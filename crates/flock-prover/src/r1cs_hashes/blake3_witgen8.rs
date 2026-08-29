@@ -654,21 +654,23 @@ impl StreamProj<'_> {
         imgs: Round1AbTableImages,
     ) {
         unsafe {
+            #[repr(C, align(64))]
+            struct Win64([u8; 64]);
+            let mut first = Win64([0u8; 64]);
+            round1_ab_inner_window_with_images(
+                &RANKED_ZERO.0,
+                &RANKED_ZERO.0,
+                &mut first.0,
+                31,
+                self.inv_table,
+                plan,
+                imgs,
+            );
+            let v = core::arch::x86_64::_mm512_load_si512(first.0.as_ptr() as *const _);
             let mut j = 0usize;
             while j != 8 {
-                let out = &mut *self
-                    .out
-                    .add(j * BYTES_PER_BLOCK + 31 * 64)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_with_images(
-                    &RANKED_ZERO.0,
-                    &RANKED_ZERO.0,
-                    out,
-                    31,
-                    self.inv_table,
-                    plan,
-                    imgs,
-                );
+                let dst = self.out.add(j * BYTES_PER_BLOCK + 31 * 64);
+                core::arch::x86_64::_mm512_stream_si512(dst as *mut _, v);
                 j += 1;
             }
         }
