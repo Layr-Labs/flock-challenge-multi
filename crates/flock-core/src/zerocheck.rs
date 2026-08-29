@@ -180,6 +180,12 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
+/// Borrow the transcript-independent table shared by every ranked proof.
+#[inline]
+pub fn shared_urm_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
+
 /// Witness padding descriptor for URM work-skipping.
 ///
 /// The witness is a sequence of `2^(m - k_log)` blocks of `2^k_log` bits each;
@@ -327,7 +333,16 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed,
+        Some(b_packed),
+        None,
+        c_packed,
+        m,
+        padding,
+        false,
+        None,
+        None,
+        challenger,
     );
     (proof, claim)
 }
@@ -348,7 +363,16 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed,
+        Some(b_packed),
+        None,
+        c_packed,
+        m,
+        padding,
+        true,
+        None,
+        None,
+        challenger,
     );
     (
         proof,
@@ -386,7 +410,8 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
-        b_packed,
+        Some(b_packed),
+        None,
         c_packed,
         m,
         padding,
@@ -421,7 +446,8 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
-        b_packed,
+        Some(b_packed),
+        None,
         c_packed,
         m,
         padding,
@@ -437,10 +463,79 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
     )
 }
 
+/// Exact ranked identity-C path whose B operand uses the 1,364-byte/block
+/// census format. The dense B argument is deliberately absent: the complete
+/// precomputed AB inner makes round one independent of it, and both later
+/// packed passes consume `b_compact` directly. Any diagnostic/off-target
+/// fallback expands to a private dense oracle before it can read B.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_identity_c_ranked_compact_b<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_compact: &[u8],
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    assert_eq!(m, 32, "compact B is branded to the ranked log2=18 witness");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15409);
+    assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    let expected_bytes = (1usize << m) / 8;
+    assert_eq!(
+        b_compact.len(),
+        expected_bytes / univariate_skip_optimized::RANKED_B_DENSE_BYTES_PER_BLOCK
+            * univariate_skip_optimized::RANKED_B_COMPACT_BYTES_PER_BLOCK
+    );
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        None,
+        Some(b_compact),
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(c_identity_z),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn expand_ranked_b_compact(compact: &[u8], dense_bytes: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    use univariate_skip_optimized::{
+        RANKED_B_COMPACT_BYTES_PER_BLOCK, RANKED_B_DENSE_BYTES_PER_BLOCK, unpack_ranked_b_block,
+    };
+
+    assert_eq!(dense_bytes % RANKED_B_DENSE_BYTES_PER_BLOCK, 0);
+    assert_eq!(
+        compact.len(),
+        dense_bytes / RANKED_B_DENSE_BYTES_PER_BLOCK * RANKED_B_COMPACT_BYTES_PER_BLOCK
+    );
+    let mut dense = vec![0u8; dense_bytes];
+    dense
+        .par_chunks_mut(RANKED_B_DENSE_BYTES_PER_BLOCK)
+        .zip(compact.par_chunks(RANKED_B_COMPACT_BYTES_PER_BLOCK))
+        .for_each(|(dst, src)| unpack_ranked_b_block(src, dst));
+    dense
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
-    b_packed: &[u8],
+    b_packed: Option<&[u8]>,
+    ranked_b_compact: Option<&[u8]>,
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
@@ -458,8 +553,36 @@ fn prove_packed_padded_inner<C: Challenger>(
     );
     let expected_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    if let Some(b_packed) = b_packed {
+        assert_eq!(b_packed.len(), expected_bytes);
+    }
     assert_eq!(c_packed.len(), expected_bytes);
+    if let Some(compact) = ranked_b_compact {
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(m, 32);
+            assert_eq!(padding.k_log, 14);
+            assert_eq!(padding.useful_bits_per_block, 15409);
+            assert_eq!(
+                compact.len(),
+                expected_bytes / univariate_skip_optimized::RANKED_B_DENSE_BYTES_PER_BLOCK
+                    * univariate_skip_optimized::RANKED_B_COMPACT_BYTES_PER_BLOCK
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        unreachable!("ranked compact B is x86-only");
+        assert_eq!(
+            precomputed_ab
+                .as_ref()
+                .expect("compact B requires precomputed AB")
+                .invalid_prefix_bytes(),
+            0
+        );
+        assert!(
+            c_identity_z.is_some(),
+            "compact B requires ranked identity C"
+        );
+    }
     let n_mlv = m - k_skip;
 
     challenger.observe_label(b"flock-zerocheck-v0");
@@ -517,6 +640,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::pcs::ranked_direct_fold4_enabled(),
                 "identity-C reuse requires ranked DirectFold4"
             );
+            let ranked_one_rows = ab_inner.ranked_one_rows_elided();
             // The two halves are independent (round one has no Fiat-Shamir
             // dependency inside it), so run them concurrently rather than
             // back to back: each alone reaches only ~35 GB/s, while the pair
@@ -532,7 +656,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let c_closure = || {
                 let t = std::time::Instant::now();
-                let (c, s_hat_v_c, quad, fold4, fold8) =
+                let (c, s_hat_v_c, quad, fold4, fold8, one_ab) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
                         c_identity_z,
                         m,
@@ -541,6 +665,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         padding.useful_bits_per_block,
                         &r,
                         inv_table,
+                        ranked_one_rows,
                     );
                 (
                     c,
@@ -548,6 +673,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     quad,
                     fold4,
                     fold8,
+                    one_ab,
                     t.elapsed().as_secs_f64() * 1e3,
                 )
             };
@@ -558,14 +684,34 @@ fn prove_packed_padded_inner<C: Challenger>(
             // happened to co-schedule. Schedule only: identical closures over
             // identical inputs, so the proof bytes are unchanged. Falls back to
             // the incumbent `rayon::join` whenever the pools are absent.
-            let ((ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, t_c_ms)) =
+            let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) => rayon::join(
-                        || ab_pool.install(ab_closure),
-                        || c_pool.install(c_closure),
-                    ),
+                    Some((ab_pool, c_pool)) => {
+                        // Hand AB to its own pool and run C's install from the
+                        // calling worker directly: one global worker blocks for
+                        // the window instead of two, and the second
+                        // cross-registry latch round-trip disappears. Same
+                        // closures over the same inputs on the same pinned
+                        // pools; the proof bytes are unchanged.
+                        let mut ab_closure = ab_closure;
+                        let mut ab_out = None;
+                        let mut c_out = None;
+                        let ab_slot = &mut ab_out;
+                        let c_slot = &mut c_out;
+                        ab_pool.in_place_scope(move |s| {
+                            s.spawn(move |_| *ab_slot = Some(ab_closure()));
+                            *c_slot = Some(c_pool.install(c_closure));
+                        });
+                        (ab_out.unwrap(), c_out.unwrap())
+                    }
                     None => rayon::join(ab_closure, c_closure),
                 };
+            if let Some(one_ab) = one_ab {
+                debug_assert_eq!(ab.len(), one_ab.len());
+                for (dst, src) in ab.iter_mut().zip(one_ab) {
+                    *dst += src;
+                }
+            }
             if zc_timing {
                 eprintln!(
                     "[zc-timing] round1 AB {t_ab_ms:.2} ms || identity-C fold {t_c_ms:.2} ms -> {:.2} ms",
@@ -587,7 +733,15 @@ fn prove_packed_padded_inner<C: Challenger>(
         {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                    ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                    ab_inner,
+                    a_packed,
+                    b_packed.expect("dense precomputed AB path requires B"),
+                    c_packed,
+                    m,
+                    k_skip,
+                    &r,
+                    inv_table,
+                    padding,
                 );
             (
                 ab,
@@ -602,7 +756,15 @@ fn prove_packed_padded_inner<C: Challenger>(
         } else {
             let (ab, c, s_hat_v_c, quad) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-                    ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                    ab_inner,
+                    a_packed,
+                    b_packed.expect("dense precomputed AB path requires B"),
+                    c_packed,
+                    m,
+                    k_skip,
+                    &r,
+                    inv_table,
+                    padding,
                 );
             (
                 ab,
@@ -618,7 +780,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else if capture_s_hat_v_c {
         let (ab, c, s_hat_v_c, quad) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
-                a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                a_packed,
+                b_packed.expect("dense capture path requires B"),
+                c_packed,
+                m,
+                k_skip,
+                &r,
+                inv_table,
+                padding,
             );
         (
             ab,
@@ -632,7 +801,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         )
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
-            a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+            a_packed,
+            b_packed.expect("dense round-one path requires B"),
+            c_packed,
+            m,
+            k_skip,
+            &r,
+            inv_table,
+            padding,
         );
         (ab, c, None)
     };
@@ -716,6 +892,39 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
+    // Compact B has no semantically valid dense backing. Keep it active only
+    // on the two ranked GFNI/VBMI2 no-materialize passes. A diagnostic kill
+    // switch, off-target build, or disabled GFNI first reconstructs the exact
+    // dense bytes into a private buffer, so no dense consumer can ever see
+    // the placeholder passed by the compact-only public wrapper.
+    // `FLOCK_COMPACT_B_FORCE_DENSE=1` preserves the compact producer and its
+    // precomputed round-one AB output, but routes both later packed passes
+    // through that dense oracle. This isolates the native compact consumers
+    // from producer/decoder exactness in one same-binary proof bisect.
+    let compact_native = cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )) && std::env::var_os("FLOCK_NO_ZC_GFNI").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+        && std::env::var_os("FLOCK_COMPACT_B_FORCE_DENSE").is_none();
+    #[cfg(target_arch = "x86_64")]
+    let dense_b_fallback = ranked_b_compact
+        .filter(|_| !use_nomat || !compact_native)
+        .map(|compact| expand_ranked_b_compact(compact, expected_bytes));
+    #[cfg(not(target_arch = "x86_64"))]
+    let dense_b_fallback: Option<Vec<u8>> = None;
+    let b_rounds = dense_b_fallback.as_deref().or(b_packed);
+    let ranked_b_compact = if dense_b_fallback.is_some() {
+        None
+    } else {
+        ranked_b_compact
+    };
+    debug_assert!(ranked_b_compact.is_none() || (use_nomat && compact_native));
+
     // Round two and the packed rounds-3+4 pass share the same 13 high eq
     // coordinates at the ranked split. Keep round two's small tensors until
     // that pass; its low tensor loses exactly the first two coordinates.
@@ -729,7 +938,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
         let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             a_packed,
-            b_packed,
+            b_rounds,
+            ranked_b_compact,
             m,
             k_skip,
             &fold_table,
@@ -741,7 +951,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else if use_lookahead {
         let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             a_packed,
-            b_packed,
+            b_rounds.expect("dense lookahead path requires B"),
             m,
             k_skip,
             &fold_table,
@@ -752,7 +962,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else {
         let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
             a_packed,
-            b_packed,
+            b_rounds.expect("dense round-two path requires B"),
             m,
             k_skip,
             &fold_table,
@@ -908,7 +1118,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 a_packed,
-                b_packed,
+                b_rounds,
+                ranked_b_compact,
                 m,
                 k_skip,
                 &fold_table,

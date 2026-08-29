@@ -26,7 +26,8 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
-    round1_ab_inner_window_with_images, round1_ab_table_images,
+    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
+    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -534,6 +535,8 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) out: *mut u8,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
+    /// Compact-ranked residual representation; dense producers leave this off.
+    pub(crate) one_rows_elided: bool,
 }
 
 #[repr(C, align(64))]
@@ -605,12 +608,39 @@ impl StreamProj<'_> {
     unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
+            if self.one_rows_elided && blk == 2 {
+                self.project_blocks_ranked_hot_offsets_residual::<2,0xfc>(plan,imgs,rows,off);
+                return;
+            }
+            if self.one_rows_elided && blk == 29 {
+                self.project_blocks_ranked_hot_offsets_residual::<29,0x0f>(plan,imgs,rows,off);
+                return;
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
-                rows.publish_dense(j,sa,sb);
+                rows.publish_dense(blk,j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                j+=1;
+            }
+        }
+    }
+
+    /// Out-of-line residual loop keeps the ranked hot dispatcher at one
+    /// block-level branch. Literal BLK/KEEP values prevent LLVM from merging
+    /// the two residual arithmetic bodies back into the incumbent j loop.
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_residual<const BLK:usize,const KEEP:u8>(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            const { assert!((BLK==2 && KEEP==0xfc)||(BLK==29 && KEEP==0x0f)); }
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(BLK,j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
         }
@@ -707,9 +737,11 @@ struct Drain8<'t> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_compact: *mut u8,
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    ranked_elide: bool,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -1169,23 +1201,24 @@ struct RankedRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_compact: *mut u8,
 }
 
 impl RankedRows {
     #[inline(always)]
-    fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
+    fn new(z: *mut u32, a: *mut u32, b: *mut u32, b_compact: *mut u8) -> Self {
         #[cfg(target_feature = "avx512f")]
         {
             debug_assert!((z as usize).is_multiple_of(64));
             debug_assert!((a as usize).is_multiple_of(64));
-            debug_assert!((b as usize).is_multiple_of(64));
+            debug_assert!(b.is_null() || (b as usize).is_multiple_of(64));
         }
-        Self { z, a, b }
+        Self { z, a, b, b_compact }
     }
 
     /// Dense ranked windows 2..29: z, a, and b are all fully live.
     #[inline(always)]
-    unsafe fn publish_dense(&self, j: usize, sa: *const u32, sb: *const u32) {
+    unsafe fn publish_dense(&self, blk: usize, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
             let o = j * U32_PER_BLOCK;
             let ap = sa.add(j * STEP_WORDS);
@@ -1196,6 +1229,20 @@ impl RankedRows {
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
                 stream_ranked_line(self.a.add(o), av);
+                #[cfg(target_feature = "avx512vbmi2")]
+                if !self.b_compact.is_null() {
+                    use flock_core::zerocheck::univariate_skip_optimized::{
+                        RANKED_B_COMPACT_BYTES_PER_BLOCK, RANKED_B_COMPACT_PLAN,
+                    };
+                    let plan = RANKED_B_COMPACT_PLAN[blk];
+                    let dst = self
+                        .b_compact
+                        .add(j * RANKED_B_COMPACT_BYTES_PER_BLOCK + plan.offset as usize);
+                    _mm512_mask_compressstoreu_epi8(dst.cast::<i8>(), plan.load_mask, bv);
+                } else {
+                    stream_ranked_line(self.b.add(o), bv);
+                }
+                #[cfg(not(target_feature = "avx512vbmi2"))]
                 stream_ranked_line(self.b.add(o), bv);
             }
             #[cfg(not(target_feature = "avx512f"))]
@@ -1234,12 +1281,47 @@ impl RankedRows {
         }
     }
 
+    /// Canonical all-zero ranked window. Compact B carries no payload for
+    /// line 31, but a cold compact producer must still initialize the Z/A
+    /// destinations instead of relying on scratch provenance.
+    #[inline(always)]
+    unsafe fn publish_zero(&self, j: usize) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            #[cfg(target_feature = "avx512f")]
+            {
+                let zero = _mm512_setzero_si512();
+                stream_ranked_line(self.z.add(o), zero);
+                stream_ranked_line(self.a.add(o), zero);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
+            {
+                let zero = _mm256_setzero_si256();
+                stream_pair_v8(self.z.add(o), zero, zero, true);
+                stream_pair_v8(self.a.add(o), zero, zero, true);
+            }
+        }
+    }
+
     /// Sparse ranked window 30: only its first qword is live; publish the
     /// complete line with the other seven qwords zeroed in the load itself.
     #[inline(always)]
     unsafe fn publish_sparse_30(&self, j: usize, p: *const u64) {
         unsafe {
             let o = j * U32_PER_BLOCK;
+            if !self.b_compact.is_null() {
+                use flock_core::zerocheck::univariate_skip_optimized::{
+                    RANKED_B_COMPACT_BYTES_PER_BLOCK, RANKED_B_COMPACT_PLAN,
+                };
+                let plan = RANKED_B_COMPACT_PLAN[30];
+                debug_assert_eq!(plan.load_mask, 0x3f);
+                core::ptr::write_bytes(
+                    self.b_compact
+                        .add(j * RANKED_B_COMPACT_BYTES_PER_BLOCK + plan.offset as usize),
+                    0xff,
+                    6,
+                );
+            }
             #[cfg(target_feature = "avx512f")]
             {
                 let av = _mm512_maskz_loadu_epi64(1, p.cast::<i64>());
@@ -1262,7 +1344,15 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static {
+                if self.ranked_elide {
+                    self.drain_range_spread::<true,true>(&self.proj,base_word,ring_word,words)
+                } else {
+                    self.drain_range_spread::<false,true>(&self.proj,base_word,ring_word,words)
+                }
+            } else {
+                self.drain_range_spread::<false,false>(&self.proj,base_word,ring_word,words)
+            };
         }
     }
 
@@ -1284,7 +1374,7 @@ impl Drain8<'_> {
     /// spread costs no extra call or spill traffic.
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn drain_range_spread<const E:bool>(
+    unsafe fn drain_range_spread<const E:bool,const S:bool>(
         &self,
         proj: &StreamProj<'_>,
         base_word: usize,
@@ -1302,8 +1392,8 @@ impl Drain8<'_> {
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
                 let (plan, imgs) = proj.window_prep(blk);
-                if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                if S && (blk <= 1 || blk == 30 || blk == 31) {
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.wrapping_add(abs_word),self.b_compact);
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -1331,10 +1421,30 @@ impl Drain8<'_> {
                         }
                     }
                     if blk == 0 {
-                        proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                        if proj.one_rows_elided {
+                            let mut j=0usize;
+                            while j!=8 { rows.publish_static::<0>(j,proj.stage); j+=1; }
+                        } else {
+                            proj.project_blocks_ranked_static::<0>(plan, imgs, rows);
+                        }
                     } else if blk == 1 {
-                        proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                        if proj.one_rows_elided {
+                            let mut j=0usize;
+                            while j!=8 { rows.publish_static::<1>(j,proj.stage); j+=1; }
+                        } else {
+                            proj.project_blocks_ranked_static::<1>(plan, imgs, rows);
+                        }
                     } else {
+                        // Dense ranked selection implies provenance (`E`),
+                        // while compact ranked selection may be cold. In the
+                        // latter case line 31 has no compact payload but Z/A
+                        // still require their canonical zero bytes. AB is a
+                        // fresh allocation in both reuse modes, so always
+                        // publish its zero transform as the dense path does.
+                        if !E {
+                            let mut j=0usize;
+                            while j!=8 { rows.publish_zero(j); j+=1; }
+                        }
                         proj.project_blocks_ranked_zero(plan, imgs);
                     }
                     continue;
@@ -1352,7 +1462,7 @@ impl Drain8<'_> {
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                 let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
 
-                if E {
+                if S {
                     // Ranked dense path: each side's two AVX2 half-transposes
                     // become one 16-word ZMM transpose, one aligned store per
                     // block row, and the same live ZMM feeds offset widening.
@@ -1381,7 +1491,7 @@ impl Drain8<'_> {
                             store_v8(p.add(8),b_hi[r]);
                         }
                     }
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.wrapping_add(abs_word),self.b_compact);
                     proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
@@ -1574,13 +1684,16 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_compact: *mut u8,
     proj: StreamProj<'_>,
     elide: [bool; 3],
 ) {
     unsafe {
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        let compact = !b_compact.is_null();
+        let ranked_elide = elide == [true; 3];
+        let ranked_static = (ranked_elide || compact) && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -1701,9 +1814,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             z,
             a,
             b,
+            b_compact,
             proj,
             elide,
             ranked_static,
+            ranked_elide,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
