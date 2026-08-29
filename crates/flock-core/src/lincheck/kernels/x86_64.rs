@@ -382,6 +382,7 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
 pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
