@@ -1385,6 +1385,17 @@ fn st_fmp_run(
             }
         }
         let _drain = DrainGuard { st };
+        struct MpNtFence;
+        impl Drop for MpNtFence {
+            fn drop(&mut self) {
+                // SAFETY: this M+P worker emits every non-temporal publish
+                // assigned to it while pinned to one logical CPU.
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            }
+        }
+        // Declared after `_drain` so reverse drop order drains this worker's
+        // WC buffers before the fold sibling is joined and staging is freed.
+        let _nt_fence = MpNtFence;
         let mut i = 0usize;
         loop {
             let r = next.fetch_add(1, Ordering::Relaxed);
@@ -2975,10 +2986,6 @@ impl AdditiveNttF128 {
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
                     );
                 }
-                // All 512 rows of this task are published. Drain the WC
-                // buffers here, exactly as the fused path does per task; the
-                // rayon join below is the reader's happens-before edge.
-                core::arch::x86_64::_mm_sfence();
             }
         };
 
