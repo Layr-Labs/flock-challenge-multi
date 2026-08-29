@@ -2630,7 +2630,7 @@ fn eq_split_x4_enabled() -> bool {
 /// `lo` must have equal length.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
+pub(crate) unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(out.len(), lo.len());

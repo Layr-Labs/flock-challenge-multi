@@ -38,7 +38,9 @@
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+use crate::field::gf2_128::x86_64::{
+    WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
@@ -55,6 +57,21 @@ use kernels::aarch64::{round2_chunk_raw_neon, round2_chunk_raw_neon_q};
     target_feature = "vpclmulqdq"
 ))]
 use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
+
+/// `FLOCK_NO_EQ_PRESCALE=1` restores the reduced `a*b`, then weighted
+/// accumulator path for same-binary diagnostics. The ranked worker's cleared
+/// environment selects the split `eq*a`, then unreduced `*b` path.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+fn eq_prescale_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_PRESCALE").is_none());
+    *ON
+}
 
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
@@ -790,6 +807,12 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     // switch for one-process A/B runs; the ranked worker never sets it.
     #[cfg(target_arch = "aarch64")]
     let r2_qmsg = std::env::var_os("FLOCK_NO_R2_QMSG").is_none();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let use_eq_prescale = eq_prescale_enabled();
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -879,11 +902,17 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                         f128x4_set(a0[0] + a1[0], a0[1] + a1[1], a0[2] + a1[2], a0[3] + a1[3]);
                     let b_sum_x4 =
                         f128x4_set(b0[0] + b1[0], b0[1] + b1[1], b0[2] + b1[2], b0[3] + b1[3]);
-                    let g1x4 = ghash_mul_x4(a1x4, b1x4);
-                    let g_inf_x4 = ghash_mul_x4(a_sum_x4, b_sum_x4);
                     let eqx4 = f128x4_loadu(eq_lo[x_lo..].as_ptr());
-                    p1_wide.mul_acc(eqx4, g1x4);
-                    pinf_wide.mul_acc(eqx4, g_inf_x4);
+                    if use_eq_prescale {
+                        let eq_x64 = ghash_shift64_x4(eqx4);
+                        p1_wide.mul_acc(ghash_mul_x4_split(a1x4, eqx4, eq_x64), b1x4);
+                        pinf_wide.mul_acc(ghash_mul_x4_split(a_sum_x4, eqx4, eq_x64), b_sum_x4);
+                    } else {
+                        let g1x4 = ghash_mul_x4(a1x4, b1x4);
+                        let g_inf_x4 = ghash_mul_x4(a_sum_x4, b_sum_x4);
+                        p1_wide.mul_acc(eqx4, g1x4);
+                        pinf_wide.mul_acc(eqx4, g_inf_x4);
+                    }
                     x_lo += 4;
                 }
 

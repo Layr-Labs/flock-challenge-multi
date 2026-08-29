@@ -11,6 +11,16 @@ use super::super::{ELL, F128, N_MEDIUM};
 #[cfg(target_feature = "gfni")]
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 
+/// Same-binary rollback for the split equality prescale used by the ranked
+/// x86 AB conversion kernels. Resolved once per process.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+fn eq_prescale_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_PRESCALE").is_none());
+    *ON
+}
+
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
 /// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
 /// are identical to the NEON version, applied to all eight 64-bit lanes at once.
@@ -367,6 +377,33 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
     }
 }
 
+/// Ranked residual-AB fixed-stream-store leaf. The two admitted masks are
+/// block 2's K2..7 and block 29's K0..3. Dispatch is outside the arithmetic
+/// body, so each arm statically deletes the omitted inverse-table applies.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+    keep: u8,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let acc = match keep {
+            0xfc => residual_2img_offw_k2_7(imgs, op),
+            0x0f => residual_2img_offw_k0_3(imgs, op),
+            _ => core::hint::unreachable_unchecked(),
+        };
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
 /// Horner over x: Σ_k x^k·y_k = y_0 + x·(y_1 + x·(… + x·y_7)). Same count of
 /// `vgf2p8mulb` as the explicit x^k form (8 products + 7 scalings), but the
 /// multiplier is the loop-invariant x = 0x02, so the per-iteration `mov $1` /
@@ -407,6 +444,76 @@ unsafe fn horner_2img_offw(
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
         }
         acc
+    }
+}
+
+/// Explicit ranked block-2 subset of [`horner_2img_offw`]. Keeping literal
+/// K indices here prevents LLVM from retaining a six-trip control loop.
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn residual_2img_offw_k2_7(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        macro_rules! scaled {
+            ($k:literal) => {{
+                let product =
+                    _mm512_gf2p8mul_epi8(apply(op.add($k * 8)), apply(op.add(64 + $k * 8)));
+                _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
+            }};
+        }
+        let p2 = scaled!(2);
+        let p3 = scaled!(3);
+        let p4 = scaled!(4);
+        let p5 = scaled!(5);
+        let p6 = scaled!(6);
+        let p7 = scaled!(7);
+        _mm512_xor_si512(
+            _mm512_xor_si512(p2, p3),
+            _mm512_xor_si512(_mm512_xor_si512(p4, p5), _mm512_xor_si512(p6, p7)),
+        )
+    }
+}
+
+/// Explicit ranked block-29 subset of [`horner_2img_offw`].
+#[inline(always)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+unsafe fn residual_2img_offw_k0_3(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
+        let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
+        macro_rules! scaled {
+            ($k:literal) => {{
+                let product =
+                    _mm512_gf2p8mul_epi8(apply(op.add($k * 8)), apply(op.add(64 + $k * 8)));
+                _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
+            }};
+        }
+        _mm512_xor_si512(
+            _mm512_xor_si512(p0, scaled!(1)),
+            _mm512_xor_si512(scaled!(2), scaled!(3)),
+        )
     }
 }
 
@@ -628,16 +735,20 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
+    let use_eq_prescale = eq_prescale_enabled();
 
     // SAFETY: the fixed-size input/partial arrays contain every four-lane load
     // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -648,7 +759,12 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let cf_ab = f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]);
+            let scaled_ab = if use_eq_prescale {
+                ghash_mul_x4_split(cf_ab, eq, eq_x64)
+            } else {
+                ghash_mul_x4(cf_ab, eq)
+            };
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -728,10 +844,13 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{
+        f128x4_set, ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4,
+    };
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
+    let use_eq_prescale = eq_prescale_enabled();
 
     let owned;
     let production = super::super::convert_table();
@@ -770,6 +889,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -808,8 +928,14 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let (scaled0, scaled1) = if use_eq_prescale {
+                    (
+                        ghash_mul_x4_split(aos0, eq, eq_x64),
+                        ghash_mul_x4_split(aos1, eq, eq_x64),
+                    )
+                } else {
+                    (ghash_mul_x4(aos0, eq), ghash_mul_x4(aos1, eq))
+                };
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
@@ -1453,6 +1579,126 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
             mats,
             bank_planes,
         );
+    }
+}
+
+/// First-write ranked residual body: rows 0 and 1 are supplied by the
+/// identity-C contribution, so this evaluates absolute medium rows 2..N.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni_range2(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed_range2::<15, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed_range2::<16, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+/// Accumulating twin of [`write_convert_ab_nomul_x86_gfni_range2`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_range2(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    unsafe {
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed_range2::<15, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed_range2::<16, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_range2<
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(N == 15 || N == 16);
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in 2..N {
+            rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = 2;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
     }
 }
 
