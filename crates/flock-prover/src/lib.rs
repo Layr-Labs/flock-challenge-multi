@@ -40,3 +40,6 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+#[used]
+static UROLL_9: [u8; 1288] = [0u8; 1288];
