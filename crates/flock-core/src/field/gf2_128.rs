@@ -547,6 +547,43 @@ mod tests {
         }
     }
 
+    /// Compiled-in 4-wide split dispatch must match scalar `F128::mul` and
+    /// [`ghash_mul_x4`], lane for lane — companion `t·x^64` is the only extra
+    /// operand; the reduced product is unique.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn ghash_mul_x4_split_matches_scalar() {
+        use core::arch::x86_64::*;
+        let mut rng = Rng::new(0x5B11_7C0D);
+        for _ in 0..256 {
+            let vs = [
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+                rng.next_f128(),
+            ];
+            let t = rng.next_f128();
+            // SAFETY: vpclmulqdq+avx512f enabled at compile time (cfg gate).
+            let got: [F128; 4] = unsafe {
+                let v = x86_64::f128x4_loadu(vs.as_ptr());
+                let (tv, t64) = x86_64::ghash_broadcast_split(t);
+                let r = x86_64::ghash_mul_x4_split(v, tv, t64);
+                x86_64::f128x4_extract(r)
+            };
+            for lane in 0..4 {
+                assert_eq!(
+                    got[lane],
+                    vs[lane] * t,
+                    "lane {lane}: x4_split != scalar mul"
+                );
+            }
+        }
+    }
+
     /// The 4-lane deferred-reduction accumulator must equal the scalar
     /// XOR-of-`mul_unreduced` it replaces, both before and after `reduce()`.
     #[cfg(all(
