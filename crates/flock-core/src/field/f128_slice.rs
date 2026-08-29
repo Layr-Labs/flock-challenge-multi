@@ -480,6 +480,14 @@ mod tests {
                 weinf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
             }
             assert_eq!((e1, einf), (we1, weinf), "msg n={n}");
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                super::MSG_SPLIT_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                let serial = msg_split_half(&chi, &clo, &zhi, &zlo, n);
+                super::MSG_SPLIT_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!((e1, einf), serial, "pipe vs serial n={n}");
+            }
             // bind_both_and_msg_split
             let (c0, c1, c2, c3) = (draw(n), draw(n), draw(n), draw(n));
             let (z0, z1, z2, z3) = (draw(n), draw(n), draw(n), draw(n));
@@ -780,6 +788,36 @@ pub(crate) fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     for i in 0..lo.len() {
         lo[i] = lo[i] + r * (hi[i] + lo[i]);
     }
+}
+
+/// Test latch so the round-0 pipe oracle can drive both arms without
+/// mutating env. Ranked `env_clear()` never sets this.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static MSG_SPLIT_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default software-pipelines `msg_split_half`'s 4-wide loads:
+/// preload the next 4 F128 while `mul_acc` of the current group covers
+/// CLMUL latency. `FLOCK_NO_LC_SUMCHECK_R0_PIPE=1` restores the serial
+/// load/mul_acc loop. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn msg_split_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if MSG_SPLIT_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_R0_PIPE").is_none());
+    *ON
 }
 
 /// Product-sumcheck message over a top-bit split:

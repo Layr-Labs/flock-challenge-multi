@@ -1597,7 +1597,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
