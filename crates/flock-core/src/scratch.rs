@@ -259,6 +259,9 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
 /// AB projection, zerocheck ping-pong, and open-stage transients. This parks
 /// 6.5 GiB at ranked m = 32 instead of 10.5 GiB; release with [`clear`].
 pub fn prewarm_prover(m: usize) {
+    // First thing, before any state exists: one-shot ASLR pin + re-exec
+    // (see `pin_address_space`); the exec replaces this process image.
+    crate::pin_address_space();
     use rayon::prelude::*;
     if m < 7 {
         return;
@@ -277,6 +280,13 @@ pub fn prewarm_prover(m: usize) {
             // SAFETY: F128 is plain bytes (no Drop); zero is a valid pattern.
             unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
+    });
+    // Still inside the untimed setup window: collapse any region of the
+    // just-faulted set that fell back to 4 KiB pages into 2 MiB pages, so
+    // every timed prove runs on the same mapping regardless of the THP
+    // fault-time lottery. Best-effort, content-preserving.
+    bufs.par_iter_mut().for_each(|b| {
+        crate::collapse_hugepages(b.as_mut_ptr().cast::<u8>(), b.len() * 16);
     });
     for b in bufs {
         give_f128(b);
