@@ -140,6 +140,36 @@ pub(super) fn fold_two_and_msg_in_place_scalar(
     (u0, u2)
 }
 
+/// Test latch so the 4-wide leaf-pipe oracle can drive both arms without
+/// mutating env. Ranked `env_clear()` never sets this.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static F128_SLICE_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default software-pipelines the 4-wide `fold_pairs` and
+/// `add_scaled` AVX-512 leaves: preload the next group while `ghash_mul_x4_split`
+/// of the current group covers CLMUL latency.
+/// `FLOCK_NO_F128_SLICE_PIPE=1` restores the serial loops. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn f128_slice_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if F128_SLICE_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F128_SLICE_PIPE").is_none());
+    *ON
+}
+
 /// Add one scaled field slice into another: `dst[i] += scale * addend[i]`.
 ///
 /// The ranked lazy-OOD fold uses this after folding the incumbent basis and
@@ -577,6 +607,72 @@ mod tests {
         fold_pairs(&src, 3, &mut actual, r);
 
         assert_eq!(actual, expected);
+    }
+
+    /// 4-wide piped `fold_pairs` / `add_scaled` must match the serial
+    /// AVX-512 bodies (and the portable scalar formulas) at vector and
+    /// tail lengths.
+    #[test]
+    fn f128_slice_pipe_matches_serial_and_scalar() {
+        use super::*;
+        let mut state = 0x511C_EF01_D000_0001u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 7, 8, 9, 16, 64, 257] {
+            let src: Vec<F128> = (0..2 * n + 8)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let r = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let mut piped = vec![F128::ZERO; n];
+            fold_pairs(&src, 0, &mut piped, r);
+            let mut scalar = vec![F128::ZERO; n];
+            for t in 0..n {
+                let even = src[2 * t];
+                scalar[t] = even + r * (even + src[2 * t + 1]);
+            }
+            assert_eq!(piped, scalar, "fold_pairs n={n}");
+            let mut dst: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let addend: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let scale = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let mut want = dst.clone();
+            for i in 0..n {
+                want[i] += scale * addend[i];
+            }
+            add_scaled(&mut dst, &addend, scale);
+            assert_eq!(dst, want, "add_scaled n={n}");
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                let mut serial_pairs = vec![F128::ZERO; n];
+                super::F128_SLICE_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                fold_pairs(&src, 0, &mut serial_pairs, r);
+                super::F128_SLICE_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(piped, serial_pairs, "fold_pairs pipe vs serial n={n}");
+            }
+        }
     }
 
     /// Portable one-mul leaf is bit-identical to the two-mul formula.

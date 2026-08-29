@@ -15,16 +15,40 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
         let r_x64 = ghash_shift64_x4(r_bcast);
         let lanes = dst.len() & !3;
         let mut t = 0;
-        while t < lanes {
-            let s = 2 * (base + t);
-            let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+        if super::f128_slice_pipe_enabled() && lanes >= 8 {
+            let mut lo = _mm512_loadu_si512(src.as_ptr().add(2 * base) as *const __m512i);
+            let mut hi = _mm512_loadu_si512(src.as_ptr().add(2 * base + 4) as *const __m512i);
+            while t + 8 <= lanes {
+                let ns = 2 * (base + t + 4);
+                let nlo = _mm512_loadu_si512(src.as_ptr().add(ns) as *const __m512i);
+                let nhi = _mm512_loadu_si512(src.as_ptr().add(ns + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                let diff = _mm512_xor_si512(even, odd);
+                let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+                lo = nlo;
+                hi = nhi;
+                t += 4;
+            }
             let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
             let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
             let diff = _mm512_xor_si512(even, odd);
             let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
             t += 4;
+        } else {
+            while t < lanes {
+                let s = 2 * (base + t);
+                let lo = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let hi = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+                let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+                let diff = _mm512_xor_si512(even, odd);
+                let new = _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, new);
+                t += 4;
+            }
         }
         portable_tail(src, base, dst, r, t);
     }
@@ -46,13 +70,32 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
         let scale_x64 = ghash_shift64_x4(scale_x4);
         let lanes = dst.len() & !3;
         let mut i = 0usize;
-        while i < lanes {
-            let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
-            let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
+        if super::f128_slice_pipe_enabled() && lanes >= 8 {
+            let mut current = _mm512_loadu_si512(dst.as_ptr() as *const __m512i);
+            let mut extra = _mm512_loadu_si512(addend.as_ptr() as *const __m512i);
+            while i + 8 <= lanes {
+                let ncurrent = _mm512_loadu_si512(dst.as_ptr().add(i + 4) as *const __m512i);
+                let nextra = _mm512_loadu_si512(addend.as_ptr().add(i + 4) as *const __m512i);
+                let corrected =
+                    _mm512_xor_si512(current, ghash_mul_x4_split(extra, scale_x4, scale_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
+                current = ncurrent;
+                extra = nextra;
+                i += 4;
+            }
             let corrected =
                 _mm512_xor_si512(current, ghash_mul_x4_split(extra, scale_x4, scale_x64));
             _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
             i += 4;
+        } else {
+            while i < lanes {
+                let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
+                let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
+                let corrected =
+                    _mm512_xor_si512(current, ghash_mul_x4_split(extra, scale_x4, scale_x64));
+                _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, corrected);
+                i += 4;
+            }
         }
         while i < dst.len() {
             dst[i] += scale * addend[i];
