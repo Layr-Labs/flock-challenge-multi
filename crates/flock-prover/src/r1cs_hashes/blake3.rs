@@ -111,6 +111,13 @@ pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
 
+#[inline]
+fn witgen_urm_share_enabled() -> bool {
+    // The witness-local table wins at the ranked shape: sharing this table
+    // extends its lifetime and adds cross-phase cache pressure.
+    false
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -1796,6 +1803,182 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Storage for zerocheck's B operand after witness generation.
+pub(crate) enum Round2PackedB {
+    Dense(Vec<F128>),
+    RankedCompact {
+        /// Dense-size, prewarmed scratch backing. Only `used_bytes` at the
+        /// front hold the compact representation; retaining the incumbent
+        /// size class avoids a new first-touch allocation in the timed call.
+        storage: Vec<F128>,
+        used_bytes: usize,
+    },
+}
+
+/// Ranked witness entry with a representation choice for B. Only the exact
+/// log2=18 closed-form source can select compact storage; every Slice,
+/// off-shape, portable, or killed call retains the incumbent dense producer.
+pub(crate) fn generate_witness_with_ab_packed_and_round1_inner_ranked_from(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Round2PackedB,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi2"
+    ))]
+    if n_blocks_log == 18
+        && matches!(
+            blocks,
+            crate::seed_pipe::BlockSource::Closed { len, .. } if len == (1usize << 18)
+        )
+        && std::env::var_os("FLOCK_NO_ZC_COMPACT_B").is_none()
+    {
+        if let Some((z, a, b, used_bytes, ab)) =
+            generate_witness_with_ab_packed_and_round1_inner_compact_b(blocks, n_blocks_log)
+        {
+            return (
+                z,
+                a,
+                Round2PackedB::RankedCompact {
+                    storage: b,
+                    used_bytes,
+                },
+                ab,
+            );
+        }
+    }
+
+    let (z, a, b, ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, n_blocks_log);
+    (z, a, Round2PackedB::Dense(b), ab)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi2"
+))]
+fn generate_witness_with_ab_packed_and_round1_inner_compact_b(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> Option<(
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    usize,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+)> {
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+
+    let n_total = 1usize << n_blocks_log;
+    assert_eq!(n_blocks_log, 18);
+    assert!(matches!(
+        blocks,
+        crate::seed_pipe::BlockSource::Closed { len, .. } if len == n_total
+    ));
+    let skip_bytes =
+        flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        );
+    assert_eq!(
+        skip_bytes, 0,
+        "compact B requires a complete streamed AB inner"
+    );
+
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+        n_total * BYTES_PER_BLOCK,
+    );
+    let one_rows_elided =
+        flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::pcs::ranked_direct_fold8_enabled();
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        &inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
+    // The compact producer has no semantic dense-B destination. Its ranked
+    // drain is therefore valid only when the exact prepared offset/NT plan
+    // will select the static publisher. This includes GFNI and all four URM
+    // latches, a 64-byte-aligned ab_inner, and FLOCK_NO_ABINNER_NT being off.
+    if !win_plan.ranked_stream_eligible(2) {
+        return None;
+    }
+
+    // Reuse the exact dense-B size class warmed by setup/previous proofs.
+    // The ranked allocator normally returns it line-aligned; compact publish
+    // requires that invariant because adjacent 21,824-byte task groups share
+    // no partial cache line. A rare incompatible backing takes the incumbent
+    // dense path before any parallel producer starts.
+    let b_tag = witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128);
+    let a_tag = witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128);
+    let z_tag = witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128);
+    let (mut b_compact, b_tok) = flock_core::scratch::take_f128_tagged(n_f128, b_tag);
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(n_f128, a_tag);
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(n_f128, z_tag);
+    if [b_compact.as_ptr(), a.as_ptr(), z.as_ptr()]
+        .into_iter()
+        .any(|p| !(p as usize).is_multiple_of(64))
+    {
+        let give_unmodified = |v, hit, tag| {
+            if hit {
+                flock_core::scratch::give_f128_tagged(v, tag);
+            } else {
+                flock_core::scratch::give_f128(v);
+            }
+        };
+        give_unmodified(b_compact, b_tok, b_tag);
+        give_unmodified(a, a_tok, a_tag);
+        give_unmodified(z, z_tok, z_tag);
+        return None;
+    }
+    let compact_bytes = n_total
+        * flock_core::zerocheck::univariate_skip_optimized::RANKED_B_COMPACT_BYTES_PER_BLOCK;
+    assert_eq!(compact_bytes % core::mem::size_of::<F128>(), 0);
+    assert!(compact_bytes <= b_compact.len() * core::mem::size_of::<F128>());
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let elide_on = witgen_simd::const_elide_enabled();
+    let ab_elide = elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+
+    generate_round1_inner_octa_compact_b(
+        blocks,
+        &mut z,
+        &mut a,
+        &mut b_compact,
+        &mut ab_inner,
+        &inv_table,
+        win_plan,
+        &padding,
+        [z_tok && elide_on, a_tok && ab_elide, false],
+    );
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    Some((z, a, b_compact, compact_bytes, ab_inner))
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -1914,9 +2097,19 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_total * BYTES_PER_BLOCK,
     );
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2122,6 +2315,177 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
 
+/// Per-folder storage for the compact-B ranked producer.
+///
+/// Every non-temporal store issued while this state is borrowed runs on the
+/// Rayon worker that owns it. Dropping the state on that same worker drains
+/// its WC buffers before the folder is released; the parallel-iterator join
+/// is then the happens-before edge for the proof's consumers. Keeping the
+/// fence at folder lifetime, rather than after every 16-block item, lets a
+/// worker overlap one item's publication with the next item's witness work.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi2"
+))]
+struct CompactBWorkerState {
+    win: Vec<core::mem::MaybeUninit<AbWinLine>>,
+    b_stage: Vec<core::mem::MaybeUninit<AbWinLine>>,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi2"
+))]
+impl Drop for CompactBWorkerState {
+    fn drop(&mut self) {
+        flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+    }
+}
+
+/// Compact-B ranked producer. One Rayon item is the incumbent 16-block group;
+/// its 16 * 1364-byte compact stage is exactly 341 cache lines. Per-window
+/// `vcompressb` stores fill that L1-resident stage, then one sequential NT
+/// drain publishes it without write allocation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi2"
+))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_compact_b(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    z: &mut [F128],
+    a: &mut [F128],
+    b_compact: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    win_plan: flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan,
+    padding: &Compression,
+    elide: [bool; 3],
+) {
+    use core::arch::x86_64::*;
+    use rayon::prelude::*;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+    const COMPACT_PER_BLOCK: usize =
+        flock_core::zerocheck::univariate_skip_optimized::RANKED_B_COMPACT_BYTES_PER_BLOCK;
+    const COMPACT_GROUP_BYTES: usize = GROUP * COMPACT_PER_BLOCK;
+    const COMPACT_LINES: usize = COMPACT_GROUP_BYTES / 64;
+    const _: () = assert!(COMPACT_GROUP_BYTES.is_multiple_of(64));
+
+    #[inline(always)]
+    unsafe fn publish_compact(stage: *const u8, out: *mut u8) {
+        unsafe {
+            debug_assert!((stage as usize).is_multiple_of(64));
+            debug_assert!((out as usize).is_multiple_of(64));
+            for line in 0..COMPACT_LINES {
+                let v = _mm512_load_si512(stage.add(64 * line).cast::<__m512i>());
+                let dst = out.add(64 * line);
+                _mm512_stream_si512(dst.cast::<__m512i>(), v);
+            }
+        }
+    }
+
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let compact_used_bytes = z.len() / F128_PER_BLOCK * COMPACT_PER_BLOCK;
+    debug_assert!(compact_used_bytes <= b_compact.len() * core::mem::size_of::<F128>());
+    debug_assert!((b_compact.as_ptr() as usize).is_multiple_of(64));
+    let compact_bytes = unsafe {
+        core::slice::from_raw_parts_mut(b_compact.as_mut_ptr().cast::<u8>(), compact_used_bytes)
+    };
+    let one_rows_elided = ab_inner.ranked_one_rows_elided();
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    assert!(win_plan.ranked_stream_eligible(2));
+
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(compact_bytes.par_chunks_mut(COMPACT_GROUP_BYTES))
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each_init(
+            || {
+                let alloc = |lines: usize| {
+                    let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                    v.reserve_exact(lines);
+                    unsafe { v.set_len(lines) };
+                    v
+                };
+                CompactBWorkerState {
+                    win: alloc(STAGE_LINES),
+                    b_stage: alloc(COMPACT_LINES),
+                }
+            },
+            |state, (g, (((z_out, a_out), b_out), ab_out))| {
+                debug_assert_eq!(z_out.len(), group_f128);
+                debug_assert_eq!(b_out.len(), COMPACT_GROUP_BYTES);
+                let stage = state.win.as_mut_ptr().cast::<u32>();
+                let compact_stage = state.b_stage.as_mut_ptr().cast::<u8>();
+                unsafe {
+                    for half in 0..(GROUP / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        let staged: [Compression; SIMD];
+                        let octa = match blocks {
+                            crate::seed_pipe::BlockSource::Slice(s) => {
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    s.get(base + j).unwrap_or(padding)
+                                }))
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len }
+                                if base + SIMD <= len =>
+                            {
+                                blake3_witgen8::OctaInputs::Closed { init, base }
+                            }
+                            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                staged = std::array::from_fn(|j| {
+                                    let idx = base + j;
+                                    if idx < len {
+                                        crate::seed_pipe::gen_block(init, idx)
+                                    } else {
+                                        *padding
+                                    }
+                                });
+                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                    &staged[j]
+                                }))
+                            }
+                        };
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        let proj = blake3_witgen8::StreamProj {
+                            stage,
+                            out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided,
+                        };
+                        blake3_witgen8::build_octa_witness_ab_stream_elide(
+                            octa,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            core::ptr::null_mut(),
+                            compact_stage.add(half * SIMD * COMPACT_PER_BLOCK),
+                            proj,
+                            elide,
+                        );
+                    }
+                    publish_compact(compact_stage, b_out.as_mut_ptr());
+                }
+            },
+        );
+}
+
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
@@ -2283,6 +2647,7 @@ fn generate_round1_inner_octa(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
+                                one_rows_elided: false,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
@@ -2290,6 +2655,7 @@ fn generate_round1_inner_octa(
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            core::ptr::null_mut(),
                             proj,
                             elide,
                         );
@@ -3752,14 +4118,23 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
-                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
+                let (codeword, (z_packed, a_packed_f128, b_round2, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner_from(
-                                blocks,
-                                self.n_blocks_log(),
-                            )
+                            if crate::prover::ranked_identity_c_fold_enabled(&self.r1cs) {
+                                generate_witness_with_ab_packed_and_round1_inner_ranked_from(
+                                    blocks,
+                                    self.n_blocks_log(),
+                                )
+                            } else {
+                                let (z, a, b, ab) =
+                                    generate_witness_with_ab_packed_and_round1_inner_from(
+                                        blocks,
+                                        self.n_blocks_log(),
+                                    );
+                                (z, a, Round2PackedB::Dense(b), ab)
+                            }
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
@@ -3767,12 +4142,12 @@ impl Blake3Setup {
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
-                crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                crate::prover::prove_fast_ligerito_from_block_major_witness_with_ranked_b(
                     &self.r1cs,
                     &self.pcs_params,
                     z_packed,
                     a_packed_f128,
-                    b_packed_f128,
+                    b_round2,
                     ab_inner,
                     lc_circuit,
                     codeword,

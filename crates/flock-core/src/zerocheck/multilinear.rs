@@ -1386,7 +1386,8 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
 ) -> (F128, F128, Round3Lookahead) {
     uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         a_packed,
-        b_packed,
+        Some(b_packed),
+        None,
         m,
         k_skip,
         table,
@@ -1399,7 +1400,8 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     a_packed: &[u8],
-    b_packed: &[u8],
+    b_packed: Option<&[u8]>,
+    ranked_b_compact: Option<&[u8]>,
     m: usize,
     k_skip: usize,
     table: &UniSkipFoldTable,
@@ -1436,7 +1438,20 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
     assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    if let Some(b_packed) = b_packed {
+        assert_eq!(b_packed.len(), n_out * n_chunks);
+    }
+    assert!(b_packed.is_some() || ranked_b_compact.is_some());
+    if let Some(compact) = ranked_b_compact {
+        use crate::zerocheck::univariate_skip_optimized::{
+            RANKED_B_COMPACT_BYTES_PER_BLOCK, RANKED_B_DENSE_BYTES_PER_BLOCK,
+        };
+        assert_eq!(a_packed.len() % RANKED_B_DENSE_BYTES_PER_BLOCK, 0);
+        assert_eq!(
+            compact.len(),
+            a_packed.len() / RANKED_B_DENSE_BYTES_PER_BLOCK * RANKED_B_COMPACT_BYTES_PER_BLOCK
+        );
+    }
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -1497,20 +1512,54 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             // shape, WRITE=false touches no chunk, and the cfg gate supplies
             // every intrinsic feature.
             let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut none_a,
-                    &mut none_b,
-                    eq_lo,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    wtab_arg,
-                )
+                #[cfg(target_feature = "avx512vbmi2")]
+                if let Some(compact) = ranked_b_compact {
+                    kernels::x86_64::round2_lookahead_chunk_ranked_compact_b_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        compact.as_ptr(),
+                        row_base,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                    )
+                } else {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.expect("dense B missing").as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                    )
+                }
+                #[cfg(not(target_feature = "avx512vbmi2"))]
+                {
+                    assert!(ranked_b_compact.is_none());
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.expect("dense B missing").as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                    )
+                }
             };
             #[cfg(not(all(
                 target_arch = "x86_64",
@@ -1519,7 +1568,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             )))]
             let out = round2_lookahead_chunk_scalar::<false>(
                 a_packed,
-                b_packed,
+                b_packed.expect("scalar no-materialize path requires dense B"),
                 table,
                 &mut none_a,
                 &mut none_b,
@@ -1589,14 +1638,27 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     r_next4: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-        a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
+        a_packed,
+        Some(b_packed),
+        None,
+        m,
+        k_skip,
+        table,
+        padding,
+        a_out,
+        b_out,
+        rho1,
+        rho2,
+        r_next4,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     a_packed: &[u8],
-    b_packed: &[u8],
+    b_packed: Option<&[u8]>,
+    ranked_b_compact: Option<&[u8]>,
     m: usize,
     k_skip: usize,
     table: &UniSkipFoldTable,
@@ -1677,7 +1739,20 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let n = 1usize << (m - k_skip);
     assert!(n >= 16);
     assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    if let Some(b_packed) = b_packed {
+        assert_eq!(b_packed.len(), n * n_chunks);
+    }
+    assert!(b_packed.is_some() || ranked_b_compact.is_some());
+    if let Some(compact) = ranked_b_compact {
+        use crate::zerocheck::univariate_skip_optimized::{
+            RANKED_B_COMPACT_BYTES_PER_BLOCK, RANKED_B_DENSE_BYTES_PER_BLOCK,
+        };
+        assert_eq!(a_packed.len() % RANKED_B_DENSE_BYTES_PER_BLOCK, 0);
+        assert_eq!(
+            compact.len(),
+            a_packed.len() / RANKED_B_DENSE_BYTES_PER_BLOCK * RANKED_B_COMPACT_BYTES_PER_BLOCK
+        );
+    }
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
     assert_eq!(b_out.len(), quarter);
@@ -1757,23 +1832,65 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             // 4·out_base .. 4·(out_base + chunk_out); the table has the
             // protocol-fixed shape; the cfg gate supplies every feature.
             let out = unsafe {
-                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
-                    a_out,
-                    b_out,
-                    rho1,
-                    rho2,
-                    eq_lo,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    nt_out,
-                    cfold_arg,
-                    wtab_arg,
-                )
+                #[cfg(target_feature = "avx512vbmi2")]
+                if let Some(compact) = ranked_b_compact {
+                    kernels::x86_64::fold2_from_packed_lookahead_ranked_compact_b_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        compact.as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        nt_out,
+                        cfold_arg,
+                        wtab_arg,
+                    )
+                } else {
+                    kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.expect("dense B missing").as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        nt_out,
+                        cfold_arg,
+                        wtab_arg,
+                    )
+                }
+                #[cfg(not(target_feature = "avx512vbmi2"))]
+                {
+                    assert!(ranked_b_compact.is_none());
+                    kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.expect("dense B missing").as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        nt_out,
+                        cfold_arg,
+                        wtab_arg,
+                    )
+                }
             };
             #[cfg(not(all(
                 target_arch = "x86_64",
@@ -1782,7 +1899,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             )))]
             let out = fold2_from_packed_lookahead_scalar(
                 a_packed,
-                b_packed,
+                b_packed.expect("scalar composed path requires dense B"),
                 table,
                 out_base,
                 a_out,
@@ -4268,6 +4385,176 @@ mod tests {
                 out_s, out_ns,
                 "scalar no-store sums lo_size={lo_size} mask={mask}"
             );
+        }
+    }
+
+    /// The constant-fiber `b == 1` window (`FLOCK_NO_ZC_B_ONES`) against the
+    /// scalar oracle, on the REAL BLAKE3 `b` pattern.
+    ///
+    /// Three things are asserted:
+    ///   1. the load-bearing identity `T(u64::MAX) == F128::ONE` — the fold
+    ///      table's columns are the Lagrange weights `L_i(z)` of the k_skip
+    ///      domain, so the all-ones row folds to `sum_i L_i(z) = 1` (partition
+    ///      of unity) for EVERY `z`;
+    ///   2. the kernel's outputs and written chunks match
+    ///      `round2_lookahead_chunk_scalar` bit for bit on a witness whose
+    ///      block prefix is all-ones and whose remainder is random, with and
+    ///      without the hoisted `(w, w*x^64)` table, in both WRITE arms;
+    ///   3. the window actually FIRES (hit counter), and does NOT fire when
+    ///      the same shape carries a non-degenerate `b`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn round2_b_ones_window_matches_scalar() {
+        use std::sync::atomic::Ordering;
+        const K_SKIP: usize = 6;
+        // Ranked K-block geometry: 256 post-URM rows = 128 pairs; the const-one
+        // input wires make rows 0..18 and 236..240 the all-ones word.
+        const BLOCK_ROWS: usize = 256;
+        const ONES_ROWS: std::ops::Range<usize> = 0..18;
+        const ONES_ROWS_HI: std::ops::Range<usize> = 236..240;
+        const ZERO_ROWS_HI: std::ops::Range<usize> = 241..256;
+
+        for &(lo_size, mask, useful, base_blocks, degenerate) in &[
+            (128usize, 127usize, 121usize, 0usize, true),
+            (128, 127, 121, 3, true),
+            (256, 127, 121, 1, true),
+            (128, 127, 121, 0, false), // same shape, random b -> must not fire
+            (64, 63, 60, 2, true),     // half-block chunks
+        ] {
+            let mut rng = Rng::new(0xB0E5_0000 + lo_size as u64 + base_blocks as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            // (1) partition of unity.
+            assert_eq!(
+                table.fold_one_row(&[0xffu8; 8]),
+                F128::ONE,
+                "all-ones row must fold to ONE"
+            );
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats = r2_gfni_mats(&table);
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats_arg = r2_mats.as_ref();
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let r2_mats_arg: Option<&[u64; 128]> = None;
+
+            let pair_idx_base = base_blocks * (BLOCK_ROWS / 2);
+            let row_base = 2 * pair_idx_base;
+            let n_rows = row_base + 2 * lo_size;
+            let mut a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            if degenerate {
+                for blk in 0..n_rows.div_ceil(BLOCK_ROWS) {
+                    for r in ONES_ROWS.chain(ONES_ROWS_HI) {
+                        let g = blk * BLOCK_ROWS + r;
+                        if g < n_rows {
+                            b_packed[g * 8..g * 8 + 8].fill(0xff);
+                        }
+                    }
+                    for r in ZERO_ROWS_HI {
+                        let g = blk * BLOCK_ROWS + r;
+                        if g < n_rows {
+                            b_packed[g * 8..g * 8 + 8].fill(0);
+                        }
+                    }
+                }
+            }
+            // Production shape: padded pairs hold zero rows on both sides.
+            for pair in 0..lo_size {
+                if ((pair_idx_base + pair) & mask) >= useful {
+                    let r0 = (row_base + 2 * pair) * 8;
+                    a_packed[r0..r0 + 16].fill(0);
+                    b_packed[r0..r0 + 16].fill(0);
+                }
+            }
+            let eq_lo = rng.f128_vec(lo_size);
+
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = vec![F128::ZERO; 2 * lo_size];
+            let out_s = round2_lookahead_chunk_scalar::<true>(
+                &a_packed,
+                &b_packed,
+                &table,
+                &mut a_s,
+                &mut b_s,
+                &eq_lo,
+                row_base,
+                pair_idx_base,
+                mask,
+                useful,
+            );
+
+            let before = kernels::x86_64::B_ONES_HITS.load(Ordering::Relaxed);
+            let sparse_before = kernels::x86_64::B_SPARSE_HITS.load(Ordering::Relaxed);
+            let mut a_v = vec![F128::ONE; 2 * lo_size];
+            let mut b_v = vec![F128::ONE; 2 * lo_size];
+            // SAFETY: rows/table/chunk lengths satisfy the kernel's contract.
+            let out_v = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut a_v,
+                    &mut b_v,
+                    &eq_lo,
+                    pair_idx_base,
+                    mask,
+                    useful,
+                    None,
+                )
+            };
+            assert_eq!(a_s, a_v, "a chunk lo_size={lo_size} base={base_blocks}");
+            assert_eq!(b_s, b_v, "b chunk lo_size={lo_size} base={base_blocks}");
+            assert_eq!(out_s, out_v, "sums lo_size={lo_size} base={base_blocks}");
+
+            // Same inputs through the no-store arm and the hoisted w table.
+            let wtab_test = build_w_pair_table(&eq_lo);
+            let mut a_e: Vec<F128> = Vec::new();
+            let mut b_e: Vec<F128> = Vec::new();
+            // SAFETY: as above; WRITE=false ignores the (empty) chunks.
+            let out_n = unsafe {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut a_e,
+                    &mut b_e,
+                    &eq_lo,
+                    pair_idx_base,
+                    mask,
+                    useful,
+                    Some(&wtab_test),
+                )
+            };
+            assert_eq!(
+                out_s, out_n,
+                "wtab sums lo_size={lo_size} base={base_blocks}"
+            );
+            let hits = kernels::x86_64::B_ONES_HITS.load(Ordering::Relaxed) - before;
+            let sparse_hits =
+                kernels::x86_64::B_SPARSE_HITS.load(Ordering::Relaxed) - sparse_before;
+            if degenerate {
+                assert!(
+                    hits >= 2,
+                    "window never fired (lo_size={lo_size} base={base_blocks}, hits={hits})"
+                );
+                assert!(
+                    sparse_hits >= 2 || lo_size < 128,
+                    "sparse window never fired (lo_size={lo_size} base={base_blocks}, hits={sparse_hits})"
+                );
+            } else {
+                assert_eq!(hits, 0, "window fired on a non-degenerate witness");
+                assert_eq!(
+                    sparse_hits, 0,
+                    "sparse window fired on a non-degenerate witness"
+                );
+            }
         }
     }
 
