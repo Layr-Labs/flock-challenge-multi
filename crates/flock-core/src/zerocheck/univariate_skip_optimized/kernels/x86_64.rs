@@ -398,15 +398,43 @@ unsafe fn horner_2img_offw(
         let apply = |o: *const u16| {
             crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
         };
-        let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
-        for k in (0..7usize).rev() {
-            let av = apply(op.add(k * 8));
-            let bv = apply(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        // Flattened form of the same sum: Σ_k x^k·(a_k·b_k) with the eight
+        // x^k = 2^k (k ≤ 7) as byte constants, so every product and every
+        // scaling is independent and the seven-deep serial `vgf2p8mulb`
+        // accumulator chain becomes a two-level product/scale layer plus a
+        // three-deep XOR tree. Same multiply count (8 products + 7 scalings;
+        // x^0 = 1 needs none); GF(2^8) multiplication distributes over XOR
+        // and is associative/commutative, so the value is bit-identical to
+        // the Horner form.
+        let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
+        let mut t = [core::mem::MaybeUninit::<__m512i>::uninit(); 7];
+        macro_rules! scaled {
+            ($k:literal) => {{
+                let av = apply(op.add($k * 8));
+                let bv = apply(op.add(64 + $k * 8));
+                let product = _mm512_gf2p8mul_epi8(av, bv);
+                t[$k - 1].write(_mm512_gf2p8mul_epi8(
+                    product,
+                    _mm512_set1_epi8((1u8 << $k) as i8),
+                ));
+            }};
         }
-        acc
+        scaled!(1);
+        scaled!(2);
+        scaled!(3);
+        scaled!(4);
+        scaled!(5);
+        scaled!(6);
+        scaled!(7);
+        let t = core::mem::transmute::<_, [__m512i; 7]>(t);
+        let s01 = _mm512_xor_si512(p0, t[0]);
+        let s23 = _mm512_xor_si512(t[1], t[2]);
+        let s45 = _mm512_xor_si512(t[3], t[4]);
+        let s67 = _mm512_xor_si512(t[5], t[6]);
+        _mm512_xor_si512(
+            _mm512_xor_si512(s01, s23),
+            _mm512_xor_si512(s45, s67),
+        )
     }
 }
 
@@ -433,15 +461,38 @@ unsafe fn horner_2img_off_narrow(
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         let apply = |o: *const u16| inv_table.apply_x86_avx512_register_2img_off_unchecked(o);
-        let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
-        for k in (0..7usize).rev() {
-            let av = apply(op.add(k * 8));
-            let bv = apply(op.add(64 + k * 8));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        // Flattened form, mirroring `horner_2img_offw`: independent products
+        // scaled by the constant powers x^k = 2^k and XOR-reduced as a tree.
+        // Bit-identical by GF(2^8) distributivity/associativity.
+        let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
+        let mut t = [core::mem::MaybeUninit::<__m512i>::uninit(); 7];
+        macro_rules! scaled_n {
+            ($k:literal) => {{
+                let av = apply(op.add($k * 8));
+                let bv = apply(op.add(64 + $k * 8));
+                let product = _mm512_gf2p8mul_epi8(av, bv);
+                t[$k - 1].write(_mm512_gf2p8mul_epi8(
+                    product,
+                    _mm512_set1_epi8((1u8 << $k) as i8),
+                ));
+            }};
         }
-        acc
+        scaled_n!(1);
+        scaled_n!(2);
+        scaled_n!(3);
+        scaled_n!(4);
+        scaled_n!(5);
+        scaled_n!(6);
+        scaled_n!(7);
+        let t = core::mem::transmute::<_, [__m512i; 7]>(t);
+        let s01 = _mm512_xor_si512(p0, t[0]);
+        let s23 = _mm512_xor_si512(t[1], t[2]);
+        let s45 = _mm512_xor_si512(t[3], t[4]);
+        let s67 = _mm512_xor_si512(t[5], t[6]);
+        _mm512_xor_si512(
+            _mm512_xor_si512(s01, s23),
+            _mm512_xor_si512(s45, s67),
+        )
     }
 }
 
@@ -628,7 +679,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -638,6 +689,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
@@ -648,7 +700,11 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_ab = ghash_mul_x4_split(
+                f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]),
+                eq,
+                eq_x64,
+            );
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
@@ -728,7 +784,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert!(convert.len() >= n_b_med * 256);
@@ -770,6 +826,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
     unsafe {
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_x64 = ghash_shift64_x4(eq);
         for lane_base in (0..ELL).step_by(16) {
             let mut los = [_mm512_setzero_si512(); 2];
             let mut his = [_mm512_setzero_si512(); 2];
@@ -808,8 +865,8 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             }
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
-                let scaled0 = ghash_mul_x4(aos0, eq);
-                let scaled1 = ghash_mul_x4(aos1, eq);
+                let scaled0 = ghash_mul_x4_split(aos0, eq, eq_x64);
+                let scaled1 = ghash_mul_x4_split(aos1, eq, eq_x64);
                 let partial_ptr =
                     partial_ab.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                 _mm512_storeu_si512(
