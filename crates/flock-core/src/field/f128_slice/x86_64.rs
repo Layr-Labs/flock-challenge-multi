@@ -414,15 +414,38 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
         let r_x64 = ghash_shift64_x4(r_bcast);
         let lanes = lo.len() & !3;
         let mut i = 0usize;
-        while i < lanes {
-            let a = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
-            let b = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);
+        if super::bind_split_pipe_enabled() && lanes >= 8 {
+            let mut a = _mm512_loadu_si512(lo.as_ptr() as *const __m512i);
+            let mut b = _mm512_loadu_si512(hi.as_ptr() as *const __m512i);
+            while i + 8 <= lanes {
+                let na = _mm512_loadu_si512(lo.as_ptr().add(i + 4) as *const __m512i);
+                let nb = _mm512_loadu_si512(hi.as_ptr().add(i + 4) as *const __m512i);
+                let new = _mm512_xor_si512(
+                    a,
+                    ghash_mul_x4_split(_mm512_xor_si512(a, b), r_bcast, r_x64),
+                );
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new);
+                a = na;
+                b = nb;
+                i += 4;
+            }
             let new = _mm512_xor_si512(
                 a,
                 ghash_mul_x4_split(_mm512_xor_si512(a, b), r_bcast, r_x64),
             );
             _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new);
             i += 4;
+        } else {
+            while i < lanes {
+                let a = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+                let b = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);
+                let new = _mm512_xor_si512(
+                    a,
+                    ghash_mul_x4_split(_mm512_xor_si512(a, b), r_bcast, r_x64),
+                );
+                _mm512_storeu_si512(lo.as_mut_ptr().add(i) as *mut __m512i, new);
+                i += 4;
+            }
         }
         while i < lo.len() {
             lo[i] = lo[i] + r * (hi[i] + lo[i]);

@@ -470,6 +470,15 @@ mod tests {
             for i in 0..n {
                 assert_eq!(got[i], lo0[i] + r * (hi[i] + lo0[i]), "bind n={n} i={i}");
             }
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                let mut serial = lo0.clone();
+                super::BIND_SPLIT_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                bind_split_half(&mut serial, &hi, r);
+                super::BIND_SPLIT_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(got, serial, "bind pipe vs serial n={n}");
+            }
             // msg_split_half
             let (chi, clo, zhi, zlo) = (draw(n), draw(n), draw(n), draw(n));
             let (e1, einf) = msg_split_half(&chi, &clo, &zhi, &zlo, n);
@@ -747,6 +756,36 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             *value = v;
         }
     }
+}
+
+/// Test latch so the bind-pipe oracle can drive both arms without mutating
+/// env. Ranked `env_clear()` never sets this.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static BIND_SPLIT_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default software-pipelines `bind_split_half`'s 4-wide loads:
+/// preload the next 4 lo/hi while `ghash_mul_x4_split` of the current
+/// group covers CLMUL latency. `FLOCK_NO_F128_BIND_PIPE=1` restores the
+/// serial loop. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn bind_split_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if BIND_SPLIT_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F128_BIND_PIPE").is_none());
+    *ON
 }
 
 /// Bind one top-bit split in place: `lo[i] = lo[i] + r·(hi[i] + lo[i])`.
