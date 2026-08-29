@@ -1566,6 +1566,176 @@ fn write_aligned_lin_words(
     }
 }
 
+// ---------------------------------------------------------------------------
+// B-side speed-format feasibility oracle.
+//
+// A G contributes only six non-constant B operands: the 31 low bits of the
+// right-hand carry-row operand for each ADD.  Its two lin-id words use B = 1,
+// as do the block prefix and out_hi rows; padding uses B = 0.  Store each
+// six variable operands consecutively, LSB-first, at bit offsets
+// 0,31,62,93,124,155. Bits 186..192 are canonical zero. The resulting format
+// is exactly 24 bytes/G and can reconstruct the full dense 2-KiB B block
+// without consulting A, Z, or the Compression input again.
+//
+// This is deliberately an oracle only.  The ranked witness producer and
+// zerocheck consumers continue to use the incumbent dense representation.
+// ---------------------------------------------------------------------------
+
+const B_SPEED_BITS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
+const B_SPEED_BYTES_PER_G: usize = B_SPEED_BITS_PER_G.div_ceil(8);
+pub(crate) const B_SIDE_BYTES_PER_BLOCK: usize = N_G * B_SPEED_BYTES_PER_G;
+const B_SPEED_TAIL_MASK: u8 = u8::MAX << (B_SPEED_BITS_PER_G % 8);
+const B_DENSE_BYTES_PER_BLOCK: usize = K / 8;
+const B_LOW31_MASK: u32 = (1u32 << CARRY_BITS_PER_ADD) - 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BSideSpeedBlock([[u8; B_SPEED_BYTES_PER_G]; N_G]);
+
+const _: () = assert!(B_SIDE_BYTES_PER_BLOCK == 1344);
+
+impl BSideSpeedBlock {
+    #[inline(always)]
+    fn put_rhs(&mut self, g: usize, add: usize, rhs: u32) {
+        debug_assert!(g < N_G && add < ADDS_PER_G);
+        let rhs = rhs & B_LOW31_MASK;
+        let off = add * CARRY_BITS_PER_ADD;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            let dst_bit = off + bit;
+            let mask = 1u8 << (dst_bit & 7);
+            let byte = &mut self.0[g][dst_bit >> 3];
+            *byte = (*byte & !mask) | ((((rhs >> bit) & 1) as u8) << (dst_bit & 7));
+        }
+    }
+
+    #[inline(always)]
+    fn rhs(&self, g: usize, add: usize) -> u32 {
+        debug_assert!(g < N_G && add < ADDS_PER_G);
+        let off = add * CARRY_BITS_PER_ADD;
+        let mut rhs = 0u32;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            let src_bit = off + bit;
+            rhs |= (((self.0[g][src_bit >> 3] >> (src_bit & 7)) & 1) as u32) << bit;
+        }
+        rhs
+    }
+
+    #[inline(always)]
+    fn has_canonical_tail(&self, g: usize) -> bool {
+        debug_assert!(g < N_G);
+        self.0[g][B_SPEED_BYTES_PER_G - 1] & B_SPEED_TAIL_MASK == 0
+    }
+}
+
+/// Encode the six low-31 B carry-row operands emitted by each G in the same
+/// scalar state evolution used by [`build_block_witness_ab_packed_into`].
+fn encode_b_side_speed_block(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> BSideSpeedBlock {
+    let mut encoded = BSideSpeedBlock([[0u8; B_SPEED_BYTES_PER_G]; N_G]);
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter as u32,
+        (counter >> 32) as u32,
+        block_len,
+        flags,
+    ];
+    let msg_idx = per_round_msg_idx();
+
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let a = state[la];
+            let b = state[lb];
+            let c = state[lc];
+            let d = state[ld];
+
+            let mut add = 0;
+            let mut push_add = |x: u32, y: u32| {
+                let (sum, _left, right, _carry) = add_carry_parts(x, y);
+                encoded.put_rhs(g, add, right);
+                add += 1;
+                sum
+            };
+
+            let tmp_0 = push_add(a, b);
+            let a_1 = push_add(tmp_0, m[mx_i]);
+            let d_1 = (d ^ a_1).rotate_right(16);
+            let c_1 = push_add(c, d_1);
+            let b_1 = (b ^ c_1).rotate_right(12);
+            let tmp_1 = push_add(a_1, b_1);
+            let a_2 = push_add(tmp_1, m[my_i]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = push_add(c_1, d_2);
+            debug_assert_eq!(add, ADDS_PER_G);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_2;
+        }
+    }
+
+    encoded
+}
+
+#[inline]
+fn b_side_set_ones(dst: &mut [u8; B_DENSE_BYTES_PER_BLOCK], start: usize, end: usize) {
+    debug_assert!(start <= end && end <= K);
+    for bit in start..end {
+        dst[bit >> 3] |= 1 << (bit & 7);
+    }
+}
+
+#[inline(always)]
+fn b_side_write_low31(dst: &mut [u8; B_DENSE_BYTES_PER_BLOCK], bit_off: usize, value: u32) {
+    debug_assert_eq!(value & !B_LOW31_MASK, 0);
+    for bit in 0..CARRY_BITS_PER_ADD {
+        dst[(bit_off + bit) >> 3] |= (((value >> bit) & 1) as u8) << ((bit_off + bit) & 7);
+    }
+}
+
+/// Expand the speed format into the exact canonical dense B block.
+fn expand_b_side_speed_block(encoded: &BSideSpeedBlock) -> [u8; B_DENSE_BYTES_PER_BLOCK] {
+    let mut dense = [0u8; B_DENSE_BYTES_PER_BLOCK];
+
+    // CV, out_lo, constant, message, counter, block_len, and flags are all
+    // lin/input rows, hence B = 1 through the first G boundary.
+    b_side_set_ones(&mut dense, 0, GS_BASE);
+    for g in 0..N_G {
+        debug_assert!(encoded.has_canonical_tail(g));
+        let g_base = GS_BASE + g * G_STRIDE;
+        for add in 0..ADDS_PER_G {
+            b_side_write_low31(
+                &mut dense,
+                g_base + add * CARRY_BITS_PER_ADD,
+                encoded.rhs(g, add),
+            );
+        }
+        let lin_base = g_base + ADDS_PER_G * CARRY_BITS_PER_ADD;
+        b_side_set_ones(&mut dense, lin_base, lin_base + LIN_WORDS_PER_G * WORD_BITS);
+    }
+    b_side_set_ones(&mut dense, OUT_HI_BASE, USEFUL_BITS);
+    dense
+}
+
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
 /// of the F128-packed per-block storage. Every destination word is overwritten;
 /// prior buffer contents are ignored.
@@ -1796,6 +1966,94 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Ranked Sapphire-Rapids witness route with PACKED186 as B's sole
+/// persistent representation. The rolling B ring in the octa producer still
+/// exists long enough to derive Z and the complete round-one AB projection;
+/// it is never drained into a dense witness allocation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn generate_ranked_witness_with_b_sidecar(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const B_SIDE_F128_PER_BLOCK: usize = B_SIDE_BYTES_PER_BLOCK / core::mem::size_of::<F128>();
+    const {
+        assert!(B_SIDE_BYTES_PER_BLOCK.is_multiple_of(core::mem::size_of::<F128>()));
+        assert!(B_SIDE_F128_PER_BLOCK == 84);
+    }
+
+    // This exact geometry is the only one whose consumer descriptors and
+    // block/quadrant mapping are admitted. Any drift fails before allocation.
+    assert_eq!(n_blocks_log, 18, "B sidecar is ranked m=32 only");
+    assert_eq!(K_LOG, 14);
+    let n_total = 1usize << n_blocks_log;
+    assert!(blocks.len() <= n_total);
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let mut b_sidecar = flock_core::scratch::take_f128(n_total * B_SIDE_F128_PER_BLOCK);
+    let mut ab_inner =
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        );
+    // No dense B survives the octa. Therefore round one must be fully
+    // materialized by the producer; a deferred GPU prefix would have no
+    // canonical operand to reconstruct from and is rejected atomically.
+    let skip_bytes =
+        flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        );
+    assert_eq!(skip_bytes, 0, "B sidecar forbids a deferred round1 prefix");
+    ab_inner.set_invalid_prefix_bytes(0);
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l =
+        flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let elide_on = witgen_simd::const_elide_enabled();
+    generate_round1_inner_octa(
+        blocks,
+        0,
+        &mut z,
+        &mut a,
+        &mut [],
+        &mut b_sidecar,
+        &mut ab_inner,
+        &inv_table,
+        &padding,
+        [z_tok && elide_on, a_tok && elide_on, true],
+        true,
+    );
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    (z, a, b_sidecar, ab_inner)
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -1948,6 +2206,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut z,
             &mut a,
             &mut b,
+            &mut [],
             &mut ab_inner,
             &inv_table,
             &padding,
@@ -2148,6 +2407,7 @@ fn generate_round1_inner_octa(
     z: &mut [F128],
     a: &mut [F128],
     b: &mut [F128],
+    b_sidecar: &mut [F128],
     ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
     inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
     padding: &Compression,
@@ -2166,6 +2426,16 @@ fn generate_round1_inner_octa(
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
     let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let sidecar_mode = !b_sidecar.is_empty();
+    assert_eq!(a.len(), z.len());
+    assert_eq!(b.is_empty(), sidecar_mode);
+    if sidecar_mode {
+        assert_eq!(
+            b_sidecar.len() * core::mem::size_of::<F128>(),
+            (z.len() / F128_PER_BLOCK) * B_SIDE_BYTES_PER_BLOCK
+        );
+        assert!(skip_blocks == 0, "B sidecar requires a fully emitted round1_inner");
+    }
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
 
@@ -2185,9 +2455,10 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
+    let a_addr = a.as_mut_ptr() as usize;
+    let b_addr = b.as_mut_ptr() as usize;
+    let sidecar_addr = b_sidecar.as_mut_ptr() as usize;
     z.par_chunks_mut(group_f128)
-        .zip(a.par_chunks_mut(group_f128))
-        .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
@@ -2214,8 +2485,25 @@ fn generate_round1_inner_octa(
                 }
                 v
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+            |win, (g, (z_out, ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
+                let base_f128 = g * group_f128;
+                let a_out = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (a_addr as *mut F128).add(base_f128),
+                        z_out.len(),
+                    )
+                };
+                let b_out = if sidecar_mode {
+                    &mut [][..]
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (b_addr as *mut F128).add(base_f128),
+                            z_out.len(),
+                        )
+                    }
+                };
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
@@ -2289,7 +2577,17 @@ fn generate_round1_inner_octa(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            if sidecar_mode {
+                                a_out.as_mut_ptr().add(off).cast::<u32>()
+                            } else {
+                                b_out.as_mut_ptr().add(off).cast::<u32>()
+                            },
+                            if sidecar_mode {
+                                (sidecar_addr as *mut u8)
+                                    .add((GROUP * g + half * SIMD) * B_SIDE_BYTES_PER_BLOCK)
+                            } else {
+                                core::ptr::null_mut()
+                            },
                             proj,
                             elide,
                         );
@@ -3752,6 +4050,48 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx2",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                {
+                    if self.r1cs.m == 32
+                        && self.r1cs.k_log == 14
+                        && self.r1cs.useful_bits == USEFUL_BITS
+                    {
+                    let (codeword, (z_packed, a_packed_f128, b_sidecar, ab_inner)) =
+                        crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                            flock_core::gaptime::mark("witness: pool entered");
+                            let r =
+                                flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                                    generate_ranked_witness_with_b_sidecar(
+                                        blocks,
+                                        self.n_blocks_log(),
+                                    )
+                                });
+                            flock_core::gaptime::mark("witness: work done (incl. prefault)");
+                            r
+                        });
+                    flock_core::gaptime::mark("witness: pool exited");
+                    let lc_circuit = self.lincheck_circuit();
+                    flock_core::gaptime::mark("lc_circuit built");
+                    return crate::prover::prove_fast_ligerito_from_block_major_witness_with_b_sidecar(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_sidecar,
+                        ab_inner,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    );
+                    }
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -4261,6 +4601,174 @@ mod tests {
         }
     }
 
+    fn incumbent_dense_b(block: &Compression) -> [u8; B_DENSE_BYTES_PER_BLOCK] {
+        let (cv, m, counter, block_len, flags) = block;
+        let mut z = vec![0u64; K / 64];
+        let mut a = vec![0u64; K / 64];
+        let mut b = vec![0u64; K / 64];
+        build_block_witness_ab_packed_into(
+            cv, m, *counter, *block_len, *flags, &mut z, &mut a, &mut b,
+        );
+        let mut bytes = [0u8; B_DENSE_BYTES_PER_BLOCK];
+        for (dst, word) in bytes.chunks_exact_mut(8).zip(b) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn speed_encode(block: &Compression) -> BSideSpeedBlock {
+        let (cv, m, counter, block_len, flags) = block;
+        encode_b_side_speed_block(cv, m, *counter, *block_len, *flags)
+    }
+
+    #[inline]
+    fn dense_b_bit(bytes: &[u8; B_DENSE_BYTES_PER_BLOCK], bit: usize) -> u32 {
+        ((bytes[bit >> 3] >> (bit & 7)) & 1) as u32
+    }
+
+    fn dense_b_low31(bytes: &[u8; B_DENSE_BYTES_PER_BLOCK], bit_off: usize) -> u32 {
+        let mut value = 0u32;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            value |= dense_b_bit(bytes, bit_off + bit) << bit;
+        }
+        value
+    }
+
+    #[test]
+    fn b_side_speed_format_randomized_matches_dense_b_byte_for_byte() {
+        assert_eq!(
+            std::mem::size_of::<BSideSpeedBlock>(),
+            N_G * B_SPEED_BYTES_PER_G,
+            "the canonical format must remain exactly 24 bytes/G"
+        );
+        let mut rng = Rng::new(0xB51D_E5E5_CAFE_0001);
+        for case in 0..32 {
+            let block: Compression = (
+                std::array::from_fn(|_| rng.next_u32()),
+                std::array::from_fn(|_| rng.next_u32()),
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                rng.next_u32(),
+                rng.next_u32(),
+            );
+            let encoded = speed_encode(&block);
+            let incumbent = incumbent_dense_b(&block);
+            for (g, operands) in encoded.0.iter().enumerate() {
+                assert_eq!(
+                    operands[B_SPEED_BYTES_PER_G - 1] & B_SPEED_TAIL_MASK,
+                    0,
+                    "non-canonical tail bits at case={case}, g={g}"
+                );
+                for add in 0..ADDS_PER_G {
+                    assert_eq!(
+                        encoded.rhs(g, add),
+                        dense_b_low31(
+                            &incumbent,
+                            GS_BASE + g * G_STRIDE + add * CARRY_BITS_PER_ADD
+                        ),
+                        "packed field roundtrip at case={case}, g={g}, add={add}"
+                    );
+                }
+            }
+            assert_eq!(
+                expand_b_side_speed_block(&encoded),
+                incumbent,
+                "dense B mismatch at randomized case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn b_side_speed_format_has_the_expected_physical_bit_order() {
+        let mut encoded = BSideSpeedBlock([[0u8; B_SPEED_BYTES_PER_G]; N_G]);
+        for add in 0..ADDS_PER_G {
+            encoded.put_rhs(0, add, 1);
+        }
+
+        let mut expected = [0u8; B_SPEED_BYTES_PER_G];
+        expected[0] = 0x01; // bit 0
+        expected[3] = 0x80; // bit 31
+        expected[7] = 0x40; // bit 62
+        expected[11] = 0x20; // bit 93
+        expected[15] = 0x10; // bit 124
+        expected[19] = 0x08; // bit 155
+        assert_eq!(encoded.0[0], expected);
+        assert!(encoded.has_canonical_tail(0));
+    }
+
+    #[test]
+    fn b_side_speed_format_zero_padding_compression_matches_dense_b() {
+        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+        let encoded = speed_encode(&padding);
+        assert_eq!(
+            expand_b_side_speed_block(&encoded),
+            incumbent_dense_b(&padding)
+        );
+    }
+
+    #[test]
+    fn b_side_speed_expansion_covers_every_layout_boundary_and_g_seam() {
+        let mut rng = Rng::new(0xB0A7_DA7A_5EAA_0001);
+        let block: Compression = (
+            std::array::from_fn(|_| rng.next_u32()),
+            std::array::from_fn(|_| rng.next_u32()),
+            ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            rng.next_u32(),
+            rng.next_u32(),
+        );
+        let encoded = speed_encode(&block);
+        let dense = expand_b_side_speed_block(&encoded);
+        assert_eq!(dense, incumbent_dense_b(&block));
+
+        // Prefix boundary: CV/out_lo and every scalar input row use B = 1.
+        assert!((0..GS_BASE).all(|bit| dense_b_bit(&dense, bit) == 1));
+        assert_eq!(dense_b_bit(&dense, GS_BASE - 1), 1);
+
+        // Every G boundary is checked on both sides: six packed low-31
+        // operands followed by the 64 fixed-one lin-id bits.  The next G
+        // starts immediately after that fixed suffix, including unaligned
+        // byte/u64 seams.
+        for g in 0..N_G {
+            let g_base = GS_BASE + g * G_STRIDE;
+            for add in 0..ADDS_PER_G {
+                let rhs = encoded.rhs(g, add);
+                let bit_base = g_base + add * CARRY_BITS_PER_ADD;
+                for bit in 0..CARRY_BITS_PER_ADD {
+                    assert_eq!(
+                        dense_b_bit(&dense, bit_base + bit),
+                        (rhs >> bit) & 1,
+                        "g={g}, add={add}, bit={bit}"
+                    );
+                }
+            }
+            let lin_base = g_base + ADDS_PER_G * CARRY_BITS_PER_ADD;
+            assert!(
+                (lin_base..lin_base + LIN_WORDS_PER_G * WORD_BITS)
+                    .all(|bit| dense_b_bit(&dense, bit) == 1)
+            );
+            assert_eq!(lin_base + LIN_WORDS_PER_G * WORD_BITS, g_base + G_STRIDE);
+            if g + 1 < N_G {
+                assert_eq!(g_base + G_STRIDE, GS_BASE + (g + 1) * G_STRIDE);
+                assert_eq!(
+                    dense_b_bit(&dense, g_base + G_STRIDE),
+                    encoded.rhs(g + 1, 0) & 1,
+                    "G seam {g}->{next}",
+                    next = g + 1
+                );
+            }
+        }
+        assert_eq!(GS_BASE + N_G * G_STRIDE, OUT_HI_BASE);
+
+        // out_hi is fixed B = 1.  USEFUL_BITS lands 49 bits into u64 row
+        // 240, so that row is the final mixed one/zero word and row 241+
+        // must be pure padding zero.
+        assert!((OUT_HI_BASE..USEFUL_BITS).all(|bit| dense_b_bit(&dense, bit) == 1));
+        let row_240 = u64::from_le_bytes(dense[240 * 8..241 * 8].try_into().unwrap());
+        assert_eq!(USEFUL_BITS - 240 * 64, 49);
+        assert_eq!(row_240, (1u64 << 49) - 1);
+        assert!(dense[241 * 8..].iter().all(|&byte| byte == 0));
+        assert!((USEFUL_BITS..K).all(|bit| dense_b_bit(&dense, bit) == 0));
+    }
+
     /// BLAKE3 chunk flags (subset).
     const CHUNK_START: u32 = 1 << 0;
     const CHUNK_END: u32 = 1 << 1;
@@ -4701,6 +5209,7 @@ mod tests {
                     &mut z,
                     &mut a,
                     &mut b,
+                    &mut [],
                     &mut ab_inner,
                     &inv_table,
                     &padding,
