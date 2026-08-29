@@ -1149,6 +1149,29 @@ fn lc_gather_tr_enabled() -> bool {
     *ON
 }
 
+/// Test latch so the plane-elide oracle can drive both arms without mutating
+/// env. Ranked `env_clear()` never sets this.
+#[cfg(test)]
+static LC_PLANE_ELIDE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default transposes each GFNI worker's byte planes to F128 in the
+/// producer, then XOR-reduces F128 partials. That deletes the second Rayon
+/// pass's cross-worker gather of 1024-byte plane blocks (poor locality)
+/// plus its in-reduce transpose. `FLOCK_NO_LC_PLANE_ELIDE=1` restores the
+/// shared-plane reduce. Default ON. Inactive workers stay algebraic zero,
+/// so XOR-including them is bit-identical to skipping them.
+#[allow(dead_code)] // Consumed only by the ranked AVX-512 GFNI route.
+fn lc_plane_elide_enabled() -> bool {
+    #[cfg(test)]
+    if LC_PLANE_ELIDE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_ELIDE").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LINCHECK_GT_FUSE=1` restores the two-instruction
 /// gather/transpose composition (`VPERMT2Q` lo/hi split plus `VPERMB` byte
 /// transpose). The default uses one `VPERMT2B` per limb with the static
@@ -1437,9 +1460,21 @@ unsafe fn reduce_worker_plane_block(
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
     }
-    // The plane rows are contiguous, while the old per-column loop made 16
-    // strided byte loads for every F128. Transpose eight 8-byte groups with
-    // GPR delta-swaps so every load is a contiguous u64.
+    transpose_plane_block_to_f128(&acc, out);
+}
+
+/// One 16×64-byte GFNI plane block → 64 F128. Plane row `byte_k` is
+/// 64 contiguous bytes; column `c` is the F128 whose byte `k` is
+/// `row[k][c]`. Eight 8-byte GPR transposes, same as the in-reduce
+/// leaf the kill switch still uses.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn transpose_plane_block_to_f128(acc: &[u8], out: &mut [F128]) {
+    debug_assert_eq!(acc.len(), 1024);
+    debug_assert_eq!(out.len(), 64);
     for group in 0..8 {
         let mut lo_rows = [0u64; 8];
         let mut hi_rows = [0u64; 8];
@@ -1456,6 +1491,55 @@ unsafe fn reduce_worker_plane_block(
                 lo: lo_cols[col],
                 hi: hi_cols[col],
             };
+        }
+    }
+}
+
+/// Producer-side: one worker's stored live plane blocks → F128 partial,
+/// with the optional top-bind fused in so the partial is already length
+/// `k/2`. Padding blocks stay algebraic zero (the `local` chunk is
+/// pre-zeroed).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn worker_planes_to_f128(
+    wplanes: &[core::mem::MaybeUninit<u8>],
+    local: &mut [F128],
+    k: usize,
+    live_blocks: usize,
+    top_bind: Option<F128>,
+) {
+    debug_assert_eq!(wplanes.len(), k * 16);
+    // SAFETY: this worker stored every `blk < live_blocks` from a
+    // `seed_zero=true` first tile; padding is not read.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(wplanes.as_ptr().cast::<u8>(), wplanes.len()) };
+    if let Some(r) = top_bind {
+        debug_assert_eq!(local.len(), k / 2);
+        let n_low = local.len() / 64;
+        for blk in 0..n_low {
+            if blk < live_blocks {
+                transpose_plane_block_to_f128(
+                    &bytes[blk * 1024..blk * 1024 + 1024],
+                    &mut local[blk * 64..blk * 64 + 64],
+                );
+            }
+            let mut hi = [F128::ZERO; 64];
+            let hi_blk = blk + k / 128;
+            if hi_blk < live_blocks {
+                transpose_plane_block_to_f128(&bytes[hi_blk * 1024..hi_blk * 1024 + 1024], &mut hi);
+            }
+            crate::field::f128_slice::bind_split_half(&mut local[blk * 64..blk * 64 + 64], &hi, r);
+        }
+    } else {
+        debug_assert_eq!(local.len(), k);
+        for blk in 0..live_blocks {
+            transpose_plane_block_to_f128(
+                &bytes[blk * 1024..blk * 1024 + 1024],
+                &mut local[blk * 64..blk * 64 + 64],
+            );
         }
     }
 }
@@ -1490,11 +1574,16 @@ fn fold_block_major_gfni(
     // subranges are initialized; it is never reinterpreted wholesale as u8.
     let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * k * 16);
     let mut active = vec![0u8; n_workers];
+    let live_blocks = useful_bits.div_ceil(64);
+    let out_len = if top_bind.is_some() { k / 2 } else { k };
+    let elide = lc_plane_elide_enabled();
+    let mut partials = vec![F128::ZERO; n_workers * out_len];
     planes
         .par_chunks_mut(k * 16)
+        .zip(partials.par_chunks_mut(out_len))
         .zip(active.par_iter_mut())
         .enumerate()
-        .for_each(|(worker, (wplanes, worker_active))| {
+        .for_each(|(worker, ((wplanes, local), worker_active))| {
             let tile_lo = worker * tiles_per_worker;
             let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
             let (mut claim_lo, mut claim_hi) = if dynamic {
@@ -1700,7 +1789,32 @@ fn fold_block_major_gfni(
             // true `first_tile` means dynamic claiming assigned it no work,
             // so none of its uninitialized plane bytes may enter reduction.
             *worker_active = u8::from(!first_tile);
+            if elide && *worker_active != 0 {
+                worker_planes_to_f128(wplanes, local, k, live_blocks, top_bind);
+            }
         });
+
+    if elide {
+        // Inactive workers left `local` as algebraic zero, so XOR-including
+        // them equals skipping them. Worker 0 first, then 1..n — same
+        // association as the nibble-path single-pass reduce.
+        let mut out = vec![F128::ZERO; out_len];
+        let cols_per_task = out_len.div_ceil(4 * n_workers.max(1)).max(64);
+        out.par_chunks_mut(cols_per_task)
+            .enumerate()
+            .for_each(|(ti, o)| {
+                let base = ti * cols_per_task;
+                let len = o.len();
+                o.copy_from_slice(&partials[base..base + len]);
+                for w in 1..n_workers {
+                    let src = &partials[w * out_len + base..w * out_len + base + len];
+                    for (a, b) in o.iter_mut().zip(src) {
+                        *a += *b;
+                    }
+                }
+            });
+        return out;
+    }
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
     // 64-column blocks (a standalone transpose would be a full-buffer
@@ -1717,8 +1831,6 @@ fn fold_block_major_gfni(
         .enumerate()
         .filter_map(|(worker, active)| (active != 0).then_some(worker))
         .collect();
-    let live_blocks = useful_bits.div_ceil(64);
-    let out_len = if top_bind.is_some() { k / 2 } else { k };
     // Keep output initialized as F128 throughout. The much larger plane
     // buffer carries the dead zero-fill; avoiding this comparatively small
     // clear would require a separate MaybeUninit ownership conversion.
@@ -4066,6 +4178,64 @@ mod tests {
                     "affine(mats, {v}) must equal table[{v}]"
                 );
             }
+        }
+    }
+
+    /// Plane row `byte_k`, column `c` is `acc[byte_k*64 + c]`. The GPR
+    /// 8×8 transpose must rebuild that F128 for every column.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn transpose_plane_block_to_f128_matches_column_bytes() {
+        let mut acc = [0u8; 1024];
+        for (i, slot) in acc.iter_mut().enumerate() {
+            *slot = (i.wrapping_mul(17) + 3) as u8;
+        }
+        let mut got = [F128::ZERO; 64];
+        transpose_plane_block_to_f128(&acc, &mut got);
+        for c in 0..64 {
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for k in 0..8 {
+                lo |= (acc[k * 64 + c] as u64) << (8 * k);
+                hi |= (acc[(k + 8) * 64 + c] as u64) << (8 * k);
+            }
+            assert_eq!(got[c], F128 { lo, hi }, "c={c}");
+        }
+    }
+
+    /// Producer-side plane→F128 elide must match the shared-plane reduce
+    /// (and the sequential one-shot) bit-for-bit, with and without top-bind.
+    #[test]
+    fn plane_elide_matches_byte_reduce_oneshot() {
+        use std::sync::atomic::Ordering;
+        let cases: &[(usize, usize, usize, bool)] = &[
+            (16, 8, 241, false),
+            (16, 8, 241, true),
+            (25, 7, 121, false),
+            (25, 7, 121, true),
+        ];
+        for &(m, k_log, useful_bits, bind) in cases {
+            let mut rng = Rng::new(0xE11D_E000 + (m * 17 + k_log * 3 + useful_bits) as u64);
+            let n_outer = 1usize << (m - k_log);
+            let chunks_per_block = (1usize << k_log) / 128;
+            let z = rng.f128_vec(n_outer * chunks_per_block);
+            let r_outer = rng.f128_vec(m - k_log);
+            let r_top = rng.f128();
+            let run = |off: bool| {
+                LC_PLANE_ELIDE_TEST_OFF.store(off, Ordering::Relaxed);
+                let out = if bind {
+                    fold_block_major_one_shot_bind_top(&z, m, k_log, useful_bits, &r_outer, r_top)
+                } else {
+                    fold_block_major_one_shot(&z, m, k_log, useful_bits, &r_outer)
+                };
+                LC_PLANE_ELIDE_TEST_OFF.store(false, Ordering::Relaxed);
+                out
+            };
+            assert_eq!(run(false), run(true), "m={m} k_log={k_log} bind={bind}");
         }
     }
 
