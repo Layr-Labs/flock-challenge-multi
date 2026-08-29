@@ -114,9 +114,12 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
         && r1cs.m == 32
-        && r1cs.k_log == 14
+        // Tied to the authoritative circuit constants: a future layout change
+        // that moves K_LOG/USEFUL_BITS in blake3.rs must move this gate with
+        // it, not silently disarm identity-C into the 32-bank drain.
+        && r1cs.k_log == crate::r1cs_hashes::blake3::K_LOG
         && r1cs.k_skip == zerocheck::K_SKIP
-        && r1cs.useful_bits == 15_409
+        && r1cs.useful_bits == crate::r1cs_hashes::blake3::USEFUL_BITS
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && c0_is_identity_cached(r1cs)
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
@@ -164,6 +167,39 @@ fn precompute_ab_s_hat_v(
         Some(pcs::ring_switch::s_hat_v_from_z_vec(z_vec, inner_rest_tail))
     } else {
         None
+    }
+}
+
+/// Compile-time rollback for reusing lincheck's first fold as the ranked PCS
+/// fold8 statistic.
+const ZC_LC_FOLD8_REUSE: bool = true;
+
+fn ab_capture_mode(
+    r1cs: &BlockR1cs,
+    captured: &zerocheck::CapturedSHatVC,
+) -> lincheck::ZCaptureMode {
+    if ZC_LC_FOLD8_REUSE
+        && ranked_direct_fold8_precompute_enabled(r1cs, captured)
+        && r1cs.k_log.checked_sub(r1cs.k_skip) == Some(8)
+    {
+        lincheck::ZCaptureMode::RankedFold8Tail
+    } else {
+        lincheck::ZCaptureMode::PreSumcheck
+    }
+}
+
+fn finish_ab_s_hat_v(
+    r1cs: &BlockR1cs,
+    captured: &zerocheck::CapturedSHatVC,
+    z_vec: Vec<F128>,
+    actual: lincheck::ZCaptureMode,
+    inner_rest_tail: &[F128],
+) -> Option<Vec<F128>> {
+    if actual == lincheck::ZCaptureMode::RankedFold8Tail {
+        debug_assert!(ranked_direct_fold8_precompute_enabled(r1cs, captured));
+        Some(z_vec)
+    } else {
+        precompute_ab_s_hat_v(r1cs, captured, &z_vec, inner_rest_tail)
     }
 }
 
@@ -382,7 +418,7 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = lincheck::prove_padded_capture_z_vec_mode(
         &z_packed_lincheck,
         r1cs.m,
         r1cs.k_log,
@@ -390,6 +426,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         r1cs.useful_bits,
         &lc_circuit,
         &x_ab,
+        ab_capture_mode(r1cs, &s_hat_v_c),
         challenger,
     );
 
@@ -403,7 +440,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     };
 
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        finish_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, z_mode, &lc_claim.r_inner_rest[1..]);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -565,17 +602,13 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // ~20 ms open instead of inside the measured publish tail. Tens of µs of
     // work; the fingerprint gate in `proof_io` makes a stale or missing
     // stash fall back to the incumbent full encode, byte-identically.
-    let stash = if crate::proof_io::pre_encode_enabled() {
-        let commitment_c = commitment.clone();
-        let zc_c = zc_proof.clone();
-        let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
-            crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
-        }))
-    } else {
-        None
-    };
+    // Inline, not spawned: the stash is ~tens of µs of work, while the
+    // spawn + three deep proof clones + scheduler round-trip + join cost
+    // ~180-250 µs on the ranked part per the public record (`b723227`'s
+    // family isolation). Same bytes, same fingerprint gate, no thread.
+    if crate::proof_io::pre_encode_enabled() {
+        crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof);
+    }
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -586,11 +619,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &lig_config,
         challenger,
     );
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
-    }
+
     flock_core::gaptime::mark("open: returned");
 
     let proof = R1csProofLigerito {
@@ -830,6 +859,12 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         ),
     );
     let ((commitment, prover_data), ab_inner) = if let Some(ab_inner) = ab_inner {
+        // The NTT's st_fmp and deep SMT splits arm only when this closure
+        // runs OUTSIDE any rayon pool (`current_thread_index() == None`);
+        // `in_commit_phase_pool` is the identity off macOS/aarch64 and the
+        // caller is the seed-pipe OS thread. Moving this call under a
+        // `rayon::join`/`install` would silently disarm both splits.
+        debug_assert!(rayon::current_thread_index().is_none());
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = match prefaulted_codeword {
@@ -936,9 +971,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
-    let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
+            let result = lincheck::prove_padded_capture_z_vec_mode(
                 &z_packed_lincheck,
                 r1cs.m,
                 r1cs.k_log,
@@ -946,6 +981,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 r1cs.useful_bits,
                 lincheck_circuit,
                 &x_ab,
+                ab_capture_mode(r1cs, &s_hat_v_c),
                 challenger,
             );
             // The stripe copy is dead after lincheck. Stripe-based callers
@@ -953,7 +989,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode(
             &z_packed,
             r1cs.m,
             r1cs.k_log,
@@ -961,6 +997,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             r1cs.useful_bits,
             lincheck_circuit,
             &x_ab,
+            ab_capture_mode(r1cs, &s_hat_v_c),
             challenger,
         ),
     };
@@ -980,7 +1017,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        finish_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, z_mode, &lc_claim.r_inner_rest[1..]);
     flock_core::gaptime::mark("s_hat_v_ab built (core exit)");
 
     ProveCore {
@@ -1174,9 +1211,9 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
+            let result = lincheck::prove_padded_capture_z_vec_mode(
                 &z_packed_lincheck,
                 r1cs.m,
                 r1cs.k_log,
@@ -1184,12 +1221,13 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 r1cs.useful_bits,
                 lincheck_circuit,
                 &x_ab,
+                ab_capture_mode(r1cs, &s_hat_v_c),
                 challenger,
             );
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode(
             &z_packed,
             r1cs.m,
             r1cs.k_log,
@@ -1197,6 +1235,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             r1cs.useful_bits,
             lincheck_circuit,
             &x_ab,
+            ab_capture_mode(r1cs, &s_hat_v_c),
             challenger,
         ),
     };
@@ -1209,7 +1248,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        finish_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, z_mode, &lc_claim.r_inner_rest[1..]);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
