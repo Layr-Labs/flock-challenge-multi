@@ -171,6 +171,36 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Test latch so the glue-pipe oracle can drive both arms without mutating
+/// env. Ranked `env_clear()` never sets this.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static GLUE_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default software-pipelines `fold_pairs_with_scaled_addend`'s
+/// 4-wide loads: preload the next src/addend pair-groups while the current
+/// group's three `ghash_mul_x4_split` cover CLMUL latency.
+/// `FLOCK_NO_F128_GLUE_PIPE=1` restores the serial loop. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn glue_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if GLUE_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F128_GLUE_PIPE").is_none());
+    *ON
+}
+
 /// Fold adjacent pairs from `src` and `addend` at `r`, add the scaled folded
 /// addend, and write the result without materializing either intermediate:
 /// `dst[t] = fold_r(src)[j] + scale * fold_r(addend)[j]`, where
@@ -653,9 +683,18 @@ mod tests {
             add_scaled(&mut glued, &addend, scale);
             let mut want = initial.clone();
             fold_pairs(&glued, base, &mut want, r);
-            let mut got = initial;
+            let mut got = initial.clone();
             fold_pairs_with_scaled_addend(&src, &addend, base, &mut got, r, scale);
             assert_eq!(got, want, "base={base} n={n}");
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                let mut serial = initial;
+                super::GLUE_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                fold_pairs_with_scaled_addend(&src, &addend, base, &mut serial, r, scale);
+                super::GLUE_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(got, serial, "glue pipe vs serial base={base} n={n}");
+            }
         }
     }
 

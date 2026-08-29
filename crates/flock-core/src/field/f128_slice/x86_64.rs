@@ -87,30 +87,61 @@ pub(super) unsafe fn fold_pairs_with_scaled_addend(
         let scale_x64 = ghash_shift64_x4(scale_x4);
         let lanes = dst.len() & !3;
         let mut t = 0usize;
-        while t < lanes {
-            let index = 2 * (base + t);
-            let src_lo = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
-            let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
-            let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
-            let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
-            let src_folded = _mm512_xor_si512(
-                src_even,
-                ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
-            );
-            let addend_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
-            let addend_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
-            let addend_even = _mm512_shuffle_i32x4::<0x88>(addend_lo, addend_hi);
-            let addend_odd = _mm512_shuffle_i32x4::<0xDD>(addend_lo, addend_hi);
-            let addend_folded = _mm512_xor_si512(
-                addend_even,
-                ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
-            );
-            let output = _mm512_xor_si512(
-                src_folded,
-                ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
-            );
+        let glue_group = |src_lo: __m512i, src_hi: __m512i, add_lo: __m512i, add_hi: __m512i| {
+            // Closures do not inherit `unsafe` from the enclosing 2024 body.
+            unsafe {
+                let src_even = _mm512_shuffle_i32x4::<0x88>(src_lo, src_hi);
+                let src_odd = _mm512_shuffle_i32x4::<0xDD>(src_lo, src_hi);
+                let src_folded = _mm512_xor_si512(
+                    src_even,
+                    ghash_mul_x4_split(_mm512_xor_si512(src_even, src_odd), r_x4, r_x64),
+                );
+                let addend_even = _mm512_shuffle_i32x4::<0x88>(add_lo, add_hi);
+                let addend_odd = _mm512_shuffle_i32x4::<0xDD>(add_lo, add_hi);
+                let addend_folded = _mm512_xor_si512(
+                    addend_even,
+                    ghash_mul_x4_split(_mm512_xor_si512(addend_even, addend_odd), r_x4, r_x64),
+                );
+                _mm512_xor_si512(
+                    src_folded,
+                    ghash_mul_x4_split(addend_folded, scale_x4, scale_x64),
+                )
+            }
+        };
+        if super::glue_pipe_enabled() && lanes >= 8 {
+            let mut src_lo = _mm512_loadu_si512(src.as_ptr().add(2 * base) as *const __m512i);
+            let mut src_hi = _mm512_loadu_si512(src.as_ptr().add(2 * base + 4) as *const __m512i);
+            let mut add_lo = _mm512_loadu_si512(addend.as_ptr().add(2 * base) as *const __m512i);
+            let mut add_hi =
+                _mm512_loadu_si512(addend.as_ptr().add(2 * base + 4) as *const __m512i);
+            while t + 8 <= lanes {
+                let nindex = 2 * (base + t + 4);
+                let nsrc_lo = _mm512_loadu_si512(src.as_ptr().add(nindex) as *const __m512i);
+                let nsrc_hi = _mm512_loadu_si512(src.as_ptr().add(nindex + 4) as *const __m512i);
+                let nadd_lo = _mm512_loadu_si512(addend.as_ptr().add(nindex) as *const __m512i);
+                let nadd_hi = _mm512_loadu_si512(addend.as_ptr().add(nindex + 4) as *const __m512i);
+                let output = glue_group(src_lo, src_hi, add_lo, add_hi);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
+                src_lo = nsrc_lo;
+                src_hi = nsrc_hi;
+                add_lo = nadd_lo;
+                add_hi = nadd_hi;
+                t += 4;
+            }
+            let output = glue_group(src_lo, src_hi, add_lo, add_hi);
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
             t += 4;
+        } else {
+            while t < lanes {
+                let index = 2 * (base + t);
+                let src_lo = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+                let src_hi = _mm512_loadu_si512(src.as_ptr().add(index + 4) as *const __m512i);
+                let add_lo = _mm512_loadu_si512(addend.as_ptr().add(index) as *const __m512i);
+                let add_hi = _mm512_loadu_si512(addend.as_ptr().add(index + 4) as *const __m512i);
+                let output = glue_group(src_lo, src_hi, add_lo, add_hi);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, output);
+                t += 4;
+            }
         }
         while t < dst.len() {
             let index = 2 * (base + t);
