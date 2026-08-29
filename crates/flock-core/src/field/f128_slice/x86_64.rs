@@ -516,41 +516,98 @@ pub(super) unsafe fn bind_both_and_msg_split(
         let mut einf_wide = WideGhashX4::zero();
         let lanes = n & !3;
         let mut i = 0usize;
-        while i < lanes {
-            let c0 = _mm512_loadu_si512(cq0.as_ptr().add(i) as *const __m512i);
-            let c1 = _mm512_loadu_si512(cq1.as_ptr().add(i) as *const __m512i);
-            let c2 = _mm512_loadu_si512(cq2.as_ptr().add(i) as *const __m512i);
-            let c3 = _mm512_loadu_si512(cq3.as_ptr().add(i) as *const __m512i);
-            let z0 = _mm512_loadu_si512(zq0.as_ptr().add(i) as *const __m512i);
-            let z1 = _mm512_loadu_si512(zq1.as_ptr().add(i) as *const __m512i);
-            let z2 = _mm512_loadu_si512(zq2.as_ptr().add(i) as *const __m512i);
-            let z3 = _mm512_loadu_si512(zq3.as_ptr().add(i) as *const __m512i);
-
-            let lo = _mm512_xor_si512(
-                c0,
-                ghash_mul_x4_split(_mm512_xor_si512(c2, c0), r_bcast, r_x64),
-            );
-            let hi = _mm512_xor_si512(
-                c1,
-                ghash_mul_x4_split(_mm512_xor_si512(c3, c1), r_bcast, r_x64),
-            );
-            let zlo = _mm512_xor_si512(
-                z0,
-                ghash_mul_x4_split(_mm512_xor_si512(z2, z0), r_bcast, r_x64),
-            );
-            let zhi = _mm512_xor_si512(
-                z1,
-                ghash_mul_x4_split(_mm512_xor_si512(z3, z1), r_bcast, r_x64),
-            );
-
+        let bind_group = |c0: __m512i,
+                          c1: __m512i,
+                          c2: __m512i,
+                          c3: __m512i,
+                          z0: __m512i,
+                          z1: __m512i,
+                          z2: __m512i,
+                          z3: __m512i|
+         -> (__m512i, __m512i, __m512i, __m512i) {
+            // Closures do not inherit `unsafe` from the enclosing 2024 body.
+            unsafe {
+                let lo = _mm512_xor_si512(
+                    c0,
+                    ghash_mul_x4_split(_mm512_xor_si512(c2, c0), r_bcast, r_x64),
+                );
+                let hi = _mm512_xor_si512(
+                    c1,
+                    ghash_mul_x4_split(_mm512_xor_si512(c3, c1), r_bcast, r_x64),
+                );
+                let zlo = _mm512_xor_si512(
+                    z0,
+                    ghash_mul_x4_split(_mm512_xor_si512(z2, z0), r_bcast, r_x64),
+                );
+                let zhi = _mm512_xor_si512(
+                    z1,
+                    ghash_mul_x4_split(_mm512_xor_si512(z3, z1), r_bcast, r_x64),
+                );
+                (lo, hi, zlo, zhi)
+            }
+        };
+        if super::fused_bind_pipe_enabled() && lanes >= 8 {
+            let mut c0 = _mm512_loadu_si512(cq0.as_ptr() as *const __m512i);
+            let mut c1 = _mm512_loadu_si512(cq1.as_ptr() as *const __m512i);
+            let mut c2 = _mm512_loadu_si512(cq2.as_ptr() as *const __m512i);
+            let mut c3 = _mm512_loadu_si512(cq3.as_ptr() as *const __m512i);
+            let mut z0 = _mm512_loadu_si512(zq0.as_ptr() as *const __m512i);
+            let mut z1 = _mm512_loadu_si512(zq1.as_ptr() as *const __m512i);
+            let mut z2 = _mm512_loadu_si512(zq2.as_ptr() as *const __m512i);
+            let mut z3 = _mm512_loadu_si512(zq3.as_ptr() as *const __m512i);
+            while i + 8 <= lanes {
+                let nc0 = _mm512_loadu_si512(cq0.as_ptr().add(i + 4) as *const __m512i);
+                let nc1 = _mm512_loadu_si512(cq1.as_ptr().add(i + 4) as *const __m512i);
+                let nc2 = _mm512_loadu_si512(cq2.as_ptr().add(i + 4) as *const __m512i);
+                let nc3 = _mm512_loadu_si512(cq3.as_ptr().add(i + 4) as *const __m512i);
+                let nz0 = _mm512_loadu_si512(zq0.as_ptr().add(i + 4) as *const __m512i);
+                let nz1 = _mm512_loadu_si512(zq1.as_ptr().add(i + 4) as *const __m512i);
+                let nz2 = _mm512_loadu_si512(zq2.as_ptr().add(i + 4) as *const __m512i);
+                let nz3 = _mm512_loadu_si512(zq3.as_ptr().add(i + 4) as *const __m512i);
+                let (lo, hi, zlo, zhi) = bind_group(c0, c1, c2, c3, z0, z1, z2, z3);
+                _mm512_storeu_si512(cq0.as_mut_ptr().add(i) as *mut __m512i, lo);
+                _mm512_storeu_si512(cq1.as_mut_ptr().add(i) as *mut __m512i, hi);
+                _mm512_storeu_si512(zq0.as_mut_ptr().add(i) as *mut __m512i, zlo);
+                _mm512_storeu_si512(zq1.as_mut_ptr().add(i) as *mut __m512i, zhi);
+                e1_wide.mul_acc(hi, zhi);
+                einf_wide.mul_acc(_mm512_xor_si512(hi, lo), _mm512_xor_si512(zhi, zlo));
+                c0 = nc0;
+                c1 = nc1;
+                c2 = nc2;
+                c3 = nc3;
+                z0 = nz0;
+                z1 = nz1;
+                z2 = nz2;
+                z3 = nz3;
+                i += 4;
+            }
+            let (lo, hi, zlo, zhi) = bind_group(c0, c1, c2, c3, z0, z1, z2, z3);
             _mm512_storeu_si512(cq0.as_mut_ptr().add(i) as *mut __m512i, lo);
             _mm512_storeu_si512(cq1.as_mut_ptr().add(i) as *mut __m512i, hi);
             _mm512_storeu_si512(zq0.as_mut_ptr().add(i) as *mut __m512i, zlo);
             _mm512_storeu_si512(zq1.as_mut_ptr().add(i) as *mut __m512i, zhi);
-
             e1_wide.mul_acc(hi, zhi);
             einf_wide.mul_acc(_mm512_xor_si512(hi, lo), _mm512_xor_si512(zhi, zlo));
             i += 4;
+        } else {
+            while i < lanes {
+                let c0 = _mm512_loadu_si512(cq0.as_ptr().add(i) as *const __m512i);
+                let c1 = _mm512_loadu_si512(cq1.as_ptr().add(i) as *const __m512i);
+                let c2 = _mm512_loadu_si512(cq2.as_ptr().add(i) as *const __m512i);
+                let c3 = _mm512_loadu_si512(cq3.as_ptr().add(i) as *const __m512i);
+                let z0 = _mm512_loadu_si512(zq0.as_ptr().add(i) as *const __m512i);
+                let z1 = _mm512_loadu_si512(zq1.as_ptr().add(i) as *const __m512i);
+                let z2 = _mm512_loadu_si512(zq2.as_ptr().add(i) as *const __m512i);
+                let z3 = _mm512_loadu_si512(zq3.as_ptr().add(i) as *const __m512i);
+                let (lo, hi, zlo, zhi) = bind_group(c0, c1, c2, c3, z0, z1, z2, z3);
+                _mm512_storeu_si512(cq0.as_mut_ptr().add(i) as *mut __m512i, lo);
+                _mm512_storeu_si512(cq1.as_mut_ptr().add(i) as *mut __m512i, hi);
+                _mm512_storeu_si512(zq0.as_mut_ptr().add(i) as *mut __m512i, zlo);
+                _mm512_storeu_si512(zq1.as_mut_ptr().add(i) as *mut __m512i, zhi);
+                e1_wide.mul_acc(hi, zhi);
+                einf_wide.mul_acc(_mm512_xor_si512(hi, lo), _mm512_xor_si512(zhi, zlo));
+                i += 4;
+            }
         }
         let mut e1_acc = F256Unreduced::ZERO;
         let mut einf_acc = F256Unreduced::ZERO;

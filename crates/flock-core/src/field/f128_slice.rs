@@ -510,6 +510,23 @@ mod tests {
                 (wc0, wc1, wz0, wz1),
                 "fused tables n={n}"
             );
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                let (mut sc0, mut sc1, mut sz0, mut sz1) =
+                    (c0.clone(), c1.clone(), z0.clone(), z1.clone());
+                super::FUSED_BIND_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                let serial = bind_both_and_msg_split(
+                    &mut sc0, &mut sc1, &c2, &c3, &mut sz0, &mut sz1, &z2, &z3, r, n,
+                );
+                super::FUSED_BIND_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(got, serial, "fused pipe vs serial message n={n}");
+                assert_eq!(
+                    (gc0, gc1, gz0, gz1),
+                    (sc0, sc1, sz0, sz1),
+                    "fused pipe vs serial tables n={n}"
+                );
+            }
         }
     }
 
@@ -824,6 +841,36 @@ pub(crate) fn msg_split_half(
         }
         (e1, einf)
     }
+}
+
+/// Test latch so the fused-bind pipe oracle can drive both arms without
+/// mutating env. Ranked `env_clear()` never sets this.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static FUSED_BIND_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default software-pipelines `bind_both_and_msg_split`'s 4-wide
+/// loads: preload the next eight quarter-vectors while the current group's
+/// four binds and two `mul_acc` cover CLMUL latency.
+/// `FLOCK_NO_LC_SUMCHECK_FUSED_PIPE=1` restores the serial loop. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn fused_bind_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if FUSED_BIND_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_FUSED_PIPE").is_none());
+    *ON
 }
 
 /// Fused quarter bind of `(comb, z)` at `r` plus the next round's message.
