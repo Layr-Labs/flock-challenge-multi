@@ -1027,8 +1027,30 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
 
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
-        // so empty rows need no branch.
-        for r in 0..self.n_rows {
+        // so empty rows need no branch. Four-lane split GHASH when the
+        // AVX2/GFNI runtime gate arms; scalar `n % 4` tail otherwise.
+        let mut r = 0usize;
+        if adjoint_x4_inject_enabled() {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: cfg pins avx512f+vpclmulqdq; the runtime gate pins
+            // AVX2+GFNI; every root is a valid node id (`< n_nodes`) by
+            // construction in `build`, and `n_rows <= K == eq_inner.len()`.
+            unsafe {
+                r = inject_alpha_eq_x4(
+                    &mut acc,
+                    &self.a_roots,
+                    &self.b_roots,
+                    alpha,
+                    eq_inner,
+                    self.n_rows,
+                );
+            }
+        }
+        while r < self.n_rows {
             let e = eq_inner[r];
             let ea = alpha * e;
             // SAFETY: every root is a valid node id (`< n_nodes`) by
@@ -1037,6 +1059,7 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
                 *acc.get_unchecked_mut(*self.a_roots.get_unchecked(r) as usize) += ea;
                 *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
             }
+            r += 1;
         }
 
         // One reverse-topological sweep: a node's children were interned
@@ -1055,6 +1078,74 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
 
         acc.truncate(K);
         acc
+    }
+}
+
+/// Ranked default injects `α·eq` through 4-lane split GHASH. Compile-time
+/// `avx512f`+`vpclmulqdq` is required to even emit the kernel; AVX2+GFNI at
+/// runtime is the extra gate (Sapphire Rapids has both). No env-var override.
+fn adjoint_x4_inject_enabled() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni")
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        false
+    }
+}
+
+/// Inject `α·eq[r]` at `a_roots[r]` and `eq[r]` at `b_roots[r]` in groups of
+/// 4 via `ghash_mul_x4_split` / `ghash_shift64_x4`. Returns `n_rows & !3`
+/// so the caller can run the scalar `n % 4` tail.
+///
+/// # Safety
+/// Caller must provide `avx512f`+`vpclmulqdq` (cfg + target_feature),
+/// `eq_inner.len() >= n_rows`, and every root `< acc.len()`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn inject_alpha_eq_x4(
+    acc: &mut [F128],
+    a_roots: &[u32],
+    b_roots: &[u32],
+    alpha: F128,
+    eq_inner: &[F128],
+    n_rows: usize,
+) -> usize {
+    use core::arch::x86_64::*;
+    use flock_core::field::gf2_128::x86_64::{f128x4_loadu, ghash_mul_x4_split, ghash_shift64_x4};
+
+    // SAFETY: target_feature + caller bounds.
+    unsafe {
+        let alpha_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+        let alpha_x64 = ghash_shift64_x4(alpha_x4);
+        let lanes = n_rows & !3;
+        let mut r = 0usize;
+        while r < lanes {
+            let e_v = f128x4_loadu(eq_inner.as_ptr().add(r));
+            let ea_v = ghash_mul_x4_split(e_v, alpha_x4, alpha_x64);
+            let mut ea = [F128::ZERO; 4];
+            _mm512_storeu_si512(ea.as_mut_ptr() as *mut __m512i, ea_v);
+            for k in 0..4 {
+                *acc.get_unchecked_mut(*a_roots.get_unchecked(r + k) as usize) += ea[k];
+                *acc.get_unchecked_mut(*b_roots.get_unchecked(r + k) as usize) +=
+                    *eq_inner.get_unchecked(r + k);
+            }
+            r += 4;
+        }
+        r
     }
 }
 
@@ -1082,6 +1173,75 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 // ---------------------------------------------------------------------------
 
 #[inline]
+fn scatter_one_carry_bit(
+    comb: &mut [F128],
+    x: &Word,
+    y: &Word,
+    carry_base: usize,
+    i: usize,
+    e: F128,
+    ea: F128,
+) {
+    for &slot in x.bits[i].iter() {
+        comb[slot] += ea;
+    }
+    for j in 0..i {
+        comb[carry_base + j] += ea;
+    }
+    for &slot in y.bits[i].iter() {
+        comb[slot] += e;
+    }
+    for j in 0..i {
+        comb[carry_base + j] += e;
+    }
+}
+
+/// Scale 4 contiguous `eq_inner[carry_base + i .. + 4]` by `alpha` via split
+/// GHASH. Returns the first unprocessed bit so the scalar `n % 4` tail
+/// (and the CSC remainder) keep running through [`scatter_one_carry_bit`].
+///
+/// # Safety
+/// `avx512f`+`vpclmulqdq`; `eq_inner` has 4 readable elements at `carry_base`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn scatter_add_carry_rows_x4(
+    comb: &mut [F128],
+    alpha: F128,
+    eq_inner: &[F128],
+    x: &Word,
+    y: &Word,
+    carry_base: usize,
+) -> usize {
+    use core::arch::x86_64::*;
+    use flock_core::field::gf2_128::x86_64::{f128x4_loadu, ghash_mul_x4_split, ghash_shift64_x4};
+
+    // SAFETY: target_feature + 4 readable F128 at each load.
+    unsafe {
+        let alpha_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+        let alpha_x64 = ghash_shift64_x4(alpha_x4);
+        let lanes = CARRY_BITS_PER_ADD & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let e_v = f128x4_loadu(eq_inner.as_ptr().add(carry_base + i));
+            let ea_v = ghash_mul_x4_split(e_v, alpha_x4, alpha_x64);
+            let mut ea = [F128::ZERO; 4];
+            _mm512_storeu_si512(ea.as_mut_ptr() as *mut __m512i, ea_v);
+            for k in 0..4 {
+                let bit = i + k;
+                let e = *eq_inner.get_unchecked(carry_base + bit);
+                scatter_one_carry_bit(comb, x, y, carry_base, bit, e, ea[k]);
+            }
+            i += 4;
+        }
+        i
+    }
+}
+
+#[inline]
 fn scatter_add_carry_rows(
     comb: &mut [F128],
     alpha: F128,
@@ -1090,22 +1250,24 @@ fn scatter_add_carry_rows(
     y: &Word,
     carry_base: usize,
 ) -> Word {
-    for i in 0..CARRY_BITS_PER_ADD {
-        let row = carry_base + i;
-        let e = eq_inner[row];
+    let mut i = 0usize;
+    if adjoint_x4_inject_enabled() {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: cfg + AVX2/GFNI gate; carry bits are a contiguous 31-wide
+        // window inside `eq_inner` (length K).
+        unsafe {
+            i = scatter_add_carry_rows_x4(comb, alpha, eq_inner, x, y, carry_base);
+        }
+    }
+    while i < CARRY_BITS_PER_ADD {
+        let e = eq_inner[carry_base + i];
         let ea = alpha * e;
-        for &slot in x.bits[i].iter() {
-            comb[slot] += ea;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += ea;
-        }
-        for &slot in y.bits[i].iter() {
-            comb[slot] += e;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += e;
-        }
+        scatter_one_carry_bit(comb, x, y, carry_base, i, e, ea);
+        i += 1;
     }
     Word::add_sum(x, y, carry_base)
 }
