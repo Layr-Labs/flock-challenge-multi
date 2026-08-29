@@ -304,6 +304,81 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Sixty-four-bank weighted fold with deferred reduction, four output slots
+/// per pass: `dst[t] = Σ_{b<64} w[b] · src[64t + b]`.
+///
+/// Same 4×4 128-bit-lane transpose as [`fold16_banked`], sixteen groups of
+/// four banks instead of four, one `WideGhashX4` reduced once per four
+/// outputs. Equals fold16_banked of 16-bank groups followed by fold4_nested
+/// when `w[16g + b] = w16[b] * w4[g]`. Field-identical (reduction is
+/// F₂-linear).
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 64 * dst.len()`.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold64_banked(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let wb: [__m512i; 64] = core::array::from_fn(|b| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        });
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let quads = dst.len() & !3;
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(256);
+        let mut t = 0usize;
+        while t < quads {
+            if pf_ahead != 0 {
+                let ahead = 64 * t + pf_ahead;
+                if ahead <= pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut l = 0usize;
+                    while l < 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        l += 64;
+                    }
+                }
+            }
+            let mut acc = WideGhashX4::zero();
+            for g in 0..16 {
+                let base = 64 * t + 4 * g;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 64) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 128) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 192) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc(u0, wb[4 * g]);
+                acc.mul_acc(u1, wb[4 * g + 1]);
+                acc.mul_acc(u2, wb[4 * g + 2]);
+                acc.mul_acc(u3, wb[4 * g + 3]);
+            }
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
+            t += 4;
+        }
+        while t < dst.len() {
+            let mut v = F128::ZERO;
+            for b in 0..64 {
+                v += w[b] * src[64 * t + b];
+            }
+            dst[t] = v;
+            t += 1;
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.

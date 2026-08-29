@@ -330,6 +330,56 @@ mod tests {
         }
     }
 
+    /// `fold64_banked` equals fold16_banked of 16-bank groups followed by
+    /// fold4_nested, and also the straight 64-term reduced sum, including
+    /// vector-body and scalar-tail lengths.
+    #[test]
+    fn fold64_banked_matches_fold16_then_fold4() {
+        use super::*;
+        let mut state = 0xF01D_64BAu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w16: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let r4 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let r5 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let w64 = compose_fold64_weights(&w16, r4, r5);
+            let mut got = vec![F128::ZERO; n];
+            fold64_banked(&src, &mut got, &w64);
+            let mut mid = vec![F128::ZERO; 4 * n];
+            fold16_banked(&src, &mut mid, &w16);
+            let mut want_nested = vec![F128::ZERO; n];
+            fold4_nested(&mid, &mut want_nested, r4, r5);
+            assert_eq!(got, want_nested, "nested n={n}");
+            for t in 0..n {
+                let mut want = F128::ZERO;
+                for b in 0..64 {
+                    want += w64[b] * src[64 * t + b];
+                }
+                assert_eq!(got[t], want, "sum n={n} t={t}");
+            }
+        }
+    }
+
     /// The PCS open-phase materializers hand these two folds a RECYCLED
     /// destination (`crate::scratch::LocalBuf`), so both must write every
     /// output slot before reading it — the result may not depend on what an
@@ -743,6 +793,56 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             let mut v = F128::ZERO;
             for b in 0..16 {
                 v += w[b] * src[16 * t + b];
+            }
+            *value = v;
+        }
+    }
+}
+
+/// Compose DirectFold8's 64 bank weights from the 16-bank fold16 table and
+/// the two remaining pair-fold challenges. `w[16g + b] = w16[b] · eq(r4,r5)[g]`
+/// with `build_eq` first coord LSB, matching fold16_banked then fold4_nested.
+#[inline]
+pub(crate) fn compose_fold64_weights(w16: &[F128; 16], r4: F128, r5: F128) -> [F128; 64] {
+    let one_r4 = F128::ONE + r4;
+    let one_r5 = F128::ONE + r5;
+    let w4 = [one_r4 * one_r5, r4 * one_r5, one_r4 * r5, r4 * r5];
+    std::array::from_fn(|b| w16[b % 16] * w4[b / 16])
+}
+
+/// Sixty-four-bank weighted fold: `dst[t] = Σ_{b<64} w[b] · src[64t + b]`.
+///
+/// AVX-512: deferred-reduction kernel (one reduce per output lane). Other
+/// targets: the straightforward reduced form. Same field element either way.
+#[inline]
+pub(crate) fn fold64_banked(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold64 source must contain sixty-four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all sixty-four source elements per output.
+    unsafe {
+        x86_64::fold64_banked(src, dst, w);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let mut v = F128::ZERO;
+            for b in 0..64 {
+                v += w[b] * src[64 * t + b];
             }
             *value = v;
         }
