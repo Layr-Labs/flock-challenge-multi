@@ -3136,6 +3136,46 @@ fn r1_cfold_x4_enabled() -> bool {
     *ON
 }
 
+/// Test latch so the collapse oracle can drive both arms without mutating
+/// env. Ranked `env_clear()` never sets this.
+#[cfg(test)]
+static CFOLD_COLLAPSE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ranked default collapses identity-C's fold8→fold4 and fold4→quad with
+/// two MSB-first [`crate::field::f128_slice::bind_split_half`] radix steps
+/// instead of a 4-group `add_scaled` nest. Same char-2 polynomial: first
+/// `build_eq` coordinate is LSB, and the bank layout is high-major
+/// (`bank + 16*high` / `e + 4*q`), so binding `inner_tail[5]` then `[4]`
+/// (then `[3]` then `[2]`) equals the nest and drops one mul per collapsed
+/// slot (6144+1536 vs 8192+2048). Fold8 is left intact for DirectFold8
+/// capture. `FLOCK_NO_ZC_CFOLD_COLLAPSE=1` restores the nest. Default ON.
+fn cfold_collapse_enabled() -> bool {
+    #[cfg(test)]
+    if CFOLD_COLLAPSE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CFOLD_COLLAPSE").is_none());
+    *ON
+}
+
+/// Collapse four equal-sized contiguous groups by two MSB-first
+/// `bind_split_half` steps. `src` is `4 * group` F128; returns length
+/// `group`. `r_msb` is the high bit of the 2-bit group index (first bind
+/// splits `src` in half); `r_lsb` is the low bit.
+fn collapse_four_groups(src: &[F128], r_msb: F128, r_lsb: F128) -> Vec<F128> {
+    debug_assert!(!src.is_empty() && src.len() % 4 == 0);
+    let half = src.len() / 2;
+    let group = src.len() / 4;
+    let mut work = src[..half].to_vec();
+    crate::field::f128_slice::bind_split_half(&mut work, &src[half..], r_msb);
+    let (lo, hi) = work.split_at_mut(group);
+    crate::field::f128_slice::bind_split_half(lo, hi, r_lsb);
+    work.truncate(group);
+    work
+}
+
 /// Round-one AB message from the challenge-independent precompute, with no C
 /// drain. Bit-identical to the AB output of
 /// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4`];
@@ -3388,26 +3428,34 @@ pub fn round1_c_fold4_from_block_major_z(
             crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail)
         };
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
-        let retained_top_eq = build_eq(&inner_tail[4..6]);
-        let mut fold4 = vec![F128::ZERO; 16 * n_packed];
-        let wide = r1_cfold_x4_enabled();
-        for high in 0..4 {
-            for bank in 0..16 {
-                let src = (bank + 16 * high) * n_packed;
-                let dst = bank * n_packed;
-                if wide {
-                    crate::field::f128_slice::add_scaled(
-                        &mut fold4[dst..dst + n_packed],
-                        &fold8[src..src + n_packed],
-                        retained_top_eq[high],
-                    );
-                } else {
-                    for packed in 0..n_packed {
-                        fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+        // Default: two MSB-first bind_split_half steps (inner_tail[5] then
+        // [4]) over the high-major 64-bank layout. Kill switch keeps the
+        // 4×16 add_scaled nest. Fold8 is not mutated.
+        let fold4 = if cfold_collapse_enabled() {
+            collapse_four_groups(&fold8, inner_tail[5], inner_tail[4])
+        } else {
+            let retained_top_eq = build_eq(&inner_tail[4..6]);
+            let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+            let wide = r1_cfold_x4_enabled();
+            for high in 0..4 {
+                for bank in 0..16 {
+                    let src = (bank + 16 * high) * n_packed;
+                    let dst = bank * n_packed;
+                    if wide {
+                        crate::field::f128_slice::add_scaled(
+                            &mut fold4[dst..dst + n_packed],
+                            &fold8[src..src + n_packed],
+                            retained_top_eq[high],
+                        );
+                    } else {
+                        for packed in 0..n_packed {
+                            fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                        }
                     }
                 }
             }
-        }
+            fold4
+        };
         (fold4, fold8)
     } else {
         // Kill switch restores the incumbent sixteen-bank producer; do not
@@ -3420,27 +3468,34 @@ pub fn round1_c_fold4_from_block_major_z(
     };
 
     // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 stay bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    let wide_quad = r1_cfold_x4_enabled();
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            if wide_quad {
-                crate::field::f128_slice::add_scaled(
-                    &mut quad[dst..dst + n_packed],
-                    &fold4[src..src + n_packed],
-                    retained_hi_eq[q],
-                );
-            } else {
-                for packed in 0..n_packed {
-                    quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+    // tensor (coordinates 0 and 1 stay bank selectors). Same two-step
+    // bind_split_half as fold8→fold4, now 16→4, unless the kill switch
+    // restores the 4×4 add_scaled nest.
+    let quad = if cfold_collapse_enabled() {
+        collapse_four_groups(&fold4, inner_tail[3], inner_tail[2])
+    } else {
+        let retained_hi_eq = build_eq(&inner_tail[2..4]);
+        let mut quad = vec![F128::ZERO; 4 * n_packed];
+        let wide_quad = r1_cfold_x4_enabled();
+        for q in 0..4 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                if wide_quad {
+                    crate::field::f128_slice::add_scaled(
+                        &mut quad[dst..dst + n_packed],
+                        &fold4[src..src + n_packed],
+                        retained_hi_eq[q],
+                    );
+                } else {
+                    for packed in 0..n_packed {
+                        quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                    }
                 }
             }
         }
-    }
+        quad
+    };
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
 
     // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
@@ -4734,6 +4789,92 @@ mod tests {
                 assert!(fold8_new.is_empty(), "Fold8 kill switch still widened C");
             }
         }
+    }
+
+    /// Two MSB-first `bind_split_half` steps on a high-major 4-group tensor
+    /// must match the 4-group `add_scaled` nest bit-for-bit: `build_eq`
+    /// first coord is LSB, so binding `r_msb` then `r_lsb` equals
+    /// `Σ_high eq[high] * group[high]`.
+    #[test]
+    fn collapse_four_groups_matches_add_scaled_nest() {
+        for &(n_groups_lo, n_packed) in &[(16usize, 8usize), (16, 128), (4, 8), (4, 128)] {
+            let src_banks = 4 * n_groups_lo;
+            let mut rng =
+                Rng::new(0xC0_11A9_5Eu64.wrapping_add((src_banks * 1000 + n_packed) as u64));
+            let src = rng.f128_vec(src_banks * n_packed);
+            let r_lsb = rng.f128();
+            let r_msb = rng.f128();
+            let eq = build_eq(&[r_lsb, r_msb]);
+            let mut nest = vec![F128::ZERO; n_groups_lo * n_packed];
+            for high in 0..4 {
+                for bank in 0..n_groups_lo {
+                    let s = (bank + n_groups_lo * high) * n_packed;
+                    let d = bank * n_packed;
+                    crate::field::f128_slice::add_scaled(
+                        &mut nest[d..d + n_packed],
+                        &src[s..s + n_packed],
+                        eq[high],
+                    );
+                }
+            }
+            let got = collapse_four_groups(&src, r_msb, r_lsb);
+            assert_eq!(got, nest, "n_groups_lo={n_groups_lo} n_packed={n_packed}");
+        }
+    }
+
+    /// Same-binary: identity-C with the bind_split_half collapse must match
+    /// the add_scaled nest on both captured tensors and the lifted C message.
+    #[test]
+    fn identity_c_collapse_matches_add_scaled_nest() {
+        use std::sync::atomic::Ordering;
+
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        let m = 22usize;
+        const K_LOG: usize = 14;
+        let useful_bits = 15_409usize;
+        let mut rng = Rng::new(0xC011_A95E_1DC2);
+        let total_bits = 1usize << m;
+        let mut c = rng.bits(total_bits);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(total_bits / block_size) {
+            for offset in useful_bits..block_size {
+                c[block * block_size + offset] = false;
+            }
+        }
+        let c_p = pack_bits(&c);
+        let c_words: Vec<F128> = c_p
+            .chunks_exact(16)
+            .map(|w| F128 {
+                lo: u64::from_le_bytes(w[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(w[8..].try_into().unwrap()),
+            })
+            .collect();
+        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let r = build_protocol_r(m, &outer);
+        let table = make_inv_table();
+
+        let run = |off: bool| {
+            CFOLD_COLLAPSE_TEST_OFF.store(off, Ordering::Relaxed);
+            let out = round1_c_fold4_from_block_major_z(
+                &c_words,
+                m,
+                K_LOG,
+                K_SKIP,
+                useful_bits,
+                &r,
+                &table,
+            );
+            CFOLD_COLLAPSE_TEST_OFF.store(false, Ordering::Relaxed);
+            out
+        };
+        let collapsed = run(false);
+        let nest = run(true);
+        assert_eq!(collapsed.0, nest.0, "res_c_lifted");
+        assert_eq!(collapsed.1, nest.1, "s_hat_v_c");
+        assert_eq!(collapsed.2, nest.2, "quad");
+        assert_eq!(collapsed.3, nest.3, "fold4");
+        assert_eq!(collapsed.4, nest.4, "fold8");
     }
 
     #[test]
