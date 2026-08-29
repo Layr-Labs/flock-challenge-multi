@@ -2877,6 +2877,57 @@ pub fn prove<Ch: Challenger>(
 /// `[useful_bits, 2^k_log)` are honest zero padding. The partial-fold over
 /// the outer dimension skips work for those padding rows — byte-identical
 /// proof on a witness with zero-padded blocks.
+/// Internal capture mode for the lincheck witness vector (`z_vec`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LincheckCaptureMode {
+    /// Do not capture any z_vec.
+    None,
+    /// Capture the pre-sumcheck z_vec (length `2^k_log`).
+    PreSumcheck,
+    /// Capture the post-round-0 fold8 z_vec (length `2^(k_log - 1)`).
+    /// If sumcheck has no rounds (`inner_rest_len == 0`), falls back to pre-sumcheck.
+    Fold8,
+}
+
+/// Workspace-internal test defect selector for validating production capture invariants.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureDefect {
+    None,
+    BeforeRound,
+    AfterRoundOne,
+    WrongChallengeOrder,
+    WrongLayoutLength,
+    OwnershipAliasCollapse,
+    FallbackMisrouting,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVE_DEFECT: std::cell::Cell<CaptureDefect> = const { std::cell::Cell::new(CaptureDefect::None) };
+}
+
+#[cfg(test)]
+pub fn with_capture_defect<F, R>(defect: CaptureDefect, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE_DEFECT.with(|c| c.set(CaptureDefect::None));
+        }
+    }
+    ACTIVE_DEFECT.with(|c| c.set(defect));
+    let _guard = Guard;
+    f()
+}
+
+#[cfg(test)]
+pub fn active_defect() -> CaptureDefect {
+    ACTIVE_DEFECT.with(|c| c.get())
+}
+
 pub fn prove_padded<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
@@ -2895,7 +2946,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        LincheckCaptureMode::None,
         challenger,
     );
     (proof, claim)
@@ -2928,13 +2979,13 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        LincheckCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture=PreSumcheck must produce z_vec"),
     )
 }
 
@@ -2960,13 +3011,76 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        LincheckCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("capture=PreSumcheck must produce z_vec"),
+    )
+}
+
+/// Ranked post-round-0 fold8 capture variant of [`prove_padded_capture_z_vec`].
+///
+/// Captures the folded `z_vec` immediately following sumcheck round 0 (length
+/// `2^(k_log - 1)`), avoiding the pre-sumcheck clone and downstream multilinear
+/// fold in `precompute_ab_s_hat_v`. When `inner_rest_len == 0`, falls back to
+/// capturing the pre-sumcheck vector.
+pub fn prove_padded_capture_fold8<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        LincheckCaptureMode::Fold8,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=Fold8 must produce z_vec"),
+    )
+}
+
+/// Direct block-major counterpart of [`prove_padded_capture_fold8`].
+pub fn prove_padded_capture_fold8_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        LincheckCaptureMode::Fold8,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=Fold8 must produce z_vec"),
     )
 }
 
@@ -2979,7 +3093,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture: LincheckCaptureMode,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -3118,10 +3232,20 @@ fn prove_padded_inner<Ch: Challenger>(
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
-    } else {
-        None
+    #[cfg(test)]
+    let mut captured_z_vec: Option<Vec<F128>> = match capture {
+        LincheckCaptureMode::PreSumcheck => Some(z_vec.clone()),
+        LincheckCaptureMode::Fold8 if inner_rest_len == 0 => Some(z_vec.clone()),
+        LincheckCaptureMode::Fold8 if active_defect() == CaptureDefect::BeforeRound => {
+            Some(z_vec.clone())
+        }
+        _ => None,
+    };
+    #[cfg(not(test))]
+    let mut captured_z_vec: Option<Vec<F128>> = match capture {
+        LincheckCaptureMode::PreSumcheck => Some(z_vec.clone()),
+        LincheckCaptureMode::Fold8 if inner_rest_len == 0 => Some(z_vec.clone()),
+        _ => None,
     };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
@@ -3156,6 +3280,53 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if capture == LincheckCaptureMode::Fold8 && captured_z_vec.is_none() {
+                #[cfg(not(test))]
+                {
+                    captured_z_vec = Some(z_vec.clone());
+                }
+                #[cfg(test)]
+                {
+                    match active_defect() {
+                        CaptureDefect::AfterRoundOne => {
+                            if t == 1 {
+                                captured_z_vec = Some(z_vec.clone());
+                            }
+                        }
+                        CaptureDefect::WrongChallengeOrder => {
+                            if t == 0 {
+                                let mut wrong = z_vec.clone();
+                                for x in wrong.iter_mut() {
+                                    *x += F128::ONE;
+                                }
+                                captured_z_vec = Some(wrong);
+                            }
+                        }
+                        CaptureDefect::WrongLayoutLength => {
+                            if t == 0 {
+                                let mut wrong = z_vec.clone();
+                                wrong.pop();
+                                captured_z_vec = Some(wrong);
+                            }
+                        }
+                        CaptureDefect::OwnershipAliasCollapse => {
+                            if t == 0 {
+                                captured_z_vec = Some(vec![F128::ZERO; z_vec.len()]);
+                            }
+                        }
+                        CaptureDefect::FallbackMisrouting => {
+                            if t == 0 {
+                                captured_z_vec = Some(Vec::new());
+                            }
+                        }
+                        CaptureDefect::None | CaptureDefect::BeforeRound => {
+                            if t == 0 {
+                                captured_z_vec = Some(z_vec.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4691,5 +4862,320 @@ mod tests {
             ),
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
+    }
+
+    #[test]
+    fn public_capture_contract_across_geometries() {
+        let configs = [
+            (14, 7, 6),
+            (10, 4, 2),
+            (10, 4, 4),
+            (12, 5, 3),
+            (17, 14, 6),
+        ];
+        let mut rng = Rng::new(0xCA97_0001);
+        for (m, k_log, k_skip) in configs {
+            let k = 1 << k_log;
+            let a_0 = random_sparse_matrix(k, k, &mut rng);
+            let b_0 = random_sparse_matrix(k, k, &mut rng);
+            let z = rng.bits(1 << m);
+            let a = apply_block_diag(&a_0, &z, k_log);
+            let b = apply_block_diag(&b_0, &z, k_log);
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
+            let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
+
+            let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+            // 1. Baseline prove_padded
+            let mut ch_base = FsChallenger::new(b"flock-test-contract");
+            let (proof_base, claim_base) = prove_padded(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch_base,
+            );
+
+            // 2. prove_padded_capture_z_vec (Stripe)
+            let mut ch_cap = FsChallenger::new(b"flock-test-contract");
+            let (proof_cap, claim_cap, z_vec_cap) = prove_padded_capture_z_vec(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch_cap,
+            );
+            assert_eq!(proof_cap, proof_base);
+            assert_eq!(claim_cap, claim_base);
+            assert_eq!(
+                z_vec_cap.len(),
+                k,
+                "public capture must return full pre-sumcheck vector length 2^k_log"
+            );
+
+            let mut ch_v = FsChallenger::new(b"flock-test-contract");
+            verify(m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof_cap, &mut ch_v)
+                .expect("public capture proof must verify");
+
+            // 3. prove_padded_capture_z_vec_block_major (when k_log >= LOG_PACKING)
+            if k_log >= crate::pcs::LOG_PACKING {
+                let z_block_major = crate::pcs::pack_witness(&z, m);
+                let mut ch_bm = FsChallenger::new(b"flock-test-contract");
+                let (proof_bm, claim_bm, z_vec_bm) = prove_padded_capture_z_vec_block_major(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    k_skip,
+                    k,
+                    &circuit,
+                    &x_ab,
+                    &mut ch_bm,
+                );
+                assert_eq!(proof_bm, proof_base);
+                assert_eq!(claim_bm, claim_base);
+                assert_eq!(z_vec_bm.len(), k);
+                assert_eq!(z_vec_bm, z_vec_cap);
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_private_fold8_bit_identical_and_verifies() {
+        let m = 17;
+        let k_log = 14;
+        let k_skip = 6;
+        let k = 1 << k_log;
+        let mut rng = Rng::new(0xF01D_8001);
+        let a_0 = random_sparse_matrix(k, k, &mut rng);
+        let b_0 = random_sparse_matrix(k, k, &mut rng);
+        let z = rng.bits(1 << m);
+        let a = apply_block_diag(&a_0, &z, k_log);
+        let b = apply_block_diag(&b_0, &z, k_log);
+        let z_packed = pack_z_lincheck(&z, m, k_log);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+        let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
+        let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
+
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+        // Baseline pre-sumcheck capture to feed oracle
+        let mut ch_cap = FsChallenger::new(b"flock-test-fold8");
+        let (proof_base, claim_base, z_vec_full) = prove_padded_capture_z_vec(
+            &z_packed,
+            m,
+            k_log,
+            k_skip,
+            k,
+            &circuit,
+            &x_ab,
+            &mut ch_cap,
+        );
+
+        // Oracle: pcs::ring_switch::s_hat_v_fold8_from_z_vec over full z_vec
+        let oracle_fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(
+            &z_vec_full,
+            &claim_base.r_inner_rest[1..],
+        );
+        assert_eq!(oracle_fold8.len(), k / 2);
+
+        // Stripe fold8 capture
+        let mut ch_f8 = FsChallenger::new(b"flock-test-fold8");
+        let (proof_f8, claim_f8, z_vec_f8) = prove_padded_capture_fold8(
+            &z_packed,
+            m,
+            k_log,
+            k_skip,
+            k,
+            &circuit,
+            &x_ab,
+            &mut ch_f8,
+        );
+        assert_eq!(proof_f8, proof_base);
+        assert_eq!(claim_f8, claim_base);
+        assert_eq!(z_vec_f8.len(), k / 2);
+        assert_eq!(
+            z_vec_f8, oracle_fold8,
+            "post-round-0 fold8 captured vector must match oracle bit-for-bit"
+        );
+
+        let mut ch_v = FsChallenger::new(b"flock-test-fold8");
+        verify(m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof_f8, &mut ch_v)
+            .expect("fold8 proof must verify with honest verifier");
+
+        // Block-major fold8 capture
+        let z_block_major = crate::pcs::pack_witness(&z, m);
+        let mut ch_bm = FsChallenger::new(b"flock-test-fold8");
+        let (proof_bm, claim_bm, z_vec_bm) = prove_padded_capture_fold8_block_major(
+            &z_block_major,
+            m,
+            k_log,
+            k_skip,
+            k,
+            &circuit,
+            &x_ab,
+            &mut ch_bm,
+        );
+        assert_eq!(proof_bm, proof_base);
+        assert_eq!(claim_bm, claim_base);
+        assert_eq!(z_vec_bm, oracle_fold8);
+    }
+
+    #[test]
+    fn production_mutants_caught_by_invariants() {
+        let m = 17;
+        let k_log = 14;
+        let k_skip = 6;
+        let k = 1 << k_log;
+        let mut rng = Rng::new(0xDEAD_F01D);
+        let a_0 = random_sparse_matrix(k, k, &mut rng);
+        let b_0 = random_sparse_matrix(k, k, &mut rng);
+        let z = rng.bits(1 << m);
+        let z_packed = pack_z_lincheck(&z, m, k_log);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+        let mut ch_honest = FsChallenger::new(b"flock-test-mutants");
+        let (_, _claim_honest, honest_fold8) = prove_padded_capture_fold8(
+            &z_packed,
+            m,
+            k_log,
+            k_skip,
+            k,
+            &circuit,
+            &x_ab,
+            &mut ch_honest,
+        );
+        assert_eq!(honest_fold8.len(), 8192);
+
+        // 1. BeforeRound mutant
+        with_capture_defect(CaptureDefect::BeforeRound, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_ne!(
+                mutant_vec.len(),
+                8192,
+                "BeforeRound mutant must produce un-folded 16384 vector instead of 8192"
+            );
+            assert_eq!(mutant_vec.len(), 16384);
+        });
+
+        // 2. AfterRoundOne mutant
+        with_capture_defect(CaptureDefect::AfterRoundOne, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_ne!(
+                mutant_vec.len(),
+                8192,
+                "AfterRoundOne mutant must produce double-folded 4096 vector instead of 8192"
+            );
+            assert_eq!(mutant_vec.len(), 4096);
+        });
+
+        // 3. WrongChallengeOrder mutant
+        with_capture_defect(CaptureDefect::WrongChallengeOrder, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_eq!(mutant_vec.len(), 8192);
+            assert_ne!(
+                mutant_vec, honest_fold8,
+                "WrongChallengeOrder mutant must not match honest fold8 vector"
+            );
+        });
+
+        // 4. WrongLayoutLength mutant
+        with_capture_defect(CaptureDefect::WrongLayoutLength, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_eq!(
+                mutant_vec.len(),
+                8191,
+                "WrongLayoutLength mutant must produce truncated length 8191"
+            );
+        });
+
+        // 5. OwnershipAliasCollapse mutant
+        with_capture_defect(CaptureDefect::OwnershipAliasCollapse, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_eq!(mutant_vec.len(), 8192);
+            assert!(
+                mutant_vec.iter().all(|x| *x == F128::ZERO),
+                "OwnershipAliasCollapse mutant must produce zeroed/collapsed vector"
+            );
+            assert_ne!(mutant_vec, honest_fold8);
+        });
+
+        // 6. FallbackMisrouting mutant
+        with_capture_defect(CaptureDefect::FallbackMisrouting, || {
+            let mut ch = FsChallenger::new(b"flock-test-mutants");
+            let (_, _, mutant_vec) = prove_padded_capture_fold8(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                &mut ch,
+            );
+            assert_eq!(
+                mutant_vec.len(),
+                0,
+                "FallbackMisrouting mutant must produce empty vector"
+            );
+        });
     }
 }

@@ -142,26 +142,23 @@ fn ranked_direct_fold8_precompute_enabled(
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
-    z_vec: &[F128],
+    z_vec: Vec<F128>,
     inner_rest_tail: &[F128],
 ) -> Option<Vec<F128>> {
     if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
-        Some(pcs::ring_switch::s_hat_v_fold8_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
+        Some(z_vec)
     } else if ranked_direct_fold4_precompute_enabled(r1cs, captured) {
         Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
-            z_vec,
+            &z_vec,
             inner_rest_tail,
         ))
     } else if ranked_direct_ab_precompute_enabled(r1cs) {
         Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            z_vec,
+            &z_vec,
             inner_rest_tail,
         ))
     } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(z_vec, inner_rest_tail))
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(&z_vec, inner_rest_tail))
     } else {
         None
     }
@@ -382,16 +379,30 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        &lc_circuit,
-        &x_ab,
-        challenger,
-    );
+    let use_fold8 = ranked_direct_fold8_precompute_enabled(r1cs, &s_hat_v_c);
+    let (lc_proof, lc_claim, z_vec_pre) = if use_fold8 {
+        lincheck::prove_padded_capture_fold8(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            &lc_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            &lc_circuit,
+            &x_ab,
+            challenger,
+        )
+    };
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -402,8 +413,9 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
+    let inner_rest_tail = lc_claim.r_inner_rest.get(1..).unwrap_or(&[]);
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, inner_rest_tail);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -936,33 +948,62 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
+    let use_fold8 = ranked_direct_fold8_precompute_enabled(r1cs, &s_hat_v_c);
     let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
-                &z_packed_lincheck,
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                r1cs.useful_bits,
-                lincheck_circuit,
-                &x_ab,
-                challenger,
-            );
+            let result = if use_fold8 {
+                lincheck::prove_padded_capture_fold8(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            } else {
+                lincheck::prove_padded_capture_z_vec(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            };
             // The stripe copy is dead after lincheck. Stripe-based callers
             // retain their existing allocation lifecycle.
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
-            &z_packed,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
-            lincheck_circuit,
-            &x_ab,
-            challenger,
-        ),
+        FastLincheckInput::BlockMajor => {
+            if use_fold8 {
+                lincheck::prove_padded_capture_fold8_block_major(
+                    &z_packed,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            } else {
+                lincheck::prove_padded_capture_z_vec_block_major(
+                    &z_packed,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            }
+        }
     };
     flock_core::gaptime::mark("lincheck: done");
 
@@ -979,8 +1020,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
+    let inner_rest_tail = lc_claim.r_inner_rest.get(1..).unwrap_or(&[]);
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, inner_rest_tail);
     flock_core::gaptime::mark("s_hat_v_ab built (core exit)");
 
     ProveCore {
@@ -1174,31 +1216,60 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
+    let use_fold8 = ranked_direct_fold8_precompute_enabled(r1cs, &s_hat_v_c);
     let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
-                &z_packed_lincheck,
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                r1cs.useful_bits,
-                lincheck_circuit,
-                &x_ab,
-                challenger,
-            );
+            let result = if use_fold8 {
+                lincheck::prove_padded_capture_fold8(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            } else {
+                lincheck::prove_padded_capture_z_vec(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            };
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
-            &z_packed,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
-            lincheck_circuit,
-            &x_ab,
-            challenger,
-        ),
+        FastLincheckInput::BlockMajor => {
+            if use_fold8 {
+                lincheck::prove_padded_capture_fold8_block_major(
+                    &z_packed,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            } else {
+                lincheck::prove_padded_capture_z_vec_block_major(
+                    &z_packed,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    challenger,
+                )
+            }
+        }
     };
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1208,8 +1279,9 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
+    let inner_rest_tail = lc_claim.r_inner_rest.get(1..).unwrap_or(&[]);
     let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        precompute_ab_s_hat_v(r1cs, &s_hat_v_c, z_vec_pre, inner_rest_tail);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
