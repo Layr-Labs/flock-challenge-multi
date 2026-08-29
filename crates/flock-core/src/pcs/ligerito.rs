@@ -4166,11 +4166,14 @@ unsafe fn fold_and_msg_chunk_nt_x86(
     debug_assert!(len <= stage_f.len() && len <= stage_b.len());
     debug_assert!(len.is_multiple_of(2));
 
-    crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
-    crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
-    // SAFETY: target features cfg-guaranteed; stage slices have equal even
-    // length (caller / debug_assert).
-    let (u0, u2) = unsafe { msg_reduce_avx512(&stage_f[..len], &stage_b[..len]) };
+    let (u0, u2) = crate::field::f128_slice::fold_two_and_msg(
+        f,
+        b,
+        base,
+        &mut stage_f[..len],
+        &mut stage_b[..len],
+        r,
+    );
 
     let dst_aligned = (fc.as_mut_ptr() as usize).is_multiple_of(16)
         && (bc.as_mut_ptr() as usize).is_multiple_of(16);
@@ -4238,6 +4241,23 @@ fn fold_and_msg_lsb_inner(
     }
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
+        if deferred_basis.is_none() && lazy_ood.is_none() {
+            let mut nf = crate::alloc_uninit_f128_vec(half);
+            let mut nb = crate::alloc_uninit_f128_vec(half);
+            let (u_0, u_2) = crate::field::f128_slice::fold_two_and_msg(
+                f,
+                b,
+                0,
+                &mut nf,
+                &mut nb,
+                r,
+            );
+            return (
+                FoldBuf::Owned(nf),
+                FoldBuf::Owned(nb),
+                SumcheckMessage { u_0, u_2 },
+            );
+        }
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
         // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
@@ -4415,6 +4435,9 @@ fn fold_and_msg_lsb_inner(
                 }
             }
             let len = fc.len();
+            if deferred_basis.is_none() && lazy_ood.is_none() {
+                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
+            }
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             if let Some((basis, alpha)) = deferred_basis {

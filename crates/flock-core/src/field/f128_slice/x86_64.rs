@@ -30,6 +30,107 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
     }
 }
 
+/// Four-pair (8-output) fused fold of `f` and `b` at `r` with single-pass
+/// `(u0, u2)` unreduced message accumulate.
+///
+/// Loads each `(f0, f1, b0, b1)` group once from `f` and `b` starting at pair `base`,
+/// computes the folded `fc` and `bc` values, stores them to `fc` and `bc`, and
+/// accumulates the next-round message terms into unreduced `WideGhashX4` accumulators,
+/// reducing once at the end.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `fc.len() == bc.len()`.
+/// `f` and `b` contain `2 * (base + fc.len())` elements.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_two_and_msg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(fc.len(), bc.len());
+    let len = fc.len();
+
+    // SAFETY: caller guarantees target features and buffer bounds.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_bcast);
+
+        let fold4 = |ptr: *const F128, s: usize| -> __m512i {
+            let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
+            let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
+            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+            let diff = _mm512_xor_si512(even, odd);
+            _mm512_xor_si512(even, ghash_mul_x4_split(diff, r_bcast, r_x64))
+        };
+
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let f_ptr = f.as_ptr();
+        let b_ptr = b.as_ptr();
+        let fc_ptr = fc.as_mut_ptr();
+        let bc_ptr = bc.as_mut_ptr();
+        let lanes = len & !7;
+        let mut t = 0usize;
+        while t < lanes {
+            let s = 2 * (base + t);
+            let f0 = fold4(f_ptr, s);
+            let f1 = fold4(f_ptr, s + 8);
+            let b0 = fold4(b_ptr, s);
+            let b1 = fold4(b_ptr, s + 8);
+            _mm512_storeu_si512(fc_ptr.add(t) as *mut __m512i, f0);
+            _mm512_storeu_si512(fc_ptr.add(t + 4) as *mut __m512i, f1);
+            _mm512_storeu_si512(bc_ptr.add(t) as *mut __m512i, b0);
+            _mm512_storeu_si512(bc_ptr.add(t + 4) as *mut __m512i, b1);
+
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            t += 8;
+        }
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        while t + 1 < len {
+            let s = 2 * (base + t);
+            let f0 = *f_ptr.add(s) + r * (*f_ptr.add(s) + *f_ptr.add(s + 1));
+            let f1 = *f_ptr.add(s + 2) + r * (*f_ptr.add(s + 2) + *f_ptr.add(s + 3));
+            let b0 = *b_ptr.add(s) + r * (*b_ptr.add(s) + *b_ptr.add(s + 1));
+            let b1 = *b_ptr.add(s + 2) + r * (*b_ptr.add(s + 2) + *b_ptr.add(s + 3));
+            *fc_ptr.add(t) = f0;
+            *fc_ptr.add(t + 1) = f1;
+            *bc_ptr.add(t) = b0;
+            *bc_ptr.add(t + 1) = b1;
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            t += 2;
+        }
+        if t < len {
+            let s = 2 * (base + t);
+            let f0 = *f_ptr.add(s) + r * (*f_ptr.add(s) + *f_ptr.add(s + 1));
+            let b0 = *b_ptr.add(s) + r * (*b_ptr.add(s) + *b_ptr.add(s + 1));
+            *fc_ptr.add(t) = f0;
+            *bc_ptr.add(t) = b0;
+        }
+        (u0, u2)
+    }
+}
+
 /// Four-lane `dst += scale * addend` for the lazy-OOD correction.
 ///
 /// # Safety

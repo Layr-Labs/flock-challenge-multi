@@ -69,6 +69,57 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// Fold adjacent pairs from `f` and `b` at `r` into `fc` and `bc`, and derive
+/// the next-round `(u0,u2)` sumcheck message statistics in the same pass.
+///
+/// Computes:
+///   `fc[t] = f[2j] + r·(f[2j] + f[2j+1])`
+///   `bc[t] = b[2j] + r·(b[2j] + b[2j+1])`
+///   `u0 = Σ fc[2k] · bc[2k]`
+///   `u2 = Σ (fc[2k] + fc[2k+1]) · (bc[2k] + bc[2k+1])`
+/// where `j = base + t`.
+///
+/// On AVX-512+VPCLMUL, each 8-element source block from `f` and `b` is loaded
+/// once, folded, stored to `fc` and `bc`, and accumulated into unreduced
+/// VPCLMUL message accumulators with a single mod-p reduction per chunk.
+#[inline]
+pub(crate) fn fold_two_and_msg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    assert_eq!(fc.len(), bc.len(), "destination slices must have equal length");
+    assert!(
+        base <= f.len() / 2 && fc.len() <= f.len() / 2 - base,
+        "fold source f must contain both elements for every destination pair"
+    );
+    assert!(
+        base <= b.len() / 2 && bc.len() <= b.len() / 2 - base,
+        "fold source b must contain both elements for every destination pair"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees avx512f+vpclmulqdq; bounds checks
+    // guarantee valid source and destination ranges.
+    unsafe {
+        return x86_64::fold_two_and_msg(f, b, base, fc, bc, r);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    portable::fold_two_and_msg(f, b, base, fc, bc, r)
+}
+
 /// Ranked default routes DirectFold8 factor-state binds through the AVX-512
 /// `fold_pairs` permute plus deferred `WideGhashX4` message accumulate.
 /// `FLOCK_NO_OPEN_FOLD8_BIND_X4=1` restores the compact scalar scan. Read once
@@ -436,6 +487,88 @@ mod tests {
             assert_eq!(got, want, "message n={n}");
             assert_eq!(f_got, f_want, "folded f n={n}");
             assert_eq!(b_got, b_want, "folded b n={n}");
+        }
+    }
+
+    /// `fold_two_and_msg` matches the portable reference and separate reference
+    /// folds across zero, one, alignment boundaries, nonzero bases, randomized lengths,
+    /// output slices, and both message fields.
+    #[test]
+    fn fold_two_and_msg_matches_portable_differential() {
+        use super::*;
+        let mut state = 0x89AB_CDEF_0123_4567_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut draw_f128 = || F128 {
+            lo: next(),
+            hi: next(),
+        };
+
+        // Zero, one, tiny, unaligned, and vector-aligned lengths with various bases.
+        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256, 1024, 2048] {
+            for base in [0usize, 1, 2, 3, 4, 7, 16] {
+                let total_src = 2 * (base + n) + 8;
+                let f_full: Vec<F128> = (0..total_src).map(|_| draw_f128()).collect();
+                let b_full: Vec<F128> = (0..total_src).map(|_| draw_f128()).collect();
+                let r = draw_f128();
+
+                // Test with various slice alignment offsets (0..4).
+                for offset in [0usize, 1, 2, 3] {
+                    let f_slice = &f_full[offset..];
+                    let b_slice = &b_full[offset..];
+
+                    let mut fc_got = vec![F128::ZERO; n + offset];
+                    let mut bc_got = vec![F128::ZERO; n + offset];
+                    let mut fc_want = vec![F128::ZERO; n + offset];
+                    let mut bc_want = vec![F128::ZERO; n + offset];
+
+                    let got = fold_two_and_msg(
+                        f_slice,
+                        b_slice,
+                        base,
+                        &mut fc_got[offset..offset + n],
+                        &mut bc_got[offset..offset + n],
+                        r,
+                    );
+                    let want = portable::fold_two_and_msg(
+                        f_slice,
+                        b_slice,
+                        base,
+                        &mut fc_want[offset..offset + n],
+                        &mut bc_want[offset..offset + n],
+                        r,
+                    );
+
+                    assert_eq!(got, want, "message mismatch n={n} base={base} offset={offset}");
+                    assert_eq!(fc_got, fc_want, "fc mismatch n={n} base={base} offset={offset}");
+                    assert_eq!(bc_got, bc_want, "bc mismatch n={n} base={base} offset={offset}");
+
+                    // Parity against separate reference folds + independent message calculation.
+                    let mut fc_ref = vec![F128::ZERO; n];
+                    let mut bc_ref = vec![F128::ZERO; n];
+                    fold_pairs(f_slice, base, &mut fc_ref, r);
+                    fold_pairs(b_slice, base, &mut bc_ref, r);
+                    let mut u0_ref = F128::ZERO;
+                    let mut u2_ref = F128::ZERO;
+                    let mut k = 0;
+                    while k + 1 < n {
+                        let f0 = fc_ref[k];
+                        let f1 = fc_ref[k + 1];
+                        let b0 = bc_ref[k];
+                        let b1 = bc_ref[k + 1];
+                        u0_ref += f0 * b0;
+                        u2_ref += (f0 + f1) * (b0 + b1);
+                        k += 2;
+                    }
+                    assert_eq!(got, (u0_ref, u2_ref), "reference message mismatch n={n} base={base} offset={offset}");
+                    assert_eq!(&fc_got[offset..offset + n], &fc_ref[..], "reference fc mismatch n={n}");
+                    assert_eq!(&bc_got[offset..offset + n], &bc_ref[..], "reference bc mismatch n={n}");
+                }
+            }
         }
     }
 
