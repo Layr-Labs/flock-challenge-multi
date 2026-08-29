@@ -224,6 +224,34 @@ pub(crate) fn fold_pairs_with_scaled_addend(
     }
 }
 
+/// Ranked default software-pipelines `fold4_nested`'s 4-wide loads: preload
+/// the next 16-source / 4-dest group while the current group's three
+/// `ghash_mul_x4_split` cover CLMUL latency.
+/// `FLOCK_NO_F128_FOLD4_PIPE=1` restores the serial loop. Default ON.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn fold4_pipe_enabled() -> bool {
+    #[cfg(test)]
+    if FOLD4_PIPE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F128_FOLD4_PIPE").is_none());
+    *ON
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) static FOLD4_PIPE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Nested pair-fold of adjacent 4-tuples: `r0` then `r1`, even/odd pairing.
 ///
 /// `dst[t] = low + r1·(low+high)` where
@@ -670,7 +698,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let src: Vec<F128> = (0..44)
+        let src: Vec<F128> = (0..128)
             .map(|_| F128 {
                 lo: next(),
                 hi: next(),
@@ -684,7 +712,7 @@ mod tests {
             lo: next(),
             hi: next(),
         };
-        for n in [1usize, 3, 4, 5, 7, 8, 11] {
+        for n in [1usize, 3, 4, 5, 7, 8, 11, 16, 32] {
             let mut got = vec![F128::ZERO; n];
             let mut portable_got = vec![F128::ZERO; n];
             fold4_nested(&src[..4 * n], &mut got, r0, r1);
@@ -706,6 +734,15 @@ mod tests {
             fold_pairs(&src[..4 * n], 0, &mut mid, r0);
             fold_pairs(&mid, 0, &mut via_pairs, r1);
             assert_eq!(got, via_pairs, "two-pass pairs n={n}");
+            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            {
+                use std::sync::atomic::Ordering;
+                let mut serial = vec![F128::ZERO; n];
+                super::FOLD4_PIPE_TEST_OFF.store(true, Ordering::Relaxed);
+                fold4_nested(&src[..4 * n], &mut serial, r0, r1);
+                super::FOLD4_PIPE_TEST_OFF.store(false, Ordering::Relaxed);
+                assert_eq!(got, serial, "fold4 pipe vs serial n={n}");
+            }
         }
     }
 }

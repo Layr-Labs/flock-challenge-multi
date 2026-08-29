@@ -161,36 +161,65 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
         let r1_x64 = ghash_shift64_x4(r1_bcast);
         let lanes = dst.len() & !3;
         let mut t = 0;
-        while t < lanes {
-            let s = 4 * t;
-            let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
-            let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
-            let v2 = _mm512_loadu_si512(src.as_ptr().add(s + 8) as *const __m512i);
-            let v3 = _mm512_loadu_si512(src.as_ptr().add(s + 12) as *const __m512i);
+        let fold4_group = |v0: __m512i, v1: __m512i, v2: __m512i, v3: __m512i| {
+            // Closures do not inherit `unsafe` from the enclosing 2024 body.
+            unsafe {
+                // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
+                let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
+                let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
+                let mid01 = _mm512_xor_si512(
+                    even01,
+                    ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
+                );
+                let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
+                let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
+                let mid23 = _mm512_xor_si512(
+                    even23,
+                    ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
+                );
 
-            // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
-            let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
-            let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
-            let mid01 = _mm512_xor_si512(
-                even01,
-                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
-            );
-            let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
-            let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
-            let mid23 = _mm512_xor_si512(
-                even23,
-                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
-            );
-
-            // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
-            let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
-            let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
-            let out = _mm512_xor_si512(
-                low,
-                ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
-            );
+                // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
+                let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
+                let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
+                _mm512_xor_si512(
+                    low,
+                    ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
+                )
+            }
+        };
+        if super::fold4_pipe_enabled() && lanes >= 8 {
+            let mut v0 = _mm512_loadu_si512(src.as_ptr() as *const __m512i);
+            let mut v1 = _mm512_loadu_si512(src.as_ptr().add(4) as *const __m512i);
+            let mut v2 = _mm512_loadu_si512(src.as_ptr().add(8) as *const __m512i);
+            let mut v3 = _mm512_loadu_si512(src.as_ptr().add(12) as *const __m512i);
+            while t + 8 <= lanes {
+                let nsrc = src.as_ptr().add(4 * (t + 4));
+                let nv0 = _mm512_loadu_si512(nsrc as *const __m512i);
+                let nv1 = _mm512_loadu_si512(nsrc.add(4) as *const __m512i);
+                let nv2 = _mm512_loadu_si512(nsrc.add(8) as *const __m512i);
+                let nv3 = _mm512_loadu_si512(nsrc.add(12) as *const __m512i);
+                let out = fold4_group(v0, v1, v2, v3);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+                v0 = nv0;
+                v1 = nv1;
+                v2 = nv2;
+                v3 = nv3;
+                t += 4;
+            }
+            let out = fold4_group(v0, v1, v2, v3);
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
             t += 4;
+        } else {
+            while t < lanes {
+                let s = 4 * t;
+                let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
+                let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
+                let v2 = _mm512_loadu_si512(src.as_ptr().add(s + 8) as *const __m512i);
+                let v3 = _mm512_loadu_si512(src.as_ptr().add(s + 12) as *const __m512i);
+                let out = fold4_group(v0, v1, v2, v3);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+                t += 4;
+            }
         }
         while t < dst.len() {
             let a0 = src[4 * t];
