@@ -330,6 +330,179 @@ mod tests {
         }
     }
 
+    /// Isolate every bank and output slot. Distinct full-field weights make
+    /// a swapped pair limb observable even when the other source bank is zero.
+    #[test]
+    fn fold16_banked_one_hot_bank_and_slot() {
+        use super::*;
+
+        let w: [F128; 16] = core::array::from_fn(|b| F128 {
+            lo: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(2 * b as u64 + 1),
+            hi: 0xd1b5_4a32_d192_ed03u64.rotate_left(3 * b as u32),
+        });
+        let dirty = F128 {
+            lo: 0xa55a_0123_4567_89ab,
+            hi: 0xfedc_ba98_7654_3210,
+        };
+        for n in [4usize, 5, 7, 8] {
+            for bank in 0..16 {
+                for slot in 0..n {
+                    let value = F128 {
+                        lo: 0x8000_0000_0000_0001u64.rotate_left((bank + slot) as u32),
+                        hi: 0xf00d_1234_5678_9abcu64 ^ ((16 * slot + bank) as u64),
+                    };
+                    let mut src = vec![F128::ZERO; 16 * n];
+                    src[16 * slot + bank] = value;
+                    let mut got = vec![dirty; n];
+                    fold16_banked(&src, &mut got, &w);
+                    for (t, &actual) in got.iter().enumerate() {
+                        let want = if t == slot {
+                            w[bank] * value
+                        } else {
+                            F128::ZERO
+                        };
+                        assert_eq!(actual, want, "n={n} bank={bank} slot={slot} t={t}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Low-only, high-only, zero diagonal, and reduction-boundary products
+    /// exercise the unreduced L/H/D representation independently in each lane.
+    #[test]
+    fn fold16_banked_limb_and_reduction_boundaries() {
+        use super::*;
+
+        let patterns = [
+            F128::ZERO,
+            F128::ONE,
+            F128 { lo: 2, hi: 0 },
+            F128 {
+                lo: 1 << 62,
+                hi: 0,
+            },
+            F128 {
+                lo: 1 << 63,
+                hi: 0,
+            },
+            F128 { lo: 0, hi: 1 },
+            F128 {
+                lo: 0,
+                hi: 1 << 62,
+            },
+            F128 {
+                lo: 0,
+                hi: 1 << 63,
+            },
+            F128 { lo: 1, hi: 1 },
+            F128 {
+                lo: 1 << 63,
+                hi: 1 << 63,
+            },
+            F128 {
+                lo: u64::MAX,
+                hi: 0,
+            },
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            F128 {
+                lo: 0x0123_4567_89ab_cdef,
+                hi: 0xfedc_ba98_7654_3210,
+            },
+        ];
+        let dirty = F128 {
+            lo: 0xdead,
+            hi: 0xbeef,
+        };
+        for bank in 0..16 {
+            for (xi, &x) in patterns.iter().enumerate() {
+                let lanes = [
+                    x,
+                    F128 { lo: x.hi, hi: x.lo },
+                    F128 { lo: x.lo, hi: x.lo },
+                    F128 { lo: x.hi, hi: x.hi },
+                ];
+                let mut src = [F128::ZERO; 64];
+                for (slot, &value) in lanes.iter().enumerate() {
+                    src[16 * slot + bank] = value;
+                }
+                for (yi, &y) in patterns.iter().enumerate() {
+                    let mut w = [F128::ZERO; 16];
+                    w[bank] = y;
+                    let mut got = [dirty; 4];
+                    fold16_banked(&src, &mut got, &w);
+                    for slot in 0..4 {
+                        assert_eq!(
+                            got[slot],
+                            lanes[slot] * y,
+                            "bank={bank} x={xi} y={yi} slot={slot}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Include all scalar-tail lengths, SUB-sized calls, and four F128
+    /// offsets. Guards and destinations are initialized: this tests exact
+    /// output writes and stale-content independence, not uninitialized reads.
+    #[test]
+    fn fold16_banked_dirty_slices_and_tails() {
+        use super::*;
+
+        let src_guard = F128 {
+            lo: 0x0123_4567_89ab_cdef,
+            hi: 0x7654_3210_fedc_ba98,
+        };
+        let dst_guard = F128 {
+            lo: 0x8bad_f00d_dead_beef,
+            hi: 0x55aa_aa55_f0f0_0f0f,
+        };
+        let w: [F128; 16] = core::array::from_fn(|b| F128 {
+            lo: 0xd6e8_feb8_6659_fd93u64.wrapping_mul(b as u64 + 1),
+            hi: 0xa076_1d64_78bd_642fu64.rotate_left(5 * b as u32),
+        });
+        for n in [
+            0usize, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 63, 64, 65, 255, 256, 257, 1024, 1025,
+        ] {
+            for offset in 0..4 {
+                let mut src = vec![src_guard; offset + 16 * n + 4];
+                for i in 0..16 * n {
+                    let index = i as u64 + 1;
+                    src[offset + i] = F128 {
+                        lo: index.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        hi: index.rotate_left(37) ^ 0x8000_0000_0000_0087,
+                    };
+                }
+                let before = src.clone();
+                let want: Vec<F128> = (0..n)
+                    .map(|slot| {
+                        (0..16).fold(F128::ZERO, |sum, bank| {
+                            sum + w[bank] * src[offset + 16 * slot + bank]
+                        })
+                    })
+                    .collect();
+                let mut got = vec![dst_guard; offset + n + 4];
+                fold16_banked(
+                    &src[offset..offset + 16 * n],
+                    &mut got[offset..offset + n],
+                    &w,
+                );
+                assert_eq!(
+                    &got[offset..offset + n],
+                    want.as_slice(),
+                    "n={n} offset={offset}"
+                );
+                assert!(got[..offset].iter().all(|&value| value == dst_guard));
+                assert!(got[offset + n..].iter().all(|&value| value == dst_guard));
+                assert_eq!(src, before, "source changed: n={n} offset={offset}");
+            }
+        }
+    }
+
     /// The PCS open-phase materializers hand these two folds a RECYCLED
     /// destination (`crate::scratch::LocalBuf`), so both must write every
     /// output slot before reading it — the result may not depend on what an
@@ -712,8 +885,9 @@ mod tests {
 
 /// Sixteen-bank weighted fold: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
-/// AVX-512: deferred-reduction kernel (one reduce per output lane). Other
-/// targets: the straightforward reduced form. Same field element either way.
+/// AVX-512: paired-bank Karatsuba with one deferred reduction per output
+/// lane. Other targets: the straightforward reduced form. Same field element
+/// either way.
 #[inline]
 pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     assert_eq!(

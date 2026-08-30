@@ -471,6 +471,27 @@ impl Round1AbInner {
         self.ranked_one_rows_elided
     }
 
+    /// Restore dense AB when a consumer cannot add the identity-C one rows.
+    /// This is a cold fallback for representation/consumer gate mismatches;
+    /// the ranked identity-C path never calls it.
+    pub(crate) fn restore_full_if_ranked_one_rows_elided(
+        &mut self,
+        a_packed: &[u8],
+        b_packed: &[u8],
+        inv_table: &InvNttTableByteSingleGf8,
+    ) {
+        if !self.ranked_one_rows_elided {
+            return;
+        }
+        // Validate before the existing prefix repair reaches raw kernels.
+        assert_eq!(a_packed.len(), self.len_bytes());
+        assert_eq!(b_packed.len(), self.len_bytes());
+        assert_eq!(inv_table.k, K_SKIP);
+        self.invalid_prefix_bytes = self.len_bytes();
+        self.fill_invalid_prefix(a_packed, b_packed, inv_table);
+        self.ranked_one_rows_elided = false;
+    }
+
     /// Declare the leading `bytes` of the storage unwritten (the producer
     /// skipped them because round 1's GPU share covers those x_hi windows
     /// from raw a/b). Round 1 recomputes them on CPU if the GPU share
@@ -938,6 +959,7 @@ pub struct Round1AbWindowPlan {
     bstatic: Option<&'static kernels::BstaticPartials>,
     kernel: kernels::ShiftReducePlan,
     nt: u8,
+    bcomplement: bool,
 }
 
 impl Round1AbWindowPlan {
@@ -999,10 +1021,51 @@ pub fn prepare_round1_ab_window_plan(
     } else {
         0
     };
+    let kernel = kernels::prepare_shift_reduce(inv_table);
     Round1AbWindowPlan {
         bstatic: kernels::prepare_bstatic(inv_table),
-        kernel: kernels::prepare_shift_reduce(inv_table),
+        kernel,
         nt,
+        bcomplement: prepare_round1_bcomplement(inv_table, kernel),
+    }
+}
+
+/// The complement identity is checked against this exact table, once per
+/// streaming buffer, not inferred from the BLAKE3 layout or a cached pointer.
+/// The hot leaf additionally verifies every byte it intends to omit.
+fn prepare_round1_bcomplement(
+    inv_table: &InvNttTableByteSingleGf8,
+    kernel: kernels::ShiftReducePlan,
+) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT").is_none())
+            || !kernels::shift_reduce_offsets_eligible(kernel, false, 2)
+            || inv_table.k != 6
+            || inv_table.ell != 64
+            || inv_table.n_chunks != 8
+        {
+            return false;
+        }
+        let mut ones_image = [F8::ZERO; 64];
+        inv_table.apply(&[u8::MAX; 8], &mut ones_image);
+        ones_image.iter().all(|value| *value == F8::ONE)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (inv_table, kernel);
+        false
     }
 }
 
@@ -1198,6 +1261,120 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
     )))]
     unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
 }
+
+/// Try the value-guarded complement projection for a ranked mixed-B window.
+/// On success this writes the same complete 64-byte result as the original
+/// offset kernel, restricted to the original K positions selected by `keep`.
+/// On failure it writes nothing: the caller must use the original kernel with
+/// the SAME `keep`, including the residual windows' omitted complete-one rows.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`]. For an enabled plan
+/// and supported `(blk, keep)`, `b_raw` addresses this window's packed B bytes,
+/// matching the B offsets in `off`. Every selected K row has eight initialized,
+/// readable bytes; unselected rows need not be read. Supported masks are `0xff`,
+/// or `0xfc` for block 2, or `0x0f` for block 29. `imgs` belongs to the same
+/// table from which `plan` was prepared. The offsets are never modified.
+/// A disabled plan or unsupported `(blk, keep)` returns false before reading
+/// `b_raw`; in those cases only, that raw pointer need not be readable.
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    b_raw: *const u8,
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+    keep: u8,
+) -> bool {
+    // Offset/table/feature eligibility was frozen in the buffer plan. Do not
+    // re-enter the offset-arena switch for each of its millions of windows.
+    if !plan.bcomplement {
+        return false;
+    }
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        return kernels::x86_64_bcomplement::try_shift_reduce_bcomplement_offw_nt2(
+            off.as_ptr(),
+            b_raw,
+            out,
+            (imgs.0, imgs.1),
+            blk,
+            keep,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    false
+}
+
+/// Full-window twin of [`round1_ab_inner_window_from_offsets_nt2_bcomplement`]
+/// for an inlined producer that already loaded this same window's packed B
+/// bytes. The value is checked with the original runtime byte guard, not
+/// trusted as a mask certificate. No raw B memory is read by this entry point.
+///
+/// Success writes the same complete 64-byte result as the original dense NT2
+/// offset kernel. Failure leaves `out` untouched and requires that same dense
+/// fallback. Residual KEEP=fc/0f windows must use the original interfaces.
+/// This entry point is always-inline so the ranked producer can keep the B
+/// value inside its existing outlined octa consumer.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`]. `b_value` contains all
+/// 64 initialized packed B bytes, in their original byte order, from the SAME
+/// window as `off`: B offset i equals B byte i shifted left by six. `imgs`
+/// belongs to the exact table from which `plan` was prepared.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[inline(always)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_preloaded(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    b_value: core::arch::x86_64::__m512i,
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) -> bool {
+    if !plan.bcomplement {
+        return false;
+    }
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    unsafe {
+        kernels::x86_64_bcomplement::try_shift_reduce_bcomplement_offw_nt2_preloaded(
+            off.as_ptr(),
+            b_value,
+            out,
+            (imgs.0, imgs.1),
+            blk,
+        )
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+mod bcomplement_tests;
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
@@ -4694,6 +4871,42 @@ mod tests {
             full.as_bytes_mut(),
             "fill_invalid_prefix drifted from the standalone precompute"
         );
+    }
+
+    #[test]
+    fn one_rows_fallback_restores_dense_storage() {
+        const BYTES: usize = 2048;
+        let mut rng = Rng::new(0x0A8D_E115);
+        let a = pack_bits(&rng.bits(BYTES * 8));
+        let b = pack_bits(&rng.bits(BYTES * 8));
+        let inv_table = make_inv_table();
+        let mut expected = vec![0u8; BYTES];
+        precompute_round1_ab_inner_windows(&a, &b, &mut expected, &inv_table, false);
+
+        let mut residual = Round1AbInner::take_uninit(BYTES);
+        residual.as_bytes_mut().fill(0xA5);
+        residual.set_ranked_one_rows_elided();
+        residual.restore_full_if_ranked_one_rows_elided(&a, &b, &inv_table);
+        assert!(!residual.ranked_one_rows_elided());
+        assert_eq!(residual.invalid_prefix_bytes(), 0);
+        assert_eq!(residual.as_bytes(), expected.as_slice());
+
+        // A dense object keeps its ordinary invalid-prefix contract. The
+        // residual repair must not touch it or require raw input slices.
+        residual.as_bytes_mut().fill(0x5A);
+        residual.set_invalid_prefix_bytes(1024);
+        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
+        assert_eq!(residual.invalid_prefix_bytes(), 1024);
+        assert!(residual.as_bytes().iter().all(|byte| *byte == 0x5A));
+    }
+
+    #[test]
+    #[should_panic]
+    fn one_rows_fallback_rejects_wrong_raw_extent() {
+        let inv_table = make_inv_table();
+        let mut residual = Round1AbInner::take_uninit(1024);
+        residual.set_ranked_one_rows_elided();
+        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
     }
 
     /// Round 1 with a producer-skipped (invalid) ab_inner prefix must be

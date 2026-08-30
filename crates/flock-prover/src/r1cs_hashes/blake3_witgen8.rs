@@ -29,6 +29,22 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
+#[cfg(all(
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use flock_core::zerocheck::univariate_skip_optimized::{
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_preloaded,
+};
+#[cfg(not(all(
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+)))]
+use flock_core::zerocheck::univariate_skip_optimized::{
+    round1_ab_inner_window_from_offsets_nt2_bcomplement,
+};
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -603,6 +619,9 @@ impl StreamProj<'_> {
     /// and every half-row is live with wide non-temporal publication. Keeping
     /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
     /// policy branch and the generic row publisher from the measured path.
+    /// The complement body inlines into this existing octa boundary, retaining
+    /// publish-then-project pacing. Residual windows keep their independent
+    /// weighted-product leaves instead of acquiring a Horner dependency chain.
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
@@ -619,9 +638,21 @@ impl StreamProj<'_> {
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
+                #[cfg(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw"))]
+                let b_value=rows.publish_dense_b(j,sa,sb);
+                #[cfg(not(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw")))]
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                let block_off=&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>();
+                // The exact B register just published is consumed by the
+                // unchanged guard, then dies before the projection arithmetic.
+                #[cfg(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw"))]
+                let projected=round1_ab_inner_window_from_offsets_nt2_bcomplement_preloaded(block_off,b_value,out,plan,imgs,blk);
+                #[cfg(not(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw")))]
+                let projected=round1_ab_inner_window_from_offsets_nt2_bcomplement(block_off,sb.add(j*STEP_WORDS).cast::<u8>(),out,plan,imgs,blk,0xff);
+                if !projected {
+                    round1_ab_inner_window_from_offsets_nt2(block_off,out,plan,imgs);
+                }
                 j+=1;
             }
         }
@@ -1214,19 +1245,15 @@ impl RankedRows {
     #[inline(always)]
     unsafe fn publish_dense(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
-            let o = j * U32_PER_BLOCK;
-            let ap = sa.add(j * STEP_WORDS);
-            let bp = sb.add(j * STEP_WORDS);
             #[cfg(target_feature = "avx512f")]
             {
-                let av = _mm512_load_si512(ap.cast::<__m512i>());
-                let bv = _mm512_load_si512(bp.cast::<__m512i>());
-                stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
-                stream_ranked_line(self.a.add(o), av);
-                stream_ranked_line(self.b.add(o), bv);
+                let _ = self.publish_dense_b(j, sa, sb);
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
+                let o = j * U32_PER_BLOCK;
+                let ap = sa.add(j * STEP_WORDS);
+                let bp = sb.add(j * STEP_WORDS);
                 let a_lo = load_v8(ap);
                 let a_hi = load_v8(ap.add(8));
                 let b_lo = load_v8(bp);
@@ -1235,6 +1262,27 @@ impl RankedRows {
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
                 stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
             }
+        }
+    }
+
+    /// Publish the same three lines and retain the actual packed B value for
+    /// this row's immediately following guard. Staging and all destinations
+    /// are disjoint, and the original aligned full-line loads are unchanged.
+    /// This always inlines inside the existing per-octa projection boundary;
+    /// the returned vector is not carried between j iterations or into Horner.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_dense_b(&self, j: usize, sa: *const u32, sb: *const u32) -> __m512i {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            let ap = sa.add(j * STEP_WORDS);
+            let bp = sb.add(j * STEP_WORDS);
+            let av = _mm512_load_si512(ap.cast::<__m512i>());
+            let bv = _mm512_load_si512(bp.cast::<__m512i>());
+            stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+            stream_ranked_line(self.a.add(o), av);
+            stream_ranked_line(self.b.add(o), bv);
+            bv
         }
     }
 
@@ -2188,6 +2236,79 @@ mod tests {
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
                 let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
                 assert_eq!(got, expected, "block {block}");
+            }
+        }
+    }
+
+    /// Each current-j value is also the B row actually published. The leading
+    /// and trailing lines, all other blocks and the rest of this block stay
+    /// untouched. Both the returning and discard-return publishers are checked.
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn ranked_dense_publisher_returns_same_j_b_and_preserves_other_rows() {
+        const GUARD_WORDS: usize = STEP_WORDS;
+        const DEST_WORDS: usize = 2 * GUARD_WORDS + 8 * U32_PER_BLOCK;
+        const SENTINEL: u32 = 0xdead_beef;
+        #[repr(C, align(64))]
+        struct Stage([u32; 8 * STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct Dest([u32; DEST_WORDS]);
+
+        let sa = Stage(core::array::from_fn(|i| {
+            0x1357_0000 | (((i / STEP_WORDS) as u32) << 8) | (i % STEP_WORDS) as u32
+        }));
+        let sb = Stage(core::array::from_fn(|i| {
+            0x8000_0080 | (((7 - i / STEP_WORDS) as u32) << 16) | (((i % STEP_WORDS) as u32) << 8)
+        }));
+        let saved_a = sa.0;
+        let saved_b = sb.0;
+        for blk in [3usize, 28] {
+            for j in 0..8 {
+                for return_b in [false, true] {
+                    let mut z = Dest([SENTINEL; DEST_WORDS]);
+                    let mut a = Dest([SENTINEL; DEST_WORDS]);
+                    let mut b = Dest([SENTINEL; DEST_WORDS]);
+                    let base = GUARD_WORDS + blk * STEP_WORDS;
+                    let mut actual_b = [0u32; STEP_WORDS];
+                    // SAFETY: all stage rows and target lines are initialized,
+                    // 64-byte aligned, and independently owned. Each target
+                    // has all eight full block strides plus bounding sentinels.
+                    unsafe {
+                        let rows = RankedRows::new(
+                            z.0.as_mut_ptr().add(base),
+                            a.0.as_mut_ptr().add(base),
+                            b.0.as_mut_ptr().add(base),
+                        );
+                        if return_b {
+                            let value = rows.publish_dense_b(j, sa.0.as_ptr(), sb.0.as_ptr());
+                            _mm512_storeu_si512(actual_b.as_mut_ptr().cast::<__m512i>(), value);
+                        } else {
+                            rows.publish_dense(j, sa.0.as_ptr(), sb.0.as_ptr());
+                        }
+                        _mm_sfence();
+                    }
+                    if return_b {
+                        assert_eq!(&actual_b, &sb.0[j * STEP_WORDS..(j + 1) * STEP_WORDS]);
+                    }
+                    let row_start = base + j * U32_PER_BLOCK;
+                    for word in 0..DEST_WORDS {
+                        let expected = if (row_start..row_start + STEP_WORDS).contains(&word) {
+                            let source = j * STEP_WORDS + word - row_start;
+                            let av = sa.0[source];
+                            let bv = sb.0[source];
+                            [av & bv, av, bv]
+                        } else {
+                            [SENTINEL; 3]
+                        };
+                        assert_eq!(
+                            [z.0[word], a.0[word], b.0[word]],
+                            expected,
+                            "blk={blk} j={j} word={word} returning={return_b}"
+                        );
+                    }
+                    assert_eq!(sa.0, saved_a);
+                    assert_eq!(sb.0, saved_b);
+                }
             }
         }
     }
