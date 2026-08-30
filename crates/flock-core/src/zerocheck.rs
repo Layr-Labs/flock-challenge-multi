@@ -138,6 +138,10 @@ pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Test-only master latch for the deep cascade extension (rounds 13..18).
+#[cfg(test)]
+pub(crate) static ZC_DEEP_CASCADE_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// `FLOCK_NO_ZC_CASCADE4=1` stops the cascade after rounds 7+8 (the incumbent
 /// frontier behavior); the default runs one more composed pass over rounds
@@ -167,6 +171,46 @@ fn cascade5_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
+}
+
+/// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted frontier's last
+/// composed pass (rounds 11+12). The default extends the exact same
+/// transcript-identical cascade through rounds 13+14, 15+16 and 17+18 when
+/// geometry and non-zero parity weights permit. At ranked `m=32` this stops
+/// with 2^10 rows: the incumbent round-19 parallel pass and round-20-onward
+/// serial tiny tail remain completely untouched.
+#[inline]
+fn deep_cascade_off() -> bool {
+    #[cfg(test)]
+    if ZC_DEEP_CASCADE_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+}
+
+/// Number of additional composed levels after the promoted frontier's five.
+/// Geometry is checked before indexing its corresponding parity weight; the
+/// first unavailable or zero weight terminates the monotone chain and leaves
+/// all remaining rounds to the incumbent tail.
+#[inline]
+fn deep_cascade_extension_levels(
+    use_cascade5: bool,
+    n_mlv: usize,
+    r: &[F128],
+    k_skip: usize,
+    disabled: bool,
+) -> usize {
+    if !use_cascade5 || disabled {
+        return 0;
+    }
+    let mut levels = 0;
+    for (min_n_mlv, parity_offset) in [(14usize, 11usize), (16, 13), (18, 15)] {
+        if n_mlv < min_n_mlv || r[k_skip + parity_offset] == F128::ZERO {
+            break;
+        }
+        levels += 1;
+    }
+    levels
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -845,13 +889,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_cascade2 =
         use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
     let use_cascade3 = use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
-    // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain. Their
-    // parity weights r[k_skip+7] / r[k_skip+9] are sampled slots (the seven
-    // protocol constants end at k_skip+6), so they are non-zero except with
-    // probability 2⁻¹²⁸; the chain simply stops a level earlier otherwise.
-    // The n_mlv floors keep the last composed pass's input at ≥ 16 elements
-    // (level L consumes 2^(n_mlv−2L)) with a level of margin, matching the
-    // Apple track's shipped gating.
+    // Levels 3 through 7 (rounds 9+10 through 17+18) extend the same chain.
+    // Their parity weights r[k_skip+7], r[k_skip+9], ... r[k_skip+15] are
+    // sampled slots (the seven protocol constants end at k_skip+6), so they
+    // are non-zero except with probability 2⁻¹²⁸; the chain simply stops a
+    // level earlier otherwise. The n_mlv floors keep every composed pass's
+    // input at ≥ 16 elements (level L consumes 2^(n_mlv−2L)).
     //
     // Level 3 ships on (kill switch FLOCK_NO_ZC_CASCADE4): at the ranked shape
     // it turns tail rounds log_n 20 and 19 — 2.0 + 1.2 ms of rayon regions —
@@ -861,19 +904,26 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
-    let n_levels = match (
-        use_lookahead,
-        use_cascade2,
-        use_cascade3,
-        use_cascade4,
-        use_cascade5,
-    ) {
-        (false, ..) => 0,
-        (true, false, ..) => 1,
-        (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+    // One rollback gate owns the whole deep extension, so an official A/B can
+    // restore the exact promoted frontier without changing any earlier level.
+    // Each later level still has an independent zero-parity fallback through
+    // this monotone chain.
+    let deep_levels =
+        deep_cascade_extension_levels(use_cascade5, n_mlv, &r, k_skip, deep_cascade_off());
+    let n_levels = if deep_levels != 0 {
+        5 + deep_levels
+    } else if use_cascade5 {
+        5
+    } else if use_cascade4 {
+        4
+    } else if use_cascade3 {
+        3
+    } else if use_cascade2 {
+        2
+    } else if use_lookahead {
+        1
+    } else {
+        0
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -1356,12 +1406,13 @@ mod tests {
 
     /// **Lookahead / cascade transcript identity**: the two-challenge
     /// lookahead route (deferred round-3 quadratic + composed rounds-3/4
-    /// double fold) and its cascades (rounds 5+6, 7+8, 9+10, 11+12) each emit
+    /// double fold) and its cascades (rounds 5+6 through 17+18) each emit
     /// a proof and claim byte-identical to the incumbent route — dense and
-    /// BLAKE3-padded (k_log=14, useful=15409), m ∈ {13, 14, 17, 18, 19}
-    /// (n_mlv = 7 enables level 2 only, 8 three, 10 four, 12 five) — and the
-    /// full-cascade proof verifies. Each arm caps the cascade one level lower
-    /// than the previous, so every level is its own successor’s oracle.
+    /// BLAKE3-padded (k_log=14, useful=15409), m ∈
+    /// {13, 14, 17, 18, 19, 20, 22, 24}. The compact shapes exercise the
+    /// full historical rollback ladder; m=20/22/24 respectively engage the
+    /// new rounds 13+14 / 15+16 / 17+18, each against the exact promoted-
+    /// frontier cap after round 12. The full-cascade proof verifies.
     /// Toggles the test latches, not the process env.
     #[test]
     fn prove_transcript_identical_with_and_without_lookahead() {
@@ -1372,6 +1423,9 @@ mod tests {
             (17, false),
             (18, false),
             (19, false),
+            (20, false),
+            (22, false),
+            (24, false),
             (17, true),
             (18, true),
         ] {
@@ -1397,20 +1451,14 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
-            // nomat) forced-off flags.
-            let arms = [
-                (false, false, false, false, false, false), // full: nomat sweep + every level
-                (false, false, false, false, false, true),  // materializing sweep + every level
-                (false, false, false, false, true, false),  // cascade capped at level 3
-                (false, false, false, true, true, false),   // capped at level 2 (frontier)
-                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
-                (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true), // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),  // incumbent
-            ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 12 {
+            let all = if n_mlv >= 18 {
+                8
+            } else if n_mlv >= 16 {
+                7
+            } else if n_mlv >= 14 {
+                6
+            } else if n_mlv >= 12 {
                 5
             } else if n_mlv >= 10 {
                 4
@@ -1421,15 +1469,56 @@ mod tests {
             } else {
                 1
             };
-            let expect_levels = [all, all, all.min(4), all.min(3), all.min(2), 1, 1, 0];
-            let expect_nomat = [true, false, true, true, true, true, false, false];
+            // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
+            // deep-cascade, nomat) forced-off flags. Large shapes need only
+            // the new factor vs its single rollback gate; smaller shapes keep
+            // the full historical ladder as an additional oracle.
+            let (arms, expect_levels, expect_nomat) = if n_mlv > 14 {
+                (
+                    vec![
+                        (false, false, false, false, false, false, false),
+                        (false, false, false, false, false, true, false),
+                    ],
+                    vec![all, 5],
+                    vec![true, true],
+                )
+            } else {
+                (
+                    vec![
+                        (false, false, false, false, false, false, false), // full: every level
+                        (false, false, false, false, false, false, true),  // materializing sweep
+                        (false, false, false, false, false, true, false),  // promoted frontier
+                        (false, false, false, false, true, true, false),   // cap at level 4
+                        (false, false, false, true, true, true, false),    // cap at level 3
+                        (false, false, true, true, true, true, false),     // cap at level 2
+                        (false, true, true, true, true, true, false),      // lookahead only
+                        (false, true, true, true, true, true, true), // materializing lookahead
+                        (true, true, true, true, true, true, true),  // incumbent
+                    ],
+                    vec![
+                        all,
+                        all,
+                        all.min(5),
+                        all.min(4),
+                        all.min(3),
+                        all.min(2),
+                        1,
+                        1,
+                        0,
+                    ],
+                    vec![true, false, true, true, true, true, true, false, false],
+                )
+            };
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, deep_off, nm_off)) in
+                arms.iter().enumerate()
+            {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
                 ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
+                ZC_DEEP_CASCADE_FORCED_OFF.store(deep_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1449,6 +1538,7 @@ mod tests {
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_DEEP_CASCADE_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
@@ -1468,6 +1558,57 @@ mod tests {
                 .unwrap_or_else(|e| panic!("verify rejected cascade proof at m={m}: {e:?}"));
             assert_eq!(&claim_v, claim_full, "verify claim mismatch at m={m}");
         }
+    }
+
+    /// Deep levels are admitted only while both the exact table geometry and
+    /// the parity-inversion precondition hold. A zero at any new level stops
+    /// there and hands every remaining round back to the incumbent tail.
+    #[test]
+    fn deep_cascade_geometry_and_zero_parity_fallback() {
+        let mut r = vec![F128::ONE; K_SKIP + 20];
+        for &(n_mlv, expected) in &[
+            (13usize, 0usize),
+            (14, 1),
+            (16, 2),
+            (18, 3),
+            (20, 3),
+            (26, 3),
+        ] {
+            assert_eq!(
+                deep_cascade_extension_levels(true, n_mlv, &r, K_SKIP, false),
+                expected,
+                "wrong geometry limit at n_mlv={n_mlv}"
+            );
+        }
+        assert_eq!(
+            deep_cascade_extension_levels(true, 26, &r, K_SKIP, true),
+            0,
+            "rollback gate did not restore the promoted frontier"
+        );
+        assert_eq!(
+            deep_cascade_extension_levels(false, 26, &r, K_SKIP, false),
+            0,
+            "deep extension bypassed the level-5 dependency"
+        );
+
+        for (stopped_after, parity_offset) in [(0usize, 11usize), (1, 13), (2, 15)] {
+            r[K_SKIP + parity_offset] = F128::ZERO;
+            assert_eq!(
+                deep_cascade_extension_levels(true, 26, &r, K_SKIP, false),
+                stopped_after,
+                "zero parity did not stop before offset {parity_offset}"
+            );
+            r[K_SKIP + parity_offset] = F128::ONE;
+        }
+        // Offset 17 is the parity slot a rounds-19+20 extension would use.
+        // It is deliberately outside this factor: changing it cannot change
+        // the admitted level count, which pins the serial-tail boundary.
+        r[K_SKIP + 17] = F128::ZERO;
+        assert_eq!(
+            deep_cascade_extension_levels(true, 26, &r, K_SKIP, false),
+            3,
+            "rounds 19+20 leaked across the serial-tail boundary"
+        );
     }
 
     /// **Prove→verify roundtrip**: an honest proof verifies cleanly, and the

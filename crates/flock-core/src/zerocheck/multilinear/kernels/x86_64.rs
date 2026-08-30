@@ -527,6 +527,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     if all == 0xff {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The tail window's A side is single-lane too (a
+                        // static plan, verified at runtime like B): then
+                        // a0^a1 = a0^a2 = a0^a1^a2^a3 = a0, so the three
+                        // surviving accumulates share ONE widened product,
+                        // XOR'd into all three accumulators — 9 CLMULs for
+                        // the window instead of 17. Any mismatch falls
+                        // through to the incumbent three-product arm.
+                        let a0_lane0 = _mm512_maskz_mov_epi64(0x03, a0);
+                        let a_sp = _mm512_cmpeq_epi64_mask(a0, a0_lane0)
+                            & _mm512_cmpeq_epi64_mask(a1, zero)
+                            & _mm512_cmpeq_epi64_mask(a2, zero)
+                            & _mm512_cmpeq_epi64_mask(a3, zero);
                         let a1_msg = _mm512_xor_si512(a0, a1);
                         let a5_msg = _mm512_xor_si512(a0, a2);
                         let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
@@ -551,9 +563,17 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                                 ghash_mul_x4(w, b0_lane0)
                             }
                         };
-                        acc[1].mul_acc(a1_msg, wb);
-                        acc[5].mul_acc(a5_msg, wb);
-                        acc[7].mul_acc(a7_msg, wb);
+                        if a_sp == 0xff {
+                            let mut p = crate::field::gf2_128::x86_64::WideGhashX4::zero();
+                            p.mul_acc(a0_lane0, wb);
+                            acc[1].xor_acc(&p);
+                            acc[5].xor_acc(&p);
+                            acc[7].xor_acc(&p);
+                        } else {
+                            acc[1].mul_acc(a1_msg, wb);
+                            acc[5].mul_acc(a5_msg, wb);
+                            acc[7].mul_acc(a7_msg, wb);
+                        }
                         x_lo += 8;
                         continue;
                     }
