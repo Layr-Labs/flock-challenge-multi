@@ -479,7 +479,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, false>(
+            butterfly_fused_2layer_row_from_geo_impl::<false, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -490,7 +490,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
                 twiddles,
             )
         } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, false>(
+            butterfly_fused_2layer_row_from_geo_impl::<true, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -525,30 +525,24 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
 ) {
     debug_assert_eq!(num_ntts % 4, 0);
     debug_assert_eq!(dst as usize % 16, 0);
-    // SAFETY: forwarded caller contract.
+    let inner_low = !low_inner_fused2_disabled()
+        && twiddles[1].hi == 0
+        && twiddles[2].hi == 0;
+    // SAFETY: forwarded; `inner_low` is the LOW precondition on both inners.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
-        } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
+        match (mul_diet_disabled(), inner_low) {
+            (true, false) => butterfly_fused_2layer_row_from_geo_impl::<false, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (true, true) => butterfly_fused_2layer_row_from_geo_impl::<false, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_geo_impl::<true, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_geo_impl::<true, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
         }
     }
 }
@@ -559,7 +553,11 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: bool>(
+unsafe fn butterfly_fused_2layer_row_from_geo_impl<
+    const DIET: bool,
+    const NT: bool,
+    const INNER_LOW: bool,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -573,11 +571,12 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
 
     let [t_outer, t_inner_a, t_inner_b] = *twiddles;
     // SAFETY: caller guarantees target features, pointer geometry, and
-    // non-aliasing src/dst.
+    // non-aliasing src/dst. INNER_LOW requires both inner high limbs zero.
     unsafe {
+        debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
         let outer = tw_x4::<false, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
@@ -595,10 +594,10 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
             vd = _mm512_xor_si512(vd, new_b);
             vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
+            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
             vb = _mm512_xor_si512(vb, new_a);
             va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
+            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
@@ -1456,6 +1455,15 @@ fn low_outer_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
 }
 
+/// `FLOCK_NO_NTT_LOW_INNER_FUSED2=1` restores the general/diet product for
+/// both inner twiddles of the fused-two *dense* NT row-from kernel. Outer
+/// stays on the incumbent form (dense outer LOW is a different, priced site).
+#[inline]
+fn low_inner_fused2_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_INNER_FUSED2").is_some())
+}
+
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores the general twiddle product
 /// for the fused-three sweep's inner layers; `FLOCK_NO_NTT_LOW_OUTER_FUSED3=1`
 /// does the same for its outer layer.
@@ -2064,7 +2072,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_geo_impl::<true, false>(
+                        butterfly_fused_2layer_row_from_geo_impl::<true, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2075,7 +2083,7 @@ mod diet_tests {
                             &tw3,
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_geo_impl::<false, false>(
+                        butterfly_fused_2layer_row_from_geo_impl::<false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
