@@ -32,6 +32,14 @@
 
 use std::sync::OnceLock;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use core::arch::x86_64::__m512i;
+
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
@@ -960,6 +968,7 @@ pub struct Round1AbWindowPlan {
     kernel: kernels::ShiftReducePlan,
     nt: u8,
     bcomplement_static: bool,
+    bcomplement_static_x4: bool,
 }
 
 impl Round1AbWindowPlan {
@@ -968,6 +977,14 @@ impl Round1AbWindowPlan {
     #[inline]
     pub fn bcomplement_static_eligible(&self) -> bool {
         self.bcomplement_static
+    }
+
+    /// Four-lane mode-dispatch sharing is independently reversible while the
+    /// checked scalar B-complement path remains available in the same binary.
+    /// A plan which failed the original table/geometry gate can never opt in.
+    #[inline]
+    pub fn bcomplement_static_x4_eligible(&self) -> bool {
+        self.bcomplement_static_x4
     }
 
     /// This plan specialised to one medium-window index: the static-B partials
@@ -1029,11 +1046,39 @@ pub fn prepare_round1_ab_window_plan(
         0
     };
     let kernel = kernels::prepare_shift_reduce(inv_table);
+    let bcomplement_static = prepare_round1_bcomplement_static(inv_table, kernel);
     Round1AbWindowPlan {
         bstatic: kernels::prepare_bstatic(inv_table),
         kernel,
         nt,
-        bcomplement_static: prepare_round1_bcomplement_static(inv_table, kernel),
+        bcomplement_static,
+        bcomplement_static_x4: bcomplement_static && round1_bcomplement_static_x4_enabled(),
+    }
+}
+
+/// Resolve the reversible x4 policy once with the rest of the window plan,
+/// keeping environment/cache initialization out of the per-block hot path.
+fn round1_bcomplement_static_x4_enabled() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT_X4").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        false
     }
 }
 
@@ -1313,6 +1358,38 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
         target_feature = "avx512bw"
     )))]
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+/// Four consecutive ranked-static B-complement windows. Results remain in
+/// registers so the witness producer can interleave each result with that
+/// lane's existing non-temporal `z,a,b` publication.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2_bcomplement_static`];
+/// `off` points to four consecutive [`ROUND1_AB_OFF_WORDS`]-word windows.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[inline(always)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_x4(
+    off: *const u16,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) -> (__m512i, __m512i, __m512i, __m512i) {
+    debug_assert!(plan.bcomplement_static_x4_eligible());
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert!((2..=29).contains(&blk));
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_x4(
+            off,
+            (imgs.0, imgs.1),
+            blk,
+        )
+    }
 }
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
