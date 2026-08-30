@@ -17,6 +17,8 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// Submission archive marker: zarar redraw 2026-08-30 C.
+
 pub mod bits;
 pub mod challenger;
 pub mod field;
