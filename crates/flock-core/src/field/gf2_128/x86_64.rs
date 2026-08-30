@@ -556,6 +556,20 @@ impl WideGhashX4 {
             _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
     }
 
+    /// XOR another accumulator's three part-registers into this one —
+    /// exactly the effect of having issued the other's `mul_acc` calls into
+    /// `self`, so one widened product can feed several accumulators.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn xor_acc(&mut self, o: &Self) {
+        self.lo = _mm512_xor_si512(self.lo, o.lo);
+        self.mid = _mm512_xor_si512(self.mid, o.mid);
+        self.hi = _mm512_xor_si512(self.hi, o.hi);
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.

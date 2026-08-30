@@ -478,42 +478,59 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         & _mm512_cmpeq_epi64_mask(b2, one)
                         & _mm512_cmpeq_epi64_mask(b3, one);
                     if all == 0xff {
-                        let (a1w, a2w, a3w) = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            (
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                            )
-                        } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
-                                )
-                            } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
-                            }
-                        };
                         #[cfg(test)]
                         B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        acc[0].mul_acc_one(a1w);
-                        acc[2].mul_acc_one(a3w);
-                        acc[4].mul_acc_one(a2w);
+                        // Every surviving term here is `a_k · w · 1`, so the
+                        // weighted value never needs to exist as a reduced
+                        // field element: accumulate the WIDENED `a_k × w`
+                        // product straight into the accumulator instead of
+                        // reducing it and re-injecting the reduced value
+                        // through the identity path. The accumulator is
+                        // folded and reduced exactly once at the end of the
+                        // chunk and reduction is XOR-linear, so this is
+                        // bit-identical — it deletes one reduction per
+                        // surviving term (and the `x^64` companion the split
+                        // form needs) from the window.
+                        if ey_r2_reshape_enabled() {
+                            let w = if let Some(wt) = wtab {
+                                _mm512_loadu_si512(wt.as_ptr().add(x_lo) as *const __m512i)
+                            } else {
+                                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                                _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi)
+                            };
+                            acc[0].mul_acc(a1, w);
+                            acc[2].mul_acc(a3, w);
+                            acc[4].mul_acc(a2, w);
+                        } else {
+                            let (a1w, a2w, a3w) = if let Some(wt) = wtab {
+                                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                                let w = _mm512_loadu_si512(wp);
+                                let w64 = _mm512_loadu_si512(wp.add(1));
+                                (
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                                )
+                            } else {
+                                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                                if wsplit {
+                                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                    (
+                                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                                    )
+                                } else {
+                                    (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
+                                }
+                            };
+                            acc[0].mul_acc_one(a1w);
+                            acc[2].mul_acc_one(a3w);
+                            acc[4].mul_acc_one(a2w);
+                        }
                         x_lo += 8;
                         continue;
                     }
@@ -527,6 +544,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     if all == 0xff {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The tail window's A side is single-lane too (a
+                        // static plan, verified at runtime like B): then
+                        // a0^a1 = a0^a2 = a0^a1^a2^a3 = a0, so the three
+                        // surviving accumulates share ONE widened product,
+                        // XOR'd into all three accumulators — 9 CLMULs for
+                        // the window instead of 17. Any mismatch falls
+                        // through to the incumbent three-product arm.
+                        let a0_lane0 = _mm512_maskz_mov_epi64(0x03, a0);
+                        let a_sp = _mm512_cmpeq_epi64_mask(a0, a0_lane0)
+                            & _mm512_cmpeq_epi64_mask(a1, zero)
+                            & _mm512_cmpeq_epi64_mask(a2, zero)
+                            & _mm512_cmpeq_epi64_mask(a3, zero);
                         let a1_msg = _mm512_xor_si512(a0, a1);
                         let a5_msg = _mm512_xor_si512(a0, a2);
                         let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
@@ -551,9 +580,17 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                                 ghash_mul_x4(w, b0_lane0)
                             }
                         };
-                        acc[1].mul_acc(a1_msg, wb);
-                        acc[5].mul_acc(a5_msg, wb);
-                        acc[7].mul_acc(a7_msg, wb);
+                        if a_sp == 0xff && ey_r2_reshape_enabled() {
+                            let mut p = crate::field::gf2_128::x86_64::WideGhashX4::zero();
+                            p.mul_acc(a0_lane0, wb);
+                            acc[1].xor_acc(&p);
+                            acc[5].xor_acc(&p);
+                            acc[7].xor_acc(&p);
+                        } else {
+                            acc[1].mul_acc(a1_msg, wb);
+                            acc[5].mul_acc(a5_msg, wb);
+                            acc[7].mul_acc(a7_msg, wb);
+                        }
                         x_lo += 8;
                         continue;
                     }
@@ -1330,6 +1367,18 @@ pub(crate) static B_SPARSE_HITS: std::sync::atomic::AtomicUsize =
 pub(crate) fn zc_b_ones_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_ONES").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_EY_R2_RESHAPE=1` restores the incumbent arithmetic inside the
+/// two specialized round-two windows — the sparse tail's three separate
+/// products and the all-ones head's reduced-then-inject form — while both
+/// windows keep firing. Same binary, same windows, only the product
+/// bookkeeping differs.
+#[inline]
+fn ey_r2_reshape_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_R2_RESHAPE").is_none());
     *ON
 }
 

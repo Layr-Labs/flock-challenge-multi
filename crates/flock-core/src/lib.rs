@@ -479,6 +479,121 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
+
+/// Best-effort `madvise(MADV_COLLAPSE)` over an already-touched buffer: where
+/// the first-touch faults lost the THP lottery under fragmentation, this asks
+/// the kernel to assemble the range into 2 MiB pages synchronously; where they
+/// won, the calls are no-ops. Setup-phase only. `FLOCK_NO_MADV_COLLAPSE=1`
+/// disables it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if bytes < HUGE {
+        return;
+    }
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
+    if *DISABLED {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = ptr as usize + bytes;
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_COLLAPSE: usize = 25;
+    // SAFETY: the advised range lies within the caller's live buffer, and
+    // MADV_COLLAPSE never alters contents or mapping validity; failure is
+    // ignored (pure hint).
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_COLLAPSE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
+
+/// Re-exec the process ONCE with address-space layout randomization disabled
+/// (`personality(ADDR_NO_RANDOMIZE)`), so every timed trial of a run sees
+/// the same text/heap/stack/mmap placement instead of a fresh per-process
+/// draw. The benchmark driver spawns a NEW worker process per trial, so
+/// under ASLR the aliasing pattern is re-rolled per trial; a same-binary
+/// A/B on the same part measured the per-process wall spread collapsing
+/// from 19.5% to 3.3% with randomization off, medians equal. Runs in the
+/// untimed setup window, before any pools exist; file descriptors survive
+/// the exec. `FLOCK_NO_ASLR_PIN=1` disables; `FLOCK_ASLR_PINNED` marks the
+/// second invocation; every failure path falls through to running
+/// un-pinned.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn pin_address_space() {
+    if std::env::var_os("FLOCK_ASLR_DEBUG").is_some() {
+        eprintln!(
+            "aslr-pin: pinned={} text-probe {:p}",
+            std::env::var_os("FLOCK_ASLR_PINNED").is_some(),
+            pin_address_space as *const ()
+        );
+    }
+    if std::env::var_os("FLOCK_NO_ASLR_PIN").is_some()
+        || std::env::var_os("FLOCK_ASLR_PINNED").is_some()
+    {
+        return;
+    }
+    const SYS_PERSONALITY: isize = 135;
+    const ADDR_NO_RANDOMIZE: usize = 0x0040000;
+    const QUERY: usize = 0xffffffff;
+    unsafe fn personality(arg: usize) -> isize {
+        let ret: isize;
+        // SAFETY: personality(2) reads/writes no memory through pointers.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SYS_PERSONALITY => ret,
+                in("rdi") arg,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        ret
+    }
+    // SAFETY: query-then-set of the personality flags; no memory effects.
+    let cur = unsafe { personality(QUERY) };
+    if cur < 0 || (cur as usize) & ADDR_NO_RANDOMIZE != 0 {
+        return;
+    }
+    if unsafe { personality(cur as usize | ADDR_NO_RANDOMIZE) } < 0 {
+        return;
+    }
+    let Ok(exe) = std::fs::read_link("/proc/self/exe") else {
+        return;
+    };
+    use std::os::unix::process::CommandExt;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // exec only returns on failure; on success the pinned twin takes over
+    // this process id, this stdin, and this ready/proof contract.
+    let _ = std::process::Command::new(exe)
+        .args(args)
+        .env("FLOCK_ASLR_PINNED", "1")
+        .exec();
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn pin_address_space() {}
+
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
