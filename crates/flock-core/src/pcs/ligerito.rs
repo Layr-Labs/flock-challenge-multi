@@ -4416,13 +4416,13 @@ fn fold_and_msg_lsb_inner(
             }
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
             if let Some((basis, alpha)) = deferred_basis {
+                crate::field::f128_slice::fold_pairs(f, base, fc, r);
                 crate::field::f128_slice::fold_pairs_with_scaled_addend(
                     b, basis, base, bc, r, alpha,
                 );
             } else {
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
+                crate::field::f128_slice::fold_pairs_dual(f, b, base, fc, bc, r);
             }
             if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
                 let scale = gamma * eq_hi[ci];

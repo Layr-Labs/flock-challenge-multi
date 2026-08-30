@@ -69,6 +69,62 @@ pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     portable::fold_pairs(src, base, dst, r);
 }
 
+/// `FLOCK_NO_OPEN_FOLD_PAIRS_DUAL=1` restores two separate [`fold_pairs`]
+/// calls for the f and b streams. Ranked env is cleared, so the dual leaf
+/// runs.
+fn fold_pairs_dual_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FOLD_PAIRS_DUAL").is_none());
+    *ON
+}
+
+/// Fold adjacent pairs of two independent streams at the same `r`.
+///
+/// Byte-identical to `fold_pairs(src_a, …)` then `fold_pairs(src_b, …)`.
+/// The AVX-512 leaf shares the `r` broadcast and issues both products in
+/// one loop so two CLMUL chains cover each other's latency.
+#[inline]
+pub(crate) fn fold_pairs_dual(
+    src_a: &[F128],
+    src_b: &[F128],
+    base: usize,
+    dst_a: &mut [F128],
+    dst_b: &mut [F128],
+    r: F128,
+) {
+    assert_eq!(dst_a.len(), dst_b.len());
+    if !fold_pairs_dual_enabled() {
+        fold_pairs(src_a, base, dst_a, r);
+        fold_pairs(src_b, base, dst_b, r);
+        return;
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate plus the same pair-coverage assert as [`fold_pairs`].
+    unsafe {
+        assert!(
+            base <= src_a.len() / 2
+                && dst_a.len() <= src_a.len() / 2 - base
+                && base <= src_b.len() / 2
+                && dst_b.len() <= src_b.len() / 2 - base,
+            "dual fold source must contain both elements for every destination pair"
+        );
+        x86_64::fold_pairs_dual(src_a, src_b, base, dst_a, dst_b, r);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        fold_pairs(src_a, base, dst_a, r);
+        fold_pairs(src_b, base, dst_b, r);
+    }
+}
+
 /// Ranked default routes DirectFold8 factor-state binds through the AVX-512
 /// `fold_pairs` permute plus deferred `WideGhashX4` message accumulate.
 /// `FLOCK_NO_OPEN_FOLD8_BIND_X4=1` restores the compact scalar scan. Read once
@@ -272,6 +328,45 @@ mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
     /// elsewhere) equals the straight reduced sum `Σ w[b]·src[16t+b]` at
     /// lengths that hit the four-slot vector body and the scalar tail.
+    #[test]
+    fn fold_pairs_dual_matches_two_fold_pairs() {
+        use super::*;
+        let mut state = 0xD0A1_F01Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let r = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src_a: Vec<F128> = (0..2 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let src_b: Vec<F128> = (0..2 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut want_a = vec![F128::ZERO; n];
+            let mut want_b = vec![F128::ZERO; n];
+            fold_pairs(&src_a, 0, &mut want_a, r);
+            fold_pairs(&src_b, 0, &mut want_b, r);
+            let mut got_a = vec![F128::ZERO; n];
+            let mut got_b = vec![F128::ZERO; n];
+            fold_pairs_dual(&src_a, &src_b, 0, &mut got_a, &mut got_b, r);
+            assert_eq!(got_a, want_a, "n={n} stream a");
+            assert_eq!(got_b, want_b, "n={n} stream b");
+        }
+    }
+
     #[test]
     fn fold16_banked_matches_scalar_reduced_sum() {
         use super::*;

@@ -30,6 +30,61 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
     }
 }
 
+/// Two independent [`fold_pairs`] streams sharing one `r` broadcast.
+///
+/// Same element order and stores as two separate [`fold_pairs`] calls.
+/// Interleaving the streams keeps two `ghash_mul_x4_split` products in
+/// flight against one CLMUL latency.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. Both destinations have equal
+/// length; each source covers every pair selected by `base` and that length.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_pairs_dual(
+    src_a: &[F128],
+    src_b: &[F128],
+    base: usize,
+    dst_a: &mut [F128],
+    dst_b: &mut [F128],
+    r: F128,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(dst_a.len(), dst_b.len());
+    // SAFETY: caller guarantees features and pair coverage on both streams.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_bcast);
+        let lanes = dst_a.len() & !3;
+        let mut t = 0;
+        while t < lanes {
+            let s = 2 * (base + t);
+            let a_lo = _mm512_loadu_si512(src_a.as_ptr().add(s) as *const __m512i);
+            let a_hi = _mm512_loadu_si512(src_a.as_ptr().add(s + 4) as *const __m512i);
+            let a_even = _mm512_shuffle_i32x4::<0x88>(a_lo, a_hi);
+            let a_odd = _mm512_shuffle_i32x4::<0xDD>(a_lo, a_hi);
+            let a = _mm512_xor_si512(
+                a_even,
+                ghash_mul_x4_split(_mm512_xor_si512(a_even, a_odd), r_bcast, r_x64),
+            );
+            let b_lo = _mm512_loadu_si512(src_b.as_ptr().add(s) as *const __m512i);
+            let b_hi = _mm512_loadu_si512(src_b.as_ptr().add(s + 4) as *const __m512i);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b_lo, b_hi);
+            let b_odd = _mm512_shuffle_i32x4::<0xDD>(b_lo, b_hi);
+            let b = _mm512_xor_si512(
+                b_even,
+                ghash_mul_x4_split(_mm512_xor_si512(b_even, b_odd), r_bcast, r_x64),
+            );
+            _mm512_storeu_si512(dst_a.as_mut_ptr().add(t) as *mut __m512i, a);
+            _mm512_storeu_si512(dst_b.as_mut_ptr().add(t) as *mut __m512i, b);
+            t += 4;
+        }
+        portable_tail(src_a, base, dst_a, r, t);
+        portable_tail(src_b, base, dst_b, r, t);
+    }
+}
+
 /// Four-lane `dst += scale * addend` for the lazy-OOD correction.
 ///
 /// # Safety
