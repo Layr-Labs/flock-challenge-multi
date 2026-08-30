@@ -29,6 +29,12 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
+#[cfg(all(
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use flock_core::zerocheck::univariate_skip_optimized::prepare_round1_bcomplement_octa;
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -484,15 +490,35 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
 
 /// Transpose and stage one fully-live ranked side, preserving each complete
 /// ZMM row long enough to build its two offset halves without a stage reload.
+/// On the eligible B side, also reduce the eight live rows into one byte
+/// equality mask. AND_r B_r[j] == ff iff every block has ff at byte j.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
-unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op: *mut u16) {
+unsafe fn stage_ranked_dense_side<const GUARD: bool>(
+    ring: *const V8,
+    w: usize,
+    stage: *mut u32,
+    op: *mut u16,
+    check_b: bool,
+) -> u64 {
     unsafe {
         let rows = tr8x16_zmm(ring, w);
+        let equal_bytes = if GUARD && check_b {
+            let p0 = _mm512_and_si512(rows[0], rows[1]);
+            let p1 = _mm512_and_si512(rows[2], rows[3]);
+            let p2 = _mm512_and_si512(rows[4], rows[5]);
+            let p3 = _mm512_and_si512(rows[6], rows[7]);
+            let q0 = _mm512_and_si512(p0, p1);
+            let q1 = _mm512_and_si512(p2, p3);
+            _mm512_cmpeq_epi8_mask(_mm512_and_si512(q0, q1), _mm512_set1_epi8(-1))
+        } else {
+            0
+        };
         for (r, row) in rows.into_iter().enumerate() {
             store_ranked_stage_line(stage.add(r * STEP_WORDS), row);
             widen_off_line(row, op.add(r * ROUND1_AB_OFF_WORDS));
         }
+        equal_bytes
     }
 }
 
@@ -603,9 +629,12 @@ impl StreamProj<'_> {
     /// and every half-row is live with wide non-temporal publication. Keeping
     /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
     /// policy branch and the generic row publisher from the measured path.
+    /// The aggregate B check selects one loop for the whole octa, retaining
+    /// publish-then-project pacing. Residual windows keep their independent
+    /// weighted-product leaves instead of acquiring a Horner dependency chain.
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+    unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16, all_b_equal_bytes: u64) {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
             if self.one_rows_elided && blk == 2 {
@@ -617,11 +646,31 @@ impl StreamProj<'_> {
                 return;
             }
             let (sa,sb)=self.sides();
+            // E=true's two dense stages initialized every arena word. The
+            // mask came from those same eight B vectors; the borrow prevents
+            // replacing the arena between this check and its eight uses.
+            #[cfg(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw"))]
+            let complement=prepare_round1_bcomplement_octa(&*off.cast::<[u16;8*ROUND1_AB_OFF_WORDS]>(),all_b_equal_bytes,plan,imgs,blk);
+            #[cfg(not(all(target_feature="gfni",target_feature="avx512f",target_feature="avx512bw")))]
+            let complement:Option<flock_core::zerocheck::univariate_skip_optimized::Round1AbBComplementOcta<'_>>={let _=all_b_equal_bytes;None};
+            if let Some(checked)=complement {
+                let mut j=0usize;
+                while j!=8 {
+                    rows.publish_dense(j,sa,sb);
+                    let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                    checked.project(j,out);
+                    j+=1;
+                }
+                return;
+            }
+            // One failed required byte sends all eight blocks to the original
+            // dense kernel. No per-member complement guard remains here.
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                let block_off=&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>();
+                round1_ab_inner_window_from_offsets_nt2(block_off,out,plan,imgs);
                 j+=1;
             }
         }
@@ -1394,15 +1443,15 @@ impl Drain8<'_> {
                     // become one 16-word ZMM transpose, one aligned store per
                     // block row, and the same live ZMM feeds offset widening.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-                    {
-                        stage_ranked_dense_side(self.ast,rw,sa,op);
-                        stage_ranked_dense_side(self.bs,rw,sb,op.add(64));
-                    }
+                    let all_b_equal_bytes={
+                        stage_ranked_dense_side::<false>(self.ast,rw,sa,op,false);
+                        stage_ranked_dense_side::<true>(self.bs,rw,sb,op.add(64),plan.bcomplement_octa_eligible(blk))
+                    };
                     // Portable builds cannot select E=true: the ranked gate
                     // requires the AVX-512 offset plan. Retain the old staging
                     // shape so this monomorphization remains well-formed.
                     #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
-                    {
+                    let all_b_equal_bytes={
                         let a_lo=tr8_chunk(self.ast,rw);
                         let a_hi=tr8_chunk(self.ast,rw+8);
                         for r in 0..8 {
@@ -1417,9 +1466,10 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
-                    }
+                        0
+                    };
                     let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16);
+                    proj.project_blocks_ranked_hot_offsets(blk,plan,imgs,rows,op as *const u16,all_b_equal_bytes);
                 } else {
                     // Cold/generic path stays on the two incumbent AVX2
                     // transposes and its per-window offset eligibility gate.
@@ -2188,6 +2238,127 @@ mod tests {
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
                 let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
                 assert_eq!(got, expected, "block {block}");
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    fn check_ranked_staging<const GUARD: bool>(
+        words: &[[u32; 8]; RING_WORDS],
+        rw: usize,
+        offset_side: usize,
+        check_b: bool,
+    ) -> u64 {
+        #[repr(C, align(64))]
+        struct Input([[u32; 8]; RING_WORDS]);
+        #[repr(C, align(64))]
+        struct Stage([u32; 10 * STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct Offsets([u16; 32 + 8 * ROUND1_AB_OFF_WORDS + 32]);
+
+        const STAGE_SENTINEL: u32 = 0xa55a_c33c;
+        const OFFSET_SENTINEL: u16 = 0x1680;
+        assert!(matches!(rw, 0 | 16));
+        assert!(matches!(offset_side, 0 | 64));
+        assert_eq!(ROUND1_AB_OFF_WORDS, 128);
+        let input = Input(*words);
+        let mut stage = Stage([STAGE_SENTINEL; 10 * STEP_WORDS]);
+        // Both operand halves and both red zones are fully initialized. The
+        // untouched half even contains legal byte<<6 offsets, not poison.
+        let mut offsets = Offsets([OFFSET_SENTINEL; 32 + 8 * ROUND1_AB_OFF_WORDS + 32]);
+        // SAFETY: the complete ring is initialized. The stage and offset
+        // destinations start after 64-byte red zones, remain 64-byte aligned,
+        // and contain all eight output rows at their original strides.
+        let got = unsafe {
+            stage_ranked_dense_side::<GUARD>(
+                input.0.as_ptr().cast::<V8>(),
+                rw,
+                stage.0.as_mut_ptr().add(STEP_WORDS),
+                offsets.0.as_mut_ptr().add(32 + offset_side),
+                check_b,
+            )
+        };
+        let mut expected_mask = 0u64;
+        for byte in 0..64 {
+            if (0..8).all(|r| words[rw + byte / 4][r].to_le_bytes()[byte % 4] == 0xff) {
+                expected_mask |= 1 << byte;
+            }
+        }
+        assert_eq!(got, if GUARD && check_b { expected_mask } else { 0 });
+        for r in 0..8 {
+            for word in 0..STEP_WORDS {
+                let value = words[rw + word][r];
+                assert_eq!(stage.0[STEP_WORDS + r * STEP_WORDS + word], value);
+                for (byte, value) in value.to_le_bytes().into_iter().enumerate() {
+                    let index = 32 + r * ROUND1_AB_OFF_WORDS + offset_side + word * 4 + byte;
+                    assert_eq!(offsets.0[index], u16::from(value) << 6);
+                }
+            }
+            let other = 32 + r * ROUND1_AB_OFF_WORDS + (64 - offset_side);
+            assert_eq!(&offsets.0[other..other + 64], &[OFFSET_SENTINEL; 64]);
+        }
+        assert_eq!(&stage.0[..STEP_WORDS], &[STAGE_SENTINEL; STEP_WORDS]);
+        assert_eq!(&stage.0[9 * STEP_WORDS..], &[STAGE_SENTINEL; STEP_WORDS]);
+        assert_eq!(&offsets.0[..32], &[OFFSET_SENTINEL; 32]);
+        assert_eq!(
+            &offsets.0[32 + 8 * ROUND1_AB_OFF_WORDS..],
+            &[OFFSET_SENTINEL; 32]
+        );
+        assert_eq!(input.0, *words);
+        got
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn ranked_staging_preserves_layout_when_either_guard_switch_is_off() {
+        let words = core::array::from_fn(|word| {
+            core::array::from_fn(|r| {
+                u32::from_le_bytes(core::array::from_fn(|byte| {
+                    if (word * 4 + byte).is_multiple_of(5) {
+                        0xff
+                    } else {
+                        (word as u8).wrapping_mul(29)
+                            ^ (r as u8).wrapping_mul(71)
+                            ^ (byte as u8).wrapping_mul(43)
+                    }
+                }))
+            })
+        });
+        for rw in [0, 16] {
+            for offset_side in [0, 64] {
+                for check_b in [false, true] {
+                    check_ranked_staging::<false>(&words, rw, offset_side, check_b);
+                    check_ranked_staging::<true>(&words, rw, offset_side, check_b);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn ranked_staging_octa_mask_rejects_each_members_single_cleared_bit() {
+        for rw in [0, 16] {
+            // The unselected ring half is zero, so reading the wrong rw is
+            // observably different even for the initial all-ones window.
+            let mut words = [[0u32; 8]; RING_WORDS];
+            for row in &mut words[rw..rw + STEP_WORDS] {
+                *row = [u32::MAX; 8];
+            }
+            assert_eq!(check_ranked_staging::<true>(&words, rw, 64, true), u64::MAX);
+            for r in 0..8 {
+                for byte in 0..64 {
+                    for bit in 0..8 {
+                        let word = rw + byte / 4;
+                        words[word][r] = u32::MAX ^ (1 << (8 * (byte % 4) + bit));
+                        let got = check_ranked_staging::<true>(&words, rw, 64, true);
+                        assert_eq!(
+                            got,
+                            u64::MAX ^ (1 << byte),
+                            "rw={rw} block={r} byte={byte} bit={bit}"
+                        );
+                        words[word][r] = u32::MAX;
+                    }
+                }
             }
         }
     }
