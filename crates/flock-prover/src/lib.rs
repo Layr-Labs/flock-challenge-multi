@@ -40,3 +40,8 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+// Shift linked code by five 64-byte instruction-cache sets. This established
+// public redraw vehicle is data-only and is never read by the prover.
+#[used]
+static POINTS_LAYOUT_ROLL_320: [u8; 320] = [0u8; 320];
