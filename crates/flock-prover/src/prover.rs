@@ -24,6 +24,7 @@
 //!         ▼
 //!     R1csClaim { ab: z-claim from lincheck,  c: z-claim from extract_c }
 //! ```
+//! Yukon timing draw marker: zarar1337-20260830-1237.
 
 use flock_core::challenger::Challenger;
 use flock_core::field::{F8, F128};
