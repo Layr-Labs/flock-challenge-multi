@@ -479,6 +479,46 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
+/// Best-effort synchronous huge-page promotion for a buffer that setup has
+/// already faulted in. This complements the allocation-time MADV_HUGEPAGE
+/// hint: fragmented ranges may still be backed by 4 KiB pages when the timed
+/// proof starts. Failure is harmless and leaves the mapping unchanged.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
+    const HUGE: usize = 1 << 21;
+    if bytes < HUGE {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (ptr as usize).next_multiple_of(PAGE);
+    let end = ptr as usize + bytes;
+    if end <= start {
+        return;
+    }
+    const SYS_MADVISE: usize = 28;
+    const MADV_COLLAPSE: usize = 25;
+    // SAFETY: the range is contained in the live allocation. MADV_COLLAPSE
+    // preserves contents and mapping validity; unsupported kernels and
+    // ineligible ranges simply return an error, which is intentionally ignored.
+    unsafe {
+        let ret: isize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") SYS_MADVISE as isize => ret,
+            in("rdi") start,
+            in("rsi") end - start,
+            in("rdx") MADV_COLLAPSE,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        let _ = ret;
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
