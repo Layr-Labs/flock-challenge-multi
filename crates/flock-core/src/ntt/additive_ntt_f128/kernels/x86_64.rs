@@ -1065,6 +1065,25 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
 
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn prepare_twiddles_fused4(twiddles: &[F128; 15]) -> [TwX4; 15] {
+    let zero = core::arch::x86_64::_mm512_setzero_si512();
+    let mut tw = [(zero, zero); 15];
+    if mul_diet_disabled() {
+        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+            *slot = tw_x4::<false, false>(*value);
+        }
+    } else {
+        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+            *slot = tw_x4::<false, true>(*value);
+        }
+    }
+    tw
+}
+
+/// # Safety
+/// The caller guarantees target features, pointer validity, and disjoint rows.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
@@ -1076,6 +1095,24 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
+        let tw = prepare_twiddles_fused4(twiddles);
+        butterfly_fused_4layer_row_tw(ptr, sixteenth, num_ntts, active_lanes, r, &tw, twiddles);
+    }
+}
+
+/// Direct twiddle-precomputed twin of [`butterfly_fused_4layer_row`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    tw: &[TwX4; 15],
+    twiddles: &[F128; 15],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
         if mul_diet_disabled() {
             butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
                 ptr,
@@ -1083,6 +1120,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 num_ntts,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 0,
             )
@@ -1093,6 +1131,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 num_ntts,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 0,
             )
@@ -1119,6 +1158,34 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
+        let tw = prepare_twiddles_fused4(twiddles);
+        butterfly_fused_4layer_row_tw_pf::<H>(
+            ptr,
+            sixteenth,
+            num_ntts,
+            active_lanes,
+            r,
+            &tw,
+            twiddles,
+            pf_r,
+        );
+    }
+}
+
+/// Direct twiddle-precomputed twin of [`butterfly_fused_4layer_row_pf`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw_pf<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    tw: &[TwX4; 15],
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
         if mul_diet_disabled() {
             butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
                 ptr,
@@ -1126,6 +1193,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 num_ntts,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 pf_r,
             )
@@ -1136,6 +1204,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 num_ntts,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 pf_r,
             )
@@ -1171,6 +1240,35 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     // SAFETY: forwarded caller contract; S16/NN substitute equal runtime
     // values in the same impl body (a distinct monomorphization).
     unsafe {
+        let tw = prepare_twiddles_fused4(twiddles);
+        butterfly_fused_4layer_row_tw_shaped::<S16, NN, H>(
+            ptr,
+            active_lanes,
+            r,
+            &tw,
+            twiddles,
+            pf_r,
+        );
+    }
+}
+
+/// Direct twiddle-precomputed twin of [`butterfly_fused_4layer_row_shaped`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw_shaped<
+    const S16: usize,
+    const NN: usize,
+    const H: u8,
+>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    r: usize,
+    tw: &[TwX4; 15],
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract; S16/NN substitute equal runtime
+    // values in the same impl body (a distinct monomorphization).
+    unsafe {
         if mul_diet_disabled() {
             butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
                 ptr,
@@ -1178,6 +1276,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 NN,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 pf_r,
             )
@@ -1188,6 +1287,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 NN,
                 active_lanes,
                 r,
+                tw,
                 twiddles,
                 pf_r,
             )
@@ -1214,6 +1314,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
     num_ntts: usize,
     active_lanes: usize,
     r: usize,
+    tw: &[TwX4; 15],
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
@@ -1227,14 +1328,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
-        // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
-        // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
         let zero = _mm512_setzero_si512();
-        let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
-        }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -2107,22 +2201,40 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
+                        let tw = {
+                            let zero = core::arch::x86_64::_mm512_setzero_si512();
+                            let mut t = [(zero, zero); 15];
+                            for (slot, value) in t.iter_mut().zip(tw15.iter()) {
+                                *slot = tw_x4::<false, true>(*value);
+                            }
+                            t
+                        };
                         butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
                             len,
                             0,
+                            &tw,
                             &tw15,
                             0,
                         );
                     } else {
+                        let tw = {
+                            let zero = core::arch::x86_64::_mm512_setzero_si512();
+                            let mut t = [(zero, zero); 15];
+                            for (slot, value) in t.iter_mut().zip(tw15.iter()) {
+                                *slot = tw_x4::<false, false>(*value);
+                            }
+                            t
+                        };
                         butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
                             len,
                             0,
+                            &tw,
                             &tw15,
                             0,
                         );

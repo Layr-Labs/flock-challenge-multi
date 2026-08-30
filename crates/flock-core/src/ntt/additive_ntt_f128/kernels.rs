@@ -651,6 +651,95 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
 /// The caller must ensure the 16 row slices selected by `r` are valid and
 /// disjoint from any row group being processed concurrently.
 #[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) use x86_64::{prepare_twiddles_fused4, TwX4};
+
+/// Direct twiddle-precomputed twin of [`butterfly_fused_4layer_row`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    tw: &[x86_64::TwX4; 15],
+    twiddles: &[F128; 15],
+) {
+    debug_assert!(lanes <= num_ntts);
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_tw_shaped::<128, 64, 0>(
+                        ptr, lanes, r, tw, twiddles, 0,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_tw_shaped::<8, 64, 0>(
+                        ptr, lanes, r, tw, twiddles, 0,
+                    );
+                }
+                1 => {
+                    return x86_64::butterfly_fused_4layer_row_tw_shaped::<1, 64, 0>(
+                        ptr, lanes, r, tw, twiddles, 0,
+                    );
+                }
+                _ => {}
+            }
+        }
+        x86_64::butterfly_fused_4layer_row_tw(ptr, sixteenth, num_ntts, lanes, r, tw, twiddles);
+    }
+}
+
+/// Direct twiddle-precomputed twin of [`butterfly_fused_4layer_row_pf`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_row_tw_pf<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    tw: &[x86_64::TwX4; 15],
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    debug_assert!(lanes <= num_ntts);
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_tw_shaped::<128, 64, H>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_tw_shaped::<8, 64, H>(
+                        ptr, lanes, r, tw, twiddles, pf_r,
+                    );
+                }
+                _ => {}
+            }
+        }
+        x86_64::butterfly_fused_4layer_row_tw_pf::<H>(
+            ptr, sixteenth, num_ntts, lanes, r, tw, twiddles, pf_r,
+        );
+    }
+}
+
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,

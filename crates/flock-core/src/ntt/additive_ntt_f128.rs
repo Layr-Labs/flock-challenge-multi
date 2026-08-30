@@ -4377,34 +4377,76 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
     // `{i*sixteenth + r : i ∈ 0..16}`, so concurrent writes never alias.
     let base = block.as_mut_ptr() as usize;
-    if sixteenth < PARALLEL_ROW_THRESHOLD {
-        for r in 0..sixteenth {
-            // SAFETY: row group r writes disjoint rows of this block.
-            unsafe {
-                kernels::butterfly_fused_4layer_row(
-                    base as *mut F128,
-                    sixteenth,
-                    num_ntts,
-                    row_lanes(r, num_ntts, odd_tail),
-                    r,
-                    t,
-                )
-            };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        let tw = unsafe { kernels::prepare_twiddles_fused4(t) };
+        if sixteenth < PARALLEL_ROW_THRESHOLD {
+            for r in 0..sixteenth {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row_tw(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        row_lanes(r, num_ntts, odd_tail),
+                        r,
+                        &tw,
+                        t,
+                    );
+                }
+            }
+        } else {
+            let tw_ref = &tw;
+            (0..sixteenth).into_par_iter().for_each(|r| {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row_tw(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        row_lanes(r, num_ntts, odd_tail),
+                        r,
+                        tw_ref,
+                        t,
+                    );
+                }
+            });
         }
-    } else {
-        (0..sixteenth).into_par_iter().for_each(|r| {
-            // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe {
-                kernels::butterfly_fused_4layer_row(
-                    base as *mut F128,
-                    sixteenth,
-                    num_ntts,
-                    row_lanes(r, num_ntts, odd_tail),
-                    r,
-                    t,
-                )
-            };
-        });
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        if sixteenth < PARALLEL_ROW_THRESHOLD {
+            for r in 0..sixteenth {
+                // SAFETY: row group r writes disjoint rows of this block.
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        row_lanes(r, num_ntts, odd_tail),
+                        r,
+                        t,
+                    )
+                };
+            }
+        } else {
+            (0..sixteenth).into_par_iter().for_each(|r| {
+                // SAFETY: distinct r → disjoint row groups → no aliasing.
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        row_lanes(r, num_ntts, odd_tail),
+                        r,
+                        t,
+                    )
+                };
+            });
+        }
     }
 }
 
@@ -4422,40 +4464,79 @@ fn butterfly_interleaved_fused_4layer_rows(
 ) {
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
-    let base = block.as_mut_ptr();
-    for r in 0..sixteenth {
-        let lanes = row_lanes(r, num_ntts, odd_tail);
-        // The sixteen rows the NEXT row group reads are asked for one line
-        // per lane step. The hints move no data of their own and change no
-        // value; `FLOCK_NO_NTT_DEEP_PF=1` removes them.
-        // SAFETY: each call writes the valid, disjoint row group
-        // `{i*sixteenth + r : i in 0..16}` and calls are sequential here; the
-        // hinted group is inside the same block.
-        unsafe {
-            if hint == 0 || r + 1 >= sixteenth {
-                kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
-            } else if hint == 1 {
-                kernels::butterfly_fused_4layer_row_pf::<1>(
-                    base,
-                    sixteenth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    t,
-                    r + 1,
-                )
-            } else {
-                kernels::butterfly_fused_4layer_row_pf::<2>(
-                    base,
-                    sixteenth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    t,
-                    r + 1,
-                )
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        let tw = unsafe { kernels::prepare_twiddles_fused4(t) };
+        let base = block.as_mut_ptr();
+        for r in 0..sixteenth {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            unsafe {
+                if hint == 0 || r + 1 >= sixteenth {
+                    kernels::butterfly_fused_4layer_row_tw(
+                        base, sixteenth, num_ntts, lanes, r, &tw, t,
+                    );
+                } else if hint == 1 {
+                    kernels::butterfly_fused_4layer_row_tw_pf::<1>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        &tw,
+                        t,
+                        r + 1,
+                    );
+                } else {
+                    kernels::butterfly_fused_4layer_row_tw_pf::<2>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        &tw,
+                        t,
+                        r + 1,
+                    );
+                }
             }
-        };
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let base = block.as_mut_ptr();
+        for r in 0..sixteenth {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            unsafe {
+                if hint == 0 || r + 1 >= sixteenth {
+                    kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
+                } else if hint == 1 {
+                    kernels::butterfly_fused_4layer_row_pf::<1>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    )
+                } else {
+                    kernels::butterfly_fused_4layer_row_pf::<2>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    )
+                }
+            };
+        }
     }
 }
 
