@@ -17,6 +17,8 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// Yukon source-archive marker: zarar@1337 in-pool-wstate redraw 2026-08-30-A.
+
 pub mod bits;
 pub mod challenger;
 pub mod field;
@@ -477,78 +479,39 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-/// Prewarm marker ab
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
 /// Run `op` on a pool worker instead of the calling thread.
 ///
-/// Every top-level parallel region opened from a NON-worker thread parks that
-/// thread on the region's latch and wakes it again at the end; measured in
-/// situ that round trip is ~15 µs, against ~5 µs for the same region opened
-/// from inside a worker. A phase that opens dozens of small regions therefore
-/// pays the difference dozens of times. Wrapping the phase body in a
-/// `rayon::join` moves the body onto a worker, so each of its regions becomes
-/// a nested join instead of a fresh top-level entry.
+/// When a non-worker thread opens a top-level rayon region, it parks on the
+/// region latch until the work completes. Wrapping a phase body in a tiny
+/// `rayon::join` moves that body onto a worker, so nested parallel regions
+/// opened from inside it stay in-worker instead of repeatedly re-entering from
+/// the main thread.
 ///
-/// Schedule only: the closure runs to completion before this returns, on the
-/// same pool, with the same work. `FLOCK_NO_IN_POOL=1` restores the direct
-/// call, and a caller that is already a worker takes the direct call anyway.
+/// Schedule only: same pool, same work, same result. `FLOCK_NO_IN_POOL=1`
+/// restores the direct call, and callers that are already on a worker keep the
+/// direct call too.
 pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
-    if !*ON || rayon::current_thread_index().is_some() {
+    if !in_pool_enabled() || rayon::current_thread_index().is_some() {
         return op();
     }
     rayon::join(op, || ()).0
 }
 
-
-/// Best-effort `madvise(MADV_COLLAPSE)` over an already-touched buffer: where
-/// the first-touch faults lost the THP lottery under fragmentation, this asks
-/// the kernel to assemble the range into 2 MiB pages synchronously; where they
-/// won, the calls are no-ops. Setup-phase only. `FLOCK_NO_MADV_COLLAPSE=1`
-/// disables it.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
-    const HUGE: usize = 1 << 21;
-    if bytes < HUGE {
-        return;
+fn in_pool_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    #[cfg(test)]
+    if IN_POOL_TEST_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
-    static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
-    if *DISABLED {
-        return;
-    }
-    const PAGE: usize = 4096;
-    let start = (ptr as usize).next_multiple_of(PAGE);
-    let end = ptr as usize + bytes;
-    if end <= start {
-        return;
-    }
-    const SYS_MADVISE: usize = 28;
-    const MADV_COLLAPSE: usize = 25;
-    // SAFETY: the advised range lies within the caller's live buffer, and
-    // MADV_COLLAPSE never alters contents or mapping validity; failure is
-    // ignored (pure hint).
-    unsafe {
-        let ret: isize;
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") SYS_MADVISE as isize => ret,
-            in("rdi") start,
-            in("rsi") end - start,
-            in("rdx") MADV_COLLAPSE,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-        let _ = ret;
-    }
+    *ON
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
-
+#[cfg(test)]
+static IN_POOL_TEST_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
@@ -684,4 +647,53 @@ fn linux_physical_cores() -> Option<usize> {
         }
     }
     (!cores.is_empty()).then_some(cores.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static IN_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct InPoolDisableGuard {
+        prev: bool,
+    }
+
+    impl InPoolDisableGuard {
+        fn set(disabled: bool) -> Self {
+            let prev = IN_POOL_TEST_DISABLED.swap(disabled, Ordering::Relaxed);
+            Self { prev }
+        }
+    }
+
+    impl Drop for InPoolDisableGuard {
+        fn drop(&mut self) {
+            IN_POOL_TEST_DISABLED.store(self.prev, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn in_pool_uses_worker_from_non_worker_thread() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(false);
+        assert!(in_pool(|| rayon::current_thread_index().is_some()));
+    }
+
+    #[test]
+    fn in_pool_kill_switch_restores_direct_call() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(true);
+        assert!(in_pool(|| rayon::current_thread_index().is_none()));
+    }
+
+    #[test]
+    fn in_pool_preserves_result() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(false);
+        let expect = (0_u64..8192).map(|x| x * x + 3).sum::<u64>();
+        let got = in_pool(|| (0_u64..8192).map(|x| x * x + 3).sum::<u64>());
+        assert_eq!(got, expect);
+    }
 }

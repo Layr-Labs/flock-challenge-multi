@@ -471,27 +471,6 @@ impl Round1AbInner {
         self.ranked_one_rows_elided
     }
 
-    /// Restore dense AB when a consumer cannot add the identity-C one rows.
-    /// This is a cold fallback for representation/consumer gate mismatches;
-    /// the ranked identity-C path never calls it.
-    pub(crate) fn restore_full_if_ranked_one_rows_elided(
-        &mut self,
-        a_packed: &[u8],
-        b_packed: &[u8],
-        inv_table: &InvNttTableByteSingleGf8,
-    ) {
-        if !self.ranked_one_rows_elided {
-            return;
-        }
-        // Validate before the existing prefix repair reaches raw kernels.
-        assert_eq!(a_packed.len(), self.len_bytes());
-        assert_eq!(b_packed.len(), self.len_bytes());
-        assert_eq!(inv_table.k, K_SKIP);
-        self.invalid_prefix_bytes = self.len_bytes();
-        self.fill_invalid_prefix(a_packed, b_packed, inv_table);
-        self.ranked_one_rows_elided = false;
-    }
-
     /// Declare the leading `bytes` of the storage unwritten (the producer
     /// skipped them because round 1's GPU share covers those x_hi windows
     /// from raw a/b). Round 1 recomputes them on CPU if the GPU share
@@ -2429,19 +2408,6 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
 }
 
 /// Per-worker state for the four-window fold4 producer.
-/// The fused GFNI C drain's first live group of a band overwrites every one
-/// of the 32 KiB byte planes, so the band-wide zero fill, that group's plane
-/// loads, and the fused route's `partial_c4` zero seed are all dead work.
-/// Ranked default. `FLOCK_NO_ZC_C_PLANE_FIRST_WRITE=1` restores the incumbent
-/// clear-then-accumulate form, which is the byte-identity oracle.
-#[inline]
-fn c_plane_first_write_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
-    });
-    *ON
-}
-
 pub(crate) struct WorkerStateFold4 {
     partial_ab: [F128; ELL],
     /// Byte-plane banks for the eq-folded GFNI AB drain (`2^s x 1 KiB`);
@@ -2452,9 +2418,6 @@ pub(crate) struct WorkerStateFold4 {
     /// 63 bytes so both stay cache-line aligned. Empty until the fused arm
     /// first sizes it.
     plane_c: Vec<u8>,
-    /// True until the first live fused-C group has overwritten every plane in
-    /// the current band; that first group need not read or clear stale bytes.
-    plane_c_first_write: bool,
     plane_c_off: usize,
     partial_c4: Box<[[[F128; ELL]; N_C_BANKS]; N_C_Q]>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
@@ -2473,7 +2436,6 @@ impl WorkerStateFold4 {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
             plane_c: Vec::new(),
-            plane_c_first_write: false,
             plane_c_off: 0,
             partial_c4: Box::new([[[F128::ZERO; ELL]; N_C_BANKS]; N_C_Q]),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
@@ -2529,31 +2491,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // Fused GFNI C drain: size and zero the 32 KiB byte-plane C banks for
     // this band; `FLOCK_NO_ZC_C_GFNI=1` keeps the incumbent transpose +
     // nibble-LUT drain (`c_gfni_mats == None`).
-    let first_write = c_plane_first_write_enabled();
-    state.plane_c_first_write = first_write && c_gfni_mats.is_some();
     if c_gfni_mats.is_some() {
         if state.plane_c.is_empty() {
-            let bytes = C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63;
-            state.plane_c = if first_write {
-                crate::alloc_uninit_vec::<u8>(bytes)
-            } else {
-                vec![0u8; bytes]
-            };
+            state.plane_c = vec![0u8; C_PLANE_BANK_BYTES + C_GROUP_BYTES + 63];
             let off = state.plane_c.as_ptr().align_offset(64);
             state.plane_c_off = if off <= 63 { off } else { 0 };
-        } else if !first_write {
+        } else {
             let off = state.plane_c_off;
             state.plane_c[off..off + C_PLANE_BANK_BYTES].fill(0);
         }
     }
-    // The fused route's `partial_c4` slots are all overwritten by the band-end
-    // reassembly below, so only the fallback drain needs a zero seed here; an
-    // all-dead fused band is cleared at the end instead.
-    if !first_write || c_gfni_mats.is_none() {
-        for group in state.partial_c4.iter_mut() {
-            for bank in group.iter_mut() {
-                bank.fill(F128::ZERO);
-            }
+    for group in state.partial_c4.iter_mut() {
+        for bank in group.iter_mut() {
+            bank.fill(F128::ZERO);
         }
     }
     let n_lo = n_lo_and_inner - N_INNER;
@@ -2690,12 +2640,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
             let planes: &mut [u8; C_PLANE_BANK_BYTES] = planes
                 .try_into()
                 .expect("aligned 32 KiB plane C bank window");
-            if state.plane_c_first_write {
-                kernels::write_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
-                state.plane_c_first_write = false;
-            } else {
-                kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
-            }
+            kernels::accumulate_c_banks_fold4_fused_gfni(stage, &group_counts, mats_g, planes);
             continue;
         }
         let c_tables =
@@ -2728,25 +2673,15 @@ fn process_one_x_hi_with_precomputed_ab_fold4(
     // sixteen byte planes become its 64 F128 lanes. Pure XOR accumulation,
     // so these are the incumbent's `partial_c4` values byte-for-byte.
     if c_gfni_mats.is_some() {
-        if state.plane_c_first_write {
-            // A fused band with no live group never wrote the plane bank, so
-            // it must not be read; every logical C contribution is zero.
-            for group in state.partial_c4.iter_mut() {
-                for bank in group.iter_mut() {
-                    bank.fill(F128::ZERO);
-                }
-            }
-        } else {
-            let off = state.plane_c_off;
-            let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
-            for q in 0..N_C_Q {
-                for bank in 0..N_C_BANKS {
-                    let bank_planes: &[u8; 16 * ELL] = planes[(q * N_C_BANKS + bank) * 16 * ELL..]
-                        [..16 * ELL]
-                        .try_into()
-                        .expect("one 16-plane bank");
-                    kernels::c_plane_bank_to_f128(bank_planes, &mut state.partial_c4[q][bank]);
-                }
+        let off = state.plane_c_off;
+        let planes = &state.plane_c[off..off + C_PLANE_BANK_BYTES];
+        for q in 0..N_C_Q {
+            for bank in 0..N_C_BANKS {
+                let bank_planes: &[u8; 16 * ELL] = planes[(q * N_C_BANKS + bank) * 16 * ELL..]
+                    [..16 * ELL]
+                    .try_into()
+                    .expect("one 16-plane bank");
+                kernels::c_plane_bank_to_f128(bank_planes, &mut state.partial_c4[q][bank]);
             }
         }
     }
@@ -4854,42 +4789,6 @@ mod tests {
             full.as_bytes_mut(),
             "fill_invalid_prefix drifted from the standalone precompute"
         );
-    }
-
-    #[test]
-    fn one_rows_fallback_restores_dense_storage() {
-        const BYTES: usize = 2048;
-        let mut rng = Rng::new(0x0A8D_E115);
-        let a = pack_bits(&rng.bits(BYTES * 8));
-        let b = pack_bits(&rng.bits(BYTES * 8));
-        let inv_table = make_inv_table();
-        let mut expected = vec![0u8; BYTES];
-        precompute_round1_ab_inner_windows(&a, &b, &mut expected, &inv_table, false);
-
-        let mut residual = Round1AbInner::take_uninit(BYTES);
-        residual.as_bytes_mut().fill(0xA5);
-        residual.set_ranked_one_rows_elided();
-        residual.restore_full_if_ranked_one_rows_elided(&a, &b, &inv_table);
-        assert!(!residual.ranked_one_rows_elided());
-        assert_eq!(residual.invalid_prefix_bytes(), 0);
-        assert_eq!(residual.as_bytes(), expected.as_slice());
-
-        // A dense object keeps its ordinary invalid-prefix contract. The
-        // residual repair must not touch it or require raw input slices.
-        residual.as_bytes_mut().fill(0x5A);
-        residual.set_invalid_prefix_bytes(1024);
-        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
-        assert_eq!(residual.invalid_prefix_bytes(), 1024);
-        assert!(residual.as_bytes().iter().all(|byte| *byte == 0x5A));
-    }
-
-    #[test]
-    #[should_panic]
-    fn one_rows_fallback_rejects_wrong_raw_extent() {
-        let inv_table = make_inv_table();
-        let mut residual = Round1AbInner::take_uninit(1024);
-        residual.set_ranked_one_rows_elided();
-        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
     }
 
     /// Round 1 with a producer-skipped (invalid) ab_inner prefix must be
