@@ -504,6 +504,21 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
 
+/// Parent-level rayon chunk. HEAD uses [`BLAKE3_GROUP`] (1024). 2048 halves
+/// the task count on wide levels (`2^{19}` → 256 tasks) while leaving leaf
+/// hashing and the serial cutoff unchanged.
+/// `FLOCK_NO_MERKLE_PARENT_GROUP_WIDE=1` restores 1024.
+fn merkle_parent_group() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_MERKLE_PARENT_GROUP_WIDE").is_some() {
+            BLAKE3_GROUP
+        } else {
+            2048
+        }
+    });
+    *N
+}
+
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
 /// its leaves are still cache-hot, from inside the NTT rayon job (where a
@@ -548,9 +563,10 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
+                let group = merkle_parent_group();
                 write
-                    .par_chunks_mut(BLAKE3_GROUP)
-                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .par_chunks_mut(group)
+                    .zip(read_bytes.par_chunks(group * 64))
                     .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }
