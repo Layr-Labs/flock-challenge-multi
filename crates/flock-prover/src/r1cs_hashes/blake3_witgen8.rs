@@ -26,6 +26,7 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement,
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
@@ -603,6 +604,9 @@ impl StreamProj<'_> {
     /// and every half-row is live with wide non-temporal publication. Keeping
     /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
     /// policy branch and the generic row publisher from the measured path.
+    /// The complement body inlines into this existing octa boundary, retaining
+    /// publish-then-project pacing. Residual windows keep their independent
+    /// weighted-product leaves instead of acquiring a Horner dependency chain.
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked_hot_offsets(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
@@ -621,7 +625,10 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                let block_off=&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>();
+                if !round1_ab_inner_window_from_offsets_nt2_bcomplement(block_off,sb.add(j*STEP_WORDS).cast::<u8>(),out,plan,imgs,blk,0xff) {
+                    round1_ab_inner_window_from_offsets_nt2(block_off,out,plan,imgs);
+                }
                 j+=1;
             }
         }

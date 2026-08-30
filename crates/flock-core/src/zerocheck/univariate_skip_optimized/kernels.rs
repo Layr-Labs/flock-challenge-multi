@@ -33,6 +33,13 @@ pub(super) mod x86_64_bstatic;
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
+pub(super) mod x86_64_bcomplement;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 mod x86_64_bstatic_plan;
 
 #[cfg(all(
