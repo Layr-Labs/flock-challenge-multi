@@ -16,6 +16,8 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//!
+//! Submission packaging marker: promoted-tree redraw A.
 
 pub mod bits;
 pub mod challenger;
