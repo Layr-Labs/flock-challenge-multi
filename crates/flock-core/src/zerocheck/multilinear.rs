@@ -4310,7 +4310,10 @@ mod tests {
     /// (fold then `round_pair_naive`) at several challenges.
     #[test]
     fn cascade_lookahead_matches_incumbent() {
-        for &log_n in &[4usize, 5, 6, 8, 10, 13] {
+        // The ranked deep-cascade extension enters this same primitive at
+        // log_n 16, 14, 12 and 10 for rounds 13+14 through 19+20. Pin those
+        // exact geometries as well as the existing small/reference cases.
+        for &log_n in &[4usize, 5, 6, 8, 10, 12, 13, 14, 16] {
             let mut rng = Rng::new(0x5E00 + log_n as u64);
             let n = 1usize << log_n;
             let a = rng.f128_vec(n);
