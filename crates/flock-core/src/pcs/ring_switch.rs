@@ -2832,11 +2832,150 @@ fn direct_fold8_states_seq(
     (a_state, w_state, round0)
 }
 
+#[cfg(test)]
+static DIRECT_FOLD8_W_STATE_GFNI_TEST_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn direct_fold8_w_state_scalar_par(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    let w_rows: Vec<Vec<F128>> = (0..64usize)
+        .into_par_iter()
+        .map(|d_low| {
+            let mut row = Vec::with_capacity(n_packed);
+            let mut basis_product = low_eq[d_low];
+            row.push(fold_one_slot(basis_product, table));
+            for _ in 1..n_packed {
+                basis_product = crate::field::mul_by_x(basis_product);
+                row.push(fold_one_slot(basis_product, table));
+            }
+            row
+        })
+        .collect();
+    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    w_state.par_chunks_mut(64).enumerate().for_each(|(bit, w_row)| {
+        for lane in 0..64 {
+            w_row[lane] = w_rows[lane][bit];
+        }
+    });
+    w_state
+}
+
+/// `FLOCK_NO_DIRECT_FOLD8_W_STATE_GFNI=1` restores the exact incumbent
+/// parallel `fold_one_slot` materializer. Read once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_w_state_gfni_enabled() -> bool {
+    #[cfg(test)]
+    if DIRECT_FOLD8_W_STATE_GFNI_TEST_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DIRECT_FOLD8_W_STATE_GFNI").is_none()
+    });
+    *ON
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    use crate::zerocheck::multilinear::kernels::x86_64::{
+        build_row_fold_mats, gfni_fold64_two_maps,
+    };
+    use rayon::prelude::*;
+
+    const N_LOW: usize = 64;
+
+    let n_packed = 1usize << LOG_PACKING;
+    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
+
+    let low_mats = build_row_fold_mats(&table[..8 * FOLD_TABLE_SIZE]);
+    let high_mats = build_row_fold_mats(&table[8 * FOLD_TABLE_SIZE..]);
+    let raw_rows: Vec<Vec<F128>> = (0..N_LOW)
+        .into_par_iter()
+        .map(|d_low| {
+            let mut row = Vec::with_capacity(n_packed);
+            let mut basis_product = low_eq[d_low];
+            row.push(basis_product);
+            for _ in 1..n_packed {
+                basis_product = crate::field::mul_by_x(basis_product);
+                row.push(basis_product);
+            }
+            row
+        })
+        .collect();
+
+    let mut w_state = vec![F128::ZERO; N_LOW * n_packed];
+    w_state
+        .par_chunks_mut(N_LOW)
+        .enumerate()
+        .for_each(|(bit, output)| {
+            let mut row_lo = [0u64; N_LOW];
+            let mut row_hi = [0u64; N_LOW];
+            for d_low in 0..N_LOW {
+                let value = raw_rows[d_low][bit];
+                row_lo[d_low] = value.lo;
+                row_hi[d_low] = value.hi;
+            }
+            // SAFETY: the row buffers hold one 64-lane low/high limb slice,
+            // the matrices come from the matching table halves, and this cfg
+            // gate is only enabled on builds with the required ISA support.
+            unsafe {
+                gfni_fold64_two_maps::<false>(
+                    row_lo.as_ptr().cast::<u8>(),
+                    &low_mats,
+                    row_hi.as_ptr().cast::<u8>(),
+                    &high_mats,
+                    output.as_mut_ptr(),
+                    core::ptr::null(),
+                );
+            }
+        });
+    w_state
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn direct_fold8_w_state_par(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    if direct_fold8_w_state_gfni_enabled() {
+        direct_fold8_w_state_gfni(low_eq, table)
+    } else {
+        direct_fold8_w_state_scalar_par(low_eq, table)
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+)))]
+fn direct_fold8_w_state_par(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    direct_fold8_w_state_scalar_par(low_eq, table)
+}
+
 /// Value-identical full-width form of [`direct_fold8_states_seq`]. The 64
 /// `d_low` doubling chains and the 64 bank transposes are mutually
 /// independent (each is a pure function of its own `low_eq[d]` / bank
 /// stripe), the bit-major gather writes disjoint 64-lane rows, and the
-/// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
+/// round-0 reduce is an XOR sum - no ordering choice here can change a byte.
 fn direct_fold8_states_par(
     fold8: &[F128],
     low_eq: &[F128; 64],
@@ -2844,22 +2983,8 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
-                        row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
+    let (w_state, a_rows): (Vec<F128>, Vec<Vec<F128>>) = rayon::join(
+        || direct_fold8_w_state_par(low_eq, table),
         || {
             (0..64usize)
                 .into_par_iter()
@@ -2867,15 +2992,12 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    w_state
+    a_state
         .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
         .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
+        .for_each(|(bit, a_row)| {
             for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
                 a_row[lane] = a_rows[lane][bit];
             }
         });
@@ -4574,7 +4696,7 @@ mod tests {
         let mut rng = Rng::new(0x7A11_9A85_EEDF_08D8);
         let n_packed = 1usize << LOG_PACKING;
         // Cover the ranked tail length (13), the intake-test length (5), and
-        // the minimal legal split (4 — `split_n_lo` clamps at 4).
+        // the minimal legal split (4 - `split_n_lo` clamps at 4).
         for &tail_len in &[4usize, 5, 13] {
             let suffix: Vec<F128> = (0..(6 + tail_len)).map(|_| rng.f128()).collect();
             let generators: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
@@ -4601,6 +4723,53 @@ mod tests {
                 "corrupted statistic went undetected in round0 tail_len={tail_len}"
             );
         }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_w_state_gfni_matches_scalar_and_kill_switch() {
+        let mut rng = Rng::new(0x2117_DF08_AB1E);
+        let generators: Vec<F128> = (0..(1usize << LOG_PACKING)).map(|_| rng.f128()).collect();
+        let table = build_fold_byte_table(&generators);
+        let low_eq: [F128; 64] = std::array::from_fn(|_| rng.f128());
+
+        let scalar = direct_fold8_w_state_scalar_par(&low_eq, &table);
+        assert_eq!(
+            direct_fold8_w_state_gfni(&low_eq, &table),
+            scalar,
+            "GFNI batch-map diverged from the scalar-par oracle"
+        );
+
+        let switched = {
+            DIRECT_FOLD8_W_STATE_GFNI_TEST_DISABLED.store(
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let out = direct_fold8_w_state_par(&low_eq, &table);
+            DIRECT_FOLD8_W_STATE_GFNI_TEST_DISABLED.store(
+                false,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            out
+        };
+        assert_eq!(
+            switched, scalar,
+            "kill switch failed to restore the exact incumbent materializer"
+        );
+
+        let mut bad_low_eq = low_eq;
+        bad_low_eq[17] += F128::ONE;
+        assert_ne!(
+            direct_fold8_w_state_gfni(&bad_low_eq, &table),
+            scalar,
+            "corrupted doubling chain went undetected"
+        );
     }
 
     /// The gated `add_scaled` collapse must match the scalar accumulation
