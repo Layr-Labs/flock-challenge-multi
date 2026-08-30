@@ -6836,4 +6836,37 @@ mod low_twiddle_invariant {
             }
         }
     }
+
+    /// The fused-three outer layer is `dim - 3`. The two deepest layers are
+    /// all-zero-high; this layer is the first that can carry a live high limb.
+    /// Ranked L0 is dim=20 (2^17 outer blocks); recursive encode is dim=16.
+    /// The production kernel still inspects `twiddles[0].hi` per block, so a
+    /// fully-low layer (small dim) and a mixed layer (large dim) are both
+    /// correct — LOW fires exactly on the zero-high blocks.
+    #[test]
+    fn fused3_outer_layer_zero_high_limb_hit_rate() {
+        for dim in 12..=20usize {
+            let ntt = AdditiveNttF128::standard(dim);
+            let layer = dim - 3;
+            let n = 1usize << layer;
+            let mut low = 0usize;
+            for block in 0..n {
+                if ntt.twiddle(layer, block).hi == 0 {
+                    low += 1;
+                }
+            }
+            eprintln!(
+                "dim={dim} layer={layer} outer LOW {low}/{n} ({:.1}%)",
+                100.0 * low as f64 / n as f64
+            );
+            assert!(
+                low > 0,
+                "dim={dim} layer={layer} expected some outer hi=0, low={low} n={n}"
+            );
+            assert!(
+                low * 4 >= n,
+                "dim={dim} layer={layer} outer LOW hit-rate too small: low={low} n={n}"
+            );
+        }
+    }
 }
