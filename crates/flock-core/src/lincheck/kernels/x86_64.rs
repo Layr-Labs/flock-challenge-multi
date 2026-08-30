@@ -125,16 +125,42 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     let mut out = vec![F128::ZERO; k];
     for b in 0..k / 64 {
         let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            let bank_planes: &[u8; 16 * 64] = (&planes[base..base + 16 * 64])
+                .try_into()
+                .expect("one plane block");
+            crate::zerocheck::univariate_skip_optimized::reassemble_gfni_plane_block(
+                bank_planes,
+                &mut out[b * 64..(b + 1) * 64],
+            );
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            for col in 0..64 {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |=
+                        (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                out[b * 64 + col] = F128 { lo, hi };
             }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            out[b * 64 + col] = F128 { lo, hi };
         }
     }
     out
