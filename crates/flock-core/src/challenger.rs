@@ -213,6 +213,16 @@ pub struct FsChallenger {
     n_absorbed: u64,
 }
 
+/// `FLOCK_NO_EY_GRIND_WAVES=1` restores the incumbent `2^(bits+1)` grind
+/// block. Default ON; the ranked worker's cleared environment never disables
+/// it.
+#[inline(always)]
+fn ey_grind_waves_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_GRIND_WAVES").is_none());
+    *ON
+}
+
 impl FsChallenger {
     /// New challenger seeded with a domain-separation tag (e.g.
     /// `b"flock-r1cs-v0"`), using SHA-256.
@@ -420,7 +430,23 @@ impl Challenger for FsChallenger {
             // pre-match work), small enough to avoid the 4× over-scan the old
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
-            let block: u64 = 1 << (bits.min(24) + 1);
+            // Block sizing. `find_first` must scan every chunk below the match
+            // anyway, so the only waste is the work dispatched past it, which is
+            // bounded by the block. A block of 2^(bits+1) is ~2x the expected
+            // attempts, so that overshoot is a fraction of 2^bits; sizing the
+            // block to a fixed number of thread-waves bounds it by the wave
+            // instead, at the cost of re-dispatching for a match that lands
+            // later. Four waves measured best on this shape; one wave is worse
+            // than the incumbent because dispatch overhead dominates.
+            // Determinism is unaffected for any block size: blocks are scanned
+            // in ascending order and `pow_scan` returns the smallest nonce
+            // within its chunk, so the globally smallest match is unchanged.
+            let block: u64 = if ey_grind_waves_enabled() {
+                let threads = rayon::current_num_threads() as u64;
+                (4 * threads * GRIND_CHUNK).min(1u64 << (bits.min(24) + 1))
+            } else {
+                1 << (bits.min(24) + 1)
+            };
             let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start: u64 = 0;
             loop {

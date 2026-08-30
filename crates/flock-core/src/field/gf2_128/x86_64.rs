@@ -527,11 +527,11 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
