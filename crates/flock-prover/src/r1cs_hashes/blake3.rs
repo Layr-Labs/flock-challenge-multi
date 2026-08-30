@@ -4929,6 +4929,7 @@ mod tests {
         let padding = flock_core::zerocheck::PaddingSpec {
             k_log: K_LOG,
             useful_bits_per_block: USEFUL_BITS,
+            ranked_blake3_bstatic: false,
         };
         let inv_table = {
             let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
@@ -4982,6 +4983,7 @@ mod tests {
             let padding = flock_core::zerocheck::PaddingSpec {
                 k_log: K_LOG,
                 useful_bits_per_block: USEFUL_BITS,
+                ranked_blake3_bstatic: false,
             };
             let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
             let ntt_l =
