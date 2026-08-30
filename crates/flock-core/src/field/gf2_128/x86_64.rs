@@ -548,12 +548,10 @@ impl WideGhashX4 {
     /// # Safety
     /// `avx512f` available (cfg-gated).
     #[inline]
-    #[target_feature(enable = "avx512f")]
+    #[target_feature(enable = "avx512f,avx512bw")]
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
-        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
-        self.mid =
-            _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
+        self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
