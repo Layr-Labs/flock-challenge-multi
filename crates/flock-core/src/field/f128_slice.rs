@@ -330,6 +330,179 @@ mod tests {
         }
     }
 
+    /// Isolate every bank and output slot. Distinct full-field weights make
+    /// a swapped pair limb observable even when the other source bank is zero.
+    #[test]
+    fn fold16_banked_one_hot_bank_and_slot() {
+        use super::*;
+
+        let w: [F128; 16] = core::array::from_fn(|b| F128 {
+            lo: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(2 * b as u64 + 1),
+            hi: 0xd1b5_4a32_d192_ed03u64.rotate_left(3 * b as u32),
+        });
+        let dirty = F128 {
+            lo: 0xa55a_0123_4567_89ab,
+            hi: 0xfedc_ba98_7654_3210,
+        };
+        for n in [4usize, 5, 7, 8] {
+            for bank in 0..16 {
+                for slot in 0..n {
+                    let value = F128 {
+                        lo: 0x8000_0000_0000_0001u64.rotate_left((bank + slot) as u32),
+                        hi: 0xf00d_1234_5678_9abcu64 ^ ((16 * slot + bank) as u64),
+                    };
+                    let mut src = vec![F128::ZERO; 16 * n];
+                    src[16 * slot + bank] = value;
+                    let mut got = vec![dirty; n];
+                    fold16_banked(&src, &mut got, &w);
+                    for (t, &actual) in got.iter().enumerate() {
+                        let want = if t == slot {
+                            w[bank] * value
+                        } else {
+                            F128::ZERO
+                        };
+                        assert_eq!(actual, want, "n={n} bank={bank} slot={slot} t={t}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Low-only, high-only, zero diagonal, and reduction-boundary products
+    /// exercise the unreduced L/H/D representation independently in each lane.
+    #[test]
+    fn fold16_banked_limb_and_reduction_boundaries() {
+        use super::*;
+
+        let patterns = [
+            F128::ZERO,
+            F128::ONE,
+            F128 { lo: 2, hi: 0 },
+            F128 {
+                lo: 1 << 62,
+                hi: 0,
+            },
+            F128 {
+                lo: 1 << 63,
+                hi: 0,
+            },
+            F128 { lo: 0, hi: 1 },
+            F128 {
+                lo: 0,
+                hi: 1 << 62,
+            },
+            F128 {
+                lo: 0,
+                hi: 1 << 63,
+            },
+            F128 { lo: 1, hi: 1 },
+            F128 {
+                lo: 1 << 63,
+                hi: 1 << 63,
+            },
+            F128 {
+                lo: u64::MAX,
+                hi: 0,
+            },
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            F128 {
+                lo: 0x0123_4567_89ab_cdef,
+                hi: 0xfedc_ba98_7654_3210,
+            },
+        ];
+        let dirty = F128 {
+            lo: 0xdead,
+            hi: 0xbeef,
+        };
+        for bank in 0..16 {
+            for (xi, &x) in patterns.iter().enumerate() {
+                let lanes = [
+                    x,
+                    F128 { lo: x.hi, hi: x.lo },
+                    F128 { lo: x.lo, hi: x.lo },
+                    F128 { lo: x.hi, hi: x.hi },
+                ];
+                let mut src = [F128::ZERO; 64];
+                for (slot, &value) in lanes.iter().enumerate() {
+                    src[16 * slot + bank] = value;
+                }
+                for (yi, &y) in patterns.iter().enumerate() {
+                    let mut w = [F128::ZERO; 16];
+                    w[bank] = y;
+                    let mut got = [dirty; 4];
+                    fold16_banked(&src, &mut got, &w);
+                    for slot in 0..4 {
+                        assert_eq!(
+                            got[slot],
+                            lanes[slot] * y,
+                            "bank={bank} x={xi} y={yi} slot={slot}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Include all scalar-tail lengths, SUB-sized calls, and four F128
+    /// offsets. Guards and destinations are initialized: this tests exact
+    /// output writes and stale-content independence, not uninitialized reads.
+    #[test]
+    fn fold16_banked_dirty_slices_and_tails() {
+        use super::*;
+
+        let src_guard = F128 {
+            lo: 0x0123_4567_89ab_cdef,
+            hi: 0x7654_3210_fedc_ba98,
+        };
+        let dst_guard = F128 {
+            lo: 0x8bad_f00d_dead_beef,
+            hi: 0x55aa_aa55_f0f0_0f0f,
+        };
+        let w: [F128; 16] = core::array::from_fn(|b| F128 {
+            lo: 0xd6e8_feb8_6659_fd93u64.wrapping_mul(b as u64 + 1),
+            hi: 0xa076_1d64_78bd_642fu64.rotate_left(5 * b as u32),
+        });
+        for n in [
+            0usize, 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 63, 64, 65, 255, 256, 257, 1024, 1025,
+        ] {
+            for offset in 0..4 {
+                let mut src = vec![src_guard; offset + 16 * n + 4];
+                for i in 0..16 * n {
+                    let index = i as u64 + 1;
+                    src[offset + i] = F128 {
+                        lo: index.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        hi: index.rotate_left(37) ^ 0x8000_0000_0000_0087,
+                    };
+                }
+                let before = src.clone();
+                let want: Vec<F128> = (0..n)
+                    .map(|slot| {
+                        (0..16).fold(F128::ZERO, |sum, bank| {
+                            sum + w[bank] * src[offset + 16 * slot + bank]
+                        })
+                    })
+                    .collect();
+                let mut got = vec![dst_guard; offset + n + 4];
+                fold16_banked(
+                    &src[offset..offset + 16 * n],
+                    &mut got[offset..offset + n],
+                    &w,
+                );
+                assert_eq!(
+                    &got[offset..offset + n],
+                    want.as_slice(),
+                    "n={n} offset={offset}"
+                );
+                assert!(got[..offset].iter().all(|&value| value == dst_guard));
+                assert!(got[offset + n..].iter().all(|&value| value == dst_guard));
+                assert_eq!(src, before, "source changed: n={n} offset={offset}");
+            }
+        }
+    }
+
     /// The PCS open-phase materializers hand these two folds a RECYCLED
     /// destination (`crate::scratch::LocalBuf`), so both must write every
     /// output slot before reading it — the result may not depend on what an
@@ -712,8 +885,9 @@ mod tests {
 
 /// Sixteen-bank weighted fold: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
-/// AVX-512: deferred-reduction kernel (one reduce per output lane). Other
-/// targets: the straightforward reduced form. Same field element either way.
+/// AVX-512: paired-bank Karatsuba with one deferred reduction per output
+/// lane. Other targets: the straightforward reduced form. Same field element
+/// either way.
 #[inline]
 pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     assert_eq!(
@@ -745,6 +919,376 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
                 v += w[b] * src[16 * t + b];
             }
             *value = v;
+        }
+    }
+}
+
+/// Sixty-four-bank weighted fold: `dst[t] = Σ_{b<64} w[b] · src[64t + b]`.
+///
+/// Weights may be arbitrary field elements; no challenge factorization is
+/// required. Every destination is overwritten without reading its old value.
+/// AVX-512 uses the banked dot-product leaf; other targets keep the direct
+/// reduced sum. Neither input needs alignment beyond that of `F128`.
+#[inline]
+#[allow(dead_code)] // F-only x86 caller; retain the scalar form on other builds.
+pub(crate) fn fold64_banked(src: &[F128], dst: &mut [F128], w: &[F128; 64]) {
+    assert!(
+        src.len().is_multiple_of(64) && src.len() / 64 == dst.len(),
+        "fold64 source must contain exactly sixty-four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg supplies the required CPU features. The division-based
+    // geometry check cannot overflow and covers all 64 inputs per output;
+    // the slice borrows also exclude overlap with the destination.
+    unsafe {
+        x86_64::fold64_banked(src, dst, w);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (row, value) in src.chunks_exact(64).zip(dst.iter_mut()) {
+        *value = row
+            .iter()
+            .zip(w)
+            .fold(F128::ZERO, |sum, (&x, &weight)| sum + x * weight);
+    }
+}
+
+#[cfg(test)]
+mod fold64_tests {
+    use super::*;
+
+    const DIRTY: F128 = F128 {
+        lo: 0x8bad_f00d_dead_beef,
+        hi: 0x55aa_aa55_f0f0_0f0f,
+    };
+
+    fn sample(index: usize, salt: u64) -> F128 {
+        let word = (index as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        F128 {
+            lo: word ^ salt,
+            hi: word.rotate_left(29) ^ salt.rotate_right(11) ^ 0x8000_0000_0000_0087,
+        }
+    }
+
+    // Each product is reduced independently by scalar F128 multiplication;
+    // this does not share the new leaf's bank packing or deferred accumulator.
+    fn scalar_dot(src: &[F128], w: &[F128; 64]) -> Vec<F128> {
+        src.chunks_exact(64)
+            .map(|row| {
+                row.iter()
+                    .zip(w)
+                    .fold(F128::ZERO, |sum, (&x, &weight)| sum + x * weight)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fold64_banked_matches_scalar_arbitrary_weights() {
+        for salt in [0x5eed_f01d_64u64, 0xd1b5_4a32_d192_ed03, u64::MAX] {
+            let w = core::array::from_fn(|bank| sample(bank, salt));
+            for n in [1usize, 4, 5, 8, 9, 17] {
+                let src: Vec<F128> = (0..64 * n)
+                    .map(|i| sample(i, salt.rotate_left(23)))
+                    .collect();
+                let mut got = vec![DIRTY; n];
+                fold64_banked(&src, &mut got, &w);
+                assert_eq!(got, scalar_dot(&src, &w), "n={n} salt={salt:#x}");
+            }
+        }
+    }
+
+    /// All 64 bank positions include every internal 128-bit SIMD lane and
+    /// pair member. Nine distinct output positions also expose cross-output
+    /// contamination and any short tail selected by the implementation.
+    #[test]
+    fn fold64_banked_one_hot_bank_and_output_lane() {
+        let w = core::array::from_fn(|bank| sample(bank, 0xd6e8_feb8_6659_fd93));
+        for bank in 0..64 {
+            for slot in 0..9 {
+                let value = sample(64 * slot + bank, 0xa076_1d64_78bd_642f);
+                let mut src = vec![F128::ZERO; 64 * 9];
+                src[64 * slot + bank] = value;
+                let mut got = [DIRTY; 9];
+                fold64_banked(&src, &mut got, &w);
+                for (t, &actual) in got.iter().enumerate() {
+                    let want = if t == slot {
+                        value * w[bank]
+                    } else {
+                        F128::ZERO
+                    };
+                    assert_eq!(actual, want, "bank={bank} slot={slot} t={t}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fold64_banked_zero_one_and_full_field_patterns() {
+        let inputs = [
+            vec![F128::ZERO; 64 * 5],
+            vec![F128::ONE; 64 * 5],
+            (0..64 * 5)
+                .map(|i| sample(i, 0x243f_6a88_85a3_08d3))
+                .collect(),
+        ];
+        let weights = [
+            [F128::ZERO; 64],
+            [F128::ONE; 64],
+            [F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            }; 64],
+            core::array::from_fn(|bank| sample(bank, 0x1319_8a2e_0370_7344)),
+        ];
+        for (input_case, src) in inputs.iter().enumerate() {
+            for (weight_case, w) in weights.iter().enumerate() {
+                let mut got = [DIRTY; 5];
+                fold64_banked(src, &mut got, w);
+                assert_eq!(
+                    got.as_slice(),
+                    scalar_dot(src, w).as_slice(),
+                    "input={input_case} weights={weight_case}"
+                );
+            }
+        }
+    }
+
+    /// Isolated low/high limbs, zero Karatsuba diagonals, and products of
+    /// degree 128 or 254. The second output swaps source limbs independently.
+    #[test]
+    fn fold64_banked_limb_and_reduction_boundaries() {
+        let x = F128 { lo: 2, hi: 0 };
+        let lo_top = F128 {
+            lo: 1 << 63,
+            hi: 0,
+        };
+        let hi_low = F128 { lo: 0, hi: 1 };
+        let hi_top = F128 {
+            lo: 0,
+            hi: 1 << 63,
+        };
+        let both_top = F128 {
+            lo: 1 << 63,
+            hi: 1 << 63,
+        };
+        let full = F128 {
+            lo: u64::MAX,
+            hi: u64::MAX,
+        };
+        let products = [
+            (F128::ONE, F128::ONE),
+            (lo_top, x),
+            (hi_low, hi_low),
+            (hi_top, x),
+            (hi_top, hi_top),
+            (full, full),
+            (both_top, both_top),
+            (
+                F128 {
+                    lo: u64::MAX,
+                    hi: 0,
+                },
+                F128 {
+                    lo: 0,
+                    hi: u64::MAX,
+                },
+            ),
+        ];
+        for bank in 0..64 {
+            for (case, &(value, weight)) in products.iter().enumerate() {
+                let swapped = F128 {
+                    lo: value.hi,
+                    hi: value.lo,
+                };
+                let mut src = [F128::ZERO; 128];
+                src[bank] = value;
+                src[64 + bank] = swapped;
+                let mut w = [F128::ZERO; 64];
+                w[bank] = weight;
+                let mut got = [DIRTY; 2];
+                fold64_banked(&src, &mut got, &w);
+                assert_eq!(got, [value * weight, swapped * weight], "bank={bank} case={case}");
+                if case == 2 || case == 3 {
+                    // x^128 = x^7 + x^2 + x + 1 in the GHASH field.
+                    assert_eq!(got[0], F128 { lo: 0x87, hi: 0 });
+                }
+            }
+        }
+    }
+
+    /// Recycled destinations, distinct input/output offsets, short lengths,
+    /// and 256-slot chunk boundaries. All halos are initialized; this checks
+    /// exact writes and stale-value independence, not absence of input reads.
+    #[test]
+    fn fold64_banked_dirty_offsets_and_tails() {
+        let src_guard = F128 {
+            lo: 0x0123_4567_89ab_cdef,
+            hi: 0x7654_3210_fedc_ba98,
+        };
+        let w = core::array::from_fn(|bank| sample(bank, 0xfeed_1234_5678_9abc));
+        let weights_before = w;
+        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 255, 256, 257] {
+            for offset in 0..4 {
+                let src_start = 1 + offset;
+                let dst_start = 4 - offset;
+                let mut src = vec![src_guard; src_start + 64 * n + 4];
+                for (i, value) in src[src_start..src_start + 64 * n].iter_mut().enumerate() {
+                    *value = sample(i, 0x0bad_c0de_f00d_9911);
+                }
+                let source_before = src.clone();
+                let want = scalar_dot(&src[src_start..src_start + 64 * n], &w);
+                let mut got = vec![DIRTY; dst_start + n + 4];
+                fold64_banked(
+                    &src[src_start..src_start + 64 * n],
+                    &mut got[dst_start..dst_start + n],
+                    &w,
+                );
+                assert_eq!(
+                    &got[dst_start..dst_start + n],
+                    want.as_slice(),
+                    "n={n} offset={offset}"
+                );
+                assert!(got[..dst_start].iter().all(|&value| value == DIRTY));
+                assert!(got[dst_start + n..].iter().all(|&value| value == DIRTY));
+                assert_eq!(src, source_before, "source changed: n={n} offset={offset}");
+                assert_eq!(w, weights_before, "weights changed: n={n} offset={offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn fold64_banked_matches_six_lsb_pair_rounds() {
+        let challenges = [
+            [F128::ZERO; 6],
+            [F128::ONE; 6],
+            core::array::from_fn(|bit| {
+                if bit % 2 == 0 {
+                    F128::ZERO
+                } else {
+                    F128::ONE
+                }
+            }),
+            core::array::from_fn(|bit| sample(bit, 0x6a09_e667_f3bc_c909)),
+        ];
+        for n in [1usize, 2, 5, 9] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|i| sample(i, 0xbb67_ae85_84ca_a73b))
+                .collect();
+            for (case, rounds) in challenges.iter().enumerate() {
+                let w = core::array::from_fn(|bank| {
+                    rounds.iter().enumerate().fold(F128::ONE, |weight, (bit, &r)| {
+                        let factor = if bank & (1 << bit) == 0 {
+                            F128::ONE + r
+                        } else {
+                            r
+                        };
+                        weight * factor
+                    })
+                });
+                let mut want = src.clone();
+                for &r in rounds {
+                    let mut next = vec![DIRTY; want.len() / 2];
+                    fold_pairs(&want, 0, &mut next, r);
+                    want = next;
+                }
+                let mut got = vec![DIRTY; n];
+                fold64_banked(&src, &mut got, &w);
+                assert_eq!(got, want, "n={n} rounds={case}");
+                assert_eq!(got, scalar_dot(&src, &w));
+            }
+        }
+    }
+
+    /// w16 is arbitrary, not assumed to be a four-challenge equality table.
+    /// Bank bits 0..3 select w16; bits 4 and 5 select r4 and r5, respectively.
+    #[test]
+    fn fold64_banked_matches_arbitrary_fold16_then_fold4() {
+        let pairs = [
+            (F128::ZERO, F128::ZERO),
+            (F128::ONE, F128::ZERO),
+            (F128::ZERO, F128::ONE),
+            (F128::ONE, F128::ONE),
+            (
+                sample(0, 0x3c6e_f372_fe94_f82b),
+                sample(1, 0xa54f_f53a_5f1d_36f1),
+            ),
+            (
+                F128 {
+                    lo: 0,
+                    hi: 1 << 63,
+                },
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+            ),
+        ];
+        for n in [1usize, 3, 4, 5, 9] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|i| sample(i, 0x510e_527f_ade6_82d1))
+                .collect();
+            for (case, &(r4, r5)) in pairs.iter().enumerate() {
+                let w16: [F128; 16] =
+                    core::array::from_fn(|bank| sample(bank + 16 * case, 0x9b05_688c_2b3e_6c1f));
+                let q = [
+                    (F128::ONE + r4) * (F128::ONE + r5),
+                    r4 * (F128::ONE + r5),
+                    (F128::ONE + r4) * r5,
+                    r4 * r5,
+                ];
+                let w = core::array::from_fn(|bank| w16[bank & 15] * q[bank >> 4]);
+                let mut mid = vec![DIRTY; 4 * n];
+                fold16_banked(&src, &mut mid, &w16);
+                let mut want = vec![DIRTY; n];
+                fold4_nested(&mid, &mut want, r4, r5);
+                let mut got = vec![DIRTY; n];
+                fold64_banked(&src, &mut got, &w);
+                assert_eq!(got, want, "n={n} pair={case}");
+                assert_eq!(got, scalar_dot(&src, &w));
+            }
+        }
+    }
+
+    #[test]
+    fn fold64_banked_rejects_inexact_geometry_before_writing() {
+        let w = core::array::from_fn(|bank| sample(bank, 0x1f83_d9ab_fb41_bd6b));
+        for (src_len, dst_len) in [
+            (0usize, 1usize),
+            (1, 0),
+            (1, 1),
+            (63, 1),
+            (65, 1),
+            (64, 0),
+            (64, 2),
+            (127, 2),
+            (129, 2),
+            (128, 1),
+            (192, 2),
+            (64, 3),
+        ] {
+            let src: Vec<F128> = (0..src_len)
+                .map(|i| sample(i, 0x5be0_cd19_137e_2179))
+                .collect();
+            let source_before = src.clone();
+            let mut dst = vec![DIRTY; dst_len + 2];
+            let destination_before = dst.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fold64_banked(&src, &mut dst[1..1 + dst_len], &w);
+            }));
+            assert!(result.is_err(), "src={src_len} dst={dst_len}");
+            assert_eq!(dst, destination_before);
+            assert_eq!(src, source_before);
         }
     }
 }

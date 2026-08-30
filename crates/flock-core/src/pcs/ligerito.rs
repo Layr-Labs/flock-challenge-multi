@@ -6027,35 +6027,30 @@ fn materialize_direct_fold8_f_for_precommit(
 ) {
     use rayon::prelude::*;
 
-    const SUB: usize = 256;
-    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+    assert!(
+        packed_witness.len().is_multiple_of(64) && packed_witness.len() / 64 == folded_f.len()
+    );
+    // The last two bindings multiply the four 16-bank groups by these
+    // tensor factors. Absorb them into the first four bindings once, before
+    // the parallel sweep, so each final slot is one 64-bank weighted sum.
+    let high_weight = [
+        (F128::ONE + r4) * (F128::ONE + r5),
+        r4 * (F128::ONE + r5),
+        (F128::ONE + r4) * r5,
+        r4 * r5,
+    ];
+    let weight: [F128; 64] =
+        std::array::from_fn(|bank| fold16_weight[bank & 15] * high_weight[bank >> 4]);
     folded_f
         .par_chunks_mut(block_len)
         .enumerate()
-        .for_each_init(
-            || {
-                crate::scratch::LocalBuf::new(
-                    (4 * SUB).max(ALIGN64_MIN_F128),
-                    crate::scratch::fold_buf_pool_enabled(),
-                )
-            },
-            |mid4, (block, f_out)| {
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)],
-                        m4,
-                        fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
-                    slot += n;
-                }
-            },
-        );
+        .for_each(|(block, f_out)| {
+            let start = 64 * block * block_len;
+            let f_in = &packed_witness[start..start + 64 * f_out.len()];
+            // One kernel invocation per block: no SUB staging, LocalBuf,
+            // intermediate publish/read, or weight repacking per SUB.
+            crate::field::f128_slice::fold64_banked(f_in, f_out, &weight);
+        });
 }
 
 /// Materialize the exact ranked two-claim GFNI basis and M6 after folded_f is
@@ -9722,6 +9717,108 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_precommit_fusion_matches_staged_fold() {
+        let mut state = 0xD164_F053_928A_761Bu64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(29))
+        };
+        let sentinel = F128::new(0x7319_A45C_F026_8BD2, 0xD08A_5247_B631_9EFC);
+        let challenge_pairs = [
+            (F128::ZERO, F128::ZERO),
+            (F128::ONE, F128::ONE),
+            (F128::ZERO, F128::ONE),
+            (F128::ONE, F128::ZERO),
+            (random(), random()),
+            (F128::new(0, 1 << 63), F128::new(u64::MAX, u64::MAX)),
+        ];
+        for &(block_len, n) in &[
+            (1usize, 0usize),
+            (1, 1),
+            (3, 7),
+            (4, 9),
+            (64, 64),
+            (64, 65),
+            (64, 131),
+            (256, 256),
+            (256, 257),
+            (257, 515),
+        ] {
+            let mut src = vec![sentinel; 64 * n + 4];
+            for value in &mut src[1..1 + 64 * n] {
+                *value = random();
+            }
+            let original = src.clone();
+            let weight: [F128; 16] = std::array::from_fn(|_| random());
+            for &(r4, r5) in &challenge_pairs {
+                let mut got = vec![sentinel; n + 4];
+                materialize_direct_fold8_f_for_precommit(
+                    &src[1..1 + 64 * n],
+                    &mut got[1..1 + n],
+                    block_len,
+                    &weight,
+                    r4,
+                    r5,
+                );
+                let mut mid = vec![F128::ZERO; 4 * n];
+                let mut expected = vec![F128::ZERO; n];
+                crate::field::f128_slice::fold16_banked(
+                    &src[1..1 + 64 * n],
+                    &mut mid,
+                    &weight,
+                );
+                crate::field::f128_slice::fold4_nested(&mid, &mut expected, r4, r5);
+                assert_eq!(&got[1..1 + n], expected.as_slice(), "block={block_len} n={n}");
+                assert_eq!(got[0], sentinel);
+                assert!(got[1 + n..].iter().all(|&value| value == sentinel));
+                assert_eq!(src, original, "source changed block={block_len} n={n}");
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_precommit_fusion_selects_every_endpoint_bank() {
+        let src: Vec<F128> = (0..64 * 5)
+            .map(|i| F128::new(i as u64 + 1, (i as u64 + 1).rotate_left(37)))
+            .collect();
+        for bank in 0..64 {
+            let mut weight = [F128::ZERO; 16];
+            weight[bank & 15] = F128::ONE;
+            let r4 = if bank & 16 == 0 {
+                F128::ZERO
+            } else {
+                F128::ONE
+            };
+            let r5 = if bank & 32 == 0 {
+                F128::ZERO
+            } else {
+                F128::ONE
+            };
+            let mut got = vec![F128::ZERO; 5];
+            materialize_direct_fold8_f_for_precommit(&src, &mut got, 3, &weight, r4, r5);
+            for (t, &value) in got.iter().enumerate() {
+                assert_eq!(value, src[64 * t + bank], "bank={bank} slot={t}");
+            }
+        }
+    }
 
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
