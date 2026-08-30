@@ -4578,6 +4578,25 @@ fn direct_fold4_b_gfni_enabled() -> bool {
     *ON
 }
 
+/// Run the ranked DirectFold4 witness fold and its independent two-claim GFNI
+/// basis fold concurrently on opposite SMT siblings. The two destinations are
+/// disjoint and the message reduction remains after both joins, so this is a
+/// schedule-only change. The ranked worker clears the rollback variable.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold4_smt_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF4_SMT_OVERLAP").is_none()
+    });
+    *ON
+}
+
 #[cfg(any(
     test,
     all(
@@ -4727,6 +4746,110 @@ fn materialize_direct_fold4(
     let pf_on = mdf4_pf_enabled();
     #[cfg(target_arch = "x86_64")]
     let n_blocks = out_len / block_len;
+
+    // The ranked DirectFold4 materializer has two independent halves. The
+    // f-side streams a 2 MiB witness slab from DRAM while the b-side runs the
+    // two-claim GFNI composed-map fold out of small tables. The incumbent does
+    // every f half first and every b half second inside each rayon task, which
+    // synchronizes all workers into a memory-only phase followed by a
+    // compute-only phase. The already-initialized ranked sibling pools give
+    // each physical core one f worker and one b worker so those complementary
+    // resources overlap. Both vectors are complete before the unchanged
+    // message reduction below.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    if b_gfni_on && deferred_reduce && direct_fold4_smt_overlap_enabled() {
+        if let Some((f_pool, b_pool)) = crate::smt_split::zc_r1_pools() {
+            rayon::join(
+                || {
+                    f_pool.install(|| {
+                        folded_f
+                            .par_chunks_mut(block_len)
+                            .enumerate()
+                            .for_each(|(block, f_out)| {
+                                let start = 16 * block * block_len;
+                                let f_in = &packed_witness[start..start + 16 * block_len];
+                                crate::field::f128_slice::fold16_banked(
+                                    f_in,
+                                    f_out,
+                                    &fold_weight,
+                                );
+                            });
+                    });
+                },
+                || {
+                    b_pool.install(|| {
+                        folded_b
+                            .par_chunks_mut(block_len)
+                            .enumerate()
+                            .for_each(|(block, b_out)| {
+                                use crate::zerocheck::multilinear::kernels::x86_64::{
+                                    build_row_fold_mats_from_cols,
+                                    gfni_fold64_four_maps_staged,
+                                };
+                                use core::arch::x86_64::_mm512_setzero_si512;
+
+                                let (claim0, claim1) = (&claims[0], &claims[1]);
+                                let cols0 = super::ring_switch::compose_block_cols(
+                                    &direct_tables[0],
+                                    claim0.eq_hi[block],
+                                );
+                                let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                                let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                                let cols1 = super::ring_switch::compose_block_cols(
+                                    &direct_tables[1],
+                                    claim1.eq_hi[block],
+                                );
+                                let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                                let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                                let (rows0, rows1) =
+                                    (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                                let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                                for slot in (0..block_len).step_by(64) {
+                                    // SAFETY: this is the same ranked-shape
+                                    // GFNI leaf and the same disjoint b_out
+                                    // slice used by the incumbent loop below.
+                                    unsafe {
+                                        gfni_fold64_four_maps_staged(
+                                            rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                            &mats0_lo,
+                                            rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                            &mats0_hi,
+                                            rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                            &mats1_lo,
+                                            rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                            &mats1_hi,
+                                            b_out.as_mut_ptr().add(slot),
+                                            planes.as_mut_ptr(),
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                },
+            );
+
+            let (u_0, u_2) = folded_b
+                .par_chunks(block_len)
+                .zip(folded_f.par_chunks(block_len))
+                .map(|(b_out, f_out)| {
+                    // SAFETY: the ranked feature gate supplies AVX-512F and
+                    // VPCLMULQDQ; both complete chunks have equal length.
+                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+                );
+            return (folded_f, folded_b, SumcheckMessage { u_0, u_2 });
+        }
+    }
+
     let (u_0, u_2) = folded_b
         .par_chunks_mut(block_len)
         .zip(folded_f.par_chunks_mut(block_len))
