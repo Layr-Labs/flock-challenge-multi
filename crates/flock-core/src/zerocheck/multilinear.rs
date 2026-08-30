@@ -1103,9 +1103,21 @@ const PACKED_SPLIT_MAX_N_HI: usize = 13;
     target_feature = "vpclmulqdq"
 ))]
 fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
+    build_w_pair_table_into(eq_lo, eq_lo.len())
+}
+
+/// [`build_w_pair_table`] into an allocation of `cap` `F128`, so the canonical
+/// sparse-weight cache can be appended without a second allocation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_w_pair_table_into(eq_lo: &[F128], cap: usize) -> Vec<F128> {
     debug_assert!(eq_lo.len().is_multiple_of(8));
+    debug_assert!(cap >= eq_lo.len());
     let x64 = F128::new(0, 1);
-    let mut t = crate::alloc_uninit_f128_vec(eq_lo.len());
+    let mut t = crate::alloc_uninit_f128_vec(cap);
     for g in 0..eq_lo.len() / 8 {
         for k in 0..4 {
             let w = eq_lo[8 * g + 2 * k + 1];
@@ -1114,6 +1126,102 @@ fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
         }
     }
     t
+}
+
+/// The canonical round-two sparse `b` row. Every 128-pair `b` block ends with
+/// seven r1cs-padding pairs whose rows are zero, so the window that starts at
+/// pair `ZC_B_SPARSE_PAIR` carries exactly one live row — and that row is the
+/// same eight bytes, low forty-nine bits set, in every block of the ranked
+/// instance (measured: 262 144 blocks, one distinct value, every other row of
+/// the window zero). The kernel re-proves the match per window before it uses
+/// the cached product, so this constant is an optimization hint and never a
+/// correctness assumption.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+const ZC_SPARSE_B_ROW: u64 = 0x0001_ffff_ffff_ffff;
+
+/// Fold one packed eight-byte post-URM row through the univariate-skip fold
+/// table — the scalar form of `fold_round2_pair_x86_unchecked_8` for a single
+/// row.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn fold_packed_row(table: &UniSkipFoldTable, row: u64) -> F128 {
+    let bytes = row.to_le_bytes();
+    let mut acc = F128::ZERO;
+    for (j, byte) in bytes.iter().enumerate().take(table.n_chunks) {
+        acc += table.data[j * 256 + *byte as usize];
+    }
+    acc
+}
+
+/// Number of `F128` a `lo_size`-wide weight table occupies once the canonical
+/// sparse-weight cache is appended: the `(w, w·x⁶⁴)` pairs, then one product
+/// per sparse window of the pass, then the canonical folded row that gates
+/// them. At the ranked shape (`lo_size = 4096`) the tail is 32 + 1 entries —
+/// 528 bytes on the end of an allocation that already exists.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn w_pair_table_swc_len(lo_size: usize) -> usize {
+    lo_size + (lo_size / kernels::x86_64::ZC_B_BLOCK_PAIRS) + 1
+}
+
+/// Build the per-pass weight table with the canonical sparse-weight cache
+/// appended when the pass has the shape the sweep's sparse window needs.
+///
+/// The sparse window of block `j` sits at low index `128·j + 120`, and the
+/// sweep weights the whole window by the group's odd lane `eq_lo[128·j + 121]`.
+/// Its only live `b` operand is the fold of [`ZC_SPARSE_B_ROW`], a per-pass
+/// constant, so the entire weighted operand
+/// `Q[j] = eq_lo[128·j + 121] · fold(ZC_SPARSE_B_ROW)` is a pass constant too:
+/// `lo_size / 128` multiplies here replace one five-CLMUL product per sparse
+/// window per worker chunk (32 multiplies against 8192 · 32 products at the
+/// ranked shape).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_w_pair_table_swc(eq_lo: &[F128], table: &UniSkipFoldTable) -> Vec<F128> {
+    use kernels::x86_64::{ZC_B_BLOCK_PAIRS, ZC_B_SPARSE_PAIR};
+    let lo_size = eq_lo.len();
+    let n_q = lo_size / ZC_B_BLOCK_PAIRS;
+    let mut t = build_w_pair_table_into(eq_lo, w_pair_table_swc_len(lo_size));
+    let b_canon = fold_packed_row(table, ZC_SPARSE_B_ROW);
+    for j in 0..n_q {
+        t[lo_size + j] = eq_lo[ZC_B_BLOCK_PAIRS * j + ZC_B_SPARSE_PAIR + 1] * b_canon;
+    }
+    t[lo_size + n_q] = b_canon;
+    t
+}
+
+/// The per-pass weight table for a round-two lookahead sweep, with the
+/// canonical sparse-weight cache appended whenever the shape allows it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_w_pair_table_for_pass(eq_lo: &[F128], table: &UniSkipFoldTable) -> Option<Vec<F128>> {
+    let lo_size = eq_lo.len();
+    if !kernels::x86_64::zc_wtab_enabled() || !lo_size.is_multiple_of(8) {
+        return None;
+    }
+    if kernels::x86_64::zc_sparse_wcache_enabled()
+        && lo_size.is_multiple_of(kernels::x86_64::ZC_B_BLOCK_PAIRS)
+    {
+        Some(build_w_pair_table_swc(eq_lo, table))
+    } else {
+        Some(build_w_pair_table(eq_lo))
+    }
 }
 
 fn packed_split_n_hi(n_vars: usize) -> usize {
@@ -1251,11 +1359,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
-        Some(build_w_pair_table(eq_lo))
-    } else {
-        None
-    };
+    let wtab_vec = build_w_pair_table_for_pass(eq_lo, table);
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1466,11 +1570,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
-        Some(build_w_pair_table(eq_lo))
-    } else {
-        None
-    };
+    let wtab_vec = build_w_pair_table_for_pass(eq_lo, table);
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4268,6 +4368,108 @@ mod tests {
                 out_s, out_ns,
                 "scalar no-store sums lo_size={lo_size} mask={mask}"
             );
+        }
+    }
+
+    /// Canonical sparse-weight cache: on a production-shaped chunk (the last
+    /// useful pair of every 128-pair block carrying the canonical low-49-bits
+    /// `b` row, its window's other fifteen rows zero) the cached arm must both
+    /// FIRE and agree with the scalar oracle, and disabling it must not move
+    /// the result.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn round2_sparse_weight_cache_matches_scalar() {
+        use kernels::x86_64::{ZC_B_BLOCK_PAIRS, ZC_B_SPARSE_PAIR};
+        const K_SKIP: usize = 6;
+        for &lo_size in &[ZC_B_BLOCK_PAIRS, 2 * ZC_B_BLOCK_PAIRS] {
+            let mut rng = Rng::new(0x5C00 + lo_size as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats = r2_gfni_mats(&table);
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let r2_mats_arg = r2_mats.as_ref();
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let r2_mats_arg: Option<&[u64; 128]> = None;
+            let (mask, useful) = (ZC_B_BLOCK_PAIRS - 1, ZC_B_SPARSE_PAIR + 1);
+            let n_rows = 4 * lo_size + 16;
+            let mut a_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let eq_lo = rng.f128_vec(lo_size);
+            let row_base = 2 * lo_size;
+            let pair_idx_base = lo_size;
+            // Production `b` shape: the block's padding pairs are zero rows,
+            // and the last useful pair carries the canonical sparse row in
+            // its even slot and zero in its odd slot.
+            for pair in 0..lo_size {
+                let in_block = (pair_idx_base + pair) & mask;
+                let r0 = (row_base + 2 * pair) * 8;
+                if in_block >= useful {
+                    a_packed[r0..r0 + 16].fill(0);
+                    b_packed[r0..r0 + 16].fill(0);
+                } else if in_block == ZC_B_SPARSE_PAIR {
+                    b_packed[r0..r0 + 8].copy_from_slice(&ZC_SPARSE_B_ROW.to_le_bytes());
+                    b_packed[r0 + 8..r0 + 16].fill(0);
+                }
+            }
+
+            let mut a_e: Vec<F128> = Vec::new();
+            let mut b_e: Vec<F128> = Vec::new();
+            let out_s = round2_lookahead_chunk_scalar::<false>(
+                &a_packed,
+                &b_packed,
+                &table,
+                &mut a_e,
+                &mut b_e,
+                &eq_lo,
+                row_base,
+                pair_idx_base,
+                mask,
+                useful,
+            );
+            let plain = build_w_pair_table(&eq_lo);
+            let cached = build_w_pair_table_swc(&eq_lo, &table);
+            assert_eq!(cached.len(), w_pair_table_swc_len(lo_size));
+            assert_eq!(&cached[..lo_size], &plain[..]);
+            let run = |wt: &[F128]| -> [F128; 8] {
+                let mut a_e: Vec<F128> = Vec::new();
+                let mut b_e: Vec<F128> = Vec::new();
+                // SAFETY: rows/table lengths satisfy the kernel's contract
+                // and WRITE=false touches no chunk.
+                unsafe {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut a_e,
+                        &mut b_e,
+                        &eq_lo,
+                        pair_idx_base,
+                        mask,
+                        useful,
+                        Some(wt),
+                    )
+                }
+            };
+            let before = kernels::x86_64::B_SPARSE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(out_s, run(&cached), "cached sums lo_size={lo_size}");
+            let hits = kernels::x86_64::B_SPARSE_HITS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert_eq!(
+                hits,
+                lo_size / ZC_B_BLOCK_PAIRS,
+                "sparse windows taken lo_size={lo_size}"
+            );
+            assert_eq!(out_s, run(&plain), "uncached sums lo_size={lo_size}");
+            // Poisoning the cache must move the result: proof that the cached
+            // values, not the recomputed product, fed the accumulators.
+            let mut bad = cached.clone();
+            bad[lo_size] += F128::ONE;
+            assert_ne!(out_s, run(&bad), "cache is live lo_size={lo_size}");
         }
     }
 

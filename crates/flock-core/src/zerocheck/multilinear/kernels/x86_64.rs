@@ -160,6 +160,19 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     }
 }
 
+/// Round-two `b` block period, in pairs: the post-URM `b` rows repeat with
+/// this period, and the sweep's two window specializations sit at fixed
+/// offsets inside it.
+pub(crate) const ZC_B_BLOCK_PAIRS: usize = 128;
+
+/// `log2(ZC_B_BLOCK_PAIRS)`.
+pub(crate) const ZC_B_BLOCK_LOG: u32 = 7;
+
+/// Offset, in pairs, of the sparse `b` window inside a block: the last useful
+/// pair, whose even row alone survives while every other row of the eight-pair
+/// window folds to zero.
+pub(crate) const ZC_B_SPARSE_PAIR: usize = 120;
+
 /// x86 lookahead round-two sweep for one worker chunk: folds every pair of
 /// this chunk into `a_chunk`/`b_chunk` (bit-identical to the incumbent
 /// sweep) and returns the eight per-chunk sums
@@ -217,8 +230,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
-        const B_ONES_BLOCK_PAIRS: usize = 128;
-        const B_SPARSE_PAIR: usize = 120;
+        const B_ONES_BLOCK_PAIRS: usize = ZC_B_BLOCK_PAIRS;
+        const B_SPARSE_PAIR: usize = ZC_B_SPARSE_PAIR;
         const B_SPECIAL_ONES: u8 = 0;
         const B_SPECIAL_SPARSE: u8 = 1;
         const B_SPECIAL_NONE: u8 = 2;
@@ -242,6 +255,37 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             ),
             (false, false) => (usize::MAX, B_SPECIAL_NONE),
         };
+        // Canonical sparse-weight cache. In the sparse window the only
+        // surviving `b` operand is lane 0 of `b0` — the fold of the block's
+        // canonical low-49-bits row — and that row is the SAME eight bytes in
+        // every block of every pass, so `w · b0[0]` depends on nothing but
+        // `x_lo`. The driver appends the `lo_size / 128` products plus the
+        // canonical folded row itself to the existing weight allocation
+        // (528 bytes at the production shape), computed once per pass and
+        // read by all `hi_size` worker chunks. The sparse tail then spends a
+        // masked 16-byte load where it used to spend a five-CLMUL
+        // `ghash_mul_x4_split`: 17 CLMUL per window becomes 12.
+        //
+        // The canonical folded row sits one past the products, so the single
+        // compare in the sparse arm both proves the window is sparse and
+        // proves the cached product applies. A mismatch falls through to the
+        // incumbent product, so the cache can never change a result — only
+        // which instructions produce it. Only the base pointer is resolved
+        // here: both table reads stay inside the one-window-in-sixteen arm
+        // rather than pinning a ZMM across the whole sweep.
+        let swc_len = lo_size + (lo_size >> ZC_B_BLOCK_LOG) + 1;
+        let swc_q: *const F128 = match wtab {
+            Some(wt)
+                if b_sparse_on
+                    && lo_size.is_multiple_of(ZC_B_BLOCK_PAIRS)
+                    && (pair_idx_base & (ZC_B_BLOCK_PAIRS - 1)) == 0
+                    && wt.len() == swc_len =>
+            {
+                wt.as_ptr().add(lo_size)
+            }
+            _ => core::ptr::null(),
+        };
+        let swc_canon = swc_q.wrapping_add(lo_size >> ZC_B_BLOCK_LOG);
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
         // rows; the consume path below skips them exactly as before).
@@ -519,38 +563,58 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     }
                 } else {
                     let zero = _mm512_setzero_si512();
-                    let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
-                    let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
-                        & _mm512_cmpeq_epi64_mask(b1, zero)
+                    let b_tail_zero = _mm512_cmpeq_epi64_mask(b1, zero)
                         & _mm512_cmpeq_epi64_mask(b2, zero)
                         & _mm512_cmpeq_epi64_mask(b3, zero);
-                    if all == 0xff {
+                    // Cached arm: one compare against the canonical folded
+                    // row settles both "this window is sparse" and "the
+                    // per-pass product applies", so the weighted operand is
+                    // a masked 16-byte load, not a five-CLMUL product.
+                    let wb = if !swc_q.is_null()
+                        && b_tail_zero == 0xff
+                        && _mm512_cmpeq_epi64_mask(
+                            b0,
+                            _mm512_maskz_loadu_epi64(0x03, swc_canon.cast::<i64>()),
+                        ) == 0xff
+                    {
+                        Some(_mm512_maskz_loadu_epi64(
+                            0x03,
+                            swc_q.add(x_lo >> ZC_B_BLOCK_LOG).cast::<i64>(),
+                        ))
+                    } else {
+                        let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
+                        if (b_tail_zero & _mm512_cmpeq_epi64_mask(b0, b0_lane0)) == 0xff {
+                            Some(if let Some(wt) = wtab {
+                                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                                let w = _mm512_loadu_si512(wp);
+                                let w64 = _mm512_loadu_si512(wp.add(1));
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                    b0_lane0, w, w64,
+                                )
+                            } else {
+                                let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                                let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                                if wsplit {
+                                    let w64 =
+                                        crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                        b0_lane0, w, w64,
+                                    )
+                                } else {
+                                    ghash_mul_x4(w, b0_lane0)
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(wb) = wb {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let a1_msg = _mm512_xor_si512(a0, a1);
                         let a5_msg = _mm512_xor_si512(a0, a2);
                         let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
-                        let wb = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
-                        } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
-                            } else {
-                                ghash_mul_x4(w, b0_lane0)
-                            }
-                        };
                         acc[1].mul_acc(a1_msg, wb);
                         acc[5].mul_acc(a5_msg, wb);
                         acc[7].mul_acc(a7_msg, wb);
@@ -1338,6 +1402,16 @@ fn zc_b_sparse_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_SPARSE").is_none());
     *ENABLED
+}
+
+/// `FLOCK_NO_ZC_SPARSE_WCACHE=1` stops the driver appending the canonical
+/// sparse-weight cache to the per-pass weight table, so the sweep takes the
+/// incumbent five-CLMUL product in the sparse window (exact same-binary A/B;
+/// the cache holds the identical field element the product otherwise forms).
+pub(crate) fn zc_sparse_wcache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_SPARSE_WCACHE").is_none());
+    *ON
 }
 
 /// Deferred-reduction form of the sixteen-to-four composed pair fold. The
