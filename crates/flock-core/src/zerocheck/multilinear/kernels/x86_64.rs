@@ -278,6 +278,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let unmasked = zc_unmasked_fold_enabled();
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -286,26 +288,44 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 // gather path reads.
                 let m = mats.unwrap();
                 let g0 = row_base + 2 * x_lo;
-                // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
-                // start, so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
-                // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
-                // worker with a cleared environment, so the gate is off and
-                // the mask is a constant 0 on every one of the ~2.1 M leaf
-                // tiles. Feeding the constant in directly drops the per-tile
-                // `OnceLock` acquire load and the eight-bit mask build, and
-                // lets the fold kernels take their unpredicated line path.
-                let dead = 0u8;
+                // Ranked env never sets `FLOCK_PREFOLD_ROW_SKIP`, so every
+                // tile has eight readable lines. The unmasked leaf drops the
+                // dead-line `u8` from the outlined ABI; the masked sibling
+                // with `dead = 0` is the same-binary rollback.
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
-                if tr_bcast {
-                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
-                } else if tr_emit {
-                    gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                if unmasked {
+                    if tr_bcast {
+                        gfni_fold64_rows_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    } else if tr_emit {
+                        gfni_fold64_rows_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    } else {
+                        gfni_fold64_rows(a_pkt.add(g0 * 8), m, fa.as_mut_ptr());
+                        gfni_fold64_rows(b_pkt.add(g0 * 8), m, fb.as_mut_ptr());
+                    }
                 } else {
-                    gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    let dead = 0u8;
+                    if tr_bcast {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            a_pkt.add(g0 * 8),
+                            m,
+                            fa.as_mut_ptr(),
+                            dead,
+                        );
+                        gfni_fold64_rows_masked_tr_bcast(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        );
+                    } else if tr_emit {
+                        gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    } else {
+                        gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
+                        gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    }
                 }
                 // The packed bursts `pf_tiles` refills ahead — a gap the
                 // hardware prefetcher does not bridge across the strided
@@ -1340,6 +1360,18 @@ fn zc_b_sparse_enabled() -> bool {
     *ENABLED
 }
 
+/// Ranked refill loops pass a literal `0` dead-line mask into an
+/// `#[inline(never)]` GFNI leaf. LLVM cannot fold that `u8` across the
+/// outlined ABI, so each of ~2.1 M tiles still takes a mask register and a
+/// `dead_lines == 0` test inside the kernel. This selector calls a sibling
+/// leaf with no mask parameter. `FLOCK_NO_ZC_UNMASKED_FOLD=1` restores the
+/// masked ABI with `dead = 0`.
+fn zc_unmasked_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_UNMASKED_FOLD").is_none());
+    *ON
+}
+
 /// Deferred-reduction form of the sixteen-to-four composed pair fold. The
 /// two fold levels expand (char 2) to
 /// `out = x0 ^ ra*(x0^x1) ^ rb*(x0^x2) ^ (ra*rb)*(x0^x1^x2^x3)` per output
@@ -2124,10 +2156,11 @@ pub(crate) fn build_row_fold_mats_from_cols(cols: &[F128]) -> [u64; 128] {
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-// Retained as the unpredicated reference the dead-line skip is proved
-// byte-identical to (`gfni_masked_prefold_matches_unpredicated_kernel`); the
-// hot paths call `gfni_fold64_rows_masked`.
-#[cfg_attr(not(test), allow(dead_code))]
+// Unpredicated reference the dead-line skip is proved byte-identical to
+// (`gfni_masked_prefold_matches_unpredicated_kernel`). Ranked refill calls
+// this when `zc_unmasked_fold_enabled`; `#[inline(never)]` keeps the eight
+// loads off the rayon leaf's ABI.
+#[inline(never)]
 pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
     use core::arch::x86_64::*;
     // SAFETY: caller guarantees 512 readable bytes at `rows` and 64 writable
@@ -2547,6 +2580,47 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
                     *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
                 }
             }
+        }
+        gfni_fold64_regs_sigma_bcast(z, mats, out);
+    }
+}
+
+/// Unmasked sibling of [`gfni_fold64_rows_masked_tr`].
+/// The non-tr unmasked leaf is the existing oracle [`gfni_fold64_rows`].
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr`] with every line live.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_tr(rows: *const u8, mats: &[u64; 128], out: *mut F128) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        }
+        gfni_fold64_regs_sigma(z, mats, out);
+    }
+}
+
+/// Unmasked sibling of [`gfni_fold64_rows_masked_tr_bcast`]. Ranked default.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_masked_tr_bcast`] with every line live.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
         }
         gfni_fold64_regs_sigma_bcast(z, mats, out);
     }
