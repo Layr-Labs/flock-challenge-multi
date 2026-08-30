@@ -471,6 +471,27 @@ impl Round1AbInner {
         self.ranked_one_rows_elided
     }
 
+    /// Restore dense AB when a consumer cannot add the identity-C one rows.
+    /// This is a cold fallback for representation/consumer gate mismatches;
+    /// the ranked identity-C path never calls it.
+    pub(crate) fn restore_full_if_ranked_one_rows_elided(
+        &mut self,
+        a_packed: &[u8],
+        b_packed: &[u8],
+        inv_table: &InvNttTableByteSingleGf8,
+    ) {
+        if !self.ranked_one_rows_elided {
+            return;
+        }
+        // Validate before the existing prefix repair reaches raw kernels.
+        assert_eq!(a_packed.len(), self.len_bytes());
+        assert_eq!(b_packed.len(), self.len_bytes());
+        assert_eq!(inv_table.k, K_SKIP);
+        self.invalid_prefix_bytes = self.len_bytes();
+        self.fill_invalid_prefix(a_packed, b_packed, inv_table);
+        self.ranked_one_rows_elided = false;
+    }
+
     /// Declare the leading `bytes` of the storage unwritten (the producer
     /// skipped them because round 1's GPU share covers those x_hi windows
     /// from raw a/b). Round 1 recomputes them on CPU if the GPU share
@@ -4694,6 +4715,42 @@ mod tests {
             full.as_bytes_mut(),
             "fill_invalid_prefix drifted from the standalone precompute"
         );
+    }
+
+    #[test]
+    fn one_rows_fallback_restores_dense_storage() {
+        const BYTES: usize = 2048;
+        let mut rng = Rng::new(0x0A8D_E115);
+        let a = pack_bits(&rng.bits(BYTES * 8));
+        let b = pack_bits(&rng.bits(BYTES * 8));
+        let inv_table = make_inv_table();
+        let mut expected = vec![0u8; BYTES];
+        precompute_round1_ab_inner_windows(&a, &b, &mut expected, &inv_table, false);
+
+        let mut residual = Round1AbInner::take_uninit(BYTES);
+        residual.as_bytes_mut().fill(0xA5);
+        residual.set_ranked_one_rows_elided();
+        residual.restore_full_if_ranked_one_rows_elided(&a, &b, &inv_table);
+        assert!(!residual.ranked_one_rows_elided());
+        assert_eq!(residual.invalid_prefix_bytes(), 0);
+        assert_eq!(residual.as_bytes(), expected.as_slice());
+
+        // A dense object keeps its ordinary invalid-prefix contract. The
+        // residual repair must not touch it or require raw input slices.
+        residual.as_bytes_mut().fill(0x5A);
+        residual.set_invalid_prefix_bytes(1024);
+        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
+        assert_eq!(residual.invalid_prefix_bytes(), 1024);
+        assert!(residual.as_bytes().iter().all(|byte| *byte == 0x5A));
+    }
+
+    #[test]
+    #[should_panic]
+    fn one_rows_fallback_rejects_wrong_raw_extent() {
+        let inv_table = make_inv_table();
+        let mut residual = Round1AbInner::take_uninit(1024);
+        residual.set_ranked_one_rows_elided();
+        residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
     }
 
     /// Round 1 with a producer-skipped (invalid) ab_inner prefix must be

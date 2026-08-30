@@ -4271,6 +4271,107 @@ mod tests {
         }
     }
 
+    /// Exercise both B-window identities and their value-checked fallbacks.
+    /// High A lanes deliberately remain nonzero in the sparse window: only
+    /// lane zero of its three trailing rows is required to vanish.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn round2_b_window_fusion_matches_scalar() {
+        const LO_SIZE: usize = 128;
+        const N_ROWS: usize = 2 * LO_SIZE;
+        for case in 0..8 {
+            let mut rng = Rng::new(0xB71D_0000 + case as u64);
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let eq_lo = rng.f128_vec(LO_SIZE);
+            let wtab = build_w_pair_table(&eq_lo);
+            let mut a_packed: Vec<u8> = (0..N_ROWS * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed: Vec<u8> = (0..N_ROWS * 8).map(|_| rng.next_u64() as u8).collect();
+            b_packed[..16 * 8].fill(0xff);
+            b_packed[241 * 8..].fill(0);
+            a_packed[241 * 8..244 * 8].fill(0);
+            match case {
+                1 => b_packed[3 * 8] ^= 1,
+                2 => b_packed[241 * 8] = 1,
+                3 => a_packed[241 * 8] = 1,
+                4 => a_packed[242 * 8] = 1,
+                5 => a_packed[243 * 8] = 1,
+                6 => b_packed[240 * 8..241 * 8].fill(0),
+                7 => b_packed[..16 * 8].fill(0),
+                _ => {}
+            }
+            assert_eq!(table.fold_one_row(&[0xff; 8]), F128::ONE);
+
+            let mut a_ref = vec![F128::ZERO; N_ROWS];
+            let mut b_ref = vec![F128::ZERO; N_ROWS];
+            let expected = round2_lookahead_chunk_scalar::<true>(
+                &a_packed,
+                &b_packed,
+                &table,
+                &mut a_ref,
+                &mut b_ref,
+                &eq_lo,
+                0,
+                0,
+                0,
+                usize::MAX,
+            );
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            let mats = r2_gfni_mats(&table);
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            let mats: Option<[u64; 128]> = None;
+            for mats_arg in [None, mats.as_ref()] {
+                for weights in [None, Some(wtab.as_slice())] {
+                    let mut a_out = vec![F128::ONE; N_ROWS];
+                    let mut b_out = vec![F128::ONE; N_ROWS];
+                    // SAFETY: all rows, the table, weights, and destinations
+                    // have the exact extents required by the kernel.
+                    let got = unsafe {
+                        kernels::x86_64::round2_lookahead_chunk_x86_avx512::<true>(
+                            table.data.as_ptr(),
+                            mats_arg,
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            0,
+                            &mut a_out,
+                            &mut b_out,
+                            &eq_lo,
+                            0,
+                            0,
+                            usize::MAX,
+                            weights,
+                        )
+                    };
+                    assert_eq!(got, expected, "materialized case={case}");
+                    assert_eq!(a_out, a_ref, "A case={case}");
+                    assert_eq!(b_out, b_ref, "B case={case}");
+                    // SAFETY: same input extents; WRITE=false never accesses
+                    // either of the empty destination slices.
+                    let got = unsafe {
+                        kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                            table.data.as_ptr(),
+                            mats_arg,
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            0,
+                            &mut [],
+                            &mut [],
+                            &eq_lo,
+                            0,
+                            0,
+                            usize::MAX,
+                            weights,
+                        )
+                    };
+                    assert_eq!(got, expected, "no-materialize case={case}");
+                }
+            }
+        }
+    }
+
     /// AVX-512 composed-fold kernel vs the portable reference on one chunk.
     #[cfg(all(
         target_arch = "x86_64",
