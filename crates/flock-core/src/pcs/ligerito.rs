@@ -4856,7 +4856,7 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
@@ -6205,11 +6205,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
-    let direct_tables: Vec<Vec<F128>> = claims
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = claims
         .par_iter()
         .map(|claim| {
             let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
         })
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
@@ -6236,12 +6236,16 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
+                let cols0 = super::ring_switch::compose_block_cols_gfni(
+                    &direct_gfni_mats[0],
+                    claim0.eq_hi[block],
+                );
                 let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                 let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
+                let cols1 = super::ring_switch::compose_block_cols_gfni(
+                    &direct_gfni_mats[1],
+                    claim1.eq_hi[block],
+                );
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
@@ -6406,6 +6410,31 @@ fn materialize_direct_fold8(
     )))]
     let _ = l1_precommit;
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
+        Vec::new()
+    } else {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect()
+    };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
@@ -6429,6 +6458,24 @@ fn materialize_direct_fold8(
                     claim.eq_lo.iter().map(|x| x.lo).collect(),
                     claim.eq_lo.iter().map(|x| x.hi).collect(),
                 )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
             })
             .collect()
     } else {
@@ -6543,14 +6590,14 @@ fn materialize_direct_fold8(
                         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let cols0 = super::ring_switch::compose_block_cols_gfni(
+                        &direct_gfni_mats[0],
                         claim0.eq_hi[block],
                     );
                     let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                     let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let cols1 = super::ring_switch::compose_block_cols_gfni(
+                        &direct_gfni_mats[1],
                         claim1.eq_hi[block],
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
