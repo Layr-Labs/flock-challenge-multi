@@ -279,6 +279,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        // Resolved once per worker chunk, never inside the refill loop.
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let a_pad_on = tr_bcast && zc_a_pad_skip_enabled();
         // Use the same basis columns as build_row_fold_mats, not a
         // hard-coded ONE: arbitrary linear-map tests need not map ff to 1.
         // These two tiny values are derived once per worker chunk and never
@@ -318,12 +321,30 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let dead = 0u8;
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
-                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     // Global row phase only schedules a possible fast path;
-                    // the helper checks all 128 raw bytes before omitting
-                    // one whole 16-row GFNI group. All cache slots are still
+                    // both helpers check all 128 raw bytes of the group they
+                    // would omit before omitting it. All cache slots are still
                     // initialized in the same residue-major layout.
-                    match (b_canonical_values.as_ref(), g0 & 255) {
+                    let blk_pos = g0 & 255;
+                    // A has no protocol-constant rows, but its padding tail is
+                    // as omissible as B's once read: the last 16 rows of a
+                    // block hold at most one useful row.
+                    if a_pad_on && blk_pos == 192 {
+                        gfni_fold64_rows_tr_bcast_a_tail_sparse(
+                            a_pkt.add(g0 * 8),
+                            m,
+                            fa.as_mut_ptr(),
+                            table_data,
+                        );
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast(
+                            a_pkt.add(g0 * 8),
+                            m,
+                            fa.as_mut_ptr(),
+                            dead,
+                        );
+                    }
+                    match (b_canonical_values.as_ref(), blk_pos) {
                         (Some(values), 0) if b_ones_on => {
                             gfni_fold64_rows_tr_bcast_b_canonical(
                                 b_pkt.add(g0 * 8),
@@ -1395,6 +1416,21 @@ fn zc_b_canonical_prefold_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
     });
+    *ENABLED
+}
+
+/// `FLOCK_NO_ZC_A_PAD_SKIP=1` restores the unconditional full A prefold in
+/// the round-two sweep, in place of the checked padding-tail skip
+/// ([`gfni_fold64_rows_tr_bcast_a_tail_sparse`]). Exact same-binary A/B: the
+/// skip only omits GFNI groups whose input rows it has just *read and proven*
+/// to be zero, and a zero row folds to zero through any zero-preserving
+/// table, so the cache is byte-identical either way. Read once per process;
+/// the ranked worker's cleared environment never sets it.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline]
+fn zc_a_pad_skip_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_A_PAD_SKIP").is_none());
     *ENABLED
 }
 
@@ -3599,5 +3635,73 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
             _mm512_storeu_si512(dst.add(8), zero);
             _mm512_storeu_si512(dst.add(12), zero);
         }
+    }
+}
+
+/// Residue-major **A** prefold with the block's padding tail omitted — the
+/// operand-agnostic twin of [`gfni_fold64_rows_tr_bcast_b_canonical`]'s
+/// `group = 3` arm.
+///
+/// The caller only offers this tile when its 64 rows end a padding block
+/// (`g0 & 255 == 192`, so tile rows 48..=63 are block rows 240..=255). At the
+/// ranked BLAKE3 layout `round2_row_zero` puts `first_dead_row` at
+/// `ceil(15409/64) = 241`, so block rows 241..=255 are structurally zero and
+/// row 240 carries 49 useful bits — but **nothing here rests on that**: the
+/// guard reads all 128 bytes of the two lines covering rows 240..=255 and
+/// proves rows 241..=255 are zero before anything is omitted, exactly as the
+/// B twin proves its canonical group. A witness that disagrees takes the
+/// incumbent full prefold and is bit-identical.
+///
+/// On a hit, the 32 `vgf2p8affineqb` of GFNI group 3 (plus its two input
+/// lines, two `vpermb`, eight `vpermt2q` and twelve `vpternlogq`) are never
+/// issued. Unlike the B twin the surviving row's image is not a protocol
+/// constant, so it is gathered from the caller's own byte tables — the same
+/// `Σ_j T_j[byte_j]` the scalar path uses — which is eight loads and eight
+/// XORs against the thirty-two affines it replaces.
+///
+/// Returns whether the skip was taken.
+///
+/// # Safety
+/// `rows` covers 512 readable bytes, `table_data` points at the 8 × 256
+/// `F128` fold table whose linear map `mats` encodes, and `out` covers 64
+/// writable `F128`s in the residue-major layout of
+/// [`gfni_fold64_rows_masked_tr_bcast`]. AVX-512F/VBMI/GFNI are required.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_a_tail_sparse(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    table_data: *const F128,
+) -> bool {
+    use core::arch::x86_64::*;
+    // SAFETY: both guard loads lie inside the caller's 512-byte extent; a
+    // successful guard proves the omitted rows are zero, and the surviving
+    // row's bytes index the caller's own 8 × 256 table.
+    unsafe {
+        // Rows 48..=55 and 56..=63 of the tile (block rows 240..=255).
+        let z0 = _mm512_loadu_si512(rows.add(384).cast::<__m512i>());
+        let z1 = _mm512_loadu_si512(rows.add(448).cast::<__m512i>());
+        // Everything except row 240 (qword 0 of `z0`) must be zero.
+        let tail = _mm512_or_si512(_mm512_maskz_mov_epi64(0xfe, z0), z1);
+        if _mm512_cmpeq_epi64_mask(tail, _mm512_setzero_si512()) != 0xff {
+            gfni_fold64_rows_masked_tr_bcast(rows, mats, out, 0);
+            return false;
+        }
+        // `fold_one_row` for the single surviving row, from the same tables.
+        let word = rows.add(384).cast::<u64>().read_unaligned();
+        let mut folded = F128::ZERO;
+        for j in 0..8usize {
+            folded += *table_data.add(j * 256 + ((word >> (8 * j)) & 0xff) as usize);
+        }
+        gfni_fold64_rows_tr_bcast_b_canonical_leaf(rows, mats, out, 3, folded);
+        true
     }
 }
