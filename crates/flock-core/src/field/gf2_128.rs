@@ -121,7 +121,7 @@ impl Mul for F128 {
             // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
             // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
             // hidden in throughput-bound NTT/fold muls. Field-identical.
-            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
+            unsafe { x86_64::ghash_mul_karatsuba(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
