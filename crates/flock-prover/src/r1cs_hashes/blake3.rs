@@ -2285,15 +2285,25 @@ fn generate_round1_inner_octa(
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
+                        let proj = match stage {
+                            Some(st) => blake3_witgen8::StreamProj {
                                 stage: st,
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
-                            }
-                        }).unwrap_unchecked();
+                                imgs:
+                                    flock_core::zerocheck::univariate_skip_optimized::round1_ab_table_images(
+                                        inv_table, win_plan,
+                                    ),
+                            },
+                            // The streaming drain is this arm's only octa
+                            // path; a disarmed stage must fail loudly, not
+                            // hand the drain an uninitialized projection.
+                            None => panic!(
+                                "witgen AB stream staging absent (FLOCK_NO_WITGEN_AB_NT / FLOCK_NO_WITGEN_AB_WINSTREAM)"
+                            ),
+                        };
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),

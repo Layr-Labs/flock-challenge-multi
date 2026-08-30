@@ -27,7 +27,6 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -537,6 +536,10 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) plan: Round1AbWindowPlan,
     /// Ranked residual representation; dense producers leave this off.
     pub(crate) one_rows_elided: bool,
+    /// The kernel's table images. `for_window` varies only the static-B
+    /// eligibility, never the kernel, so the images are one resolve per
+    /// projection rather than one per (task, window).
+    pub(crate) imgs: Round1AbTableImages,
 }
 
 #[repr(C, align(64))]
@@ -570,8 +573,7 @@ impl StreamProj<'_> {
     /// resolves them ONCE and hands them to every piece.
     #[inline(always)]
     fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
-        let p = self.plan.for_window(blk);
-        (p, round1_ab_table_images(self.inv_table, p))
+        (self.plan.for_window(blk), self.imgs)
     }
 
     #[rustfmt::skip]
@@ -681,21 +683,29 @@ impl StreamProj<'_> {
         imgs: Round1AbTableImages,
     ) {
         unsafe {
+            // All eight blocks share identical inputs for window 31 (the
+            // all-zero line), so compute the 64-byte result once into an
+            // ALIGNED stack slot — the kernel's store class is plan-driven
+            // and may stream, which requires a 64-byte-aligned destination —
+            // and stream the register to the eight destinations. Same-thread
+            // reload of a just-streamed line is program-ordered on x86.
+            #[repr(C, align(64))]
+            struct Win64([u8; 64]);
+            let mut first = Win64([0u8; 64]);
+            round1_ab_inner_window_with_images(
+                &RANKED_ZERO.0,
+                &RANKED_ZERO.0,
+                &mut first.0,
+                31,
+                self.inv_table,
+                plan,
+                imgs,
+            );
+            let v = core::arch::x86_64::_mm512_load_si512(first.0.as_ptr() as *const _);
             let mut j = 0usize;
             while j != 8 {
-                let out = &mut *self
-                    .out
-                    .add(j * BYTES_PER_BLOCK + 31 * 64)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_with_images(
-                    &RANKED_ZERO.0,
-                    &RANKED_ZERO.0,
-                    out,
-                    31,
-                    self.inv_table,
-                    plan,
-                    imgs,
-                );
+                let dst = self.out.add(j * BYTES_PER_BLOCK + 31 * 64);
+                core::arch::x86_64::_mm512_stream_si512(dst as *mut _, v);
                 j += 1;
             }
         }
@@ -1285,8 +1295,10 @@ impl RankedRows {
 }
 
 impl Drain8<'_> {
+    // A branch-and-forward this thin costs a full outlined call frame at
+    // every drain step; the spread body it selects is the one kept outlined.
     #[rustfmt::skip]
-    #[inline(never)]
+    #[inline(always)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
             if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
@@ -1727,8 +1739,13 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         ];
 
         let zero = dup_u32(0);
-        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        // 64-byte-aligned rings: the ZMM transpose reads them with eight
+        // 64-byte loads at multiples of 64 from the base; a 32-aligned frame
+        // slot would make every one of those loads a cache-line split.
+        #[repr(C, align(64))]
+        struct Ring([V8; RING_WORDS]);
+        let mut ast = core::mem::MaybeUninit::<Ring>::uninit();
+        let mut bs = core::mem::MaybeUninit::<Ring>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 

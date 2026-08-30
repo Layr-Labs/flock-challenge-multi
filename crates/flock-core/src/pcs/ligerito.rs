@@ -2836,6 +2836,82 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
     data
 }
 
+#[allow(clippy::too_many_arguments)]
+fn densify_sparse_runs(
+    ntt: &AdditiveNttF128,
+    n: usize,
+    k: usize,
+    positions: &[usize],
+    values: &[F128],
+    order: &[u32],
+    mut run_slots: Vec<Option<(usize, usize)>>,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let log_d = n.trailing_zeros() as usize;
+    let window_len = 1usize << k;
+    let window_mask = window_len - 1;
+    let multi_max = k / 2;
+    debug_assert_eq!(run_slots.len(), n >> k);
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    data.par_chunks_mut(window_len)
+        .zip(run_slots.par_iter_mut())
+        .enumerate()
+        .for_each(|(window, (dst, run))| {
+            let Some((rs, re)) = run.take() else {
+                dst.fill(F128::ZERO);
+                return;
+            };
+            let nnz = re - rs;
+            if nnz <= multi_max {
+                let first = order[rs] as usize;
+                expand_singleton_into(
+                    ntt,
+                    log_d,
+                    k,
+                    window,
+                    positions[first] & window_mask,
+                    values[first],
+                    dst,
+                );
+                if nnz > 1 {
+                    let mut scratch = take_singleton_buf(k);
+                    for &index in &order[rs + 1..re] {
+                        let index = index as usize;
+                        expand_singleton_into(
+                            ntt,
+                            log_d,
+                            k,
+                            window,
+                            positions[index] & window_mask,
+                            values[index],
+                            &mut scratch[..window_len],
+                        );
+                        for (out, &extra) in dst.iter_mut().zip(&scratch) {
+                            *out += extra;
+                        }
+                    }
+                }
+            } else {
+                dst.fill(F128::ZERO);
+                for &index in &order[rs..re] {
+                    let index = index as usize;
+                    dst[positions[index] & window_mask] += values[index];
+                }
+                transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, window, dst);
+            }
+        });
+    data
+}
+
+fn induce_direct_windows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_INDUCE_DIRECT_WINDOWS").is_none()
+    });
+    *ON
+}
+
 /// Dense `2^k` transpose for one sparse-prefix window. This is the incumbent
 /// path and remains the exact collision fallback for the singleton shortcut.
 #[inline]
@@ -2846,6 +2922,19 @@ fn transpose_forward_ntt_window_dense(
     w: usize,
     mut buf: Vec<F128>,
 ) -> (usize, Vec<F128>) {
+    transpose_forward_ntt_window_dense_in_place(ntt, log_d, k, w, &mut buf);
+    (w, buf)
+}
+
+#[inline]
+fn transpose_forward_ntt_window_dense_in_place(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    buf: &mut [F128],
+) {
+    debug_assert_eq!(buf.len(), 1usize << k);
     for s in 0..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
@@ -2858,7 +2947,6 @@ fn transpose_forward_ntt_window_dense(
             transpose_butterfly(top_h, bot, t);
         }
     }
-    (w, buf)
 }
 
 /// Ranked default skips the singleton window buffers' zero-fill (every slot
@@ -3131,11 +3219,15 @@ fn transpose_forward_ntt_sparse_inner(
     } else {
         InduceSingletonStats::default()
     };
+    let fused_densify = induce_fused_densify_enabled();
+    let direct_windows = fused_densify && fill && singleton_on && induce_direct_windows_enabled();
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
     let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
+    let processed: Vec<(usize, Vec<F128>)> = if direct_windows {
+        Vec::new()
+    } else if fill {
         runs.par_iter()
             .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
                 let first = order[rs] as usize;
@@ -3205,13 +3297,28 @@ fn transpose_forward_ntt_sparse_inner(
     let ot = open_timing();
     let _ta = std::time::Instant::now();
     let mf0 = if ot { minor_faults() } else { 0 };
-    let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
+    let (mut data, alloc_ms, dens_ms) = if fused_densify {
         // FUSED: one parallel pass writes every window exactly once, from an
         // UNINITIALIZED buffer. See `densify_windows_fused`.
-        let slots = window_slots(n >> k, processed);
+        let mut direct_run_slots = Vec::new();
+        let slots = if direct_windows {
+            direct_run_slots = vec![None; n >> k];
+            for &(rs, re) in &runs {
+                let window = positions[order[rs] as usize] >> k;
+                debug_assert!(direct_run_slots[window].is_none());
+                direct_run_slots[window] = Some((rs, re));
+            }
+            Vec::new()
+        } else {
+            window_slots(n >> k, processed)
+        };
         let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
         let _td = std::time::Instant::now();
-        let data = densify_windows_fused(n, k, slots);
+        let data = if direct_windows {
+            densify_sparse_runs(ntt, n, k, positions, values, &order, direct_run_slots)
+        } else {
+            densify_windows_fused(n, k, slots)
+        };
         (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
     } else {
         let mut data = vec![F128::ZERO; n];
