@@ -16,6 +16,7 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//! Yukon timing draw marker: zarar1337-20260830-0819.
 
 pub mod bits;
 pub mod challenger;
