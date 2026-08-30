@@ -127,6 +127,14 @@ use std::thread::JoinHandle;
 
 mod kernels;
 
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+mod gfni_pair_tests;
+
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
@@ -1516,6 +1524,47 @@ fn fold_block_major_gfni(
     top_bind: Option<F128>,
     ranked_one_rows: bool,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
+    fold_block_major_gfni_with_pairs(
+        z_packed,
+        k,
+        chunks_per_block,
+        useful_bits,
+        useful_chunks,
+        n_workers,
+        tiles_per_worker,
+        n_tiles,
+        dynamic,
+        eq8_at,
+        top_bind,
+        ranked_one_rows,
+        true,
+    )
+}
+
+/// Pair only consecutive non-seed tiles already owned by the same worker.
+/// The explicit policy argument keeps the incumbent traversal available to
+/// source tests without process-global environment mutation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_gfni_with_pairs(
+    z_packed: &[F128],
+    k: usize,
+    chunks_per_block: usize,
+    useful_bits: usize,
+    useful_chunks: usize,
+    n_workers: usize,
+    tiles_per_worker: usize,
+    n_tiles: usize,
+    dynamic: bool,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    top_bind: Option<F128>,
+    ranked_one_rows: bool,
+    pair_tiles: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
@@ -1540,10 +1589,14 @@ fn fold_block_major_gfni(
                 (tile_lo, tile_hi)
             };
             let mut mats = [0u64; 128];
+            let mut paired_mats = [0u64; 128];
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
             let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            // The pair leaf consumes both completed gathers. No full tile
+            // is copied: each gather writes directly into its own buffer.
+            let mut paired_transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
             // First tile this worker writes into an uninitialized plane
             // buffer: seed the GFNI acc from a register zero idiom. Later
             // tiles load only blocks that this first tile initialized.
@@ -1589,9 +1642,27 @@ fn fold_block_major_gfni(
                     break;
                 };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                // Do not reach across a claim boundary or pair the first
+                // tile, which must initialize every live output plane.
+                // First/odd/disabled cases still use the original leaf.
+                let paired_stripe_base = if pair_tiles && !first_tile && claim_lo < claim_hi {
+                    let paired_tile = claim_lo;
+                    claim_lo += 1;
+                    Some(paired_tile * DIRECT_FOLD_TILE_STRIPES)
+                } else {
+                    None
+                };
                 for t in 0..DIRECT_FOLD_TILE_STRIPES {
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                }
+                if let Some(paired_base) = paired_stripe_base {
+                    // Each tile's matrices depend on its stripe, not q.
+                    // Build both once before visiting any column chunks.
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let eq8 = eq8_at(8 * (paired_base + t));
+                        kernels::fold_mats_from_basis(&eq8, &mut paired_mats[t * 16..(t + 1) * 16]);
+                    }
                 }
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
@@ -1629,6 +1700,36 @@ fn fold_block_major_gfni(
                                 &mut transposed,
                             );
                         }
+                        if let Some(paired_base) = paired_stripe_base {
+                            // G0(q), G1(q), then pair-fold. The demand reads
+                            // and prefetch addresses/counts are retained,
+                            // but their timing relative to folds changes.
+                            if gather_tr_vpermt2b {
+                                gather_transpose_group4_x86::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    paired_base,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut paired_transposed,
+                                );
+                            } else {
+                                gather_transpose_group4_x86::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    paired_base,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut paired_transposed,
+                                );
+                            }
+                        }
                         for c in 0..4 {
                             // Spread delivery: the same eight-hints-per-stripe
                             // block, issued from the fold that follows the
@@ -1656,20 +1757,46 @@ fn fold_block_major_gfni(
                                             chunks_per_block,
                                             cpb_ranked,
                                         );
+                                        if let Some(paired_base) = paired_stripe_base {
+                                            lc_prefetch_rows16(
+                                                z_packed.as_ptr().add(
+                                                    (8 * paired_base + 16 * c) * chunks_per_block
+                                                        + qn,
+                                                ),
+                                                chunks_per_block,
+                                                cpb_ranked,
+                                            );
+                                        }
                                     }
                                 }
                             }
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
-                                    &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
-                                    first_tile,
-                                );
+                                if paired_stripe_base.is_some() {
+                                    // A previous complete tile initialized
+                                    // all live planes. Both full gathers and
+                                    // both matrices are separate from that
+                                    // worker-owned output allocation.
+                                    kernels::gfni_fold_tile_pair_nonseed(
+                                        transposed.as_ptr().add(c * 1024),
+                                        paired_transposed.as_ptr().add(c * 1024),
+                                        128,
+                                        2,
+                                        &mats,
+                                        &paired_mats,
+                                        wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                    );
+                                } else {
+                                    kernels::gfni_fold_tile(
+                                        transposed.as_ptr().add(c * 1024),
+                                        128,
+                                        2,
+                                        &mats,
+                                        wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                        first_tile,
+                                    );
+                                }
                             }
                         }
                         q += 4;
@@ -1714,20 +1841,74 @@ fn fold_block_major_gfni(
                         q,
                         &mut transposed,
                     );
+                    if let Some(paired_base) = paired_stripe_base {
+                        #[cfg(target_feature = "avx512vbmi")]
+                        if gather_tr_fused {
+                            if gather_tr_vpermt2b {
+                                gather_transpose_tile_x86::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    paired_base,
+                                    q,
+                                    &mut paired_transposed,
+                                );
+                            } else {
+                                gather_transpose_tile_x86::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    paired_base,
+                                    q,
+                                    &mut paired_transposed,
+                                );
+                            }
+                        } else {
+                            gather_transpose_tile_scalar(
+                                z_packed,
+                                chunks_per_block,
+                                paired_base,
+                                q,
+                                &mut paired_transposed,
+                            );
+                        }
+                        #[cfg(not(target_feature = "avx512vbmi"))]
+                        gather_transpose_tile_scalar(
+                            z_packed,
+                            chunks_per_block,
+                            paired_base,
+                            q,
+                            &mut paired_transposed,
+                        );
+                    }
                     // SAFETY: `transposed` holds 8 stripes x 128 bytes at
-                    // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
+                    // stride 128 (max read 7*128 + 2*64 = its 1024-byte slab);
                     // the worker planes cover (2q + chunk blocks) * 1024
                     // bytes for every q < useful_chunks <= k/128. first_tile
                     // is true iff this worker has not yet stored into wplanes.
                     unsafe {
-                        kernels::gfni_fold_tile(
-                            transposed.as_ptr(),
-                            128,
-                            chunk_bits.div_ceil(64),
-                            &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
-                            first_tile,
-                        );
+                        if paired_stripe_base.is_some() {
+                            // As above, the prior seed initialized this
+                            // block and the two inputs do not alias output.
+                            // A short last chunk keeps the original exact
+                            // one- or two-block read/write extent.
+                            kernels::gfni_fold_tile_pair_nonseed(
+                                transposed.as_ptr(),
+                                paired_transposed.as_ptr(),
+                                128,
+                                chunk_bits.div_ceil(64),
+                                &mats,
+                                &paired_mats,
+                                wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                            );
+                        } else {
+                            kernels::gfni_fold_tile(
+                                transposed.as_ptr(),
+                                128,
+                                chunk_bits.div_ceil(64),
+                                &mats,
+                                wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                                first_tile,
+                            );
+                        }
                     }
                     q += 1;
                 }

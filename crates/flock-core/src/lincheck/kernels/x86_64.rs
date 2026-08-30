@@ -424,6 +424,169 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// Accumulate two tiles into already initialized byte planes, retaining all
+/// sixteen accumulators until both tiles have contributed. Relative to two
+/// non-seed `gfni_fold_tile` calls, each 64-column block omits sixteen plane
+/// stores and sixteen plane reloads. GFNI and ternary-XOR counts are unchanged.
+///
+/// The sixteen plane chains are interleaved by input-row pair. Two alternating
+/// row-register pairs keep the next inputs ready without retaining all eight
+/// rows of either tile: sixteen accumulators, four rows, two temporaries.
+///
+/// # Safety
+/// - When `n_blocks64 > 0`, each tile pointer covers
+///   `7 * stripe_stride + n_blocks64 * 64` readable bytes, and its matrix
+///   reference supplies all eight rows' sixteen maps.
+/// - When `n_blocks64 > 0`, `out_planes_ptr` covers `n_blocks64 * 1024`
+///   initialized writable bytes.
+///   Unlike the single-tile leaf, this entry never accepts an uninitialized
+///   seed buffer.
+/// - The output must not overlap either tile's readable range or either
+///   matrix array. The two read-only tile ranges may overlap each other.
+///   This is deliberately narrower than the old leaf's raw alias behavior:
+///   inputs for the second tile are read before any intermediate plane store.
+/// - When `n_blocks64 == 0`, no raw-pointer arithmetic or memory access is
+///   performed; the raw input and output pointers may be null.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile_pair_nonseed(
+    tile0: *const u8,
+    tile1: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats0: &[u64; 128],
+    mats1: &[u64; 128],
+    out_planes_ptr: *mut u8,
+) {
+    // The affine byte plane k uses matrix qword 16*t+k. Each immediate
+    // displacement below is therefore 128*t+8*k; even the final qword is
+    // exactly [1016, 1024). Keep the instruction template visibly auditable.
+    #[rustfmt::skip]
+    macro_rules! pair_plane {
+        ($acc:literal, $byte:literal, $mats:ident, $r0:literal, $r1:literal, $m0:literal, $m1:literal) => {
+            concat!(
+                "vgf2p8affineqb zmm20, ", $r0, ", qword ptr [{", stringify!($mats), "} + ", stringify!($m0), " + ", stringify!($byte), "]{{1to8}}, 0\n",
+                "vgf2p8affineqb zmm21, ", $r1, ", qword ptr [{", stringify!($mats), "} + ", stringify!($m1), " + ", stringify!($byte), "]{{1to8}}, 0\n",
+                "vpternlogq ", $acc, ", zmm20, zmm21, 0x96\n",
+            )
+        };
+    }
+    #[rustfmt::skip]
+    macro_rules! pair_rows {
+        ($mats:ident, $r0:literal, $r1:literal, $m0:literal, $m1:literal) => {
+            concat!(
+                pair_plane!("zmm0",    0, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm1",    8, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm2",   16, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm3",   24, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm4",   32, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm5",   40, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm6",   48, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm7",   56, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm8",   64, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm9",   72, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm10",  80, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm11",  88, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm12",  96, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm13", 104, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm14", 112, $mats, $r0, $r1, $m0, $m1),
+                pair_plane!("zmm15", 120, $mats, $r0, $r1, $m0, $m1),
+            )
+        };
+    }
+
+    // SAFETY: every row, matrix qword and full plane lies in the caller's
+    // promised ranges. vmovdqu64 makes no alignment assumption. Stores happen
+    // only after both tiles' eight rows have contributed to every plane.
+    unsafe {
+        for block in 0..n_blocks64 {
+            let bs = block * 64;
+            let planes = out_planes_ptr.add(block * 1024);
+            core::arch::asm!(
+                "vmovdqu64 zmm16, [{rows0}]",
+                "vmovdqu64 zmm17, [{rows0} + {stride}]",
+                "vmovdqu64 zmm0, [{planes}]",
+                "vmovdqu64 zmm1, [{planes} + 64]",
+                "vmovdqu64 zmm2, [{planes} + 128]",
+                "vmovdqu64 zmm3, [{planes} + 192]",
+                "vmovdqu64 zmm4, [{planes} + 256]",
+                "vmovdqu64 zmm5, [{planes} + 320]",
+                "vmovdqu64 zmm6, [{planes} + 384]",
+                "vmovdqu64 zmm7, [{planes} + 448]",
+                "vmovdqu64 zmm8, [{planes} + 512]",
+                "vmovdqu64 zmm9, [{planes} + 576]",
+                "vmovdqu64 zmm10, [{planes} + 640]",
+                "vmovdqu64 zmm11, [{planes} + 704]",
+                "vmovdqu64 zmm12, [{planes} + 768]",
+                "vmovdqu64 zmm13, [{planes} + 832]",
+                "vmovdqu64 zmm14, [{planes} + 896]",
+                "vmovdqu64 zmm15, [{planes} + 960]",
+                "lea {rows0}, [{rows0} + {stride} * 2]",
+                "vmovdqu64 zmm18, [{rows0}]",
+                "vmovdqu64 zmm19, [{rows0} + {stride}]",
+                pair_rows!(mats0, "zmm16", "zmm17", 0, 128),
+                "lea {rows0}, [{rows0} + {stride} * 2]",
+                "vmovdqu64 zmm16, [{rows0}]",
+                "vmovdqu64 zmm17, [{rows0} + {stride}]",
+                pair_rows!(mats0, "zmm18", "zmm19", 256, 384),
+                "lea {rows0}, [{rows0} + {stride} * 2]",
+                "vmovdqu64 zmm18, [{rows0}]",
+                "vmovdqu64 zmm19, [{rows0} + {stride}]",
+                pair_rows!(mats0, "zmm16", "zmm17", 512, 640),
+                "vmovdqu64 zmm16, [{rows1}]",
+                "vmovdqu64 zmm17, [{rows1} + {stride}]",
+                pair_rows!(mats0, "zmm18", "zmm19", 768, 896),
+                "lea {rows1}, [{rows1} + {stride} * 2]",
+                "vmovdqu64 zmm18, [{rows1}]",
+                "vmovdqu64 zmm19, [{rows1} + {stride}]",
+                pair_rows!(mats1, "zmm16", "zmm17", 0, 128),
+                "lea {rows1}, [{rows1} + {stride} * 2]",
+                "vmovdqu64 zmm16, [{rows1}]",
+                "vmovdqu64 zmm17, [{rows1} + {stride}]",
+                pair_rows!(mats1, "zmm18", "zmm19", 256, 384),
+                "lea {rows1}, [{rows1} + {stride} * 2]",
+                "vmovdqu64 zmm18, [{rows1}]",
+                "vmovdqu64 zmm19, [{rows1} + {stride}]",
+                pair_rows!(mats1, "zmm16", "zmm17", 512, 640),
+                pair_rows!(mats1, "zmm18", "zmm19", 768, 896),
+                "vmovdqu64 [{planes}], zmm0",
+                "vmovdqu64 [{planes} + 64], zmm1",
+                "vmovdqu64 [{planes} + 128], zmm2",
+                "vmovdqu64 [{planes} + 192], zmm3",
+                "vmovdqu64 [{planes} + 256], zmm4",
+                "vmovdqu64 [{planes} + 320], zmm5",
+                "vmovdqu64 [{planes} + 384], zmm6",
+                "vmovdqu64 [{planes} + 448], zmm7",
+                "vmovdqu64 [{planes} + 512], zmm8",
+                "vmovdqu64 [{planes} + 576], zmm9",
+                "vmovdqu64 [{planes} + 640], zmm10",
+                "vmovdqu64 [{planes} + 704], zmm11",
+                "vmovdqu64 [{planes} + 768], zmm12",
+                "vmovdqu64 [{planes} + 832], zmm13",
+                "vmovdqu64 [{planes} + 896], zmm14",
+                "vmovdqu64 [{planes} + 960], zmm15",
+                rows0 = inout(reg) tile0.add(bs) => _,
+                rows1 = inout(reg) tile1.add(bs) => _,
+                stride = in(reg) stripe_stride,
+                mats0 = in(reg) mats0.as_ptr(),
+                mats1 = in(reg) mats1.as_ptr(),
+                planes = in(reg) planes,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _,
+                out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
+                out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _,
+                out("zmm20") _, out("zmm21") _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`

@@ -227,32 +227,43 @@ fn fold16_pf_ahead() -> usize {
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
-/// The 16 slot-major loads of a 4-slot block are transposed (128-bit lanes)
-/// into bank-major vectors, each multiplied by its broadcast weight into ONE
-/// four-lane unreduced accumulator (`WideGhashX4::mul_acc`, 4 CLMUL per
-/// vector), and reduced once per lane at the end — 18 vector CLMULs per four
-/// outputs against 36 for the two nested pair-fold passes it replaces.
-/// Field-identical (reduction is F₂-linear).
+/// The 16 slot-major loads of a 4-slot block are transposed into low/high
+/// limb vectors for adjacent bank pairs, using the same 32 permutes as the
+/// bank-major transpose. Each pair contributes six CLMULs to three sums:
+/// low, high, and `(x.lo + x.hi) * (w.lo + w.hi)`. Forming the cross sum only
+/// after all eight pairs gives 48 product CLMULs plus two for reduction,
+/// instead of 64 plus two for four-part products. This is valid for arbitrary
+/// weights; it does not assume that their sum is one.
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
-    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use crate::field::gf2_128::x86_64::ghash_reduce_acc_x4;
     use core::arch::x86_64::*;
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
-            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        // Still sixteen broadcast vectors: each pair stores its two low
+        // limbs and two high limbs separately. Do not retain an additional
+        // array of mixed weights across the hot loop.
+        let wb: [[__m512i; 2]; 8] = core::array::from_fn(|pair| {
+            let a = w[2 * pair];
+            let b = w[2 * pair + 1];
+            [
+                _mm512_broadcast_i32x4(_mm_set_epi64x(b.lo as i64, a.lo as i64)),
+                _mm512_broadcast_i32x4(_mm_set_epi64x(b.hi as i64, a.hi as i64)),
+            ]
         });
-        // 4×4 transpose of 128-bit lanes: stage-1 index vectors interleave
-        // lanes {0,1} / {2,3} of two inputs; stage 2 gathers lanes {0,1} /
-        // {2,3} of the two stage-1 results.
+        // Stage 1 interleaves 128-bit lanes as before. Stage 2 now puts
+        // banks b/b+1 into the low/high qwords of each output-slot lane,
+        // selecting their low limbs and high limbs in separate vectors.
+        // Low-to-high qword indices are [0,4,2,6,8,12,10,14] and
+        // [1,5,3,7,9,13,11,15]; set_epi64 takes them in reverse order.
         let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
         let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let s2_lo = _mm512_set_epi64(14, 10, 12, 8, 6, 2, 4, 0);
+        let s2_hi = _mm512_set_epi64(15, 11, 13, 9, 7, 3, 5, 1);
         let quads = dst.len() & !3;
         let pf_ahead = fold16_pf_ahead();
         let pf_limit = src.len().saturating_sub(64);
@@ -269,7 +280,9 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                     }
                 }
             }
-            let mut acc = WideGhashX4::zero();
+            let mut acc_lo = _mm512_setzero_si512();
+            let mut acc_hi = _mm512_setzero_si512();
+            let mut acc_diag = _mm512_setzero_si512();
             for g in 0..4 {
                 // v_s = banks 4g..4g+3 of slot t+s.
                 let base = 16 * t + 4 * g;
@@ -281,16 +294,70 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1); // [a0.L2 a1.L2 a0.L3 a1.L3]
                 let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
                 let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2); // bank 4g+0 over slots 0..4
-                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
-                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
-                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                // Finish the first pair before forming the second pair's
+                // limb vectors, keeping mixed operands local to one pair.
+                {
+                    let x_lo = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                    let x_hi = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                    let [w_lo, w_hi] = wb[2 * g];
+                    acc_lo = _mm512_xor_si512(
+                        acc_lo,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_lo, w_lo),
+                            _mm512_clmulepi64_epi128::<0x11>(x_lo, w_lo),
+                        ),
+                    );
+                    acc_hi = _mm512_xor_si512(
+                        acc_hi,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_hi, w_hi),
+                            _mm512_clmulepi64_epi128::<0x11>(x_hi, w_hi),
+                        ),
+                    );
+                    let x_mix = _mm512_xor_si512(x_lo, x_hi);
+                    let w_mix = _mm512_xor_si512(w_lo, w_hi);
+                    acc_diag = _mm512_xor_si512(
+                        acc_diag,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_mix, w_mix),
+                            _mm512_clmulepi64_epi128::<0x11>(x_mix, w_mix),
+                        ),
+                    );
+                }
+                {
+                    let x_lo = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                    let x_hi = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                    let [w_lo, w_hi] = wb[2 * g + 1];
+                    acc_lo = _mm512_xor_si512(
+                        acc_lo,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_lo, w_lo),
+                            _mm512_clmulepi64_epi128::<0x11>(x_lo, w_lo),
+                        ),
+                    );
+                    acc_hi = _mm512_xor_si512(
+                        acc_hi,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_hi, w_hi),
+                            _mm512_clmulepi64_epi128::<0x11>(x_hi, w_hi),
+                        ),
+                    );
+                    let x_mix = _mm512_xor_si512(x_lo, x_hi);
+                    let w_mix = _mm512_xor_si512(w_lo, w_hi);
+                    acc_diag = _mm512_xor_si512(
+                        acc_diag,
+                        _mm512_xor_si512(
+                            _mm512_clmulepi64_epi128::<0x00>(x_mix, w_mix),
+                            _mm512_clmulepi64_epi128::<0x11>(x_mix, w_mix),
+                        ),
+                    );
+                }
             }
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
+            // Karatsuba's diagonal equals cross XOR low XOR high. XOR is
+            // linear, so recover the cross sum once after all sixteen banks.
+            let acc_mid = _mm512_xor_si512(acc_diag, _mm512_xor_si512(acc_lo, acc_hi));
+            let folded = ghash_reduce_acc_x4(acc_lo, acc_mid, acc_hi);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, folded);
             t += 4;
         }
         while t < dst.len() {
