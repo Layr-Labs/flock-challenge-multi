@@ -424,6 +424,81 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// Ranked two-block GFNI sweep. The two adjacent 64-column blocks use the
+/// same tile matrices, so each broadcast is shared by both affine products.
+///
+/// # Safety
+/// - `tile_bytes_ptr` covers eight 128-byte rows.
+/// - `mats` contains the tile's eight-by-sixteen matrices.
+/// - `out_planes_ptr` covers two initialized 1024-byte plane blocks.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_ranked_pair2_accum(
+    tile_bytes_ptr: *const u8,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller upholds the fixed-size pointer contracts above.
+    unsafe {
+        let rows0: [__m512i; 8] = core::array::from_fn(|t| {
+            _mm512_loadu_si512(tile_bytes_ptr.add(t * 128) as *const __m512i)
+        });
+        let rows1: [__m512i; 8] = core::array::from_fn(|t| {
+            _mm512_loadu_si512(tile_bytes_ptr.add(t * 128 + 64) as *const __m512i)
+        });
+        for byte_k in 0..16 {
+            let plane0 = out_planes_ptr.add(byte_k * 64) as *mut __m512i;
+            let plane1 = out_planes_ptr.add(1024 + byte_k * 64) as *mut __m512i;
+            let mut acc0 = _mm512_loadu_si512(plane0 as *const __m512i);
+            let mut acc1 = _mm512_loadu_si512(plane1 as *const __m512i);
+            for t in (0..8).step_by(2) {
+                let mat0 = _mm512_set1_epi64(mats[t * 16 + byte_k] as i64);
+                let mat1 = _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64);
+                let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t], mat0);
+                let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t + 1], mat1);
+                let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t], mat0);
+                let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t + 1], mat1);
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g00, g01);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g10, g11);
+            }
+            _mm512_storeu_si512(plane0, acc0);
+            _mm512_storeu_si512(plane1, acc1);
+        }
+    }
+}
+
+/// First-tile initializer for [`gfni_fold_ranked_pair2_accum`]. This runs for
+/// each live block pair during an active worker's first tile; steady-state
+/// tiles enter the accumulator directly.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_ranked_pair2_seed(
+    tile_bytes_ptr: *const u8,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller provides the full writable two-block output range.
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        for plane in 0..32 {
+            _mm512_storeu_si512(out_planes_ptr.add(plane * 64) as *mut __m512i, zero);
+        }
+        gfni_fold_ranked_pair2_accum(tile_bytes_ptr, mats, out_planes_ptr);
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`

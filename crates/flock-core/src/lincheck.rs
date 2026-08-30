@@ -1061,6 +1061,20 @@ fn block_major_gfni_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GFNI_PAIR2=1` restores the generic one-block-at-a-time GFNI
+/// leaf. The default ranked path shares each tile-matrix broadcast across the
+/// two adjacent 64-column blocks in a full 128-column chunk.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_gfni_pair2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GFNI_PAIR2").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_LC_GATHER_TR=1` restores the scalar stripe gather + staging
 /// transpose in the GFNI block-major arm (exact same-binary A/B).
 #[cfg(all(
@@ -1573,6 +1587,8 @@ fn fold_block_major_gfni(
             // inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+            let ranked_pair2 =
+                chunks_per_block == 128 && useful_bits == 15_409 && lc_gfni_pair2_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1662,14 +1678,20 @@ fn fold_block_major_gfni(
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
-                                    &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
-                                    first_tile,
-                                );
+                                let input = transposed.as_ptr().add(c * 1024);
+                                let output =
+                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024);
+                                if ranked_pair2 {
+                                    if first_tile {
+                                        kernels::gfni_fold_ranked_pair2_seed(input, &mats, output);
+                                    } else {
+                                        kernels::gfni_fold_ranked_pair2_accum(input, &mats, output);
+                                    }
+                                } else {
+                                    kernels::gfni_fold_tile(
+                                        input, 128, 2, &mats, output, first_tile,
+                                    );
+                                }
                             }
                         }
                         q += 4;
@@ -1720,14 +1742,31 @@ fn fold_block_major_gfni(
                     // bytes for every q < useful_chunks <= k/128. first_tile
                     // is true iff this worker has not yet stored into wplanes.
                     unsafe {
-                        kernels::gfni_fold_tile(
-                            transposed.as_ptr(),
-                            128,
-                            chunk_bits.div_ceil(64),
-                            &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
-                            first_tile,
-                        );
+                        let output = wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024);
+                        if ranked_pair2 && chunk_bits == 128 {
+                            if first_tile {
+                                kernels::gfni_fold_ranked_pair2_seed(
+                                    transposed.as_ptr(),
+                                    &mats,
+                                    output,
+                                );
+                            } else {
+                                kernels::gfni_fold_ranked_pair2_accum(
+                                    transposed.as_ptr(),
+                                    &mats,
+                                    output,
+                                );
+                            }
+                        } else {
+                            kernels::gfni_fold_tile(
+                                transposed.as_ptr(),
+                                128,
+                                chunk_bits.div_ceil(64),
+                                &mats,
+                                output,
+                                first_tile,
+                            );
+                        }
                     }
                     q += 1;
                 }
@@ -4167,6 +4206,61 @@ mod tests {
                     "affine(mats, {v}) must equal table[{v}]"
                 );
             }
+        }
+    }
+
+    /// The ranked two-block leaf is exactly the generic two-block kernel for
+    /// both its first-tile initialization and steady-state accumulation arms.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_ranked_pair2_matches_generic() {
+        let mut rng = Rng::new(0x6F4E_4932);
+        for _ in 0..8 {
+            let input: Vec<u8> = (0..8 * 128).map(|_| rng.next_u64() as u8).collect();
+            let eq8s: [[F128; 8]; 8] = std::array::from_fn(|_| std::array::from_fn(|_| rng.f128()));
+            let mut mats = [0u64; 128];
+            for t in 0..8 {
+                kernels::fold_mats_from_basis(&eq8s[t], &mut mats[t * 16..(t + 1) * 16]);
+            }
+
+            let mut generic_seed = vec![0xA5u8; 2048];
+            let mut pair_seed = vec![0x5Au8; 2048];
+            unsafe {
+                kernels::gfni_fold_tile(
+                    input.as_ptr(),
+                    128,
+                    2,
+                    &mats,
+                    generic_seed.as_mut_ptr(),
+                    true,
+                );
+                kernels::gfni_fold_ranked_pair2_seed(input.as_ptr(), &mats, pair_seed.as_mut_ptr());
+            }
+            assert_eq!(generic_seed, pair_seed);
+
+            let initial: Vec<u8> = (0..2048).map(|_| rng.next_u64() as u8).collect();
+            let mut generic_accum = initial.clone();
+            let mut pair_accum = initial;
+            unsafe {
+                kernels::gfni_fold_tile(
+                    input.as_ptr(),
+                    128,
+                    2,
+                    &mats,
+                    generic_accum.as_mut_ptr(),
+                    false,
+                );
+                kernels::gfni_fold_ranked_pair2_accum(
+                    input.as_ptr(),
+                    &mats,
+                    pair_accum.as_mut_ptr(),
+                );
+            }
+            assert_eq!(generic_accum, pair_accum);
         }
     }
 

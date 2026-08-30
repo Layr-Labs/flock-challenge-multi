@@ -31,7 +31,10 @@ pub(crate) use x86_64::{build_nibble_tables, fold_block_major_chunk_x86_avx512};
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
-pub(crate) use x86_64::{fold_mats_from_basis, gfni_fold_tile, xor_bytes_avx512};
+pub(crate) use x86_64::{
+    fold_mats_from_basis, gfni_fold_ranked_pair2_accum, gfni_fold_ranked_pair2_seed,
+    gfni_fold_tile, xor_bytes_avx512,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
