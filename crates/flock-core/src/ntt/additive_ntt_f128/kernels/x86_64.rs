@@ -686,7 +686,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -698,7 +698,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
                 core::ptr::null(),
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -737,7 +737,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, true, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -749,7 +749,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
                 pf_src,
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true, false>(
+            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, true, false, false>(
                 src,
                 src_quarter,
                 src_r,
@@ -782,32 +782,22 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_nt(
 ) {
     debug_assert_eq!(num_ntts % 4, 0);
     debug_assert_eq!(dst as usize % 16, 0);
-    // SAFETY: forwarded caller contract.
+    let inner_low = !low_inner_sparse_disabled() && right_twiddle.hi == 0;
+    // SAFETY: forwarded caller contract; `inner_low` is the LOW precondition.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                right_twiddle,
-                core::ptr::null(),
-            )
-        } else {
-            butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                right_twiddle,
-                core::ptr::null(),
-            )
+        match (mul_diet_disabled(), inner_low) {
+            (true, false) => butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle, core::ptr::null(),
+            ),
+            (true, true) => butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle, core::ptr::null(),
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle, core::ptr::null(),
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle, core::ptr::null(),
+            ),
         }
     }
 }
@@ -822,6 +812,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
     const DIET: bool,
     const PF: bool,
     const NT: bool,
+    const INNER_LOW: bool,
 >(
     src: *const F128,
     src_quarter: usize,
@@ -838,7 +829,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
     // SAFETY: caller guarantees target features, pointer geometry, and
     // non-aliasing src/dst.
     unsafe {
-        let inner_b = tw_x4::<false, DIET>(right_twiddle);
+        debug_assert!(!INNER_LOW || right_twiddle.hi == 0);
+        let inner_b = tw_x4::<INNER_LOW, DIET>(right_twiddle);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
@@ -861,7 +853,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
             vd = _mm512_xor_si512(vd, vb);
             vb = _mm512_xor_si512(vb, va);
 
-            let new_c = _mm512_xor_si512(vc, mul_x4::<false, DIET>(inner_b, vd));
+            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
@@ -1454,6 +1446,16 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 fn low_outer_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
+}
+
+/// `FLOCK_NO_NTT_LOW_INNER_SPARSE=1` restores the general/diet product for
+/// the sparse seed kernel's sole remaining twiddle (`right_twiddle` /
+/// inner-b). Ranked seed-NT block 0 uses this kernel; the fused-two *dense*
+/// outer LOW path is a different site.
+#[inline]
+fn low_inner_sparse_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_INNER_SPARSE").is_some())
 }
 
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores the general twiddle product
@@ -2097,7 +2099,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2109,7 +2111,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false>(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
