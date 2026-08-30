@@ -251,6 +251,28 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
 }
 
+/// `FLOCK_NO_NTT_SEED_TOP_FUSED4=1` keeps recursive (`n_top < 9`) encodes on
+/// the separate seed pass plus a later fused-two top. Default ON: fold the
+/// rate-1/2 seed into that fused-two so the recursive codeword is written
+/// once, already at layer 5. Independent of the ranked fused-eight path
+/// (`n_top ≥ 9`); the parent `FLOCK_NO_NTT_SEED_TOP_FUSION` kills both.
+fn ntt_seed_top_fused4_disabled() -> bool {
+    #[cfg(test)]
+    if SEED_TOP_FUSED4_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSED4").is_some())
+}
+
+#[cfg(test)]
+static SEED_TOP_FUSED4_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static SEED_TOP_FUSED4_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
 /// fused-two scratch stores followed by the separate non-temporal scatter.
 /// Read once per process, outside every row/quad loop.
@@ -1691,11 +1713,16 @@ impl AdditiveNttF128 {
         on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
     ) {
         let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        // Pass the message through whenever a fused seed task might apply:
+        // ranked fused-eight needs `n_top ≥ 9`, recursive fused-four needs
+        // `n_top ≥ 4` here because the impl's lone-top bump (4 → 5) has not
+        // run yet. The impl re-checks and falls back to a separate seed pass
+        // if the fused geometry still does not fit after the bump.
         let fuse_seed = Self::top_fusion_available()
             && !ntt_top_fusion_disabled()
             && !ntt_seed_top_fusion_disabled()
-            && n_top >= 9
-            && log_d >= 9;
+            && log_d >= 5
+            && (n_top >= 9 || (n_top >= 4 && !ntt_seed_top_fused4_disabled()));
         if fuse_seed {
             // The impl re-checks the preconditions and runs the separate seed
             // pass itself if anything disagrees.
@@ -2570,6 +2597,178 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Recursive sibling of [`Self::seed_top_fused8_pass`]: seed layers 1–2
+    /// plus top layers 3–4 in one staging pass, so a `n_top = 5` encode
+    /// writes the codeword once already at layer 5. Same seed kernels and the
+    /// same 8×64 staging geometry as the ranked fused-eight; the fold stops
+    /// after the fused-two of layers 3–4. Temporal publish: the recursive
+    /// codeword fits L3 and the deep pass rereads it immediately.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn seed_top_fused4_pass(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        odd_tail: usize,
+    ) {
+        use rayon::prelude::*;
+        #[cfg(test)]
+        SEED_TOP_FUSED4_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        const LAYER: usize = 3;
+        debug_assert!(log_d >= 5);
+        debug_assert_eq!(data.len(), 2 * msg.len());
+        let block_size = 1usize << (log_d - LAYER);
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert_eq!(msg_positions >> 2, block_size);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6;
+        debug_assert!(sub_stride >= 1);
+        let quarter = block_size >> 2;
+        let lanes2_tail = if quarter.is_multiple_of(2) {
+            odd_tail
+        } else {
+            0
+        };
+        let row_len = num_ntts;
+
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let seed_right = seed_tw[0][2];
+        let seed_dense = seed_tw[1];
+        let top_tw: [(F128, F128, F128); 8] = std::array::from_fn(|block| {
+            (
+                self.twiddle(LAYER, block),
+                self.twiddle(LAYER + 1, 2 * block),
+                self.twiddle(LAYER + 1, 2 * block + 1),
+            )
+        });
+
+        let src_addr = msg.as_ptr() as usize;
+        let base_addr = data.as_mut_ptr() as usize;
+        let task = |buf: &mut Vec<F128>, r: usize| {
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            let bufp = buf.as_mut_ptr();
+            unsafe {
+                let src = src_addr as *const F128;
+                for k in 0..64 {
+                    let r_s = r + k * sub_stride;
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if !ntt_seed_hold4_disabled() {
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(k * row_len),
+                            bufp.add((256 + k) * row_len),
+                            64,
+                            row_len,
+                            seed_right,
+                            &seed_dense,
+                            core::ptr::null(),
+                        );
+                    } else {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(k * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + k) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
+                    {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(k * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + k) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    }
+                }
+                let base = base_addr as *mut F128;
+                for block in 0..8 {
+                    let region = bufp.add(block * 64 * row_len);
+                    let (t_outer, t_inner_a, t_inner_b) = top_tw[block];
+                    for m in 0..16 {
+                        let p = region.add(m * row_len);
+                        let step = 16 * row_len;
+                        let a = std::slice::from_raw_parts_mut(p, lanes2);
+                        let b = std::slice::from_raw_parts_mut(p.add(step), lanes2);
+                        let c = std::slice::from_raw_parts_mut(p.add(2 * step), lanes2);
+                        let d = std::slice::from_raw_parts_mut(p.add(3 * step), lanes2);
+                        kernels::butterfly_fused_2layer(
+                            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+                        );
+                    }
+                }
+                for block in 0..8 {
+                    for k in 0..64 {
+                        core::ptr::copy_nonoverlapping(
+                            bufp.add((block * 64 + k) * row_len),
+                            base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                            row_len,
+                        );
+                    }
+                }
+            }
+        };
+
+        const PARALLEL_TASK_THRESHOLD: usize = 32;
+        if sub_stride < PARALLEL_TASK_THRESHOLD {
+            let mut buf = staging_block(512, row_len);
+            for r in 0..sub_stride {
+                task(&mut buf, r);
+            }
+        } else {
+            (0..sub_stride)
+                .into_par_iter()
+                .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
+        }
+    }
+
     #[allow(clippy::manual_is_multiple_of)]
     fn seed_top_fused8_pass(
         &self,
@@ -3199,12 +3398,19 @@ impl AdditiveNttF128 {
             Self::top_fusion_available() && stream.is_none() && !ntt_top_fusion_disabled();
         // Seed fusion: `seed_msg` means layers 1–2 have NOT been applied yet
         // and the caller expects the first top task to apply them from the
-        // message. That is only possible when layers 3..8 are all top layers;
-        // otherwise run the separate seed pass here and continue as usual.
+        // message. Ranked fused-eight needs layers 3..8 all in the top;
+        // recursive fused-four needs layers 3..4 (n_top ≥ 5 after the bump).
+        // Otherwise run the separate seed pass here and continue as usual.
         let mut seed_msg = seed_msg;
         if let Some(msg) = seed_msg {
-            let fits = start_layer == 3 && top_fusion_ok && n_top >= 9 && log_d >= 9;
-            if !fits {
+            let fits8 = start_layer == 3 && top_fusion_ok && n_top >= 9 && log_d >= 9;
+            let fits4 = start_layer == 3
+                && top_fusion_ok
+                && n_top >= 5
+                && n_top < 9
+                && log_d >= 5
+                && !ntt_seed_top_fused4_disabled();
+            if !fits8 && !fits4 {
                 self.seed_rate_half_layers_1_through_2(msg, data, num_ntts);
                 seed_msg = None;
             }
@@ -3252,11 +3458,18 @@ impl AdditiveNttF128 {
             let block_bytes = block_size * num_ntts;
 
             if let Some(msg) = seed_msg.take() {
-                // Checked above: layer == 3, top fusion on, n_top ≥ 9.
-                debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
-                self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
-                crate::gaptime::mark("ntt: seed+top fused pass done");
-                layer += 6;
+                debug_assert!(layer == 3 && top_fusion_ok);
+                if n_top >= 9 {
+                    debug_assert!(layer + 5 < n_top);
+                    self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
+                    crate::gaptime::mark("ntt: seed+top fused8 pass done");
+                    layer += 6;
+                } else {
+                    debug_assert!(n_top >= 5 && layer + 1 < n_top);
+                    self.seed_top_fused4_pass(msg, data, num_ntts, log_d, odd_tail);
+                    crate::gaptime::mark("ntt: seed+top fused4 pass done");
+                    layer += 2;
+                }
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
                 layer += 6;
@@ -5813,6 +6026,59 @@ mod tests {
                 "seed fusion mismatch at log_d={log_d} num_ntts={num_ntts}"
             );
         }
+    }
+
+    /// Recursive fused-four (seed layers 1–2 plus top layers 3–4) vs the
+    /// separate seed pass, on the Ligerito recursive shape (`log_d = 16`,
+    /// `num_ntts = 8`, 16 threads → `n_top = 5` after the lone-top bump).
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn seed_top_fused4_matches_seed_pass() {
+        use std::sync::atomic::Ordering;
+        let mut rng = Rng::new(0x5EED_F4);
+        let log_d = 16usize;
+        let num_ntts = 8usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
+        let ntt = AdditiveNttF128::standard(log_d);
+        let codeword_len = (1usize << log_d) * num_ntts;
+        let msg_len = codeword_len >> 1;
+        let msg = rand_vec(&mut rng, msg_len);
+        let (control, candidate) = pool.install(|| {
+            let n_top = AdditiveNttF128::interleaved_n_top(log_d, num_ntts);
+            assert!(
+                n_top >= 4 && n_top < 9,
+                "recursive test shape must land in the fused-four n_top band, got {n_top}"
+            );
+            SEED_TOP_FUSED4_TEST_OFF.store(true, Ordering::Relaxed);
+            let mut control = junk_vec(codeword_len);
+            ntt.rs_encode_interleaved(&msg, &mut control, num_ntts);
+            SEED_TOP_FUSED4_TEST_OFF.store(false, Ordering::Relaxed);
+            let mut candidate = junk_vec(codeword_len);
+            let hits_before = SEED_TOP_FUSED4_HITS.load(Ordering::Relaxed);
+            ntt.rs_encode_interleaved(&msg, &mut candidate, num_ntts);
+            assert!(
+                SEED_TOP_FUSED4_HITS.load(Ordering::Relaxed) > hits_before,
+                "recursive seed fused-four did not run at n_top={n_top}"
+            );
+            (control, candidate)
+        });
+        let mut oracle = vec![F128::ZERO; codeword_len];
+        oracle[..msg_len].copy_from_slice(&msg);
+        ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+        assert!(
+            control == oracle,
+            "separate seed pass mismatch on recursive fused-four shape"
+        );
+        assert!(
+            candidate == oracle,
+            "recursive seed fused-four mismatch vs scalar NTT"
+        );
     }
 
     /// **Lead-4(d) hoist oracle.** The cached subspace-eval table must be
