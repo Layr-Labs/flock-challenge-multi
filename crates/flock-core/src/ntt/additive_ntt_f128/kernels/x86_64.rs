@@ -10,6 +10,15 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_F4_BLOCK_DRIVER=1` restores the public-wrapper dispatch on
+/// every fused-four row. The default ranked block driver resolves the fixed
+/// shape, hint and multiplication mode once before entering its row loop.
+#[inline]
+fn fused4_block_driver_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_F4_BLOCK_DRIVER").is_some())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -1191,6 +1200,109 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 twiddles,
                 pf_r,
             )
+        }
+    }
+}
+
+/// Run one ranked fused-four block after resolving every invariant dispatch
+/// once. Returns `false` when the kill switch or an unranked shape asks the
+/// caller to use its existing per-row route.
+///
+/// # Safety
+/// `ptr` covers `16 * sixteenth * 64` elements; the row groups are disjoint.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_ranked_block(
+    ptr: *mut F128,
+    sixteenth: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+    hint: u8,
+) -> bool {
+    if fused4_block_driver_disabled() || !matches!(sixteenth, 8 | 128) || hint > 2 {
+        return false;
+    }
+    let diet = !mul_diet_disabled();
+    // Monomorphize the three block invariants before the row loop. The macro
+    // only keeps this otherwise mechanical dispatch compact.
+    macro_rules! run {
+        ($diet:expr, $s16:expr) => {
+            match hint {
+                0 => butterfly_fused_4layer_ranked_block_impl::<$diet, $s16, 0>(
+                    ptr, odd_tail, twiddles,
+                ),
+                1 => butterfly_fused_4layer_ranked_block_impl::<$diet, $s16, 1>(
+                    ptr, odd_tail, twiddles,
+                ),
+                2 => butterfly_fused_4layer_ranked_block_impl::<$diet, $s16, 2>(
+                    ptr, odd_tail, twiddles,
+                ),
+                _ => core::hint::unreachable_unchecked(),
+            }
+        };
+    }
+    // SAFETY: the shape/hint guards above and the forwarded caller contract
+    // establish every selected monomorph's preconditions.
+    unsafe {
+        match (diet, sixteenth) {
+            (false, 8) => run!(false, 8),
+            (false, 128) => run!(false, 128),
+            (true, 8) => run!(true, 8),
+            (true, 128) => run!(true, 128),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+    true
+}
+
+/// Direct leaf used by the block driver. Keeping this boundary out of line
+/// preserves the incumbent row kernel's code shape while bypassing its public
+/// runtime-dispatch wrapper.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_ranked_row<const DIET: bool, const S16: usize, const H: u8>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded; the block driver pins S16 and NN=64 exactly.
+    unsafe {
+        butterfly_fused_4layer_row_impl::<DIET, H, S16, 64>(
+            ptr,
+            S16,
+            64,
+            active_lanes,
+            r,
+            twiddles,
+            pf_r,
+        )
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_ranked_block_impl<
+    const DIET: bool,
+    const S16: usize,
+    const H: u8,
+>(
+    ptr: *mut F128,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+) {
+    debug_assert!(odd_tail <= 64);
+    for r in 0..S16 {
+        let lanes = if r & 1 == 1 { 64 - odd_tail } else { 64 };
+        // The incumbent uses the non-prefetch leaf for the final row because
+        // no in-block successor exists. Every other row retains the selected
+        // hint and exact `pf_r = r + 1`.
+        unsafe {
+            if H == 0 || r + 1 == S16 {
+                butterfly_fused_4layer_ranked_row::<DIET, S16, 0>(ptr, lanes, r, twiddles, 0);
+            } else {
+                butterfly_fused_4layer_ranked_row::<DIET, S16, H>(ptr, lanes, r, twiddles, r + 1);
+            }
         }
     }
 }

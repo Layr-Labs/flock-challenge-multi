@@ -4423,6 +4423,20 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: `block` owns every selected row. The ranked helper returns
+    // false without touching it when the shape or kill switch does not fit.
+    unsafe {
+        if kernels::butterfly_fused_4layer_ranked_block(
+            base, sixteenth, num_ntts, odd_tail, t, hint,
+        ) {
+            return;
+        }
+    }
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line

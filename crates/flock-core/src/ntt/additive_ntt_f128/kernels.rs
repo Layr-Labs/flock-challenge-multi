@@ -762,6 +762,29 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     }
 }
 
+/// Ranked sequential fused-four block driver. Returns false for every shape
+/// that must keep the generic per-row route.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_ranked_block(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+    hint: u8,
+) -> bool {
+    if num_ntts != 64 || !super::ntt_shaped_enabled() {
+        return false;
+    }
+    // SAFETY: target features are cfg-gated and the caller owns the block.
+    unsafe { x86_64::butterfly_fused_4layer_ranked_block(ptr, sixteenth, odd_tail, twiddles, hint) }
+}
+
 /// Process one fused-three-layer group of eight consecutive rows.
 ///
 /// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
