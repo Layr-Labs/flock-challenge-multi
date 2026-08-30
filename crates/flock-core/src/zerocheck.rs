@@ -506,12 +506,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if c_identity_z.is_none() {
-            // Fold4/quad fallback consumers require dense AB. In particular,
-            // disabling identity-C must not expose the producer's omitted
-            // one-row windows as though they had been initialized.
-            ab_inner.restore_full_if_ranked_one_rows_elided(a_packed, b_packed, inv_table);
-        }
         if let Some(c_identity_z) = c_identity_z {
             // Ranked identity-C: AB completes without touching `c_packed`, and
             // C's message plus all three capture tensors come from one
@@ -867,19 +861,47 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    let use_cascade6 =
+        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO;
+    let use_cascade7 =
+        use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO;
+    let use_cascade8 =
+        use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO;
+    let use_cascade9 =
+        use_cascade8 && n_mlv >= 20 && r[k_skip + 17] != F128::ZERO;
+    let use_cascade10 =
+        use_cascade9 && n_mlv >= 22 && r[k_skip + 19] != F128::ZERO;
+    let use_cascade11 =
+        use_cascade10 && n_mlv >= 24 && r[k_skip + 21] != F128::ZERO;
+    let use_cascade12 =
+        use_cascade11 && n_mlv >= 26 && r[k_skip + 23] != F128::ZERO;
     let n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
         use_cascade4,
         use_cascade5,
+        use_cascade6,
+        use_cascade7,
+        use_cascade8,
+        use_cascade9,
+        use_cascade10,
+        use_cascade11,
+        use_cascade12,
     ) {
         (false, ..) => 0,
         (true, false, ..) => 1,
         (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+        (true, true, true, false, ..) => 3,
+        (true, true, true, true, false, ..) => 4,
+        (true, true, true, true, true, false, ..) => 5,
+        (true, true, true, true, true, true, false, ..) => 6,
+        (true, true, true, true, true, true, true, false, ..) => 7,
+        (true, true, true, true, true, true, true, true, false, ..) => 8,
+        (true, true, true, true, true, true, true, true, true, false, ..) => 9,
+        (true, true, true, true, true, true, true, true, true, true, false, ..) => 10,
+        (true, true, true, true, true, true, true, true, true, true, true, false) => 11,
+        (true, true, true, true, true, true, true, true, true, true, true, true) => 12,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -1416,7 +1438,21 @@ mod tests {
                 (true, true, true, true, true, true),  // incumbent
             ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 12 {
+            let all = if n_mlv >= 26 {
+                12
+            } else if n_mlv >= 24 {
+                11
+            } else if n_mlv >= 22 {
+                10
+            } else if n_mlv >= 20 {
+                9
+            } else if n_mlv >= 18 {
+                8
+            } else if n_mlv >= 16 {
+                7
+            } else if n_mlv >= 14 {
+                6
+            } else if n_mlv >= 12 {
                 5
             } else if n_mlv >= 10 {
                 4
