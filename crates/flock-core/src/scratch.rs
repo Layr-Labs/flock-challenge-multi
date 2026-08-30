@@ -278,6 +278,14 @@ pub fn prewarm_prover(m: usize) {
             unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
     });
+    // Force promotion after first-touch while setup is still outside the
+    // benchmark window. On kernels without MADV_COLLAPSE this is a no-op.
+    bufs.par_iter_mut().for_each(|b| {
+        crate::collapse_hugepages(
+            b.as_mut_ptr().cast::<u8>(),
+            b.len() * core::mem::size_of::<F128>(),
+        );
+    });
     for b in bufs {
         give_f128(b);
     }

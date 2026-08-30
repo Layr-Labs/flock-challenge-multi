@@ -278,13 +278,18 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+unsafe fn gf2_128_reduce_x4(t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        // t0 ^ (t1 << 64) ^ (t1.hi * 0x87). Immediate 0x96 is three-operand
+        // XOR, so the two dependent XORs collapse to one VPTERNLOG after the
+        // independent shift and CLMUL. Bit-identical per 128-bit lane.
+        _mm512_ternarylogic_epi64::<0x96>(
+            t0,
+            _mm512_bslli_epi128::<8>(t1),
+            _mm512_clmulepi64_epi128::<0x01>(t1, poly),
+        )
     }
 }
 
@@ -527,11 +532,14 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        // mid ^= (x.hi*y.lo) ^ (x.lo*y.hi). Immediate 0x96 is three-operand
+        // XOR, so the temporary cross XOR and the accumulator XOR become one
+        // VPTERNLOG. The four CLMULs and the lo/hi limbs are unchanged.
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
@@ -554,6 +562,20 @@ impl WideGhashX4 {
         let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
         self.mid =
             _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
+    }
+
+    /// XOR another accumulator's three part-registers into this one --
+    /// exactly the effect of having issued the other's `mul_acc` calls into
+    /// `self`, so one widened product can feed several accumulators.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn xor_acc(&mut self, o: &Self) {
+        self.lo = _mm512_xor_si512(self.lo, o.lo);
+        self.mid = _mm512_xor_si512(self.mid, o.mid);
+        self.hi = _mm512_xor_si512(self.hi, o.hi);
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
