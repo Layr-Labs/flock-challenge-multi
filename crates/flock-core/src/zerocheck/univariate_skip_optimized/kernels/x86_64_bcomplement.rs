@@ -105,6 +105,120 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2(
     }
 }
 
+/// Four-lane twin of [`shift_reduce_bcomplement_offw_nt2`]. The four offset
+/// windows are consecutive in the producer's octa arena. Keeping four named
+/// accumulators makes the B-mode branch invariant across the lanes without
+/// materialising a dynamically-indexed accumulator array.
+///
+/// The caller owns publication: results stay in registers so it can preserve
+/// its per-lane `z,a,b,out` non-temporal store order.
+///
+/// # Safety
+/// As for [`shift_reduce_bcomplement_offw_nt2`], except `op` owns four
+/// consecutive 128-word windows and the returned registers are not stored.
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_x4(
+    op: *const u16,
+    imgs: (*const u8, *const u8),
+    blk: usize,
+) -> (__m512i, __m512i, __m512i, __m512i) {
+    debug_assert!((2..=29).contains(&blk));
+    unsafe {
+        const STRIDE: usize = 128;
+        let op0 = op;
+        let op1 = op.add(STRIDE);
+        let op2 = op.add(2 * STRIDE);
+        let op3 = op.add(3 * STRIDE);
+        let apply = |p| apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, p);
+        let x = _mm512_set1_epi8(2);
+        let mut acc0 = _mm512_setzero_si512();
+        let mut acc1 = _mm512_setzero_si512();
+        let mut acc2 = _mm512_setzero_si512();
+        let mut acc3 = _mm512_setzero_si512();
+        let mut modes = WINDOW_PLANS[blk - 2].modes;
+        let mut k = 7usize;
+
+        macro_rules! products {
+            ($a0:expr, $a1:expr, $a2:expr, $a3:expr; $b0:expr, $b1:expr, $b2:expr, $b3:expr) => {
+                (
+                    _mm512_gf2p8mul_epi8($a0, $b0),
+                    _mm512_gf2p8mul_epi8($a1, $b1),
+                    _mm512_gf2p8mul_epi8($a2, $b2),
+                    _mm512_gf2p8mul_epi8($a3, $b3),
+                )
+            };
+        }
+        macro_rules! partial_products {
+            ($a0:expr, $a1:expr, $a2:expr, $a3:expr; $first:expr, $end:expr) => {
+                products!(
+                    $a0,
+                    $a1,
+                    $a2,
+                    $a3;
+                    apply_b_complement::<$first, $end>(imgs, op0.add(64 + k * 8)),
+                    apply_b_complement::<$first, $end>(imgs, op1.add(64 + k * 8)),
+                    apply_b_complement::<$first, $end>(imgs, op2.add(64 + k * 8)),
+                    apply_b_complement::<$first, $end>(imgs, op3.add(64 + k * 8))
+                )
+            };
+        }
+
+        loop {
+            let av0 = apply(op0.add(k * 8));
+            let av1 = apply(op1.add(k * 8));
+            let av2 = apply(op2.add(k * 8));
+            let av3 = apply(op3.add(k * 8));
+            let (product0, product1, product2, product3) = match modes as u8 {
+                1 => partial_products!(av0, av1, av2, av3; 1, 8),
+                2 => partial_products!(av0, av1, av2, av3; 2, 8),
+                3 => partial_products!(av0, av1, av2, av3; 3, 8),
+                4 => partial_products!(av0, av1, av2, av3; 4, 8),
+                5 => partial_products!(av0, av1, av2, av3; 5, 8),
+                6 => partial_products!(av0, av1, av2, av3; 6, 8),
+                7 => partial_products!(av0, av1, av2, av3; 7, 8),
+                8 => partial_products!(av0, av1, av2, av3; 0, 7),
+                9 => partial_products!(av0, av1, av2, av3; 0, 6),
+                10 => partial_products!(av0, av1, av2, av3; 0, 5),
+                11 => partial_products!(av0, av1, av2, av3; 0, 4),
+                12 => partial_products!(av0, av1, av2, av3; 0, 3),
+                13 => partial_products!(av0, av1, av2, av3; 0, 2),
+                14 => partial_products!(av0, av1, av2, av3; 0, 1),
+                15 => {
+                    let one = _mm512_set1_epi8(1);
+                    products!(av0, av1, av2, av3; one, one, one, one)
+                }
+                _ => products!(
+                    av0,
+                    av1,
+                    av2,
+                    av3;
+                    apply(op0.add(64 + k * 8)),
+                    apply(op1.add(64 + k * 8)),
+                    apply(op2.add(64 + k * 8)),
+                    apply(op3.add(64 + k * 8))
+                ),
+            };
+            if k == 7 {
+                acc0 = product0;
+                acc1 = product1;
+                acc2 = product2;
+                acc3 = product3;
+            } else {
+                acc0 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc0, x), product0);
+                acc1 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc1, x), product1);
+                acc2 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc2, x), product2);
+                acc3 = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc3, x), product3);
+            }
+            if k == 0 {
+                break;
+            }
+            modes >>= 8;
+            k -= 1;
+        }
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
 /// Shared dispatch inside the existing consumer, not one call per K-row.
 #[inline(always)]
 unsafe fn apply_b_mode(imgs: (*const u8, *const u8), op: *const u16, mode: u8) -> __m512i {

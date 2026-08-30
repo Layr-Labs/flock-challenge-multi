@@ -30,6 +30,12 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
+#[cfg(all(
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+use flock_core::zerocheck::univariate_skip_optimized::round1_ab_inner_window_from_offsets_nt2_bcomplement_static_x4;
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -563,6 +569,62 @@ unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op
     }
 }
 
+/// Consume four consecutive octa lanes under one B-mode dispatch per K-row.
+/// Computation precedes the stores, but the publication burst remains exactly
+/// `z,a,b,out` for each lane before advancing to the next lane, preserving the
+/// incumbent write-combining-buffer population and store order.
+#[cfg(all(
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[inline(never)]
+unsafe fn project_ranked_bcomplement_x4(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    off: *const u16,
+    a_rows: *const __m512i,
+    b_rows: *const __m512i,
+    j: usize,
+) {
+    unsafe {
+        let (r0, r1, r2, r3) =
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_x4(off, plan, imgs, blk);
+
+        let av0 = _mm512_load_si512(a_rows);
+        let bv0 = _mm512_load_si512(b_rows);
+        rows.publish_dense_values(j, av0, bv0);
+        _mm512_stream_si512(proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast(), r0);
+
+        let av1 = _mm512_load_si512(a_rows.add(1));
+        let bv1 = _mm512_load_si512(b_rows.add(1));
+        rows.publish_dense_values(j + 1, av1, bv1);
+        _mm512_stream_si512(
+            proj.out.add((j + 1) * BYTES_PER_BLOCK + blk * 64).cast(),
+            r1,
+        );
+
+        let av2 = _mm512_load_si512(a_rows.add(2));
+        let bv2 = _mm512_load_si512(b_rows.add(2));
+        rows.publish_dense_values(j + 2, av2, bv2);
+        _mm512_stream_si512(
+            proj.out.add((j + 2) * BYTES_PER_BLOCK + blk * 64).cast(),
+            r2,
+        );
+
+        let av3 = _mm512_load_si512(a_rows.add(3));
+        let bv3 = _mm512_load_si512(b_rows.add(3));
+        rows.publish_dense_values(j + 3, av3, bv3);
+        _mm512_stream_si512(
+            proj.out.add((j + 3) * BYTES_PER_BLOCK + blk * 64).cast(),
+            r3,
+        );
+    }
+}
+
 /// Caller-owned direct-publish path: keep the ranked rows in the caller's
 /// frame, widen their offsets there, and consume them without an outlined ABI
 /// boundary or a by-value `[__m512i; 8]` return.
@@ -620,6 +682,33 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
                 );
                 j += 1;
             }
+            return;
+        }
+
+        #[cfg(target_feature = "gfni")]
+        if plan.bcomplement_static_x4_eligible() {
+            project_ranked_bcomplement_x4(
+                proj,
+                blk,
+                plan,
+                imgs,
+                rows,
+                off,
+                a_rows.as_ptr(),
+                b_rows.as_ptr(),
+                0,
+            );
+            project_ranked_bcomplement_x4(
+                proj,
+                blk,
+                plan,
+                imgs,
+                rows,
+                off.add(4 * ROUND1_AB_OFF_WORDS),
+                a_rows.as_ptr().add(4),
+                b_rows.as_ptr().add(4),
+                4,
+            );
             return;
         }
 
@@ -802,6 +891,12 @@ impl StreamProj<'_> {
             debug_assert!(blk > 1 && blk < 30);
             debug_assert!(plan.bcomplement_static_eligible());
             let (sa,sb)=self.sides();
+            #[cfg(all(target_feature = "gfni", target_feature = "avx512f", target_feature = "avx512bw"))]
+            if plan.bcomplement_static_x4_eligible() {
+                project_ranked_bcomplement_x4(self,blk,plan,imgs,rows,off,sa.cast(),sb.cast(),0);
+                project_ranked_bcomplement_x4(self,blk,plan,imgs,rows,off.add(4*ROUND1_AB_OFF_WORDS),sa.add(4*STEP_WORDS).cast(),sb.add(4*STEP_WORDS).cast(),4);
+                return;
+            }
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
@@ -830,6 +925,12 @@ impl StreamProj<'_> {
             }
             if self.one_rows_elided && blk == 29 {
                 self.project_blocks_ranked_hot_offsets_residual_direct_rollback::<29,0x0f>(plan,imgs,rows,a_rows,b_rows,off);
+                return;
+            }
+            #[cfg(target_feature = "gfni")]
+            if plan.bcomplement_static_x4_eligible() {
+                project_ranked_bcomplement_x4(self,blk,plan,imgs,rows,off,a_rows.as_ptr(),b_rows.as_ptr(),0);
+                project_ranked_bcomplement_x4(self,blk,plan,imgs,rows,off.add(4*ROUND1_AB_OFF_WORDS),a_rows.as_ptr().add(4),b_rows.as_ptr().add(4),4);
                 return;
             }
             let mut j=0usize;
