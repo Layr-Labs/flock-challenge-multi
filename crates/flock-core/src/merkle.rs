@@ -301,14 +301,32 @@ fn blake3_platform() -> blake3::platform::Platform {
 /// Inputs handed to `hash_many` per call.
 ///
 /// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
-/// entry can loop over several such groups. Four groups amortize the FFI and
-/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
-/// the established 16-input policy on non-x86 targets, where an M4 sweep found
-/// it marginally best and the SIMD width is only four.
+/// entry can loop over several such groups. HEAD uses four groups (64) to
+/// amortize the FFI while keeping the pointer array to 512 bytes. Eight
+/// groups (128) halves the number of `hash_many` calls on ranked 1024-leaf
+/// serial subtrees (`1024/64 = 16` → `8`) at 1 KiB of stack pointers.
+/// `FLOCK_NO_BLAKE3_BATCH128=1` restores 64. Non-x86 stays 16.
 #[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
+const BLAKE3_BATCH: usize = 128;
 #[cfg(not(target_arch = "x86_64"))]
 const BLAKE3_BATCH: usize = 16;
+
+#[cfg(target_arch = "x86_64")]
+fn blake3_batch() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_BLAKE3_BATCH128").is_some() {
+            64
+        } else {
+            BLAKE3_BATCH
+        }
+    });
+    *N
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn blake3_batch() -> usize {
+    BLAKE3_BATCH
+}
 
 /// Drive `hash_many` over `data`, a run of `out.len()` contiguous `N`-byte
 /// messages, in [`BLAKE3_BATCH`]-wide calls. `flags`/`start`/`end` select the
@@ -326,10 +344,8 @@ fn blake3_hash_many<const N: usize>(
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
-    for (outs, msgs) in out
-        .chunks_mut(BLAKE3_BATCH)
-        .zip(data.chunks(BLAKE3_BATCH * N))
-    {
+    let batch = blake3_batch();
+    for (outs, msgs) in out.chunks_mut(batch).zip(data.chunks(batch * N)) {
         let n = outs.len();
         // Fill a stack array of input pointers. Slot 0 seeds the array so the
         // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
