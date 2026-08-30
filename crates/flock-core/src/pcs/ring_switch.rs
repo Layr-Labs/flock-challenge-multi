@@ -2832,6 +2832,147 @@ fn direct_fold8_states_seq(
     (a_state, w_state, round0)
 }
 
+/// The DirectFold8 `W` generator applies the claim's 16×256 byte table to
+/// every element of 64 `mul_by_x` doubling chains. Default-on, the batched
+/// GFNI form ([`direct_fold8_w_state_gfni`]) evaluates that table map;
+/// `FLOCK_NO_EY_DF8_GFNI=1` restores the incumbent per-slot `fold_one_slot`
+/// generator ([`direct_fold8_w_state_slots`]) byte-for-byte. Read once per
+/// process.
+#[allow(dead_code)] // Only read on the GFNI-capable build.
+#[inline]
+fn df8_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_DF8_GFNI").is_none());
+    *ON
+}
+
+/// Incumbent `W` generator, kept verbatim as the kill-switch path and the
+/// byte-identity oracle: 64 independent `low_eq[d]` doubling chains, each
+/// chain element mapped through the byte table by one `fold_one_slot`
+/// (sixteen byte-indexed loads + a depth-4 reduction tree), gathered
+/// bit-major into 64-lane rows.
+fn direct_fold8_w_state_slots(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    let w_rows: Vec<Vec<F128>> = (0..64usize)
+        .into_par_iter()
+        .map(|d_low| {
+            let mut row = Vec::with_capacity(n_packed);
+            let mut basis_product = low_eq[d_low];
+            row.push(fold_one_slot(basis_product, table));
+            for _ in 1..n_packed {
+                basis_product = crate::field::mul_by_x(basis_product);
+                row.push(fold_one_slot(basis_product, table));
+            }
+            row
+        })
+        .collect();
+    let mut w_state = vec![F128::ZERO; 64 * n_packed];
+    w_state
+        .par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(bit, w_row)| {
+            for lane in 0..64 {
+                w_row[lane] = w_rows[lane][bit];
+            }
+        });
+    w_state
+}
+
+/// Batch the DirectFold8 `Φ` table map over all sixty-four low-bank values.
+/// `fold_one_slot` is the F2-linear map `Σ_k table[k·256 + byte_k(x)]`, which
+/// splits into an eight-byte low map (`table[..8·256]`, indexed by the bytes
+/// of `x.lo`) and an eight-byte high map (`table[8·256..]`, indexed by the
+/// bytes of `x.hi`); the existing GFNI two-map kernel evaluates both maps
+/// over a 64-value plane and XORs them into the same 64 outputs. The two
+/// matrix blocks are built once per claim from the two halves of the same
+/// table — `build_row_fold_mats` reads exactly the subset-sum basis columns
+/// `build_fold_byte_table` wrote — so no new algebra is introduced and the
+/// existing table is not discarded. The preceding doubling chains and the
+/// bit-major state layout stay unchanged, so only the table application
+/// changes; every output is the same XOR sum of the same table columns,
+/// reassociated, hence bit-identical to [`direct_fold8_w_state_slots`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    use crate::zerocheck::multilinear::kernels::x86_64::{
+        build_row_fold_mats, gfni_fold64_two_maps,
+    };
+    use rayon::prelude::*;
+
+    const N_LOW: usize = 64;
+    let n_packed = 1usize << LOG_PACKING;
+    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
+    let low_mats = build_row_fold_mats(&table[..8 * FOLD_TABLE_SIZE]);
+    let high_mats = build_row_fold_mats(&table[8 * FOLD_TABLE_SIZE..]);
+    let raw_rows: Vec<Vec<F128>> = (0..N_LOW)
+        .into_par_iter()
+        .map(|d_low| {
+            let mut row = Vec::with_capacity(n_packed);
+            let mut basis_product = low_eq[d_low];
+            row.push(basis_product);
+            for _ in 1..n_packed {
+                basis_product = crate::field::mul_by_x(basis_product);
+                row.push(basis_product);
+            }
+            row
+        })
+        .collect();
+    let mut w_state = vec![F128::ZERO; N_LOW * n_packed];
+    w_state
+        .par_chunks_mut(N_LOW)
+        .enumerate()
+        .for_each(|(bit, output)| {
+            let mut row_lo = [0u64; N_LOW];
+            let mut row_hi = [0u64; N_LOW];
+            for d_low in 0..N_LOW {
+                let value = raw_rows[d_low][bit];
+                row_lo[d_low] = value.lo;
+                row_hi[d_low] = value.hi;
+            }
+            // SAFETY: each temporary row is exactly 64 packed 8-byte
+            // elements (512 bytes), each matrix block covers its eight input
+            // bytes, and the output chunk contains exactly 64 writable
+            // F128s. The cfg gate supplies AVX-512F/VBMI/GFNI (and the
+            // kernel's own cfg also requires VPCLMULQDQ).
+            unsafe {
+                gfni_fold64_two_maps::<false>(
+                    row_lo.as_ptr().cast::<u8>(),
+                    &low_mats,
+                    row_hi.as_ptr().cast::<u8>(),
+                    &high_mats,
+                    output.as_mut_ptr(),
+                    core::ptr::null(),
+                );
+            }
+        });
+    w_state
+}
+
+/// Select the `W` generator: batched GFNI two-map by default on a build that
+/// carries the kernel, the incumbent per-slot form under the kill switch or
+/// on any other target.
+fn direct_fold8_w_state_par(low_eq: &[F128; 64], table: &[F128]) -> Vec<F128> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        if df8_gfni_enabled() {
+            return direct_fold8_w_state_gfni(low_eq, table);
+        }
+    }
+    direct_fold8_w_state_slots(low_eq, table)
+}
+
 /// Value-identical full-width form of [`direct_fold8_states_seq`]. The 64
 /// `d_low` doubling chains and the 64 bank transposes are mutually
 /// independent (each is a pure function of its own `low_eq[d]` / bank
@@ -2844,22 +2985,8 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
-                        row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
+    let (w_state, a_rows): (Vec<F128>, Vec<Vec<F128>>) = rayon::join(
+        || direct_fold8_w_state_par(low_eq, table),
         || {
             (0..64usize)
                 .into_par_iter()
@@ -2867,15 +2994,12 @@ fn direct_fold8_states_par(
                 .collect()
         },
     );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    w_state
+    a_state
         .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
         .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
+        .for_each(|(bit, a_row)| {
             for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
                 a_row[lane] = a_rows[lane][bit];
             }
         });
@@ -4376,6 +4500,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
 
             if packed.len().is_multiple_of(8) {
@@ -4437,6 +4562,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
 
             let reference = fold_1b_rows_1way_mfr_16wide_padded(&w, &full_eq, &padding);
@@ -4474,6 +4600,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
             let n_lo = split_n_lo(l);
             let r0: Vec<F128> = (0..l).map(|_| rng.f128()).collect();

@@ -230,10 +230,12 @@ impl BlockR1cs {
             WitnessLayout::RowMajor => crate::zerocheck::PaddingSpec {
                 k_log: self.k_log,
                 useful_bits_per_block: self.useful_bits,
+                ranked_blake3_bstatic: false,
             },
             WitnessLayout::BatchMajor => crate::zerocheck::PaddingSpec {
                 k_log: self.m,
                 useful_bits_per_block: self.useful_bits.div_ceil(128) << (7 + self.n_log()),
+                ranked_blake3_bstatic: false,
             },
         }
     }

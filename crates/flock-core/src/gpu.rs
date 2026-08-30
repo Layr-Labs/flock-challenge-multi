@@ -2413,6 +2413,7 @@ mod tests {
         let padding = PaddingSpec {
             k_log: 14,
             useful_bits_per_block: 15_409,
+            ranked_blake3_bstatic: false,
         };
 
         // Default tile (16 x_outer_lo, 1 tile, 2 stream iterations).

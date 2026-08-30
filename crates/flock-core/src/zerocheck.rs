@@ -193,6 +193,12 @@ static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
 pub struct PaddingSpec {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    /// The packed A/B operands came from the ranked BLAKE3 witness producer,
+    /// which brands its precomputed round-one transform only after eliding
+    /// the circuit's structurally constant B rows. This is a prover-local
+    /// performance provenance bit; it is never observed by the transcript or
+    /// verifier and defaults to false for every generic caller.
+    pub ranked_blake3_bstatic: bool,
 }
 
 impl PaddingSpec {
@@ -202,6 +208,7 @@ impl PaddingSpec {
         Self {
             k_log: m,
             useful_bits_per_block: 1usize << m,
+            ranked_blake3_bstatic: false,
         }
     }
 }
@@ -506,6 +513,12 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
+        if c_identity_z.is_none() {
+            // Fold4/quad fallback consumers require dense AB. In particular,
+            // disabling identity-C must not expose the producer's omitted
+            // one-row windows as though they had been initialized.
+            ab_inner.restore_full_if_ranked_one_rows_elided(a_packed, b_packed, inv_table);
+        }
         if let Some(c_identity_z) = c_identity_z {
             // Ranked identity-C: AB completes without touching `c_packed`, and
             // C's message plus all three capture tensors come from one
@@ -1390,6 +1403,7 @@ mod tests {
                 PaddingSpec {
                     k_log,
                     useful_bits_per_block: useful,
+                    ranked_blake3_bstatic: false,
                 }
             } else {
                 PaddingSpec::dense(m)
