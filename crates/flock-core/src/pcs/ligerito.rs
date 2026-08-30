@@ -4562,6 +4562,24 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// Same-binary rollback for the ranked DirectFold4 two-claim GFNI b-side.
+/// Default ON: the ranked worker's cleared environment never sets the kill
+/// switch. Scalar `fold_one_slot` remains the fallback for AVX2 builds,
+/// ordinary-basis claims, and widths that are not a multiple of 64 slots.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold4_b_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD4_B_GFNI").is_none());
+    *ON
+}
+
 #[inline]
 #[allow(dead_code)] // Reserved for the rollback DirectFold8 lookahead path.
 fn eval_fold8_lookahead4(
@@ -4639,6 +4657,45 @@ fn materialize_direct_fold4(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && out_len == block_len * claim.eq_hi.len()
     }));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let b_gfni_candidate = direct_fold4_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    let b_gfni_candidate = false;
+    // The GFNI kernel owns complete 64-slot batches. Unusual DirectFold4
+    // widths stay on scalar `fold_one_slot` instead of reading a short tail.
+    let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                (
+                    claim.eq_lo.iter().map(|x| x.lo).collect(),
+                    claim.eq_lo.iter().map(|x| x.hi).collect(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     // Ranked path has no ordinary basis and uses fold16_banked, so the mid
@@ -4734,15 +4791,79 @@ fn materialize_direct_fold4(
                         slot += n;
                     }
                 }
-                // ---- b: direct claims, one 64 KiB composed table live at a time.
-                // Ranked path: no ordinary basis. `take_f128` is write-before-read
-                // (stale/uninit), so the fold2 materializer's table-hot schedule
-                // applies: first claim ASSIGNS every slot, later claims ADD.
-                // Deletes the `b_out.fill(ZERO)` memset that used to paint the
-                // whole chunk before the same += loop. Same F128 values — XOR
-                // with zero is the identity; the assign *is* that identity
-                // without the store. Existing 4-wide stride kept (not unrolled
-                // further; #120's 8-wide was cancelled with no official score).
+                // ---- b: direct claims.
+                // Ranked two-claim / no-ordinary / 64-aligned path: the same
+                // GFNI four-map kernel DirectFold8 already uses on this table
+                // layout. `fold_one_slot(eq_lo, composed)` is F2-linear in the
+                // 16 bytes of eq_lo, so packing lo/hi halves and folding both
+                // claims in one staged 64-row batch is bit-identical to the
+                // two scalar assign/add loops. Geometries that miss the gate
+                // keep the 64 KiB composed table and 4-wide `fold_one_slot`.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                if b_gfni_on {
+                    use crate::zerocheck::multilinear::kernels::x86_64::{
+                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+                    };
+                    let (claim0, claim1) = (&claims[0], &claims[1]);
+                    let cols0 = super::ring_switch::compose_block_cols(
+                        &direct_tables[0],
+                        claim0.eq_hi[block],
+                    );
+                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let cols1 = super::ring_switch::compose_block_cols(
+                        &direct_tables[1],
+                        claim1.eq_hi[block],
+                    );
+                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                    for slot in (0..block_len).step_by(64) {
+                        // Keep the measured 256 KiB next-slab T1 walk. Both
+                        // claims now share one 64-slot batch, so issue 32
+                        // lines per batch (was 1 line per 4 slots × 2 claims).
+                        #[cfg(target_arch = "x86_64")]
+                        if !pf_base.is_null() {
+                            let mut n = 0usize;
+                            while n < 32 && pf_at < pf_span {
+                                // SAFETY: `pf_at < pf_span` keeps the address
+                                // inside `packed_witness`. Prefetch has no
+                                // architectural effect.
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        pf_base.add(pf_at).cast::<i8>(),
+                                        core::arch::x86_64::_MM_HINT_T1,
+                                    );
+                                }
+                                pf_at += 64;
+                                n += 1;
+                            }
+                        }
+                        // SAFETY: each packed-u64 row half supplies 512 bytes;
+                        // both outputs cover 64 F128s; cfg features hold.
+                        unsafe {
+                            gfni_fold64_four_maps_staged(
+                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_lo,
+                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats0_hi,
+                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_lo,
+                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                &mats1_hi,
+                                b_out.as_mut_ptr().add(slot),
+                                scratch.as_mut_ptr().cast(),
+                            );
+                        }
+                    }
+                }
+                if !b_gfni_on {
                 let table = &mut scratch[..table_len];
                 let mut claims_iter = claims.iter().zip(direct_tables.iter());
                 if !has_ordinary {
@@ -4814,6 +4935,7 @@ fn materialize_direct_fold4(
                         b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
                         s += 1;
                     }
+                }
                 }
                 // Vectorized message-term reduction over the folded chunk.
                 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
