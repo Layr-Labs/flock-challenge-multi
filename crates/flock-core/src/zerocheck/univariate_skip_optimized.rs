@@ -938,9 +938,17 @@ pub struct Round1AbWindowPlan {
     bstatic: Option<&'static kernels::BstaticPartials>,
     kernel: kernels::ShiftReducePlan,
     nt: u8,
+    bcomplement_static: bool,
 }
 
 impl Round1AbWindowPlan {
+    /// True when the caller has independently established the ranked BLAKE3
+    /// static-B geometry and may use the checked-table complement leaf.
+    #[inline]
+    pub fn bcomplement_static_eligible(&self) -> bool {
+        self.bcomplement_static
+    }
+
     /// This plan specialised to one medium-window index: the static-B partials
     /// are dropped for every window whose plan is not live, so a producer that
     /// transforms several blocks at the same window index resolves the
@@ -999,10 +1007,53 @@ pub fn prepare_round1_ab_window_plan(
     } else {
         0
     };
+    let kernel = kernels::prepare_shift_reduce(inv_table);
     Round1AbWindowPlan {
         bstatic: kernels::prepare_bstatic(inv_table),
-        kernel: kernels::prepare_shift_reduce(inv_table),
+        kernel,
         nt,
+        bcomplement_static: prepare_round1_bcomplement_static(inv_table, kernel),
+    }
+}
+
+/// Validate the algebraic table identity used by the ranked-static
+/// B-complement leaf. The witness-side caller separately proves the fixed-one
+/// byte geometry; this plan only admits the exact table/kernel combination.
+fn prepare_round1_bcomplement_static(
+    inv_table: &InvNttTableByteSingleGf8,
+    kernel: kernels::ShiftReducePlan,
+) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT_STATIC").is_none()
+        });
+        if !*ON
+            || !kernels::shift_reduce_offsets_eligible(kernel, false, 2)
+            || inv_table.k != 6
+            || inv_table.ell != 64
+            || inv_table.n_chunks != 8
+        {
+            return false;
+        }
+        let mut ones_image = [F8::ZERO; 64];
+        inv_table.apply(&[u8::MAX; 8], &mut ones_image);
+        ones_image.iter().all(|value| *value == F8::ONE)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (inv_table, kernel);
+        false
     }
 }
 
@@ -1197,6 +1248,50 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
         target_feature = "avx512bw"
     )))]
     unreachable!("nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
+/// Ranked-static B-complement twin of
+/// [`round1_ab_inner_window_from_offsets_nt2`]. The caller must have proved
+/// the BLAKE3 fixed-one byte geometry and checked
+/// [`Round1AbWindowPlan::bcomplement_static_eligible`] for this plan.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`], plus the static-byte
+/// geometry above. This wrapper does no per-window raw-B guard by design.
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((2..=29).contains(&blk));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+            blk,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
 }
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
@@ -4165,6 +4260,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
             let (padded_ab, padded_c) = round1_shift_reduce_extract_c_packed_padded(
                 &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
@@ -4785,6 +4881,7 @@ mod tests {
                     PaddingSpec {
                         k_log,
                         useful_bits_per_block: useful_bits,
+                        ranked_blake3_bstatic: false,
                     }
                 }
             };
@@ -4850,6 +4947,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log: K_LOG,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
             let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
             // The packed byte buffer and the F128 word buffer are the same
@@ -4995,6 +5093,7 @@ mod tests {
                     PaddingSpec {
                         k_log,
                         useful_bits_per_block: useful_bits,
+                        ranked_blake3_bstatic: false,
                     }
                 }
             };

@@ -44,6 +44,29 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     }
 }
 
+/// Fold one packed eight-byte row through the round-two byte tables.
+///
+/// # Safety
+/// `table_data` covers 8 × 256 aligned entries and `row` covers eight bytes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn fold_round2_row_x86_unchecked_8(table_data: *const F128, row: *const u8) -> F128 {
+    use core::arch::x86_64::*;
+
+    unsafe {
+        let mut acc = _mm_setzero_si128();
+        for chunk in 0..8 {
+            let entry = table_data.add(chunk * 256 + *row.add(chunk) as usize);
+            acc = _mm_xor_si128(acc, _mm_load_si128(entry.cast::<__m128i>()));
+        }
+        core::mem::transmute::<__m128i, F128>(acc)
+    }
+}
+
 /// x86 fused fold plus next-round message for one worker chunk.
 ///
 /// Each four-message iteration folds eight `a` and `b` outputs, stores them
@@ -199,6 +222,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
+    trusted_ranked_bstatic: bool,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -298,8 +322,56 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let dead = 0u8;
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
-                    gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
+                    gfni_fold64_rows_masked_tr_bcast::<4>(
+                        a_pkt.add(g0 * 8),
+                        m,
+                        fa.as_mut_ptr(),
+                        dead,
+                    );
+                    // A trusted special window occupies exactly one of the
+                    // refill's four 16-row groups. Its specialized consumer
+                    // never needs the all-ones B cache and needs only the
+                    // sparse group's first row, so omit that group's 1/4 of
+                    // the B GFNI work and reconstruct the lone sparse value
+                    // with eight table loads.
+                    let trusted_refill_group = if trusted_ranked_bstatic
+                        && b_special_head >= x_lo
+                        && b_special_head < x_lo + 32
+                    {
+                        Some(((b_special_head - x_lo) / 8, b_special_kind))
+                    } else {
+                        None
+                    };
+                    match trusted_refill_group.map(|(group, _)| group) {
+                        Some(0) => gfni_fold64_rows_masked_tr_bcast::<0>(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        ),
+                        Some(3) => gfni_fold64_rows_masked_tr_bcast::<3>(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        ),
+                        _ => gfni_fold64_rows_masked_tr_bcast::<4>(
+                            b_pkt.add(g0 * 8),
+                            m,
+                            fb.as_mut_ptr(),
+                            dead,
+                        ),
+                    }
+                    if let Some((group, B_SPECIAL_SPARSE)) = trusted_refill_group {
+                        let first_row = g0 + 16 * group;
+                        let sparse = fold_round2_row_x86_unchecked_8(
+                            table_data,
+                            b_pkt.add(first_row * 8),
+                        );
+                        let b0 = &mut fb[4 * group..4 * group + 4];
+                        b0.fill(F128::ZERO);
+                        b0[0] = sparse;
+                    }
                 } else if tr_emit {
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
@@ -355,6 +427,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
+            // The ranked BLAKE3 producer already proves the two special B
+            // windows structurally. In the no-store residue-major path those
+            // windows can therefore avoid loading registers that their
+            // specialized arithmetic never consumes: a0 plus all four B
+            // vectors for the all-ones row, and b1..b3 for the sparse row.
+            let trusted_special = if trusted_ranked_bstatic && x_lo == b_special_head {
+                b_special_kind
+            } else {
+                B_SPECIAL_NONE
+            };
             let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
@@ -365,16 +447,39 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     let ld = |base: *const F128, k: usize| {
                         _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
                     };
-                    (
-                        ld(fa.as_ptr(), 0),
-                        ld(fa.as_ptr(), 1),
-                        ld(fa.as_ptr(), 2),
-                        ld(fa.as_ptr(), 3),
-                        ld(fb.as_ptr(), 0),
-                        ld(fb.as_ptr(), 1),
-                        ld(fb.as_ptr(), 2),
-                        ld(fb.as_ptr(), 3),
-                    )
+                    let zero = _mm512_setzero_si512();
+                    match trusted_special {
+                        B_SPECIAL_ONES => (
+                            zero,
+                            ld(fa.as_ptr(), 1),
+                            ld(fa.as_ptr(), 2),
+                            ld(fa.as_ptr(), 3),
+                            zero,
+                            zero,
+                            zero,
+                            zero,
+                        ),
+                        B_SPECIAL_SPARSE => (
+                            ld(fa.as_ptr(), 0),
+                            ld(fa.as_ptr(), 1),
+                            ld(fa.as_ptr(), 2),
+                            ld(fa.as_ptr(), 3),
+                            ld(fb.as_ptr(), 0),
+                            zero,
+                            zero,
+                            zero,
+                        ),
+                        _ => (
+                            ld(fa.as_ptr(), 0),
+                            ld(fa.as_ptr(), 1),
+                            ld(fa.as_ptr(), 2),
+                            ld(fa.as_ptr(), 3),
+                            ld(fb.as_ptr(), 0),
+                            ld(fb.as_ptr(), 1),
+                            ld(fb.as_ptr(), 2),
+                            ld(fb.as_ptr(), 3),
+                        ),
+                    }
                 } else {
                     let fap = fa.as_ptr().add(r0).cast::<__m512i>();
                     let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
@@ -472,12 +577,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     b_special_head = b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS);
                 }
                 if special_kind == B_SPECIAL_ONES {
-                    let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
-                    let all = _mm512_cmpeq_epi64_mask(b0, one)
-                        & _mm512_cmpeq_epi64_mask(b1, one)
-                        & _mm512_cmpeq_epi64_mask(b2, one)
-                        & _mm512_cmpeq_epi64_mask(b3, one);
-                    if all == 0xff {
+                    let valid = trusted_ranked_bstatic || {
+                        let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
+                        let all = _mm512_cmpeq_epi64_mask(b0, one)
+                            & _mm512_cmpeq_epi64_mask(b1, one)
+                            & _mm512_cmpeq_epi64_mask(b2, one)
+                            & _mm512_cmpeq_epi64_mask(b3, one);
+                        all == 0xff
+                    };
+                    if valid {
                         let (a1w, a2w, a3w) = if let Some(wt) = wtab {
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
@@ -520,11 +628,14 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 } else {
                     let zero = _mm512_setzero_si512();
                     let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
-                    let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
-                        & _mm512_cmpeq_epi64_mask(b1, zero)
-                        & _mm512_cmpeq_epi64_mask(b2, zero)
-                        & _mm512_cmpeq_epi64_mask(b3, zero);
-                    if all == 0xff {
+                    let valid = trusted_ranked_bstatic || {
+                        let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
+                            & _mm512_cmpeq_epi64_mask(b1, zero)
+                            & _mm512_cmpeq_epi64_mask(b2, zero)
+                            & _mm512_cmpeq_epi64_mask(b3, zero);
+                        all == 0xff
+                    };
+                    if valid {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let a1_msg = _mm512_xor_si512(a0, a1);
@@ -2525,7 +2636,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 /// As [`gfni_fold64_rows_masked_tr`].
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast<const SKIP_GROUP: usize>(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
@@ -2535,7 +2646,8 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     // SAFETY: as for `gfni_fold64_rows_masked_tr`.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
+        debug_assert!(SKIP_GROUP <= 4);
+        if dead_lines == 0 && SKIP_GROUP == 4 {
             // The ranked shape has no dead lines: one test replaces eight
             // predicated loads.
             for (i, slot) in z.iter_mut().enumerate() {
@@ -2543,12 +2655,12 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
             }
         } else {
             for (i, slot) in z.iter_mut().enumerate() {
-                if dead_lines & (1u8 << i) == 0 {
+                if i / 2 != SKIP_GROUP && dead_lines & (1u8 << i) == 0 {
                     *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
                 }
             }
         }
-        gfni_fold64_regs_sigma_bcast(z, mats, out);
+        gfni_fold64_regs_sigma_bcast::<SKIP_GROUP>(z, mats, out);
     }
 }
 
@@ -3285,7 +3397,7 @@ unsafe fn gfni_fold64_regs_impl<const SIGMA: bool>(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-unsafe fn gfni_fold64_regs_sigma_bcast(
+unsafe fn gfni_fold64_regs_sigma_bcast<const SKIP_GROUP: usize>(
     z: [core::arch::x86_64::__m512i; 8],
     mats: &[u64; 128],
     out: *mut F128,
@@ -3324,6 +3436,9 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
         let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
         let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
         for g in 0..4 {
+            if g == SKIP_GROUP {
+                continue;
+            }
             let mut a01 = [_mm512_setzero_si512(); 2];
             let mut a23 = [_mm512_setzero_si512(); 2];
             for half in 0..2 {

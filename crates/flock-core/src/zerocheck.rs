@@ -193,6 +193,12 @@ static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
 pub struct PaddingSpec {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    /// The packed A/B operands came from the ranked BLAKE3 witness producer,
+    /// which brands its precomputed round-one transform only after eliding
+    /// the circuit's structurally constant B rows. This is a prover-local
+    /// performance provenance bit; it is never observed by the transcript or
+    /// verifier and defaults to false for every generic caller.
+    pub ranked_blake3_bstatic: bool,
 }
 
 impl PaddingSpec {
@@ -202,6 +208,7 @@ impl PaddingSpec {
         Self {
             k_log: m,
             useful_bits_per_block: 1usize << m,
+            ranked_blake3_bstatic: false,
         }
     }
 }
@@ -1390,6 +1397,7 @@ mod tests {
                 PaddingSpec {
                     k_log,
                     useful_bits_per_block: useful,
+                    ranked_blake3_bstatic: false,
                 }
             } else {
                 PaddingSpec::dense(m)

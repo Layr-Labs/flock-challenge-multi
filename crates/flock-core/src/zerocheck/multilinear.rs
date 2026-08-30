@@ -1296,6 +1296,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     wtab_arg,
+                    padding.ranked_blake3_bstatic,
                 )
             };
             #[cfg(not(all(
@@ -1510,6 +1511,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     wtab_arg,
+                    padding.ranked_blake3_bstatic,
                 )
             };
             #[cfg(not(all(
@@ -3854,6 +3856,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             };
 
             let dense = uni_skip_fold_and_round_pair_optimized_packed(
@@ -4043,6 +4046,7 @@ mod tests {
             PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+                ranked_blake3_bstatic: false,
             }
         } else {
             PaddingSpec::dense(m)
@@ -4219,6 +4223,7 @@ mod tests {
                     mask,
                     useful,
                     None,
+                    false,
                 )
             };
             assert_eq!(a_s, a_v, "a chunk lo_size={lo_size} mask={mask}");
@@ -4249,6 +4254,7 @@ mod tests {
                     mask,
                     useful,
                     wtab_test.as_deref(),
+                    false,
                 )
             };
             assert_eq!(out_s, out_n, "no-store sums lo_size={lo_size} mask={mask}");
@@ -4808,6 +4814,7 @@ mod tests {
         PaddingSpec {
             k_log: 14,
             useful_bits_per_block: 15_409,
+            ranked_blake3_bstatic: false,
         }
     }
 
@@ -4881,6 +4888,7 @@ mod tests {
                         let padding = PaddingSpec {
                             k_log,
                             useful_bits_per_block: useful,
+                            ranked_blake3_bstatic: false,
                         };
                         assert_eq!(
                             round2_row_zero(&padding, k_skip).map(|(_, r)| r),
@@ -5355,7 +5363,7 @@ mod tests {
                 tr.as_mut_ptr(),
                 0b1000_0000,
             );
-            kernels::x86_64::gfni_fold64_rows_masked_tr_bcast(
+            kernels::x86_64::gfni_fold64_rows_masked_tr_bcast::<4>(
                 poisoned.as_ptr(),
                 &mats,
                 trb.as_mut_ptr(),
