@@ -887,20 +887,12 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
                     } else {
                         _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
                     };
-                    los[group] = _mm512_xor_si512(
-                        los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
-                    );
-                    his[group] = _mm512_xor_si512(
-                        his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
-                    );
+                    let l0 = lookup8(n0_8, lut.n0_lo[b_med].as_ptr());
+                    let l1 = lookup8(n1_8, lut.n1_lo[b_med].as_ptr());
+                    los[group] = _mm512_ternarylogic_epi64::<0x96>(los[group], l0, l1);
+                    let h0 = lookup8(n0_8, lut.n0_hi[b_med].as_ptr());
+                    let h1 = lookup8(n1_8, lut.n1_hi[b_med].as_ptr());
+                    his[group] = _mm512_ternarylogic_epi64::<0x96>(his[group], h0, h1);
                 }
             }
             for group in 0..2 {
@@ -1187,26 +1179,17 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
                         _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3))
                     };
 
-                    let los = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_lo.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_lo.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_lo.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_lo.as_ptr()),
-                        ),
-                    );
-                    let his = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_hi.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_hi.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_hi.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_hi.as_ptr()),
-                        ),
-                    );
+                    let l0 = lookup8(n0_8, lut.lo_n0_lo.as_ptr());
+                    let l1 = lookup8(n1_8, lut.lo_n1_lo.as_ptr());
+                    let l2 = lookup8(n2_8, lut.hi_n0_lo.as_ptr());
+                    let l3 = lookup8(n3_8, lut.hi_n1_lo.as_ptr());
+                    let los = _mm512_ternarylogic_epi64::<0x96>(l0, l1, _mm512_xor_si512(l2, l3));
+
+                    let h0 = lookup8(n0_8, lut.lo_n0_hi.as_ptr());
+                    let h1 = lookup8(n1_8, lut.lo_n1_hi.as_ptr());
+                    let h2 = lookup8(n2_8, lut.hi_n0_hi.as_ptr());
+                    let h3 = lookup8(n3_8, lut.hi_n1_hi.as_ptr());
+                    let his = _mm512_ternarylogic_epi64::<0x96>(h0, h1, _mm512_xor_si512(h2, h3));
                     let (aos0, aos1) = interleave_aos(los, his);
                     let partial_ptr = bank.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
                     _mm512_storeu_si512(
