@@ -2056,11 +2056,30 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+/// Source-isolated salvage of santhreal's subset-table builder from PR 2012.
+/// `FLOCK_NO_RS_SUBSET_TABLE=1` restores the previous builder.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn rs_subset_table_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_SUBSET_TABLE").is_none());
+    *ON
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn rs_subset_table_enabled() -> bool {
+    false
+}
+
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
+    if rs_subset_table_enabled() {
+        return build_direct_fold8_table_from_generators(eq_r_dprime);
+    }
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
