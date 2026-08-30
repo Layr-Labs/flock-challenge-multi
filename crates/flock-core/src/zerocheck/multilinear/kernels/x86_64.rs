@@ -175,7 +175,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 /// `a_chunk`/`b_chunk` may then be empty.
 ///
 /// # Safety
-/// `table_data` must point to the 8 × 256 `F128` fold table; `a_pkt`/`b_pkt`
+/// `table_data` must point to the zero-based subset-XOR 8 × 256 `F128`
+/// fold table produced by `UniSkipFoldTable::new` (or an equivalent linear
+/// table: every byte entry is the XOR of its set-bit basis entries, and
+/// each byte subtable's zero entry is ZERO); `a_pkt`/`b_pkt`
 /// must expose 8 readable bytes for every post-URM row
 /// `row_base .. row_base + 2·eq_lo.len()`; if `WRITE`, `a_chunk.len() ==
 /// b_chunk.len() == 2·eq_lo.len()`; `eq_lo.len()` is even. When present,
@@ -286,15 +289,37 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // whether either value may replace an actual B subgroup.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let b_canonical_values = if tr_bcast && zc_b_canonical_prefold_enabled() {
-            let mut values = [F128::ZERO; 2];
-            for bit in 0..64 {
-                let basis = *table_data.add((bit / 8) * 256 + (1 << (bit % 8)));
-                values[0] += basis;
-                if bit < 49 {
-                    values[1] += basis;
+            if zc_b_canonical_sum9_enabled() {
+                // UniSkipFoldTable::new builds T_j[v] by subset XOR from
+                // T_j[0] = ZERO. The first six complete bytes are shared by
+                // both images: all 64 bits, and just the low 49 bits. Read
+                // those six aggregate entries once, then the two full high
+                // bytes for all-ones and bit 48 for the tail: nine reads,
+                // versus the incumbent's 64 basis reads and 113 XORs.
+                // No assumption that the all-one image equals ONE is used.
+                let prefix = *table_data.add(255)
+                    + *table_data.add(256 + 255)
+                    + *table_data.add(2 * 256 + 255)
+                    + *table_data.add(3 * 256 + 255)
+                    + *table_data.add(4 * 256 + 255)
+                    + *table_data.add(5 * 256 + 255);
+                Some([
+                    prefix + *table_data.add(6 * 256 + 255) + *table_data.add(7 * 256 + 255),
+                    prefix + *table_data.add(6 * 256 + 1),
+                ])
+            } else {
+                // Exact same-binary rollback: retain the original per-bit
+                // derivation as an independent arithmetic oracle.
+                let mut values = [F128::ZERO; 2];
+                for bit in 0..64 {
+                    let basis = *table_data.add((bit / 8) * 256 + (1 << (bit % 8)));
+                    values[0] += basis;
+                    if bit < 49 {
+                        values[1] += basis;
+                    }
                 }
+                Some(values)
             }
-            Some(values)
         } else {
             None
         };
@@ -1394,6 +1419,18 @@ fn zc_b_sparse_enabled() -> bool {
 fn zc_b_canonical_prefold_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
+    });
+    *ENABLED
+}
+
+/// Derive the same canonical images from nine subset-XOR table entries.
+/// `FLOCK_NO_ZC_B_CANONICAL_SUM9=1` restores the original 64-column sum;
+/// the existing canonical-prefold gate and raw-byte checks are unchanged.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline]
+fn zc_b_canonical_sum9_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_SUM9").is_none()
     });
     *ENABLED
 }
