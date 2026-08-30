@@ -2059,19 +2059,41 @@ const FOLD_TABLE_SIZE: usize = 256;
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
+/// In-place builder for fold byte tables using the 8-way doubling tree.
+#[inline(always)]
+pub(crate) fn build_fold_byte_table_into(eq_r_dprime: &[F128], out: &mut [F128; FOLD_TABLE_TOTAL]) {
+    debug_assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
+    for byte_idx in 0..FOLD_N_BYTES {
+        let table = &mut out[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
+        table[0] = F128::ZERO;
+        for (bit, &generator) in eq_r_dprime[byte_idx * 8..byte_idx * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for value in 0..half {
+                table[value + half] = table[value] + generator;
+            }
+        }
+    }
+}
+
+/// Stack-allocated fold byte table builder avoiding heap allocation.
+#[inline(always)]
+pub(crate) fn build_fold_byte_table_stack(eq_r_dprime: &[F128]) -> [F128; FOLD_TABLE_TOTAL] {
+    let mut out = [F128::ZERO; FOLD_TABLE_TOTAL];
+    build_fold_byte_table_into(eq_r_dprime, &mut out);
+    out
+}
+
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
-        let bit_base = byte_idx * 8;
-        for value in 0..FOLD_TABLE_SIZE {
-            let mut acc = F128::ZERO;
-            for bit_in_byte in 0..8 {
-                if (value >> bit_in_byte) & 1 == 1 {
-                    acc += eq_r_dprime[bit_base + bit_in_byte];
-                }
+        let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
+        table[0] = F128::ZERO;
+        for (bit, &generator) in eq_r_dprime[byte_idx * 8..byte_idx * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for value in 0..half {
+                table[value + half] = table[value] + generator;
             }
-            tables[byte_idx * FOLD_TABLE_SIZE + value] = acc;
         }
     }
     tables
@@ -3547,9 +3569,12 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let tail_par = rs_tail_par_enabled();
     let claim_output =
         |i: usize, w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
-            let scaled_eq_r_dprime: Vec<F128> =
-                w.eq_r_dprime.iter().map(|value| g * *value).collect();
-            let table = build_fold_byte_table(&scaled_eq_r_dprime);
+            let mut scaled_eq_r_dprime = [F128::ZERO; 1 << LOG_PACKING];
+            for (out, &value) in scaled_eq_r_dprime.iter_mut().zip(&w.eq_r_dprime) {
+                *out = g * value;
+            }
+            let mut table = [F128::ZERO; FOLD_TABLE_TOTAL];
+            build_fold_byte_table_into(&scaled_eq_r_dprime, &mut table);
             let wants_direct = w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1);
             let direct_fold2 = match kinds[i] {
                 Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
@@ -5394,5 +5419,30 @@ mod tests {
             assert_eq!(build_eq_parallel(&r), two_mul(&r), "n={n}");
             assert_eq!(build_eq_parallel(&r), build_eq(&r), "vs sequential n={n}");
         }
+    }
+    #[test]
+    fn build_fold_byte_table_into_matches_bit_loop() {
+        let mut rng = Rng::new(0x7AB1_E001_8008);
+        let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+        let mut expected = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+        for byte_idx in 0..FOLD_N_BYTES {
+            let bit_base = byte_idx * 8;
+            for value in 0..FOLD_TABLE_SIZE {
+                let mut acc = F128::ZERO;
+                for bit_in_byte in 0..8 {
+                    if (value >> bit_in_byte) & 1 == 1 {
+                        acc += eq_r_dprime[bit_base + bit_in_byte];
+                    }
+                }
+                expected[byte_idx * FOLD_TABLE_SIZE + value] = acc;
+            }
+        }
+        let got_vec = build_fold_byte_table(&eq_r_dprime);
+        let got_stack = build_fold_byte_table_stack(&eq_r_dprime);
+        let mut got_into = [F128::ZERO; FOLD_TABLE_TOTAL];
+        build_fold_byte_table_into(&eq_r_dprime, &mut got_into);
+        assert_eq!(got_vec, expected);
+        assert_eq!(got_stack.to_vec(), expected);
+        assert_eq!(got_into.to_vec(), expected);
     }
 }
