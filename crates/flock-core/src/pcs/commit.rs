@@ -535,22 +535,65 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
     crate::alloc_uninit_vec(total_nodes)
 }
 
+pub(crate) const MAX_TREE_POOLED: usize = 8;
+pub(crate) const MIN_TREE_CAPACITY: usize = 1 << 13;
+
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
-    // Only park allocations big enough to matter for wrap-cache stability.
-    // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
-    // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
-    if tree.capacity() < (1 << 16) {
+    // Only park allocations big enough to matter for wrap-cache and allocation stability.
+    // Floor at 2^13 nodes (~256 KiB) so all recursive Ligerito trees (L0 64 MiB, L1 16 MiB,
+    // L2 4 MiB, L3 1 MiB, L4 256 KiB) are recycled without incurring unmap/mmap churn.
+    if tree.capacity() < MIN_TREE_CAPACITY {
         return;
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {
-        // Cap 3: ranked L0 (64 MiB) + L1 (16 MiB) + L2 (4 MiB) all park
-        // after untimed warmup; the timed prove takes all three without
-        // a fresh mmap/fault. Trees are sequential (L_i dropped before
-        // L_{i+1} is committed), so at most three are ever parked at once.
-        if pool.len() < 3 {
+        if pool.len() < MAX_TREE_POOLED {
             pool.push(tree);
+        } else {
+            // Evict smallest if current buffer is larger to prioritize large tree retention.
+            let mut smallest_idx = 0;
+            for (i, item) in pool.iter().enumerate() {
+                if item.capacity() < pool[smallest_idx].capacity() {
+                    smallest_idx = i;
+                }
+            }
+            if tree.capacity() > pool[smallest_idx].capacity() {
+                pool.swap_remove(smallest_idx);
+                pool.push(tree);
+            }
         }
+    }
+}
+
+pub(crate) fn clear_tree_pool() {
+    if let Ok(mut pool) = TREE_POOL.lock() {
+        pool.clear();
+    }
+}
+
+/// Prewarm the Merkle tree buffer pool for witness size `2^m`.
+/// Touches/prefaults pages in parallel so tree allocations during the prove
+/// execute with zero page faults and zero memory-management syscalls.
+pub fn prewarm_tree_pool(m: usize) {
+    use rayon::prelude::*;
+    if m < 12 {
+        return;
+    }
+    let n_leaves = 1usize << (m - 11);
+    let mut tree_nodes = Vec::new();
+    let mut cur = n_leaves;
+    while cur >= MIN_TREE_CAPACITY && tree_nodes.len() < 5 {
+        tree_nodes.push(2 * cur - 1);
+        cur /= 4;
+    }
+    let mut trees: Vec<Vec<Hash>> = tree_nodes.into_iter().map(take_tree).collect();
+    trees.par_iter_mut().for_each(|t| {
+        t.par_chunks_mut(1 << 14).for_each(|chunk| {
+            unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
+        });
+    });
+    for t in trees {
+        give_tree(t);
     }
 }
 

@@ -281,6 +281,7 @@ pub fn prewarm_prover(m: usize) {
     for b in bufs {
         give_f128(b);
     }
+    crate::pcs::commit::prewarm_tree_pool(m);
 }
 
 /// Release every pooled buffer back to the OS. The per-thread free lists
@@ -288,6 +289,7 @@ pub fn prewarm_prover(m: usize) {
 /// retain at most a few tens of KiB per worker thread.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+    crate::pcs::commit::clear_tree_pool();
 }
 
 // ---------------------------------------------------------------------------
