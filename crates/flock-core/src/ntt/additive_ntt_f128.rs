@@ -1545,6 +1545,89 @@ impl AdditiveNttF128 {
         span_get(&v[1..], block)
     }
 
+    /// Batch indexer for 4-layer fused butterflies (15 twiddles).
+    #[inline]
+    pub fn twiddles_fused4(&self, layer: usize, block: usize) -> [F128; 15] {
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            let off0 = (1usize << layer) - 1 + block;
+            let off1 = (1usize << (layer + 1)) - 1 + 2 * block;
+            let off2 = (1usize << (layer + 2)) - 1 + 4 * block;
+            let off3 = (1usize << (layer + 3)) - 1 + 8 * block;
+            let mut tw = [F128::ZERO; 15];
+            tw[0] = twiddles[off0];
+            tw[1] = twiddles[off1];
+            tw[2] = twiddles[off1 + 1];
+            tw[3] = twiddles[off2];
+            tw[4] = twiddles[off2 + 1];
+            tw[5] = twiddles[off2 + 2];
+            tw[6] = twiddles[off2 + 3];
+            tw[7] = twiddles[off3];
+            tw[8] = twiddles[off3 + 1];
+            tw[9] = twiddles[off3 + 2];
+            tw[10] = twiddles[off3 + 3];
+            tw[11] = twiddles[off3 + 4];
+            tw[12] = twiddles[off3 + 5];
+            tw[13] = twiddles[off3 + 6];
+            tw[14] = twiddles[off3 + 7];
+            return tw;
+        }
+        let mut tw = [F128::ZERO; 15];
+        tw[0] = self.twiddle(layer, block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer + 3, 8 * block + s);
+        }
+        tw
+    }
+
+    /// Batch indexer for 3-layer fused butterflies (7 twiddles).
+    #[inline]
+    pub fn twiddles_fused3(&self, layer: usize, block: usize) -> [F128; 7] {
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            let off0 = (1usize << layer) - 1 + block;
+            let off1 = (1usize << (layer + 1)) - 1 + 2 * block;
+            let off2 = (1usize << (layer + 2)) - 1 + 4 * block;
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = twiddles[off0];
+            tw[1] = twiddles[off1];
+            tw[2] = twiddles[off1 + 1];
+            tw[3] = twiddles[off2];
+            tw[4] = twiddles[off2 + 1];
+            tw[5] = twiddles[off2 + 2];
+            tw[6] = twiddles[off2 + 3];
+            return tw;
+        }
+        let mut tw = [F128::ZERO; 7];
+        tw[0] = self.twiddle(layer, block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+        }
+        tw
+    }
+
+    /// Batch indexer for 2-layer fused butterflies (3 twiddles).
+    #[inline]
+    pub fn twiddles_fused2(&self, layer: usize, block: usize) -> (F128, F128, F128) {
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            let off0 = (1usize << layer) - 1 + block;
+            let off1 = (1usize << (layer + 1)) - 1 + 2 * block;
+            return (twiddles[off0], twiddles[off1], twiddles[off1 + 1]);
+        }
+        (
+            self.twiddle(layer, block),
+            self.twiddle(layer + 1, 2 * block),
+            self.twiddle(layer + 1, 2 * block + 1),
+        )
+    }
+
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
     /// `log_d ≤ log_domain_size()`. Layer `l ∈ [0, log_d)` is processed in
     /// order (neighbors-last: top layer first).
@@ -3428,17 +3511,7 @@ impl AdditiveNttF128 {
                     let block_size = 1usize << (log_d - layer);
                     let sixteenth = block_size >> 4;
                     let global_block = sub_idx;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer, global_block);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                    }
-                    for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                    }
+                    let tw = self.twiddles_fused4(layer, global_block);
                     butterfly_interleaved_fused_4layer_rows(
                         sub_data,
                         &tw,
@@ -3465,17 +3538,7 @@ impl AdditiveNttF128 {
                 FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for b in 0..16usize {
                     let g4 = sub_idx * 16 + b;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer4, g4);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-                    }
-                    for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-                    }
+                    let tw = self.twiddles_fused4(layer4, g4);
                     let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
                     butterfly_interleaved_fused_4layer_rows(
                         blk,
@@ -3491,14 +3554,7 @@ impl AdditiveNttF128 {
                     );
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
-                        let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
-                        tw3[0] = self.twiddle(layer3, g8);
-                        for s in 0..2 {
-                            tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
-                        }
-                        for s in 0..4 {
-                            tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
-                        }
+                        let tw3 = self.twiddles_fused3(layer3, g8);
                         let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
                         // SAFETY: eight consecutive rows of `num_ntts` lanes,
                         // owned exclusively by this sub-group task; the zero
@@ -3544,17 +3600,7 @@ impl AdditiveNttF128 {
                         let sixteenth = block_size >> 4;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
-                            for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                            }
+                            let tw = self.twiddles_fused4(layer, global_block);
                             let block_start = block_in_sub * block_bytes;
                             butterfly_interleaved_fused_4layer_rows(
                                 &mut sub_data[block_start..block_start + block_bytes],
@@ -3596,14 +3642,7 @@ impl AdditiveNttF128 {
                         let dense_lanes = num_ntts - odd_tail;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
+                            let tw = self.twiddles_fused3(layer, global_block);
                             let block_start = block_in_sub * block_bytes;
                             let block = &mut sub_data[block_start..block_start + block_bytes];
                             debug_assert_eq!(block.len(), 8 * num_ntts);
@@ -3627,9 +3666,8 @@ impl AdditiveNttF128 {
                         let quarter = block_size >> 2;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let t_outer = self.twiddle(layer, global_block);
-                            let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
-                            let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                            let (t_outer, t_inner_a, t_inner_b) =
+                                self.twiddles_fused2(layer, global_block);
                             let block_start = block_in_sub * block_bytes;
                             butterfly_interleaved_fused_2layer_par_rows(
                                 &mut sub_data[block_start..block_start + block_bytes],
@@ -4248,13 +4286,21 @@ fn butterfly_interleaved_block_par_rows(
     }
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
-    top.par_chunks_mut(num_ntts)
-        .zip(bot.par_chunks_mut(num_ntts))
-        .enumerate()
-        .for_each(|(r, (top_row, bot_row))| {
-            let lanes = row_lanes(r, num_ntts, odd_tail);
-            kernels::butterfly_row_pair(&mut top_row[..lanes], &mut bot_row[..lanes], twiddle);
-        });
+    if odd_tail == 0 {
+        top.par_chunks_mut(num_ntts)
+            .zip(bot.par_chunks_mut(num_ntts))
+            .for_each(|(top_row, bot_row)| {
+                kernels::butterfly_row_pair(top_row, bot_row, twiddle);
+            });
+    } else {
+        top.par_chunks_mut(num_ntts)
+            .zip(bot.par_chunks_mut(num_ntts))
+            .enumerate()
+            .for_each(|(r, (top_row, bot_row))| {
+                let lanes = row_lanes(r, num_ntts, odd_tail);
+                kernels::butterfly_row_pair(&mut top_row[..lanes], &mut bot_row[..lanes], twiddle);
+            });
+    }
 }
 
 /// Fused 2-layer butterfly: combines layer L (twiddle `t_outer`, shared by
@@ -4306,7 +4352,28 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
 
-    if quarter < PARALLEL_ROW_THRESHOLD {
+    if odd_tail == 0 {
+        let lanes = num_ntts;
+        if quarter < PARALLEL_ROW_THRESHOLD {
+            for r in 0..quarter {
+                let off = r * num_ntts;
+                let (q1r, q1_rest) = q1[off..].split_at_mut(num_ntts);
+                let _ = q1_rest;
+                let (q2r, _) = q2[off..].split_at_mut(num_ntts);
+                let (q3r, _) = q3[off..].split_at_mut(num_ntts);
+                let (q4r, _) = q4[off..].split_at_mut(num_ntts);
+                do_one(lanes, q1r, q2r, q3r, q4r);
+            }
+        } else {
+            q1.par_chunks_mut(num_ntts)
+                .zip(q2.par_chunks_mut(num_ntts))
+                .zip(q3.par_chunks_mut(num_ntts))
+                .zip(q4.par_chunks_mut(num_ntts))
+                .for_each(|(((row_a, row_b), row_c), row_d)| {
+                    do_one(lanes, row_a, row_b, row_c, row_d);
+                });
+        }
+    } else if quarter < PARALLEL_ROW_THRESHOLD {
         for r in 0..quarter {
             let off = r * num_ntts;
             let (q1r, q1_rest) = q1[off..].split_at_mut(num_ntts);
@@ -4351,10 +4418,19 @@ fn butterfly_interleaved_block(
     debug_assert!(odd_tail == 0 || block_size_half.is_multiple_of(2));
     let off_bot = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(off_bot);
-    for r in 0..block_size_half {
-        let o = r * num_ntts;
-        let lanes = row_lanes(r, num_ntts, odd_tail);
-        kernels::butterfly_row_pair(&mut top[o..o + lanes], &mut bot[o..o + lanes], twiddle);
+    if odd_tail == 0 {
+        for (top_row, bot_row) in top
+            .chunks_exact_mut(num_ntts)
+            .zip(bot.chunks_exact_mut(num_ntts))
+        {
+            kernels::butterfly_row_pair(top_row, bot_row, twiddle);
+        }
+    } else {
+        for r in 0..block_size_half {
+            let o = r * num_ntts;
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            kernels::butterfly_row_pair(&mut top[o..o + lanes], &mut bot[o..o + lanes], twiddle);
+        }
     }
 }
 
@@ -4377,9 +4453,37 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
     // `{i*sixteenth + r : i ∈ 0..16}`, so concurrent writes never alias.
     let base = block.as_mut_ptr() as usize;
-    if sixteenth < PARALLEL_ROW_THRESHOLD {
+    if odd_tail == 0 {
+        let lanes = num_ntts;
+        if sixteenth < PARALLEL_ROW_THRESHOLD {
+            for r in 0..sixteenth {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                    )
+                };
+            }
+        } else {
+            (0..sixteenth).into_par_iter().for_each(|r| {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                    )
+                };
+            });
+        }
+    } else if sixteenth < PARALLEL_ROW_THRESHOLD {
         for r in 0..sixteenth {
-            // SAFETY: row group r writes disjoint rows of this block.
             unsafe {
                 kernels::butterfly_fused_4layer_row(
                     base as *mut F128,
@@ -4393,7 +4497,6 @@ fn butterfly_interleaved_fused_4layer_par_rows(
         }
     } else {
         (0..sixteenth).into_par_iter().for_each(|r| {
-            // SAFETY: distinct r → disjoint row groups → no aliasing.
             unsafe {
                 kernels::butterfly_fused_4layer_row(
                     base as *mut F128,
@@ -4423,39 +4526,92 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
-    for r in 0..sixteenth {
-        let lanes = row_lanes(r, num_ntts, odd_tail);
-        // The sixteen rows the NEXT row group reads are asked for one line
-        // per lane step. The hints move no data of their own and change no
-        // value; `FLOCK_NO_NTT_DEEP_PF=1` removes them.
-        // SAFETY: each call writes the valid, disjoint row group
-        // `{i*sixteenth + r : i in 0..16}` and calls are sequential here; the
-        // hinted group is inside the same block.
-        unsafe {
-            if hint == 0 || r + 1 >= sixteenth {
-                kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
-            } else if hint == 1 {
-                kernels::butterfly_fused_4layer_row_pf::<1>(
-                    base,
-                    sixteenth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    t,
-                    r + 1,
-                )
-            } else {
-                kernels::butterfly_fused_4layer_row_pf::<2>(
-                    base,
-                    sixteenth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    t,
-                    r + 1,
-                )
+    if odd_tail == 0 {
+        let lanes = num_ntts;
+        if hint == 0 || sixteenth <= 1 {
+            for r in 0..sixteenth {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t);
+                }
             }
-        };
+        } else if hint == 1 {
+            for r in 0..sixteenth - 1 {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row_pf::<1>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    );
+                }
+            }
+            unsafe {
+                kernels::butterfly_fused_4layer_row(
+                    base,
+                    sixteenth,
+                    num_ntts,
+                    lanes,
+                    sixteenth - 1,
+                    t,
+                );
+            }
+        } else {
+            for r in 0..sixteenth - 1 {
+                unsafe {
+                    kernels::butterfly_fused_4layer_row_pf::<2>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    );
+                }
+            }
+            unsafe {
+                kernels::butterfly_fused_4layer_row(
+                    base,
+                    sixteenth,
+                    num_ntts,
+                    lanes,
+                    sixteenth - 1,
+                    t,
+                );
+            }
+        }
+    } else {
+        for r in 0..sixteenth {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            unsafe {
+                if hint == 0 || r + 1 >= sixteenth {
+                    kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
+                } else if hint == 1 {
+                    kernels::butterfly_fused_4layer_row_pf::<1>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    )
+                } else {
+                    kernels::butterfly_fused_4layer_row_pf::<2>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                    )
+                }
+            };
+        }
     }
 }
 
