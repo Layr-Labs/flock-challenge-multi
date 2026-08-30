@@ -535,6 +535,34 @@ fn ranked_direct_dense_inline_enabled() -> bool {
     }
 }
 
+/// Blocks whose pre-scaled `u16` offsets are live at once in the ranked dense
+/// window transform — the witness phase's largest private (per-thread) memory
+/// object.
+///
+/// The incumbent widened all eight blocks into a 2 KiB arena before consuming
+/// any. Two SMT siblings then hold 4 KiB of arena on one core's 48 KiB L1d,
+/// on top of the shared inverse-NTT two-image table. Passing the same rows
+/// over a SMALLER arena more times publishes the same bytes in the same order
+/// from the same registers, and the private line count falls with it.
+///
+/// Default 4 (a 1 KiB arena, two passes). `FLOCK_NO_EY_L1SHRINK=1` restores
+/// the incumbent 8. `FLOCK_EY_L1SHRINK_BPP=2` takes it to a 512 B arena over
+/// four passes; any other value of that variable is ignored.
+#[inline]
+fn ey_l1shrink_off_bpp() -> usize {
+    static BPP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_EY_L1SHRINK").is_some() {
+            return 8;
+        }
+        match std::env::var_os("FLOCK_EY_L1SHRINK_BPP").as_deref().and_then(|v| v.to_str()) {
+            Some("2") => 2,
+            Some("8") => 8,
+            _ => 4,
+        }
+    });
+    *BPP
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_ranked_dense_rows(rows: &[__m512i; 8], op: *mut u16) {
@@ -566,9 +594,24 @@ unsafe fn stage_ranked_dense_side(ring: *const V8, w: usize, stage: *mut u32, op
 /// Caller-owned direct-publish path: keep the ranked rows in the caller's
 /// frame, widen their offsets there, and consume them without an outlined ABI
 /// boundary or a by-value `[__m512i; 8]` return.
+///
+/// `BPP` ("blocks per offset pass") is the private-L1 knob. The transposed
+/// rows for all eight blocks live in ZMM registers either way; only the
+/// `u16` offset arena they are widened into is a memory object, and it is
+/// rewritten once per pass. `BPP = 8` is the incumbent — one 2 KiB arena,
+/// every block's offsets live at once. `BPP = 4` (the default) runs the same
+/// bytes as two 4-block passes over the SAME 1 KiB of arena, halving the
+/// witness phase's dominant private working-set line count; `BPP = 2` takes
+/// it to 512 B over four passes.
+///
+/// The producer/consumer distance shrinks with `BPP` — the arena's 64-bit
+/// consuming reads must not sit in the shadow of their own 512-bit widening
+/// stores — which is why the pass emits ALL of its blocks' offsets before
+/// consuming any of them, and why the knob is a knob.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
-unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
+#[rustfmt::skip]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const BPP: usize>(
     proj: &StreamProj<'_>,
     blk: usize,
     plan: Round1AbWindowPlan,
@@ -579,75 +622,94 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
     rw: usize,
     off: *mut u16,
 ) {
+    const {
+        assert!(BPP == 8 || BPP == 4 || BPP == 2);
+    }
     unsafe {
         debug_assert!(blk > 1 && blk < 30);
         let a_rows = tr8x16_zmm(a_ring, rw);
-        widen_ranked_dense_rows(&a_rows, off);
+        // BPP == 8 is one pass over the whole arena, so hoisting its widening
+        // here reproduces the incumbent instruction sequence exactly (all of
+        // a, then all of b, then the consume loop) rather than an a/b
+        // interleaving of the same stores.
+        if BPP == 8 {
+            widen_ranked_dense_rows(&a_rows, off);
+        }
         let b_rows = tr8x16_zmm(b_ring, rw);
-        widen_ranked_dense_rows(&b_rows, off.add(64));
-
-        if proj.one_rows_elided && blk == 2 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 2 * 64).cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0xfc,
-                );
-                j += 1;
-            }
-            return;
-        }
-        if proj.one_rows_elided && blk == 29 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 29 * 64).cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0x0f,
-                );
-                j += 1;
-            }
-            return;
+        if BPP == 8 {
+            widen_ranked_dense_rows(&b_rows, off.add(64));
         }
 
-        let mut j = 0usize;
-        while j != 8 {
-            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
-            if plan.bcomplement_static_eligible() {
-                round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    blk,
-                );
+        // Kernel selection is window-invariant, so it is resolved once and
+        // the passes branch on the two resulting bools. Keeping the widening
+        // OUTSIDE that branch is what holds the emitted code at the
+        // incumbent's size: eight block widenings and 4x8 block consumes per
+        // inlined instance, whatever BPP is.
+        let resid2 = proj.one_rows_elided && blk == 2;
+        let resid29 = proj.one_rows_elided && blk == 29;
+        let bcomp = plan.bcomplement_static_eligible();
+
+        // One pass: widen `BPP` blocks' a/b rows into arena slots `0..BPP`,
+        // then consume those same slots. `base` is the pass's first block —
+        // a RUNTIME value, deliberately: LLVM already keeps the two
+        // transposed row arrays in the frame and indexes them, so a dynamic
+        // block index is free, and a rolled pass loop emits ONE copy of the
+        // consume kernel however many passes there are. At `BPP = 8` the
+        // trip count is one and the whole loop folds back to the incumbent.
+        macro_rules! consume {
+            ($base:expr, $kernel:expr) => {{
+                let mut r = 0usize;
+                while r != BPP {
+                    let j = $base + r;
+                    rows.publish_dense_values(
+                        j,
+                        *a_rows.get_unchecked(j),
+                        *b_rows.get_unchecked(j),
+                    );
+                    let o = &*off
+                        .add(r * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>();
+                    let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
+                    #[allow(clippy::redundant_closure_call)]
+                    ($kernel)(o, out);
+                    r += 1;
+                }
+            }};
+        }
+        let mut base = 0usize;
+        while base != 8 {
+            if BPP != 8 {
+                let mut r = 0usize;
+                while r != BPP {
+                    widen_off_line(
+                        *a_rows.get_unchecked(base + r),
+                        off.add(r * ROUND1_AB_OFF_WORDS),
+                    );
+                    widen_off_line(
+                        *b_rows.get_unchecked(base + r),
+                        off.add(r * ROUND1_AB_OFF_WORDS + 64),
+                    );
+                    r += 1;
+                }
+            }
+            if resid2 {
+                consume!(base, |o, out| {
+                    round1_ab_inner_window_from_offsets_nt2_residual(o, out, plan, imgs, 0xfc)
+                });
+            } else if resid29 {
+                consume!(base, |o, out| {
+                    round1_ab_inner_window_from_offsets_nt2_residual(o, out, plan, imgs, 0x0f)
+                });
+            } else if bcomp {
+                consume!(base, |o, out| {
+                    round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+                        o, out, plan, imgs, blk,
+                    )
+                });
             } else {
-                round1_ab_inner_window_from_offsets_nt2(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                );
+                consume!(base, |o, out| round1_ab_inner_window_from_offsets_nt2(o, out, plan, imgs));
             }
-            j += 1;
+            base += BPP;
         }
     }
 }
@@ -978,6 +1040,8 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    /// Blocks per ranked offset pass; see [`ey_l1shrink_off_bpp`].
+    off_bpp: usize,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -1543,7 +1607,17 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static{
+                // Private-L1 knob; see `project_blocks_ranked_hot_offsets_direct_inline`.
+                // The kill-switch monomorphization (BPP=8) is the incumbent
+                // body verbatim and is never entered by default, so its copy
+                // costs binary size only, not instruction cache.
+                match self.off_bpp {
+                    2 => self.drain_range_spread::<true,2>(&self.proj,base_word,ring_word,words),
+                    8 => self.drain_range_spread::<true,8>(&self.proj,base_word,ring_word,words),
+                    _ => self.drain_range_spread::<true,4>(&self.proj,base_word,ring_word,words),
+                }
+            }else{self.drain_range_spread::<false,8>(&self.proj,base_word,ring_word,words)};
         }
     }
 
@@ -1565,7 +1639,7 @@ impl Drain8<'_> {
     /// spread costs no extra call or spill traffic.
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn drain_range_spread<const E:bool>(
+    unsafe fn drain_range_spread<const E:bool,const BPP:usize>(
         &self,
         proj: &StreamProj<'_>,
         base_word: usize,
@@ -1638,6 +1712,11 @@ impl Drain8<'_> {
                 // The E=true static cases continued above, so its remaining
                 // windows are exactly 2..29 and offsets are unconditional.
                 // E=false retains the original per-window eligibility test.
+                // Only the leading `BPP` blocks' slots are ever touched (see
+                // the direct-inline consumer): the reservation stays at the
+                // incumbent eight so the frame layout, its alignment, and
+                // every non-default arm are unchanged, while the L1 lines the
+                // ranked default actually writes fall to `BPP * 256` bytes.
                 #[repr(align(64))]
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
@@ -1654,7 +1733,7 @@ impl Drain8<'_> {
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
-                                project_blocks_ranked_hot_offsets_direct_inline(
+                                project_blocks_ranked_hot_offsets_direct_inline::<BPP>(
                                     proj,
                                     blk,
                                     plan,
@@ -2019,6 +2098,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             proj,
             elide,
             ranked_static,
+            off_bpp: ey_l1shrink_off_bpp(),
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
