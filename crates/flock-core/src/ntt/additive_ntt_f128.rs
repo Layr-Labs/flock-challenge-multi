@@ -4423,6 +4423,10 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    // The broadcast/companion table is invariant across the whole row loop;
+    // build it once here instead of once per row group.
+    // SAFETY: same target-feature contract as the row kernels below.
+    let tw = unsafe { kernels::butterfly_fused_4layer_prepare(t) };
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line
@@ -4433,24 +4437,28 @@ fn butterfly_interleaved_fused_4layer_rows(
         // hinted group is inside the same block.
         unsafe {
             if hint == 0 || r + 1 >= sixteenth {
-                kernels::butterfly_fused_4layer_row(base, sixteenth, num_ntts, lanes, r, t)
+                kernels::butterfly_fused_4layer_row_tw::<0>(
+                    base, sixteenth, num_ntts, lanes, r, &tw, t, 0,
+                )
             } else if hint == 1 {
-                kernels::butterfly_fused_4layer_row_pf::<1>(
+                kernels::butterfly_fused_4layer_row_tw::<1>(
                     base,
                     sixteenth,
                     num_ntts,
                     lanes,
                     r,
+                    &tw,
                     t,
                     r + 1,
                 )
             } else {
-                kernels::butterfly_fused_4layer_row_pf::<2>(
+                kernels::butterfly_fused_4layer_row_tw::<2>(
                     base,
                     sixteenth,
                     num_ntts,
                     lanes,
                     r,
+                    &tw,
                     t,
                     r + 1,
                 )
