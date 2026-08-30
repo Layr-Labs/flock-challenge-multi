@@ -1478,6 +1478,13 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         "fold8 s_hat_v requires six retained packed-index coordinates"
     );
     let n_packed = 1usize << LOG_PACKING;
+    let fold8_len = 64 * n_packed;
+    // Lincheck Fold8-tail capture already bound the sole remaining
+    // coordinate (ranked tail.len()==7). Length fold8_len means the table
+    // IS the sixty-four-bank statistic; do not bind it again.
+    if x_inner_rest_tail.len() == 7 && z_vec.len() == fold8_len {
+        return z_vec.to_vec();
+    }
     let n_tail = 1usize << x_inner_rest_tail.len();
     assert_eq!(
         z_vec.len(),
@@ -4649,6 +4656,20 @@ mod tests {
         let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
         let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
         assert_eq!(fold8.len(), 64 * (1usize << LOG_PACKING));
+        // Fold8-tail capture: bind the top coordinate ourselves and feed the
+        // already-bound table back. Length 64*2^LOG_PACKING must short-circuit
+        // to the same statistic (lincheck first inner-rest bind).
+        {
+            let tail = &inner_rest[1..];
+            let r = tail[6];
+            let half = z_vec.len() / 2;
+            let mut bound = z_vec[..half].to_vec();
+            for i in 0..half {
+                bound[i] = z_vec[i] + r * (z_vec[i] + z_vec[i + half]);
+            }
+            let reused = s_hat_v_fold8_from_z_vec(&bound, tail);
+            assert_eq!(reused, fold8, "already-bound fold8 tail must match the bind");
+        }
 
         let ordinary = s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]);
         assert_eq!(

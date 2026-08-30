@@ -167,6 +167,75 @@ fn precompute_ab_s_hat_v(
     }
 }
 
+/// Lincheck AB capture. Ranked DirectFold8 snapshots `z_vec` after the first
+/// inner-rest bind (the Fold8 one-multiply) so `s_hat_v_fold8_from_z_vec`
+/// does not walk the table again. Other shapes keep the pre-sumcheck clone.
+fn capture_lincheck_stripe<Ch: Challenger>(
+    z_packed: &[u8],
+    r1cs: &BlockR1cs,
+    captured: &zerocheck::CapturedSHatVC,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    x_ab: &lincheck::QuirkyPoint,
+    challenger: &mut Ch,
+) -> (lincheck::LincheckProof, lincheck::LincheckClaim, Vec<F128>) {
+    if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
+        lincheck::prove_padded_capture_z_vec_fold8_tail(
+            z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec(
+            z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    }
+}
+
+fn capture_lincheck_block_major<Ch: Challenger>(
+    z_packed: &[F128],
+    r1cs: &BlockR1cs,
+    captured: &zerocheck::CapturedSHatVC,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    x_ab: &lincheck::QuirkyPoint,
+    challenger: &mut Ch,
+) -> (lincheck::LincheckProof, lincheck::LincheckClaim, Vec<F128>) {
+    if ranked_direct_fold8_precompute_enabled(r1cs, captured) {
+        lincheck::prove_padded_capture_z_vec_block_major_fold8_tail(
+            z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec_block_major(
+            z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    }
+}
+
 /// Pick C's precomputed slot. The DirectFold8 route takes the sixty-four-bank
 /// tensor; the strict DirectFold4 experiment takes the sixteen-bank tensor;
 /// the incumbent ranked path takes the four-bank tensor; every other shape
@@ -382,12 +451,10 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, z_vec_pre) = capture_lincheck_stripe(
         &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
+        r1cs,
+        &s_hat_v_c,
         &lc_circuit,
         &x_ab,
         challenger,
@@ -938,12 +1005,10 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
     let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
+            let result = capture_lincheck_stripe(
                 &z_packed_lincheck,
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                r1cs.useful_bits,
+                r1cs,
+                &s_hat_v_c,
                 lincheck_circuit,
                 &x_ab,
                 challenger,
@@ -953,12 +1018,10 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+        FastLincheckInput::BlockMajor => capture_lincheck_block_major(
             &z_packed,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
+            r1cs,
+            &s_hat_v_c,
             lincheck_circuit,
             &x_ab,
             challenger,
@@ -1176,12 +1239,10 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     let t0 = Instant::now();
     let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec(
+            let result = capture_lincheck_stripe(
                 &z_packed_lincheck,
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                r1cs.useful_bits,
+                r1cs,
+                &s_hat_v_c,
                 lincheck_circuit,
                 &x_ab,
                 challenger,
@@ -1189,12 +1250,10 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+        FastLincheckInput::BlockMajor => capture_lincheck_block_major(
             &z_packed,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
+            r1cs,
+            &s_hat_v_c,
             lincheck_circuit,
             &x_ab,
             challenger,

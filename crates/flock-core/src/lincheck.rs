@@ -2997,6 +2997,7 @@ pub fn prove_padded<Ch: Challenger>(
         circuit,
         x_ab,
         false,
+        false,
         challenger,
     );
     (proof, claim)
@@ -3030,6 +3031,42 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         circuit,
         x_ab,
         true,
+        false,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Ranked Fold8 capture: clone `z_vec` after the first inner-rest bind
+/// (length `64 · 2^LOG_PACKING`) instead of the pre-sumcheck table. The
+/// bind is exactly `s_hat_v_fold8_from_z_vec`'s ranked one-multiply, so
+/// the PCS open skips that duplicate walk. `FLOCK_NO_LC_FOLD8_CAPTURE=1`
+/// falls back to the pre-sumcheck clone inside the same binary.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_fold8_tail<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        true,
         challenger,
     );
     (
@@ -3062,6 +3099,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         circuit,
         x_ab,
         true,
+        false,
         challenger,
     );
     (
@@ -3069,6 +3107,45 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         claim,
         captured.expect("capture=true must produce z_vec"),
     )
+}
+
+/// Block-major twin of [`prove_padded_capture_z_vec_fold8_tail`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_fold8_tail<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// `FLOCK_NO_LC_FOLD8_CAPTURE=1` restores the pre-sumcheck `z_vec` clone
+/// even when the caller requested Fold8-tail capture. Ranked worker env is
+/// cleared, so the tail capture runs.
+fn lincheck_fold8_tail_capture_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_FOLD8_CAPTURE").is_none())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3081,6 +3158,7 @@ fn prove_padded_inner<Ch: Challenger>(
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     capture_z_vec: bool,
+    capture_fold8_tail: bool,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -3216,10 +3294,20 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    // 3b. Optional capture for the AB-claim s_hat_v. Two shapes:
+    //     * pre-sumcheck clone (length 2^k_log) — incumbent, fold8/fold4/quad
+    //       consumers bind it themselves;
+    //     * Fold8 tail: skip that clone and snapshot z_vec after the first
+    //       inner-rest bind. That bind is the ranked s_hat_v_fold8 one-multiply
+    //       (`even + r·(even+odd)` at r_rounds[0] = r_inner_rest[7]), so the
+    //       PCS open must not walk the table again.
+    let fold8_src_len = 2 * 64 * (1usize << crate::pcs::LOG_PACKING);
+    let fold8_tail = capture_z_vec
+        && capture_fold8_tail
+        && lincheck_fold8_tail_capture_enabled()
+        && inner_rest_len >= 2
+        && z_vec.len() == fold8_src_len;
+    let mut captured_z_vec: Option<Vec<F128>> = if capture_z_vec && !fold8_tail {
         Some(z_vec.clone())
     } else {
         None
@@ -3253,6 +3341,10 @@ fn prove_padded_inner<Ch: Challenger>(
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
                 e1 = ne1;
                 einf = neinf;
+                if fold8_tail && t == 0 && captured_z_vec.is_none() {
+                    debug_assert_eq!(z_vec.len(), fold8_src_len / 2);
+                    captured_z_vec = Some(z_vec.clone());
+                }
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
