@@ -46,6 +46,8 @@ pub(crate) fn open_timing() -> bool {
     *ON
 }
 
+// zarar-ligerito-residual-resample-20260830-01: source archive marker only.
+
 /// `FLOCK_NO_OPEN_FILL=1` restores the incumbent open-phase scheduling at every
 /// site where the recursive open left cores idle for want of tasks (measured
 /// per sub-phase on a quiet 16-vCPU c7i with `CLOCK_PROCESS_CPUTIME_ID` deltas
@@ -1959,33 +1961,37 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
 
     // Per-query precomputation: Ŵ_k(q) for all k, then split into prefix
     // product (fixed scalar) and suffix Ŵ values (varied per y).
+    const MAX_SUFFIX_W: usize = 16;
+    assert!(
+        yr_log_n <= MAX_SUFFIX_W,
+        "yr_log_n ({yr_log_n}) exceeds MAX_SUFFIX_W ({MAX_SUFFIX_W})"
+    );
     struct PerQuery {
         prefix_prod: F128,
-        suffix_w: Vec<F128>, // length = yr_log_n
+        suffix_w: [F128; MAX_SUFFIX_W],
     }
     let compute_query = |&q: &usize| -> PerQuery {
         let q_field = F128::new(q as u64, 0);
-        // Compute s_k(q_field) recursively, then normalize by 1/s_k(v_k).
-        let mut sks_at_x = Vec::with_capacity(log_msg_cols.max(1));
+        let mut sks_at_x = [F128::ZERO; 32];
         if log_msg_cols > 0 {
-            sks_at_x.push(q_field);
+            sks_at_x[0] = q_field;
             for k in 1..log_msg_cols {
-                sks_at_x.push(next_s(sks_at_x[k - 1], sks_vks[k - 1]));
+                sks_at_x[k] = next_s(sks_at_x[k - 1], sks_vks[k - 1]);
             }
             for k in 0..log_msg_cols {
                 sks_at_x[k] *= inv_sks_vks[k];
             }
         }
-        // Prefix product: Π_{k<prefix_len} (1 + ris[k] · (1 + Ŵ_k(q)))
         let mut prefix_prod = F128::ONE;
         for k in 0..prefix_len {
             prefix_prod *= F128::ONE + ris_for_basis[k] * (F128::ONE + sks_at_x[k]);
         }
-        let suffix_w = if log_msg_cols > prefix_len {
-            sks_at_x[prefix_len..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut suffix_w = [F128::ZERO; MAX_SUFFIX_W];
+        if log_msg_cols > prefix_len {
+            for j in 0..yr_log_n {
+                suffix_w[j] = sks_at_x[prefix_len + j];
+            }
+        }
         PerQuery {
             prefix_prod,
             suffix_w,
@@ -2009,13 +2015,11 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
         for i in 0..n_queries {
             let pq = &per_query[i];
             let mut suffix_prod = F128::ONE;
-            for j in 0..yr_log_n {
-                let p_j = if (y >> j) & 1 == 1 {
-                    F128::ONE
-                } else {
-                    F128::ZERO
-                };
-                suffix_prod *= F128::ONE + p_j * (F128::ONE + pq.suffix_w[j]);
+            let mut bits = y;
+            while bits != 0 {
+                let j = bits.trailing_zeros() as usize;
+                suffix_prod *= pq.suffix_w[j];
+                bits &= bits - 1;
             }
             sum += alpha_pows[i] * pq.prefix_prod * suffix_prod;
         }
