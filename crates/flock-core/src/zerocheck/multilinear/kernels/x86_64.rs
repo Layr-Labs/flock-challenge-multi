@@ -125,11 +125,11 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
             let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
             let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
-            let g1 = ghash_mul_x4(a1, b1);
-            let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
             let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            p1_wide.mul_acc(eq, g1);
-            pinf_wide.mul_acc(eq, g_inf);
+            let a1_eq = ghash_mul_x4(a1, eq);
+            let a01_eq = ghash_mul_x4(_mm512_xor_si512(a0, a1), eq);
+            p1_wide.mul_acc(a1_eq, b1);
+            pinf_wide.mul_acc(a01_eq, _mm512_xor_si512(b0, b1));
             x_lo += 4;
         }
 
@@ -149,8 +149,8 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
                 let b0 = b_out[o];
                 let b1 = b_out[o + 1];
                 let eq = eq_lo[x_lo + lane];
-                p1_tail ^= eq.mul_unreduced(a1 * b1);
-                pinf_tail ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
+                p1_tail ^= (eq * a1).mul_unreduced(b1);
+                pinf_tail ^= (eq * (a0 + a1)).mul_unreduced(b0 + b1);
             }
         }
 
@@ -744,6 +744,9 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     unsafe {
         let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho1.hi as i64, rho1.lo as i64));
         let r2 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho2.hi as i64, rho2.lo as i64));
+        let rho12 = rho1 * rho2;
+        let r12 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho12.hi as i64, rho12.lo as i64));
+        let defer = zc_fold_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut p1_wide = WideGhashX4::zero();
@@ -757,20 +760,29 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
-            // Level 1 (ρ₁): 32 inputs → 16 values in four ZMMs.
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let ta2 = fold_x4(a_src.add(16), r1, even_idx, odd_idx);
-            let ta3 = fold_x4(a_src.add(24), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let tb2 = fold_x4(b_src.add(16), r1, even_idx, odd_idx);
-            let tb3 = fold_x4(b_src.add(24), r1, even_idx, odd_idx);
-            // Level 2 (ρ₂): 16 → 8 outputs in two ZMMs per array.
-            let a_lo = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let a_hi = fold_regs(ta2, ta3, r2, even_idx, odd_idx);
-            let b_lo = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
-            let b_hi = fold_regs(tb2, tb3, r2, even_idx, odd_idx);
+            let (a_lo, a_hi, b_lo, b_hi) = if defer {
+                (
+                    fold16_to_4_deferred(a_src, r1, r2, r12),
+                    fold16_to_4_deferred(a_src.add(16), r1, r2, r12),
+                    fold16_to_4_deferred(b_src, r1, r2, r12),
+                    fold16_to_4_deferred(b_src.add(16), r1, r2, r12),
+                )
+            } else {
+                let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
+                let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
+                let ta2 = fold_x4(a_src.add(16), r1, even_idx, odd_idx);
+                let ta3 = fold_x4(a_src.add(24), r1, even_idx, odd_idx);
+                let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
+                let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
+                let tb2 = fold_x4(b_src.add(16), r1, even_idx, odd_idx);
+                let tb3 = fold_x4(b_src.add(24), r1, even_idx, odd_idx);
+                (
+                    fold_regs(ta0, ta1, r2, even_idx, odd_idx),
+                    fold_regs(ta2, ta3, r2, even_idx, odd_idx),
+                    fold_regs(tb0, tb1, r2, even_idx, odd_idx),
+                    fold_regs(tb2, tb3, r2, even_idx, odd_idx),
+                )
+            };
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -781,11 +793,11 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let a1 = _mm512_permutex2var_epi64(a_lo, odd_idx, a_hi);
             let b0 = _mm512_permutex2var_epi64(b_lo, even_idx, b_hi);
             let b1 = _mm512_permutex2var_epi64(b_lo, odd_idx, b_hi);
-            let g1 = ghash_mul_x4(a1, b1);
-            let g_inf = ghash_mul_x4(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
             let eq = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-            p1_wide.mul_acc(eq, g1);
-            pinf_wide.mul_acc(eq, g_inf);
+            let a1_eq = ghash_mul_x4(a1, eq);
+            let a01_eq = ghash_mul_x4(_mm512_xor_si512(a0, a1), eq);
+            p1_wide.mul_acc(a1_eq, b1);
+            pinf_wide.mul_acc(a01_eq, _mm512_xor_si512(b0, b1));
             x_lo += 4;
         }
 
@@ -796,12 +808,21 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let a_folded = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let b_folded = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
+            let (a_folded, b_folded) = if defer {
+                (
+                    fold16_to_4_deferred(a_src, r1, r2, r12),
+                    fold16_to_4_deferred(b_src, r1, r2, r12),
+                )
+            } else {
+                let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
+                let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
+                let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
+                let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
+                (
+                    fold_regs(ta0, ta1, r2, even_idx, odd_idx),
+                    fold_regs(tb0, tb1, r2, even_idx, odd_idx),
+                )
+            };
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -812,8 +833,8 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
                 let b0 = b_out[o];
                 let b1 = b_out[o + 1];
                 let eq = eq_lo[x_lo + lane];
-                p1_tail ^= eq.mul_unreduced(a1 * b1);
-                pinf_tail ^= eq.mul_unreduced((a0 + a1) * (b0 + b1));
+                p1_tail ^= (eq * a1).mul_unreduced(b1);
+                pinf_tail ^= (eq * (a0 + a1)).mul_unreduced(b0 + b1);
             }
         }
 

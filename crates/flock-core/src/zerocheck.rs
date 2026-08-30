@@ -169,6 +169,24 @@ fn cascade5_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
 }
 
+/// Cascade level 5+ (rounds 13..26) ships on: `FLOCK_NO_ZC_CASCADE6=1` restores
+/// the prior level-4 (rounds 11+12) cap. Continuing the cascade deletes all
+/// remaining rayon passes and Fiat-Shamir round boundaries down to the scalar
+/// leaf. One mechanism, kill-switch default ON; the ranked worker's cleared
+/// env never sets the flag.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE6_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn cascade6_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE6_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_CASCADE6").is_some()
+}
+
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
@@ -861,7 +879,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
-    let n_levels = match (
+    let mut n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
@@ -875,6 +893,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         (true, true, true, true, false) => 4,
         (true, true, true, true, true) => 5,
     };
+    if n_levels == 5 && !cascade6_off() {
+        let mut l = 5;
+        while n_mlv >= 2 * l + 4 && r[k_skip + 2 * l + 1] != F128::ZERO {
+            n_levels = l + 1;
+            l += 1;
+        }
+    }
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
 
@@ -1398,38 +1423,36 @@ mod tests {
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
             // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
-            // nomat) forced-off flags.
+            // cascade6, nomat) forced-off flags.
             let arms = [
-                (false, false, false, false, false, false), // full: nomat sweep + every level
-                (false, false, false, false, false, true),  // materializing sweep + every level
-                (false, false, false, false, true, false),  // cascade capped at level 3
-                (false, false, false, true, true, false),   // capped at level 2 (frontier)
-                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
-                (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true), // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),  // incumbent
+                (false, false, false, false, false, false, false), // full: nomat sweep + every level
+                (false, false, false, false, false, false, true),  // materializing sweep + every level
+                (false, false, false, false, false, true, false),  // cascade capped at level 4
+                (false, false, false, false, true, true, false),   // cascade capped at level 3
+                (false, false, false, true, true, true, false),    // capped at level 2 (frontier)
+                (false, false, true, true, true, true, false),     // nomat + lookahead + cascade2
+                (false, true, true, true, true, true, false),      // nomat + lookahead only
+                (false, true, true, true, true, true, true), // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true, true),  // incumbent
             ];
             let n_mlv = m - K_SKIP;
-            let all = if n_mlv >= 12 {
-                5
-            } else if n_mlv >= 10 {
-                4
-            } else if n_mlv >= 8 {
-                3
+            let all = if n_mlv >= 8 {
+                (n_mlv / 2) - 1
             } else if n_mlv >= 7 {
                 2
             } else {
                 1
             };
-            let expect_levels = [all, all, all.min(4), all.min(3), all.min(2), 1, 1, 0];
-            let expect_nomat = [true, false, true, true, true, true, false, false];
+            let expect_levels = [all, all, all.min(5), all.min(4), all.min(3), all.min(2), 1, 1, 0];
+            let expect_nomat = [true, false, true, true, true, true, true, false, false];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, c6_off, nm_off)) in arms.iter().enumerate() {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
                 ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
+                ZC_CASCADE6_FORCED_OFF.store(c6_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
@@ -1449,8 +1472,8 @@ mod tests {
             ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE6_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
-
             let (proof_full, claim_full) = &results[0];
             for (k, (proof, claim)) in results.iter().enumerate().skip(1) {
                 assert_eq!(
