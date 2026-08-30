@@ -2154,6 +2154,35 @@ fn generate_round1_inner_octa(
     elide: [bool; 3],
     ab_nt: bool,
 ) {
+    // The ranked x86 path has no planned GPU prefix, so skip_blocks is zero.
+    // Select that exact case once per witness generation, rather than paying
+    // a block-index comparison for every one of the 2^18 blocks. The false
+    // specialization preserves the general/padded and GPU-prefix paths.
+    if skip_blocks == 0 {
+        generate_round1_inner_octa_impl::<true>(
+            blocks, skip_blocks, z, a, b, ab_inner, inv_table, padding, elide, ab_nt,
+        );
+    } else {
+        generate_round1_inner_octa_impl::<false>(
+            blocks, skip_blocks, z, a, b, ab_inner, inv_table, padding, elide, ab_nt,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_impl<const SKIP_ZERO: bool>(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
@@ -2168,14 +2197,6 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
-        && skip_blocks == 0
-        && z.len() / F128_PER_BLOCK == 1 << 18
-        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
-        && flock_core::pcs::ranked_direct_fold8_enabled();
-    if one_rows_elided {
-        ab_inner.set_ranked_one_rows_elided();
-    }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2291,7 +2312,6 @@ fn generate_round1_inner_octa(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
-                                one_rows_elided,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
@@ -2308,7 +2328,7 @@ fn generate_round1_inner_octa(
                         // ab_inner's NT stream stays sequential per thread.
                         if let Some((win_a, win_b)) = win_ab {
                             for j in 0..SIMD {
-                                if base + j < skip_blocks {
+                                if !SKIP_ZERO && base + j < skip_blocks {
                                     continue;
                                 }
                                 let a_bytes = std::slice::from_raw_parts(
@@ -2340,7 +2360,7 @@ fn generate_round1_inner_octa(
                 };
                 for j in j0..n_here {
                     let block_idx = GROUP * g + j;
-                    if block_idx >= skip_blocks {
+                    if SKIP_ZERO || block_idx >= skip_blocks {
                         let a_bytes = unsafe {
                             std::slice::from_raw_parts(
                                 a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
