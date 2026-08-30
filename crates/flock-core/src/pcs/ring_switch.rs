@@ -1493,6 +1493,15 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
+        // `FLOCK_NO_FOLD8_SHAT_BIND_X4=1` restores the scalar rayon bind.
+        static BIND_X4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_FOLD8_SHAT_BIND_X4").is_none()
+        });
+        if *BIND_X4 {
+            let mut out = z0.to_vec();
+            crate::field::f128_slice::bind_split_half(&mut out, z1, r);
+            return out;
+        }
         let mut out = vec![F128::ZERO; half];
         out.par_iter_mut()
             .zip(z0.par_iter())
