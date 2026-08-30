@@ -5966,10 +5966,31 @@ fn fold_direct_fold8_factors_and_message(
 fn direct_fold8_final_generators(
     claim: &super::ring_switch::DirectFold8Factors,
     challenge: F128,
-) -> Vec<F128> {
-    let mut generators = vec![F128::ZERO; claim.w_state.len() / 2];
+) -> [F128; 1 << super::LOG_PACKING] {
+    let mut generators = [F128::ZERO; 1 << super::LOG_PACKING];
+    assert_eq!(claim.w_state.len() / 2, 1 << super::LOG_PACKING);
     crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
     generators
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn unpack_direct_gfni_rows(eq_lo: &[F128]) -> (Vec<u64>, Vec<u64>) {
+    let len = eq_lo.len();
+    assert!(len.is_multiple_of(64));
+    let mut lo = Vec::with_capacity(len);
+    let mut hi = Vec::with_capacity(len);
+    for x in eq_lo {
+        lo.push(x.lo);
+        hi.push(x.hi);
+    }
+    (lo, hi)
 }
 
 #[cfg(all(
@@ -6097,12 +6118,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
         .par_iter()
-        .map(|claim| {
-            (
-                claim.eq_lo.iter().map(|x| x.lo).collect(),
-                claim.eq_lo.iter().map(|x| x.hi).collect(),
-            )
-        })
+        .map(|claim| unpack_direct_gfni_rows(&claim.eq_lo))
         .collect();
 
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
@@ -6185,17 +6201,43 @@ fn materialize_direct_fold8(
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
     let [r0, r1, r2, r3, r4, r5] = challenges;
-    let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges[..4].iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    let fold16_weight: [F128; 16] = {
+        let w0 = [F128::ONE + r0, r0];
+        let w1 = [
+            w0[0] * (F128::ONE + r1),
+            w0[1] * (F128::ONE + r1),
+            w0[0] * r1,
+            w0[1] * r1,
+        ];
+        let w2 = [
+            w1[0] * (F128::ONE + r2),
+            w1[1] * (F128::ONE + r2),
+            w1[2] * (F128::ONE + r2),
+            w1[3] * (F128::ONE + r2),
+            w1[0] * r2,
+            w1[1] * r2,
+            w1[2] * r2,
+            w1[3] * r2,
+        ];
+        [
+            w2[0] * (F128::ONE + r3),
+            w2[1] * (F128::ONE + r3),
+            w2[2] * (F128::ONE + r3),
+            w2[3] * (F128::ONE + r3),
+            w2[4] * (F128::ONE + r3),
+            w2[5] * (F128::ONE + r3),
+            w2[6] * (F128::ONE + r3),
+            w2[7] * (F128::ONE + r3),
+            w2[0] * r3,
+            w2[1] * r3,
+            w2[2] * r3,
+            w2[3] * r3,
+            w2[4] * r3,
+            w2[5] * r3,
+            w2[6] * r3,
+            w2[7] * r3,
+        ]
+    };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -6307,12 +6349,7 @@ fn materialize_direct_fold8(
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = if b_gfni_on {
         claims
             .par_iter()
-            .map(|claim| {
-                (
-                    claim.eq_lo.iter().map(|x| x.lo).collect(),
-                    claim.eq_lo.iter().map(|x| x.hi).collect(),
-                )
-            })
+            .map(|claim| unpack_direct_gfni_rows(&claim.eq_lo))
             .collect()
     } else {
         Vec::new()
