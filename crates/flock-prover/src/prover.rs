@@ -25,6 +25,8 @@
 //!     R1csClaim { ab: z-claim from lincheck,  c: z-claim from extract_c }
 //! ```
 
+// Yukon draw marker: exact promoted source replay, 2026-08-30T06:14Z.
+
 use flock_core::challenger::Challenger;
 use flock_core::field::{F8, F128};
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
