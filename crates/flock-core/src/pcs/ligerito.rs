@@ -4131,6 +4131,150 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
     }
 }
 
+/// Regular x86 fold plus next-round message for one worker chunk.
+///
+/// The ordinary sumcheck path used to fold `f` and `b`, store both output
+/// slices, and immediately reload them for [`msg_reduce_avx512`]. Keep the
+/// freshly folded eight-output batch in registers instead: the same two
+/// unreduced accumulators consume the output before its single store. The
+/// fold multiplier's split companion is supplied by the caller, so every
+/// chunk in this round shares one `ghash_shift64_x4` result.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `f` and `b` contain the source pairs
+/// selected by `base`; `fc` and `bc` have equal even lengths and each output
+/// has two source elements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_x86(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+    r_x4: core::arch::x86_64::__m512i,
+    r_x64: core::arch::x86_64::__m512i,
+) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
+    use core::arch::x86_64::*;
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+
+    // SAFETY: the caller supplies the feature set and the fold shape ensures
+    // every sixteen-element source batch below is in bounds.
+    unsafe {
+        let lanes = len & !7;
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let mut k = 0usize;
+        while k < lanes {
+            let source = 2 * (base + k);
+            let f0_lo = _mm512_loadu_si512(f.as_ptr().add(source).cast::<__m512i>());
+            let f0_hi = _mm512_loadu_si512(f.as_ptr().add(source + 4).cast::<__m512i>());
+            let f1_lo = _mm512_loadu_si512(f.as_ptr().add(source + 8).cast::<__m512i>());
+            let f1_hi = _mm512_loadu_si512(f.as_ptr().add(source + 12).cast::<__m512i>());
+            let b0_lo = _mm512_loadu_si512(b.as_ptr().add(source).cast::<__m512i>());
+            let b0_hi = _mm512_loadu_si512(b.as_ptr().add(source + 4).cast::<__m512i>());
+            let b1_lo = _mm512_loadu_si512(b.as_ptr().add(source + 8).cast::<__m512i>());
+            let b1_hi = _mm512_loadu_si512(b.as_ptr().add(source + 12).cast::<__m512i>());
+
+            let f0_even = _mm512_shuffle_i32x4::<0x88>(f0_lo, f0_hi);
+            let f0_odd = _mm512_shuffle_i32x4::<0xDD>(f0_lo, f0_hi);
+            let f_out0 = _mm512_xor_si512(
+                f0_even,
+                ghash_mul_x4_split(_mm512_xor_si512(f0_even, f0_odd), r_x4, r_x64),
+            );
+            let f1_even = _mm512_shuffle_i32x4::<0x88>(f1_lo, f1_hi);
+            let f1_odd = _mm512_shuffle_i32x4::<0xDD>(f1_lo, f1_hi);
+            let f_out1 = _mm512_xor_si512(
+                f1_even,
+                ghash_mul_x4_split(_mm512_xor_si512(f1_even, f1_odd), r_x4, r_x64),
+            );
+
+            let b0_even = _mm512_shuffle_i32x4::<0x88>(b0_lo, b0_hi);
+            let b0_odd = _mm512_shuffle_i32x4::<0xDD>(b0_lo, b0_hi);
+            let b_out0 = _mm512_xor_si512(
+                b0_even,
+                ghash_mul_x4_split(_mm512_xor_si512(b0_even, b0_odd), r_x4, r_x64),
+            );
+            let b1_even = _mm512_shuffle_i32x4::<0x88>(b1_lo, b1_hi);
+            let b1_odd = _mm512_shuffle_i32x4::<0xDD>(b1_lo, b1_hi);
+            let b_out1 = _mm512_xor_si512(
+                b1_even,
+                ghash_mul_x4_split(_mm512_xor_si512(b1_even, b1_odd), r_x4, r_x64),
+            );
+
+            _mm512_storeu_si512(fc.as_mut_ptr().add(k).cast::<__m512i>(), f_out0);
+            _mm512_storeu_si512(fc.as_mut_ptr().add(k + 4).cast::<__m512i>(), f_out1);
+            _mm512_storeu_si512(bc.as_mut_ptr().add(k).cast::<__m512i>(), b_out0);
+            _mm512_storeu_si512(bc.as_mut_ptr().add(k + 4).cast::<__m512i>(), b_out1);
+
+            // These selectors choose the even pair positions in the same
+            // layout as `msg_reduce_avx512`; B1 forms the two adjacent-pair
+            // sums for the quadratic message term.
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f_out0, f_out1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b_out0, b_out1);
+            u0_acc.mul_acc(f_even, b_even);
+            let f0_sum = _mm512_xor_si512(
+                f_out0,
+                _mm512_shuffle_i32x4::<0xB1>(f_out0, f_out0),
+            );
+            let f1_sum = _mm512_xor_si512(
+                f_out1,
+                _mm512_shuffle_i32x4::<0xB1>(f_out1, f_out1),
+            );
+            let b0_sum = _mm512_xor_si512(
+                b_out0,
+                _mm512_shuffle_i32x4::<0xB1>(b_out0, b_out0),
+            );
+            let b1_sum = _mm512_xor_si512(
+                b_out1,
+                _mm512_shuffle_i32x4::<0xB1>(b_out1, b_out1),
+            );
+            u2_acc.mul_acc(
+                _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum),
+                _mm512_shuffle_i32x4::<0x88>(b0_sum, b1_sum),
+            );
+            k += 8;
+        }
+
+        // Power-of-two chunks normally take the vector body exactly. Keep a
+        // scalar tail for the generic even-length contract and fold it before
+        // adding its message pairs to the reduced vector accumulators.
+        while k < len {
+            let source = 2 * (base + k);
+            let f0 = f[source];
+            let f1 = f[source + 1];
+            let b0 = b[source];
+            let b1 = b[source + 1];
+            fc[k] = f0 + r * (f0 + f1);
+            bc[k] = b0 + r * (b0 + b1);
+            k += 1;
+        }
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        let mut pair = lanes;
+        while pair + 1 < len {
+            let f0 = fc[pair];
+            let f1 = fc[pair + 1];
+            let b0 = bc[pair];
+            let b1 = bc[pair + 1];
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            pair += 2;
+        }
+        (u0, u2)
+    }
+}
+
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
 /// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
@@ -4316,6 +4460,21 @@ fn fold_and_msg_lsb_inner(
         && deferred_basis.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // The regular x86 chunks all fold with the same challenge. Build its
+    // broadcast and split-reduction companion once per round, not once per
+    // chunk or once per input slice.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let (r_x4, r_x64) = unsafe {
+        use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+        use core::arch::x86_64::*;
+        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        (r_x4, ghash_shift64_x4(r_x4))
+    };
+
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4399,6 +4558,7 @@ fn fold_and_msg_lsb_inner(
                 // (bounds asserted by the caller's chunking) and every chunk
                 // has even length.
                 if use_soa {
+
                     return unsafe {
                         if use_nt {
                             fold_and_msg_chunk_nt_neon_soa::<true>(f, b, base, fc, bc, r)
@@ -4414,6 +4574,19 @@ fn fold_and_msg_lsb_inner(
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
             }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if !use_nt && lazy_ood.is_none() && deferred_basis.is_none() {
+                // SAFETY: the cfg supplies the kernel features; this arm is
+                // the dense no-correction path whose chunk geometry is even.
+                return unsafe {
+                    fold_and_msg_chunk_x86(f, b, base, fc, bc, r, r_x4, r_x64)
+                };
+            }
+
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
@@ -4856,7 +5029,7 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
@@ -6205,11 +6378,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
-    let direct_tables: Vec<Vec<F128>> = claims
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = claims
         .par_iter()
         .map(|claim| {
             let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
         })
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
@@ -6236,12 +6409,16 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
+                let cols0 = super::ring_switch::compose_block_cols_gfni(
+                    &direct_gfni_mats[0],
+                    claim0.eq_hi[block],
+                );
                 let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                 let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
+                let cols1 = super::ring_switch::compose_block_cols_gfni(
+                    &direct_gfni_mats[1],
+                    claim1.eq_hi[block],
+                );
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
@@ -6406,6 +6583,31 @@ fn materialize_direct_fold8(
     )))]
     let _ = l1_precommit;
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
+        Vec::new()
+    } else {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect()
+    };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
@@ -6429,6 +6631,24 @@ fn materialize_direct_fold8(
                     claim.eq_lo.iter().map(|x| x.lo).collect(),
                     claim.eq_lo.iter().map(|x| x.hi).collect(),
                 )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
             })
             .collect()
     } else {
@@ -6543,14 +6763,14 @@ fn materialize_direct_fold8(
                         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let cols0 = super::ring_switch::compose_block_cols_gfni(
+                        &direct_gfni_mats[0],
                         claim0.eq_hi[block],
                     );
                     let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                     let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let cols1 = super::ring_switch::compose_block_cols_gfni(
+                        &direct_gfni_mats[1],
                         claim1.eq_hi[block],
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);

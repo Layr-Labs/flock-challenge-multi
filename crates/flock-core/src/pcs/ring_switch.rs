@@ -2108,6 +2108,87 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     }
     cols
 }
+/// The AVX-512 DirectFold8 consumer repeatedly composes the same fixed byte
+/// map with different `e_hi` values. Precompute the two 64-bit input halves of
+/// that map once so each block only generates `X^b · e_hi` and applies the
+/// existing two-map GFNI leaf.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(crate) struct GfniDirectFoldMap {
+    low: [u64; 128],
+    high: [u64; 128],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline]
+pub(crate) fn build_gfni_direct_fold_map_from_generators(
+    generators: &[F128],
+) -> GfniDirectFoldMap {
+    assert_eq!(generators.len(), 1 << LOG_PACKING);
+    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+    GfniDirectFoldMap {
+        low: build_row_fold_mats_from_cols(&generators[..64]),
+        high: build_row_fold_mats_from_cols(&generators[64..]),
+    }
+}
+
+/// Compose a fixed byte-linear fold map with multiplication by `e_hi`.
+///
+/// The two calls cover columns 0..64 and 64..128. Their input rows are
+/// `X^b · e_hi`, split into low and high qwords, and the two-map leaf returns
+/// the same F128 columns as `compose_block_cols` without sixteen scalar table
+/// gathers per column.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline(always)]
+pub(crate) fn compose_block_cols_gfni(
+    map: &GfniDirectFoldMap,
+    e_hi: F128,
+) -> [F128; 128] {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
+
+    let mut cols = [F128::ZERO; 128];
+    let mut low_rows = [0u64; 64];
+    let mut high_rows = [0u64; 64];
+    let mut w = e_hi;
+    for chunk in 0..2 {
+        for lane in 0..64 {
+            low_rows[lane] = w.lo;
+            high_rows[lane] = w.hi;
+            w = crate::field::mul_by_x(w);
+        }
+        // SAFETY: both row arrays hold 64 initialized u64 values, the output
+        // has 64 initialized F128 slots, and this function's cfg supplies
+        // every target feature required by the leaf.
+        unsafe {
+            gfni_fold64_two_maps::<false>(
+                low_rows.as_ptr().cast::<u8>(),
+                &map.low,
+                high_rows.as_ptr().cast::<u8>(),
+                &map.high,
+                cols.as_mut_ptr().add(chunk * 64),
+                core::ptr::null(),
+            );
+        }
+    }
+    cols
+}
 
 #[inline(always)]
 pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
