@@ -2428,6 +2428,23 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
     x
 }
 
+/// Reassemble one 16-plane, 64-lane GFNI block with the AVX-512 transpose leaf.
+///
+/// The block is already reduced across workers, so this only changes the
+/// plane-major-to-F128 layout conversion; it does not alter field values.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+pub(crate) fn reassemble_gfni_plane_block(bank_planes: &[u8; 16 * 64], out: &mut [F128]) {
+    let out: &mut [F128; 64] = out.try_into().expect("one 64-lane F128 block");
+    kernels::c_plane_bank_to_f128(bank_planes, out);
+}
+
 /// Per-worker state for the four-window fold4 producer.
 /// The fused GFNI C drain's first live group of a band overwrites every one
 /// of the 32 KiB byte planes, so the band-wide zero fill, that group's plane
