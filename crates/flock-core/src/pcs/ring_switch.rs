@@ -1493,6 +1493,22 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
+        // SIMD bind_split_half per rayon chunk. Kill FLOCK_NO_FOLD8_SHAT_BIND_PAR_X4=1
+        // restores the scalar zip. Chunk size is 4-lane aligned.
+        static PAR_X4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_FOLD8_SHAT_BIND_PAR_X4").is_none()
+        });
+        if *PAR_X4 {
+            let mut out = z0.to_vec();
+            let threads = rayon::current_num_threads().max(1);
+            let chunk = (half.div_ceil(threads).max(4) + 3) & !3;
+            out.par_chunks_mut(chunk)
+                .zip(z1.par_chunks(chunk))
+                .for_each(|(lo, hi)| {
+                    crate::field::f128_slice::bind_split_half(lo, hi, r);
+                });
+            return out;
+        }
         let mut out = vec![F128::ZERO; half];
         out.par_iter_mut()
             .zip(z0.par_iter())
