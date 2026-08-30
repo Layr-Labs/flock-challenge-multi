@@ -394,6 +394,144 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
+        if !seed_zero {
+            // Each plane is old ^ g0 ^ ... ^ g7. Keep the same four ternary
+            // XORs, but form A = old^g0^g1, B = g2^g3^g4, C = g5^g6^g7,
+            // then A^B^C: two dependent ternary levels instead of four.
+            // Four planes share eight captured rows; pairs of planes reuse
+            // four GFNI temporaries. Registers 0..7 are rows, 8..11 are A,
+            // 12..15 are B, 16..19 are C, and 20..23 are temporaries.
+            // The macro only expands visible constant matrix/plane offsets.
+            // Keeping the entire block in one asm preserves capture-before-
+            // write even when raw input and output ranges overlap.
+            #[rustfmt::skip] // One instruction per line keeps register/offset review local.
+            macro_rules! tree4_planes {
+                ($k0:literal, $k1:literal, $k2:literal, $k3:literal) => {
+                    concat!(
+                        "vmovdqu64 zmm8, zmmword ptr [{planes} + 64 * ", stringify!($k0), "]\n",
+                        "vmovdqu64 zmm9, zmmword ptr [{planes} + 64 * ", stringify!($k1), "]\n",
+                        "vmovdqu64 zmm10, zmmword ptr [{planes} + 64 * ", stringify!($k2), "]\n",
+                        "vmovdqu64 zmm11, zmmword ptr [{planes} + 64 * ", stringify!($k3), "]\n",
+                        // A: old ^ g0 ^ g1, two independent planes at a time.
+                        "vgf2p8affineqb zmm20, zmm0, qword ptr [{mats} + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm1, qword ptr [{mats} + 128 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm0, qword ptr [{mats} + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm1, qword ptr [{mats} + 128 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm8, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm9, zmm22, zmm23, 0x96\n",
+                        "vgf2p8affineqb zmm20, zmm0, qword ptr [{mats} + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm1, qword ptr [{mats} + 128 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm0, qword ptr [{mats} + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm1, qword ptr [{mats} + 128 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm10, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm11, zmm22, zmm23, 0x96\n",
+                        // B: g2 ^ g3 ^ g4; g2 initializes B without a move.
+                        "vgf2p8affineqb zmm12, zmm2, qword ptr [{mats} + 256 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm20, zmm3, qword ptr [{mats} + 384 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm4, qword ptr [{mats} + 512 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm13, zmm2, qword ptr [{mats} + 256 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm3, qword ptr [{mats} + 384 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm4, qword ptr [{mats} + 512 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm12, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm13, zmm22, zmm23, 0x96\n",
+                        "vgf2p8affineqb zmm14, zmm2, qword ptr [{mats} + 256 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm20, zmm3, qword ptr [{mats} + 384 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm4, qword ptr [{mats} + 512 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm15, zmm2, qword ptr [{mats} + 256 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm3, qword ptr [{mats} + 384 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm4, qword ptr [{mats} + 512 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm14, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm15, zmm22, zmm23, 0x96\n",
+                        // C: g5 ^ g6 ^ g7; g5 initializes C without a move.
+                        "vgf2p8affineqb zmm16, zmm5, qword ptr [{mats} + 640 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm20, zmm6, qword ptr [{mats} + 768 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm7, qword ptr [{mats} + 896 + 8 * ", stringify!($k0), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm17, zmm5, qword ptr [{mats} + 640 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm6, qword ptr [{mats} + 768 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm7, qword ptr [{mats} + 896 + 8 * ", stringify!($k1), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm16, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm17, zmm22, zmm23, 0x96\n",
+                        "vgf2p8affineqb zmm18, zmm5, qword ptr [{mats} + 640 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm20, zmm6, qword ptr [{mats} + 768 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm21, zmm7, qword ptr [{mats} + 896 + 8 * ", stringify!($k2), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm19, zmm5, qword ptr [{mats} + 640 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm22, zmm6, qword ptr [{mats} + 768 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vgf2p8affineqb zmm23, zmm7, qword ptr [{mats} + 896 + 8 * ", stringify!($k3), "]{{1to8}}, 0\n",
+                        "vpternlogq zmm18, zmm20, zmm21, 0x96\n",
+                        "vpternlogq zmm19, zmm22, zmm23, 0x96\n",
+                        // A ^ B ^ C, then publish in original plane order.
+                        "vpternlogq zmm8, zmm12, zmm16, 0x96\n",
+                        "vpternlogq zmm9, zmm13, zmm17, 0x96\n",
+                        "vpternlogq zmm10, zmm14, zmm18, 0x96\n",
+                        "vpternlogq zmm11, zmm15, zmm19, 0x96\n",
+                        "vmovdqu64 zmmword ptr [{planes} + 64 * ", stringify!($k0), "], zmm8\n",
+                        "vmovdqu64 zmmword ptr [{planes} + 64 * ", stringify!($k1), "], zmm9\n",
+                        "vmovdqu64 zmmword ptr [{planes} + 64 * ", stringify!($k2), "], zmm10\n",
+                        "vmovdqu64 zmmword ptr [{planes} + 64 * ", stringify!($k3), "], zmm11\n",
+                    )
+                };
+            }
+
+            for block in 0..n_blocks64 {
+                // Capture all eight rows before any output store. Only the
+                // source cursor changes; three LEAs advance it by six
+                // strides, without touching flags. The last read starts at
+                // 7*stripe_stride + block*64, exactly as in the old loop.
+                // All written SIMD registers and the cursor are declared.
+                // This reads/writes caller memory, so no nomem/readonly/pure
+                // promise is made. There is no call or stack instruction.
+                core::arch::asm!(
+                    "vmovdqu64 zmm0, zmmword ptr [{rows}]",
+                    "vmovdqu64 zmm1, zmmword ptr [{rows} + {stride}]",
+                    "lea {rows}, [{rows} + {stride} * 2]",
+                    "vmovdqu64 zmm2, zmmword ptr [{rows}]",
+                    "vmovdqu64 zmm3, zmmword ptr [{rows} + {stride}]",
+                    "lea {rows}, [{rows} + {stride} * 2]",
+                    "vmovdqu64 zmm4, zmmword ptr [{rows}]",
+                    "vmovdqu64 zmm5, zmmword ptr [{rows} + {stride}]",
+                    "lea {rows}, [{rows} + {stride} * 2]",
+                    "vmovdqu64 zmm6, zmmword ptr [{rows}]",
+                    "vmovdqu64 zmm7, zmmword ptr [{rows} + {stride}]",
+                    tree4_planes!(0, 1, 2, 3),
+                    tree4_planes!(4, 5, 6, 7),
+                    tree4_planes!(8, 9, 10, 11),
+                    tree4_planes!(12, 13, 14, 15),
+                    rows = inout(reg) tile_bytes_ptr.add(block * 64) => _,
+                    stride = in(reg) stripe_stride,
+                    mats = in(reg) mats.as_ptr(),
+                    planes = in(reg) out_planes_ptr.add(block * 1024),
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    out("zmm2") _,
+                    out("zmm3") _,
+                    out("zmm4") _,
+                    out("zmm5") _,
+                    out("zmm6") _,
+                    out("zmm7") _,
+                    out("zmm8") _,
+                    out("zmm9") _,
+                    out("zmm10") _,
+                    out("zmm11") _,
+                    out("zmm12") _,
+                    out("zmm13") _,
+                    out("zmm14") _,
+                    out("zmm15") _,
+                    out("zmm16") _,
+                    out("zmm17") _,
+                    out("zmm18") _,
+                    out("zmm19") _,
+                    out("zmm20") _,
+                    out("zmm21") _,
+                    out("zmm22") _,
+                    out("zmm23") _,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+
+        // Preserve the incumbent first-write route. A seed call may receive
+        // uninitialized output and must never load an old plane value.
         for block in 0..n_blocks64 {
             let bs = block * 64;
             let rows: [__m512i; 8] = core::array::from_fn(|t| {

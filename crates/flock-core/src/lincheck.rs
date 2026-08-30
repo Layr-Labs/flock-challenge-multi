@@ -4170,6 +4170,357 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    fn gfni_tile_test_tables(eq8s: &[[F128; 8]; 8]) -> ([u64; 128], Vec<F128>) {
+        let mut mats = [0u64; 128];
+        let mut tables = vec![F128::ZERO; 8 * 256];
+        for t in 0..8 {
+            kernels::fold_mats_from_basis(&eq8s[t], &mut mats[t * 16..(t + 1) * 16]);
+            build_sum_table(&eq8s[t], &mut tables[t * 256..(t + 1) * 256]);
+        }
+        (mats, tables)
+    }
+
+    /// A bounded offset that gives the requested actual address modulo 64,
+    /// without assuming any extra alignment from a byte-vector allocation.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    fn gfni_tile_test_offset(base: *const u8, byte_in_line: usize) -> usize {
+        assert!(byte_in_line < 64);
+        let aligned = (64 - ((base as usize) & 63)) & 63;
+        aligned + byte_in_line
+    }
+
+    /// Independent F128 sum-table oracle, with no GFNI matrix application or
+    /// ternary-XOR scheduling shared with the leaf under test. Capture all
+    /// eight rows first so this also models the raw-pointer alias contract.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    fn gfni_tile_scalar_block(
+        rows: &[[u8; 64]; 8],
+        tables: &[F128],
+        out: &mut [u8],
+        seed_zero: bool,
+    ) {
+        assert_eq!(tables.len(), 8 * 256);
+        assert_eq!(out.len(), 1024);
+        for col in 0..64 {
+            let mut value = F128::ZERO;
+            for t in 0..8 {
+                value += tables[t * 256 + rows[t][col] as usize];
+            }
+            let lo = value.lo.to_le_bytes();
+            let hi = value.hi.to_le_bytes();
+            for byte_k in 0..16 {
+                let byte = if byte_k < 8 { lo[byte_k] } else { hi[byte_k - 8] };
+                let dst = &mut out[byte_k * 64 + col];
+                if seed_zero {
+                    *dst = byte;
+                } else {
+                    *dst ^= byte;
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    fn gfni_tile_scalar(
+        tile: &[u8],
+        stride: usize,
+        n_blocks: usize,
+        tables: &[F128],
+        out: &mut [u8],
+        seed_zero: bool,
+    ) {
+        assert_eq!(tile.len(), 7 * stride + n_blocks * 64);
+        assert_eq!(out.len(), n_blocks * 1024);
+        for block in 0..n_blocks {
+            let rows: [[u8; 64]; 8] = std::array::from_fn(|t| {
+                std::array::from_fn(|col| tile[t * stride + block * 64 + col])
+            });
+            gfni_tile_scalar_block(
+                &rows,
+                tables,
+                &mut out[block * 1024..(block + 1) * 1024],
+                seed_zero,
+            );
+        }
+    }
+
+    /// The existing packed-stripe tests use one tile per chunk and therefore
+    /// call only seed_zero=true. Exercise the accumulating leaf directly,
+    /// including caller stride 128, larger stripe layouts and dirty offsets.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_tile_nonseed_matches_scalar_with_offsets_and_repeated_accumulation() {
+        let mut rng = Rng::new(0x7EE4_6408_A11C_0001);
+        // n_blocks, stripe stride, source address mod 64, output address mod 64.
+        let cases: &[(usize, usize, usize, usize)] = &[
+            (0, 128, 1, 3),
+            (1, 64, 0, 0),
+            (1, 128, 7, 11),
+            (2, 128, 3, 17),
+            (3, 193, 5, 31),
+            (4, 256, 9, 63),
+            (5, 337, 31, 1),
+        ];
+        for &(n_blocks, stride, source_skew, output_skew) in cases {
+            let input_len = 7 * stride + n_blocks * 64;
+            let output_len = n_blocks * 1024;
+            let mut input = vec![0xA5u8; input_len + 192];
+            let input_offset = gfni_tile_test_offset(input.as_ptr(), source_skew);
+            for (i, byte) in input[input_offset..input_offset + input_len]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (i as u8).wrapping_mul(37).wrapping_add((i >> 8) as u8);
+            }
+            let input_before = input.clone();
+            let mut got = vec![0xC3u8; output_len + 192];
+            let output_offset = gfni_tile_test_offset(got.as_ptr(), output_skew);
+            for byte in &mut got[output_offset..output_offset + output_len] {
+                *byte = rng.next_u64() as u8 | 1;
+            }
+            let mut want = got.clone();
+            for round in 0..2 {
+                let eq8s = std::array::from_fn(|_| std::array::from_fn(|_| rng.f128()));
+                let (mats, tables) = gfni_tile_test_tables(&eq8s);
+                let mats_before = mats;
+                gfni_tile_scalar(
+                    &input[input_offset..input_offset + input_len],
+                    stride,
+                    n_blocks,
+                    &tables,
+                    &mut want[output_offset..output_offset + output_len],
+                    false,
+                );
+                // SAFETY: all source bytes, matrices and output planes are
+                // initialized and disjoint, with the documented full extents.
+                // Even the empty case supplies valid backing allocations.
+                unsafe {
+                    kernels::gfni_fold_tile(
+                        input.as_ptr().add(input_offset),
+                        stride,
+                        n_blocks,
+                        &mats,
+                        got.as_mut_ptr().add(output_offset),
+                        false,
+                    );
+                }
+                assert_eq!(
+                    got, want,
+                    "blocks={n_blocks} stride={stride} round={round}"
+                );
+                assert_eq!(input, input_before, "input must remain unchanged");
+                assert_eq!(mats, mats_before, "matrices must remain unchanged");
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_tile_nonseed_individual_terms_match_scalar() {
+        let weight = F128 {
+            lo: 0x8070_6050_4030_2010,
+            hi: 0xF1E2_D3C4_B5A6_9788,
+        };
+        // Each stripe/input-bit term separately, then the old-acc-only case.
+        for term in 0..=64 {
+            let mut eq8s = [[F128::ZERO; 8]; 8];
+            if term < 64 {
+                eq8s[term / 8][term % 8] = weight;
+            }
+            let (mats, tables) = gfni_tile_test_tables(&eq8s);
+            let input_len = 7 * 128 + 64;
+            let mut input = vec![0xA5u8; input_len + 192];
+            let input_offset = gfni_tile_test_offset(input.as_ptr(), 1);
+            for t in 0..8 {
+                for col in 0..64 {
+                    input[input_offset + t * 128 + col] = (col as u8)
+                        .wrapping_mul(13)
+                        .rotate_left(t as u32)
+                        .wrapping_add((17 * t) as u8);
+                }
+            }
+            let input_before = input.clone();
+            let mut got = vec![0x6Du8; 1024 + 192];
+            let output_offset = gfni_tile_test_offset(got.as_ptr(), 5);
+            let mut want = got.clone();
+            gfni_tile_scalar(
+                &input[input_offset..input_offset + input_len],
+                128,
+                1,
+                &tables,
+                &mut want[output_offset..output_offset + 1024],
+                false,
+            );
+            // SAFETY: complete initialized, non-overlapping source/output;
+            // unaligned accesses and target features match the leaf contract.
+            unsafe {
+                kernels::gfni_fold_tile(
+                    input.as_ptr().add(input_offset),
+                    128,
+                    1,
+                    &mats,
+                    got.as_mut_ptr().add(output_offset),
+                    false,
+                );
+            }
+            assert_eq!(got, want, "isolated term={term}");
+            assert_eq!(input, input_before);
+        }
+    }
+
+    /// A worker's first tile may receive genuinely uninitialized live planes.
+    /// Only that live extent is uninitialized; neighboring sentinel bytes are
+    /// initialized and can be inspected after the full-write seed completes.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_tile_uninitialized_seed_then_accumulate_matches_scalar() {
+        use core::mem::MaybeUninit;
+
+        let mut rng = Rng::new(0x7EE4_6408_A11C_0002);
+        for &(n_blocks, stride) in &[(0usize, 128usize), (1, 64), (2, 128), (3, 193)] {
+            let input_len = 7 * stride + n_blocks * 64;
+            let output_len = n_blocks * 1024;
+            let mut input = vec![0xA5u8; input_len + 192];
+            let input_offset = gfni_tile_test_offset(input.as_ptr(), 7);
+            for byte in &mut input[input_offset..input_offset + input_len] {
+                *byte = rng.next_u64() as u8;
+            }
+            let input_before = input.clone();
+            let mut got = vec![MaybeUninit::new(0x6Du8); output_len + 192];
+            let output_offset = gfni_tile_test_offset(got.as_ptr().cast::<u8>(), 17);
+            got[output_offset..output_offset + output_len].fill(MaybeUninit::uninit());
+            let mut want = vec![0x6Du8; got.len()];
+            for seed_zero in [true, false] {
+                let eq8s = std::array::from_fn(|_| std::array::from_fn(|_| rng.f128()));
+                let (mats, tables) = gfni_tile_test_tables(&eq8s);
+                gfni_tile_scalar(
+                    &input[input_offset..input_offset + input_len],
+                    stride,
+                    n_blocks,
+                    &tables,
+                    &mut want[output_offset..output_offset + output_len],
+                    seed_zero,
+                );
+                // SAFETY: seed=true writes every live byte without loading it;
+                // seed=false follows that completed write. Source and matrices
+                // are initialized and disjoint, and halos were initialized.
+                unsafe {
+                    kernels::gfni_fold_tile(
+                        input.as_ptr().add(input_offset),
+                        stride,
+                        n_blocks,
+                        &mats,
+                        got.as_mut_ptr().cast::<u8>().add(output_offset),
+                        seed_zero,
+                    );
+                }
+                // SAFETY: the full-write seed has completed, so live planes
+                // and both preinitialized halos now all contain valid bytes.
+                let initialized = unsafe {
+                    core::slice::from_raw_parts(got.as_ptr().cast::<u8>(), got.len())
+                };
+                assert_eq!(
+                    initialized,
+                    want.as_slice(),
+                    "blocks={n_blocks} stride={stride} seed={seed_zero}"
+                );
+                assert_eq!(input, input_before);
+            }
+        }
+    }
+
+    /// Raw input/output pointers are allowed to overlap. Within each block
+    /// all eight rows are captured before stores; a later block must observe
+    /// any earlier block's writes. No matrix storage aliases the byte buffer.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_tile_nonseed_overlap_preserves_block_order() {
+        let mut rng = Rng::new(0x7EE4_6408_A11C_0003);
+        // n_blocks, stride, source offset, output offset, relative to alignment.
+        let cases: &[(usize, usize, usize, usize)] = &[
+            (1, 64, 0, 0),
+            (1, 128, 37, 5),
+            (2, 128, 0, 0),
+            (3, 193, 64, 1),
+        ];
+        for &(n_blocks, stride, source_delta, output_delta) in cases {
+            let input_len = 7 * stride + n_blocks * 64;
+            let output_len = n_blocks * 1024;
+            let extent = (source_delta + input_len).max(output_delta + output_len);
+            let mut got = vec![0x5Au8; extent + 192];
+            let base = gfni_tile_test_offset(got.as_ptr(), 0);
+            for byte in &mut got[base..base + extent] {
+                *byte = rng.next_u64() as u8 | 1;
+            }
+            let source_offset = base + source_delta;
+            let output_offset = base + output_delta;
+            let mut want = got.clone();
+            let eq8s = std::array::from_fn(|_| std::array::from_fn(|_| rng.f128()));
+            let (mats, tables) = gfni_tile_test_tables(&eq8s);
+            for block in 0..n_blocks {
+                let rows: [[u8; 64]; 8] = std::array::from_fn(|t| {
+                    std::array::from_fn(|col| {
+                        want[source_offset + t * stride + block * 64 + col]
+                    })
+                });
+                gfni_tile_scalar_block(
+                    &rows,
+                    &tables,
+                    &mut want[output_offset + block * 1024..output_offset + (block + 1) * 1024],
+                    false,
+                );
+            }
+            // SAFETY: one initialized allocation supplies both complete byte
+            // extents through raw pointers. No shared byte reference is live;
+            // matrices are separate. The original leaf permits this overlap.
+            unsafe {
+                let ptr = got.as_mut_ptr();
+                kernels::gfni_fold_tile(
+                    ptr.add(source_offset).cast_const(),
+                    stride,
+                    n_blocks,
+                    &mats,
+                    ptr.add(output_offset),
+                    false,
+                );
+            }
+            assert_eq!(got, want, "overlap blocks={n_blocks} stride={stride}");
+        }
+    }
+
     /// Factoring the outer equality tensor preserves both its LSB-first
     /// indexing and the padding-aware block-major fold. The final case uses
     /// the ranked BLAKE3 outer geometry (18 variables split 9+9) without

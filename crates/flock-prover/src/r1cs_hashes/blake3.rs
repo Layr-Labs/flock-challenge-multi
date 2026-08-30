@@ -2112,12 +2112,66 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     (z, a, b, ab_inner)
 }
 
-/// One 64-byte line of a rayon task's fused a/b projection windows. A task
-/// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
-/// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
-/// total — allocated once per `for_each_init` bout and rewritten by every octa
-/// in the task, so it stays L1-resident. The `align(64)` is what the whole
-/// allocation inherits; nothing ever reads the field.
+/// Full-write scalar fallback for a disabled streaming producer or a ragged
+/// sub-octa tail. Unlike the ranked producer, this never relies on provenance
+/// or emits the residual one-row representation. A skipped AB block is left
+/// untouched, but its complete z/a/b witness is still produced.
+///
+/// When `nt_out` is true, only AB uses NT stores; the caller must fence them
+/// before task release.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn build_round1_inner_scalar_block(
+    block: &Compression,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_out: &mut [u8],
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    project: bool,
+    nt_out: bool,
+) {
+    const F128_PER_BLOCK: usize = K / 128;
+    const U64_PER_BLOCK: usize = K / 64;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    assert_eq!(z.len(), F128_PER_BLOCK);
+    assert_eq!(a.len(), F128_PER_BLOCK);
+    assert_eq!(b.len(), F128_PER_BLOCK);
+    assert_eq!(ab_out.len(), BYTES_PER_BLOCK);
+    // SAFETY: each checked F128 slice owns exactly one complete block, is
+    // u64-aligned, and is disjoint from the other mutable output slices.
+    let (z_words, a_words, b_words) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(z.as_mut_ptr().cast::<u64>(), U64_PER_BLOCK),
+            std::slice::from_raw_parts_mut(a.as_mut_ptr().cast::<u64>(), U64_PER_BLOCK),
+            std::slice::from_raw_parts_mut(b.as_mut_ptr().cast::<u64>(), U64_PER_BLOCK),
+        )
+    };
+    let (cv, msg, counter, block_len, flags) = block;
+    build_block_witness_ab_packed_into(
+        cv, msg, *counter, *block_len, *flags, z_words, a_words, b_words,
+    );
+    if project {
+        // SAFETY: the scalar builder overwrote every word before either byte
+        // view is read; these shared views do not overlap the mutable AB output.
+        let (a_bytes, b_bytes) = unsafe {
+            (
+                std::slice::from_raw_parts(a_words.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+                std::slice::from_raw_parts(b_words.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+            )
+        };
+        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+            a_bytes, b_bytes, ab_out, inv_table, nt_out,
+        );
+    }
+}
+
+/// One 64-byte line of a rayon task's fused a/b projection staging. The live
+/// streaming path uses sixteen lines (1 KiB): eight block rows per side,
+/// rewritten at each drain step. The allocation inherits `align(64)`; it is
+/// held through `MaybeUninit`, and nothing reads this field directly.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
@@ -2125,15 +2179,14 @@ struct AbWinLine([u64; 8]);
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
 /// task owns 16 contiguous padded slots (two octa dumps).
 ///
-/// With `ab_nt` (the default; `FLOCK_NO_WITGEN_AB_NT=1` restores the other
-/// arm) the octa dump publishes a/b NON-TEMPORALLY and simultaneously fills a
-/// 32 KiB per-task window buffer from the same transpose registers; the
-/// round-1 AB window projection for those eight blocks then runs immediately,
-/// reading the L1-hot windows. a/b are never re-read, deleting their
-/// write-allocate RFO (1 GiB at the ranked shape).
+/// With `ab_nt` and the window-stream switch enabled (both default on), the
+/// octa dump publishes a/b NON-TEMPORALLY and projects each step from a 1 KiB
+/// staging pair. a/b are never re-read in this phase.
 ///
-/// Without `ab_nt` this is the incumbent: temporal a/b dumps followed by one
-/// projection loop over the task's 16 blocks reading a/b back.
+/// Disabling either switch uses the full-write scalar fallback, which has no
+/// streaming stage and writes dense AB. This is a correct rollback, not a
+/// performance-equivalent restoration of the removed whole-window octa leaf.
+/// A final group shorter than eight blocks uses the same full-write fallback.
 ///
 /// `elide` forwards the per-buffer constant-region skips (z, a, b) — pass
 /// `true` ONLY for a buffer whose pool provenance token verified it still
@@ -2168,13 +2221,35 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
-        && skip_blocks == 0
-        && z.len() / F128_PER_BLOCK == 1 << 18
-        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
-        && flock_core::pcs::ranked_direct_fold8_enabled();
-    if one_rows_elided {
-        ab_inner.set_ranked_one_rows_elided();
+    if !ab_stream {
+        // The remaining octa builder requires a StreamProj unconditionally;
+        // never construct it from an absent stage. The old non-streaming octa
+        // leaf no longer exists, so use the existing scalar full-write math.
+        // All stores here are temporal and the residual brand stays unset.
+        assert_eq!(z.len(), a.len());
+        assert_eq!(z.len(), b.len());
+        assert!(z.len().is_multiple_of(F128_PER_BLOCK));
+        assert_eq!(ab_inner.len_bytes(), std::mem::size_of_val(z));
+        z.par_chunks_mut(F128_PER_BLOCK)
+            .zip(a.par_chunks_mut(F128_PER_BLOCK))
+            .zip(b.par_chunks_mut(F128_PER_BLOCK))
+            .zip(ab_inner.as_bytes_mut().par_chunks_mut(BYTES_PER_BLOCK))
+            .enumerate()
+            .for_each(|(block_idx, (((z_out, a_out), b_out), ab_out))| {
+                blocks.with_block(block_idx, padding, |block| {
+                    build_round1_inner_scalar_block(
+                        block,
+                        z_out,
+                        a_out,
+                        b_out,
+                        ab_out,
+                        inv_table,
+                        block_idx >= skip_blocks,
+                        false,
+                    );
+                });
+            });
+        return;
     }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
@@ -2193,6 +2268,15 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
+    // Match the witness kernel's E=true dispatch exactly. Cold/partial
+    // provenance and non-offset plans produce dense AB, not a residual.
+    let one_rows_elided = ab_stream
+        && skip_blocks == 0
+        && z.len() / F128_PER_BLOCK == 1 << 18
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+        && flock_core::pcs::ranked_direct_fold8_enabled();
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -2285,6 +2369,8 @@ fn generate_round1_inner_octa(
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
+                        // The non-streaming branch returned before allocating
+                        // staging, so `stage` is always Some on this path.
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
                                 stage: st,
@@ -2329,10 +2415,9 @@ fn generate_round1_inner_octa(
                         }
                     }
                 }
-                // Incumbent arm — and, under `ab_nt`, only a ragged sub-octa tail
-                // the dump loop above could not cover (unreachable at every
-                // power-of-two shape ≥ 8; kept so the two arms stay observably
-                // identical). Reads a/b back.
+                // Only a ragged sub-octa tail remains. It has not passed
+                // through any witness builder, so fill z/a/b before reading
+                // them for AB. The ranked power-of-two shape has no such tail.
                 let j0 = if win_ab.is_some() || stage.is_some() {
                     (n_here / SIMD) * SIMD
                 } else {
@@ -2340,24 +2425,20 @@ fn generate_round1_inner_octa(
                 };
                 for j in j0..n_here {
                     let block_idx = GROUP * g + j;
-                    if block_idx >= skip_blocks {
-                        let a_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let b_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
-                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                    blocks.with_block(block_idx, padding, |block| {
+                        let words = j * F128_PER_BLOCK..(j + 1) * F128_PER_BLOCK;
+                        let bytes = j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK;
+                        build_round1_inner_scalar_block(
+                            block,
+                            &mut z_out[words.clone()],
+                            &mut a_out[words.clone()],
+                            &mut b_out[words],
+                            &mut ab_out[bytes],
+                            inv_table,
+                            block_idx >= skip_blocks,
+                            abinner_nt,
                         );
-                    }
+                    });
                 }
                 // Last NT store of the task in every arm — a/b's streams included.
                 if abinner_nt || z_nt || ab_nt {
@@ -2365,6 +2446,11 @@ fn generate_round1_inner_octa(
                 }
             },
         );
+    // Publish the representation tag only after all producers and their
+    // non-temporal-store fences have completed.
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -2635,27 +2721,22 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
-    /// `FLOCK_NO_WITGEN_AB_NT=1` restores the pre-fusion octa task structure
-    /// in full: temporal a/b dumps, then a separate round-1 projection loop
-    /// that re-reads a/b. With the switch off (the default) the dump writes
-    /// a/b non-temporally while filling a per-task window buffer from the
-    /// same transpose registers, and the projection runs per octa off those
-    /// windows — deleting a/b's write-allocate RFO traffic. Orthogonal to the
-    /// z, ab_inner and elide switches.
+    /// `FLOCK_NO_WITGEN_AB_NT=1` disables the fused streaming producer. The
+    /// round1-inner caller uses full-write scalar z/a/b and temporal dense AB;
+    /// this is a correctness rollback, not the removed pre-fusion octa's
+    /// performance control. By default a/b publish non-temporally and AB reads
+    /// the small staging pair instead of the large witness buffers.
     pub(crate) fn witgen_ab_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_NT").is_none());
         *ON
     }
 
-    /// `FLOCK_NO_WITGEN_AB_WINSTREAM=1` restores the whole-block a/b window
-    /// buffers: the fused dump fills two full per-task window copies of the
-    /// octa and the round-1 projection runs over them once the octa is
-    /// complete. With the switch off (the default) each drain step's eight
-    /// 64-byte round-1 medium windows are transformed as they are produced,
-    /// out of a small staging pair, and no whole-block window buffer exists.
-    /// Same ab_inner bytes either way; only meaningful under
-    /// `witgen_ab_nt_enabled`.
+    /// `FLOCK_NO_WITGEN_AB_WINSTREAM=1` disables the streaming-stage producer.
+    /// The removed whole-window octa leaf is not reconstructed: the caller
+    /// uses the same full-write scalar rollback as `FLOCK_NO_WITGEN_AB_NT`.
+    /// The default transforms each step's eight 64-byte AB windows from the
+    /// small staging pair. Only meaningful under `witgen_ab_nt_enabled`.
     pub(crate) fn witgen_ab_winstream_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_WINSTREAM").is_none());
@@ -4587,8 +4668,8 @@ mod tests {
     /// **Fused a/b-NT oracle, end to end.** The default octa path publishes
     /// a/b non-temporally and projects round-1 AB windows out of the per-task
     /// window buffers filled by the same transpose; `FLOCK_NO_WITGEN_AB_NT=1`
-    /// restores temporal a/b dumps plus a separate projection loop that
-    /// re-reads a/b. The two must agree byte-for-byte on z, a, b AND ab_inner.
+    /// selects the scalar full-write rollback. The two must agree byte-for-byte
+    /// on z, a, b AND ab_inner, despite their different producer schedules.
     ///
     /// Shapes: 8 blocks (a single sub-GROUP rayon chunk — the `n_here == 8`
     /// case), 16 (one full GROUP), 27-in-32 (ragged padding tail), and 64
@@ -4744,6 +4825,159 @@ mod tests {
                     assert_eq!(ab, ab_r, "ab_inner mismatch, {tag}");
                 }
             }
+        }
+    }
+
+    /// Compare the cold paths against a separate scalar block-by-block
+    /// construction. The oracle never calls the new fallback helper, and all
+    /// actual buffers start initialized but dirty so missing writes are visible.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn check_round1_octa_fallback_shape(
+        n_slots: usize,
+        n_inputs: usize,
+        skip_blocks: usize,
+        ab_nt: bool,
+    ) {
+        use crate::seed_pipe::BlockSource;
+
+        const F128_PER_BLOCK: usize = K / 128;
+        const U64_PER_BLOCK: usize = K / 64;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        const POISON: u8 = 0xa5;
+        assert!(n_inputs <= n_slots && skip_blocks <= n_slots);
+        let init = 0x73A1_91CC_45D0_F829;
+        let inputs: Vec<_> = (0..n_inputs)
+            .map(|i| crate::seed_pipe::gen_block(init, i))
+            .collect();
+        // Nonzero padding detects accidental zero padding or source overreads.
+        let padding: Compression = ([0x1234_5678; 8], [0x89ab_cdef; 16], 7, 19, 3);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut expected: [Vec<u64>; 3] =
+            std::array::from_fn(|_| vec![0u64; n_slots * U64_PER_BLOCK]);
+        let mut expected_ab = vec![POISON; n_slots * BYTES_PER_BLOCK];
+        for i in 0..n_slots {
+            let (cv, msg, counter, block_len, flags) = inputs.get(i).unwrap_or(&padding);
+            let word_range = i * U64_PER_BLOCK..(i + 1) * U64_PER_BLOCK;
+            let [z_words, a_words, b_words] = &mut expected;
+            let z_block = &mut z_words[word_range.clone()];
+            let a_block = &mut a_words[word_range.clone()];
+            let b_block = &mut b_words[word_range];
+            build_block_witness_ab_packed_into(
+                cv, msg, *counter, *block_len, *flags, z_block, a_block, b_block,
+            );
+            if i >= skip_blocks {
+                // SAFETY: initialized complete scalar u64 blocks, read-only
+                // while the disjoint expected AB block is filled.
+                let (a_bytes, b_bytes) = unsafe {
+                    (
+                        std::slice::from_raw_parts(a_block.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+                        std::slice::from_raw_parts(b_block.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+                    )
+                };
+                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                    a_bytes,
+                    b_bytes,
+                    &mut expected_ab[i * BYTES_PER_BLOCK..(i + 1) * BYTES_PER_BLOCK],
+                    &inv_table,
+                    false,
+                );
+            }
+        }
+        for (source_id, source) in [
+            BlockSource::Slice(&inputs),
+            BlockSource::Closed { init, len: n_inputs },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut z = vec![F128::ONE; n_slots * F128_PER_BLOCK];
+            let mut a = z.clone();
+            let mut b = z.clone();
+            let mut ab_inner =
+                flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+                    n_slots * BYTES_PER_BLOCK,
+                );
+            ab_inner.as_bytes_mut().fill(POISON);
+            let skip_bytes = skip_blocks * BYTES_PER_BLOCK;
+            ab_inner.set_invalid_prefix_bytes(skip_bytes);
+            generate_round1_inner_octa(
+                source,
+                skip_blocks,
+                &mut z,
+                &mut a,
+                &mut b,
+                &mut ab_inner,
+                &inv_table,
+                &padding,
+                [false; 3],
+                ab_nt,
+            );
+            let tag = format!(
+                "slots={n_slots} inputs={n_inputs} skip={skip_blocks} nt={ab_nt} src={source_id}"
+            );
+            for (role, actual, reference) in [
+                ("z", z.as_slice(), expected[0].as_slice()),
+                ("a", a.as_slice(), expected[1].as_slice()),
+                ("b", b.as_slice(), expected[2].as_slice()),
+            ] {
+                // SAFETY: all actual F128 words were initialized before the
+                // call, and one F128 occupies exactly two aligned u64 words.
+                let actual_words = unsafe {
+                    std::slice::from_raw_parts(actual.as_ptr().cast::<u64>(), actual.len() * 2)
+                };
+                assert_eq!(actual_words, reference, "{role}: {tag}");
+            }
+            assert_eq!(ab_inner.invalid_prefix_bytes(), skip_bytes, "{tag}");
+            assert!(!ab_inner.ranked_one_rows_elided(), "{tag}");
+            let actual_ab = ab_inner.as_bytes_mut();
+            assert_eq!(&actual_ab[skip_bytes..], &expected_ab[skip_bytes..], "{tag}");
+            // The incumbent full octas may also write the invalid prefix. The
+            // new scalar paths must leave their skipped AB blocks untouched.
+            let first_scalar = if ab_nt && witgen_simd::witgen_ab_winstream_enabled() {
+                (n_slots / 8) * 8
+            } else {
+                0
+            };
+            if first_scalar < skip_blocks {
+                assert!(
+                    actual_ab[first_scalar * BYTES_PER_BLOCK..skip_bytes]
+                        .iter()
+                        .all(|&byte| byte == POISON),
+                    "skipped scalar AB block was written: {tag}"
+                );
+            }
+        }
+    }
+
+    /// Covers the stage=None branch without changing a cached environment
+    /// switch. Disabling WINSTREAM selects the same branch by construction.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn round1_inner_octa_nonstream_fullwrite_matches_scalar() {
+        for (slots, inputs, skip) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (7, 5, 3),
+            (8, 8, 8),
+            (17, 13, 9),
+            (23, 20, 23),
+            (32, 29, 4),
+        ] {
+            check_round1_octa_fallback_shape(slots, inputs, skip, false);
+        }
+    }
+
+    /// All seven ragged lengths, both with no complete octa and following two
+    /// complete octas. Padding and a skip boundary inside the tail are covered.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn round1_inner_octa_ragged_tail_is_written_before_projection() {
+        for tail in 1..8 {
+            check_round1_octa_fallback_shape(tail, tail - 1, tail / 2, true);
+            check_round1_octa_fallback_shape(16 + tail, 12 + tail, 16 + tail / 2, true);
         }
     }
 
