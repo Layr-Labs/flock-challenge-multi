@@ -535,6 +535,51 @@ fn ranked_direct_dense_inline_enabled() -> bool {
     }
 }
 
+/// `FLOCK_NO_EY_DRAIN_OFF32IDX=1` restores the incumbent two-64-bit-word read
+/// of each apply's eight pre-scaled `u16` offsets. Default ON; the ranked
+/// worker's cleared environment never disables it.
+///
+/// The offsets themselves, their layout, the table rows addressed and the
+/// bytes published are all unchanged — only the instruction sequence that
+/// moves eight `u16` fields into eight index registers differs. Measured
+/// statically on this tree's `shift_reduce_inner_ab_x86_avx512_from_off_nt2`:
+/// 28 instructions per apply before, 24 after.
+#[inline(always)]
+fn ey_drain_off32idx_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_DRAIN_OFF32IDX").is_none());
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
+}
+
+/// `FLOCK_NO_EY_DRAIN_BCOMP_HOIST=1` restores the per-block static-B
+/// complement test inside the eight-block publish loop.
+///
+/// `plan` is resolved once per window and does not change across the loop's
+/// eight blocks, so the test is loop-invariant; hoisting it leaves each arm a
+/// straight publish-then-project body and deletes one compare and one branch
+/// per block. Identical calls, identical bytes.
+#[inline(always)]
+fn ey_drain_bcomp_hoist_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_EY_DRAIN_BCOMP_HOIST").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_ranked_dense_rows(rows: &[__m512i; 8], op: *mut u16) {
@@ -586,68 +631,97 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
         let b_rows = tr8x16_zmm(b_ring, rw);
         widen_ranked_dense_rows(&b_rows, off.add(64));
 
+        // One block's offset block, as the leaf's array reference.
+        macro_rules! offs {
+            ($j:expr) => {
+                &*off
+                    .add($j * ROUND1_AB_OFF_WORDS)
+                    .cast::<[u16; ROUND1_AB_OFF_WORDS]>()
+            };
+        }
+        // Publish the eight blocks' rows and project each one, with the
+        // window-invariant leaf choice already made by the caller.
+        macro_rules! publish_project {
+            ($out_blk:expr, |$j:ident, $o:ident| $leaf:expr) => {{
+                let mut $j = 0usize;
+                while $j != 8 {
+                    rows.publish_dense_values($j, a_rows[$j], b_rows[$j]);
+                    let $o = &mut *proj
+                        .out
+                        .add($j * BYTES_PER_BLOCK + $out_blk * 64)
+                        .cast::<[u8; 64]>();
+                    $leaf;
+                    $j += 1;
+                }
+            }};
+        }
+
+        let pair32 = ey_drain_off32idx_enabled();
         if proj.one_rows_elided && blk == 2 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 2 * 64).cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0xfc,
-                );
-                j += 1;
+            if pair32 {
+                publish_project!(2, |j, o| round1_ab_inner_window_from_offsets_nt2_residual::<
+                    true,
+                >(offs!(j), o, plan, imgs, 0xfc));
+            } else {
+                publish_project!(2, |j, o| round1_ab_inner_window_from_offsets_nt2_residual::<
+                    false,
+                >(offs!(j), o, plan, imgs, 0xfc));
             }
             return;
         }
         if proj.one_rows_elided && blk == 29 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 29 * 64).cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0x0f,
-                );
-                j += 1;
+            if pair32 {
+                publish_project!(29, |j, o| round1_ab_inner_window_from_offsets_nt2_residual::<
+                    true,
+                >(offs!(j), o, plan, imgs, 0x0f));
+            } else {
+                publish_project!(29, |j, o| round1_ab_inner_window_from_offsets_nt2_residual::<
+                    false,
+                >(offs!(j), o, plan, imgs, 0x0f));
             }
             return;
         }
 
-        let mut j = 0usize;
-        while j != 8 {
-            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
-            if plan.bcomplement_static_eligible() {
+        if !ey_drain_bcomp_hoist_enabled() {
+            // Incumbent shape: the loop-invariant static-B complement test is
+            // re-evaluated inside every one of the eight blocks.
+            publish_project!(blk, |j, o| if plan.bcomplement_static_eligible() {
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
+                    offs!(j),
+                    o,
                     plan,
                     imgs,
                     blk,
-                );
+                )
             } else {
-                round1_ab_inner_window_from_offsets_nt2(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
+                round1_ab_inner_window_from_offsets_nt2::<false>(offs!(j), o, plan, imgs)
+            });
+            return;
+        }
+        if plan.bcomplement_static_eligible() {
+            publish_project!(blk, |j, o| {
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
+                    offs!(j),
+                    o,
                     plan,
                     imgs,
-                );
-            }
-            j += 1;
+                    blk,
+                )
+            });
+        } else if pair32 {
+            publish_project!(blk, |j, o| round1_ab_inner_window_from_offsets_nt2::<true>(
+                offs!(j),
+                o,
+                plan,
+                imgs
+            ));
+        } else {
+            publish_project!(blk, |j, o| round1_ab_inner_window_from_offsets_nt2::<false>(
+                offs!(j),
+                o,
+                plan,
+                imgs
+            ));
         }
     }
 }
@@ -786,7 +860,7 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                round1_ab_inner_window_from_offsets_nt2::<false>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
             }
         }
@@ -845,7 +919,7 @@ impl StreamProj<'_> {
                         blk,
                     );
                 } else {
-                    round1_ab_inner_window_from_offsets_nt2(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
+                    round1_ab_inner_window_from_offsets_nt2::<false>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 }
                 j+=1;
             }
@@ -862,7 +936,7 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                round1_ab_inner_window_from_offsets_nt2_residual::<false>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
         }
@@ -878,7 +952,7 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                round1_ab_inner_window_from_offsets_nt2_residual::<false>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
         }

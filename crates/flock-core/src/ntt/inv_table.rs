@@ -562,6 +562,74 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
     }
 }
 
+/// Bit-identical twin of [`apply_x86_avx512_register_2img_offw_at`] that reads
+/// the SAME `u16` offset block as four 32-bit words instead of two 64-bit
+/// words.
+///
+/// Both forms must materialise the eight pre-scaled offsets in eight general
+/// registers, because `byte * 64` exceeds x86's `*8` index scale, so the only
+/// question is how many front-end slots the split costs. The 64-bit read needs
+/// seven ALU ops per word (`movzwl`, `mov`+`shr`, `mov`+`shr`+`movzwl`, `shr`)
+/// for four fields — 2 loads + 14 ALU for the eight. A 32-bit read carries
+/// exactly two fields and splits in two: `movzwl %ax` for the low half and
+/// `shr $16` for the high half, which zero-extends into the full register on
+/// its own. That is 4 loads + 8 ALU: **four fewer instructions per apply**,
+/// with no copy left for the renamer to eliminate.
+///
+/// The extra pair of scalar loads is free here. One apply issues eight 512-bit
+/// table-row loads, and Sapphire Rapids retires at most two of those per
+/// cycle, so an apply cannot complete in under four cycles however it is
+/// written. Twelve loads over four cycles is inside the three-per-cycle L1
+/// limit, and 24 uops is inside the six-wide rename — the 28-uop form was
+/// front-end bound at 4.67 cycles, this one sits on the load-port floor.
+///
+/// x86-64 is little-endian and the offsets are `u16`-aligned, so `d as u16` is
+/// `off[2i]` and `d >> 16` is `off[2i+1]`: the same eight values, in the same
+/// order, indexing the same two images.
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_2img_offw_at`].
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at_pair32(
+    base: *const u8,
+    base8: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: eight readable pre-scaled offsets per the contract, i.e. four
+    // readable 32-bit words. Each extracted field is one of those offsets,
+    // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
+    // 64 readable bytes per row.
+    unsafe {
+        let d0 = (off as *const u32).read_unaligned();
+        let d1 = (off.add(2) as *const u32).read_unaligned();
+        let d2 = (off.add(4) as *const u32).read_unaligned();
+        let d3 = (off.add(6) as *const u32).read_unaligned();
+        let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+        let u0 = _mm512_xor_si512(
+            row(base, d0 as u16 as usize),
+            row(base8, (d0 >> 16) as usize),
+        );
+        let u1 = _mm512_xor_si512(
+            row(base, d1 as u16 as usize),
+            row(base8, (d1 >> 16) as usize),
+        );
+        let u2 = _mm512_xor_si512(
+            row(base, d2 as u16 as usize),
+            row(base8, (d2 >> 16) as usize),
+        );
+        let u3 = _mm512_xor_si512(
+            row(base, d3 as u16 as usize),
+            row(base8, (d3 >> 16) as usize),
+        );
+        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the

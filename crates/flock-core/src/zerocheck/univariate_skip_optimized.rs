@@ -1240,7 +1240,12 @@ pub unsafe fn round1_ab_inner_window_from_offsets(
 /// [`abinner_publish_fence`] before publishing the output across threads.
 #[inline]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
+///
+/// `PAIR32` selects only how the window's pre-scaled `u16` offsets are split
+/// into index registers: `false` is the incumbent two-64-bit-word read,
+/// `true` the four-32-bit-word read that costs four fewer instructions per
+/// apply. Both address identical table rows and produce identical bytes.
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const PAIR32: bool>(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1256,7 +1261,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
     ))]
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<PAIR32>(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1319,7 +1324,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const PAIR32: bool>(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1336,7 +1341,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<PAIR32>(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),

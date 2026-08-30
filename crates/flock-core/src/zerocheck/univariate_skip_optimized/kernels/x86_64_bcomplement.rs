@@ -307,7 +307,7 @@ mod tests {
                     table.image_ptrs(),
                     blk,
                 );
-                super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+                super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<false>(
                     off.as_ptr(),
                     &mut expected.0,
                     table.image_ptrs(),
