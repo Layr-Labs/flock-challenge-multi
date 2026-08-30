@@ -479,6 +479,38 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
+/// Run `op` on a pool worker instead of the calling thread.
+///
+/// When a non-worker thread opens a top-level rayon region, it parks on the
+/// region latch until the work completes. Wrapping a phase body in a tiny
+/// `rayon::join` moves that body onto a worker, so nested parallel regions
+/// opened from inside it stay in-worker instead of repeatedly re-entering from
+/// the main thread.
+///
+/// Schedule only: same pool, same work, same result. `FLOCK_NO_IN_POOL=1`
+/// restores the direct call, and callers that are already on a worker keep the
+/// direct call too.
+pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    if !in_pool_enabled() || rayon::current_thread_index().is_some() {
+        return op();
+    }
+    rayon::join(op, || ()).0
+}
+
+fn in_pool_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    #[cfg(test)]
+    if IN_POOL_TEST_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    *ON
+}
+
+#[cfg(test)]
+static IN_POOL_TEST_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
@@ -613,4 +645,53 @@ fn linux_physical_cores() -> Option<usize> {
         }
     }
     (!cores.is_empty()).then_some(cores.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static IN_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct InPoolDisableGuard {
+        prev: bool,
+    }
+
+    impl InPoolDisableGuard {
+        fn set(disabled: bool) -> Self {
+            let prev = IN_POOL_TEST_DISABLED.swap(disabled, Ordering::Relaxed);
+            Self { prev }
+        }
+    }
+
+    impl Drop for InPoolDisableGuard {
+        fn drop(&mut self) {
+            IN_POOL_TEST_DISABLED.store(self.prev, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn in_pool_uses_worker_from_non_worker_thread() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(false);
+        assert!(in_pool(|| rayon::current_thread_index().is_some()));
+    }
+
+    #[test]
+    fn in_pool_kill_switch_restores_direct_call() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(true);
+        assert!(in_pool(|| rayon::current_thread_index().is_none()));
+    }
+
+    #[test]
+    fn in_pool_preserves_result() {
+        let _lock = IN_POOL_TEST_LOCK.lock().unwrap();
+        let _guard = InPoolDisableGuard::set(false);
+        let expect = (0_u64..8192).map(|x| x * x + 3).sum::<u64>();
+        let got = in_pool(|| (0_u64..8192).map(|x| x * x + 3).sum::<u64>());
+        assert_eq!(got, expect);
+    }
 }
