@@ -400,25 +400,43 @@ pub(crate) unsafe fn gfni_fold_tile(
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
             let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
+            for byte_k in (0..16).step_by(2) {
+                let p0 = planes.add(byte_k * 64) as *mut __m512i;
+                let p1 = planes.add((byte_k + 1) * 64) as *mut __m512i;
+                let mut acc0 = if seed_zero {
                     _mm512_setzero_si512()
                 } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    _mm512_loadu_si512(p0 as *const __m512i)
+                };
+                let mut acc1 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(p1 as *const __m512i)
                 };
                 for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
+                    let r0 = rows[t];
+                    let r1 = rows[t + 1];
+                    let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r0,
                         _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
                     );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
+                    let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r0,
+                        _mm512_set1_epi64(mats[t * 16 + byte_k + 1] as i64),
+                    );
+                    let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r1,
                         _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
                     );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                    let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r1,
+                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k + 1] as i64),
+                    );
+                    acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+                    acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
                 }
-                _mm512_storeu_si512(plane_ptr, acc);
+                _mm512_storeu_si512(p0, acc0);
+                _mm512_storeu_si512(p1, acc1);
             }
         }
     }
