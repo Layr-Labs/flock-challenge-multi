@@ -304,36 +304,41 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
-/// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
-/// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
-/// the same even/odd message layout as `msg_reduce_avx512`.
+/// Shared fused fold+msg body used by the in-place DirectFold8 bind and by
+/// the out-of-place remaining-opening chunk path. `src_base` is the pair
+/// index of `dst[0]` in each source buffer (`0` for the in-place bind).
 ///
-/// In-place is safe because output `t` depends only on source `2t..2t+2`,
-/// and stores of `dst[0..t)` never overlap unread source `2t..`.
+/// Same permute body as [`fold_pairs`] and the same even/odd message layout
+/// as `msg_reduce_avx512`. Dest stores of `t..t+8` never overlap unread
+/// source `2*(src_base+t)..` when `src` and `dst` alias (in-place); they
+/// never alias on the opening path.
 ///
 /// # Safety
-/// Requires `avx512f` and `vpclmulqdq`. `f.len() == b.len()`, multiple of 4.
+/// Requires `avx512f` and `vpclmulqdq`. Each source covers
+/// `2*(src_base + n)` F128s; each dest covers `n`. `n` is a multiple of 4.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(super) unsafe fn fold_two_and_msg_in_place(
-    f: &mut Vec<F128>,
-    b: &mut Vec<F128>,
+unsafe fn fold_two_and_msg_kernel(
+    f_src: *const F128,
+    b_src: *const F128,
+    src_base: usize,
+    f_dst: *mut F128,
+    b_dst: *mut F128,
+    n: usize,
     r: F128,
 ) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
-    debug_assert_eq!(f.len(), b.len());
-    debug_assert!(f.len().is_multiple_of(4));
-    let half = f.len() / 2;
+    debug_assert!(n.is_multiple_of(4));
 
-    // SAFETY: caller guarantees features and even pair counts; loads of
-    // `2t..2t+8` complete before stores to `t..t+4` overlap those addresses.
+    // SAFETY: caller guarantees features, bounds, and that in-place aliasing
+    // loads of `2*(src_base+t)..+8` complete before dest stores to `t..t+4`.
     unsafe {
         let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
         let r_x64 = ghash_shift64_x4(r_bcast);
 
         let fold4 = |ptr: *const F128, t: usize| -> __m512i {
-            let s = 2 * t;
+            let s = 2 * (src_base + t);
             let lo = _mm512_loadu_si512(ptr.add(s) as *const __m512i);
             let hi = _mm512_loadu_si512(ptr.add(s + 4) as *const __m512i);
             let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
@@ -344,19 +349,17 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
 
         let mut u0_acc = WideGhashX4::zero();
         let mut u2_acc = WideGhashX4::zero();
-        let f_ptr = f.as_mut_ptr();
-        let b_ptr = b.as_mut_ptr();
-        let lanes = half & !7;
+        let lanes = n & !7;
         let mut t = 0usize;
         while t < lanes {
-            let f0 = fold4(f_ptr, t);
-            let f1 = fold4(f_ptr, t + 4);
-            let b0 = fold4(b_ptr, t);
-            let b1 = fold4(b_ptr, t + 4);
-            _mm512_storeu_si512(f_ptr.add(t) as *mut __m512i, f0);
-            _mm512_storeu_si512(f_ptr.add(t + 4) as *mut __m512i, f1);
-            _mm512_storeu_si512(b_ptr.add(t) as *mut __m512i, b0);
-            _mm512_storeu_si512(b_ptr.add(t + 4) as *mut __m512i, b1);
+            let f0 = fold4(f_src, t);
+            let f1 = fold4(f_src, t + 4);
+            let b0 = fold4(b_src, t);
+            let b1 = fold4(b_src, t + 4);
+            _mm512_storeu_si512(f_dst.add(t) as *mut __m512i, f0);
+            _mm512_storeu_si512(f_dst.add(t + 4) as *mut __m512i, f1);
+            _mm512_storeu_si512(b_dst.add(t) as *mut __m512i, b0);
+            _mm512_storeu_si512(b_dst.add(t + 4) as *mut __m512i, b1);
 
             let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
             let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
@@ -375,23 +378,91 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
 
         let mut u0 = u0_acc.fold().reduce();
         let mut u2 = u2_acc.fold().reduce();
-        while t < half {
-            let source = 2 * t;
-            let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
-            let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
-            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
-            *f_ptr.add(t) = f0;
-            *f_ptr.add(t + 1) = f1;
-            *b_ptr.add(t) = b0;
-            *b_ptr.add(t + 1) = b1;
+        while t < n {
+            let source = 2 * (src_base + t);
+            let f0 = *f_src.add(source) + r * (*f_src.add(source) + *f_src.add(source + 1));
+            let f1 = *f_src.add(source + 2) + r * (*f_src.add(source + 2) + *f_src.add(source + 3));
+            let b0 = *b_src.add(source) + r * (*b_src.add(source) + *b_src.add(source + 1));
+            let b1 = *b_src.add(source + 2) + r * (*b_src.add(source + 2) + *b_src.add(source + 3));
+            *f_dst.add(t) = f0;
+            *f_dst.add(t + 1) = f1;
+            *b_dst.add(t) = b0;
+            *b_dst.add(t + 1) = b1;
             u0 += f0 * b0;
             u2 += (f0 + f1) * (b0 + b1);
             t += 2;
         }
-        f.truncate(half);
-        b.truncate(half);
         (u0, u2)
+    }
+}
+
+/// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
+/// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
+/// the same even/odd message layout as `msg_reduce_avx512`.
+///
+/// In-place is safe because output `t` depends only on source `2t..2t+2`,
+/// and stores of `dst[0..t)` never overlap unread source `2t..`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `f.len() == b.len()`, multiple of 4.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_two_and_msg_in_place(
+    f: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(f.len().is_multiple_of(4));
+    let half = f.len() / 2;
+    // SAFETY: forwarded; in-place aliasing is the kernel's documented contract.
+    let (u0, u2) = unsafe {
+        fold_two_and_msg_kernel(
+            f.as_ptr(),
+            b.as_ptr(),
+            0,
+            f.as_mut_ptr(),
+            b.as_mut_ptr(),
+            half,
+            r,
+        )
+    };
+    f.truncate(half);
+    b.truncate(half);
+    (u0, u2)
+}
+
+/// Out-of-place twin of [`fold_two_and_msg_in_place`]: fold pairs
+/// `src[2*(base+t) .. +2]` into `dst[t]` on both sides and accumulate
+/// `(u0,u2)` from the just-folded registers. Used by remaining opening
+/// rounds whose dest is a fresh half-buffer, not an in-place prefix.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`. `fc.len() == bc.len()`, multiple of
+/// 4; both sources contain every selected pair.
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold_two_and_msg_into(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    debug_assert_eq!(fc.len(), bc.len());
+    debug_assert_eq!(f.len(), b.len());
+    debug_assert!(fc.len().is_multiple_of(4));
+    debug_assert!(base + fc.len() <= f.len() / 2);
+    // SAFETY: forwarded; dest is a disjoint half-buffer on the opening path.
+    unsafe {
+        fold_two_and_msg_kernel(
+            f.as_ptr(),
+            b.as_ptr(),
+            base,
+            fc.as_mut_ptr(),
+            bc.as_mut_ptr(),
+            fc.len(),
+            r,
+        )
     }
 }
 

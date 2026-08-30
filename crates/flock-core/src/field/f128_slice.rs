@@ -111,6 +111,42 @@ pub(crate) fn fold_two_and_msg_in_place(
     fold_two_and_msg_in_place_scalar(f, b, r)
 }
 
+/// Out-of-place fused pair-fold + `(u0,u2)` accumulate. Same values as
+/// [`fold_pairs`] on `f` and `b` into `fc`/`bc` followed by the AVX-512
+/// message reduce of those dests. Ranked remaining-opening chunks use this
+/// so the message reads the just-folded registers instead of reloading dest.
+///
+/// # Safety
+/// None at this layer: the x86 kernel is cfg-gated and the assertions match
+/// its contract. Portable builds do not compile this symbol.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn fold_two_and_msg_into(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    assert_eq!(fc.len(), bc.len(), "fused fold dest lengths changed");
+    assert_eq!(f.len(), b.len(), "fused fold source lengths changed");
+    assert!(
+        base <= f.len() / 2 && fc.len() <= f.len() / 2 - base,
+        "fused fold source must contain both elements for every destination pair"
+    );
+    assert!(
+        fc.len().is_multiple_of(4),
+        "fused fold dest length must be a multiple of 4"
+    );
+    // SAFETY: cfg gate + assertions match [`x86_64::fold_two_and_msg_into`].
+    unsafe { x86_64::fold_two_and_msg_into(f, b, base, fc, bc, r) }
+}
+
 /// Scalar DirectFold8 bind. Also the kill-switch restore and the test oracle.
 pub(super) fn fold_two_and_msg_in_place_scalar(
     f: &mut Vec<F128>,
@@ -436,6 +472,62 @@ mod tests {
             assert_eq!(got, want, "message n={n}");
             assert_eq!(f_got, f_want, "folded f n={n}");
             assert_eq!(b_got, b_want, "folded b n={n}");
+        }
+    }
+
+    /// Out-of-place fused opening leaf matches two [`fold_pairs`] plus the
+    /// in-place bind's message on a copied prefix (base = 0) and on a
+    /// mid-buffer slice (base = 4).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold_two_and_msg_into_matches_fold_pairs() {
+        use super::*;
+        let mut state = 0xA11C_EDED_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (src_len, base, n) in [(16usize, 0usize, 8usize), (64, 4, 16), (256, 8, 64)] {
+            let r = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let f: Vec<F128> = (0..src_len)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let b: Vec<F128> = (0..src_len)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut fc = vec![F128::ZERO; n];
+            let mut bc = vec![F128::ZERO; n];
+            let got = fold_two_and_msg_into(&f, &b, base, &mut fc, &mut bc, r);
+            let mut fc_want = vec![F128::ZERO; n];
+            let mut bc_want = vec![F128::ZERO; n];
+            fold_pairs(&f, base, &mut fc_want, r);
+            fold_pairs(&b, base, &mut bc_want, r);
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            let mut k = 0usize;
+            while k + 1 < n {
+                u0 += fc_want[k] * bc_want[k];
+                u2 += (fc_want[k] + fc_want[k + 1]) * (bc_want[k] + bc_want[k + 1]);
+                k += 2;
+            }
+            assert_eq!(fc, fc_want, "folded f src={src_len} base={base} n={n}");
+            assert_eq!(bc, bc_want, "folded b src={src_len} base={base} n={n}");
+            assert_eq!(got, (u0, u2), "message src={src_len} base={base} n={n}");
         }
     }
 

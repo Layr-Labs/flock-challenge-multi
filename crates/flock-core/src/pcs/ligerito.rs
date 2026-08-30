@@ -4106,6 +4106,20 @@ fn open_ood_x4_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_OPEN_FUSED_MSG=1` restores two `fold_pairs` plus
+/// [`msg_reduce_avx512`] on the temporal remaining-opening path (exact
+/// same-binary A/B). Ranked env is cleared, so the fused leaf runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_fused_msg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_FUSED_MSG").is_none());
+    *ON
+}
+
 /// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
 /// `MOVNTDQ`). Same helper shape as the promoted seed-fused publish
 /// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM, because large pool /
@@ -4316,6 +4330,21 @@ fn fold_and_msg_lsb_inner(
         && deferred_basis.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // Remaining DF8 opening rounds start at half = 2^18, so the NT leaf
+    // above does not fire. The temporal path currently does two `fold_pairs`
+    // then reloads dest for `msg_reduce_avx512`. Reuse the already-resident
+    // fused fold+msg kernel (same body as the DirectFold8 in-place bind) so
+    // `(u0,u2)` accumulates from the just-folded registers. Kill
+    // `FLOCK_NO_OPEN_FUSED_MSG=1` restores two `fold_pairs` + reduce.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let use_fused_msg = lazy_ood.is_none()
+        && deferred_basis.is_none()
+        && !use_nt
+        && open_fused_msg_enabled();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4415,6 +4444,14 @@ fn fold_and_msg_lsb_inner(
                 }
             }
             let len = fc.len();
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if use_fused_msg && len.is_multiple_of(4) {
+                return crate::field::f128_slice::fold_two_and_msg_into(f, b, base, fc, bc, r);
+            }
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             if let Some((basis, alpha)) = deferred_basis {
