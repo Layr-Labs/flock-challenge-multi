@@ -1470,6 +1470,19 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
 /// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
+/// `FLOCK_NO_FOLD8_BIND_GRAIN=1` restores the implicit 1-element rayon grain
+/// of the ranked Fold8 s_hat_v bind. Ranked env is cleared, so 512 runs.
+fn fold8_bind_grain() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_FOLD8_BIND_GRAIN").is_some() {
+            1
+        } else {
+            512
+        }
+    });
+    *N
+}
+
 pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -1494,10 +1507,22 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
         let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        // Ranked default: 512-element rayon grains (16 tasks on 8192). HEAD
+        // uses the implicit 1-element grain. `FLOCK_NO_FOLD8_BIND_GRAIN=1`
+        // restores the incumbent.
+        let grain = fold8_bind_grain();
+        if grain > 1 {
+            out.par_iter_mut()
+                .with_min_len(grain)
+                .zip(z0.par_iter().with_min_len(grain))
+                .zip(z1.par_iter().with_min_len(grain))
+                .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        } else {
+            out.par_iter_mut()
+                .zip(z0.par_iter())
+                .zip(z1.par_iter())
+                .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        }
         return out;
     }
 
