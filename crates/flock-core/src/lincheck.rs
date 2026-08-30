@@ -1231,6 +1231,24 @@ fn reduce_single_pass_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_REDUCE_GROUP=1` restores one Rayon task per 64-F128 plane
+/// block in the GFNI cross-worker reduce. The grouped arm keeps four adjacent
+/// independent output blocks in one task; each block retains the incumbent
+/// worker-XOR order and transpose, so only task granularity changes.
+fn reduce_group_enabled() -> bool {
+    #[cfg(test)]
+    if REDUCE_GROUP_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_GROUP").is_none());
+    *ON
+}
+
+#[cfg(test)]
+static REDUCE_GROUP_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
 /// per-chunk `Instant::now()` probes inside the block-major sweep (the
 /// incumbent behaviour, and the way to get the tables / transpose+read /
@@ -1809,11 +1827,42 @@ fn fold_block_major_gfni(
             crate::field::f128_slice::bind_split_half(o, &hi, r);
         }
     };
+    // Four adjacent 64-F128 blocks are independent: grouping them only
+    // reduces Rayon's leaf/task count, while each block keeps the incumbent
+    // worker-XOR association and transpose order. The output lengths are
+    // powers of two and therefore divisible by four blocks on this path.
+    const REDUCE_GROUP_BLOCKS: usize = 4;
+    let reduce_group = reduce_group_enabled();
     if let Some(one) = one.as_mut() {
-        out.par_chunks_mut(64)
-            .zip(one.par_chunks_mut(64))
+        if reduce_group {
+            out.par_chunks_mut(64 * REDUCE_GROUP_BLOCKS)
+                .zip(one.par_chunks_mut(64 * REDUCE_GROUP_BLOCKS))
+                .enumerate()
+                .for_each(|(group, (o, one_o))| {
+                    for sub in 0..REDUCE_GROUP_BLOCKS {
+                        let lo = sub * 64;
+                        reduce_block(
+                            group * REDUCE_GROUP_BLOCKS + sub,
+                            &mut o[lo..lo + 64],
+                            Some(&mut one_o[lo..lo + 64]),
+                        );
+                    }
+                });
+        } else {
+            out.par_chunks_mut(64)
+                .zip(one.par_chunks_mut(64))
+                .enumerate()
+                .for_each(|(blk, (o, one_o))| reduce_block(blk, o, Some(one_o)));
+        }
+    } else if reduce_group {
+        out.par_chunks_mut(64 * REDUCE_GROUP_BLOCKS)
             .enumerate()
-            .for_each(|(blk, (o, one_o))| reduce_block(blk, o, Some(one_o)));
+            .for_each(|(group, o)| {
+                for sub in 0..REDUCE_GROUP_BLOCKS {
+                    let lo = sub * 64;
+                    reduce_block(group * REDUCE_GROUP_BLOCKS + sub, &mut o[lo..lo + 64], None);
+                }
+            });
     } else {
         out.par_chunks_mut(64)
             .enumerate()
@@ -3902,6 +3951,30 @@ mod tests {
             );
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
 
+            // Same-process A/B for the reduce task granularity. The grouped
+            // and one-block-per-task arms must agree exactly; this case also
+            // exercises the ranked 128-column geometry with a tail block.
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "gfni"
+            ))]
+            if (m, k_log, useful_bits) == (20, 14, 15_409) {
+                REDUCE_GROUP_FORCED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                let got_single = partial_fold_packed_z_block_major_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq_outer,
+                );
+                REDUCE_GROUP_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    got, got_single,
+                    "grouped reduce differs from single-block reduce"
+                );
+            }
+
             // Same call with the GFNI plane arm forced off: the nibble/scalar
             // sweep must produce the identical vector (arm-vs-arm identity in
             // one process; the env switches resolve once so a latch is the
@@ -3927,6 +4000,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn partial_fold_block_major_reduce_group_top_bind_agrees() {
+        let m = 16;
+        let k_log = 10;
+        let useful_bits = 997;
+        let mut rng = Rng::new(0xA11C_E004);
+        let n_outer = 1usize << (m - k_log);
+        let z_block_major = rng.f128_vec(n_outer * ((1usize << k_log) / 128));
+        let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+        let r = rng.f128();
+
+        let grouped = partial_fold_packed_z_block_major_padded_with_tables_result(
+            &z_block_major,
+            m,
+            k_log,
+            useful_bits,
+            |outer_base| std::array::from_fn(|lane| eq_outer[outer_base + lane]),
+            Some(r),
+            false,
+        );
+        REDUCE_GROUP_FORCED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        let single = partial_fold_packed_z_block_major_padded_with_tables_result(
+            &z_block_major,
+            m,
+            k_log,
+            useful_bits,
+            |outer_base| std::array::from_fn(|lane| eq_outer[outer_base + lane]),
+            Some(r),
+            false,
+        );
+        REDUCE_GROUP_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            grouped, single,
+            "grouped top-bind reduce differs from single-block"
+        );
     }
 
     /// Scalar oracle for the exact `VPERMT2B` selector semantics used by the

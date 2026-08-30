@@ -229,9 +229,10 @@ pub(crate) mod topology_pool {
 /// Rollback is compile-time, because `run_trial` calls `env_clear()` and no
 /// `FLOCK_*` variable reaches the ranked worker: set
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
-/// restored and no extra thread is spawned. The two env vars are local
-/// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split.
+/// restored and no extra thread is spawned. The environment controls are
+/// local diagnostics only. The split remains available through the
+/// compile-time switch and an explicit local opt-in; the shipped default is
+/// the incumbent schedule.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -371,6 +372,12 @@ pub(crate) mod smt_split {
 
         pub(super) fn build() -> Option<(ThreadPool, ThreadPool)> {
             let debug = std::env::var_os("FLOCK_SMT_SPLIT_DEBUG").is_some();
+            if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT").is_none() {
+                if debug {
+                    eprintln!("[smt_split] disabled without FLOCK_ZC_R1_SMT_SPLIT");
+                }
+                return None;
+            }
             if std::env::var_os("FLOCK_NO_ZC_R1_SMT_SPLIT").is_some() {
                 if debug {
                     eprintln!("[smt_split] disabled by FLOCK_NO_ZC_R1_SMT_SPLIT");
