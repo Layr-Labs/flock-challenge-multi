@@ -1051,8 +1051,23 @@ fn prepare_round1_bcomplement_static(
         target_feature = "avx512bw"
     ))]
     {
+        // Default flipped to OFF on the minimum-work line. Measured with
+        // `perf stat -e instructions:u` on the crown binary (0672469, 8
+        // round-robin rounds, seed 424242, log2 18): the static-B complement
+        // projection *adds* 0.152% of all retired user instructions. The
+        // complement removes a table load per known-one byte but pays a
+        // fixed per-window complement-and-correct sequence for it, and on
+        // this geometry the correction costs more instructions than the
+        // loads it deletes.
+        //
+        // This is an instruction-count decision, not a wall-clock one: loads
+        // and ALU ops are not interchangeable, so re-enable with
+        // `FLOCK_R1_B_COMPLEMENT_STATIC=1` before concluding anything about
+        // latency. `FLOCK_NO_R1_B_COMPLEMENT_STATIC=1` remains honoured and
+        // still forces the mechanism off.
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT_STATIC").is_none()
+            std::env::var_os("FLOCK_R1_B_COMPLEMENT_STATIC").is_some()
+                && std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT_STATIC").is_none()
         });
         if !*ON
             || !kernels::shift_reduce_offsets_eligible(kernel, false, 2)

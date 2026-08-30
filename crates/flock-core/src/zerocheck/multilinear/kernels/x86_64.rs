@@ -1389,11 +1389,27 @@ fn zc_b_sparse_enabled() -> bool {
     *ENABLED
 }
 
+/// Default flipped to OFF on the minimum-work line. Measured with
+/// `perf stat -e instructions:u` on the crown binary (0672469, 8 round-robin
+/// rounds, seed 424242, log2 18): the canonical prefold *adds*
+/// 0.157% of all retired user instructions, and adds them again on top of the
+/// static-B complement (`FLOCK_NO_R1_B_COMPLEMENT_STATIC`) for -0.326%
+/// together. It buys that with a raw-byte guard (two ZMM loads plus a
+/// comparison per 16-row group) that fails on most groups, so the omitted
+/// affine work is charged for far more often than it is skipped.
+///
+/// This is an instruction-count decision, not a wall-clock one: the mechanism
+/// was originally landed on a measured zerocheck-round-2 *time* win, so
+/// re-enable it with `FLOCK_ZC_B_CANONICAL_PREFOLD=1` before concluding
+/// anything about latency. `FLOCK_NO_ZC_B_CANONICAL_PREFOLD=1` remains
+/// honoured and still forces the mechanism off, so both prior A/B arms and
+/// the flipped default coexist.
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline]
 fn zc_b_canonical_prefold_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
+        std::env::var_os("FLOCK_ZC_B_CANONICAL_PREFOLD").is_some()
+            && std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
     });
     *ENABLED
 }
