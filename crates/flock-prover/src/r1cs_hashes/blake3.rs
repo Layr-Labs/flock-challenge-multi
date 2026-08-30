@@ -2168,14 +2168,6 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
-        && skip_blocks == 0
-        && z.len() / F128_PER_BLOCK == 1 << 18
-        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
-        && flock_core::pcs::ranked_direct_fold8_enabled();
-    if one_rows_elided {
-        ab_inner.set_ranked_one_rows_elided();
-    }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2193,6 +2185,15 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
+    // Match the witness kernel's E=true dispatch exactly. Cold/partial
+    // provenance and non-offset plans produce dense AB, not a residual.
+    let one_rows_elided = ab_stream
+        && skip_blocks == 0
+        && z.len() / F128_PER_BLOCK == 1 << 18
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+        && flock_core::pcs::ranked_direct_fold8_enabled();
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -2365,6 +2366,11 @@ fn generate_round1_inner_octa(
                 }
             },
         );
+    // Publish the representation tag only after all producers and their
+    // non-temporal-store fences have completed.
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck

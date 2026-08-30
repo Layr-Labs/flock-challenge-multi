@@ -556,6 +556,20 @@ impl WideGhashX4 {
             _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
     }
 
+    /// XOR an already formed unreduced product into this accumulator.
+    /// This permits several coefficients to share the same product without
+    /// repeating its carry-less multiplications or reducing it early.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn xor_acc(&mut self, rhs: Self) {
+        self.lo = _mm512_xor_si512(self.lo, rhs.lo);
+        self.hi = _mm512_xor_si512(self.hi, rhs.hi);
+        self.mid = _mm512_xor_si512(self.mid, rhs.mid);
+    }
+
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
     /// result holds the 4 reduced lane sums, field-identical to reducing every
     /// accumulated product separately and XORing per lane.

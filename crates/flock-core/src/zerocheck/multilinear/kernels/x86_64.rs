@@ -224,6 +224,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         const B_SPECIAL_NONE: u8 = 2;
         let b_ones_on = zc_b_ones_enabled();
         let b_sparse_on = zc_b_sparse_enabled();
+        let b_sparse_shared = zc_b_sparse_shared_enabled();
         let pair_in_b_block = pair_idx_base & (B_ONES_BLOCK_PAIRS - 1);
         let (mut b_special_head, mut b_special_kind) = match (b_ones_on, b_sparse_on) {
             (true, true) if pair_in_b_block == 0 => (0, B_SPECIAL_ONES),
@@ -527,9 +528,6 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     if all == 0xff {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let a1_msg = _mm512_xor_si512(a0, a1);
-                        let a5_msg = _mm512_xor_si512(a0, a2);
-                        let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
                         let wb = if let Some(wt) = wtab {
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
@@ -551,9 +549,29 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                                 ghash_mul_x4(w, b0_lane0)
                             }
                         };
-                        acc[1].mul_acc(a1_msg, wb);
-                        acc[5].mul_acc(a5_msg, wb);
-                        acc[7].mul_acc(a7_msg, wb);
+                        // The B check above confines wb to F128 lane zero.
+                        // Only that lane of a1/a2/a3 must vanish; other A
+                        // lanes are immaterial and are not assumed zero.
+                        // Ranked padding has precisely this shape, while
+                        // any other shape retains the three-product path.
+                        let share_product = b_sparse_shared && {
+                            let a_tail = _mm512_or_si512(a1, _mm512_or_si512(a2, a3));
+                            (_mm512_cmpeq_epi64_mask(a_tail, zero) & 0x03) == 0x03
+                        };
+                        if share_product {
+                            let mut product = WideGhashX4::zero();
+                            product.mul_acc(a0, wb);
+                            acc[1].xor_acc(product);
+                            acc[5].xor_acc(product);
+                            acc[7].xor_acc(product);
+                        } else {
+                            let a1_msg = _mm512_xor_si512(a0, a1);
+                            let a5_msg = _mm512_xor_si512(a0, a2);
+                            let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
+                            acc[1].mul_acc(a1_msg, wb);
+                            acc[5].mul_acc(a5_msg, wb);
+                            acc[7].mul_acc(a7_msg, wb);
+                        }
                         x_lo += 8;
                         continue;
                     }
@@ -1337,6 +1355,13 @@ pub(crate) fn zc_b_ones_enabled() -> bool {
 fn zc_b_sparse_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_SPARSE").is_none());
+    *ENABLED
+}
+
+#[inline]
+fn zc_b_sparse_shared_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_SPARSE_SHARED").is_none());
     *ENABLED
 }
 
