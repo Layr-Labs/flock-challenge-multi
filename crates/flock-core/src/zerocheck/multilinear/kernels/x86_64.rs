@@ -217,30 +217,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
-        const B_ONES_BLOCK_PAIRS: usize = 128;
+        const B_BLOCK_PAIRS: usize = 128;
         const B_SPARSE_PAIR: usize = 120;
-        const B_SPECIAL_ONES: u8 = 0;
-        const B_SPECIAL_SPARSE: u8 = 1;
-        const B_SPECIAL_NONE: u8 = 2;
-        let b_ones_on = zc_b_ones_enabled();
-        let b_sparse_on = zc_b_sparse_enabled();
-        let pair_in_b_block = pair_idx_base & (B_ONES_BLOCK_PAIRS - 1);
-        let (mut b_special_head, mut b_special_kind) = match (b_ones_on, b_sparse_on) {
-            (true, true) if pair_in_b_block == 0 => (0, B_SPECIAL_ONES),
-            (true, true) if pair_in_b_block <= B_SPARSE_PAIR => {
-                (B_SPARSE_PAIR - pair_in_b_block, B_SPECIAL_SPARSE)
-            }
-            (true, true) => (B_ONES_BLOCK_PAIRS - pair_in_b_block, B_SPECIAL_ONES),
-            (true, false) => (
-                (B_ONES_BLOCK_PAIRS - pair_in_b_block) & (B_ONES_BLOCK_PAIRS - 1),
-                B_SPECIAL_ONES,
-            ),
-            (false, true) => (
-                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block)
-                    & (B_ONES_BLOCK_PAIRS - 1),
-                B_SPECIAL_SPARSE,
-            ),
-            (false, false) => (usize::MAX, B_SPECIAL_NONE),
+        let pair_in_b_block = pair_idx_base & (B_BLOCK_PAIRS - 1);
+        let mut b_sparse_head = if zc_b_sparse_enabled() {
+            (B_SPARSE_PAIR + B_BLOCK_PAIRS - pair_in_b_block) & (B_BLOCK_PAIRS - 1)
+        } else {
+            usize::MAX
         };
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
@@ -457,106 +440,39 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
-            if x_lo == b_special_head {
-                let special_kind = b_special_kind;
-                if b_ones_on && b_sparse_on {
-                    if special_kind == B_SPECIAL_ONES {
-                        b_special_head = b_special_head.wrapping_add(B_SPARSE_PAIR);
-                        b_special_kind = B_SPECIAL_SPARSE;
+            if x_lo == b_sparse_head {
+                b_sparse_head = b_sparse_head.wrapping_add(B_BLOCK_PAIRS);
+                let zero = _mm512_setzero_si512();
+                let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
+                let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
+                    & _mm512_cmpeq_epi64_mask(b1, zero)
+                    & _mm512_cmpeq_epi64_mask(b2, zero)
+                    & _mm512_cmpeq_epi64_mask(b3, zero);
+                if all == 0xff {
+                    let a1_msg = _mm512_xor_si512(a0, a1);
+                    let a5_msg = _mm512_xor_si512(a0, a2);
+                    let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
+                    let wb = if let Some(wt) = wtab {
+                        let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                        let w = _mm512_loadu_si512(wp);
+                        let w64 = _mm512_loadu_si512(wp.add(1));
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                     } else {
-                        b_special_head =
-                            b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS - B_SPARSE_PAIR);
-                        b_special_kind = B_SPECIAL_ONES;
-                    }
-                } else {
-                    b_special_head = b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS);
-                }
-                if special_kind == B_SPECIAL_ONES {
-                    let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
-                    let all = _mm512_cmpeq_epi64_mask(b0, one)
-                        & _mm512_cmpeq_epi64_mask(b1, one)
-                        & _mm512_cmpeq_epi64_mask(b2, one)
-                        & _mm512_cmpeq_epi64_mask(b3, one);
-                    if all == 0xff {
-                        let (a1w, a2w, a3w) = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            (
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                            )
+                        let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                        let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                        let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                        if wsplit {
+                            let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                         } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
-                                )
-                            } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
-                            }
-                        };
-                        #[cfg(test)]
-                        B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        acc[0].mul_acc_one(a1w);
-                        acc[2].mul_acc_one(a3w);
-                        acc[4].mul_acc_one(a2w);
-                        x_lo += 8;
-                        continue;
-                    }
-                } else {
-                    let zero = _mm512_setzero_si512();
-                    let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
-                    let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
-                        & _mm512_cmpeq_epi64_mask(b1, zero)
-                        & _mm512_cmpeq_epi64_mask(b2, zero)
-                        & _mm512_cmpeq_epi64_mask(b3, zero);
-                    if all == 0xff {
-                        #[cfg(test)]
-                        B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let a1_msg = _mm512_xor_si512(a0, a1);
-                        let a5_msg = _mm512_xor_si512(a0, a2);
-                        let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
-                        let wb = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
-                        } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
-                            } else {
-                                ghash_mul_x4(w, b0_lane0)
-                            }
-                        };
-                        acc[1].mul_acc(a1_msg, wb);
-                        acc[5].mul_acc(a5_msg, wb);
-                        acc[7].mul_acc(a7_msg, wb);
-                        x_lo += 8;
-                        continue;
-                    }
+                            ghash_mul_x4(w, b0_lane0)
+                        }
+                    };
+                    acc[1].mul_acc(a1_msg, wb);
+                    acc[5].mul_acc(a5_msg, wb);
+                    acc[7].mul_acc(a7_msg, wb);
+                    x_lo += 8;
+                    continue;
                 }
             }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -1319,20 +1235,6 @@ pub(crate) fn zc_wsplit_enabled() -> bool {
     *ON
 }
 
-#[cfg(test)]
-pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) static B_SPARSE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub(crate) fn zc_b_ones_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_ONES").is_none());
-    *ON
-}
-
 #[inline]
 fn zc_b_sparse_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
@@ -1745,7 +1647,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
