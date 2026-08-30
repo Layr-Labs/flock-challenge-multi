@@ -19,6 +19,14 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
 
+/// Ranked-static B-complement projection (x86 AVX-512/GFNI only).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(super) mod x86_64_bcomplement;
 /// Static-B round-1 kernel (x86 AVX-512/GFNI only). See `x86_64_bstatic.rs`.
 #[cfg(all(
     target_arch = "x86_64",

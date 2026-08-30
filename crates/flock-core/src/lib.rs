@@ -17,6 +17,8 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// Yukon source-archive marker: zarar@1337 ranked-stack redraw 2026-08-30-B.
+
 pub mod bits;
 pub mod challenger;
 pub mod field;
