@@ -27,6 +27,7 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const,
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_table_images,
 };
@@ -801,6 +802,41 @@ impl StreamProj<'_> {
         unsafe {
             debug_assert!(blk > 1 && blk < 30);
             debug_assert!(plan.bcomplement_static_eligible());
+            static CONSTWIN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("FLOCK_NO_R1_B_CONSTWIN").as_deref()
+                    != Some(std::ffi::OsStr::new("1"))
+            });
+            if *CONSTWIN {
+                match blk {
+                    3 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<3>(plan,imgs,rows,off),
+                    4 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<4>(plan,imgs,rows,off),
+                    5 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<5>(plan,imgs,rows,off),
+                    6 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<6>(plan,imgs,rows,off),
+                    7 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<7>(plan,imgs,rows,off),
+                    8 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<8>(plan,imgs,rows,off),
+                    9 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<9>(plan,imgs,rows,off),
+                    10 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<10>(plan,imgs,rows,off),
+                    11 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<11>(plan,imgs,rows,off),
+                    12 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<12>(plan,imgs,rows,off),
+                    13 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<13>(plan,imgs,rows,off),
+                    14 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<14>(plan,imgs,rows,off),
+                    15 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<15>(plan,imgs,rows,off),
+                    16 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<16>(plan,imgs,rows,off),
+                    17 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<17>(plan,imgs,rows,off),
+                    18 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<18>(plan,imgs,rows,off),
+                    19 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<19>(plan,imgs,rows,off),
+                    20 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<20>(plan,imgs,rows,off),
+                    21 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<21>(plan,imgs,rows,off),
+                    22 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<22>(plan,imgs,rows,off),
+                    23 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<23>(plan,imgs,rows,off),
+                    24 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<24>(plan,imgs,rows,off),
+                    25 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<25>(plan,imgs,rows,off),
+                    26 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<26>(plan,imgs,rows,off),
+                    27 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<27>(plan,imgs,rows,off),
+                    28 => return self.project_blocks_ranked_hot_offsets_bcomplement_const::<28>(plan,imgs,rows,off),
+                    _ => {}
+                }
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
@@ -812,6 +848,28 @@ impl StreamProj<'_> {
                     plan,
                     imgs,
                     blk,
+                );
+                j+=1;
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_bcomplement_const<const BLK: usize>(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            debug_assert!((3..=28).contains(&BLK));
+            debug_assert!(plan.bcomplement_static_eligible());
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK>(
+                    &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
                 );
                 j+=1;
             }
