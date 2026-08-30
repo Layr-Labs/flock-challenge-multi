@@ -2832,11 +2832,26 @@ fn direct_fold8_states_seq(
     (a_state, w_state, round0)
 }
 
+/// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather layout
+/// in [`direct_fold8_states_par`]. Ranked env is cleared, so the direct
+/// bit-major write runs.
+fn df8_state_direct_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
+    });
+    *OFF
+}
+
 /// Value-identical full-width form of [`direct_fold8_states_seq`]. The 64
 /// `d_low` doubling chains and the 64 bank transposes are mutually
 /// independent (each is a pure function of its own `low_eq[d]` / bank
-/// stripe), the bit-major gather writes disjoint 64-lane rows, and the
+/// stripe), the bit-major stores write disjoint lanes, and the
 /// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
+///
+/// Ranked default writes the bit-major layout from the parallel producers
+/// (same stores as [`direct_fold8_states_seq`]), skipping the temporary
+/// chain-major `Vec<Vec<F128>>` and the gather transpose.
+/// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the gather.
 fn direct_fold8_states_par(
     fold8: &[F128],
     low_eq: &[F128; 64],
@@ -2844,41 +2859,83 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
+    if df8_state_direct_disabled() {
+        let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|d_low| {
+                        let mut row = Vec::with_capacity(n_packed);
+                        let mut basis_product = low_eq[d_low];
                         row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                .collect()
-        },
-    );
+                        for _ in 1..n_packed {
+                            basis_product = crate::field::mul_by_x(basis_product);
+                            row.push(fold_one_slot(basis_product, table));
+                        }
+                        row
+                    })
+                    .collect()
+            },
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
+                    .collect()
+            },
+        );
+        let mut w_state = vec![F128::ZERO; 64 * n_packed];
+        let mut a_state = vec![F128::ZERO; 64 * n_packed];
+        w_state
+            .par_chunks_mut(64)
+            .zip(a_state.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(bit, (w_row, a_row))| {
+                for lane in 0..64 {
+                    w_row[lane] = w_rows[lane][bit];
+                    a_row[lane] = a_rows[lane][bit];
+                }
+            });
+        let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+        return (a_state, w_state, round0);
+    }
+
     let mut w_state = vec![F128::ZERO; 64 * n_packed];
     let mut a_state = vec![F128::ZERO; 64 * n_packed];
-    w_state
-        .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
-        .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
-            for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
-                a_row[lane] = a_rows[lane][bit];
-            }
-        });
+    let w_addr = w_state.as_mut_ptr() as usize;
+    let a_addr = a_state.as_mut_ptr() as usize;
+    rayon::join(
+        || {
+            (0..64usize).into_par_iter().for_each(|d_low| {
+                let w = w_addr as *mut F128;
+                let mut basis_product = low_eq[d_low];
+                // SAFETY: each `d_low` writes `bit * 64 + d_low` for
+                // `bit ∈ 0..n_packed`. Distinct `d_low` never alias; the
+                // vector is not resized for the lifetime of this join.
+                unsafe {
+                    *w.add(d_low) = fold_one_slot(basis_product, table);
+                    for bit in 1..n_packed {
+                        basis_product = crate::field::mul_by_x(basis_product);
+                        *w.add(bit * 64 + d_low) = fold_one_slot(basis_product, table);
+                    }
+                }
+            });
+        },
+        || {
+            (0..64usize).into_par_iter().for_each(|e| {
+                let transposed = tensor_algebra_transpose(
+                    &fold8[e * n_packed..(e + 1) * n_packed],
+                );
+                let a = a_addr as *mut F128;
+                // SAFETY: each `e` writes `bit * 64 + e`. Distinct `e`
+                // never alias; the vector is not resized for this join.
+                unsafe {
+                    for (bit, value) in transposed.into_iter().enumerate() {
+                        *a.add(bit * 64 + e) = value;
+                    }
+                }
+            });
+        },
+    );
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }
