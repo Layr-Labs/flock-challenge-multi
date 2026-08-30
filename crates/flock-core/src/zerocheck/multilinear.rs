@@ -45,6 +45,59 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 pub(crate) mod kernels;
 
+/// Compact B operand stream for the BLAKE3 packed-witness layout.
+///
+/// Each 2^14-bit witness block becomes 256 post-`k_skip = 6` rows. Its only
+/// variable B bits are the six 31-bit carry operands in each of 56 G calls;
+/// they occupy one canonical 192-bit slot per G (186 payload bits followed by
+/// six zero bits), for 1,344 bytes per block. The x86 round-2 and composed
+/// rounds-3+4 kernels consume this view directly without materializing dense B.
+#[derive(Copy, Clone, Debug)]
+pub struct PackedB186<'a> {
+    bytes: &'a [u8],
+    blocks: usize,
+}
+
+impl<'a> PackedB186<'a> {
+    pub const BYTES_PER_G: usize = 24;
+    pub const GS_PER_BLOCK: usize = 56;
+    pub const BYTES_PER_BLOCK: usize = Self::GS_PER_BLOCK * Self::BYTES_PER_G;
+    pub const ROWS_PER_BLOCK: usize = 256;
+
+    /// Construct a shape-checked compact B view.
+    pub fn new(bytes: &'a [u8], blocks: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            blocks * Self::BYTES_PER_BLOCK,
+            "packed-B byte length does not match its block count"
+        );
+        Self { bytes, blocks }
+    }
+
+    #[inline]
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn blocks(self) -> usize {
+        self.blocks
+    }
+
+    #[inline]
+    pub fn rows(self) -> usize {
+        self.blocks * Self::ROWS_PER_BLOCK
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn block_ptr(self, block: usize) -> *const u8 {
+        debug_assert!(block < self.blocks);
+        // SAFETY: the constructor pins the exact byte count and the caller
+        // supplies a block index inside that count.
+        unsafe { self.bytes.as_ptr().add(block * Self::BYTES_PER_BLOCK) }
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
@@ -1393,6 +1446,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         mlv_challenges,
         padding,
         None,
+        None,
     )
 }
 
@@ -1406,6 +1460,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
+    b_sidecar: Option<PackedB186<'_>>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1436,7 +1491,15 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
     assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    if let Some(sidecar) = b_sidecar {
+        assert!(b_packed.is_empty());
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+        assert_eq!(sidecar.rows(), n_out);
+    } else {
+        assert_eq!(b_packed.len(), n_out * n_chunks);
+    }
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -1497,21 +1560,52 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             // shape, WRITE=false touches no chunk, and the cfg gate supplies
             // every intrinsic feature.
             let out = unsafe {
-                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    row_base,
-                    &mut none_a,
-                    &mut none_b,
-                    eq_lo,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    wtab_arg,
-                )
+                if let Some(sidecar) = b_sidecar {
+                    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                    {
+                        kernels::x86_64::round2_lookahead_chunk_x86_avx512_bside(
+                            table.data.as_ptr(),
+                            r2_mats_arg.expect("B sidecar requires the GFNI round-2 matrices"),
+                            a_packed.as_ptr(),
+                            sidecar,
+                            row_base,
+                            eq_lo,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            wtab_arg,
+                        )
+                    }
+                    #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+                    {
+                        panic!("B sidecar requires AVX-512 VBMI and GFNI")
+                    }
+                } else {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                    )
+                }
             };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            assert!(
+                b_sidecar.is_none(),
+                "B sidecar requires the Sapphire x86 path"
+            );
             #[cfg(not(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -1590,6 +1684,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
+        None,
     )
 }
 
@@ -1607,6 +1702,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     rho2: F128,
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
+    b_sidecar: Option<PackedB186<'_>>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1677,7 +1773,15 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let n = 1usize << (m - k_skip);
     assert!(n >= 16);
     assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    if let Some(sidecar) = b_sidecar {
+        assert!(b_packed.is_empty());
+        assert_eq!(m, 32);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+        assert_eq!(sidecar.rows(), n);
+    } else {
+        assert_eq!(b_packed.len(), n * n_chunks);
+    }
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
     assert_eq!(b_out.len(), quarter);
@@ -1757,24 +1861,60 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             // 4·out_base .. 4·(out_base + chunk_out); the table has the
             // protocol-fixed shape; the cfg gate supplies every feature.
             let out = unsafe {
-                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
-                    a_out,
-                    b_out,
-                    rho1,
-                    rho2,
-                    eq_lo,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    nt_out,
-                    cfold_arg,
-                    wtab_arg,
-                )
+                if let Some(sidecar) = b_sidecar {
+                    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                    {
+                        kernels::x86_64::fold2_from_packed_lookahead_x86_avx512_bside(
+                            table.data.as_ptr(),
+                            r2_mats_arg.expect("B sidecar requires the GFNI round-2 matrices"),
+                            a_packed.as_ptr(),
+                            sidecar,
+                            out_base,
+                            a_out,
+                            b_out,
+                            rho1,
+                            rho2,
+                            eq_lo,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            nt_out,
+                            cfold_arg.expect("B sidecar requires the composed GFNI matrices"),
+                            wtab_arg,
+                        )
+                    }
+                    #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+                    {
+                        panic!("B sidecar requires AVX-512 VBMI and GFNI")
+                    }
+                } else {
+                    kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        nt_out,
+                        cfold_arg,
+                        wtab_arg,
+                    )
+                }
             };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            assert!(
+                b_sidecar.is_none(),
+                "B sidecar requires the Sapphire x86 path"
+            );
             #[cfg(not(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
