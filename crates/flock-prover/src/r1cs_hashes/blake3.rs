@@ -5233,6 +5233,10 @@ mod tests {
     /// Generic (matrix-driven) Ligerito prove produces a byte-identical
     /// proof to the specialized `prove_fast` — pins that the generic path
     /// (bool trace → pack → apply → prove) and the fused path agree.
+    ///
+    /// Also drives the shipped `prove_fast` path through the in-tree verifier:
+    /// the honest proof must verify, stay under the ranked 500,000-byte cap,
+    /// and a tampered lincheck transcript must be rejected.
     #[test]
     fn prove_ligerito_generic_matches_prove_fast() {
         use flock_core::challenger::FsChallenger;
@@ -5251,10 +5255,30 @@ mod tests {
         let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&blocks, &mut ch_g);
         assert_eq!(commit_f.root, commit_g.root);
         assert_eq!(claim_f, claim_g);
+        let proof_bytes = bincode::serialize(&proof_f).unwrap();
         assert_eq!(
-            bincode::serialize(&proof_f).unwrap(),
+            proof_bytes,
             bincode::serialize(&proof_g).unwrap(),
             "generic and fused Ligerito proofs must be byte-identical"
+        );
+        assert!(
+            proof_bytes.len() <= 500_000,
+            "serialized prove_fast proof is {} bytes, over the 500,000 cap",
+            proof_bytes.len()
+        );
+
+        let mut ch_v = FsChallenger::new(b"flock-blake3-gvf");
+        let claim_v = setup
+            .verify(&commit_f, &proof_f, &mut ch_v)
+            .unwrap_or_else(|e| panic!("in-tree verifier rejected honest prove_fast proof: {e:?}"));
+        assert_eq!(claim_f, claim_v);
+
+        let mut bad = proof_f.clone();
+        bad.lincheck.z_partial[0].lo ^= 1;
+        let mut ch_bad = FsChallenger::new(b"flock-blake3-gvf");
+        assert!(
+            setup.verify(&commit_f, &bad, &mut ch_bad).is_err(),
+            "tampered lincheck transcript must not verify"
         );
     }
 

@@ -152,6 +152,14 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_SHIFT_REDUCE").is_none())
 }
 
+/// `FLOCK_NO_R1_BSTATIC_MIXED=1` restores the generic eight-row offset Horner
+/// for interior windows 3..=28 (exact same-binary A/B). The ranked worker's
+/// cleared environment never sets it.
+pub(crate) fn mixed_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R1_BSTATIC_MIXED").is_none())
+}
+
 /// Blocks whose specialised kernel measured faster than the incumbent on the
 /// AVX-512 box (single-thread hot, production entry point, plan-shaped
 /// inputs): 0 and 1 (every K-row's b word is all-ones: 0.70×), 30 (seven
@@ -566,6 +574,84 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
     }
 }
 
+/// Offset-arena Horner for interior windows 3..=28. A-side applies stay on
+/// the ranked two-image wide-read path; B-side applies are replaced with a
+/// planned `T(expected)` image plus the ≤6 varying table rows on every
+/// `ROW_STATIC` K-row, and dropped outright on `ROW_ZERO`. A miss on any
+/// planned row, or a fully-static (`vary == 0`) image that is x^K-prescaled
+/// for the unrolled kernel, falls back to the generic nt2 Horner so the
+/// output is bit-identical for any witness.
+///
+/// # Safety
+/// `op` holds this window's 128 pre-scaled offsets; `imgs` are the table's
+/// base and σ₈ image; `partials` were built from that table; `out` is
+/// 64-byte aligned; `blk` is in 3..=28. AVX-512F/BW + GFNI are baseline.
+#[inline(never)]
+pub(crate) unsafe fn shift_reduce_mixed_from_off_nt2(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+    partials: &BstaticPartials,
+    blk: usize,
+) {
+    use crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at;
+    use core::arch::x86_64::*;
+    debug_assert!((3..29).contains(&blk));
+    unsafe {
+        let mut b_words = [0u64; 8];
+        let mut hit = true;
+        for k in 0..8 {
+            let p: BstaticRow = BSTATIC_PLAN[blk][k];
+            if p.kind == ROW_GENERIC || (p.kind == ROW_STATIC && p.vary == 0) {
+                continue;
+            }
+            let mut w = 0u64;
+            for j in 0..8 {
+                let byte = (*op.add(64 + k * 8 + j) >> 6) as u64;
+                w |= byte << (8 * j);
+            }
+            b_words[k] = w;
+            hit &= (w & p.mask) == p.expected;
+        }
+        if !hit {
+            super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(op, out, imgs);
+            return;
+        }
+        let xb = _mm512_set1_epi8(2);
+        let mut acc = _mm512_setzero_si512();
+        let mut k = 8usize;
+        while k != 0 {
+            k -= 1;
+            if k != 7 {
+                acc = _mm512_gf2p8mul_epi8(acc, xb);
+            }
+            let p: BstaticRow = BSTATIC_PLAN[blk][k];
+            if p.kind == ROW_ZERO {
+                continue;
+            }
+            let av = apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, op.add(k * 8));
+            let bv = if p.kind == ROW_STATIC && p.vary != 0 {
+                let mut bv =
+                    _mm512_load_si512(partials.rows[blk][k].as_ptr() as *const __m512i);
+                let mut v = p.vary;
+                let b_word = b_words[k];
+                while v != 0 {
+                    let j = v.trailing_zeros() as usize;
+                    let byte = ((b_word >> (8 * j)) as u8) as usize;
+                    let r = _mm512_loadu_si512(imgs.0.add(byte * 64) as *const __m512i);
+                    bv = _mm512_xor_si512(bv, perm_row(r, j));
+                    v &= v - 1;
+                }
+                bv
+            } else {
+                apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, op.add(64 + k * 8))
+            };
+            acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, bv));
+        }
+        _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::x86_64::shift_reduce_inner_ab_x86_avx512;
@@ -767,6 +853,62 @@ mod tests {
             };
             let want: [u8; 64] = core::array::from_fn(|i| want[i].0);
             assert_eq!(got, want);
+        }
+    }
+
+    /// Interior mixed Horner (windows 3..=28) must match the generic nt2
+    /// offset Horner on plan-shaped hits and on misses.
+    #[test]
+    fn mixed_horner_matches_generic_offset_path() {
+        use super::super::x86_64::{
+            shift_reduce_ab_offsets_build, shift_reduce_inner_ab_x86_avx512_from_off_nt2,
+        };
+        let inv_table = standard_table();
+        let partials = build_partials(&inv_table);
+        let imgs = inv_table.image_ptrs();
+        let mut rng = Rng(0xA11C_3D);
+        for plan in 3..29 {
+            for mode in 0..2 {
+                let mut a = [0u8; 64];
+                let mut b = [0u8; 64];
+                for k in 0..8 {
+                    let p = BSTATIC_PLAN[plan][k];
+                    let a_word = rng.next_u64();
+                    let b_word = if mode == 0 {
+                        (p.expected & p.mask) | (rng.next_u64() & !p.mask)
+                    } else {
+                        rng.next_u64()
+                    };
+                    a[k * 8..k * 8 + 8].copy_from_slice(&a_word.to_le_bytes());
+                    b[k * 8..k * 8 + 8].copy_from_slice(&b_word.to_le_bytes());
+                }
+                #[repr(align(64))]
+                struct Off([u16; 128]);
+                #[repr(align(64))]
+                struct Out([u8; 64]);
+                let mut off = Off([0; 128]);
+                let mut got = Out([0; 64]);
+                let mut want = Out([0; 64]);
+                unsafe {
+                    shift_reduce_ab_offsets_build(a.as_ptr(), b.as_ptr(), off.0.as_mut_ptr());
+                    shift_reduce_mixed_from_off_nt2(
+                        off.0.as_ptr(),
+                        &mut got.0,
+                        imgs,
+                        &partials,
+                        plan,
+                    );
+                    shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+                        off.0.as_ptr(),
+                        &mut want.0,
+                        imgs,
+                    );
+                }
+                assert_eq!(
+                    got.0, want.0,
+                    "mixed/generic disagree on plan {plan} mode {mode}"
+                );
+            }
         }
     }
 }

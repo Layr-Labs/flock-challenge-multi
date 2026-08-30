@@ -948,7 +948,9 @@ impl Round1AbWindowPlan {
     #[inline]
     pub fn for_window(self, blk: usize) -> Self {
         Self {
-            bstatic: if kernels::bstatic_window_live(blk) {
+            bstatic: if kernels::bstatic_window_live(blk)
+                || kernels::bstatic_mixed_window(blk)
+            {
                 self.bstatic
             } else {
                 None
@@ -1234,6 +1236,66 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
         target_feature = "avx512bw"
     )))]
     unreachable!("residual nt2 offsets form is x86 AVX-512+GFNI only");
+}
+
+/// True when ranked window `blk` should consume offsets through the mixed
+/// static-B Horner (interior windows 3..=28) rather than the fully generic
+/// eight-row apply.
+#[inline]
+pub fn round1_ab_mixed_window(blk: usize) -> bool {
+    kernels::bstatic_mixed_window(blk)
+}
+
+/// Offset-arena Horner that skips the B-side inverse-table apply on every
+/// planned static or zero K-row of interior window `blk`. Falls back to the
+/// generic nt2 Horner if the plan is absent, the kill switch is set, or any
+/// planned row misses its (mask, expected) check. Always writes `out`.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`], plus `blk` in 3..=28
+/// and `plan.bstatic` the images of this table when mixed is live.
+#[inline]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_mixed(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((3..29).contains(&blk));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        if let Some(partials) = plan.bstatic {
+            kernels::x86_64_bstatic::shift_reduce_mixed_from_off_nt2(
+                off.as_ptr(),
+                out,
+                (imgs.0, imgs.1),
+                partials,
+                blk,
+            );
+            return;
+        }
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("mixed nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness

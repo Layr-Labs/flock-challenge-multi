@@ -26,8 +26,8 @@ use flock_core::ntt::InvNttTableByteSingleGf8;
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
-    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_inner_window_from_offsets_nt2_mixed, round1_ab_inner_window_from_offsets_nt2_residual,
+    round1_ab_inner_window_with_images, round1_ab_mixed_window, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -616,6 +616,10 @@ impl StreamProj<'_> {
                 self.project_blocks_ranked_hot_offsets_residual::<29,0x0f>(plan,imgs,rows,off);
                 return;
             }
+            if round1_ab_mixed_window(blk) {
+                self.project_blocks_ranked_hot_offsets_mixed(blk,plan,imgs,rows,off);
+                return;
+            }
             let (sa,sb)=self.sides();
             let mut j=0usize;
             while j!=8 {
@@ -638,6 +642,22 @@ impl StreamProj<'_> {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+BLK*64).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                j+=1;
+            }
+        }
+    }
+
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn project_blocks_ranked_hot_offsets_mixed(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
+        unsafe {
+            debug_assert!((3..29).contains(&blk));
+            let (sa,sb)=self.sides();
+            let mut j=0usize;
+            while j!=8 {
+                rows.publish_dense(j,sa,sb);
+                let out=&mut *self.out.add(j*BYTES_PER_BLOCK+blk*64).cast::<[u8;64]>();
+                round1_ab_inner_window_from_offsets_nt2_mixed(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,blk);
                 j+=1;
             }
         }

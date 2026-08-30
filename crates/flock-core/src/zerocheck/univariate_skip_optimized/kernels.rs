@@ -77,6 +77,33 @@ pub(super) fn bstatic_window_live(blk: usize) -> bool {
     blk <= 1 || blk == 30 || blk == 31
 }
 
+/// Interior windows 3..=28 keep the ranked offset-arena Horner, but skip the
+/// B-side inverse-table apply on every planned static/zero K-row. They are
+/// deliberately *not* `bstatic_window_live`: that path's unrolled mixed body
+/// measured 1.03–1.16× slower than the compact generic Horner.
+#[inline]
+pub(super) fn bstatic_mixed_window(blk: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        (3..29).contains(&blk) && x86_64_bstatic::mixed_enabled()
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = blk;
+        false
+    }
+}
+
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
 /// the 8192-bit window being transformed plus the resolved partial images.
 /// `None` ⇒ incumbent kernel. Only a performance hint: the static kernel
