@@ -2185,9 +2185,29 @@ fn build_direct_fold_table<const N: usize>(
 /// `byte_k` are the 16 little-endian bytes of `elem`. `tables` MUST be a
 /// `build_fold_byte_table` output (length `16·256`). Tree-reduced (depth 4)
 /// rather than a length-15 XOR chain so the adds pipeline.
+#[inline]
+fn fold_one_slot_xmm_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_SLOT_XMM").is_some()
+    });
+    *OFF
+}
+
+/// Tree-reduced 16-table XOR. On x86 the four independent XMM load-xor
+/// groups pipeline the 16 L2 hits; `FLOCK_NO_DF8_SLOT_XMM=1` restores the
+/// portable F128 tree. Ranked env is cleared, so XMM runs.
 #[inline(always)]
 pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    #[cfg(target_arch = "x86_64")]
+    if !fold_one_slot_xmm_disabled() {
+        return fold_one_slot_xmm(elem, tables);
+    }
+    fold_one_slot_scalar(elem, tables)
+}
+
+#[inline(always)]
+fn fold_one_slot_scalar(elem: F128, tables: &[F128]) -> F128 {
     let lo_bytes = elem.lo.to_le_bytes();
     let hi_bytes = elem.hi.to_le_bytes();
     let tables_ptr = tables.as_ptr();
@@ -2213,7 +2233,6 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
             *tables_ptr.add(15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize),
         )
     };
-    // Level 1: 8 pair sums.
     let p0 = l0 + l1;
     let p1 = l2 + l3;
     let p2 = l4 + l5;
@@ -2222,16 +2241,52 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let p5 = h2 + h3;
     let p6 = h4 + h5;
     let p7 = h6 + h7;
-    // Level 2.
     let q0 = p0 + p1;
     let q1 = p2 + p3;
     let q2 = p4 + p5;
     let q3 = p6 + p7;
-    // Level 3.
     let r0 = q0 + q1;
     let r1 = q2 + q3;
-    // Level 4.
     r0 + r1
+}
+
+/// Four independent 4-load XMM XOR groups, then XOR the groups. Same 16
+/// table slots as [`fold_one_slot_scalar`]; SSE2 is x86_64 baseline so this
+/// stays `#[inline(always)]` without `#[target_feature]`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn fold_one_slot_xmm(elem: F128, tables: &[F128]) -> F128 {
+    use core::arch::x86_64::*;
+    let lo_bytes = elem.lo.to_le_bytes();
+    let hi_bytes = elem.hi.to_le_bytes();
+    let p = tables.as_ptr();
+    // SAFETY: same 16 in-bounds table slots as the scalar tree; SSE2 is
+    // x86_64 baseline; F128 is 16-byte `repr(C)`.
+    unsafe {
+        let load = |byte_idx: usize, v: u8| {
+            _mm_loadu_si128(p.add(byte_idx * FOLD_TABLE_SIZE + v as usize) as *const __m128i)
+        };
+        let g0 = _mm_xor_si128(
+            _mm_xor_si128(load(0, lo_bytes[0]), load(1, lo_bytes[1])),
+            _mm_xor_si128(load(2, lo_bytes[2]), load(3, lo_bytes[3])),
+        );
+        let g1 = _mm_xor_si128(
+            _mm_xor_si128(load(4, lo_bytes[4]), load(5, lo_bytes[5])),
+            _mm_xor_si128(load(6, lo_bytes[6]), load(7, lo_bytes[7])),
+        );
+        let g2 = _mm_xor_si128(
+            _mm_xor_si128(load(8, hi_bytes[0]), load(9, hi_bytes[1])),
+            _mm_xor_si128(load(10, hi_bytes[2]), load(11, hi_bytes[3])),
+        );
+        let g3 = _mm_xor_si128(
+            _mm_xor_si128(load(12, hi_bytes[4]), load(13, hi_bytes[5])),
+            _mm_xor_si128(load(14, hi_bytes[6]), load(15, hi_bytes[7])),
+        );
+        let acc = _mm_xor_si128(_mm_xor_si128(g0, g1), _mm_xor_si128(g2, g3));
+        let mut out = F128::ZERO;
+        _mm_storeu_si128(&mut out as *mut F128 as *mut __m128i, acc);
+        out
+    }
 }
 
 #[allow(dead_code)] // Scalar oracle for the generator-based table builder.
