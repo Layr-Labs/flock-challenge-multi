@@ -267,6 +267,44 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     }
 }
 
+/// Same field values as [`fold4_nested`]. On AVX-512 x86, four `prefetcht1`
+/// lines of `next_src` fire per four-output step (the next DirectFold8 SUB's
+/// packed-witness head). Portable builds ignore `next_src`.
+#[inline]
+pub(crate) fn fold4_nested_next_pf(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+    next_src: &[F128],
+) {
+    assert_eq!(
+        src.len(),
+        4 * dst.len(),
+        "fold4 source must contain four elements for every destination slot"
+    );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: same gate and length contract as [`fold4_nested`]; the
+    // DirectFold8 caller passes the next SUB (256 KiB), of which this
+    // leaf hints the first 16 KiB.
+    unsafe {
+        x86_64::fold4_nested_next_pf(src, dst, r0, r1, next_src.as_ptr().cast());
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = next_src;
+        fold4_nested(src, dst, r0, r1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar
@@ -707,6 +745,43 @@ mod tests {
             fold_pairs(&mid, 0, &mut via_pairs, r1);
             assert_eq!(got, via_pairs, "two-pass pairs n={n}");
         }
+    }
+
+    #[test]
+    fn fold4_nested_next_pf_matches_unhinted() {
+        let mut state = 0xDF84_71E5_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let n = 16usize;
+        let src: Vec<F128> = (0..4 * n)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let next_src: Vec<F128> = (0..1024)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r0 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let r1 = F128 {
+            lo: next(),
+            hi: next(),
+        };
+        let mut unhinted = vec![F128::ZERO; n];
+        let mut hinted = vec![F128::ZERO; n];
+        fold4_nested(&src, &mut unhinted, r0, r1);
+        fold4_nested_next_pf(&src, &mut hinted, r0, r1, &next_src);
+        assert_eq!(hinted, unhinted);
     }
 }
 

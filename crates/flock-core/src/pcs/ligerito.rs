@@ -6010,6 +6010,17 @@ fn direct_fold8_l1_precommit_enabled() -> bool {
     *ON
 }
 
+/// T1-hint the next DirectFold8 SUB's packed-witness head from the f-side
+/// fold4 idle window. Default on; `FLOCK_NO_DF8_FOLD4_NEXT_PF=1` restores
+/// unhinted [`fold4_nested`]. Ranked env is cleared, so the walk runs.
+#[inline]
+#[allow(dead_code)] // Selector is consumed only by the ranked AVX-512 route.
+fn df8_fold4_next_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_FOLD4_NEXT_PF").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -6051,7 +6062,23 @@ fn materialize_direct_fold8_f_for_precommit(
                         m4,
                         fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
+                    let next = slot + n;
+                    if df8_fold4_next_pf_enabled() && next < block_len {
+                        crate::field::f128_slice::fold4_nested_next_pf(
+                            m4,
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
+                            &f_in[64 * next..],
+                        );
+                    } else {
+                        crate::field::f128_slice::fold4_nested(
+                            m4,
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
+                        );
+                    }
                     slot += n;
                 }
             },
@@ -6394,7 +6421,23 @@ fn materialize_direct_fold8(
                         m4,
                         &fold16_weight,
                     );
-                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
+                    let next = slot + n;
+                    if df8_fold4_next_pf_enabled() && next < block_len {
+                        crate::field::f128_slice::fold4_nested_next_pf(
+                            m4,
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
+                            &f_in[64 * next..],
+                        );
+                    } else {
+                        crate::field::f128_slice::fold4_nested(
+                            m4,
+                            &mut f_out[slot..slot + n],
+                            r4,
+                            r5,
+                        );
+                    }
                     if has_ordinary {
                         let m16 = &mut mid16[..16 * n];
                         crate::field::f128_slice::fold4_nested(

@@ -150,6 +150,41 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
+    // SAFETY: `PF = false` is the incumbent unhinted body.
+    unsafe { fold4_nested_impl::<false>(src, dst, r0, r1, core::ptr::null()) }
+}
+
+/// Same butterflies as [`fold4_nested`]. When `next_src` is non-null, each
+/// four-output step issues four `prefetcht1` lines of the next DirectFold8
+/// SUB's packed-witness head (`t * 64` bytes from `next_src`). Hint only.
+///
+/// # Safety
+/// Same contract as [`fold4_nested`]. If `next_src` is non-null it must
+/// remain readable for 16 KiB (64 steps × 4 cache lines).
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold4_nested_next_pf(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+    next_src: *const u8,
+) {
+    // SAFETY: forwarded; `PF = true` only adds T1 hints.
+    unsafe { fold4_nested_impl::<true>(src, dst, r0, r1, next_src) }
+}
+
+/// `PF = true` issues four T1 lines of `next_src` per four-output step.
+///
+/// # Safety
+/// Same contract as [`fold4_nested_next_pf`].
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold4_nested_impl<const PF: bool>(
+    src: &[F128],
+    dst: &mut [F128],
+    r0: F128,
+    r1: F128,
+    next_src: *const u8,
+) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
@@ -162,6 +197,13 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
         let lanes = dst.len() & !3;
         let mut t = 0;
         while t < lanes {
+            if PF && !next_src.is_null() {
+                let off = t * 64;
+                _mm_prefetch(next_src.add(off).cast::<i8>(), _MM_HINT_T1);
+                _mm_prefetch(next_src.add(off + 64).cast::<i8>(), _MM_HINT_T1);
+                _mm_prefetch(next_src.add(off + 128).cast::<i8>(), _MM_HINT_T1);
+                _mm_prefetch(next_src.add(off + 192).cast::<i8>(), _MM_HINT_T1);
+            }
             let s = 4 * t;
             let v0 = _mm512_loadu_si512(src.as_ptr().add(s) as *const __m512i);
             let v1 = _mm512_loadu_si512(src.as_ptr().add(s + 4) as *const __m512i);
