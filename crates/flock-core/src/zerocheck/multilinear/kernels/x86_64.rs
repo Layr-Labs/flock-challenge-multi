@@ -744,6 +744,9 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     unsafe {
         let r1 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho1.hi as i64, rho1.lo as i64));
         let r2 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho2.hi as i64, rho2.lo as i64));
+        let rho12 = rho1 * rho2;
+        let r12 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho12.hi as i64, rho12.lo as i64));
+        let defer = zc_fold2_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut p1_wide = WideGhashX4::zero();
@@ -757,20 +760,30 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
-            // Level 1 (ρ₁): 32 inputs → 16 values in four ZMMs.
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let ta2 = fold_x4(a_src.add(16), r1, even_idx, odd_idx);
-            let ta3 = fold_x4(a_src.add(24), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let tb2 = fold_x4(b_src.add(16), r1, even_idx, odd_idx);
-            let tb3 = fold_x4(b_src.add(24), r1, even_idx, odd_idx);
-            // Level 2 (ρ₂): 16 → 8 outputs in two ZMMs per array.
-            let a_lo = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let a_hi = fold_regs(ta2, ta3, r2, even_idx, odd_idx);
-            let b_lo = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
-            let b_hi = fold_regs(tb2, tb3, r2, even_idx, odd_idx);
+            let (a_lo, a_hi, b_lo, b_hi) = if defer {
+                (
+                    fold16_to_4_deferred(a_src, r1, r2, r12),
+                    fold16_to_4_deferred(a_src.add(16), r1, r2, r12),
+                    fold16_to_4_deferred(b_src, r1, r2, r12),
+                    fold16_to_4_deferred(b_src.add(16), r1, r2, r12),
+                )
+            } else {
+                // Level 1 (ρ₁): 32 inputs → 16 values in four ZMMs.
+                let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
+                let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
+                let ta2 = fold_x4(a_src.add(16), r1, even_idx, odd_idx);
+                let ta3 = fold_x4(a_src.add(24), r1, even_idx, odd_idx);
+                let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
+                let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
+                let tb2 = fold_x4(b_src.add(16), r1, even_idx, odd_idx);
+                let tb3 = fold_x4(b_src.add(24), r1, even_idx, odd_idx);
+                // Level 2 (ρ₂): 16 → 8 outputs in two ZMMs per array.
+                let a_lo = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
+                let a_hi = fold_regs(ta2, ta3, r2, even_idx, odd_idx);
+                let b_lo = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
+                let b_hi = fold_regs(tb2, tb3, r2, even_idx, odd_idx);
+                (a_lo, a_hi, b_lo, b_hi)
+            };
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -796,12 +809,20 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
             let input = 4 * output;
             let a_src = a_in.as_ptr().add(input);
             let b_src = b_in.as_ptr().add(input);
-            let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
-            let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
-            let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
-            let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
-            let a_folded = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
-            let b_folded = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
+            let (a_folded, b_folded) = if defer {
+                (
+                    fold16_to_4_deferred(a_src, r1, r2, r12),
+                    fold16_to_4_deferred(b_src, r1, r2, r12),
+                )
+            } else {
+                let ta0 = fold_x4(a_src, r1, even_idx, odd_idx);
+                let ta1 = fold_x4(a_src.add(8), r1, even_idx, odd_idx);
+                let tb0 = fold_x4(b_src, r1, even_idx, odd_idx);
+                let tb1 = fold_x4(b_src.add(8), r1, even_idx, odd_idx);
+                let a_folded = fold_regs(ta0, ta1, r2, even_idx, odd_idx);
+                let b_folded = fold_regs(tb0, tb1, r2, even_idx, odd_idx);
+                (a_folded, b_folded)
+            };
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -1169,6 +1190,21 @@ pub(crate) fn zc_regfold_enabled() -> bool {
 pub(crate) fn zc_fold_defer_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_DEFER").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_ZC_FOLD2_DEFER=1` restores the incumbent staged folds in the
+/// round-2 composed-fold/message kernel only.  This deliberately does not
+/// share the rounds-3+4 `zc_fold_defer_enabled` gate.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) fn zc_fold2_defer_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_FOLD2_DEFER").is_none()
+    });
     *ON
 }
 
