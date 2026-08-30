@@ -4824,7 +4824,6 @@ fn materialize_direct_fold4(
                     use crate::zerocheck::multilinear::kernels::x86_64::{
                         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
-                    use core::arch::x86_64::_mm512_setzero_si512;
 
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
@@ -4840,7 +4839,8 @@ fn materialize_direct_fold4(
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                     let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                    let mut planes =
+                        core::mem::MaybeUninit::<[core::arch::x86_64::__m512i; 16]>::uninit();
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate
@@ -4856,7 +4856,7 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
