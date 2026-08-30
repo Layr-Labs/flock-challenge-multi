@@ -1,3 +1,4 @@
+use super::super::PackedB186;
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -201,6 +202,91 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
+    // SAFETY: forwarded contract; the dense wrapper preserves the incumbent
+    // input representation and every fallback arm.
+    unsafe {
+        round2_lookahead_chunk_x86_avx512_impl::<WRITE>(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            None,
+            row_base,
+            a_chunk,
+            b_chunk,
+            eq_lo,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            wtab,
+        )
+    }
+}
+
+/// Packed186-B specialization of the ranked no-materialize round-2 pass.
+/// A remains in the incumbent dense packed layout; each aligned 64-row B
+/// refill is decoded directly into the residue-major GFNI register body.
+///
+/// # Safety
+/// The dense-A, table, and output contracts are those of
+/// [`round2_lookahead_chunk_x86_avx512`]. `row_base` must be 64-row aligned
+/// and the requested rows must lie inside `b_sidecar`.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512_bside(
+    table_data: *const F128,
+    mats: &[u64; 128],
+    a_pkt: *const u8,
+    b_sidecar: PackedB186<'_>,
+    row_base: usize,
+    eq_lo: &[F128],
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
+    assert_eq!(row_base % 64, 0, "packed-B refill must be 64-row aligned");
+    assert!(row_base + 2 * eq_lo.len() <= b_sidecar.rows());
+    assert!(eq_lo.len() >= 32 && eq_lo.len().is_multiple_of(32));
+    assert!(zc_regfold_enabled() && zc_r2_tr_enabled() && zc_r2_bcast_enabled());
+    // SAFETY: the assertions select the exhaustive ranked batch arm, so the
+    // null dense-B sentinel is never dereferenced. The compact view bounds
+    // every decoder refill.
+    unsafe {
+        round2_lookahead_chunk_x86_avx512_impl::<false>(
+            table_data,
+            Some(mats),
+            a_pkt,
+            core::ptr::null(),
+            Some(b_sidecar),
+            row_base,
+            &mut [],
+            &mut [],
+            eq_lo,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            wtab,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn round2_lookahead_chunk_x86_avx512_impl<const WRITE: bool>(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    b_sidecar: Option<PackedB186<'_>>,
+    row_base: usize,
+    a_chunk: &mut [F128],
+    b_chunk: &mut [F128],
+    eq_lo: &[F128],
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -298,6 +384,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         } else {
             None
         };
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if b_sidecar.is_some() {
+            assert!(use_batch && tr_emit && tr_bcast);
+        }
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
@@ -319,40 +409,50 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let _ = (pair_in_block_mask, useful_pairs_inclusive);
                 if tr_bcast {
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
-                    // Global row phase only schedules a possible fast path;
-                    // the helper checks all 128 raw bytes before omitting
-                    // one whole 16-row GFNI group. All cache slots are still
-                    // initialized in the same residue-major layout.
-                    match (b_canonical_values.as_ref(), g0 & 255) {
-                        (Some(values), 0) if b_ones_on => {
-                            gfni_fold64_rows_tr_bcast_b_canonical(
-                                b_pkt.add(g0 * 8),
-                                m,
-                                fb.as_mut_ptr(),
-                                0,
-                                values[0],
-                            );
-                        }
-                        (Some(values), 192) if b_sparse_on => {
-                            gfni_fold64_rows_tr_bcast_b_canonical(
-                                b_pkt.add(g0 * 8),
-                                m,
-                                fb.as_mut_ptr(),
-                                3,
-                                values[1],
-                            );
-                        }
-                        _ => gfni_fold64_rows_masked_tr_bcast(
-                            b_pkt.add(g0 * 8),
+                    if let Some(sidecar) = b_sidecar {
+                        b_side_t1_gfni_fold64_regs_sigma_bcast(
+                            b_side_decode_burst_regs(sidecar, g0),
                             m,
                             fb.as_mut_ptr(),
-                            dead,
-                        ),
+                        );
+                    } else {
+                        // Global row phase only schedules a possible fast path;
+                        // the helper checks all 128 raw bytes before omitting
+                        // one whole 16-row GFNI group. All cache slots are still
+                        // initialized in the same residue-major layout.
+                        match (b_canonical_values.as_ref(), g0 & 255) {
+                            (Some(values), 0) if b_ones_on => {
+                                gfni_fold64_rows_tr_bcast_b_canonical(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    0,
+                                    values[0],
+                                );
+                            }
+                            (Some(values), 192) if b_sparse_on => {
+                                gfni_fold64_rows_tr_bcast_b_canonical(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    3,
+                                    values[1],
+                                );
+                            }
+                            _ => gfni_fold64_rows_masked_tr_bcast(
+                                b_pkt.add(g0 * 8),
+                                m,
+                                fb.as_mut_ptr(),
+                                dead,
+                            ),
+                        }
                     }
                 } else if tr_emit {
+                    debug_assert!(b_sidecar.is_none());
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 } else {
+                    debug_assert!(b_sidecar.is_none());
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
@@ -368,10 +468,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_sidecar.is_none() {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
             }
@@ -389,10 +491,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             // Batch path: this iteration's 16 folded rows sit CONTIGUOUSLY
@@ -475,6 +579,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let r = 2 * (pair % 32);
                             [fa[r], fa[r + 1], fb[r], fb[r + 1]]
                         } else {
+                            debug_assert!(b_sidecar.is_none());
                             fold_round2_pair_x86_unchecked_8(
                                 table_data,
                                 a_pkt.add(x0g * 8),
@@ -659,6 +764,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             x_lo += 8;
         }
 
+        if b_sidecar.is_some() {
+            assert_eq!(x_lo, lo_size, "packed-B round-2 cannot enter dense tail");
+        }
+
         // Small instances (lo_size ∈ {2, 4}) leave whole groups for the
         // scalar path; identical arithmetic, one group at a time.
         while x_lo + 2 <= lo_size {
@@ -680,6 +789,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 any = true;
                 let x0g = row_base + x0l;
                 let x1g = x0g + 1;
+                debug_assert!(b_sidecar.is_none());
                 rows[half] = fold_round2_pair_x86_unchecked_8(
                     table_data,
                     a_pkt.add(x0g * 8),
@@ -1538,6 +1648,105 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     cfold: Option<&CFoldMats>,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
+    // SAFETY: forwarded contract; the dense wrapper preserves every incumbent
+    // fallback and diagnostic arm.
+    unsafe {
+        fold2_from_packed_lookahead_x86_avx512_impl(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            None,
+            out_base,
+            a_out,
+            b_out,
+            rho1,
+            rho2,
+            eq_lo,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            nt_out,
+            cfold,
+            wtab,
+        )
+    }
+}
+
+/// Packed186-B specialization of the ranked level-0 composed rounds-3+4
+/// pass. A remains dense; every aligned B refill enters the composed GFNI
+/// register body directly, without a decoded 512-byte tile.
+///
+/// # Safety
+/// The dense-A, table, and output contracts are those of
+/// [`fold2_from_packed_lookahead_x86_avx512`]. The requested global row range
+/// must lie inside `b_sidecar`.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512_bside(
+    table_data: *const F128,
+    mats: &[u64; 128],
+    a_pkt: *const u8,
+    b_sidecar: PackedB186<'_>,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: &CFoldMats,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
+    assert_eq!(out_base % 16, 0, "packed-B refill must be 64-row aligned");
+    assert!(4 * out_base + 8 * eq_lo.len() <= b_sidecar.rows());
+    assert!(eq_lo.len() >= 8 && eq_lo.len().is_multiple_of(8));
+    assert!(zc_regfold_enabled() && zc_r34_bcast_enabled());
+    // SAFETY: the assertions select the exhaustive composed batch arm, so the
+    // null dense-B sentinel is never dereferenced. The compact view bounds
+    // every decoder refill.
+    unsafe {
+        fold2_from_packed_lookahead_x86_avx512_impl(
+            table_data,
+            Some(mats),
+            a_pkt,
+            core::ptr::null(),
+            Some(b_sidecar),
+            out_base,
+            a_out,
+            b_out,
+            rho1,
+            rho2,
+            eq_lo,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            nt_out,
+            Some(cfold),
+            wtab,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_x86_avx512_impl(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    b_sidecar: Option<PackedB186<'_>>,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: Option<&CFoldMats>,
+    wtab: Option<&[F128]>,
+) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
@@ -1782,6 +1991,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if b_sidecar.is_some() {
+            assert!(use_batch && use_c4 && c4_bcast);
+        }
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -1803,7 +2016,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
@@ -1821,13 +2034,22 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 fa.as_mut_ptr(),
                                 dead,
                             );
-                            gfni_fold64_rows_masked_c4_bcast(
-                                b_pkt.add(4 * xg * 8),
-                                c,
-                                fb.as_mut_ptr(),
-                                dead,
-                            );
+                            if let Some(sidecar) = b_sidecar {
+                                b_side_t1_gfni_fold64_regs_c4_bcast(
+                                    b_side_decode_burst_regs(sidecar, 4 * xg),
+                                    c,
+                                    fb.as_mut_ptr(),
+                                );
+                            } else {
+                                gfni_fold64_rows_masked_c4_bcast(
+                                    b_pkt.add(4 * xg * 8),
+                                    c,
+                                    fb.as_mut_ptr(),
+                                    dead,
+                                );
+                            }
                         } else {
+                            debug_assert!(b_sidecar.is_none());
                             gfni_fold64_rows_masked_c4(
                                 a_pkt.add(4 * xg * 8),
                                 c,
@@ -1842,6 +2064,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             );
                         }
                     } else {
+                        debug_assert!(b_sidecar.is_none());
                         let m = mats.unwrap();
                         gfni_fold64_rows_masked(a_pkt.add(4 * xg * 8), m, fa.as_mut_ptr(), dead);
                         gfni_fold64_rows_masked(b_pkt.add(4 * xg * 8), m, fb.as_mut_ptr(), dead);
@@ -1857,10 +2080,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_sidecar.is_none() {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                 }
@@ -1921,6 +2146,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             } else {
+                debug_assert!(b_sidecar.is_none());
                 let g = groups_general(
                     table_data,
                     a_pkt,
@@ -1945,10 +2171,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let ap = a_out.as_mut_ptr().add(ol);
@@ -1987,10 +2215,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
@@ -2004,10 +2234,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                         core::arch::x86_64::_MM_HINT_T0,
                     );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                    if b_sidecar.is_none() {
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
             }
             let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -2059,6 +2291,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
             acc[6].mul_acc(o_aw, o_b);
             acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
             x_lo += 8;
+        }
+
+        if b_sidecar.is_some() {
+            assert_eq!(
+                x_lo, lo_size,
+                "packed-B composed pass cannot enter dense tail"
+            );
         }
 
         // Small instances leave whole groups: one group at a time, scalar finish.
@@ -3132,6 +3371,516 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
         pass!(0);
         pass!(1);
     }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_t1_load_64_rows_masked(
+    rows: *const u8,
+    dead_lines: u8,
+) -> [core::arch::x86_64::__m512i; 8] {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller supplies one readable 64-byte line for each live
+    // bit. Dead lines are represented by zero registers and are not read.
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        if dead_lines == 0 {
+            for (i, slot) in z.iter_mut().enumerate() {
+                *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else {
+            for (i, slot) in z.iter_mut().enumerate() {
+                if dead_lines & (1u8 << i) == 0 {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
+            }
+        }
+        z
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_t1_gfni_fold64_regs_sigma_bcast(
+    z: [core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller guarantees 64 writable F128s at `out`; the
+    // scratch is a local 512-byte array written and read in full; every
+    // shuffle index is in range and the cfg gate supplies each intrinsic.
+    unsafe {
+        // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        // 64-byte aligned so each ZMM spill is one line and each broadcast
+        // read of it is one load uop.
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = Octs([0u64; 64]);
+        let op = octs.0.as_mut_ptr();
+        for (i, zi) in z.iter().enumerate() {
+            _mm512_storeu_si512(
+                op.add(8 * i) as *mut __m512i,
+                _mm512_permutexvar_epi8(bt, *zi),
+            );
+        }
+        let mp = mats.as_ptr();
+        // Stage-1 qword gathers: pack `(lo,hi)` qword pairs of two residues.
+        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
+        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
+        // Stage-2: the two 256-bit halves of the residue pair.
+        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        for g in 0..4 {
+            let mut a01 = [_mm512_setzero_si512(); 2];
+            let mut a23 = [_mm512_setzero_si512(); 2];
+            for half in 0..2 {
+                let i = 2 * g + half;
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*op.add(8 * i + j) as i64));
+                // `h = 0` -> output bytes 0..8, `h = 1` -> 8..16.
+                let plane = |h: usize| {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(mp.add(16 * j + 8 * h) as *const __m512i),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    _mm512_xor_si512(v2, v3)
+                };
+                // qword q of `l`/`hh` = output bytes 0..8 / 8..16 of row 8i+q.
+                let l = _mm512_permutexvar_epi8(bt, plane(0));
+                let hh = _mm512_permutexvar_epi8(bt, plane(1));
+                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+            }
+            // Residue-major ZMM (k, g) holds rows 16g + 4·lane + k and lands
+            // at F128 index 16k + 4g — the `_tr` layout, byte for byte.
+            // F128 index 16k + 4g == ZMM index 4k + g.
+            let dst = (out as *mut __m512i).add(g);
+            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+        }
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_t1_gfni_fold64_regs_c4_bcast(
+    z: [core::arch::x86_64::__m512i; 8],
+    m: &CFoldMats,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY (whole body): caller supplies eight initialized row registers
+    // and 16 writable `F128`s at `out`; the broadcast scratch is written and
+    // read in full and every shuffle index is in range.
+    unsafe {
+        // 8×8 byte transpose inside each ZMM (as `gfni_fold64_regs_impl`).
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        // 64-byte aligned so each ZMM spill is one line and each broadcast
+        // read of it is one load uop.
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = Octs([0u64; 64]);
+        let op = octs.0.as_mut_ptr();
+
+        // ---- gather, both halves, BEFORE any affine ------------------------
+        // One half = rows 32h..32h+32 = super-rows 8h..8h+8, whose four
+        // residue octets are gathered from exactly these four lines: each
+        // line holds only two rows of each residue, so a same-residue octet
+        // spans four of them and the `_tr`-style single `vpermb` becomes a
+        // two-level qword gather. Both halves are gathered up front so all
+        // eight input lines die before the affine passes open and the live
+        // set there is eight broadcasts plus four accumulators.
+        let gather = |h: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+            // Stage-1: qwords `{a, a + 4}` of two lines, the only two rows of
+            // residue `a` each line holds.
+            let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+            let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+            // Stage-2: the two 256-bit halves of a residue pair.
+            let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+            let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+            let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+            let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+            let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+            let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+            let base = op.add(32 * h);
+            // `oct[a].qword[j]` = chunk `j` of rows 32h+4t+a, t = 0..8.
+            let oct = |a: usize, v: __m512i| {
+                _mm512_storeu_si512(
+                    base.add(8 * a) as *mut __m512i,
+                    _mm512_permutexvar_epi8(bt, v),
+                )
+            };
+            oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
+            oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
+            oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
+            oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+        };
+        gather(0, z[0], z[1], z[2], z[3]);
+        gather(1, z[4], z[5], z[6], z[7]);
+
+        // OPAQUE READ POINTER, AND IT IS LOAD-BEARING. Left transparent,
+        // LLVM forwards the eight stores straight back into the sixty-four
+        // qword reads and lowers every broadcast as `vpermq zmm, zmm, zmm` —
+        // a PORT-5 register broadcast — which puts 64 shuffles back on the
+        // port this factorisation exists to unload, and spills the live set
+        // on top. Hiding the address forces the round trip, so each
+        // broadcast is `vpbroadcastq zmm, m64` on the load ports (2/3/10)
+        // and costs nothing on port 5.
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = m.1.as_ptr() as *const u64;
+        let dst = out as *mut __m512i;
+
+        // ---- affine + reduce, one half at a time ---------------------------
+        // Both passes are expanded HERE, in this function, rather than
+        // through a closure LLVM outlines and calls twice: `h` stays a
+        // constant, so every octet read and every output store keeps its
+        // immediate displacement and the whole call is one straight-line
+        // block, exactly the ledgered one.
+        macro_rules! pass {
+            ($h:expr) => {{
+                const H: usize = $h;
+                // OPAQUE MATRIX BASE, per pass. The two passes read the same 64
+                // matrix ZMMs, so a transparent base lets LLVM common them up,
+                // hold all 64 live across both passes, and spill the whole 4 KiB
+                // table to the stack — 86 spill stores per call and every affine
+                // demoted to a register operand. Per-pass opacity keeps each
+                // affine's matrix as its own `m512` memory operand, which is
+                // free: the load rides the affine's own uop pair.
+                let mp = core::hint::black_box(mp);
+                // Residue `a`, output-byte half `hh`: eight affines reduce to the
+                // pair `(v2, v3)`, and the running pair absorbs it in one more
+                // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
+                // 32-input tree, with the four-residue reduction inside it.
+                //
+                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
+                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
+                // the eight affine results of `(a, hh)` are born and consumed
+                // inside one four-op window while the eight broadcasts of residue
+                // `a` and both accumulator pairs are still live, and the register
+                // allocator spills: the emitted body pays four stack stores and
+                // seven reloads per call that the map never asks for. Materialising
+                // all sixteen results of the residue first widens the window the
+                // scheduler has to place the reduction in without widening the peak
+                // live set. The uop map and the port split are untouched: 128
+                // affines, 32 port-5 shuffles, 64 XOR-class, 64 broadcasts.
+                let mut accp = [_mm512_setzero_si512(); 2];
+                let mut accq = [_mm512_setzero_si512(); 2];
+                for a in 0..4usize {
+                    let b: [__m512i; 8] = core::array::from_fn(|j| {
+                        _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
+                    });
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                b[j],
+                                _mm512_loadu_si512(
+                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
+                                ),
+                            )
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
+                        if a == 0 {
+                            accp[hh] = v2;
+                            accq[hh] = v3;
+                        } else {
+                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
+                            accq[hh] = v3;
+                        }
+                    }
+                }
+                // `r{0,1}.byte[8k + t]` = output byte `8·hh + k` of super-row
+                // 8h+t; the byte transpose turns that into qword `t` = one half
+                // of `out[8h + t]`, and the interleave rebuilds the `F128`s.
+                let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+                let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+                let a0 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[0], accq[0]));
+                let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
+                _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(a0, il_lo, a1));
+                _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+            }};
+        }
+        pass!(0);
+        pass!(1);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Packed186 B-side burst decoder.
+//
+// The canonical 186-bit/G sidecar expands one 4096-bit quadrant directly into
+// the existing register consumers without a decoded 512-byte input tile.
+// Descriptor construction is const-evaluated; the emitted decoder is eight
+// unrolled AVX-512 qword gathers and funnel shifts with no scalar row/bit loop
+// and no runtime division or modulo.
+// -------------------------------------------------------------------------
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[derive(Copy, Clone)]
+struct BSideT1BurstZmmDesc {
+    source_base_bytes: u16,
+    idx_lo: [u8; 8],
+    shift_right: [u8; 8],
+    output_shift: [u8; 8],
+    variable_len: [u8; 8],
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+const _: () = {
+    assert!(core::mem::size_of::<BSideT1BurstZmmDesc>() == 34);
+    assert!(core::mem::size_of::<[[BSideT1BurstZmmDesc; 8]; 4]>() == 1088);
+};
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+const fn b_side_t1_make_desc(quadrant: usize, zmm: usize) -> BSideT1BurstZmmDesc {
+    const GS_BASE: usize = 1153;
+    const G_STRIDE: usize = 250;
+    const PACKED_BITS_PER_G: usize = 186;
+
+    let mut source_chunks = [0usize; 8];
+    let mut source_shifts = [0u8; 8];
+    let mut output_shifts = [0u8; 8];
+    let mut variable_len = [0u8; 8];
+    let mut any_variable = false;
+    let mut min_chunk = usize::MAX;
+    let mut max_chunk = 0usize;
+    let mut lane = 0usize;
+    while lane < 8 {
+        let word_start = quadrant * 4096 + zmm * 512 + lane * 64;
+        let word_end = word_start + 64;
+        let mut var_start = 0usize;
+        let mut var_end = 0usize;
+        let mut var_g = 0usize;
+        let mut g = 0usize;
+        while g < 56 {
+            let g_start = GS_BASE + g * G_STRIDE;
+            let g_end = g_start + PACKED_BITS_PER_G;
+            let lo = if word_start > g_start {
+                word_start
+            } else {
+                g_start
+            };
+            let hi = if word_end < g_end { word_end } else { g_end };
+            if lo < hi {
+                var_start = lo;
+                var_end = hi;
+                var_g = g;
+                break;
+            }
+            g += 1;
+        }
+        if var_start < var_end {
+            any_variable = true;
+            let dst = var_start - word_start;
+            let len = var_end - var_start;
+            let g_start = GS_BASE + var_g * G_STRIDE;
+            let source_bit = var_g * 192 + (var_start - g_start);
+            let chunk = source_bit / 64;
+            let shift = source_bit % 64;
+            source_chunks[lane] = chunk;
+            source_shifts[lane] = shift as u8;
+            output_shifts[lane] = dst as u8;
+            variable_len[lane] = len as u8;
+            if chunk < min_chunk {
+                min_chunk = chunk;
+            }
+            if chunk > max_chunk {
+                max_chunk = chunk;
+            }
+        }
+        lane += 1;
+    }
+
+    // Three quadrants contain uniform fixed-one complements around their
+    // variable payloads. Q3's final two ZMMs cross the out_hi/padding seam and
+    // are represented by sentinels handled before any sidecar load.
+    let special = if quadrant == 0 && zmm < 2 {
+        u16::MAX
+    } else if quadrant == 3 && zmm == 6 {
+        u16::MAX - 1
+    } else if quadrant == 3 && zmm == 7 {
+        u16::MAX - 2
+    } else {
+        0
+    };
+    let source_base_chunk = if any_variable { (min_chunk / 8) * 8 } else { 0 };
+    assert!(!any_variable || max_chunk + 1 <= source_base_chunk + 15);
+    let mut idx_lo = [0u8; 8];
+    lane = 0;
+    while lane < 8 {
+        if variable_len[lane] != 0 {
+            idx_lo[lane] = (source_chunks[lane] - source_base_chunk) as u8;
+        }
+        lane += 1;
+    }
+    BSideT1BurstZmmDesc {
+        source_base_bytes: if special != 0 {
+            special
+        } else {
+            (source_base_chunk * 8) as u16
+        },
+        idx_lo,
+        shift_right: source_shifts,
+        output_shift: output_shifts,
+        variable_len,
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+const B_SIDE_T1_BURST_PHASES: [[BSideT1BurstZmmDesc; 8]; 4] = [
+    [
+        b_side_t1_make_desc(0, 0),
+        b_side_t1_make_desc(0, 1),
+        b_side_t1_make_desc(0, 2),
+        b_side_t1_make_desc(0, 3),
+        b_side_t1_make_desc(0, 4),
+        b_side_t1_make_desc(0, 5),
+        b_side_t1_make_desc(0, 6),
+        b_side_t1_make_desc(0, 7),
+    ],
+    [
+        b_side_t1_make_desc(1, 0),
+        b_side_t1_make_desc(1, 1),
+        b_side_t1_make_desc(1, 2),
+        b_side_t1_make_desc(1, 3),
+        b_side_t1_make_desc(1, 4),
+        b_side_t1_make_desc(1, 5),
+        b_side_t1_make_desc(1, 6),
+        b_side_t1_make_desc(1, 7),
+    ],
+    [
+        b_side_t1_make_desc(2, 0),
+        b_side_t1_make_desc(2, 1),
+        b_side_t1_make_desc(2, 2),
+        b_side_t1_make_desc(2, 3),
+        b_side_t1_make_desc(2, 4),
+        b_side_t1_make_desc(2, 5),
+        b_side_t1_make_desc(2, 6),
+        b_side_t1_make_desc(2, 7),
+    ],
+    [
+        b_side_t1_make_desc(3, 0),
+        b_side_t1_make_desc(3, 1),
+        b_side_t1_make_desc(3, 2),
+        b_side_t1_make_desc(3, 3),
+        b_side_t1_make_desc(3, 4),
+        b_side_t1_make_desc(3, 5),
+        b_side_t1_make_desc(3, 6),
+        b_side_t1_make_desc(3, 7),
+    ],
+];
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_t1_decode_zmm(
+    packed: *const u8,
+    desc: &BSideT1BurstZmmDesc,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        if desc.source_base_bytes == u16::MAX {
+            return _mm512_set1_epi64(-1);
+        }
+        if desc.source_base_bytes == u16::MAX - 1 {
+            return _mm512_setr_epi64(0x0001_ffff_ffff_ffff, 0, 0, 0, 0, 0, 0, 0);
+        }
+        if desc.source_base_bytes == u16::MAX - 2 {
+            return _mm512_setzero_si512();
+        }
+        let source = packed.add(desc.source_base_bytes as usize) as *const i64;
+        let s0 = _mm512_loadu_si512(source as *const __m512i);
+        let s1 = if desc.source_base_bytes as usize + 128 <= 56 * 24 {
+            _mm512_loadu_si512(source.add(8) as *const __m512i)
+        } else {
+            _mm512_setzero_si512()
+        };
+        let load_u8x8 = |p: *const u8| _mm512_cvtepu8_epi64(_mm_loadl_epi64(p as *const __m128i));
+        let idx_lo = load_u8x8(desc.idx_lo.as_ptr());
+        let idx_hi = _mm512_add_epi64(idx_lo, _mm512_set1_epi64(1));
+        let shift_right = load_u8x8(desc.shift_right.as_ptr());
+        let shift_left = _mm512_sub_epi64(_mm512_set1_epi64(64), shift_right);
+        let dst = load_u8x8(desc.output_shift.as_ptr());
+        let len = load_u8x8(desc.variable_len.as_ptr());
+        let len_shift = _mm512_sub_epi64(_mm512_set1_epi64(64), len);
+        let mask = _mm512_sllv_epi64(_mm512_srlv_epi64(_mm512_set1_epi64(-1), len_shift), dst);
+        let lo = _mm512_permutex2var_epi64(s0, idx_lo, s1);
+        let hi = _mm512_permutex2var_epi64(s0, idx_hi, s1);
+        let funnel = _mm512_or_si512(
+            _mm512_srlv_epi64(lo, shift_right),
+            _mm512_sllv_epi64(hi, shift_left),
+        );
+        _mm512_or_si512(
+            _mm512_and_si512(_mm512_sllv_epi64(funnel, dst), mask),
+            _mm512_xor_si512(mask, _mm512_set1_epi64(-1)),
+        )
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_t1_decode_burst_regs(
+    packed: *const u8,
+    d: &[BSideT1BurstZmmDesc; 8],
+) -> [core::arch::x86_64::__m512i; 8] {
+    // Each descriptor is fully const-evaluated and the eight calls are
+    // intentionally unrolled.
+    unsafe {
+        [
+            b_side_t1_decode_zmm(packed, &d[0]),
+            b_side_t1_decode_zmm(packed, &d[1]),
+            b_side_t1_decode_zmm(packed, &d[2]),
+            b_side_t1_decode_zmm(packed, &d[3]),
+            b_side_t1_decode_zmm(packed, &d[4]),
+            b_side_t1_decode_zmm(packed, &d[5]),
+            b_side_t1_decode_zmm(packed, &d[6]),
+            b_side_t1_decode_zmm(packed, &d[7]),
+        ]
+    }
+}
+
+/// Decode one 64-row post-URM B burst. `row_start` identifies the witness
+/// block and one of its four fixed descriptor phases; the decoded rows remain
+/// in eight ZMM registers and are never materialized as a dense tile.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn b_side_decode_burst_regs(
+    sidecar: PackedB186<'_>,
+    row_start: usize,
+) -> [core::arch::x86_64::__m512i; 8] {
+    debug_assert_eq!(row_start % 64, 0);
+    debug_assert!(row_start + 64 <= sidecar.rows());
+    let block = row_start / PackedB186::ROWS_PER_BLOCK;
+    let phase = (row_start % PackedB186::ROWS_PER_BLOCK) / 64;
+    // SAFETY: shape checks above bound the block and phase; the compact view's
+    // constructor pins every block to exactly 1,344 readable bytes.
+    unsafe { b_side_t1_decode_burst_regs(sidecar.block_ptr(block), &B_SIDE_T1_BURST_PHASES[phase]) }
 }
 
 /// [`gfni_fold64_rows`] with the 64 rows already in registers (qword q of

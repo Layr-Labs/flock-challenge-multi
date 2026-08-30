@@ -1012,6 +1012,29 @@ fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
         && lc_adjoint_enabled()
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn ranked_b_sidecar_arms(r1cs: &BlockR1cs, n_blocks_log: usize) -> bool {
+    n_blocks_log == 18
+        && r1cs.m == 32
+        && r1cs.k_log == K_LOG
+        && r1cs.k_skip == K_SKIP
+        && r1cs.useful_bits == USEFUL_BITS
+        && r1cs.a_0.num_rows == K
+        && r1cs.a_0.num_cols == K
+        && r1cs.b_0.num_rows == K
+        && r1cs.b_0.num_cols == K
+        && r1cs.const_pin == Some(Z_CONST_POS)
+        && matches!(r1cs.layout, flock_core::r1cs::WitnessLayout::RowMajor)
+        && crate::prover::ranked_identity_c_fold_enabled(r1cs)
+}
+
 impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     fn n_cols(&self) -> usize {
         K
@@ -1566,6 +1589,242 @@ fn write_aligned_lin_words(
     }
 }
 
+// ---------------------------------------------------------------------------
+// B-side PACKED186 representation.
+//
+// A G contributes only six non-constant B operands: the 31 low bits of the
+// right-hand carry-row operand for each ADD.  Its two lin-id words use B = 1,
+// as do the block prefix and out_hi rows; padding uses B = 0.  Store each
+// six variable operands consecutively, LSB-first, at bit offsets
+// 0,31,62,93,124,155. Bits 186..192 are canonical zero. The resulting format
+// is exactly 24 bytes/G and can reconstruct the full dense 2-KiB B block
+// without consulting A, Z, or the Compression input again.
+//
+// The exact ranked Sapphire path owns this representation through zerocheck;
+// all other shapes retain the incumbent dense representation unchanged.
+// ---------------------------------------------------------------------------
+
+const B_SPEED_BITS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
+pub(super) const B_SPEED_BYTES_PER_G: usize = B_SPEED_BITS_PER_G.div_ceil(8);
+const B_SPEED_TAIL_MASK: u8 = u8::MAX << (B_SPEED_BITS_PER_G % 8);
+const B_DENSE_BYTES_PER_BLOCK: usize = K / 8;
+const B_LOW31_MASK: u32 = (1u32 << CARRY_BITS_PER_ADD) - 1;
+pub(super) const B_SIDE_PACKED_BYTES_PER_BLOCK: usize = N_G * B_SPEED_BYTES_PER_G;
+
+/// Scratch-backed owner for the production PACKED186 B representation.
+///
+/// Each compression occupies 56 G records of 24 bytes. The backing allocation
+/// is borrowed from the existing F128 scratch pool, so replacing dense B does
+/// not add a second long-lived allocator class. Every producer must overwrite
+/// all bytes before exposing the owner.
+pub(crate) struct PackedBSide {
+    storage: Vec<F128>,
+    n_blocks: usize,
+}
+
+impl PackedBSide {
+    fn take_uninit(n_blocks: usize) -> Self {
+        const {
+            assert!(B_SIDE_PACKED_BYTES_PER_BLOCK.is_multiple_of(std::mem::size_of::<F128>()));
+        }
+        let n_f128 = n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK / std::mem::size_of::<F128>();
+        Self {
+            storage: flock_core::scratch::take_f128(n_f128),
+            n_blocks,
+        }
+    }
+
+    pub(crate) fn len_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.storage.as_ptr().cast::<u8>(),
+                self.n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK,
+            )
+        }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.storage.as_mut_ptr().cast::<u8>(),
+                self.n_blocks * B_SIDE_PACKED_BYTES_PER_BLOCK,
+            )
+        }
+    }
+
+    pub(crate) fn block(&self, block: usize) -> &[u8] {
+        assert!(block < self.n_blocks);
+        let start = block * B_SIDE_PACKED_BYTES_PER_BLOCK;
+        &self.as_bytes()[start..start + B_SIDE_PACKED_BYTES_PER_BLOCK]
+    }
+}
+
+impl Drop for PackedBSide {
+    fn drop(&mut self) {
+        flock_core::scratch::give_f128(std::mem::take(&mut self.storage));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BSideSpeedBlock([[u8; B_SPEED_BYTES_PER_G]; N_G]);
+
+impl BSideSpeedBlock {
+    #[inline]
+    fn as_bytes(&self) -> &[u8; B_SIDE_PACKED_BYTES_PER_BLOCK] {
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .cast::<[u8; B_SIDE_PACKED_BYTES_PER_BLOCK]>()
+        }
+    }
+
+    #[inline(always)]
+    fn put_rhs(&mut self, g: usize, add: usize, rhs: u32) {
+        debug_assert!(g < N_G && add < ADDS_PER_G);
+        let rhs = rhs & B_LOW31_MASK;
+        let off = add * CARRY_BITS_PER_ADD;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            let dst_bit = off + bit;
+            let mask = 1u8 << (dst_bit & 7);
+            let byte = &mut self.0[g][dst_bit >> 3];
+            *byte = (*byte & !mask) | ((((rhs >> bit) & 1) as u8) << (dst_bit & 7));
+        }
+    }
+
+    #[inline(always)]
+    fn rhs(&self, g: usize, add: usize) -> u32 {
+        debug_assert!(g < N_G && add < ADDS_PER_G);
+        let off = add * CARRY_BITS_PER_ADD;
+        let mut rhs = 0u32;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            let src_bit = off + bit;
+            rhs |= (((self.0[g][src_bit >> 3] >> (src_bit & 7)) & 1) as u32) << bit;
+        }
+        rhs
+    }
+
+    #[inline(always)]
+    fn has_canonical_tail(&self, g: usize) -> bool {
+        debug_assert!(g < N_G);
+        self.0[g][B_SPEED_BYTES_PER_G - 1] & B_SPEED_TAIL_MASK == 0
+    }
+}
+
+/// Encode the six low-31 B carry-row operands emitted by each G in the same
+/// scalar state evolution used by [`build_block_witness_ab_packed_into`].
+fn encode_b_side_speed_block(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> BSideSpeedBlock {
+    let mut encoded = BSideSpeedBlock([[0u8; B_SPEED_BYTES_PER_G]; N_G]);
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter as u32,
+        (counter >> 32) as u32,
+        block_len,
+        flags,
+    ];
+    let msg_idx = per_round_msg_idx();
+
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let a = state[la];
+            let b = state[lb];
+            let c = state[lc];
+            let d = state[ld];
+
+            let mut add = 0;
+            let mut push_add = |x: u32, y: u32| {
+                let (sum, _left, right, _carry) = add_carry_parts(x, y);
+                encoded.put_rhs(g, add, right);
+                add += 1;
+                sum
+            };
+
+            let tmp_0 = push_add(a, b);
+            let a_1 = push_add(tmp_0, m[mx_i]);
+            let d_1 = (d ^ a_1).rotate_right(16);
+            let c_1 = push_add(c, d_1);
+            let b_1 = (b ^ c_1).rotate_right(12);
+            let tmp_1 = push_add(a_1, b_1);
+            let a_2 = push_add(tmp_1, m[my_i]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = push_add(c_1, d_2);
+            debug_assert_eq!(add, ADDS_PER_G);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_2;
+        }
+    }
+
+    encoded
+}
+
+#[inline]
+fn b_side_set_ones(dst: &mut [u8; B_DENSE_BYTES_PER_BLOCK], start: usize, end: usize) {
+    debug_assert!(start <= end && end <= K);
+    for bit in start..end {
+        dst[bit >> 3] |= 1 << (bit & 7);
+    }
+}
+
+#[inline(always)]
+fn b_side_write_low31(dst: &mut [u8; B_DENSE_BYTES_PER_BLOCK], bit_off: usize, value: u32) {
+    debug_assert_eq!(value & !B_LOW31_MASK, 0);
+    for bit in 0..CARRY_BITS_PER_ADD {
+        dst[(bit_off + bit) >> 3] |= (((value >> bit) & 1) as u8) << ((bit_off + bit) & 7);
+    }
+}
+
+/// Expand the speed format into the exact canonical dense B block.
+fn expand_b_side_speed_block(encoded: &BSideSpeedBlock) -> [u8; B_DENSE_BYTES_PER_BLOCK] {
+    let mut dense = [0u8; B_DENSE_BYTES_PER_BLOCK];
+
+    // CV, out_lo, constant, message, counter, block_len, and flags are all
+    // lin/input rows, hence B = 1 through the first G boundary.
+    b_side_set_ones(&mut dense, 0, GS_BASE);
+    for g in 0..N_G {
+        debug_assert!(encoded.has_canonical_tail(g));
+        let g_base = GS_BASE + g * G_STRIDE;
+        for add in 0..ADDS_PER_G {
+            b_side_write_low31(
+                &mut dense,
+                g_base + add * CARRY_BITS_PER_ADD,
+                encoded.rhs(g, add),
+            );
+        }
+        let lin_base = g_base + ADDS_PER_G * CARRY_BITS_PER_ADD;
+        b_side_set_ones(&mut dense, lin_base, lin_base + LIN_WORDS_PER_G * WORD_BITS);
+    }
+    b_side_set_ones(&mut dense, OUT_HI_BASE, USEFUL_BITS);
+    dense
+}
+
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
 /// of the F128-packed per-block storage. Every destination word is overwritten;
 /// prior buffer contents are ignored.
@@ -2110,6 +2369,150 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
     (z, a, b, ab_inner)
+}
+
+/// Producer-only result for the PACKED186 B representation. This is kept
+/// separate from prover plumbing until both zerocheck consumers accept the
+/// compact layout.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) struct PackedBSideProducerOutput {
+    pub(crate) z: Vec<F128>,
+    pub(crate) a: Vec<F128>,
+    pub(crate) b: PackedBSide,
+    pub(crate) ab_inner: flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+}
+
+/// Build z/A, PACKED186 B, and the complete round-one projection in one AVX2
+/// octa pass. Dense B exists only as the kernel's rolling register/ring state;
+/// it has no persistent allocation and is never published to memory.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) fn generate_witness_with_a_packed_b_and_round1_inner_from(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> PackedBSideProducerOutput {
+    use rayon::prelude::*;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+
+    let n_total = 1usize << n_blocks_log;
+    assert!(n_total >= SIMD && blocks.len() <= n_total);
+    let n_f128 = n_total * F128_PER_BLOCK;
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let mut b = PackedBSide::take_uninit(n_total);
+    let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+        n_total * BYTES_PER_BLOCK,
+    );
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let one_rows_elided = n_blocks_log == 18
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+        && flock_core::pcs::ranked_direct_fold8_enabled();
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        &inv_table,
+        ab_inner_bytes,
+        abinner_nt,
+    );
+
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let group_packed = GROUP * B_SIDE_PACKED_BYTES_PER_BLOCK;
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.as_bytes_mut().par_chunks_mut(group_packed))
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each_init(
+            || {
+                let mut stage: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                stage.reserve_exact(STAGE_LINES);
+                unsafe { stage.set_len(STAGE_LINES) };
+                stage
+            },
+            |stage, (group, (((z_out, a_out), packed_out), ab_out))| unsafe {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                for half in 0..(n_here / SIMD) {
+                    let base = GROUP * group + half * SIMD;
+                    let staged: [Compression; SIMD];
+                    let octa = match blocks {
+                        crate::seed_pipe::BlockSource::Slice(s) => {
+                            blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                s.get(base + j).unwrap_or(&padding)
+                            }))
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len }
+                            if base + SIMD <= len =>
+                        {
+                            blake3_witgen8::OctaInputs::Closed { init, base }
+                        }
+                        crate::seed_pipe::BlockSource::Closed { init, len } => {
+                            staged = std::array::from_fn(|j| {
+                                let idx = base + j;
+                                if idx < len {
+                                    crate::seed_pipe::gen_block(init, idx)
+                                } else {
+                                    padding
+                                }
+                            });
+                            blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| &staged[j]))
+                        }
+                    };
+                    let off = half * SIMD * F128_PER_BLOCK;
+                    let stage_ptr = stage.as_mut_ptr().cast::<u32>();
+                    let proj = blake3_witgen8::StreamProj {
+                        stage: stage_ptr,
+                        out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided,
+                    };
+                    // Sidecar B supplies its fixed prefix/tail independently;
+                    // z/a still require real provenance before static windows
+                    // may skip their persistent stores.
+                    let elide = [z_tok, a_tok, true];
+                    blake3_witgen8::build_octa_witness_a_packed_b_stream_elide(
+                        octa,
+                        z_out.as_mut_ptr().add(off).cast::<u32>(),
+                        a_out.as_mut_ptr().add(off).cast::<u32>(),
+                        packed_out
+                            .as_mut_ptr()
+                            .add(half * SIMD * B_SIDE_PACKED_BYTES_PER_BLOCK),
+                        proj,
+                        elide,
+                    );
+                }
+                // a and ab_inner are streamed in every octa; publish before a
+                // task can hand its chunks to a later phase.
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            },
+        );
+
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(),
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    PackedBSideProducerOutput { z, a, b, ab_inner }
 }
 
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
@@ -3761,6 +4164,41 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx2",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                if ranked_b_sidecar_arms(&self.r1cs, self.n_blocks_log()) {
+                    let (codeword, out) = crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                        flock_core::gaptime::mark("witness: pool entered");
+                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                            generate_witness_with_a_packed_b_and_round1_inner_from(
+                                blocks,
+                                self.n_blocks_log(),
+                            )
+                        });
+                        flock_core::gaptime::mark("witness: work done (incl. prefault)");
+                        r
+                    });
+                    flock_core::gaptime::mark("witness: pool exited");
+                    let lc_circuit = self.lincheck_circuit();
+                    flock_core::gaptime::mark("lc_circuit built");
+                    return crate::prover::prove_fast_ligerito_from_block_major_witness_with_b_sidecar(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        out.z,
+                        out.a,
+                        out.b,
+                        out.ab_inner,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    );
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -4268,6 +4706,262 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             (z ^ (z >> 31)) as u32
         }
+    }
+
+    fn incumbent_dense_b(block: &Compression) -> [u8; B_DENSE_BYTES_PER_BLOCK] {
+        let (cv, m, counter, block_len, flags) = block;
+        let mut z = vec![0u64; K / 64];
+        let mut a = vec![0u64; K / 64];
+        let mut b = vec![0u64; K / 64];
+        build_block_witness_ab_packed_into(
+            cv, m, *counter, *block_len, *flags, &mut z, &mut a, &mut b,
+        );
+        let mut bytes = [0u8; B_DENSE_BYTES_PER_BLOCK];
+        for (dst, word) in bytes.chunks_exact_mut(8).zip(b) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn speed_encode(block: &Compression) -> BSideSpeedBlock {
+        let (cv, m, counter, block_len, flags) = block;
+        encode_b_side_speed_block(cv, m, *counter, *block_len, *flags)
+    }
+
+    #[inline]
+    fn dense_b_bit(bytes: &[u8; B_DENSE_BYTES_PER_BLOCK], bit: usize) -> u32 {
+        ((bytes[bit >> 3] >> (bit & 7)) & 1) as u32
+    }
+
+    fn dense_b_low31(bytes: &[u8; B_DENSE_BYTES_PER_BLOCK], bit_off: usize) -> u32 {
+        let mut value = 0u32;
+        for bit in 0..CARRY_BITS_PER_ADD {
+            value |= dense_b_bit(bytes, bit_off + bit) << bit;
+        }
+        value
+    }
+
+    #[test]
+    fn b_side_speed_format_randomized_matches_dense_b_byte_for_byte() {
+        assert_eq!(
+            std::mem::size_of::<BSideSpeedBlock>(),
+            N_G * B_SPEED_BYTES_PER_G,
+            "the canonical format must remain exactly 24 bytes/G"
+        );
+        let mut rng = Rng::new(0xB51D_E5E5_CAFE_0001);
+        for case in 0..32 {
+            let block: Compression = (
+                std::array::from_fn(|_| rng.next_u32()),
+                std::array::from_fn(|_| rng.next_u32()),
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                rng.next_u32(),
+                rng.next_u32(),
+            );
+            let encoded = speed_encode(&block);
+            let incumbent = incumbent_dense_b(&block);
+            for (g, operands) in encoded.0.iter().enumerate() {
+                assert_eq!(
+                    operands[B_SPEED_BYTES_PER_G - 1] & B_SPEED_TAIL_MASK,
+                    0,
+                    "non-canonical tail bits at case={case}, g={g}"
+                );
+                for add in 0..ADDS_PER_G {
+                    assert_eq!(
+                        encoded.rhs(g, add),
+                        dense_b_low31(
+                            &incumbent,
+                            GS_BASE + g * G_STRIDE + add * CARRY_BITS_PER_ADD
+                        ),
+                        "packed field roundtrip at case={case}, g={g}, add={add}"
+                    );
+                }
+            }
+            assert_eq!(
+                expand_b_side_speed_block(&encoded),
+                incumbent,
+                "dense B mismatch at randomized case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn b_side_packed_owner_has_exact_scalar_block_bytes() {
+        let mut rng = Rng::new(0xB51D_0A11_CAFE_0001);
+        let blocks: [Compression; 2] = std::array::from_fn(|_| {
+            (
+                std::array::from_fn(|_| rng.next_u32()),
+                std::array::from_fn(|_| rng.next_u32()),
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                rng.next_u32(),
+                rng.next_u32(),
+            )
+        });
+        let expected = blocks.map(|block| speed_encode(&block));
+        let mut owner = PackedBSide::take_uninit(2);
+        for (dst, src) in owner
+            .as_bytes_mut()
+            .chunks_exact_mut(B_SIDE_PACKED_BYTES_PER_BLOCK)
+            .zip(&expected)
+        {
+            dst.copy_from_slice(src.as_bytes());
+        }
+        assert_eq!(owner.len_blocks(), 2);
+        assert_eq!(owner.block(0), expected[0].as_bytes());
+        assert_eq!(owner.block(1), expected[1].as_bytes());
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn b_side_packed_octa_matches_scalar_and_full_projection_with_padding() {
+        let mut rng = Rng::new(0xB51D_0C7A_CAFE_0001);
+        let blocks: Vec<Compression> = (0..5)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            })
+            .collect();
+        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+        let mut out = generate_witness_with_a_packed_b_and_round1_inner_from(
+            crate::seed_pipe::BlockSource::Slice(&blocks),
+            3,
+        );
+        assert_eq!(out.b.len_blocks(), 8);
+        for block in 0..8 {
+            let scalar = speed_encode(blocks.get(block).unwrap_or(&padding));
+            assert_eq!(
+                out.b.block(block),
+                scalar.as_bytes(),
+                "packed B block {block}"
+            );
+        }
+
+        let (z_ref, a_ref, b_ref) = generate_witness_with_ab_packed(&blocks, 3);
+        assert_eq!(out.z, z_ref, "z differs from dense producer");
+        assert_eq!(out.a, a_ref, "A differs from dense producer");
+        let total_bytes = 8 * B_DENSE_BYTES_PER_BLOCK;
+        let a_bytes =
+            unsafe { std::slice::from_raw_parts(a_ref.as_ptr().cast::<u8>(), total_bytes) };
+        let b_bytes =
+            unsafe { std::slice::from_raw_parts(b_ref.as_ptr().cast::<u8>(), total_bytes) };
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let padding_spec = flock_core::zerocheck::PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+        let mut oracle =
+            flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_bytes,
+                b_bytes,
+                K_LOG + 3,
+                K_SKIP,
+                &inv_table,
+                &padding_spec,
+            );
+        assert_eq!(
+            out.ab_inner.as_bytes_mut(),
+            oracle.as_bytes_mut(),
+            "ab_inner differs from dense-B oracle"
+        );
+    }
+
+    #[test]
+    fn b_side_speed_format_has_the_expected_physical_bit_order() {
+        let mut encoded = BSideSpeedBlock([[0u8; B_SPEED_BYTES_PER_G]; N_G]);
+        for add in 0..ADDS_PER_G {
+            encoded.put_rhs(0, add, 1);
+        }
+
+        let mut expected = [0u8; B_SPEED_BYTES_PER_G];
+        expected[0] = 0x01; // bit 0
+        expected[3] = 0x80; // bit 31
+        expected[7] = 0x40; // bit 62
+        expected[11] = 0x20; // bit 93
+        expected[15] = 0x10; // bit 124
+        expected[19] = 0x08; // bit 155
+        assert_eq!(encoded.0[0], expected);
+        assert!(encoded.has_canonical_tail(0));
+    }
+
+    #[test]
+    fn b_side_speed_format_zero_padding_compression_matches_dense_b() {
+        let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+        let encoded = speed_encode(&padding);
+        assert_eq!(
+            expand_b_side_speed_block(&encoded),
+            incumbent_dense_b(&padding)
+        );
+    }
+
+    #[test]
+    fn b_side_speed_expansion_covers_every_layout_boundary_and_g_seam() {
+        let mut rng = Rng::new(0xB0A7_DA7A_5EAA_0001);
+        let block: Compression = (
+            std::array::from_fn(|_| rng.next_u32()),
+            std::array::from_fn(|_| rng.next_u32()),
+            ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            rng.next_u32(),
+            rng.next_u32(),
+        );
+        let encoded = speed_encode(&block);
+        let dense = expand_b_side_speed_block(&encoded);
+        assert_eq!(dense, incumbent_dense_b(&block));
+
+        // Prefix boundary: CV/out_lo and every scalar input row use B = 1.
+        assert!((0..GS_BASE).all(|bit| dense_b_bit(&dense, bit) == 1));
+        assert_eq!(dense_b_bit(&dense, GS_BASE - 1), 1);
+
+        // Every G boundary is checked on both sides: six packed low-31
+        // operands followed by the 64 fixed-one lin-id bits.  The next G
+        // starts immediately after that fixed suffix, including unaligned
+        // byte/u64 seams.
+        for g in 0..N_G {
+            let g_base = GS_BASE + g * G_STRIDE;
+            for add in 0..ADDS_PER_G {
+                let rhs = encoded.rhs(g, add);
+                let bit_base = g_base + add * CARRY_BITS_PER_ADD;
+                for bit in 0..CARRY_BITS_PER_ADD {
+                    assert_eq!(
+                        dense_b_bit(&dense, bit_base + bit),
+                        (rhs >> bit) & 1,
+                        "g={g}, add={add}, bit={bit}"
+                    );
+                }
+            }
+            let lin_base = g_base + ADDS_PER_G * CARRY_BITS_PER_ADD;
+            assert!(
+                (lin_base..lin_base + LIN_WORDS_PER_G * WORD_BITS)
+                    .all(|bit| dense_b_bit(&dense, bit) == 1)
+            );
+            assert_eq!(lin_base + LIN_WORDS_PER_G * WORD_BITS, g_base + G_STRIDE);
+            if g + 1 < N_G {
+                assert_eq!(g_base + G_STRIDE, GS_BASE + (g + 1) * G_STRIDE);
+                assert_eq!(
+                    dense_b_bit(&dense, g_base + G_STRIDE),
+                    encoded.rhs(g + 1, 0) & 1,
+                    "G seam {g}->{next}",
+                    next = g + 1
+                );
+            }
+        }
+        assert_eq!(GS_BASE + N_G * G_STRIDE, OUT_HI_BASE);
+
+        // out_hi is fixed B = 1.  USEFUL_BITS lands 49 bits into u64 row
+        // 240, so that row is the final mixed one/zero word and row 241+
+        // must be pure padding zero.
+        assert!((OUT_HI_BASE..USEFUL_BITS).all(|bit| dense_b_bit(&dense, bit) == 1));
+        let row_240 = u64::from_le_bytes(dense[240 * 8..241 * 8].try_into().unwrap());
+        assert_eq!(USEFUL_BITS - 240 * 64, 49);
+        assert_eq!(row_240, (1u64 << 49) - 1);
+        assert!(dense[241 * 8..].iter().all(|&byte| byte == 0));
+        assert!((USEFUL_BITS..K).all(|bit| dense_b_bit(&dense, bit) == 0));
     }
 
     /// BLAKE3 chunk flags (subset).
