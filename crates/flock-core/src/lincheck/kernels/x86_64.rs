@@ -424,6 +424,93 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// Ranked full-chunk specialization of [`gfni_fold_tile`].  The two adjacent
+/// 64-column blocks use the same 128 matrices, so broadcast each matrix once
+/// and apply it to both blocks before advancing.  This deletes half of the
+/// matrix reads/broadcasts in the overwhelmingly dominant `n_blocks64 == 2`
+/// case.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile2(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let rows0: [__m512i; 8] = core::array::from_fn(|t| {
+            _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride) as *const __m512i)
+        });
+        let rows1: [__m512i; 8] = core::array::from_fn(|t| {
+            _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + 64) as *const __m512i)
+        });
+        for byte_k in 0..16 {
+            let p0 = out_planes_ptr.add(byte_k * 64) as *mut __m512i;
+            let p1 = out_planes_ptr.add(1024 + byte_k * 64) as *mut __m512i;
+            let mut a0 = if seed_zero { _mm512_setzero_si512() } else { _mm512_loadu_si512(p0) };
+            let mut a1 = if seed_zero { _mm512_setzero_si512() } else { _mm512_loadu_si512(p1) };
+            for t in (0..8).step_by(2) {
+                let m0 = _mm512_set1_epi64(mats[t * 16 + byte_k] as i64);
+                let m1 = _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64);
+                let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t], m0);
+                let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t + 1], m1);
+                let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t], m0);
+                let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t + 1], m1);
+                a0 = _mm512_ternarylogic_epi64::<0x96>(a0, g00, g01);
+                a1 = _mm512_ternarylogic_epi64::<0x96>(a1, g10, g11);
+            }
+            _mm512_storeu_si512(p0, a0);
+            _mm512_storeu_si512(p1, a1);
+        }
+    }
+}
+
+/// Dispatch the full two-block case to [`gfni_fold_tile2`], retaining the
+/// generic kernel for the ranked ragged tail and for the same-binary rollback.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+#[inline]
+pub(crate) unsafe fn gfni_fold_tile_pair2_dispatch(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+    pair2: bool,
+) {
+    unsafe {
+        if pair2 && n_blocks64 == 2 {
+            gfni_fold_tile2(
+                tile_bytes_ptr,
+                stripe_stride,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            );
+        } else {
+            gfni_fold_tile(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            );
+        }
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`

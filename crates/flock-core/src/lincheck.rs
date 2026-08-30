@@ -1246,6 +1246,20 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_GFNI_PAIR2=1` restores the generic block-at-a-time GFNI
+/// sweep. The default full-chunk arm shares each matrix broadcast across the
+/// two adjacent 64-column blocks; the ragged ranked tail remains generic.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_gfni_pair2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GFNI_PAIR2").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1573,6 +1587,7 @@ fn fold_block_major_gfni(
             // inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+            let pair2 = lc_gfni_pair2_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1662,13 +1677,14 @@ fn fold_block_major_gfni(
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                kernels::gfni_fold_tile(
+                                kernels::gfni_fold_tile_pair2_dispatch(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
                                     2,
                                     &mats,
                                     wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
                                     first_tile,
+                                    pair2,
                                 );
                             }
                         }
@@ -1720,13 +1736,14 @@ fn fold_block_major_gfni(
                     // bytes for every q < useful_chunks <= k/128. first_tile
                     // is true iff this worker has not yet stored into wplanes.
                     unsafe {
-                        kernels::gfni_fold_tile(
+                        kernels::gfni_fold_tile_pair2_dispatch(
                             transposed.as_ptr(),
                             128,
                             chunk_bits.div_ceil(64),
                             &mats,
                             wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
                             first_tile,
+                            pair2,
                         );
                     }
                     q += 1;
@@ -4439,6 +4456,70 @@ mod tests {
                 &eq,
             );
             assert_eq!(tiled, gfni, "at m={m}, k_log={k_log}, useful={useful_bits}");
+        }
+    }
+
+    /// The pair-2 matrix-broadcast sharing is byte-identical to the generic
+    /// kernel for both accumulator modes. `n_blocks64 = 1` exercises the
+    /// ranked non-64-aligned tail's generic fallback through the same
+    /// dispatcher used by the production sweep.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_fold_tile_pair2_matches_generic_and_ragged_fallback() {
+        for case in 0..8u64 {
+            let mut rng = Rng::new(0x6F6C_6432_0000_0000 ^ case);
+            let mut tile = [0u8; 8 * 128];
+            for byte in &mut tile {
+                *byte = rng.next_u64() as u8;
+            }
+            let mats: [u64; 128] = std::array::from_fn(|_| rng.next_u64());
+            for n_blocks64 in [2usize, 1] {
+                for seed_zero in [false, true] {
+                    let initial: Vec<u8> = (0..n_blocks64 * 1024)
+                        .map(|_| rng.next_u64() as u8)
+                        .collect();
+                    let mut want = initial.clone();
+                    let mut got = initial.clone();
+                    let mut rollback = initial;
+                    unsafe {
+                        kernels::gfni_fold_tile(
+                            tile.as_ptr(),
+                            128,
+                            n_blocks64,
+                            &mats,
+                            want.as_mut_ptr(),
+                            seed_zero,
+                        );
+                        kernels::gfni_fold_tile_pair2_dispatch(
+                            tile.as_ptr(),
+                            128,
+                            n_blocks64,
+                            &mats,
+                            got.as_mut_ptr(),
+                            seed_zero,
+                            true,
+                        );
+                        kernels::gfni_fold_tile_pair2_dispatch(
+                            tile.as_ptr(),
+                            128,
+                            n_blocks64,
+                            &mats,
+                            rollback.as_mut_ptr(),
+                            seed_zero,
+                            false,
+                        );
+                    }
+                    assert_eq!(got, want, "pair2 case={case} seed_zero={seed_zero}");
+                    assert_eq!(
+                        rollback, want,
+                        "rollback blocks={n_blocks64} case={case} seed_zero={seed_zero}"
+                    );
+                }
+            }
         }
     }
 
