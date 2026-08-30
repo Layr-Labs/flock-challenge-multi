@@ -301,12 +301,12 @@ fn blake3_platform() -> blake3::platform::Platform {
 /// Inputs handed to `hash_many` per call.
 ///
 /// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
-/// entry can loop over several such groups. Four groups amortize the FFI and
-/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
+/// entry can loop over several such groups. Eight groups amortize the FFI and
+/// state-setup prologue while keeping the pointer array to 1024 bytes. Retain
 /// the established 16-input policy on non-x86 targets, where an M4 sweep found
 /// it marginally best and the SIMD width is only four.
 #[cfg(target_arch = "x86_64")]
-const BLAKE3_BATCH: usize = 64;
+const BLAKE3_BATCH: usize = 128;
 #[cfg(not(target_arch = "x86_64"))]
 const BLAKE3_BATCH: usize = 16;
 
@@ -1245,10 +1245,17 @@ mod tests {
     /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
-        // Node counts chosen around `BLAKE3_BATCH` (64): a single node, a
+        // Node counts chosen around `BLAKE3_BATCH`: a single node, a
         // partial batch, exactly one batch, one past it, and several batches
         // with a partial tail. A width bug in the batch loop shows up here.
-        let counts = [1usize, 5, 63, 64, 65, 200];
+        let counts = [
+            1usize,
+            5,
+            BLAKE3_BATCH - 1,
+            BLAKE3_BATCH,
+            BLAKE3_BATCH + 1,
+            BLAKE3_BATCH * 3 + 8,
+        ];
 
         // Parents.
         for n in counts {
