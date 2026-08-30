@@ -283,10 +283,26 @@ fn zerocheck_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
     }))
 }
 
+/// `FLOCK_NO_IN_POOL_COMMIT=1` restores the direct commit-phase call when
+/// there is no dedicated commit pool (ranked x86). Open/zerocheck/lincheck
+/// already enter via `in_pool`; commit still opened its NTT/Merkle regions
+/// from the non-worker thread.
+fn in_pool_commit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL_COMMIT").is_none());
+    *ON
+}
+
 fn in_commit_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + Send) -> R {
     match commit_phase_pool(m) {
         Some(pool) => pool.install(op),
-        None => op(),
+        None => {
+            if in_pool_commit_enabled() {
+                flock_core::in_pool(op)
+            } else {
+                op()
+            }
+        }
     }
 }
 
