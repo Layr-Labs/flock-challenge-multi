@@ -38,13 +38,26 @@ unsafe fn lane1(v: __m128i) -> u64 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute. `b_lo` is the multiplier's low limb; its high limb must be 0.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
-        let p0 = pmull(a.lo, b_lo);
-        let q = pmull(a.hi, b_lo);
-        super::ghash_reduce(lane0(p0), lane1(p0) ^ lane0(q), lane1(q), 0)
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(0, b_lo as i64);
+        let poly = _mm_set_epi64x(0, 0x87);
+
+        let t0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let t1 = _mm_clmulepi64_si128::<0x10>(va, vb);
+
+        let t1_shifted = _mm_slli_si128::<8>(t1);
+        let t1_red = _mm_clmulepi64_si128::<0x01>(t1, poly);
+        let res = _mm_xor_si128(t0, _mm_xor_si128(t1_shifted, t1_red));
+
+        F128 {
+            lo: lane0(res),
+            hi: lane1(res),
+        }
     }
 }
 
@@ -53,14 +66,17 @@ pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
-        let p_ll = pmull(a.lo, b.lo);
-        let p_lh = pmull(a.lo, b.hi);
-        let p_hl = pmull(a.hi, b.lo);
-        let p_hh = pmull(a.hi, b.hi);
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let p_ll = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let p_lh = _mm_clmulepi64_si128::<0x01>(va, vb);
+        let p_hl = _mm_clmulepi64_si128::<0x10>(va, vb);
+        let p_hh = _mm_clmulepi64_si128::<0x11>(va, vb);
 
         let cross = _mm_xor_si128(p_lh, p_hl);
         let cr_lo = lane0(cross);
@@ -83,26 +99,31 @@ pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
-        let t0 = pmull(a.lo, b.lo);
-        let t1a = pmull(a.lo, b.hi);
-        let t1b = pmull(a.hi, b.lo);
-        let t2 = pmull(a.hi, b.hi);
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let poly = _mm_set_epi64x(0, 0x87);
+
+        let t0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let t1a = _mm_clmulepi64_si128::<0x01>(va, vb);
+        let t1b = _mm_clmulepi64_si128::<0x10>(va, vb);
+        let t2 = _mm_clmulepi64_si128::<0x11>(va, vb);
         let mut t1 = _mm_xor_si128(t1a, t1b);
 
         // First reduce: t1 = t1 + x^64 · t2 (mod p).
         let t2_shifted = _mm_slli_si128::<8>(t2); // {0, t2.lo}
         t1 = _mm_xor_si128(t1, t2_shifted);
-        let t2_red = pmull(lane1(t2), 0x87);
+        let t2_red = _mm_clmulepi64_si128::<0x01>(t2, poly);
         t1 = _mm_xor_si128(t1, t2_red);
 
         // Second reduce: t0 = t0 + x^64 · t1 (mod p).
         let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
         let mut t0 = _mm_xor_si128(t0, t1_shifted);
-        let t1_red = pmull(lane1(t1), 0x87);
+        let t1_red = _mm_clmulepi64_si128::<0x01>(t1, poly);
         t0 = _mm_xor_si128(t0, t1_red);
 
         F128 {
@@ -119,13 +140,21 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 /// # Safety
 /// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
 /// features required by this function.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
-        let p0 = pmull(a.lo, b.lo);
-        let p1 = pmull(a.hi, b.hi);
-        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let poly = _mm_set_epi64x(0, 0x87);
+
+        let p0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let p1 = _mm_clmulepi64_si128::<0x11>(va, vb);
+        let va_xor = _mm_xor_si128(va, _mm_srli_si128::<8>(va));
+        let vb_xor = _mm_xor_si128(vb, _mm_srli_si128::<8>(vb));
+        let pm = _mm_clmulepi64_si128::<0x00>(va_xor, vb_xor);
+
         // cross = pm ^ p0 ^ p1 is the x^64 coefficient (binius's t1).
         let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
         let mut t0 = p0;
@@ -133,13 +162,13 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
         // First reduce: t1 = t1 + x^64 · t2 (mod p), with t2 = p1.
         let t2_shifted = _mm_slli_si128::<8>(p1); // {0, p1.lo}
         t1 = _mm_xor_si128(t1, t2_shifted);
-        let t2_red = pmull(lane1(p1), 0x87);
+        let t2_red = _mm_clmulepi64_si128::<0x01>(p1, poly);
         t1 = _mm_xor_si128(t1, t2_red);
 
         // Second reduce: t0 = t0 + x^64 · t1 (mod p).
         let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
         t0 = _mm_xor_si128(t0, t1_shifted);
-        let t1_red = pmull(lane1(t1), 0x87);
+        let t1_red = _mm_clmulepi64_si128::<0x01>(t1, poly);
         t0 = _mm_xor_si128(t0, t1_red);
 
         F128 {
@@ -155,13 +184,18 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
-        let p0 = pmull(a.lo, b.lo);
-        let p1 = pmull(a.hi, b.hi);
-        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let p0 = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let p1 = _mm_clmulepi64_si128::<0x11>(va, vb);
+        let va_xor = _mm_xor_si128(va, _mm_srli_si128::<8>(va));
+        let vb_xor = _mm_xor_si128(vb, _mm_srli_si128::<8>(vb));
+        let pm = _mm_clmulepi64_si128::<0x00>(va_xor, vb_xor);
 
         let p0_lo = lane0(p0);
         let p0_hi = lane1(p0);
@@ -229,23 +263,25 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     // SAFETY: function carries the required target features.
     unsafe {
-        let p_ll = pmull(a.lo, b.lo);
-        let p_lh = pmull(a.lo, b.hi);
-        let p_hl = pmull(a.hi, b.lo);
-        let p_hh = pmull(a.hi, b.hi);
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+
+        let p_ll = _mm_clmulepi64_si128::<0x00>(va, vb);
+        let p_lh = _mm_clmulepi64_si128::<0x01>(va, vb);
+        let p_hl = _mm_clmulepi64_si128::<0x10>(va, vb);
+        let p_hh = _mm_clmulepi64_si128::<0x11>(va, vb);
 
         let cross = _mm_xor_si128(p_lh, p_hl);
-        let cr_lo = lane0(cross);
-        let cr_hi = lane1(cross);
 
         F256Unreduced {
             r0: lane0(p_ll),
-            r1: lane1(p_ll) ^ cr_lo,
-            r2: lane0(p_hh) ^ cr_hi,
+            r1: lane1(p_ll) ^ lane0(cross),
+            r2: lane0(p_hh) ^ lane1(cross),
             r3: lane1(p_hh),
         }
     }
@@ -532,6 +568,12 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
+    }
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_low_rhs(&mut self, x: __m512i, y: __m512i) {
+        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+        self.mid = _mm512_xor_si512(self.mid, _mm512_clmulepi64_epi128::<0x10>(x, y));
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
