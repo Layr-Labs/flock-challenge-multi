@@ -3511,7 +3511,8 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
     debug_assert!(group == 0 || group == 3);
     // SAFETY: the guard established the canonical group; every other input
     // line is read into the local octet scratch before any output is stored.
-    // All 64 scratch qwords and all 64 output F128s are initialized below.
+    // The dense loop skips the canonical group, so it reads exactly the six
+    // scratch lines initialized below. All 64 output F128s are initialized.
     unsafe {
         #[rustfmt::skip]
         const BT: [i8; 64] = [
@@ -3523,20 +3524,15 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
         let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
         #[repr(C, align(64))]
         struct Octs([u64; 64]);
-        let mut octs = Octs([0u64; 64]);
-        let op = octs.0.as_mut_ptr();
+        // Keep the 64-byte alignment without zeroing the whole 512-byte
+        // staging object. The six live lines are written in full before the
+        // only reads below; the skipped canonical group's two lines are never
+        // addressed by the dense loop.
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = octs.as_mut_ptr().cast::<u64>();
         let skipped = usize::from(group);
         let first_g = if group == 0 { 1 } else { 0 };
 
-        // Explicitly write all eight scratch lines, as in the full helper.
-        // The canonical group's two lines are never consumed by the dense
-        // loop; writing zeros avoids partially initialized scratch and does
-        // not rely on partial-write dead-store elimination for correctness.
-        {
-            let zero = _mm512_setzero_si512();
-            _mm512_storeu_si512(op.add(16 * skipped).cast::<__m512i>(), zero);
-            _mm512_storeu_si512(op.add(16 * skipped + 8).cast::<__m512i>(), zero);
-        }
         for relative in 0..6 {
             let i = 2 * first_g + relative;
             let z = _mm512_loadu_si512(rows.add(64 * i).cast::<__m512i>());
