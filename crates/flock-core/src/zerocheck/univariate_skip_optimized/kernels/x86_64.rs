@@ -1641,34 +1641,61 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_range2<
         for bm in 2..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = if FIRST_WRITE {
+        // Keep two independent plane accumulators live while walking the
+        // medium rows.  The old one-plane loop made every VPTERNLOGQ wait on
+        // the previous plane's chain; the paired schedule exposes the GFNI
+        // latency without increasing the row-register footprint.
+        let mut k = 0;
+        while k < 16 {
+            let plane_ptr0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let plane_ptr1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = if FIRST_WRITE {
                 _mm512_setzero_si512()
             } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
+                _mm512_loadu_si512(plane_ptr0 as *const __m512i)
+            };
+            let mut acc1 = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr1 as *const __m512i)
             };
             let mut bm = 2;
             while bm + 1 < N {
+                let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g00, g10);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g01, g11);
+                bm += 2;
+            }
+            if bm < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
                 let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
-                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
-                );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                bm += 2;
-            }
-            if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
                 );
-                acc = _mm512_xor_si512(acc, g);
+                acc0 = _mm512_xor_si512(acc0, g0);
+                acc1 = _mm512_xor_si512(acc1, g1);
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(plane_ptr0, acc0);
+            _mm512_storeu_si512(plane_ptr1, acc1);
+            k += 2;
         }
     }
 }
@@ -1757,30 +1784,51 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         for bm in 0..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+        // Interleave two independent plane chains so GFNI products from the
+        // next output byte can issue while the current VPTERNLOGQ retires.
+        let mut k = 0;
+        while k < 16 {
+            let plane_ptr0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let plane_ptr1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = _mm512_loadu_si512(plane_ptr0 as *const __m512i);
+            let mut acc1 = _mm512_loadu_si512(plane_ptr1 as *const __m512i);
             let mut bm = 0;
             while bm + 1 < N {
+                let g00 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g01 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g10 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                let g11 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g00, g10);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g01, g11);
+                bm += 2;
+            }
+            if bm < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
                 let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
-                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
-                );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                bm += 2;
-            }
-            if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
                     rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
                 );
-                acc = _mm512_xor_si512(acc, g);
+                acc0 = _mm512_xor_si512(acc0, g0);
+                acc1 = _mm512_xor_si512(acc1, g1);
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(plane_ptr0, acc0);
+            _mm512_storeu_si512(plane_ptr1, acc1);
+            k += 2;
         }
     }
 }
