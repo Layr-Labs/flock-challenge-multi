@@ -4707,6 +4707,21 @@ fn materialize_direct_fold4(
     } else {
         Vec::new()
     };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniFoldMats> = if b_gfni_on {
+        direct_tables
+            .par_iter()
+            .map(|table| super::ring_switch::build_gfni_fold_mats_from_table(table))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
@@ -4827,14 +4842,16 @@ fn materialize_direct_fold4(
                     use core::arch::x86_64::_mm512_setzero_si512;
 
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let mats0 = &direct_gfni_mats[0];
+                    let mats1 = &direct_gfni_mats[1];
+                    let cols0 = super::ring_switch::compose_block_cols_gfni(
+                        mats0,
                         claim0.eq_hi[block],
                     );
                     let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                     let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let cols1 = super::ring_switch::compose_block_cols_gfni(
+                        mats1,
                         claim1.eq_hi[block],
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
@@ -6221,6 +6238,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             )
         })
         .collect();
+    let direct_gfni_mats: Vec<super::ring_switch::GfniFoldMats> = direct_tables
+        .par_iter()
+        .map(|table| super::ring_switch::build_gfni_fold_mats_from_table(table))
+        .collect();
+
 
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     let stats = folded_b
@@ -6236,12 +6258,18 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
+                let mats0 = &direct_gfni_mats[0];
+                let mats1 = &direct_gfni_mats[1];
+                let cols0 = super::ring_switch::compose_block_cols_gfni(
+                    mats0,
+                    claim0.eq_hi[block],
+                );
                 let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                 let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
+                let cols1 = super::ring_switch::compose_block_cols_gfni(
+                    mats1,
+                    claim1.eq_hi[block],
+                );
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
@@ -6435,6 +6463,23 @@ fn materialize_direct_fold8(
         Vec::new()
     };
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniFoldMats> = if b_gfni_on {
+        direct_tables
+            .par_iter()
+            .map(|table| super::ring_switch::build_gfni_fold_mats_from_table(table))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     const SUB: usize = 256;
@@ -6543,14 +6588,16 @@ fn materialize_direct_fold8(
                         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
                     };
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let mats0 = &direct_gfni_mats[0];
+                    let mats1 = &direct_gfni_mats[1];
+                    let cols0 = super::ring_switch::compose_block_cols_gfni(
+                        mats0,
                         claim0.eq_hi[block],
                     );
                     let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
                     let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let cols1 = super::ring_switch::compose_block_cols_gfni(
+                        mats1,
                         claim1.eq_hi[block],
                     );
                     let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
