@@ -2756,6 +2756,30 @@ fn rs_tail_par_enabled() -> bool {
     *ON
 }
 
+/// Same-binary rollback for the DirectFold8 parallel factor-state writer.
+///
+/// The ranked two-claim tail builds this state twice, serially on the
+/// Fiat–Shamir spine. Its direct writer skips the retained per-bank row
+/// collections and their final scatter; the incumbent allocation-and-gather
+/// schedule is retained below as an exact oracle. The x86-only gate matches
+/// the Yukon target's 64-byte cache lines; every other target stays on the
+/// incumbent schedule.
+#[inline]
+#[cfg(any(target_arch = "x86_64", test))]
+fn direct_fold8_state_direct_write_enabled() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RS_FOLD8_DIRECT_STATE").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Round-0 `(u_0, u_2)` over the factor states with the deferred-reduce
 /// AVX-512 message kernel when the build carries it. Bit-identical to
 /// [`direct_fold8_round0`]: the kernel accumulates the same canonical
@@ -2838,6 +2862,115 @@ fn direct_fold8_states_seq(
 /// stripe), the bit-major gather writes disjoint 64-lane rows, and the
 /// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
 fn direct_fold8_states_par(
+    fold8: &[F128],
+    low_eq: &[F128; 64],
+    table: &[F128],
+) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
+    #[cfg(any(target_arch = "x86_64", test))]
+    if direct_fold8_state_direct_write_enabled() {
+        return direct_fold8_states_par_direct_write(fold8, low_eq, table);
+    }
+    direct_fold8_states_par_indirect(fold8, low_eq, table)
+}
+
+/// Direct-write form of [`direct_fold8_states_par`]. Each worker owns a
+/// cache-line-exclusive lane group in the bit-major `[bit][lane]` output, so
+/// all state cells are written exactly once without retaining temporary row
+/// collections or a second gather pass.
+///
+/// `alloc_uninit_f128_vec` is sound here because both 64×128 outputs are
+/// fully initialized before either one is read (after `rayon::scope` joins).
+#[cfg(any(target_arch = "x86_64", test))]
+fn direct_fold8_states_par_direct_write(
+    fold8: &[F128],
+    low_eq: &[F128; 64],
+    table: &[F128],
+) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
+    let n_packed = 1usize << LOG_PACKING;
+    let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
+    let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
+    // Carry plain addresses into the scoped workers rather than aliases to
+    // the vectors. Each group is chosen to own whole physical cache lines in
+    // every 64-lane row, avoiding false sharing even when Vec's base is only
+    // F128-aligned. The row stride is 1024 bytes, hence preserves that cache
+    // line partition for every bit.
+    let w_addr = w_state.as_mut_ptr() as usize;
+    let a_addr = a_state.as_mut_ptr() as usize;
+    let cache_line_groups = |base: usize| {
+        // A 16-byte-aligned base can leave a 1–3 element edge group, hence
+        // at most 17 groups across the 64 lanes.
+        let mut groups = Vec::with_capacity(17);
+        let mut lane_start = 0usize;
+        while lane_start < 64 {
+            let offset = (base + lane_start * core::mem::size_of::<F128>()) & 63;
+            let lane_len = ((64 - offset) / core::mem::size_of::<F128>()).min(64 - lane_start);
+            debug_assert!(lane_len > 0, "F128 alignment must fit a cache-line lane");
+            debug_assert!(lane_len <= 4, "a cache line holds at most four F128s");
+            groups.push((lane_start, lane_len));
+            lane_start += lane_len;
+        }
+        groups
+    };
+    let w_groups = cache_line_groups(w_addr);
+    let a_groups = cache_line_groups(a_addr);
+    rayon::scope(|scope| {
+        for &(lane_start, lane_len) in &w_groups {
+            scope.spawn(move |_| {
+                let mut basis_products = [F128::ZERO; 4];
+                for lane in 0..lane_len {
+                    basis_products[lane] = low_eq[lane_start + lane];
+                }
+                for bit in 0..n_packed {
+                    for lane in 0..lane_len {
+                        // SAFETY: this worker exclusively owns its whole
+                        // cache-line group in every row. All 64×128 cells are
+                        // initialized before a reader exists after scope join.
+                        unsafe {
+                            (w_addr as *mut F128)
+                                .add(bit * 64 + lane_start + lane)
+                                .write(fold_one_slot(basis_products[lane], table));
+                        }
+                    }
+                    if bit + 1 < n_packed {
+                        for value in &mut basis_products[..lane_len] {
+                            *value = crate::field::mul_by_x(*value);
+                        }
+                    }
+                }
+            });
+        }
+        for &(lane_start, lane_len) in &a_groups {
+            scope.spawn(move |_| {
+                let rows: Vec<Vec<F128>> = (0..lane_len)
+                    .map(|lane| {
+                        tensor_algebra_transpose(
+                            &fold8[(lane_start + lane) * n_packed
+                                ..(lane_start + lane + 1) * n_packed],
+                        )
+                    })
+                    .collect();
+                for bit in 0..n_packed {
+                    for lane in 0..lane_len {
+                        // SAFETY: this worker exclusively owns its whole
+                        // cache-line group in every row; see the w-side
+                        // safety argument above.
+                        unsafe {
+                            (a_addr as *mut F128)
+                                .add(bit * 64 + lane_start + lane)
+                                .write(rows[lane][bit]);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+    (a_state, w_state, round0)
+}
+
+/// Incumbent row-collection schedule, retained for the cached rollback and
+/// the direct-write oracle.
+fn direct_fold8_states_par_indirect(
     fold8: &[F128],
     low_eq: &[F128; 64],
     table: &[F128],
@@ -4601,6 +4734,39 @@ mod tests {
                 "corrupted statistic went undetected in round0 tail_len={tail_len}"
             );
         }
+    }
+
+    /// The direct writer must retain the incumbent parallel builder's exact
+    /// bit-major state layout before the subsequent online folds consume it.
+    #[test]
+    fn direct_fold8_state_direct_writer_matches_indirect_oracle() {
+        let mut rng = Rng::new(0xD1CE_C7A7_E5_000008);
+        let n_packed = 1usize << LOG_PACKING;
+        let suffix: Vec<F128> = (0..19).map(|_| rng.f128()).collect();
+        let low_eq: [F128; 64] = build_eq(&suffix[..6])
+            .try_into()
+            .expect("six-coordinate eq has sixty-four entries");
+        let generators: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
+        let table = build_fold_byte_table(&generators);
+        let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+
+        let direct = direct_fold8_states_par_direct_write(&fold8, &low_eq, &table);
+        let indirect = direct_fold8_states_par_indirect(&fold8, &low_eq, &table);
+        assert_eq!(direct.0, indirect.0, "direct a_state differs from oracle");
+        assert_eq!(direct.1, indirect.1, "direct w_state differs from oracle");
+        assert_eq!(direct.2, indirect.2, "direct round0 differs from oracle");
+
+        let mut changed = fold8.clone();
+        changed[n_packed + 1] += F128::ONE;
+        let changed_direct = direct_fold8_states_par_direct_write(&changed, &low_eq, &table);
+        assert_ne!(
+            changed_direct.0, direct.0,
+            "changed fold8 bank did not reach the direct a_state"
+        );
+        assert_ne!(
+            changed_direct.2, direct.2,
+            "changed fold8 bank did not reach direct round0"
+        );
     }
 
     /// The gated `add_scaled` collapse must match the scalar accumulation
