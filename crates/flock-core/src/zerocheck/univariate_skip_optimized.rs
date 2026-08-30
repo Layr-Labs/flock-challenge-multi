@@ -1201,6 +1201,10 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
+///
+/// # Safety
+///
+/// Same contract as [`round1_ab_inner_window_from_offsets_nt2`].
 #[inline(always)]
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
