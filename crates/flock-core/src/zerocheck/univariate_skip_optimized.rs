@@ -321,21 +321,16 @@ fn build_ab_eq_fold_mats_gated(eq_top_scaled: &[F128], convert: &[F128], par: bo
         for bm in 0..16 {
             let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
             for k in 0..16 {
-                let mut qword = 0u64;
-                for i in 0..8 {
-                    let bit_index = 8 * k + i;
-                    let mut row_bits = 0u8;
-                    for (j, b) in basis.iter().enumerate() {
-                        let bit = if bit_index < 64 {
-                            (b.lo >> bit_index) & 1
-                        } else {
-                            (b.hi >> (bit_index - 64)) & 1
-                        };
-                        row_bits |= (bit as u8) << j;
-                    }
-                    qword |= (row_bits as u64) << (8 * (7 - i));
+                let mut row_u64 = 0u64;
+                for j in 0..8 {
+                    let byte_val = if k < 8 {
+                        ((basis[j].lo >> (8 * k)) & 0xFF) as u8
+                    } else {
+                        ((basis[j].hi >> (8 * (k - 8))) & 0xFF) as u8
+                    };
+                    row_u64 |= (byte_val as u64) << (8 * j);
                 }
-                row[bm * 16 + k] = qword;
+                row[bm * 16 + k] = crate::bits::transpose_8x8_bits(row_u64).swap_bytes();
             }
         }
     };
