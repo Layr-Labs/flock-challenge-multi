@@ -19,6 +19,14 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
 
+/// Ranked-static B-complement projection (x86 AVX-512/GFNI only).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+pub(super) mod x86_64_bcomplement;
 /// Static-B round-1 kernel (x86 AVX-512/GFNI only). See `x86_64_bstatic.rs`.
 #[cfg(all(
     target_arch = "x86_64",
@@ -647,6 +655,29 @@ pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     // covers the group's four windows and the plane store is fixed-size.
     unsafe {
         x86_64::accumulate_c_banks_fold4_fused_x86_gfni(c_group, n_b_med, mats, plane_banks);
+    }
+}
+/// First-write form of [`accumulate_c_banks_fold4_fused_gfni`]. The first live
+/// group of a band overwrites every plane, so stale plane bytes are ignored.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn write_c_banks_fold4_fused_gfni(
+    c_group: &[u8],
+    n_b_med: &[usize; 4],
+    mats: &[u64; super::C_FOLD4_MATS_PER_GROUP],
+    plane_banks: &mut [u8; super::C_PLANE_BANK_BYTES],
+) {
+    // SAFETY: the cfg gate guarantees the SIMD features; the caller's slice
+    // covers the group's four windows and the plane store is fixed-size.
+    unsafe {
+        x86_64::write_c_banks_fold4_fused_x86_gfni(c_group, n_b_med, mats, plane_banks);
     }
 }
 
