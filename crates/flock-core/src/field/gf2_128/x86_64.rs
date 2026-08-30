@@ -491,6 +491,23 @@ unsafe fn xor4_lanes(v: __m512i) -> __m128i {
     _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
 }
 
+/// `FLOCK_NO_GHASH_MUL_ACC_KARATSUBA=1` restores the 4-CLMUL schoolbook
+/// `WideGhashX4::mul_acc`. Default ON: 3-CLMUL Karatsuba, same unreduced
+/// limbs. Ranked env is cleared.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn mul_acc_karatsuba_enabled() -> bool {
+    #[cfg(test)]
+    if MUL_ACC_KARATSUBA_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GHASH_MUL_ACC_KARATSUBA").is_none())
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+static MUL_ACC_KARATSUBA_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[derive(Clone, Copy)]
@@ -524,14 +541,27 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        if mul_acc_karatsuba_enabled() {
+            let x_lh = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4E>(x));
+            let y_lh = _mm512_xor_si512(y, _mm512_shuffle_epi32::<0x4E>(y));
+            let p0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+            let p2 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+            let p1 = _mm512_clmulepi64_epi128::<0x00>(x_lh, y_lh);
+            self.lo = _mm512_xor_si512(self.lo, p0);
+            self.hi = _mm512_xor_si512(self.hi, p2);
+            self.mid = _mm512_xor_si512(
+                self.mid,
+                _mm512_xor_si512(p1, _mm512_xor_si512(p0, p2)),
+            );
+        } else {
+            self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+            self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+            let m = _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x01>(x, y),
+                _mm512_clmulepi64_epi128::<0x10>(x, y),
+            );
+            self.mid = _mm512_xor_si512(self.mid, m);
+        }
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
@@ -593,6 +623,57 @@ impl WideGhashX4 {
                 r1: lo_hi ^ mid_lo,
                 r2: hi_lo ^ mid_hi,
                 r3: hi_hi,
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod mul_acc_karatsuba_tests {
+    use super::*;
+    use crate::field::F128;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn karatsuba_matches_schoolbook_and_scalar() {
+        unsafe {
+            let mut xs = [F128::ZERO; 4];
+            let mut ys = [F128::ZERO; 4];
+            let mut s = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                s = s.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                s
+            };
+            for i in 0..4 {
+                xs[i] = F128 {
+                    lo: next(),
+                    hi: next(),
+                };
+                ys[i] = F128 {
+                    lo: next(),
+                    hi: next(),
+                };
+            }
+            let x = _mm512_loadu_si512(xs.as_ptr().cast());
+            let y = _mm512_loadu_si512(ys.as_ptr().cast());
+
+            MUL_ACC_KARATSUBA_TEST_OFF.store(true, Ordering::Relaxed);
+            let mut school = WideGhashX4::zero();
+            school.mul_acc(x, y);
+            let school_r = school.reduce_lanes();
+
+            MUL_ACC_KARATSUBA_TEST_OFF.store(false, Ordering::Relaxed);
+            let mut kara = WideGhashX4::zero();
+            kara.mul_acc(x, y);
+            let kara_r = kara.reduce_lanes();
+
+            let mut buf_s = [F128::ZERO; 4];
+            let mut buf_k = [F128::ZERO; 4];
+            _mm512_storeu_si512(buf_s.as_mut_ptr().cast(), school_r);
+            _mm512_storeu_si512(buf_k.as_mut_ptr().cast(), kara_r);
+            assert_eq!(buf_s, buf_k, "Karatsuba limbs reduce unlike schoolbook");
+            for i in 0..4 {
+                assert_eq!(buf_k[i], xs[i] * ys[i], "lane {i} != scalar product");
             }
         }
     }
