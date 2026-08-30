@@ -504,6 +504,21 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
 
+/// Upper Merkle levels with at most this many nodes hash serially (still
+/// SIMD-batched). HEAD is 1024. 4096 also serializes the 2^11 and 2^12
+/// parent levels on a 2^20-leaf tree, which do not fill 16 cores.
+/// `FLOCK_NO_MERKLE_SERIAL_WIDE=1` restores 1024.
+fn merkle_serial_level_nodes() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_MERKLE_SERIAL_WIDE").is_some() {
+            1024
+        } else {
+            4096
+        }
+    });
+    *N
+}
+
 /// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
 /// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
 /// its leaves are still cache-hot, from inside the NTT rayon job (where a
@@ -540,8 +555,7 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
     // initialized bytes with no padding.
     let read_bytes: &[u8] =
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
-    const SERIAL_LEVEL_NODES: usize = 1024;
-    let serial = write.len() <= SERIAL_LEVEL_NODES;
+    let serial = write.len() <= merkle_serial_level_nodes();
 
     match kind {
         HashKind::Blake3 => {
