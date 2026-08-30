@@ -5989,6 +5989,16 @@ fn direct_fold8_b_gfni_enabled() -> bool {
 /// Commit parameters for the ranked DirectFold8 -> L1 overlap. This carries
 /// no challenger: the early arm can only compute (not observe) the future
 /// root.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectFold8Defect {
+    OmittedBBlock,
+    SwappedClaimMaps,
+    PartialStaleBBeforeM6,
+    WrongMessageBlockReduction,
+    PrematureBufferRecycle,
+}
+
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Fields are consumed only by the ranked AVX-512 route.
 struct DirectFold8L1Precommit {
@@ -6058,10 +6068,10 @@ fn materialize_direct_fold8_f_for_precommit(
         );
 }
 
-/// Materialize the exact ranked two-claim GFNI basis and M6 after folded_f is
-/// complete. This is deliberately separate from the incumbent fused loop so
-/// the precommit arm can lend folded_f immutably to both Rayon branches while
-/// the kill switch and every non-ranked shape retain the old mutable loop.
+/// Materialize the exact ranked two-claim GFNI basis.
+/// This helper produces `folded_b` independently of `folded_f` so the
+/// precommit arm can run `folded_f` and `folded_b` generation concurrently
+/// across Rayon threads.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -6070,12 +6080,12 @@ fn materialize_direct_fold8_f_for_precommit(
     target_feature = "gfni"
 ))]
 fn materialize_direct_fold8_b_gfni_for_precommit(
-    folded_f: &[F128],
-    mut folded_b: Vec<F128>,
+    folded_b: &mut [F128],
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
     block_len: usize,
-) -> (Vec<F128>, SumcheckMessage) {
+    #[cfg(test)] defect: Option<DirectFold8Defect>,
+) {
     use crate::zerocheck::multilinear::kernels::x86_64::{
         build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
     };
@@ -6083,9 +6093,9 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
 
     assert_eq!(claims.len(), 2);
     assert!(block_len.is_multiple_of(64));
-    assert_eq!(folded_b.len(), folded_f.len());
+    let out_len = folded_b.len();
     assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
+        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
 
     let direct_tables: Vec<Vec<F128>> = claims
@@ -6106,19 +6116,31 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         .collect();
 
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
-    let stats = folded_b
+    folded_b
         .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks(block_len))
         .enumerate()
-        .map_init(
+        .for_each_init(
             || {
                 crate::scratch::LocalBuf::new(
                     64usize.max(ALIGN64_MIN_F128),
                     crate::scratch::fold_buf_pool_enabled(),
                 )
             },
-            |gfni_tmp, (block, (b_out, f_out))| {
-                let (claim0, claim1) = (&claims[0], &claims[1]);
+            |gfni_tmp, (block, b_out)| {
+                #[cfg(test)]
+                if defect == Some(DirectFold8Defect::OmittedBBlock) && block == 0 {
+                    return;
+                }
+                let (claim0, claim1) = {
+                    #[cfg(test)]
+                    if defect == Some(DirectFold8Defect::SwappedClaimMaps) {
+                        (&claims[1], &claims[0])
+                    } else {
+                        (&claims[0], &claims[1])
+                    }
+                    #[cfg(not(test))]
+                    (&claims[0], &claims[1])
+                };
                 let cols0 =
                     super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
                 let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
@@ -6127,7 +6149,16 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                     super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
                 let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
                 let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
-                let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                let (rows0, rows1) = {
+                    #[cfg(test)]
+                    if defect == Some(DirectFold8Defect::SwappedClaimMaps) {
+                        (&direct_gfni_rows[1], &direct_gfni_rows[0])
+                    } else {
+                        (&direct_gfni_rows[0], &direct_gfni_rows[1])
+                    }
+                    #[cfg(not(test))]
+                    (&direct_gfni_rows[0], &direct_gfni_rows[1])
+                };
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
                     // outputs cover 64 F128s, and this helper's cfg fixes all
@@ -6147,24 +6178,48 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                         );
                     }
                 }
-                // SAFETY: this helper's cfg guarantees AVX-512F+VPCLMUL;
-                // slices have the same even power-of-two block length.
-                unsafe { msg_reduce_avx512(f_out, b_out) }
             },
-        )
+        );
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn direct_fold8_reduce_m6_avx512(
+    folded_f: &[F128],
+    folded_b: &[F128],
+    block_len: usize,
+    #[cfg(test)] defect: Option<DirectFold8Defect>,
+) -> SumcheckMessage {
+    use rayon::prelude::*;
+    let stats = folded_f
+        .par_chunks(block_len)
+        .zip(folded_b.par_chunks(block_len))
+        .enumerate()
+        .map(|(_block_idx, (f_out, b_out))| {
+            #[cfg(test)]
+            if defect == Some(DirectFold8Defect::WrongMessageBlockReduction) && _block_idx == 0 {
+                let (u0, u2) = unsafe { msg_reduce_avx512(f_out, b_out) };
+                return (u0 + F128::ONE, u2);
+            }
+            // SAFETY: this helper's cfg guarantees AVX-512F+VPCLMUL;
+            // slices have the same even power-of-two block length.
+            unsafe { msg_reduce_avx512(f_out, b_out) }
+        })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
-
-    (
-        folded_b,
-        SumcheckMessage {
-            u_0: stats.0,
-            u_2: stats.1,
-        },
-    )
+    SumcheckMessage {
+        u_0: stats.0,
+        u_2: stats.1,
+    }
 }
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -6172,11 +6227,12 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
 /// initial cadence is exhausted (the fold2 pair of the fold4 route never
 /// runs and the 2^21/2^20 states never exist).
 fn materialize_direct_fold8(
-    packed_witness: Vec<F128>,
+    #[allow(unused_mut)] mut packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
     l1_precommit: Option<DirectFold8L1Precommit>,
+    #[cfg(test)] defect: Option<DirectFold8Defect>,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, Option<LigeroWitness>) {
     use rayon::prelude::*;
 
@@ -6224,11 +6280,10 @@ fn materialize_direct_fold8(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
 
-    // Ranked-only producer/consumer overlap. First finish f8, then let the
-    // L1 encoder+Merkle commit consume it while the disjoint branch builds
-    // the two-claim GFNI basis and M6. Both branches only read folded_f. The
-    // returned witness owns its codeword/tree, and its root remains entirely
-    // outside the challenger until the original post-M6 observation point.
+    // Ranked-only producer/consumer overlap:
+    // Stage 1: Run unchanged f producer concurrently with B-only producer.
+    // Buffer custody: retain packed_witness and ordinary_basis until both finish.
+    // Stage 2: Concurrently run unchanged L1 ligero_commit and block-parallel M6 reduction.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -6243,21 +6298,55 @@ fn materialize_direct_fold8(
                 (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
             );
             let mut folded_f = crate::scratch::take_f128(out_len);
-            materialize_direct_fold8_f_for_precommit(
-                &packed_witness,
-                &mut folded_f,
-                block_len,
-                &fold16_weight,
-                r4,
-                r5,
-            );
-            // Preserve incumbent buffer custody: acquire both folded outputs
-            // before returning the much larger input to the shared pool.
-            let folded_b = crate::scratch::take_f128(out_len);
-            crate::scratch::give_f128(packed_witness);
-            crate::scratch::give_f128(ordinary_basis);
+            let mut folded_b = crate::scratch::take_f128(out_len);
 
-            let (precommitted, (folded_b, msg)) = rayon::join(
+            #[cfg(test)]
+            if defect == Some(DirectFold8Defect::PrematureBufferRecycle) {
+                let mut dirty = crate::scratch::take_f128(packed_witness.len());
+                for x in dirty.iter_mut() {
+                    *x = F128::new(0xDEAD_BEEF, 0);
+                }
+                crate::scratch::give_f128(packed_witness);
+                packed_witness = dirty;
+            }
+
+            rayon::join(
+                || {
+                    materialize_direct_fold8_f_for_precommit(
+                        &packed_witness,
+                        &mut folded_f,
+                        block_len,
+                        &fold16_weight,
+                        r4,
+                        r5,
+                    );
+                },
+                || {
+                    materialize_direct_fold8_b_gfni_for_precommit(
+                        &mut folded_b,
+                        claims,
+                        challenges,
+                        block_len,
+                        #[cfg(test)]
+                        defect,
+                    );
+                },
+            );
+
+            #[cfg(not(test))]
+            {
+                crate::scratch::give_f128(packed_witness);
+                crate::scratch::give_f128(ordinary_basis);
+            }
+            #[cfg(test)]
+            {
+                if defect != Some(DirectFold8Defect::PrematureBufferRecycle) {
+                    crate::scratch::give_f128(packed_witness);
+                }
+                crate::scratch::give_f128(ordinary_basis);
+            }
+
+            let (precommitted, msg) = rayon::join(
                 || {
                     let ntt =
                         AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
@@ -6271,8 +6360,17 @@ fn materialize_direct_fold8(
                     )
                 },
                 || {
-                    materialize_direct_fold8_b_gfni_for_precommit(
-                        &folded_f, folded_b, claims, challenges, block_len,
+                    #[cfg(test)]
+                    if defect == Some(DirectFold8Defect::PartialStaleBBeforeM6) {
+                        let stale_b = vec![F128::ZERO; out_len];
+                        return direct_fold8_reduce_m6_avx512(&folded_f, &stale_b, block_len, defect);
+                    }
+                    direct_fold8_reduce_m6_avx512(
+                        &folded_f,
+                        &folded_b,
+                        block_len,
+                        #[cfg(test)]
+                        defect,
                     )
                 },
             );
@@ -7191,6 +7289,8 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         challenger,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -7232,6 +7332,8 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         None,
         fold_arena,
         challenger,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -7272,6 +7374,8 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         None,
         fold_arena,
         challenger,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -7320,6 +7424,8 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         None,
         fold_arena,
         challenger,
+        #[cfg(test)]
+        None,
     )
 }
 /// Direct-fold8 entry. The first six transcript messages come entirely from
@@ -7365,6 +7471,52 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         Some(direct),
         fold_arena,
         challenger,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recursive_prover_with_basis_direct_fold8_with_defect<Ch: Challenger>(
+    config: &ProverConfig,
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    direct: Vec<super::ring_switch::DirectFold8Factors>,
+    target: F128,
+    l0_codeword: &[F128],
+    l0_tree: &[Hash],
+    round0_uv: (F128, F128),
+    fold_arena: Option<FoldArena>,
+    challenger: &mut Ch,
+    defect: Option<DirectFold8Defect>,
+) -> LigeritoProof {
+    assert_eq!(
+        config.initial_k, 6,
+        "direct-fold8 scaffold requires initial_k=6"
+    );
+    recursive_prover_with_basis_impl(
+        config,
+        packed_witness,
+        ordinary_basis,
+        target,
+        l0_codeword,
+        l0_tree,
+        Some(SumcheckMessage {
+            u_0: round0_uv.0,
+            u_2: round0_uv.1,
+        }),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(direct),
+        fold_arena,
+        challenger,
+        defect,
     )
 }
 
@@ -7387,6 +7539,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
+    #[cfg(test)] defect: Option<DirectFold8Defect>,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
@@ -7605,6 +7758,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         r,
                     ],
                     l1_precommit,
+                    #[cfg(test)]
+                    defect,
                 );
                 early_wtns_1 = precommitted;
                 debug_assert_eq!(l1_precommit_candidate, early_wtns_1.is_some());
@@ -12794,6 +12949,521 @@ mod tests {
             &wtns_0.root(),
             &mut verifier_challenger,
         ));
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    fn materialize_direct_fold8_serial_oracle(
+        packed_witness: Vec<F128>,
+        ordinary_basis: Vec<F128>,
+        claims: &[super::super::ring_switch::DirectFold8Factors],
+        challenges: [F128; 6],
+        l1_precommit: Option<DirectFold8L1Precommit>,
+    ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, Option<LigeroWitness>) {
+        use crate::zerocheck::multilinear::kernels::x86_64::{
+            build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
+        };
+        use rayon::prelude::*;
+
+        assert!(!claims.is_empty());
+        let has_ordinary = !ordinary_basis.is_empty();
+        assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
+        assert!(packed_witness.len().is_multiple_of(64));
+        let [_r0, _r1, _r2, _r3, r4, r5] = challenges;
+        let fold16_weight: [F128; 16] = std::array::from_fn(|bank| {
+            let mut weight = F128::ONE;
+            for (bit, &challenge) in challenges[..4].iter().enumerate() {
+                weight *= if (bank >> bit) & 1 == 0 {
+                    F128::ONE + challenge
+                } else {
+                    challenge
+                };
+            }
+            weight
+        });
+        let b_gfni_candidate = direct_fold8_b_gfni_enabled() && claims.len() == 2 && !has_ordinary;
+        let out_len = packed_witness.len() / 64;
+        let block_len = claims[0].eq_lo.len();
+        assert!(block_len.is_multiple_of(4));
+        let b_gfni_on = b_gfni_candidate && block_len.is_multiple_of(64);
+        assert_eq!(out_len, block_len * claims[0].eq_hi.len());
+        assert!(claims.iter().all(|claim| {
+            claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
+        }));
+
+        if b_gfni_on && direct_fold8_l1_precommit_enabled() {
+            if let Some(precommit) = l1_precommit {
+                assert_eq!(
+                    out_len,
+                    (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
+                );
+                let mut folded_f = crate::scratch::take_f128(out_len);
+                materialize_direct_fold8_f_for_precommit(
+                    &packed_witness,
+                    &mut folded_f,
+                    block_len,
+                    &fold16_weight,
+                    r4,
+                    r5,
+                );
+                let folded_b = crate::scratch::take_f128(out_len);
+                crate::scratch::give_f128(packed_witness);
+                crate::scratch::give_f128(ordinary_basis);
+
+                let (precommitted, (folded_b, msg)) = rayon::join(
+                    || {
+                        let ntt = AdditiveNttF128::standard(
+                            precommit.log_msg_cols + precommit.log_inv_rate,
+                        );
+                        ligero_commit(
+                            &folded_f,
+                            precommit.log_msg_cols,
+                            precommit.log_num_interleaved,
+                            precommit.log_inv_rate,
+                            &ntt,
+                            precommit.kind,
+                        )
+                    },
+                    || {
+                        let direct_tables: Vec<Vec<F128>> = claims
+                            .par_iter()
+                            .map(|claim| {
+                                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                                super::super::ring_switch::build_direct_fold8_table_from_generators(
+                                    &generators,
+                                )
+                            })
+                            .collect();
+                        let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
+                            .par_iter()
+                            .map(|claim| {
+                                (
+                                    claim.eq_lo.iter().map(|x| x.lo).collect(),
+                                    claim.eq_lo.iter().map(|x| x.hi).collect(),
+                                )
+                            })
+                            .collect();
+
+                        const ALIGN64_MIN_F128: usize =
+                            (32 * 1024) / core::mem::size_of::<F128>();
+                        let mut b_vec = folded_b;
+                        let stats = b_vec
+                            .par_chunks_mut(block_len)
+                            .zip(folded_f.par_chunks(block_len))
+                            .enumerate()
+                            .map_init(
+                                || {
+                                    crate::scratch::LocalBuf::new(
+                                        64usize.max(ALIGN64_MIN_F128),
+                                        crate::scratch::fold_buf_pool_enabled(),
+                                    )
+                                },
+                                |gfni_tmp, (block, (b_out, f_out))| {
+                                    let (claim0, claim1) = (&claims[0], &claims[1]);
+                                    let cols0 = super::super::ring_switch::compose_block_cols(
+                                        &direct_tables[0],
+                                        claim0.eq_hi[block],
+                                    );
+                                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
+                                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                                    let cols1 = super::super::ring_switch::compose_block_cols(
+                                        &direct_tables[1],
+                                        claim1.eq_hi[block],
+                                    );
+                                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
+                                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                                    let (rows0, rows1) =
+                                        (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                                    for slot in (0..block_len).step_by(64) {
+                                        unsafe {
+                                            gfni_fold64_four_maps_staged(
+                                                rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                                &mats0_lo,
+                                                rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                                &mats0_hi,
+                                                rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                                &mats1_lo,
+                                                rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                                &mats1_hi,
+                                                b_out.as_mut_ptr().add(slot),
+                                                gfni_tmp.as_mut_ptr().cast(),
+                                            );
+                                        }
+                                    }
+                                    unsafe { msg_reduce_avx512(f_out, b_out) }
+                                },
+                            )
+                            .reduce(
+                                || (F128::ZERO, F128::ZERO),
+                                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                            );
+
+                        (
+                            b_vec,
+                            SumcheckMessage {
+                                u_0: stats.0,
+                                u_2: stats.1,
+                            },
+                        )
+                    },
+                );
+                return (folded_f, folded_b, msg, Some(precommitted));
+            }
+        }
+        unreachable!("serial oracle called for non-ranked shape");
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    fn make_ranked_direct_fold8_factors(
+        block_len: usize,
+        num_blocks: usize,
+        rng: &mut crate::challenger::RandomChallenger,
+    ) -> super::super::ring_switch::DirectFold8Factors {
+        let eq_lo: Vec<F128> = (0..block_len).map(|_| rng.sample_f128()).collect();
+        let eq_hi: Vec<F128> = (0..num_blocks).map(|_| rng.sample_f128()).collect();
+        let a_state: Vec<F128> = (0..256).map(|_| rng.sample_f128()).collect();
+        let w_state: Vec<F128> = (0..256).map(|_| rng.sample_f128()).collect();
+        let round0 = (rng.sample_f128(), rng.sample_f128());
+        super::super::ring_switch::DirectFold8Factors {
+            eq_lo,
+            eq_hi,
+            a_state,
+            w_state,
+            round0,
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_fb_overlap_matches_serial_oracle_across_shapes_and_pools() {
+        let pools = [1, 2, 4, 8, 16];
+        let shapes = [
+            (64usize, 1usize),
+            (64usize, 4usize),
+            (128usize, 4usize),
+            (128usize, 8usize),
+            (256usize, 8usize),
+        ];
+
+        for &threads in &pools {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut rng = crate::challenger::RandomChallenger::new(0xC001_F01D ^ (threads as u64));
+                for &(block_len, num_blocks) in &shapes {
+                    let out_len = block_len * num_blocks;
+                    let packed_witness: Vec<F128> =
+                        (0..out_len * 64).map(|_| rng.sample_f128()).collect();
+                    let claims = vec![
+                        make_ranked_direct_fold8_factors(block_len, num_blocks, &mut rng),
+                        make_ranked_direct_fold8_factors(block_len, num_blocks, &mut rng),
+                    ];
+                    let challenges = [
+                        rng.sample_f128(),
+                        rng.sample_f128(),
+                        rng.sample_f128(),
+                        rng.sample_f128(),
+                        rng.sample_f128(),
+                        rng.sample_f128(),
+                    ];
+                    let precommit = DirectFold8L1Precommit {
+                        log_msg_cols: out_len.trailing_zeros() as usize,
+                        log_num_interleaved: 0,
+                        log_inv_rate: 3,
+                        kind: HashKind::Sha256,
+                    };
+
+                    let (cand_f, cand_b, cand_msg, cand_precommit) = materialize_direct_fold8(
+                        packed_witness.clone(),
+                        Vec::new(),
+                        &claims,
+                        challenges,
+                        Some(precommit),
+                        None,
+                    );
+                    let (orc_f, orc_b, orc_msg, orc_precommit) =
+                        materialize_direct_fold8_serial_oracle(
+                            packed_witness,
+                            Vec::new(),
+                            &claims,
+                            challenges,
+                            Some(precommit),
+                        );
+
+                    assert_eq!(cand_f, orc_f, "folded_f mismatch for threads={threads} shape=({block_len},{num_blocks})");
+                    assert_eq!(cand_b, orc_b, "folded_b mismatch for threads={threads} shape=({block_len},{num_blocks})");
+                    assert_eq!(cand_msg, orc_msg, "M6 mismatch for threads={threads} shape=({block_len},{num_blocks})");
+                    let cand_wtns = cand_precommit.expect("cand precommit");
+                    let orc_wtns = orc_precommit.expect("orc precommit");
+                    assert_eq!(cand_wtns.root(), orc_wtns.root(), "precommit root mismatch for threads={threads}");
+                    assert_eq!(cand_wtns.mat, orc_wtns.mat, "precommit mat mismatch for threads={threads}");
+                    assert_eq!(cand_wtns.tree, orc_wtns.tree, "precommit tree mismatch for threads={threads}");
+                }
+            });
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_defect_variants_fail_oracle_and_verifier() {
+        let defects = [
+            DirectFold8Defect::OmittedBBlock,
+            DirectFold8Defect::SwappedClaimMaps,
+            DirectFold8Defect::PartialStaleBBeforeM6,
+            DirectFold8Defect::WrongMessageBlockReduction,
+            DirectFold8Defect::PrematureBufferRecycle,
+        ];
+
+        let block_len = 64usize;
+        let num_blocks = 4usize;
+        let out_len = block_len * num_blocks;
+
+        for defect in defects {
+            let mut rng = crate::challenger::RandomChallenger::new(0xDEAD_F00D);
+            let packed_witness: Vec<F128> =
+                (0..out_len * 64).map(|_| rng.sample_f128()).collect();
+            let claims = vec![
+                make_ranked_direct_fold8_factors(block_len, num_blocks, &mut rng),
+                make_ranked_direct_fold8_factors(block_len, num_blocks, &mut rng),
+            ];
+            let challenges = [
+                rng.sample_f128(),
+                rng.sample_f128(),
+                rng.sample_f128(),
+                rng.sample_f128(),
+                rng.sample_f128(),
+                rng.sample_f128(),
+            ];
+            let precommit = DirectFold8L1Precommit {
+                log_msg_cols: out_len.trailing_zeros() as usize,
+                log_num_interleaved: 0,
+                log_inv_rate: 3,
+                kind: HashKind::Sha256,
+            };
+
+            let (def_f, def_b, def_msg, def_precommit) = materialize_direct_fold8(
+                packed_witness.clone(),
+                Vec::new(),
+                &claims,
+                challenges,
+                Some(precommit),
+                Some(defect),
+            );
+            let (orc_f, orc_b, orc_msg, orc_precommit) =
+                materialize_direct_fold8_serial_oracle(
+                    packed_witness,
+                    Vec::new(),
+                    &claims,
+                    challenges,
+                    Some(precommit),
+                );
+
+            let def_wtns = def_precommit.expect("def precommit");
+            let orc_wtns = orc_precommit.expect("orc precommit");
+
+            let matched_oracle = def_f == orc_f
+                && def_b == orc_b
+                && def_msg == orc_msg
+                && def_wtns.root() == orc_wtns.root()
+                && def_wtns.mat == orc_wtns.mat
+                && def_wtns.tree == orc_wtns.tree;
+
+            assert!(
+                !matched_oracle,
+                "Defect {:?} unexpectedly passed oracle comparison",
+                defect
+            );
+        }
+
+        // Also verify that each defect variant causes end-to-end proof verification failure.
+        let log_n = 12;
+        let initial_k = 6;
+        let k_0 = 2;
+        let log_inv_rate = 3;
+        for defect in defects {
+            let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
+            let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+            let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+            let scaled_rdp: Vec<F128> = build_eq_table(
+                &(0..crate::pcs::LOG_PACKING)
+                    .map(|_| rng.sample_f128())
+                    .collect::<Vec<_>>(),
+            );
+            let combined_basis =
+                super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
+            let target = poly
+                .iter()
+                .zip(combined_basis.iter())
+                .map(|(&f, &b)| f * b)
+                .fold(F128::ZERO, |acc, value| acc + value);
+
+            let n_packed = 1usize << crate::pcs::LOG_PACKING;
+            let tail_eq = build_eq_table(&suffix[6..]);
+            let table = super::super::ring_switch::build_fold_byte_table(&scaled_rdp);
+            let low_eq = build_eq_table(&suffix[..6]);
+            let mut a_state = vec![F128::ZERO; 64 * n_packed];
+            for e in 0..64 {
+                let strided: Vec<F128> = (0..poly.len() / 64)
+                    .map(|rest| poly[64 * rest + e])
+                    .collect();
+                let bank = super::super::ring_switch::fold_1b_rows_naive(&strided, &tail_eq);
+                let transposed = super::super::ring_switch::tensor_algebra_transpose(&bank);
+                for (bit, value) in transposed.into_iter().enumerate() {
+                    a_state[bit * 64 + e] = value;
+                }
+            }
+            let mut w_state = vec![F128::ZERO; 64 * n_packed];
+            for d_low in 0..64 {
+                let mut basis_product = low_eq[d_low];
+                w_state[d_low] = super::super::ring_switch::fold_one_slot(basis_product, &table);
+                for bit in 1..n_packed {
+                    basis_product = crate::field::mul_by_x(basis_product);
+                    w_state[bit * 64 + d_low] =
+                        super::super::ring_switch::fold_one_slot(basis_product, &table);
+                }
+            }
+            let mut round0 = (F128::ZERO, F128::ZERO);
+            for i in (0..a_state.len()).step_by(2) {
+                let a0 = a_state[i];
+                let a1 = a_state[i + 1];
+                let b0 = w_state[i];
+                let b1 = w_state[i + 1];
+                round0.0 += a0 * b0;
+                round0.1 += (a0 + a1) * (b0 + b1);
+            }
+            let (eq_lo, eq_hi) =
+                super::super::ring_switch::build_eq_split(&suffix[6..], (log_n - 6) / 2);
+            let direct = vec![
+                super::super::ring_switch::DirectFold8Factors {
+                    eq_lo: eq_lo.clone(),
+                    eq_hi: eq_hi.clone(),
+                    a_state: a_state.clone(),
+                    w_state: w_state.clone(),
+                    round0,
+                },
+                super::super::ring_switch::DirectFold8Factors {
+                    eq_lo,
+                    eq_hi,
+                    a_state,
+                    w_state,
+                    round0,
+                },
+            ];
+
+            let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+            let cfg = ProverConfig {
+                log_inv_rates: log_inv_rates.clone(),
+                recursive_steps: 1,
+                initial_log_msg_cols: log_n - initial_k,
+                initial_log_num_interleaved: initial_k,
+                initial_k,
+                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+                recursive_ks: vec![k_0],
+                queries: log_inv_rates
+                    .iter()
+                    .map(|&rate| udr_queries(rate))
+                    .collect(),
+                grinding_bits: vec![0; log_inv_rates.len()],
+                fold_grinding_bits: vec![0; 2],
+                ood_samples: vec![0; 2],
+                merkle_hash: Default::default(),
+            };
+            let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
+            let wtns_0 = ligero_commit(
+                &poly,
+                log_n - initial_k,
+                initial_k,
+                log_inv_rate,
+                &ntt_0,
+                HashKind::Sha256,
+            );
+            let mut direct_challenger =
+                crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+            let got = recursive_prover_with_basis_direct_fold8_with_defect(
+                &cfg,
+                poly,
+                Vec::new(),
+                direct,
+                target,
+                &wtns_0.mat,
+                &wtns_0.tree,
+                round0,
+                None,
+                &mut direct_challenger,
+                Some(defect),
+            );
+
+            let v_cfg = VerifierConfig {
+                log_inv_rates: log_inv_rates.clone(),
+                recursive_steps: 1,
+                initial_log_msg_cols: log_n - initial_k,
+                initial_log_num_interleaved: initial_k,
+                initial_k,
+                recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+                recursive_ks: vec![k_0],
+                queries: log_inv_rates
+                    .iter()
+                    .map(|&rate| udr_queries(rate))
+                    .collect(),
+                grinding_bits: vec![0; log_inv_rates.len()],
+                fold_grinding_bits: vec![0; 2],
+                ood_samples: vec![0; 2],
+                merkle_hash: Default::default(),
+            };
+            let mut verifier_challenger =
+                crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+            let verified = recursive_verifier_with_basis(
+                &v_cfg,
+                &got,
+                &combined_basis,
+                target,
+                &wtns_0.root(),
+                &mut verifier_challenger,
+            );
+            assert!(
+                !verified,
+                "Defective proof with {:?} unexpectedly passed verification",
+                defect
+            );
+        }
+    }
+
+    #[test]
+    fn direct_fold8_fb_overlap_end_to_end_across_pools() {
+        let pools = [1, 2, 4, 8, 16];
+        for &threads in &pools {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                direct_fold8_full_proof_and_claim_bytes_match_ordinary_fold2();
+            });
+        }
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense
