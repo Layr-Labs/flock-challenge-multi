@@ -224,6 +224,14 @@ fn fold16_pf_ahead() -> usize {
     *D
 }
 
+/// `FLOCK_NO_FOLD16_PF_SPREAD=1` restores the sixteen-line T0 burst issued
+/// before the four demand groups. Ranked env is cleared, so spread runs.
+fn fold16_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD16_PF_SPREAD").is_none());
+    *ON
+}
+
 /// Sixteen-bank weighted fold with deferred reduction, four output slots per
 /// pass: `dst[t] = Σ_{b<16} w[b] · src[16t + b]`.
 ///
@@ -255,10 +263,11 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
         let quads = dst.len() & !3;
         let pf_ahead = fold16_pf_ahead();
+        let pf_spread = fold16_pf_spread_enabled();
         let pf_limit = src.len().saturating_sub(64);
         let mut t = 0usize;
         while t < quads {
-            if pf_ahead != 0 {
+            if pf_ahead != 0 && !pf_spread {
                 let ahead = 16 * t + pf_ahead;
                 if ahead <= pf_limit {
                     let p = src.as_ptr().add(ahead).cast::<i8>();
@@ -271,6 +280,16 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
             }
             let mut acc = WideGhashX4::zero();
             for g in 0..4 {
+                if pf_ahead != 0 && pf_spread {
+                    let ahead_base = 16 * t + pf_ahead + 4 * g;
+                    if 16 * t + pf_ahead <= pf_limit {
+                        let p = src.as_ptr();
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(ahead_base).cast::<i8>());
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(ahead_base + 16).cast::<i8>());
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(ahead_base + 32).cast::<i8>());
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(ahead_base + 48).cast::<i8>());
+                    }
+                }
                 // v_s = banks 4g..4g+3 of slot t+s.
                 let base = 16 * t + 4 * g;
                 let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
