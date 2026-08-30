@@ -17,6 +17,8 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// Yukon source-archive marker: zarar@1337 ranked-stack redraw 2026-08-30-B.
+
 pub mod bits;
 pub mod challenger;
 pub mod field;
@@ -478,6 +480,22 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
+
+/// Run `op` on a pool worker instead of the calling thread.
+///
+/// Every top-level parallel region opened from a non-worker thread parks that
+/// thread on the region latch and wakes it again at the end. Entering a phase
+/// from a worker makes its many small regions nested joins instead. Schedule
+/// only: the closure completes before this returns, on the same pool, with the
+/// same work. `FLOCK_NO_IN_POOL=1` restores direct execution.
+pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    if !*ON || rayon::current_thread_index().is_some() {
+        return op();
+    }
+    rayon::join(op, || ()).0
+}
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
