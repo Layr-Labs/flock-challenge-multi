@@ -2428,16 +2428,20 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
     x
 }
 
-/// Per-worker state for the four-window fold4 producer.
-/// The fused GFNI C drain's first live group of a band overwrites every one
-/// of the 32 KiB byte planes, so the band-wide zero fill, that group's plane
-/// loads, and the fused route's `partial_c4` zero seed are all dead work.
-/// Ranked default. `FLOCK_NO_ZC_C_PLANE_FIRST_WRITE=1` restores the incumbent
-/// clear-then-accumulate form, which is the byte-identity oracle.
+/// Keep the clear-then-accumulate form as the fail-closed default.
+/// `FLOCK_FORCE_ZC_C_PLANE_FIRST_WRITE=1` restores the first-write route
+/// enabled by default in cff868b.
+#[inline]
+fn c_plane_first_write_forced(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 #[inline]
 fn c_plane_first_write_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
+        c_plane_first_write_forced(
+            std::env::var_os("FLOCK_FORCE_ZC_C_PLANE_FIRST_WRITE").as_deref(),
+        )
     });
     *ON
 }
@@ -3881,6 +3885,16 @@ mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
+
+    #[test]
+    fn c_plane_first_write_opt_in_is_fail_closed() {
+        use std::ffi::OsStr;
+
+        assert!(!c_plane_first_write_forced(None));
+        assert!(!c_plane_first_write_forced(Some(OsStr::new(""))));
+        assert!(!c_plane_first_write_forced(Some(OsStr::new("0"))));
+        assert!(c_plane_first_write_forced(Some(OsStr::new("1"))));
+    }
 
     #[test]
     fn c_s_subfield_inverse_matches_fermat_exhaustively() {
