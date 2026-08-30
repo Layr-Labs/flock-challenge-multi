@@ -377,6 +377,32 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 ///   kernel seeds registers from zero and stores every byte of every block.
 ///   With `seed_zero = false`, the full output range must already be
 ///   initialized because every 64-byte plane is loaded before being updated.
+/// `FLOCK_NO_LC_GFNI_ZERO_ROW=1` restores the incumbent dense 8-row affine
+/// nest (exact A/B). Default ON: skip `VGF2P8AFFINEQB` of 64-byte z stripes
+/// that are the zero vector (`affine(0, ·) = 0`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_gfni_zero_row_enabled() -> bool {
+    #[cfg(test)]
+    if LC_GFNI_ZERO_ROW_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_GFNI_ZERO_ROW").is_none())
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[cfg(test)]
+pub(crate) static LC_GFNI_ZERO_ROW_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -394,31 +420,70 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
+        let skip_zero = lc_gfni_zero_row_enabled();
         for block in 0..n_blocks64 {
             let bs = block * 64;
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
             let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
-                    _mm512_setzero_si512()
-                } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
-                };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+            let live = if skip_zero {
+                let mut m = 0u8;
+                for t in 0..8 {
+                    if _mm512_test_epi64_mask(rows[t], rows[t]) != 0 {
+                        m |= 1 << t;
+                    }
                 }
-                _mm512_storeu_si512(plane_ptr, acc);
+                m
+            } else {
+                0xff
+            };
+            if live == 0 {
+                if seed_zero {
+                    core::ptr::write_bytes(planes, 0, 1024);
+                }
+                continue;
+            }
+            if live == 0xff {
+                for byte_k in 0..16 {
+                    let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                    let mut acc = if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    };
+                    for t in (0..8).step_by(2) {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t],
+                            _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                        );
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[t + 1],
+                            _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                        );
+                        acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                    }
+                    _mm512_storeu_si512(plane_ptr, acc);
+                }
+            } else {
+                for byte_k in 0..16 {
+                    let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                    let mut acc = if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(plane_ptr as *const __m512i)
+                    };
+                    for t in 0..8 {
+                        if live & (1 << t) != 0 {
+                            let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                                rows[t],
+                                _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                            );
+                            acc = _mm512_xor_si512(acc, g);
+                        }
+                    }
+                    _mm512_storeu_si512(plane_ptr, acc);
+                }
             }
         }
     }
@@ -763,5 +828,54 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
                 }
             }
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+mod gfni_zero_row_tests {
+    use super::*;
+    use crate::field::F128;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn zero_row_skip_matches_dense() {
+        let mut eq8 = [F128::ZERO; 8];
+        for (i, e) in eq8.iter_mut().enumerate() {
+            e.lo = 0x1111_1111_1111_0000 + i as u64;
+            e.hi = 0x2222_2222_2222_0000 + 7 - i as u64;
+        }
+        let mut mats = [0u64; 128];
+        for t in 0..8 {
+            fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+        }
+        let mut tile = vec![0u8; 8 * 256];
+        for t in 0..8 {
+            if t == 2 || t == 5 {
+                continue;
+            }
+            for j in 0..64 {
+                tile[t * 256 + j] = (t * 17 + j) as u8 | 1;
+            }
+        }
+        let run = |seed_zero: bool| {
+            let mut out = vec![0xA5u8; 1024];
+            unsafe {
+                gfni_fold_tile(tile.as_ptr(), 256, 1, &mats, out.as_mut_ptr(), seed_zero);
+            }
+            out
+        };
+        LC_GFNI_ZERO_ROW_TEST_OFF.store(true, Ordering::Relaxed);
+        let dense_seed = run(true);
+        let dense_acc = run(false);
+        LC_GFNI_ZERO_ROW_TEST_OFF.store(false, Ordering::Relaxed);
+        let skip_seed = run(true);
+        let skip_acc = run(false);
+        assert_eq!(skip_seed, dense_seed, "seed_zero skip vs dense");
+        assert_eq!(skip_acc, dense_acc, "accumulate skip vs dense");
     }
 }
