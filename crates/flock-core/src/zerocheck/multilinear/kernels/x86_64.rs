@@ -236,8 +236,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 B_SPECIAL_ONES,
             ),
             (false, true) => (
-                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block)
-                    & (B_ONES_BLOCK_PAIRS - 1),
+                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block) & (B_ONES_BLOCK_PAIRS - 1),
                 B_SPECIAL_SPARSE,
             ),
             (false, false) => (usize::MAX, B_SPECIAL_NONE),
@@ -492,21 +491,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
                                 (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                                 )
                             } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
+                                (
+                                    ghash_mul_x4(w, a1),
+                                    ghash_mul_x4(w, a2),
+                                    ghash_mul_x4(w, a3),
+                                )
                             }
                         };
                         #[cfg(test)]
@@ -534,19 +530,14 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
                             let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                         } else {
                             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                             } else {
                                 ghash_mul_x4(w, b0_lane0)
                             }
@@ -1745,7 +1736,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
