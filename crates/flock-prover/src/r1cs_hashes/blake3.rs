@@ -2154,6 +2154,49 @@ fn generate_round1_inner_octa(
     elide: [bool; 3],
     ab_nt: bool,
 ) {
+    if skip_blocks == 0 && std::env::var_os("FLOCK_NO_R1_SKIPZERO_SPECIALIZE").is_none() {
+        generate_round1_inner_octa_impl::<true>(
+            blocks,
+            skip_blocks,
+            z,
+            a,
+            b,
+            ab_inner,
+            inv_table,
+            padding,
+            elide,
+            ab_nt,
+        );
+    } else {
+        generate_round1_inner_octa_impl::<false>(
+            blocks,
+            skip_blocks,
+            z,
+            a,
+            b,
+            ab_inner,
+            inv_table,
+            padding,
+            elide,
+            ab_nt,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_impl<const SKIP_ZERO: bool>(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
@@ -2308,7 +2351,7 @@ fn generate_round1_inner_octa(
                         // ab_inner's NT stream stays sequential per thread.
                         if let Some((win_a, win_b)) = win_ab {
                             for j in 0..SIMD {
-                                if base + j < skip_blocks {
+                                if !SKIP_ZERO && base + j < skip_blocks {
                                     continue;
                                 }
                                 let a_bytes = std::slice::from_raw_parts(
@@ -2340,7 +2383,7 @@ fn generate_round1_inner_octa(
                 };
                 for j in j0..n_here {
                     let block_idx = GROUP * g + j;
-                    if block_idx >= skip_blocks {
+                    if SKIP_ZERO || block_idx >= skip_blocks {
                         let a_bytes = unsafe {
                             std::slice::from_raw_parts(
                                 a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
