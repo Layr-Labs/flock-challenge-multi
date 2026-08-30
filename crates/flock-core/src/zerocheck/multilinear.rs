@@ -4105,6 +4105,348 @@ mod tests {
         }
     }
 
+    /// Shaped-B differential for the round-two look-ahead B-window
+    /// specialization (`FLOCK_NO_ZC_B_ONES` / `FLOCK_NO_ZC_B_SPARSE`, both
+    /// enabled by default).
+    ///
+    /// The witness gives B an aligned all-ones head and an aligned all-zero
+    /// tail around a random middle, so one run drives all three window arms:
+    /// `Ones` (the head, including the cross-window deferred run and its
+    /// flush), `Sparse` (the tail, plus the boundary window where only the
+    /// first folded-B lane is still live) and `Generic` (the middle), plus
+    /// the scalar group tail. Padded shapes additionally punch zeros into the
+    /// head, which is exactly the "shape does not match after all" case the
+    /// runtime verification must catch. Every output has to stay
+    /// bit-identical to the incumbent round-two pass, which never runs the
+    /// specialization.
+    ///
+    /// Static-B census idea credited to newjordan (public carrier fkiene;
+    /// sparse-B half publicly isolated by i34-9); no novelty claimed.
+    #[test]
+    fn lookahead_shaped_b_head_tail_matches_incumbent() {
+        const K_SKIP: usize = 6;
+        for &(m, padded) in &[
+            (13usize, false),
+            (15, false),
+            (16, true),
+            (17, false),
+            (18, true),
+        ] {
+            let mut rng = Rng::new(0x5B00 + m as u64 + padded as u64 * 100);
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            // Quarter-aligned head/tail: 2^(m-2) bits is a whole number of
+            // 1024-bit (16-row) look-ahead windows for every m used here.
+            let quarter = total_bits / 4;
+            for v in b[..quarter].iter_mut() {
+                *v = true;
+            }
+            for v in b[total_bits - quarter..].iter_mut() {
+                *v = false;
+            }
+            let padding = if padded {
+                let k_log = 14.min(m);
+                let useful_bits = if k_log == 14 {
+                    15_409
+                } else {
+                    (1usize << k_log) - 37
+                };
+                let block_size = 1usize << k_log;
+                for blk in 0..(total_bits / block_size) {
+                    for j in useful_bits..block_size {
+                        a[blk * block_size + j] = false;
+                        b[blk * block_size + j] = false;
+                    }
+                }
+                PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful_bits,
+                }
+            } else {
+                PaddingSpec::dense(m)
+            };
+            let (a_packed, b_packed) = (pack_bits(&a), pack_bits(&b));
+
+            let z = rng.f128();
+            let table = UniSkipFoldTable::new(K_SKIP, z);
+            let mut mlv = rng.f128_vec(m - K_SKIP);
+            mlv[0] = F128::ONE; // Convention A, as the prover passes it.
+            assert_ne!(mlv[1], F128::ZERO);
+
+            let (a_ref, b_ref, m1_ref, mi_ref) =
+                uni_skip_fold_and_round_pair_optimized_packed_padded(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+            let (a_la, b_la, m1_la, mi_la, la) =
+                uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+            assert_eq!(a_ref, a_la, "shaped-B a table m={m} padded={padded}");
+            assert_eq!(b_ref, b_la, "shaped-B b table m={m} padded={padded}");
+            assert_eq!(
+                (m1_ref, mi_ref),
+                (m1_la, mi_la),
+                "shaped-B round-2 msg m={m} padded={padded}"
+            );
+
+            // Same shaped input through the no-materialize (`WRITE = false`)
+            // sweep, which takes the residue-major prefold arm.
+            let (m1_nm, mi_nm, la_nm) = uni_skip_round_pair_lookahead_nomat_packed_padded(
+                &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+            );
+            assert_eq!(
+                (m1_la, mi_la),
+                (m1_nm, mi_nm),
+                "shaped-B nomat msg m={m} padded={padded}"
+            );
+            assert_eq!(la, la_nm, "shaped-B nomat lookahead m={m} padded={padded}");
+
+            let mut r_next3 = vec![F128::ONE; m - K_SKIP - 1];
+            r_next3[1..].copy_from_slice(&mlv[2..]);
+            for &rho1 in &[F128::ZERO, F128::ONE, rng.f128()] {
+                let (mut a3, mut b3) = (a_ref.clone(), b_ref.clone());
+                fold_in_place_pair(&mut a3, &mut b3, rho1);
+                let (m1, mi) = round_pair_naive(&a3, &b3, &r_next3);
+                assert_eq!(
+                    eval_round3_lookahead(&la, rho1),
+                    (m1, mi),
+                    "shaped-B round-3 msg m={m} padded={padded} rho1={rho1:?}"
+                );
+            }
+        }
+    }
+
+    /// The all-ones B head folds to exactly `F128::ONE`, which is what the
+    /// `BWindow::Ones` arm keys on: the fold is `Σ_j table[j][0xFF]`, i.e. the
+    /// sum of all `2^k_skip` Lagrange basis weights at `z`, and a Lagrange
+    /// basis is a partition of unity. If this ever stopped holding, the ones
+    /// arm would simply stop firing (never miscompute), so this test is the
+    /// coverage guard for the differential tests above.
+    #[test]
+    fn all_ones_packed_row_folds_to_one() {
+        let mut rng = Rng::new(0x5D01);
+        for k_skip in [3usize, 4, 5, 6] {
+            let table = UniSkipFoldTable::new(k_skip, rng.f128());
+            let bytes = vec![0xFFu8; (1usize << k_skip) / 8];
+            assert_eq!(
+                table.fold_one_row(&bytes),
+                F128::ONE,
+                "all-ones row must fold to ONE (k_skip={k_skip})"
+            );
+        }
+    }
+
+    /// The exact sparse-tail *boundary* shape, held for every window at once:
+    /// B is live only on rows `r ≡ 0 (mod 16)`. One look-ahead window spans 16
+    /// rows and `b_k[lane] = fold(row 4·lane + k)`, so row 0 of the window is
+    /// folded-`b0` lane 0 and rows 1..16 are every other lane of `b0`..`b3` —
+    /// precisely "only the first F128 lane of `b0` may be nonzero". The
+    /// surviving coefficients are 1, 5 and 7 and they all ride on the same
+    /// lane-0 value, which is the algebra the specialization implements.
+    ///
+    /// Two live-row fills: all-ones (folds to `ONE`) and random (folds to an
+    /// arbitrary `beta`), so the arm is exercised with a non-trivial constant
+    /// and not just with the identity.
+    #[test]
+    fn lookahead_sparse_boundary_b_matches_incumbent() {
+        const K_SKIP: usize = 6;
+        const ROW_BITS: usize = 1 << K_SKIP;
+        for &random_fill in &[false, true] {
+            for &m in &[13usize, 16, 17] {
+                let mut rng = Rng::new(0x5E00 + m as u64 + random_fill as u64 * 100);
+                let total_bits = 1usize << m;
+                let a = rng.bits(total_bits);
+                let live = rng.bits(total_bits);
+                let mut b = vec![false; total_bits];
+                for row in (0..total_bits / ROW_BITS).step_by(16) {
+                    let base = row * ROW_BITS;
+                    for j in 0..ROW_BITS {
+                        b[base + j] = if random_fill { live[base + j] } else { true };
+                    }
+                }
+                let padding = PaddingSpec::dense(m);
+                let (a_packed, b_packed) = (pack_bits(&a), pack_bits(&b));
+
+                let z = rng.f128();
+                let table = UniSkipFoldTable::new(K_SKIP, z);
+                let mut mlv = rng.f128_vec(m - K_SKIP);
+                mlv[0] = F128::ONE;
+
+                let (a_ref, b_ref, m1_ref, mi_ref) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                let (a_la, b_la, m1_la, mi_la, la) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                assert_eq!(
+                    a_ref, a_la,
+                    "sparse-boundary a table m={m} rnd={random_fill}"
+                );
+                assert_eq!(
+                    b_ref, b_la,
+                    "sparse-boundary b table m={m} rnd={random_fill}"
+                );
+                assert_eq!(
+                    (m1_ref, mi_ref),
+                    (m1_la, mi_la),
+                    "sparse-boundary round-2 msg m={m} rnd={random_fill}"
+                );
+
+                let (m1_nm, mi_nm, la_nm) = uni_skip_round_pair_lookahead_nomat_packed_padded(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+                assert_eq!(
+                    (m1_la, mi_la),
+                    (m1_nm, mi_nm),
+                    "sparse-boundary nomat msg m={m} rnd={random_fill}"
+                );
+                assert_eq!(
+                    la, la_nm,
+                    "sparse-boundary nomat lookahead m={m} rnd={random_fill}"
+                );
+
+                let mut r_next3 = vec![F128::ONE; m - K_SKIP - 1];
+                r_next3[1..].copy_from_slice(&mlv[2..]);
+                for &rho1 in &[F128::ONE, rng.f128()] {
+                    let (mut a3, mut b3) = (a_ref.clone(), b_ref.clone());
+                    fold_in_place_pair(&mut a3, &mut b3, rho1);
+                    let (m1, mi) = round_pair_naive(&a3, &b3, &r_next3);
+                    assert_eq!(
+                        eval_round3_lookahead(&la, rho1),
+                        (m1, mi),
+                        "sparse-boundary round-3 msg m={m} rnd={random_fill} rho1={rho1:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A B whose every row is the *same* non-all-ones byte pattern folds to
+    /// one uniform constant that is not `F128::ONE`. That window shape is
+    /// deliberately `Generic`: an earlier draft accepted any uniform constant
+    /// into the deferred run, which is only exact while the constant never
+    /// changes and drops the multiply entirely once it is folded in as an
+    /// identity. This is the regression guard for that correction.
+    #[test]
+    fn lookahead_uniform_non_one_b_matches_incumbent() {
+        const K_SKIP: usize = 6;
+        const ROW_BITS: usize = 1 << K_SKIP;
+        for &pattern in &[0x0Fu8, 0xAA, 0x01] {
+            for &m in &[13usize, 16] {
+                let mut rng = Rng::new(0x5F00 + m as u64 + pattern as u64);
+                let total_bits = 1usize << m;
+                let a = rng.bits(total_bits);
+                let mut b = vec![false; total_bits];
+                for (i, v) in b.iter_mut().enumerate() {
+                    *v = (pattern >> ((i % ROW_BITS) % 8)) & 1 == 1;
+                }
+                let padding = PaddingSpec::dense(m);
+                let (a_packed, b_packed) = (pack_bits(&a), pack_bits(&b));
+
+                let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+                assert_ne!(
+                    table.fold_one_row(&[pattern; ROW_BITS / 8]),
+                    F128::ONE,
+                    "pattern {pattern:#x} must not fold to ONE, or the test is vacuous"
+                );
+                let mut mlv = rng.f128_vec(m - K_SKIP);
+                mlv[0] = F128::ONE;
+
+                let (a_ref, b_ref, m1_ref, mi_ref) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                let (a_la, b_la, m1_la, mi_la, _la) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                assert_eq!(a_ref, a_la, "uniform-B a table m={m} pat={pattern:#x}");
+                assert_eq!(b_ref, b_la, "uniform-B b table m={m} pat={pattern:#x}");
+                assert_eq!(
+                    (m1_ref, mi_ref),
+                    (m1_la, mi_la),
+                    "uniform-B round-2 msg m={m} pat={pattern:#x}"
+                );
+
+                let (m1_nm, mi_nm, _) = uni_skip_round_pair_lookahead_nomat_packed_padded(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+                assert_eq!(
+                    (m1_la, mi_la),
+                    (m1_nm, mi_nm),
+                    "uniform-B nomat msg m={m} pat={pattern:#x}"
+                );
+            }
+        }
+    }
+
+    /// All-zero B (every window degenerates to `BWindow::Sparse` with a zero
+    /// lane-0 coefficient) and all-ones B (every window degenerates to
+    /// `BWindow::Ones`, one single deferred identity run over the whole
+    /// sweep) both still reproduce the incumbent round-two pass exactly.
+    #[test]
+    fn lookahead_degenerate_b_matches_incumbent() {
+        const K_SKIP: usize = 6;
+        for &fill in &[false, true] {
+            for &m in &[13usize, 16, 17] {
+                let mut rng = Rng::new(0x5C00 + m as u64 + fill as u64 * 100);
+                let total_bits = 1usize << m;
+                let a = rng.bits(total_bits);
+                let b = vec![fill; total_bits];
+                let padding = PaddingSpec::dense(m);
+                let (a_packed, b_packed) = (pack_bits(&a), pack_bits(&b));
+
+                let z = rng.f128();
+                let table = UniSkipFoldTable::new(K_SKIP, z);
+                let mut mlv = rng.f128_vec(m - K_SKIP);
+                mlv[0] = F128::ONE;
+                assert_ne!(mlv[1], F128::ZERO);
+
+                let (a_ref, b_ref, m1_ref, mi_ref) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                let (a_la, b_la, m1_la, mi_la, la) =
+                    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
+                        &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                    );
+                assert_eq!(a_ref, a_la, "degenerate-B a table m={m} fill={fill}");
+                assert_eq!(b_ref, b_la, "degenerate-B b table m={m} fill={fill}");
+                assert_eq!(
+                    (m1_ref, mi_ref),
+                    (m1_la, mi_la),
+                    "degenerate-B round-2 msg m={m} fill={fill}"
+                );
+
+                let (m1_nm, mi_nm, la_nm) = uni_skip_round_pair_lookahead_nomat_packed_padded(
+                    &a_packed, &b_packed, m, K_SKIP, &table, &mlv, &padding,
+                );
+                assert_eq!(
+                    (m1_la, mi_la),
+                    (m1_nm, mi_nm),
+                    "degenerate-B nomat msg m={m} fill={fill}"
+                );
+                assert_eq!(la, la_nm, "degenerate-B nomat lookahead m={m} fill={fill}");
+
+                let mut r_next3 = vec![F128::ONE; m - K_SKIP - 1];
+                r_next3[1..].copy_from_slice(&mlv[2..]);
+                for &rho1 in &[F128::ONE, rng.f128()] {
+                    let (mut a3, mut b3) = (a_ref.clone(), b_ref.clone());
+                    fold_in_place_pair(&mut a3, &mut b3, rho1);
+                    let (m1, mi) = round_pair_naive(&a3, &b3, &r_next3);
+                    assert_eq!(
+                        eval_round3_lookahead(&la, rho1),
+                        (m1, mi),
+                        "degenerate-B round-3 msg m={m} fill={fill} rho1={rho1:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The composed pass equals fold(ρ₁) then fold(ρ₂) elementwise (outputs
     /// poison-prefilled so an unwritten slot is caught) and reproduces the
     /// incumbent round-four message.

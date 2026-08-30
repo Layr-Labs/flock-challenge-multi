@@ -160,6 +160,127 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     }
 }
 
+/// Shape of the four folded-B registers `[b0, b1, b2, b3]` that one eight-pair
+/// round-two look-ahead window holds (`b_k[lane] = fold(row 4*lane + k)`).
+///
+/// ## Attribution - no novelty is claimed here
+/// The idea that the ranked instance's **B side is not random**, so a *static
+/// census* of the packed B rows carves the round-two look-ahead sweep into an
+/// all-ones head and a sparse tail whose message products collapse, is
+/// **newjordan's**. **fkiene** was the public carrier of the promoted
+/// write-up that made it visible, and **i34-9** publicly isolated the
+/// sparse-B half of it as a standalone effect. This file only re-derives that
+/// published idea against the current kernel's own register grouping and
+/// eight-accumulator layout; the concept and both specializations are theirs.
+///
+/// ## Why the static census does not appear in the hot path
+/// The census is a *where to expect it* hint, never a fact this kernel trusts.
+/// A precomputed window map would have to be threaded through the packed
+/// split, the padding skip and the GFNI prefold, and it would be wrong the
+/// moment a non-ranked instance is proven. Instead every window verifies its
+/// own folded-B registers with a handful of ZMM XOR/OR ops and a `vptestmq` -
+/// data this iteration already holds in registers - and any window that fails
+/// the test falls straight through to the generic arithmetic below. The
+/// specialization is therefore input-shape-driven and cannot change any
+/// result.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BWindow {
+    /// The sparse tail. `b1 = b2 = b3 = 0` in every lane and `b0` is zero
+    /// outside its **first** F128 lane, whose value `beta` may be anything
+    /// (including zero, which is the interior of an all-zero B run).
+    ///
+    /// This is the exact shape a B tail produces, and it is NOT "four
+    /// all-zero registers": the window that straddles the boundary still
+    /// carries the last live row. With `b_k[lane] = fold(row 4*lane + k)`,
+    /// `b0` lane 0 is window row 0 and every other register lane is a later
+    /// row, so "row 0 live, rows 1..16 dead" lands in precisely this shape.
+    ///
+    /// Seven of the eight products vanish; the survivors are `acc[1]`,
+    /// `acc[5]`, `acc[7]`, all against the same lane-0 `beta`.
+    Sparse,
+    /// The all-ones head. `b0 = b1 = b2 = b3 = F128::ONE` in every lane -
+    /// an all-ones packed B row folds to `sum_i eq(z, i) = 1` exactly, so the
+    /// head does not merely share *some* constant, it shares *the* identity.
+    ///
+    /// Then `b0+b1 = b2+b3 = b0+b2 = 0`, which kills `acc[1]`, `acc[3]`,
+    /// `acc[5]`, `acc[6]` and `acc[7]` outright, and the three survivors
+    /// `acc[0] += a1w*1`, `acc[2] += a3w*1`, `acc[4] += a2w*1` are identity
+    /// multiplies. An arbitrary uniform constant is deliberately NOT accepted
+    /// here: it would still need a real multiply, and folding it into the
+    /// deferred XOR run only stays exact while the constant never changes.
+    Ones,
+    /// Anything else: the generic eight-product block runs unchanged.
+    Generic,
+}
+
+/// Broadcast `F128::ONE` (`lo = 1`, `hi = 0`) into all four F128 lanes.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+fn one_x4() -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+
+    // SAFETY: register-only AVX-512F ops; the cfg gate supplies the feature.
+    unsafe { _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1)) }
+}
+
+/// Classify one window's folded-B registers against the two shapes above.
+/// A few ZMM XOR/OR ops and one or two `vptestmq` on registers the caller
+/// already holds; `ones_on` / `sparse_on` are the hoisted kill switches, and
+/// with both off this is a constant `Generic`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+pub(crate) fn classify_b_window(
+    b0: core::arch::x86_64::__m512i,
+    b1: core::arch::x86_64::__m512i,
+    b2: core::arch::x86_64::__m512i,
+    b3: core::arch::x86_64::__m512i,
+    ones_on: bool,
+    sparse_on: bool,
+) -> BWindow {
+    use core::arch::x86_64::*;
+
+    if !ones_on && !sparse_on {
+        return BWindow::Generic;
+    }
+    // SAFETY: register-only AVX-512F ops; the cfg gate supplies the feature.
+    unsafe {
+        if sparse_on {
+            let or123 = _mm512_or_si512(b1, _mm512_or_si512(b2, b3));
+            // Qword lanes 0 and 1 are F128 lane 0, so `0xFC` masks them out
+            // and tests only the three lanes that must be zero.
+            if _mm512_test_epi64_mask(or123, or123) == 0
+                && _mm512_test_epi64_mask(b0, b0) & 0xFC == 0
+            {
+                return BWindow::Sparse;
+            }
+        }
+        if ones_on {
+            let one = one_x4();
+            let d = _mm512_or_si512(
+                _mm512_or_si512(_mm512_xor_si512(b0, one), _mm512_xor_si512(b1, one)),
+                _mm512_or_si512(_mm512_xor_si512(b2, one), _mm512_xor_si512(b3, one)),
+            );
+            if _mm512_test_epi64_mask(d, d) == 0 {
+                return BWindow::Ones;
+            }
+        }
+        BWindow::Generic
+    }
+}
+
 /// x86 lookahead round-two sweep for one worker chunk: folds every pair of
 /// this chunk into `a_chunk`/`b_chunk` (bit-identical to the incumbent
 /// sweep) and returns the eight per-chunk sums
@@ -215,33 +336,24 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // B-window specialization (see `BWindow`; idea newjordan, carried
+        // publicly by fkiene, sparse half publicly isolated by i34-9 - no
+        // novelty claimed). Both switches resolved once per worker chunk.
+        let b_ones = zc_b_ones_enabled();
+        let b_sparse = zc_b_sparse_enabled();
+        // Deferred `B = ONE` accumulation for the all-ones head. The three
+        // surviving products are identity multiplies, so XOR their left
+        // operands into one pending register each and replay the whole run
+        // through a single `mul_acc` triple at the flush below: the 256-bit
+        // carryless product is XOR-bilinear, so `(sum a1w_i)*1 == sum
+        // (a1w_i*1)` bit-for-bit in the unreduced accumulator - the same
+        // argument `WideGhashX4` already rests on. The right operand is the
+        // literal `ONE` for every window in the run, so unlike an arbitrary
+        // uniform constant there is nothing that could change mid-run and
+        // nothing to flush against.
+        let mut ones_x = [_mm512_setzero_si512(); 3];
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
-        const B_ONES_BLOCK_PAIRS: usize = 128;
-        const B_SPARSE_PAIR: usize = 120;
-        const B_SPECIAL_ONES: u8 = 0;
-        const B_SPECIAL_SPARSE: u8 = 1;
-        const B_SPECIAL_NONE: u8 = 2;
-        let b_ones_on = zc_b_ones_enabled();
-        let b_sparse_on = zc_b_sparse_enabled();
-        let pair_in_b_block = pair_idx_base & (B_ONES_BLOCK_PAIRS - 1);
-        let (mut b_special_head, mut b_special_kind) = match (b_ones_on, b_sparse_on) {
-            (true, true) if pair_in_b_block == 0 => (0, B_SPECIAL_ONES),
-            (true, true) if pair_in_b_block <= B_SPARSE_PAIR => {
-                (B_SPARSE_PAIR - pair_in_b_block, B_SPECIAL_SPARSE)
-            }
-            (true, true) => (B_ONES_BLOCK_PAIRS - pair_in_b_block, B_SPECIAL_ONES),
-            (true, false) => (
-                (B_ONES_BLOCK_PAIRS - pair_in_b_block) & (B_ONES_BLOCK_PAIRS - 1),
-                B_SPECIAL_ONES,
-            ),
-            (false, true) => (
-                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block)
-                    & (B_ONES_BLOCK_PAIRS - 1),
-                B_SPECIAL_SPARSE,
-            ),
-            (false, false) => (usize::MAX, B_SPECIAL_NONE),
-        };
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
         // rows; the consume path below skips them exactly as before).
@@ -457,144 +569,97 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
-            if x_lo == b_special_head {
-                let special_kind = b_special_kind;
-                if b_ones_on && b_sparse_on {
-                    if special_kind == B_SPECIAL_ONES {
-                        b_special_head = b_special_head.wrapping_add(B_SPARSE_PAIR);
-                        b_special_kind = B_SPECIAL_SPARSE;
-                    } else {
-                        b_special_head =
-                            b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS - B_SPARSE_PAIR);
-                        b_special_kind = B_SPECIAL_ONES;
-                    }
-                } else {
-                    b_special_head = b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS);
+            // ---- B-window specialization (idea newjordan; public carrier
+            // fkiene; sparse half publicly isolated by i34-9; no novelty
+            // claimed here). Classify the folded-B registers this iteration
+            // already holds, then take the matching arm. `Generic` is the
+            // untouched incumbent block, and it is also what every window
+            // takes when both kill switches are set.
+            let bwin = classify_b_window(b0, b1, b2, b3, b_ones, b_sparse);
+            if bwin == BWindow::Sparse {
+                // Sparse tail: `b1 = b2 = b3 = 0` and only `b0`'s first F128
+                // lane can be nonzero. Substituting into the eight products
+                // leaves three, all on lane 0 and all sharing `beta`:
+                //   acc[1] += (a0w + a1w)*(b0 + b1)      -> w*(a0+a1)*beta
+                //   acc[5] += (a0w + a2w)*(b0 + b2)      -> w*(a0+a2)*beta
+                //   acc[7] += (sum a_kw)*(sum b_k)       -> w*(sum a_k)*beta
+                // `c = w*beta` is one reduced scalar multiply shared by all
+                // three, so the window costs 1 reduced + 3 unreduced scalar
+                // multiplies instead of four `w*a_k` prescale `ghash_mul_x4`s
+                // and eight `mul_acc`s - and the prescale is never issued at
+                // all, which is why this arm sits above it.
+                //
+                // Exactness: the products land in the same deferred `tail[i]`
+                // accumulators the scalar group tail uses, and `reduce` is
+                // F2-linear, so summing unreduced and reducing once is
+                // bit-identical to the generic block's per-window products.
+                let beta = core::mem::transmute::<__m128i, F128>(_mm512_castsi512_si128(b0));
+                if beta != F128::ZERO {
+                    // `wtab[x_lo]` and `eq_lo[x_lo + 1]` are the same value:
+                    // lane 0 of `w` under both prescale paths.
+                    let w0 = match wtab {
+                        Some(wt) => *wt.get_unchecked(x_lo),
+                        None => *eq_lo.get_unchecked(x_lo + 1),
+                    };
+                    let a0_0 = core::mem::transmute::<__m128i, F128>(_mm512_castsi512_si128(a0));
+                    let a1_0 = core::mem::transmute::<__m128i, F128>(_mm512_castsi512_si128(a1));
+                    let a2_0 = core::mem::transmute::<__m128i, F128>(_mm512_castsi512_si128(a2));
+                    let a3_0 = core::mem::transmute::<__m128i, F128>(_mm512_castsi512_si128(a3));
+                    let c = w0 * beta;
+                    tail[1] ^= c.mul_unreduced(a0_0 + a1_0);
+                    tail[5] ^= c.mul_unreduced(a0_0 + a2_0);
+                    tail[7] ^= c.mul_unreduced(a0_0 + a1_0 + a2_0 + a3_0);
                 }
-                if special_kind == B_SPECIAL_ONES {
-                    let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
-                    let all = _mm512_cmpeq_epi64_mask(b0, one)
-                        & _mm512_cmpeq_epi64_mask(b1, one)
-                        & _mm512_cmpeq_epi64_mask(b2, one)
-                        & _mm512_cmpeq_epi64_mask(b3, one);
-                    if all == 0xff {
-                        let (a1w, a2w, a3w) = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            (
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                            )
-                        } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
-                                )
-                            } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
-                            }
-                        };
-                        #[cfg(test)]
-                        B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        acc[0].mul_acc_one(a1w);
-                        acc[2].mul_acc_one(a3w);
-                        acc[4].mul_acc_one(a2w);
-                        x_lo += 8;
-                        continue;
-                    }
-                } else {
-                    let zero = _mm512_setzero_si512();
-                    let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
-                    let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
-                        & _mm512_cmpeq_epi64_mask(b1, zero)
-                        & _mm512_cmpeq_epi64_mask(b2, zero)
-                        & _mm512_cmpeq_epi64_mask(b3, zero);
-                    if all == 0xff {
-                        #[cfg(test)]
-                        B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let a1_msg = _mm512_xor_si512(a0, a1);
-                        let a5_msg = _mm512_xor_si512(a0, a2);
-                        let a7_msg = _mm512_xor_si512(a1_msg, _mm512_xor_si512(a2, a3));
-                        let wb = if let Some(wt) = wtab {
-                            let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                            let w = _mm512_loadu_si512(wp);
-                            let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
-                        } else {
-                            let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
-                            let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
-                            let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
-                            } else {
-                                ghash_mul_x4(w, b0_lane0)
-                            }
-                        };
-                        acc[1].mul_acc(a1_msg, wb);
-                        acc[5].mul_acc(a5_msg, wb);
-                        acc[7].mul_acc(a7_msg, wb);
-                        x_lo += 8;
-                        continue;
-                    }
-                }
+                x_lo += 8;
+                continue;
             }
-            let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
-                // (w, w·x⁶⁴) precomputed once per pass: both are pure
-                // functions of `x_lo` (the odd eq_lo lanes and their x⁶⁴
-                // companions), yet the incumbent recomputed the companion —
-                // a permute plus a CLMUL of pure latency — at the head of
-                // the chain feeding all eight accumulates, every iteration.
+            // `w` (and its `x^64` companion for the split multiply) is shared
+            // by every prescale this window needs, so it is hoisted out of
+            // the per-register block: the `Ones` arm then skips `a0w`, which
+            // there only ever feeds dead XOR-difference products.
+            //
+            // (w, w*x^64) precomputed once per pass: both are pure functions
+            // of `x_lo` (the odd eq_lo lanes and their x^64 companions), yet
+            // the incumbent recomputed the companion - a permute plus a CLMUL
+            // of pure latency - at the head of the chain feeding all eight
+            // accumulates, every iteration.
+            let (w, w64, split) = if let Some(wt) = wtab {
                 let wp = wt.as_ptr().add(x_lo) as *const __m512i;
-                let w = _mm512_loadu_si512(wp);
-                let w64 = _mm512_loadu_si512(wp.add(1));
-                (
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                )
+                (_mm512_loadu_si512(wp), _mm512_loadu_si512(wp.add(1)), true)
             } else {
                 let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                 let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                 let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                 if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                    (
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                    )
+                    (w, crate::field::gf2_128::x86_64::ghash_shift64_x4(w), true)
                 } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
+                    (w, w, false)
                 }
             };
+            macro_rules! wmul {
+                ($a:expr) => {
+                    if split {
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_split($a, w, w64)
+                    } else {
+                        ghash_mul_x4(w, $a)
+                    }
+                };
+            }
+            if bwin == BWindow::Ones {
+                // All-ones head: `b0 = b1 = b2 = b3 = ONE` lane-wise, so the
+                // five XOR-difference right operands are `1 + 1 = 0` and only
+                // acc[0], acc[2] and acc[4] survive - each an exact identity
+                // multiply `a_kw * 1`. XOR the left operands into the pending
+                // registers and pay one `mul_acc` triple per chunk at the
+                // flush, which replays them through that same identity
+                // multiply. `a0w` is dead here and is never computed.
+                ones_x[0] = _mm512_xor_si512(ones_x[0], wmul!(a1));
+                ones_x[1] = _mm512_xor_si512(ones_x[1], wmul!(a3));
+                ones_x[2] = _mm512_xor_si512(ones_x[2], wmul!(a2));
+                x_lo += 8;
+                continue;
+            }
+            let (a0w, a1w, a2w, a3w) = (wmul!(a0), wmul!(a1), wmul!(a2), wmul!(a3));
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
             acc[2].mul_acc(a3w, b3);
@@ -608,6 +673,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             acc[6].mul_acc(o_aw, o_b);
             acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
             x_lo += 8;
+        }
+        // Close the deferred `B = ONE` run before the scalar group tail, with
+        // the identity multiply the specialized windows skipped. Unconditional:
+        // three `mul_acc`s per worker chunk, and `mul_acc(0, 1)` contributes
+        // exactly zero when the arm never fired.
+        {
+            let one = one_x4();
+            acc[0].mul_acc(ones_x[0], one);
+            acc[2].mul_acc(ones_x[1], one);
+            acc[4].mul_acc(ones_x[2], one);
         }
 
         // Small instances (lo_size ∈ {2, 4}) leave whole groups for the
@@ -1319,25 +1394,36 @@ pub(crate) fn zc_wsplit_enabled() -> bool {
     *ON
 }
 
-#[cfg(test)]
-pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) static B_SPARSE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
+/// `FLOCK_NO_ZC_B_ONES=1` restores the generic eight-product round-two
+/// message block for look-ahead windows whose four folded-B registers are all
+/// lane-wise `F128::ONE` (see `BWindow::Ones`). Default on; the ranked worker
+/// starts from a cleared environment, so the gate is never set there and the
+/// `LazyLock` is one relaxed load per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 pub(crate) fn zc_b_ones_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_ONES").is_none());
     *ON
 }
 
-#[inline]
-fn zc_b_sparse_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
+/// `FLOCK_NO_ZC_B_SPARSE=1` restores the generic eight-product round-two
+/// message block for sparse-tail look-ahead windows - `b1 = b2 = b3 = 0` with
+/// at most `b0`'s first F128 lane live (see `BWindow::Sparse`). Independent of
+/// `FLOCK_NO_ZC_B_ONES`: either specialization can be switched off on its own
+/// for an exact same-binary A/B.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) fn zc_b_sparse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_SPARSE").is_none());
-    *ENABLED
+    *ON
 }
 
 /// Deferred-reduction form of the sixteen-to-four composed pair fold. The
@@ -1745,7 +1831,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
@@ -3358,5 +3444,175 @@ unsafe fn gfni_fold64_regs_sigma_bcast(
             _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
             _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
         }
+    }
+}
+
+/// Unit coverage for the round-two B-window shape test. The differential
+/// tests in `zerocheck::multilinear` prove the *arithmetic* of each arm
+/// against the incumbent sweep; these prove the *classifier* accepts exactly
+/// the two published shapes and nothing adjacent to them — in particular that
+/// an arbitrary uniform constant is `Generic`, not `Ones`.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+mod b_window_tests {
+    use super::{BWindow, classify_b_window, one_x4};
+    use crate::field::F128;
+    use core::arch::x86_64::*;
+
+    /// Build a ZMM from four F128 lanes (lane 0 first).
+    fn zmm(lanes: [F128; 4]) -> __m512i {
+        // SAFETY: 64 readable bytes; the cfg gate supplies avx512f.
+        unsafe { _mm512_loadu_si512(lanes.as_ptr().cast::<__m512i>()) }
+    }
+
+    fn splat(v: F128) -> __m512i {
+        zmm([v; 4])
+    }
+
+    const ZERO4: [F128; 4] = [F128::ZERO; 4];
+
+    fn classify(b: [__m512i; 4]) -> BWindow {
+        classify_b_window(b[0], b[1], b[2], b[3], true, true)
+    }
+
+    #[test]
+    fn all_zero_window_is_sparse() {
+        let z = zmm(ZERO4);
+        assert_eq!(classify([z; 4]), BWindow::Sparse);
+    }
+
+    #[test]
+    fn only_b0_lane0_live_is_sparse() {
+        let z = zmm(ZERO4);
+        for &v in &[
+            F128::ONE,
+            F128::new(0xdead_beef, 0xfeed_face),
+            F128::new(0, 1),
+        ] {
+            let b0 = zmm([v, F128::ZERO, F128::ZERO, F128::ZERO]);
+            assert_eq!(classify([b0, z, z, z]), BWindow::Sparse, "beta={v:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_live_lane_is_not_sparse() {
+        let z = zmm(ZERO4);
+        let v = F128::new(7, 0);
+        // Any lane of b0 past the first breaks the shape.
+        for lane in 1..4 {
+            let mut lanes = ZERO4;
+            lanes[lane] = v;
+            assert_eq!(
+                classify([zmm(lanes), z, z, z]),
+                BWindow::Generic,
+                "lane={lane}"
+            );
+        }
+        // So does any live lane in b1/b2/b3, including lane 0.
+        for reg in 1..4 {
+            for lane in 0..4 {
+                let mut lanes = ZERO4;
+                lanes[lane] = v;
+                let mut b = [z; 4];
+                b[reg] = zmm(lanes);
+                assert_eq!(classify(b), BWindow::Generic, "reg={reg} lane={lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_all_ones_is_ones() {
+        let o = splat(F128::ONE);
+        assert_eq!(classify([o; 4]), BWindow::Ones);
+        assert!(one_x4_matches_splat());
+    }
+
+    fn one_x4_matches_splat() -> bool {
+        let a = one_x4();
+        let b = splat(F128::ONE);
+        // SAFETY: register-only avx512f op.
+        unsafe {
+            let d = _mm512_xor_si512(a, b);
+            _mm512_test_epi64_mask(d, d) == 0
+        }
+    }
+
+    /// The correction that matters: a *uniform but not ONE* window must fall
+    /// through to the generic block. Folding it into the deferred identity
+    /// run would silently drop the constant.
+    #[test]
+    fn uniform_non_one_is_generic() {
+        for &v in &[
+            F128::new(2, 0),
+            F128::new(0, 1),
+            F128::new(0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff),
+        ] {
+            let u = splat(v);
+            assert_eq!(classify([u; 4]), BWindow::Generic, "v={v:?}");
+        }
+    }
+
+    #[test]
+    fn partially_one_window_is_generic() {
+        let o = splat(F128::ONE);
+        let z = zmm(ZERO4);
+        for reg in 0..4 {
+            let mut b = [o; 4];
+            b[reg] = z;
+            assert_eq!(classify(b), BWindow::Generic, "reg={reg}");
+        }
+        // One dead lane inside an otherwise all-ones register also fails.
+        let mut lanes = [F128::ONE; 4];
+        lanes[2] = F128::ZERO;
+        let mut b = [o; 4];
+        b[1] = zmm(lanes);
+        assert_eq!(classify(b), BWindow::Generic);
+    }
+
+    #[test]
+    fn kill_switches_force_generic() {
+        let o = splat(F128::ONE);
+        let z = zmm(ZERO4);
+        let sparse = [
+            zmm([F128::new(3, 0), F128::ZERO, F128::ZERO, F128::ZERO]),
+            z,
+            z,
+            z,
+        ];
+        // Both off: constant `Generic`, no shape test at all.
+        assert_eq!(
+            classify_b_window(o, o, o, o, false, false),
+            BWindow::Generic
+        );
+        assert_eq!(
+            classify_b_window(sparse[0], sparse[1], sparse[2], sparse[3], false, false),
+            BWindow::Generic
+        );
+        // Each switch gates only its own arm.
+        assert_eq!(classify_b_window(o, o, o, o, true, false), BWindow::Ones);
+        assert_eq!(classify_b_window(o, o, o, o, false, true), BWindow::Generic);
+        assert_eq!(
+            classify_b_window(sparse[0], sparse[1], sparse[2], sparse[3], false, true),
+            BWindow::Sparse
+        );
+        assert_eq!(
+            classify_b_window(sparse[0], sparse[1], sparse[2], sparse[3], true, false),
+            BWindow::Generic
+        );
+    }
+
+    /// `Sparse` and `Ones` can never both match, so the arm order inside the
+    /// classifier is not load-bearing.
+    #[test]
+    fn shapes_are_disjoint() {
+        let o = splat(F128::ONE);
+        assert_eq!(classify_b_window(o, o, o, o, true, true), BWindow::Ones);
+        let z = zmm(ZERO4);
+        let b0 = zmm([F128::ONE, F128::ZERO, F128::ZERO, F128::ZERO]);
+        assert_eq!(classify_b_window(b0, z, z, z, true, true), BWindow::Sparse);
     }
 }
