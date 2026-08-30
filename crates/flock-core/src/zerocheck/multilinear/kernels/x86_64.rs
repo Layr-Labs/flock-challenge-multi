@@ -595,18 +595,23 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
@@ -1067,18 +1072,23 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
@@ -1988,18 +1998,23 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
