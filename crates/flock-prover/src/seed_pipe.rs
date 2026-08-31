@@ -647,7 +647,7 @@ fn rehearse_publish_tail(path: &Path, out: ProveOut) {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
-fn is_ranked_worker() -> bool {
+pub(crate) fn is_ranked_worker() -> bool {
     ranked_worker_proof_path().is_some()
 }
 
@@ -898,7 +898,14 @@ fn speculative_main(
     }
     drop(warm);
 
-    let Some(line) = read_line_fd(real_stdin) else {
+    // The read returned, so the harness has started its clock and every core
+    // is about to be needed. Release the keep-alive spin threads first: the
+    // signal is a single relaxed store, and letting them wind down while this
+    // thread parses and forwards the seed keeps the wait below out of the
+    // timed window's serial prologue.
+    let line = read_line_fd(real_stdin);
+    flock_core::cpu_keepalive::keepalive_signal();
+    let Some(line) = line else {
         close_fd(real_stdin);
         close_fd(writer);
         mark_dead();
@@ -922,6 +929,11 @@ fn speculative_main(
         mark_dead();
         return;
     }
+
+    // Quiet before real work: in the common case every spin thread has
+    // already exited during the parse/forward above, so this is one atomic
+    // load. Bounded, so it can never stall the prove.
+    flock_core::cpu_keepalive::keepalive_join();
 
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

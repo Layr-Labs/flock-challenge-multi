@@ -3647,10 +3647,16 @@ impl Blake3Setup {
         // the proof for these blocks may already be in flight on the seed-pipe
         // thread. Equality of `blocks` gates adoption; see `crate::seed_pipe`.
         // Inert unless `arm_seed_pipe` ran at the tail of call 0.
-        if call > 0
-            && let Some(adopted) = crate::seed_pipe::try_adopt(blocks)
-        {
-            return adopted;
+        if call > 0 {
+            // The timed seed is in hand (this is the timed call). If the seed
+            // pipe is live its thread already halted the CPU keep-alive the
+            // instant it read the seed; this is the idempotent fallback for
+            // the seed-pipe-disabled path. Stop before the adoption
+            // byte-compare so no keep-alive thread overlaps timed work.
+            flock_core::cpu_keepalive::keepalive_stop();
+            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
+                return adopted;
+            }
         }
         // HOISTED (was below, after the loop and the final warm-up prove).
         // This is the call that sets `GENERATOR_VERIFIED`, which decides
@@ -3717,6 +3723,16 @@ impl Blake3Setup {
             // `verify_generator_at_warmup` was hoisted above the untimed
             // warm-up loop; `arm_seed_pipe` still reads the verdict it set.
             self.arm_seed_pipe();
+            // Last thing before the worker publishes "ready" and every thread
+            // parks for the seed: light up a CPU keep-alive so the package
+            // does not collapse into a deep C-state with a decayed frequency
+            // request across the gap. The seed-pipe thread (or the timed
+            // `prove_fast` fallback above) stops it the instant the seed
+            // arrives. Ranked-worker only, so tests / benches / examples that
+            // call `prove_fast` never spin.
+            if crate::seed_pipe::is_ranked_worker() {
+                flock_core::cpu_keepalive::keepalive_start();
+            }
         }
         out
     }
