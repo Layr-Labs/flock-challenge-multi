@@ -1486,6 +1486,7 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1617,6 +1618,8 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_range2(
         }
     }
 }
+
+
 
 #[cfg(all(
     target_arch = "x86_64",

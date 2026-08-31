@@ -4133,13 +4133,10 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
-/// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
+/// The AVX-512 fold and message reduction use a per-worker L1 stage. Only
+/// the final large-round publication is non-temporal, preserving the
+/// incumbent schedule for DRAM-cold rounds while the next sumcheck round
+/// remains separated by Fiat–Shamir.
 ///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
@@ -4198,6 +4195,8 @@ thread_local! {
     static OPEN_NT_STAGE: std::cell::RefCell<(Vec<F128>, Vec<F128>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
+
+
 
 fn fold_and_msg_lsb(
     f: &[F128],
@@ -4316,6 +4315,7 @@ fn fold_and_msg_lsb_inner(
         && deferred_basis.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4374,9 +4374,10 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if use_nt {
-                // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
-                // reused scratch; dest sees only the NT publish.
+            if lazy_ood.is_none() && deferred_basis.is_none() && use_nt {
+                // Per-worker L1 stage: fold + msg_reduce stay on reused
+                // scratch; only the DRAM-cold destination is published
+                // non-temporally.
                 return OPEN_NT_STAGE.with(|cell| {
                     let mut st = cell.borrow_mut();
                     if st.0.len() < CHUNK {
@@ -4384,8 +4385,8 @@ fn fold_and_msg_lsb_inner(
                         st.1 = crate::alloc_uninit_vec(CHUNK);
                     }
                     // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
-                    // geometry matches fold_and_msg_lsb's even-length
-                    // power-of-two split; stage capacity is CHUNK.
+                    // geometry matches the even-length sumcheck split;
+                    // stage capacity is CHUNK.
                     unsafe {
                         let (sf, sb) = &mut *st;
                         fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
@@ -4413,6 +4414,7 @@ fn fold_and_msg_lsb_inner(
                 if use_nt {
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
+
             }
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
@@ -4708,6 +4710,7 @@ fn materialize_direct_fold4(
         Vec::new()
     };
 
+
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     // Ranked path has no ordinary basis and uses fold16_banked, so the mid
@@ -4831,20 +4834,24 @@ fn materialize_direct_fold4(
                         &direct_tables[0],
                         claim0.eq_hi[block],
                     );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let mats0_lo =
+                        build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi =
+                        build_row_fold_mats_from_cols(&cols0[64..]);
                     let cols1 = super::ring_switch::compose_block_cols(
                         &direct_tables[1],
                         claim1.eq_hi[block],
                     );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let mats1_lo =
+                        build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi =
+                        build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate
-                        // supplies every feature required by the kernel.
+                        // supplies all features required by the kernel.
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
@@ -4856,10 +4863,11 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
+
                 }
                 if !b_gfni_on {
                     let table = &mut scratch[..table_len];
@@ -6088,6 +6096,96 @@ fn direct_fold8_final_generators(
     crate::field::f128_slice::fold_pairs(&claim.w_state, 0, &mut generators, challenge);
     generators
 }
+/// GFNI representation of the fixed DirectFold8 byte-linear map. The two
+/// halves map the low and high 64 input bits to one F128 output, so a complete
+/// map application needs no 64 KiB subset-sum table.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+struct DirectFold8GfniMap {
+    low: [u64; 128],
+    high: [u64; 128],
+}
+
+/// Build the two GFNI maps directly from the 128 polynomial-basis generators.
+/// This is the same map encoded by `build_direct_fold8_table_from_generators`,
+/// but keeps only its 1 KiB-per-half matrix representation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn build_direct_fold8_gfni_map(generators: &[F128]) -> DirectFold8GfniMap {
+    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+
+    debug_assert_eq!(generators.len(), 128);
+    DirectFold8GfniMap {
+        low: build_row_fold_mats_from_cols(&generators[..64]),
+        high: build_row_fold_mats_from_cols(&generators[64..]),
+    }
+}
+
+/// Compose a DirectFold8 GFNI map with multiplication by `e_hi`.
+///
+/// The old composition first folded 128 `e_hi · X^b` columns through a
+/// 64-KiB byte table. Generate those columns as two 64-row batches instead:
+/// `mul_by_x` supplies the exact polynomial-basis chain, and the dedicated
+/// two-map GFNI leaf emits matrix words directly from its output planes. The
+/// returned matrices are the representation consumed by the staged two-claim
+/// drain.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn compose_direct_fold8_gfni_map(
+    map: &DirectFold8GfniMap,
+    e_hi: F128,
+) -> ([u64; 128], [u64; 128]) {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_compose64_two_maps_to_mats;
+
+    let mut rows_lo = [0u64; 128];
+    let mut rows_hi = [0u64; 128];
+    let mut w = e_hi;
+    for i in 0..128 {
+        rows_lo[i] = w.lo;
+        rows_hi[i] = w.hi;
+        w = crate::field::mul_by_x(w);
+    }
+
+    let mut mats_lo = [0u64; 128];
+    let mut mats_hi = [0u64; 128];
+    // SAFETY: each row half contains 64 contiguous u64 values (512 bytes);
+    // the maps and output arrays cover exactly 64 rows.
+    unsafe {
+        gfni_compose64_two_maps_to_mats(
+            rows_lo.as_ptr().cast::<u8>(),
+            &map.low,
+            rows_hi.as_ptr().cast::<u8>(),
+            &map.high,
+            &mut mats_lo,
+        );
+        gfni_compose64_two_maps_to_mats(
+            rows_lo.as_ptr().add(64).cast::<u8>(),
+            &map.low,
+            rows_hi.as_ptr().add(64).cast::<u8>(),
+            &map.high,
+            &mut mats_hi,
+        );
+    }
+    (mats_lo, mats_hi)
+}
+
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -6193,9 +6291,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::{
-        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-    };
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -6205,11 +6301,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
-    let direct_tables: Vec<Vec<F128>> = claims
+    let direct_gfni_maps: Vec<DirectFold8GfniMap> = claims
         .par_iter()
         .map(|claim| {
             let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            build_direct_fold8_gfni_map(&generators)
         })
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
@@ -6236,14 +6332,10 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
-                let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
-                let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                let (mats0_lo, mats0_hi) =
+                    compose_direct_fold8_gfni_map(&direct_gfni_maps[0], claim0.eq_hi[block]);
+                let (mats1_lo, mats1_hi) =
+                    compose_direct_fold8_gfni_map(&direct_gfni_maps[1], claim1.eq_hi[block]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
@@ -6406,13 +6498,35 @@ fn materialize_direct_fold8(
     )))]
     let _ = l1_precommit;
 
-    let direct_tables: Vec<Vec<F128>> = claims
-        .par_iter()
-        .map(|claim| {
-            let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
-        })
-        .collect();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_maps: Vec<DirectFold8GfniMap> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                build_direct_fold8_gfni_map(&generators)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
+        Vec::new()
+    } else {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect()
+    };
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -6539,22 +6653,12 @@ fn materialize_direct_fold8(
                     target_feature = "gfni"
                 ))]
                 if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
+                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
-                        claim0.eq_hi[block],
-                    );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
-                        claim1.eq_hi[block],
-                    );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let (mats0_lo, mats0_hi) =
+                        compose_direct_fold8_gfni_map(&direct_gfni_maps[0], claim0.eq_hi[block]);
+                    let (mats1_lo, mats1_hi) =
+                        compose_direct_fold8_gfni_map(&direct_gfni_maps[1], claim1.eq_hi[block]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
@@ -10295,7 +10399,8 @@ mod tests {
             let mut bc_nt = vec![F128::ZERO; n_pairs];
             let mut stage_f = vec![F128::ZERO; n_pairs.max(8)];
             let mut stage_b = vec![F128::ZERO; n_pairs.max(8)];
-            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
+            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk geometry
+            // satisfies the leaf's source and destination contract.
             let (u0_nt, u2_nt) = unsafe {
                 super::fold_and_msg_chunk_nt_x86(
                     &f,
@@ -12762,6 +12867,58 @@ mod tests {
         target_feature = "gfni"
     ))]
     #[test]
+    fn direct_fold8_gfni_map_matches_composed_table_oracle() {
+        use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
+
+        let mut state = 0xD1CE_8F8D_5EED_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let generators: Vec<F128> = (0..128)
+            .map(|_| F128::new(next(), next()))
+            .collect();
+        let table = super::super::ring_switch::build_direct_fold8_table_from_generators(
+            &generators,
+        );
+        let map = super::build_direct_fold8_gfni_map(&generators);
+        let e_hi = F128::new(next(), next());
+        let (mats_lo, mats_hi) = super::compose_direct_fold8_gfni_map(&map, e_hi);
+        let rows_lo: Vec<u64> = (0..64).map(|_| next()).collect();
+        let rows_hi: Vec<u64> = (0..64).map(|_| next()).collect();
+        let mut got = vec![F128::ZERO; 64];
+        // SAFETY: both row halves cover 512 readable bytes, the matrices
+        // encode complete 64-bit input maps, and `got` has 64 outputs.
+        unsafe {
+            gfni_fold64_two_maps::<false>(
+                rows_lo.as_ptr().cast::<u8>(),
+                &mats_lo,
+                rows_hi.as_ptr().cast::<u8>(),
+                &mats_hi,
+                got.as_mut_ptr(),
+                core::ptr::null(),
+            );
+        }
+        for i in 0..64 {
+            let x = F128::new(rows_lo[i], rows_hi[i]);
+            assert_eq!(
+                got[i],
+                super::super::ring_switch::fold_one_slot(x * e_hi, &table),
+                "slot {i}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
     fn direct_fold4_two_claim_gfni_matches_composed_table_oracle() {
         use crate::zerocheck::multilinear::kernels::x86_64::{
             build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
@@ -12790,12 +12947,18 @@ mod tests {
                 )
             })
             .collect();
-        let cols0 = super::super::ring_switch::compose_block_cols(&direct_tables[0], eq_hi[0]);
-        let cols1 = super::super::ring_switch::compose_block_cols(&direct_tables[1], eq_hi[1]);
-        let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-        let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-        let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-        let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+        let cols0 =
+            super::super::ring_switch::compose_block_cols(&direct_tables[0], eq_hi[0]);
+        let mats0_lo =
+            build_row_fold_mats_from_cols(&cols0[..64]);
+        let mats0_hi =
+            build_row_fold_mats_from_cols(&cols0[64..]);
+        let cols1 =
+            super::super::ring_switch::compose_block_cols(&direct_tables[1], eq_hi[1]);
+        let mats1_lo =
+            build_row_fold_mats_from_cols(&cols1[..64]);
+        let mats1_hi =
+            build_row_fold_mats_from_cols(&cols1[64..]);
         let mut got = vec![F128::ZERO; 64];
         let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
         // SAFETY: four exact 512-byte inputs, four complete composed maps,
@@ -12829,7 +12992,6 @@ mod tests {
             assert_eq!(got[slot], expect, "slot {slot}");
         }
     }
-
     #[test]
     fn direct_fold4_gfni_gate_is_ranked_shape_only() {
         assert!(direct_fold4_b_gfni_shape(2, false, 64));
