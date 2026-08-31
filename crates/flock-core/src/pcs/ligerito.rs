@@ -4133,13 +4133,10 @@ unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
 
 /// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
 ///
-/// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
+/// The AVX-512 fold and message reduction use a per-worker L1 stage. Only
+/// the final large-round publication is non-temporal, preserving the
+/// incumbent schedule for DRAM-cold rounds while the next sumcheck round
+/// remains separated by Fiat–Shamir.
 ///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
@@ -4198,6 +4195,8 @@ thread_local! {
     static OPEN_NT_STAGE: std::cell::RefCell<(Vec<F128>, Vec<F128>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
+
+
 
 fn fold_and_msg_lsb(
     f: &[F128],
@@ -4316,6 +4315,7 @@ fn fold_and_msg_lsb_inner(
         && deferred_basis.is_none()
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4374,9 +4374,10 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if use_nt {
-                // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
-                // reused scratch; dest sees only the NT publish.
+            if lazy_ood.is_none() && deferred_basis.is_none() && use_nt {
+                // Per-worker L1 stage: fold + msg_reduce stay on reused
+                // scratch; only the DRAM-cold destination is published
+                // non-temporally.
                 return OPEN_NT_STAGE.with(|cell| {
                     let mut st = cell.borrow_mut();
                     if st.0.len() < CHUNK {
@@ -4384,8 +4385,8 @@ fn fold_and_msg_lsb_inner(
                         st.1 = crate::alloc_uninit_vec(CHUNK);
                     }
                     // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
-                    // geometry matches fold_and_msg_lsb's even-length
-                    // power-of-two split; stage capacity is CHUNK.
+                    // geometry matches the even-length sumcheck split;
+                    // stage capacity is CHUNK.
                     unsafe {
                         let (sf, sb) = &mut *st;
                         fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
@@ -4413,6 +4414,7 @@ fn fold_and_msg_lsb_inner(
                 if use_nt {
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
+
             }
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
@@ -4708,6 +4710,7 @@ fn materialize_direct_fold4(
         Vec::new()
     };
 
+
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
     // Ranked path has no ordinary basis and uses fold16_banked, so the mid
@@ -4831,20 +4834,24 @@ fn materialize_direct_fold4(
                         &direct_tables[0],
                         claim0.eq_hi[block],
                     );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
+                    let mats0_lo =
+                        build_row_fold_mats_from_cols(&cols0[..64]);
+                    let mats0_hi =
+                        build_row_fold_mats_from_cols(&cols0[64..]);
                     let cols1 = super::ring_switch::compose_block_cols(
                         &direct_tables[1],
                         claim1.eq_hi[block],
                     );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let mats1_lo =
+                        build_row_fold_mats_from_cols(&cols1[..64]);
+                    let mats1_hi =
+                        build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate
-                        // supplies every feature required by the kernel.
+                        // supplies all features required by the kernel.
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
@@ -4856,10 +4863,11 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
+
                 }
                 if !b_gfni_on {
                     let table = &mut scratch[..table_len];
@@ -10251,70 +10259,6 @@ mod tests {
         }
     }
 
-    /// x86 NT fold+message leaf must be bit-identical to `fold_pairs` +
-    /// the reload message loop (NT is a cache-hint only).
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    #[test]
-    fn fold_and_msg_nt_leaf_x86_matches_generic() {
-        let mut state = 0x1234_5678_9abc_def0_u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut f128 = || F128 {
-            lo: next(),
-            hi: next(),
-        };
-        for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16), (2048, 0)] {
-            let total = 2 * (base + n_pairs);
-            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
-            let r = f128();
-
-            let mut fc_ref = vec![F128::ZERO; n_pairs];
-            let mut bc_ref = vec![F128::ZERO; n_pairs];
-            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
-            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
-            let mut u0_ref = F128::ZERO;
-            let mut u2_ref = F128::ZERO;
-            let mut k = 0;
-            while k + 1 < n_pairs {
-                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
-                u0_ref += f0 * b0;
-                u2_ref += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-
-            let mut fc_nt = vec![F128::ZERO; n_pairs];
-            let mut bc_nt = vec![F128::ZERO; n_pairs];
-            let mut stage_f = vec![F128::ZERO; n_pairs.max(8)];
-            let mut stage_b = vec![F128::ZERO; n_pairs.max(8)];
-            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
-            let (u0_nt, u2_nt) = unsafe {
-                super::fold_and_msg_chunk_nt_x86(
-                    &f,
-                    &b,
-                    base,
-                    &mut fc_nt,
-                    &mut bc_nt,
-                    r,
-                    &mut stage_f,
-                    &mut stage_b,
-                )
-            };
-            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
-            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
-            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
-            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
-        }
-    }
-
     /// The NT fold+message leaf must produce bit-identical folded outputs
     /// and (u_0, u_2) partials to the generic chunk body it replaces on
     /// large rounds (the NT hint changes cache allocation only).
@@ -12790,12 +12734,18 @@ mod tests {
                 )
             })
             .collect();
-        let cols0 = super::super::ring_switch::compose_block_cols(&direct_tables[0], eq_hi[0]);
-        let cols1 = super::super::ring_switch::compose_block_cols(&direct_tables[1], eq_hi[1]);
-        let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-        let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-        let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-        let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+        let cols0 =
+            super::super::ring_switch::compose_block_cols(&direct_tables[0], eq_hi[0]);
+        let mats0_lo =
+            build_row_fold_mats_from_cols(&cols0[..64]);
+        let mats0_hi =
+            build_row_fold_mats_from_cols(&cols0[64..]);
+        let cols1 =
+            super::super::ring_switch::compose_block_cols(&direct_tables[1], eq_hi[1]);
+        let mats1_lo =
+            build_row_fold_mats_from_cols(&cols1[..64]);
+        let mats1_hi =
+            build_row_fold_mats_from_cols(&cols1[64..]);
         let mut got = vec![F128::ZERO; 64];
         let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
         // SAFETY: four exact 512-byte inputs, four complete composed maps,
@@ -12829,7 +12779,6 @@ mod tests {
             assert_eq!(got[slot], expect, "slot {slot}");
         }
     }
-
     #[test]
     fn direct_fold4_gfni_gate_is_ranked_shape_only() {
         assert!(direct_fold4_b_gfni_shape(2, false, 64));

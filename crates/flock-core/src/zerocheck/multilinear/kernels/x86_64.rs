@@ -201,7 +201,6 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
     useful_pairs_inclusive: usize,
     wtab: Option<&[F128]>,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -215,7 +214,6 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Select the odd F128 lanes of eight consecutive eq_lo values.
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
-        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         const B_ONES_BLOCK_PAIRS: usize = 128;
@@ -270,11 +268,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         // Gated to shapes the 8-pair batch loop consumes exhaustively: the
         // scalar tail (and the regfold-off arm) index the cache BY ROW and
         // must never see the residue-major layout.
+        let regfold_on = zc_regfold_enabled();
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_emit = !WRITE
             && use_batch
             && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
+            && regfold_on
             && zc_r2_tr_enabled();
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
@@ -402,9 +401,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // store-forwarding-blocked ZMM loads. The WRITE arm is a
             // straight register copy: chunk order equals row order, and
             // padded pairs' cached rows are already zero (zero raw rows
-            // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
-            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && regfold_on {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
                     // Residue-major cache: a_k for this window is the
@@ -540,23 +538,19 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
-                                )
-                            } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
-                            }
+                            let w64 =
+                                crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                            (
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                    a1, w, w64,
+                                ),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                    a2, w, w64,
+                                ),
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                    a3, w, w64,
+                                ),
+                            )
                         };
                         #[cfg(test)]
                         B_ONES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -590,15 +584,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                            if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
-                            } else {
-                                ghash_mul_x4(w, b0_lane0)
-                            }
+                            let w64 =
+                                crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
+                                b0_lane0, w, w64,
+                            )
                         };
                         acc[1].mul_acc(a1_msg, wb);
                         acc[5].mul_acc(a5_msg, wb);
@@ -627,22 +617,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                 let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                 let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                    (
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                    )
-                } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
-                }
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -905,7 +886,6 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     wtab: Option<&[F128]>,
     nt_out: bool,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -986,7 +966,6 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
-        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         // Input look-ahead, resolved once per worker chunk (never inside the
@@ -1099,22 +1078,13 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                 let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                 let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                 let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                    (
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                    )
-                } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
-                }
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -1221,13 +1191,6 @@ pub(crate) fn zc_fold_defer_enabled() -> bool {
     *ON
 }
 
-/// `FLOCK_NO_ZC_WSPLIT=1` restores the fully-reduced `w·a_k` prescale
-/// multiplies in the round-2 / rounds-3+4 message blocks (exact same-binary
-/// A/B). The split form (`ghash_mul_x4_split` with `w·x^64` hoisted once per
-/// iteration) is field-identical — reduction mod p is a ring homomorphism,
-/// so `a·w = a.lo·w + a.hi·(w·x^64 mod p)` — and replaces the two-stage
-/// recursive reduce on the chain feeding all eight accumulators with one:
-/// 22 CLMUL + 1 shift per iteration instead of 24 + 8.
 /// `FLOCK_NO_ZC_R2_TR_EMIT=1` restores the row-major prefold cache and the
 /// consumer lane transposes in the round-2 message sweep (exact same-binary
 /// A/B; the residue-major emit is a pure reordering of identical values).
@@ -1249,11 +1212,11 @@ pub(crate) fn zc_r2_bcast_enabled() -> bool {
 }
 
 /// `FLOCK_NO_ZC_R34_BCAST=1` restores the plane network of the composed
-/// rounds-3+4 prefold (`gfni_fold64_rows_masked_c4`) in place of the
-/// broadcast factorisation (`gfni_fold64_rows_masked_c4_bcast`). Exact
-/// same-binary A/B: the two emit byte-identical caches from the same 128
-/// affine products, only the data movement differs (76 port-5 shuffles and
-/// 76 XOR-class ops per call against 32 and 64).
+/// rounds-3+4 prefold (`gfni_fold64_rows_masked_c4`) in place of the broadcast
+/// factorisation (`gfni_fold64_rows_masked_c4_bcast`). Exact same-binary A/B:
+/// the two emit byte-identical caches from the same 128 affine products, only
+/// the data movement differs (76 port-5 shuffles and 76 XOR-class ops per call
+/// against 32 and 64).
 pub(crate) fn zc_r34_bcast_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R34_BCAST").is_none());
@@ -1362,11 +1325,6 @@ pub(crate) fn zc_wtab_enabled() -> bool {
     *ON
 }
 
-pub(crate) fn zc_wsplit_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
-    *ON
-}
 
 #[cfg(test)]
 pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
@@ -1760,10 +1718,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let rho12 = rho1 * rho2;
         let r12 = _mm512_broadcast_i32x4(_mm_set_epi64x(rho12.hi as i64, rho12.lo as i64));
         let defer = zc_fold_defer_enabled();
+        let regfold_on = zc_regfold_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
-        let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
 
@@ -1778,7 +1736,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // constant multiplies per output (14 CLMUL per sixteen rows) and the
         // lane transpose they fed both disappear; the composed output is one
         // XOR of four ZMM-strided reads of the residue-major fold.
-        let use_c4 = use_batch && cfold.is_some() && zc_regfold_enabled();
+        let use_c4 = use_batch && cfold.is_some() && regfold_on;
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
@@ -1892,7 +1850,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     _mm512_loadu_si512(ap.add(12).cast::<__m512i>()),
                     _mm512_loadu_si512(bp2.add(12).cast::<__m512i>()),
                 )
-            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| zc_regfold_enabled()) {
+            } else if let Some((fa, fb, cache_base)) = cache.filter(|_| regfold_on) {
                 debug_assert_eq!(cache_base, 4 * xg);
                 let _ = cache_base;
                 let ap = fa.as_ptr();
@@ -2029,22 +1987,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                 let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                 let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                    (
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
-                        crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
-                    )
-                } else {
-                    (
-                        ghash_mul_x4(w, a0),
-                        ghash_mul_x4(w, a1),
-                        ghash_mul_x4(w, a2),
-                        ghash_mul_x4(w, a3),
-                    )
-                }
+                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                (
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
+                )
             };
             acc[0].mul_acc(a1w, b1);
             acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
@@ -2331,7 +2280,6 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
                 _mm512_xor_si512(a15, map_plane(&p, mats1, 15)),
             )
         };
-
         let lo_half = qword_transpose([a0, a1, a2, a3, a4, a5, a6, a7]);
         let hi_half = qword_transpose([a8, a9, a10, a11, a12, a13, a14, a15]);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
@@ -2351,6 +2299,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         }
     }
 }
+
 
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
