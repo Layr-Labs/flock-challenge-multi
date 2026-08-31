@@ -369,6 +369,11 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
 /// later tiles still `loadu` the running acc. Bit-identical to loadu-of-zeros.
 ///
+/// Default: the eight stripe affines of one output byte are issued before
+/// the XOR tree, so GFNI latency is covered by independent `VGF2P8AFFINEQB`.
+/// Same eight affines and four `VPTERNLOG` 0x96 as the pair-step form; only
+/// the issue order changes. `FLOCK_NO_LC_GFNI_TILE4=1` restores pair-step.
+///
 /// # Safety
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
@@ -391,8 +396,62 @@ pub(crate) unsafe fn gfni_fold_tile(
     out_planes_ptr: *mut u8,
     seed_zero: bool,
 ) {
+    // SAFETY: forwarded caller contract; the kill switch is the pair-step body.
+    unsafe {
+        if gfni_tile4_disabled() {
+            gfni_fold_tile_pairs2(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            );
+            return;
+        }
+        gfni_fold_tile_issue8(
+            tile_bytes_ptr,
+            stripe_stride,
+            n_blocks64,
+            mats,
+            out_planes_ptr,
+            seed_zero,
+        );
+    }
+}
+
+/// `FLOCK_NO_LC_GFNI_TILE4=1` restores pair-step affines inside the same
+/// binary. Ranked env is cleared, so the eight-issue body runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline]
+fn gfni_tile4_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LC_GFNI_TILE4").is_some())
+}
+
+/// Incumbent pair-step tile: two affines, then XOR, four times per byte.
+/// Outlined so the ranked eight-issue path does not keep it in I-cache.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_pairs2(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
     use core::arch::x86_64::*;
-    // SAFETY: caller upholds the pointer/length contract above.
+    // SAFETY: same contract as [`gfni_fold_tile`].
     unsafe {
         for block in 0..n_blocks64 {
             let bs = block * 64;
@@ -418,6 +477,80 @@ pub(crate) unsafe fn gfni_fold_tile(
                     );
                     acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
                 }
+                _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
+/// Eight independent stripe affines, then the same four XOR-tree steps.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn gfni_fold_tile_issue8(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: same contract as [`gfni_fold_tile`].
+    unsafe {
+        for block in 0..n_blocks64 {
+            let bs = block * 64;
+            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
+            });
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in 0..16 {
+                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+                let mut acc = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr as *const __m512i)
+                };
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[byte_k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + byte_k] as i64),
+                );
+                let g2 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + byte_k] as i64),
+                );
+                let g3 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + byte_k] as i64),
+                );
+                let g4 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + byte_k] as i64),
+                );
+                let g5 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + byte_k] as i64),
+                );
+                let g6 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + byte_k] as i64),
+                );
+                let g7 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g2, g3);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g4, g5);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g6, g7);
                 _mm512_storeu_si512(plane_ptr, acc);
             }
         }
