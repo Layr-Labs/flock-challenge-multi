@@ -329,9 +329,9 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
 ///
 /// Must be called at the same transcript position as the verifier's
 /// [`flock_core::verifier::verify_claims_ligerito`].
-pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
+pub(crate) fn open_claims_with_precomputed_ligerito<'a, Ch: Challenger>(
     z_packed: Vec<F128>,
-    prover_data: &pcs::ProverData,
+    prover_data: impl Into<pcs::ProverDataView<'a>>,
     commitment: &Commitment,
     claims: &[ZClaim],
     precomputed_s_hat_v: &[Option<&[F128]>],
@@ -350,9 +350,9 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     // short statically-chunked ligerito section loses to E-core stragglers
     // (lig-prove total +4.3 ms). Only the combine is widened, inside
     // `pcs::in_wide_combine_pool` (kill switch FLOCK_NO_OPEN_POOL=1).
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_from_view(
         z_packed,
-        prover_data,
+        prover_data.into(),
         commitment,
         &x_refs,
         precomputed_s_hat_v,
@@ -579,6 +579,11 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
 
+    // Only the ranked block-major identity-C proof consumes the new owner
+    // internally. Public core constructors continue to return Full trees.
+    let retain_cap1 = matches!(&lincheck_input, FastLincheckInput::BlockMajor)
+        && ranked_identity_c_fold_enabled(r1cs);
+
     let ProveCore {
         zc_proof,
         lc_proof,
@@ -599,6 +604,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        retain_cap1,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -663,13 +669,13 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
 /// The generic seam: `prove_fast_ligerito_from_witness` = `prove_fast_core` +
 /// `open_claims([ab, c])`; a relation wrapper (e.g. the hash chain) runs the
 /// same core, derives extra z-claims, and calls `open_claims([ab, c, …])`.
-pub struct ProveCore {
+pub struct ProveCore<Data = pcs::ProverData> {
     pub zc_proof: zerocheck::ZerocheckProof,
     pub lc_proof: lincheck::LincheckProof,
     pub ab: ZClaim,
     pub c: ZClaim,
     pub commitment: Commitment,
-    pub prover_data: pcs::ProverData,
+    pub prover_data: Data,
     pub z_packed: Vec<F128>,
     /// Precomputed `s_hat_v` for the AB claim — derived from lincheck's
     /// pre-sumcheck `z_vec` via [`pcs::ring_switch::s_hat_v_from_z_vec`].
@@ -685,6 +691,35 @@ pub struct ProveCore {
     /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
     /// claim at PCS-open time.
     pub s_hat_v_c: zerocheck::CapturedSHatVC,
+}
+
+impl ProveCore<pcs::OpenProverData> {
+    /// Used only by public core entry points, which explicitly disable cap1
+    /// before committing. Their original Full type and relation API remain.
+    fn into_full(self) -> ProveCore {
+        let ProveCore {
+            zc_proof,
+            lc_proof,
+            ab,
+            c,
+            commitment,
+            prover_data,
+            z_packed,
+            s_hat_v_ab,
+            s_hat_v_c,
+        } = self;
+        ProveCore {
+            zc_proof,
+            lc_proof,
+            ab,
+            c,
+            commitment,
+            prover_data: prover_data.expect_full(),
+            z_packed,
+            s_hat_v_ab,
+            s_hat_v_c,
+        }
+    }
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -830,8 +865,10 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        false,
         challenger,
     )
+    .into_full()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -845,8 +882,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    retain_cap1: bool,
     challenger: &mut Ch,
-) -> ProveCore {
+) -> ProveCore<pcs::OpenProverData> {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         assert_eq!(
             r1cs.layout,
@@ -880,9 +918,14 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     let ((commitment, prover_data), ab_inner) = if let Some(ab_inner) = ab_inner {
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
-            let r = match prefaulted_codeword {
-                Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-                None => pcs::commit(&z_packed, pcs_params),
+            let r = if retain_cap1 {
+                pcs::commit_for_open(&z_packed, pcs_params, prefaulted_codeword)
+            } else {
+                let (commitment, full) = match prefaulted_codeword {
+                    Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+                    None => pcs::commit(&z_packed, pcs_params),
+                };
+                (commitment, pcs::OpenProverData::Full(full))
             };
             flock_core::gaptime::mark("commit: work done");
             r
@@ -904,7 +947,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             r
         });
         flock_core::gaptime::mark("commit: pool exited");
-        r
+        let ((commitment, full), ab_inner) = r;
+        ((commitment, pcs::OpenProverData::Full(full)), ab_inner)
     };
     bind_statement(challenger, r1cs, &commitment);
     flock_core::gaptime::mark("bind_statement done");

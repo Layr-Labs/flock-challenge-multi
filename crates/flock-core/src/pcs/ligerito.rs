@@ -32,7 +32,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
-use crate::merkle::{self, Hash, HashKind};
+use crate::merkle::{self, Hash, HashKind, MerkleTreeView};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
@@ -7296,7 +7296,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         b_initial,
         target,
         l0_codeword,
-        l0_tree,
+        MerkleTreeView::Full(l0_tree),
         None,
         None,
         None,
@@ -7334,7 +7334,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         b_initial,
         target,
         l0_codeword,
-        l0_tree,
+        MerkleTreeView::Full(l0_tree),
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7374,7 +7374,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         ordinary_basis,
         target,
         l0_codeword,
-        l0_tree,
+        MerkleTreeView::Full(l0_tree),
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7422,7 +7422,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         ordinary_basis,
         target,
         l0_codeword,
-        l0_tree,
+        MerkleTreeView::Full(l0_tree),
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7467,7 +7467,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         ordinary_basis,
         target,
         l0_codeword,
-        l0_tree,
+        MerkleTreeView::Full(l0_tree),
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7486,13 +7486,13 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn recursive_prover_with_basis_impl<Ch: Challenger>(
+pub(super) fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
     l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_tree: MerkleTreeView<'_>,
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
@@ -7535,7 +7535,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
-    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
+    l0_tree.validate(block_len_0, num_interleaved_0 * 16, config.merkle_hash);
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
@@ -7553,7 +7553,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // L0 codeword + tree are borrowed (reused from upstream `pcs::commit`).
     // wtns_0 access reduces to: root (last tree node), row(q), block_len.
-    let initial_root: Hash = l0_tree[l0_tree.len() - 1];
+    let initial_root: Hash = l0_tree.root();
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
     let l0_row = |q: usize| -> &[F128] {
@@ -7931,7 +7931,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> =
         gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = match l0_tree {
+        MerkleTreeView::Full(tree) => merkle_multi_proof_for(tree, l0_block_len, &queries_0),
+        MerkleTreeView::ParentsOnly {
+            nodes, num_leaves, ..
+        } => {
+            // SAFETY: the complete committed codeword is retained and only
+            // borrowed throughout this opening; F128 has 16 unpadded bytes.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    l0_codeword.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(l0_codeword),
+                )
+            };
+            merkle::merkle_multi_proof_parents_only(
+                nodes,
+                num_leaves,
+                bytes,
+                &queries_0,
+                serial_par_enabled(),
+            )
+        }
+    };
     if trace {
         t_opens += _t.elapsed();
     }

@@ -27,7 +27,8 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
+    Commitment, OpenProverData, PcsParams, ProverData, ProverDataView, commit, commit_for_open,
+    commit_into, prefault_codeword_during,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -137,6 +138,34 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_from_view(
+        packed_witness,
+        prover_data.into(),
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        challenger,
+    )
+}
+
+/// Internal cross-crate opening seam for explicitly retained L0 storage.
+/// The ordinary public entry above still accepts only full `ProverData`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_from_view<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: ProverDataView<'_>,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
@@ -192,70 +221,70 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
-        ligerito::recursive_prover_with_basis_direct_fold8(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
-            combined.round0_prime,
-            fold_arena,
-            challenger,
-        )
+    // Preserve each existing wrapper's argument selection and shape check.
+    // Only the common implementation accepts an explicit L0 storage view;
+    // the five existing Ligerito wrappers retain their full-slice contract.
+    let (round1, round2, round3, direct2, direct4, direct8) = if let Some(direct) = combined.direct_fold8 {
+        assert_eq!(
+            lig_config.initial_k, 6,
+            "direct-fold8 scaffold requires initial_k=6"
+        );
+        (None, None, None, None, None, Some(direct))
     } else if let Some(direct) = combined.direct_fold4 {
-        ligerito::recursive_prover_with_basis_direct_fold4(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct-fold4 requires round-1 lookahead"),
-            combined
-                .round2_lookahead
-                .expect("direct-fold4 requires round-2 lookahead"),
-            combined
-                .round3_lookahead
-                .expect("direct-fold4 requires round-3 lookahead"),
-            fold_arena,
-            challenger,
+        assert!(
+            lig_config.initial_k >= 4,
+            "direct-fold4 scaffold requires initial_k >= 4"
+        );
+        (
+            Some(
+                combined.round1_lookahead.expect("direct-fold4 requires round-1 lookahead"),
+            ),
+            Some(
+                combined.round2_lookahead.expect("direct-fold4 requires round-2 lookahead"),
+            ),
+            Some(
+                combined.round3_lookahead.expect("direct-fold4 requires round-3 lookahead"),
+            ),
+            None,
+            Some(direct),
+            None,
         )
     } else if let Some(direct) = combined.direct_fold2 {
-        ligerito::recursive_prover_with_basis_direct_ab_fold2(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct AB fold2 requires round-1 lookahead"),
-            fold_arena,
-            challenger,
+        (
+            Some(
+                combined.round1_lookahead.expect("direct AB fold2 requires round-1 lookahead"),
+            ),
+            None,
+            None,
+            Some(direct),
+            None,
+            None,
         )
     } else {
-        ligerito::recursive_prover_with_basis_precomputed_round0(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            combined.target_combined,
-            &prover_data.codeword,
-            &prover_data.merkle_tree,
-            combined.round0_prime,
-            fold_arena,
-            challenger,
-        )
+        (None, None, None, None, None, None)
     };
+    let ligerito_proof = ligerito::recursive_prover_with_basis_impl(
+        lig_config,
+        packed_witness,
+        combined.b_combined,
+        combined.target_combined,
+        prover_data.codeword,
+        prover_data.tree,
+        Some(ligerito::SumcheckMessage {
+            u_0: combined.round0_prime.0,
+            u_2: combined.round0_prime.1,
+        }),
+        round1,
+        round2,
+        round3,
+        None,
+        None,
+        direct2,
+        direct4,
+        direct8,
+        fold_arena,
+        challenger,
+    );
     crate::gaptime::mark("open: ligerito recursive prover done");
     if trace {
         eprintln!(

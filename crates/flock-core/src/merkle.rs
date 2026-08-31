@@ -53,6 +53,49 @@ pub type Hash = [u8; 32];
 
 pub use crate::hash::HashKind;
 
+/// Borrowed L0 storage. `ParentsOnly` is the exact suffix `full[num_leaves..]`,
+/// never a full tree with a shorter length. Recursive trees remain `Full`.
+#[derive(Clone, Copy)]
+pub(crate) enum MerkleTreeView<'a> {
+    Full(&'a [Hash]),
+    ParentsOnly {
+        nodes: &'a [Hash],
+        num_leaves: usize,
+        leaf_size: usize,
+        kind: HashKind,
+    },
+}
+
+impl MerkleTreeView<'_> {
+    pub(crate) fn validate(self, num_leaves: usize, leaf_size: usize, kind: HashKind) {
+        assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+        match self {
+            Self::Full(nodes) => assert_eq!(nodes.len(), 2 * num_leaves - 1),
+            Self::ParentsOnly {
+                nodes,
+                num_leaves: stored_leaves,
+                leaf_size: stored_size,
+                kind: stored_kind,
+            } => {
+                assert_eq!(num_leaves, 1 << 20);
+                assert_eq!(stored_leaves, num_leaves);
+                assert_eq!(leaf_size, 1024);
+                assert_eq!(stored_size, leaf_size);
+                assert_eq!(kind, HashKind::Blake3);
+                assert_eq!(stored_kind, kind);
+                assert_eq!(nodes.len(), num_leaves - 1);
+            }
+        }
+    }
+
+    pub(crate) fn root(self) -> Hash {
+        let nodes = match self {
+            Self::Full(nodes) | Self::ParentsOnly { nodes, .. } => nodes,
+        };
+        *nodes.last().expect("validated nonempty Merkle storage")
+    }
+}
+
 #[cfg(any(
     all(target_arch = "aarch64", target_feature = "sha2"),
     all(target_arch = "x86_64", target_feature = "sha")
@@ -956,6 +999,86 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     }
 
     indices
+}
+
+/// Open the cap1 representation in the incumbent canonical sibling order.
+/// Only missing leaf CVs are recomputed; every parent is read from its stored
+/// suffix index. Inputs are the unchanged committed codeword, not opened rows
+/// (which generally do not include the missing sibling leaves).
+pub(crate) fn merkle_multi_proof_parents_only(
+    nodes: &[Hash],
+    num_leaves: usize,
+    codeword_bytes: &[u8],
+    positions: &[usize],
+    parallel: bool,
+) -> Vec<Hash> {
+    const LEAF_BYTES: usize = 1024;
+    assert_eq!(num_leaves, 1 << 20);
+    assert_eq!(nodes.len(), num_leaves - 1);
+    assert_eq!(codeword_bytes.len(), num_leaves * LEAF_BYTES);
+    assert!(positions.iter().all(|&p| p < num_leaves));
+    let indices = merkle_multi_proof_sibling_indices(num_leaves, positions);
+    // The index helper emits bottom-up, so missing leaf siblings form a
+    // prefix. Its sort/dedup and paired-active handling are unchanged.
+    let missing = indices.partition_point(|&i| i < num_leaves);
+    let stored = |&i: &usize| {
+        if i < num_leaves {
+            [0u8; 32]
+        } else {
+            nodes[i - num_leaves]
+        }
+    };
+    // Preserve the existing gather's threshold and chunk size. Only the
+    // small missing-leaf prefix is zero-initialized before hash_many writes it.
+    let mut proof: Vec<Hash> = if parallel && indices.len() >= 512 {
+        indices.par_iter().with_min_len(64).map(stored).collect()
+    } else {
+        indices.iter().map(stored).collect()
+    };
+    if missing == 0 {
+        return proof;
+    }
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(missing as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add((missing * 16) as u64, Relaxed);
+    }
+    let plat = blake3_platform();
+    for (outs, leaf_indices) in proof[..missing]
+        .chunks_mut(BLAKE3_BATCH)
+        .zip(indices[..missing].chunks(BLAKE3_BATCH))
+    {
+        // Each batch is nonempty, including the final partial batch. Unused
+        // pointer slots hold a valid first reference and are not passed on.
+        let first_at = leaf_indices[0] * LEAF_BYTES;
+        let first: &[u8; LEAF_BYTES] = codeword_bytes[first_at..first_at + LEAF_BYTES]
+            .try_into()
+            .expect("one committed leaf");
+        let mut inputs = [first; BLAKE3_BATCH];
+        for (slot, &i) in inputs.iter_mut().zip(leaf_indices) {
+            let at = i * LEAF_BYTES;
+            *slot = codeword_bytes[at..at + LEAF_BYTES]
+                .try_into()
+                .expect("one committed leaf");
+        }
+        // SAFETY: initialized Hash outputs are contiguous unpadded 32-byte
+        // arrays. hash_many writes precisely one CV for each input reference.
+        let out_bytes = unsafe {
+            core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), outs.len() * 32)
+        };
+        plat.hash_many(
+            &inputs[..outs.len()],
+            &BLAKE3_IV,
+            0,
+            blake3::IncrementCounter::No,
+            0,
+            BLAKE3_CHUNK_START,
+            BLAKE3_CHUNK_END,
+            out_bytes,
+        );
+    }
+    proof
 }
 
 /// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].

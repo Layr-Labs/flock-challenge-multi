@@ -167,6 +167,79 @@ impl Drop for ProverData {
     }
 }
 
+/// Explicit storage for the fast commit/open seam. The public `commit` and
+/// `commit_into` APIs still return the original full-tree `ProverData`.
+#[doc(hidden)]
+pub enum OpenProverData {
+    Full(ProverData),
+    ParentsOnly(ParentsOnlyProverData),
+}
+
+/// The omitted leaf CVs are recoverable only from this owner's unchanged
+/// codeword. No cap content is reused across proofs.
+#[doc(hidden)]
+pub struct ParentsOnlyProverData {
+    codeword: Vec<F128>,
+    nodes: Vec<Hash>,
+    num_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+}
+
+impl Drop for ParentsOnlyProverData {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        give_tree(std::mem::take(&mut self.nodes));
+    }
+}
+
+/// Borrowed inputs for the shared opening implementation. Neither variant
+/// coerces a cap into a full-tree slice.
+#[derive(Clone, Copy)]
+#[doc(hidden)]
+pub struct ProverDataView<'a> {
+    pub(crate) codeword: &'a [F128],
+    pub(crate) tree: merkle::MerkleTreeView<'a>,
+}
+
+impl<'a> From<&'a ProverData> for ProverDataView<'a> {
+    fn from(data: &'a ProverData) -> Self {
+        Self {
+            codeword: &data.codeword,
+            tree: merkle::MerkleTreeView::Full(&data.merkle_tree),
+        }
+    }
+}
+
+impl<'a> From<&'a OpenProverData> for ProverDataView<'a> {
+    fn from(data: &'a OpenProverData) -> Self {
+        match data {
+            OpenProverData::Full(full) => full.into(),
+            OpenProverData::ParentsOnly(cap) => Self {
+                codeword: &cap.codeword,
+                tree: merkle::MerkleTreeView::ParentsOnly {
+                    nodes: &cap.nodes,
+                    num_leaves: cap.num_leaves,
+                    leaf_size: cap.leaf_size,
+                    kind: cap.kind,
+                },
+            },
+        }
+    }
+}
+
+impl OpenProverData {
+    /// Public core constructors request Full explicitly before reaching this
+    /// adapter. Never reconstruct or silently reinterpret a cap here.
+    #[doc(hidden)]
+    pub fn expect_full(self) -> ProverData {
+        match self {
+            Self::Full(full) => full,
+            Self::ParentsOnly(_) => panic!("full-tree core received retained parent storage"),
+        }
+    }
+}
+
 /// Commit to a witness in **F_{2^128}-packed** form (polynomial basis: bit
 /// `r` of `z_packed[i]` = logical bit `i·128 + r`).
 ///
@@ -218,6 +291,224 @@ pub fn commit_into(
     );
 
     finalize_commit(codeword, z_packed, params)
+}
+
+/// Internal cross-crate seam for a proof that opens its retained L0 itself.
+/// All ineligible shapes and diagnostic schedules use the unchanged Full
+/// commit. An optional resident codeword keeps the old allocation lifecycle.
+#[doc(hidden)]
+pub fn commit_for_open(
+    z_packed: &[F128],
+    params: &PcsParams,
+    codeword: Option<Vec<F128>>,
+) -> (Commitment, OpenProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword = codeword.unwrap_or_else(|| crate::scratch::take_f128(params.codeword_len_f128()));
+    assert_eq!(codeword.len(), params.codeword_len_f128());
+    if merkle_cap1_enabled(params) {
+        finalize_commit_cap1(codeword, z_packed, params)
+    } else {
+        let (commitment, full) = commit_into(z_packed, params, codeword);
+        (commitment, OpenProverData::Full(full))
+    }
+}
+
+fn merkle_cap1_enabled(params: &PcsParams) -> bool {
+    // These are precisely the 2048-leaf subgroups / sixteen 128-leaf
+    // callbacks inspected in the deep block-fused producer and its FIFO
+    // sibling queue. The callback also checks completion before regrouping.
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        [
+            "FLOCK_NO_MERKLE_CAP1",
+            "FLOCK_NO_NTT_DEEP_BLOCK_FUSE",
+            "FLOCK_NO_NTT_KERNEL_DIET",
+            "FLOCK_NO_NTT_FUSED3",
+            "FLOCK_NTT_SUBGROUP_LOG",
+            "FLOCK_NO_NTT_DEEP_SPLIT",
+            "FLOCK_NTT_DEEP_SPLIT_DEPTH",
+            "FLOCK_NO_NTT_TOP_FUSION",
+            "FLOCK_NO_NTT_SEED_TOP_FUSION",
+            "FLOCK_NO_RATE_HALF_SEED",
+            // Preserve the original timing instrumentation by selecting
+            // Full whenever that diagnostic is requested.
+            "FLOCK_COMMIT_TIMING",
+        ]
+        .iter()
+        .all(|name| std::env::var_os(name).is_none())
+    });
+    cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "pclmulqdq",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )) && params.m == 32
+        && params.log_batch_size == 6
+        && params.log_inv_rate == 1
+        && params.profile == crate::pcs::ligerito::LigeritoProfile::Fast
+        && params.merkle_hash == HashKind::Blake3
+        && params.n_leaves() == (1 << 20)
+        && params.leaf_size_bytes() == 1024
+        // The current n_top heuristic stays at 9 through 512 threads when
+        // the subgroup override is absent. Larger pools retain Full.
+        && rayon::current_num_threads() <= 512
+        && subtree_parents_enabled()
+        && subtree_parent_regroup_enabled(1 << 20, 64, 1024, HashKind::Blake3)
+        && !crate::gpu::merkle::available()
+        && *ON
+}
+
+fn finalize_commit_cap1(
+    mut codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+) -> (Commitment, OpenProverData) {
+    use std::sync::atomic::{AtomicBool, AtomicU16};
+    const LEAVES: usize = 1 << 20;
+    const LANES: usize = 64;
+    const LEAF_BYTES: usize = 1024;
+    const BLOCK: usize = RANKED_PARENT_BLOCK_LEAVES;
+    const SUBGROUP: usize = RANKED_PARENT_SUBGROUP_LEAVES;
+    let kind = HashKind::Blake3;
+    let ntt = AdditiveNttF128::standard(params.k_code());
+    let mut nodes = take_tree(LEAVES - 1);
+    let node_addr = nodes.as_mut_ptr() as usize;
+    let completed: [AtomicU16; LEAVES / SUBGROUP] =
+        std::array::from_fn(|_| AtomicU16::new(0));
+    let failed = AtomicBool::new(false);
+
+    // This uses the same encoder/callback seam and the same ambient pool as
+    // Full. It does not wrap the entire encode in a different Rayon install.
+    ntt.rs_encode_interleaved_on_range_done(
+        z_packed,
+        &mut codeword,
+        LANES,
+        &|range, sub_data| {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
+            if range.start >= range.end
+                || range.end > LEAVES
+                || range.len() != BLOCK
+                || !range.start.is_multiple_of(BLOCK)
+                || sub_data.len() != BLOCK * LANES
+            {
+                failed.store(true, Ordering::Release);
+                return;
+            }
+            // A fully initialized private 4 KiB buffer: no reference to
+            // uninitialized Hash/u8 storage is introduced for this scratch.
+            // Its zero fill is at most another 32 MiB of writes per proof.
+            let mut leaves = [[0u8; 32]; BLOCK];
+            // SAFETY: the encoder supplies final, initialized F128 rows for
+            // this disjoint range. F128 has no padding and occupies 16 bytes.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(sub_data.as_ptr().cast::<u8>(), BLOCK * LEAF_BYTES)
+            };
+            merkle::hash_leaves_serial(bytes, LEAF_BYTES, &mut leaves, kind);
+            // SAFETY: the callback contract supplies disjoint ranges once.
+            // Each aligned 128-leaf range owns 64 distinct first-parent
+            // slots, all inside the retained `full[LEAVES..]` suffix.
+            let parents = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (node_addr as *mut Hash).add(range.start / 2),
+                    BLOCK / 2,
+                )
+            };
+            merkle::hash_pairs_level_serial(&leaves, parents, kind);
+
+            let subgroup = range.start / SUBGROUP;
+            let block = (range.start % SUBGROUP) / BLOCK;
+            let bit = 1u16 << block;
+            let previous = completed[subgroup].fetch_or(bit, Ordering::AcqRel);
+            // The default same-worker loop and sibling FIFO complete these
+            // blocks in order. A different order is rejected before reading
+            // any other block's parents; the post-join path rebuilds Full.
+            if previous != bit - 1 {
+                failed.store(true, Ordering::Release);
+                return;
+            }
+            let Some(parent_range) = local_parent_fold_range(&range, true) else {
+                return;
+            };
+            // The acquire RMW observed all fifteen prior release RMWs and
+            // their complete first-parent writes. A subgroup's higher levels
+            // are disjoint from every other subgroup and from the first level.
+            let mut read_off = parent_range.start / 2;
+            let mut read_len = SUBGROUP / 2;
+            for level in 2..=11 {
+                let level_nodes = LEAVES >> level;
+                let write_off = LEAVES - 2 * level_nodes + (parent_range.start >> level);
+                let write_len = SUBGROUP >> level;
+                // SAFETY: lower levels have been written above; the source
+                // and destination levels do not overlap. Subgroups own
+                // disjoint node ranges at every retained level.
+                let (read, write) = unsafe {
+                    (
+                        core::slice::from_raw_parts(
+                            (node_addr as *const Hash).add(read_off),
+                            read_len,
+                        ),
+                        core::slice::from_raw_parts_mut(
+                            (node_addr as *mut Hash).add(write_off),
+                            write_len,
+                        ),
+                    )
+                };
+                merkle::hash_pairs_level_serial(read, write, kind);
+                read_off = write_off;
+                read_len = write_len;
+            }
+        },
+    );
+
+    // On normal return, all callbacks and sibling queues have joined before
+    // any rebuild or recycle. Missing/unexpected ranges never return a
+    // partial cap. An encoder/callback panic keeps the incumbent join/unwind
+    // behavior; this path does not catch a panic and claim a recovered proof.
+    if failed.load(Ordering::Acquire)
+        || completed
+            .iter()
+            .any(|mask| mask.load(Ordering::Acquire) != u16::MAX)
+    {
+        give_tree(nodes);
+        let mut full = take_tree(2 * LEAVES - 1);
+        // SAFETY: encoding has completed every codeword row, independently
+        // of whether a callback accepted its range.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(codeword.as_ptr().cast::<u8>(), LEAVES * LEAF_BYTES)
+        };
+        merkle::fill_merkle_tree(&mut full, bytes, LEAVES, kind);
+        let root = full[2 * LEAVES - 2];
+        return (
+            Commitment {
+                root,
+                params: params.clone(),
+            },
+            OpenProverData::Full(ProverData {
+                codeword,
+                merkle_tree: full,
+            }),
+        );
+    }
+    // Treat the suffix as an upper tree with LEAVES/2 leaves. Its 512
+    // subgroup roots are exactly the same roots used by the Full path.
+    build_upper_levels(&mut nodes, LEAVES / 2, LEAVES / SUBGROUP, kind);
+    let root = nodes[LEAVES - 2];
+    (
+        Commitment {
+            root,
+            params: params.clone(),
+        },
+        OpenProverData::ParentsOnly(ParentsOnlyProverData {
+            codeword,
+            nodes,
+            num_leaves: LEAVES,
+            leaf_size: LEAF_BYTES,
+            kind,
+        }),
+    )
 }
 
 /// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
