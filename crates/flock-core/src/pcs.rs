@@ -192,7 +192,31 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
+    let direct_fold8_active = combined.direct_fold8.is_some();
+    // The compact L0 representation is consumed directly by the ranked
+    // Fold8 path. Retain an exact full-tree reconstruction only for an
+    // unexpected fallback dispatcher, rather than allowing a diagnostic path
+    // to interpret compact offsets as a conventional flat tree.
+    let fallback_l0_tree = (prover_data.l0_tree_omits_leaves && !direct_fold8_active).then(|| {
+        commit::expand_l0_merkle_cut_for_fallback(
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            &commitment.params,
+        )
+    });
+    let full_l0_tree = fallback_l0_tree
+        .as_deref()
+        .unwrap_or(&prover_data.merkle_tree);
     let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
+        let l0_cut = prover_data.l0_tree_omits_leaves.then_some(ligerito::L0MerkleCut {
+            upper_tree: &prover_data.merkle_tree,
+            kind: commitment.params.merkle_hash,
+        });
+        let l0_tree: &[crate::merkle::Hash] = if l0_cut.is_some() {
+            &[]
+        } else {
+            full_l0_tree
+        };
         ligerito::recursive_prover_with_basis_direct_fold8(
             lig_config,
             packed_witness,
@@ -200,7 +224,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             direct,
             combined.target_combined,
             &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            l0_tree,
+            l0_cut,
             combined.round0_prime,
             fold_arena,
             challenger,
@@ -213,7 +238,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             direct,
             combined.target_combined,
             &prover_data.codeword,
-            &prover_data.merkle_tree,
+            full_l0_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -235,7 +260,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             direct,
             combined.target_combined,
             &prover_data.codeword,
-            &prover_data.merkle_tree,
+            full_l0_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -250,7 +275,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             combined.target_combined,
             &prover_data.codeword,
-            &prover_data.merkle_tree,
+            full_l0_tree,
             combined.round0_prime,
             fold_arena,
             challenger,

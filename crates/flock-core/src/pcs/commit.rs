@@ -154,6 +154,9 @@ pub struct Commitment {
 pub struct ProverData {
     pub codeword: Vec<F128>,
     pub merkle_tree: Vec<Hash>,
+    /// Ranked L0 stores only original internal nodes; leaf hashes are
+    /// regenerated from `codeword` for the small opening multiproof.
+    pub l0_tree_omits_leaves: bool,
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
@@ -282,9 +285,14 @@ fn finalize_commit(
                 ProverData {
                     codeword,
                     merkle_tree,
+                    l0_tree_omits_leaves: false,
                 },
             );
         }
+    }
+
+    if l0_merkle_cut_enabled(params) {
+        return finalize_commit_l0_merkle_cut(codeword, z_packed, params, &ntt, timing);
     }
 
     // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
@@ -450,8 +458,173 @@ fn finalize_commit(
         ProverData {
             codeword,
             merkle_tree,
+            l0_tree_omits_leaves: false,
         },
     )
+}
+
+/// Ranked L0 commit with the reconstructible leaf-CV level omitted.
+///
+/// The conventional flat tree is `[leaves | internal levels]`. This version
+/// stores exactly its internal suffix: original tree index `i >= n_leaves`
+/// lives at compact index `i - n_leaves`. The codeword stays live through L0
+/// opening, so the small set of leaf siblings needed there can be regenerated
+/// on demand. Commit-side pairing remains the full-tree operation: leaf CVs
+/// are formed in adjacent pairs and immediately fed to the normal parent
+/// compressor.
+fn finalize_commit_l0_merkle_cut(
+    mut codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+    ntt: &AdditiveNttF128,
+    timing: bool,
+) -> (Commitment, ProverData) {
+    let n_leaves = params.n_leaves();
+    let kind = params.merkle_hash;
+    let leaf_size = params.leaf_size_bytes();
+    let num_ntts = params.num_ntts();
+    debug_assert!(l0_merkle_cut_selected(n_leaves, num_ntts, leaf_size, kind, false));
+
+    let mut merkle_tree: Vec<Hash> = take_tree(n_leaves - 1);
+    let tree_addr = merkle_tree.as_mut_ptr() as usize;
+    let subtree_parents = subtree_parents_enabled();
+    let regroup_subtree_parents =
+        subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
+    let local_levels = AtomicUsize::new(usize::MAX);
+
+    let t_ntt = std::time::Instant::now();
+    ntt.rs_encode_interleaved_on_range_done(
+        z_packed,
+        &mut codeword,
+        num_ntts,
+        &|range, sub_data| {
+            debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
+            debug_assert!(range.start.is_multiple_of(2));
+            debug_assert!(range.len().is_multiple_of(2));
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    sub_data.as_ptr() as *const u8,
+                    sub_data.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (tree_addr as *mut Hash).add(range.start >> 1),
+                    range.len() >> 1,
+                )
+            };
+            merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
+
+            if !subtree_parents {
+                return;
+            }
+            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
+            else {
+                return;
+            };
+            let len = parent_range.len();
+            let depth = if len.is_power_of_two()
+                && len >= 2
+                && parent_range.start % len == 0
+                && n_leaves % len == 0
+            {
+                len.trailing_zeros() as usize
+            } else {
+                0
+            };
+            let seen = match local_levels.compare_exchange(
+                usize::MAX,
+                depth,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => depth,
+                Err(prev) => prev,
+            };
+            if seen != depth {
+                local_levels.store(0, Ordering::Release);
+            }
+            if depth <= 1 || seen == 0 {
+                return;
+            }
+
+            // Original level one is compact level zero. Every higher original
+            // flat offset is exactly `n_leaves` beyond the compact offset.
+            let mut lvl_read_off = parent_range.start >> 1;
+            let mut lvl_read_len = len >> 1;
+            for j in 2..=depth {
+                let nodes_j = n_leaves >> j;
+                let write_off = n_leaves - 2 * nodes_j + (parent_range.start >> j);
+                let write_len = len >> j;
+                let (read, write) = unsafe {
+                    (
+                        core::slice::from_raw_parts(
+                            (tree_addr as *const Hash).add(lvl_read_off),
+                            lvl_read_len,
+                        ),
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(write_off),
+                            write_len,
+                        ),
+                    )
+                };
+                merkle::hash_pairs_level_serial(read, write, kind);
+                lvl_read_off = write_off;
+                lvl_read_len = write_len;
+            }
+        },
+    );
+    if timing {
+        eprintln!("[commit-timing] l0-cut ntt: {:.2} ms", t_ntt.elapsed().as_secs_f64() * 1e3);
+    }
+
+    let folded = match local_levels.load(Ordering::Acquire) {
+        usize::MAX | 0 => 0,
+        d => d,
+    };
+    let compact_leaves = n_leaves >> 1;
+    let from_nodes = if folded == 0 {
+        compact_leaves
+    } else {
+        compact_leaves >> (folded - 1)
+    };
+    build_upper_levels(&mut merkle_tree, compact_leaves, from_nodes, kind);
+    let root = merkle_tree[n_leaves - 2];
+
+    (
+        Commitment {
+            root,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+            l0_tree_omits_leaves: true,
+        },
+    )
+}
+
+/// Restore the conventional L0 flat tree only for an unexpected opening path
+/// that cannot consume [`ProverData::l0_tree_omits_leaves`] directly.  The
+/// ranked direct-fold8 path never calls this; it is a correctness fallback for
+/// a changed dispatcher or diagnostic configuration.
+pub(crate) fn expand_l0_merkle_cut_for_fallback(
+    codeword: &[F128],
+    upper_tree: &[Hash],
+    params: &PcsParams,
+) -> Vec<Hash> {
+    let n_leaves = params.n_leaves();
+    assert_eq!(upper_tree.len(), n_leaves - 1);
+    let mut full = crate::alloc_uninit_vec(2 * n_leaves - 1);
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
+    merkle::hash_leaves(bytes, params.leaf_size_bytes(), &mut full[..n_leaves], params.merkle_hash);
+    full[n_leaves..].copy_from_slice(upper_tree);
+    full
 }
 
 // ---------------------------------------------------------------------------
@@ -537,14 +710,15 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
 
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
-    // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
-    // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
-    if tree.capacity() < (1 << 16) {
+    // Floor at 2^15 nodes (~1 MiB) so the ranked compact L2 Ligerito suffix
+    // (2^16 leaves, 65535 internal nodes) is recycled alongside compact L0
+    // and L1 instead of being unmapped after every untimed/timed handoff.
+    if tree.capacity() < (1 << 15) {
         return;
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {
-        // Cap 3: ranked L0 (64 MiB) + L1 (16 MiB) + L2 (4 MiB) all park
+        // Cap 3: ranked compact L0 (32 MiB) + L1 (8 MiB) + L2 (2 MiB) all park
         // after untimed warmup; the timed prove takes all three without
         // a fresh mmap/fault. Trees are sequential (L_i dropped before
         // L_{i+1} is committed), so at most three are ever parked at once.
@@ -657,6 +831,38 @@ pub(crate) fn subtree_parents_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none());
     *ON
+}
+
+/// The ranked L0 source keeps the codeword through opening, but a full tree
+/// also retains one 32 MiB leaf-CV level that can be regenerated only for the
+/// queried siblings. Keep this representation narrow: recursive commits and
+/// all test geometries retain the conventional flat `2n-1` tree.
+#[inline]
+fn l0_merkle_cut_selected(
+    n_leaves: usize,
+    num_ntts: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    disabled: bool,
+) -> bool {
+    !cfg!(test)
+        && !disabled
+        && n_leaves == (1 << 20)
+        && num_ntts == 64
+        && leaf_size == 1024
+        && kind == HashKind::Blake3
+}
+
+fn l0_merkle_cut_enabled(params: &PcsParams) -> bool {
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_L0_MERKLE_CUT").is_some());
+    l0_merkle_cut_selected(
+        params.n_leaves(),
+        params.num_ntts(),
+        params.leaf_size_bytes(),
+        params.merkle_hash,
+        *DISABLED,
+    )
 }
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
@@ -806,6 +1012,107 @@ pub(crate) fn fused_encode_leaves_subtree(
             // SAFETY: read = this worker's own just-written nodes of level
             // j−1; write = this worker's own disjoint slice of level j; both
             // inside the 2·n_leaves−1 tree, never aliasing.
+            let (read, write) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        (tree_addr as *const Hash).add(lvl_read_off),
+                        lvl_read_len,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        (tree_addr as *mut Hash).add(write_off),
+                        write_len,
+                    ),
+                )
+            };
+            merkle::hash_pairs_level_serial(read, write, kind);
+            lvl_read_off = write_off;
+            lvl_read_len = write_len;
+        }
+    });
+    match local_levels.load(Ordering::Acquire) {
+        usize::MAX | 0 => 0,
+        d => d,
+    }
+}
+
+/// The compact counterpart of [`fused_encode_leaves_subtree`].  It retains
+/// only the internal suffix of the Merkle tree: original leaf siblings can be
+/// regenerated from the still-live codeword when the opening is assembled.
+///
+/// The first compact level is the original tree's level one, so leaf pairs
+/// are compressed directly into it.  All subsequent offsets are the original
+/// flat-tree offsets minus `n_leaves`.
+#[allow(
+    clippy::manual_is_multiple_of,
+    clippy::manual_slice_size_calculation,
+    clippy::too_many_arguments
+)]
+pub(crate) fn fused_encode_leaves_subtree_compact(
+    ntt: &AdditiveNttF128,
+    msg: &[F128],
+    codeword: &mut [F128],
+    num_ntts: usize,
+    tree: &mut [Hash],
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+) -> usize {
+    debug_assert_eq!(codeword.len(), n_leaves * num_ntts);
+    debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
+    debug_assert_eq!(tree.len(), n_leaves - 1);
+    let tree_addr = tree.as_mut_ptr() as usize;
+    let subtree_parents = subtree_parents_enabled();
+    let local_levels = AtomicUsize::new(usize::MAX);
+    ntt.rs_encode_interleaved_on_range_done(msg, codeword, num_ntts, &|range, sub_data| {
+        debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
+        debug_assert!(range.start.is_multiple_of(2));
+        debug_assert!(range.len().is_multiple_of(2));
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                sub_data.as_ptr() as *const u8,
+                sub_data.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(
+                (tree_addr as *mut Hash).add(range.start >> 1),
+                range.len() >> 1,
+            )
+        };
+        merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
+
+        if !subtree_parents {
+            return;
+        }
+        let len = range.len();
+        let depth =
+            if len.is_power_of_two() && len >= 2 && range.start % len == 0 && n_leaves % len == 0 {
+                len.trailing_zeros() as usize
+            } else {
+                0
+            };
+        let seen = match local_levels.compare_exchange(
+            usize::MAX,
+            depth,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => depth,
+            Err(prev) => prev,
+        };
+        if seen != depth {
+            local_levels.store(0, Ordering::Release);
+        }
+        if depth <= 1 || seen == 0 {
+            return;
+        }
+
+        let mut lvl_read_off = range.start >> 1;
+        let mut lvl_read_len = len >> 1;
+        for j in 2..=depth {
+            let nodes_j = n_leaves >> j;
+            let write_off = n_leaves - 2 * nodes_j + (range.start >> j);
+            let write_len = len >> j;
             let (read, write) = unsafe {
                 (
                     core::slice::from_raw_parts(
@@ -1771,7 +2078,7 @@ mod tests {
     /// buffer, not steal the large one (L1 must not evict L0).
     #[test]
     fn tree_pool_smallest_fit_reuses_matching_buffer() {
-        // Both sizes clear give_tree's 1<<18-node (8 MiB) floor.
+        // Both sizes clear give_tree's 1<<15-node (1 MiB) floor.
         let n_small = 1 << 18;
         let n_large = 1 << 19;
         {
@@ -1809,20 +2116,19 @@ mod tests {
         }
     }
 
-    /// TREE_POOL cap 3 + lowered floor: the ranked L2 Ligerito tree
-    /// (2^16 leaves → 2·2^16−1 = 131071 nodes, ~4 MiB) must now be parked
-    /// by give_tree (previously refused by the 2^18 floor), and three
-    /// trees (L0/L1/L2 sizes) must coexist in the pool.
+    /// TREE_POOL cap 3 + lowered floor: the ranked compact L2 Ligerito
+    /// suffix (2^16 leaves → 2^16−1 = 65535 nodes, ~2 MiB) must be parked,
+    /// and three compact trees (L0/L1/L2 sizes) must coexist in the pool.
     #[test]
     fn tree_pool_parks_l2_and_caps_at_three() {
-        let n_l2 = 2 * (1 << 16) - 1; // 131071 — ranked L2
-        let n_l1 = 2 * (1 << 18) - 1; // ranked L1
-        let n_l0 = 2 * (1 << 20) - 1; // ranked L0
+        let n_l2 = (1 << 16) - 1; // compact ranked L2
+        let n_l1 = (1 << 18) - 1; // compact ranked L1
+        let n_l0 = (1 << 20) - 1; // compact ranked L0
         {
             let mut pool = TREE_POOL.lock().unwrap();
             pool.clear();
         }
-        // L2-sized tree must now be parked (was refused by old 2^18 floor).
+        // Compact L2 must clear the new floor and be parked.
         let l2 = take_tree(n_l2);
         let ptr_l2 = l2.as_ptr();
         give_tree(l2);

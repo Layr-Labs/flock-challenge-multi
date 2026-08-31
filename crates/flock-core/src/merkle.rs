@@ -500,6 +500,71 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     }
 }
 
+/// Hash adjacent leaves and immediately fold each pair into one parent.
+///
+/// This is the storage-free level-zero producer used by the ranked L0 PCS
+/// commitment: it emits exactly the parents which a full tree would hold at
+/// level one, but never materializes its (reconstructible) leaf CVs.  The
+/// BLAKE3 arm keeps one SIMD batch of leaf CVs on the stack, then feeds its
+/// contiguous pairs straight into the same parent kernel used by a full tree.
+/// Consequently both the digest values and their left/right order are
+/// identical to `hash_leaves_serial` followed by `hash_pairs_level_serial`.
+pub(crate) fn hash_leaf_pairs_serial(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+    kind: HashKind,
+) {
+    debug_assert_eq!(data.len(), out.len() * 2 * leaf_size);
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add((out.len() * 2) as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            (out.len() * 2) as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+        hash_count::PAIR_CALLS.fetch_add(out.len() as u64, Relaxed);
+    }
+
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            // One parent batch consumes twice as many leaf CVs.  This fixed
+            // stack scratch is 4 KiB on x86 (64 parents), safely below the
+            // worker-stack budget and avoids a temporary Vec per NTT callback.
+            let mut leaves = [[0u8; 32]; BLAKE3_BATCH * 2];
+            for (parents, bytes) in out
+                .chunks_mut(BLAKE3_BATCH)
+                .zip(data.chunks(BLAKE3_BATCH * 2 * leaf_size))
+            {
+                let n_leaves = parents.len() * 2;
+                blake3_hash_many_leaves(bytes, leaf_size, &mut leaves[..n_leaves]);
+                let leaf_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(leaves.as_ptr() as *const u8, n_leaves * 32)
+                };
+                blake3_hash_many_parents(leaf_bytes, parents);
+            }
+        }
+        HashKind::Blake3 => {
+            for (parent, pair) in out.iter_mut().zip(data.chunks(2 * leaf_size)) {
+                let left = blake3_leaf_cv(&pair[..leaf_size]);
+                let right = blake3_leaf_cv(&pair[leaf_size..]);
+                *parent = blake3_parent_cv(&left, &right);
+            }
+        }
+        HashKind::Sha256 => {
+            for (parent, pair) in out.iter_mut().zip(data.chunks(2 * leaf_size)) {
+                let left: Hash = Sha256::digest(&pair[..leaf_size]).into();
+                let right: Hash = Sha256::digest(&pair[leaf_size..]).into();
+                let mut h = Sha256::new();
+                h.update(left);
+                h.update(right);
+                *parent = h.finalize().into();
+            }
+        }
+    }
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -1041,6 +1106,19 @@ pub fn verify_merkle_multi_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn leaf_pair_producer_matches_full_tree_level_one() {
+        const LEAF_SIZE: usize = 128;
+        const LEAVES: usize = 64;
+        let bytes: Vec<u8> = (0..LEAVES * LEAF_SIZE)
+            .map(|i| (i as u64).wrapping_mul(0x9E37_79B9).rotate_left((i & 31) as u32) as u8)
+            .collect();
+        let full = merkle_tree(&bytes, LEAVES, HashKind::Blake3);
+        let mut parents = vec![[0u8; 32]; LEAVES / 2];
+        hash_leaf_pairs_serial(&bytes, LEAF_SIZE, &mut parents, HashKind::Blake3);
+        assert_eq!(parents, full[LEAVES..LEAVES + LEAVES / 2]);
+    }
+
     /// Diagnostics: time small BLAKE3 trees (the Ligerito recursive-commit
     /// shapes) in isolation. `cargo test -p flock-core --release small_tree_timing_probe -- --ignored --nocapture`.
     /// Diagnostics: the Ligerito recursive-commit encode shapes (num_ntts=8,

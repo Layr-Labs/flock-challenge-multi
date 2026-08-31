@@ -1363,25 +1363,25 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // precondition for `twiddles[1..]` by inspection of the values.
     unsafe {
         match (mul_diet_disabled(), low_inner) {
-            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false>(
+            (true, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false>(
+            (true, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false>(
+            (false, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
                 twiddles,
             ),
-            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false>(
+            (false, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
                 ptr,
                 num_ntts,
                 dense_lanes,
@@ -1409,38 +1409,33 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     // layer this sweep starts at; verified by inspection like the inner check.
     let low_outer =
         !low_twiddle_fused3_disabled() && !low_outer_fused3_disabled() && twiddles[0].hi == 0;
+    let high_one_outer = !high_one_outer_fused3_disabled() && twiddles[0].hi == 1;
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]` by inspection of the values, and NN
     // substitutes an equal runtime value in the same impl body.
     unsafe {
-        match (mul_diet_disabled(), low_inner) {
-            (true, false) => {
-                if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, true>(ptr, NN, dense_lanes, twiddles)
-                } else {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, false>(ptr, NN, dense_lanes, twiddles)
-                }
-            }
-            (true, true) => {
-                if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, true>(ptr, NN, dense_lanes, twiddles)
-                } else {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, false>(ptr, NN, dense_lanes, twiddles)
-                }
-            }
-            (false, false) => {
-                if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, true>(ptr, NN, dense_lanes, twiddles)
-                } else {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, false>(ptr, NN, dense_lanes, twiddles)
-                }
-            }
-            (false, true) => {
-                if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, true>(ptr, NN, dense_lanes, twiddles)
-                } else {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, false>(ptr, NN, dense_lanes, twiddles)
-                }
+        let diet_disabled = mul_diet_disabled();
+        // The ranked tail is exactly diet-on + low inner twiddles.  Keep the
+        // uncommon diagnostic shapes on their existing monomorphizations so
+        // this narrow specialization does not grow the I-cache footprint of
+        // every fused-three variant.
+        if !diet_disabled && low_inner && !low_outer && high_one_outer {
+            butterfly_fused_3layer_rows_impl::<true, true, NN, false, true>(
+                ptr,
+                NN,
+                dense_lanes,
+                twiddles,
+            )
+        } else {
+            match (diet_disabled, low_inner, low_outer) {
+                (true, false, true) => butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(ptr, NN, dense_lanes, twiddles),
+                (true, false, false) => butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(ptr, NN, dense_lanes, twiddles),
+                (true, true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(ptr, NN, dense_lanes, twiddles),
+                (true, true, false) => butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(ptr, NN, dense_lanes, twiddles),
+                (false, false, true) => butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(ptr, NN, dense_lanes, twiddles),
+                (false, false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(ptr, NN, dense_lanes, twiddles),
+                (false, true, true) => butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(ptr, NN, dense_lanes, twiddles),
+                (false, true, false) => butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(ptr, NN, dense_lanes, twiddles),
             }
         }
     }
@@ -1465,6 +1460,14 @@ fn low_twiddle_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
 }
 
+/// `FLOCK_NO_NTT_HIGH_ONE_FUSED3=1` restores the 5-CLMUL split product for
+/// the high-one outer twiddle in the shaped fused-three tail.
+#[inline]
+fn high_one_outer_fused3_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some())
+}
+
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
 /// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
@@ -1477,6 +1480,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
     const LOW_INNER: bool,
     const NNC: usize,
     const LOW_OUTER: bool,
+    const HIGH_ONE_OUTER: bool,
 >(
     ptr: *mut F128,
     num_ntts: usize,
@@ -1505,9 +1509,16 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         let mut lane = 0;
 
         macro_rules! butterfly {
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
-                let new_u =
-                    _mm512_xor_si512($values[$u], mul_x4::<$low, DIET>($twiddle, $values[$v]));
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr) => {{
+                let product = if $high_one {
+                    crate::field::gf2_128::x86_64::ghash_mul_x4_high_one_lhs(
+                        $twiddle.0,
+                        $values[$v],
+                    )
+                } else {
+                    mul_x4::<$low, DIET>($twiddle, $values[$v])
+                };
+                let new_u = _mm512_xor_si512($values[$u], product);
                 $values[$v] = _mm512_xor_si512($values[$v], new_u);
                 $values[$u] = new_u;
             }};
@@ -1517,11 +1528,19 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
         // the outstanding row misses.
         macro_rules! butterfly2 {
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr) => {{
                 for c in 0..2 {
+                    let product = if $high_one {
+                        crate::field::gf2_128::x86_64::ghash_mul_x4_high_one_lhs(
+                            $twiddle.0,
+                            $values[c][$v],
+                        )
+                    } else {
+                        mul_x4::<$low, DIET>($twiddle, $values[c][$v])
+                    };
                     let new_u = _mm512_xor_si512(
                         $values[c][$u],
-                        mul_x4::<$low, DIET>($twiddle, $values[c][$v]),
+                        product,
                     );
                     $values[c][$v] = _mm512_xor_si512($values[c][$v], new_u);
                     $values[c][$u] = new_u;
@@ -1539,16 +1558,16 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, LOW_OUTER);
+                butterfly2!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER, false);
                 }
             }
             for s in 0..4 {
-                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER, false);
             }
 
             for (c, chunk) in values.iter().enumerate() {
@@ -1566,16 +1585,16 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
             let outer = tw[0];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, LOW_OUTER);
+                butterfly!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER, false);
                 }
             }
             for s in 0..4 {
-                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER, false);
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -1603,10 +1622,10 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 values[2 * i] = _mm512_loadu_si512(row(2 * i).add(lane) as *const __m512i);
             }
             let outer = tw[0];
-            butterfly!(values, 0, 4, outer, LOW_OUTER);
-            butterfly!(values, 2, 6, outer, LOW_OUTER);
-            butterfly!(values, 0, 2, tw[1], LOW_INNER);
-            butterfly!(values, 4, 6, tw[2], LOW_INNER);
+            butterfly!(values, 0, 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+            butterfly!(values, 2, 6, outer, LOW_OUTER, HIGH_ONE_OUTER);
+            butterfly!(values, 0, 2, tw[1], LOW_INNER, false);
+            butterfly!(values, 4, 6, tw[2], LOW_INNER, false);
             for i in 0..4 {
                 let v = values[2 * i];
                 _mm512_storeu_si512(row(2 * i).add(lane) as *mut __m512i, v);
@@ -1846,25 +1865,25 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false>(
+                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false>(
+                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false>(
+                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
                             &twiddles,
                         ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false>(
+                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
                             got.as_mut_ptr(),
                             num_ntts,
                             dense_lanes,
@@ -1975,6 +1994,50 @@ mod diet_tests {
                         },
                     ],
                 );
+            }
+        }
+    }
+
+    /// The sparse-fold high-one product is field-identical to the ordinary
+    /// product for every lane.  This is deliberately separate from the fused
+    /// tail test: it proves the arithmetic identity before scheduling enters
+    /// the picture.
+    #[test]
+    fn high_one_product_matches_incumbent() {
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_high_one_lhs};
+        use core::arch::x86_64::*;
+
+        let mut next = rng(0xA11C_E001);
+        // SAFETY: this module is statically gated on avx512f+vpclmulqdq.
+        unsafe {
+            for _ in 0..512 {
+                let t = F128 {
+                    lo: next().lo,
+                    hi: 1,
+                };
+                let v = [next(), next(), next(), next()];
+                let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+                let vv = _mm512_set_epi64(
+                    v[3].hi as i64,
+                    v[3].lo as i64,
+                    v[2].hi as i64,
+                    v[2].lo as i64,
+                    v[1].hi as i64,
+                    v[1].lo as i64,
+                    v[0].hi as i64,
+                    v[0].lo as i64,
+                );
+                let want = ghash_mul_x4(tv, vv);
+                let got = ghash_mul_x4_high_one_lhs(tv, vv);
+                let mut w = [0u64; 8];
+                let mut g = [0u64; 8];
+                _mm512_storeu_si512(w.as_mut_ptr() as *mut __m512i, want);
+                _mm512_storeu_si512(g.as_mut_ptr() as *mut __m512i, got);
+                assert_eq!(w, g, "t={t:?} v={v:?}");
+                for (i, vi) in v.iter().enumerate() {
+                    let p = *vi * t;
+                    assert_eq!((g[2 * i], g[2 * i + 1]), (p.lo, p.hi), "lane {i}");
+                }
             }
         }
     }

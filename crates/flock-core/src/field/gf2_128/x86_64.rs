@@ -359,6 +359,48 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
     }
 }
 
+/// [`ghash_mul_x4`] specialized for a multiplier `x` whose high limb is one
+/// in **every** lane.
+///
+/// Writing `x = a + x^64` and `y = b + c·x^64`, the product is
+/// `a·b + (a·c + b)·x^64 + c·0x87`.  The last term is only a multiply by
+/// the sparse reduction polynomial and is assembled with shifts/XORs, so the
+/// one remaining reduction gives **3 CLMUL instead of 6**.
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
+/// cfg gate) and that every 128-bit lane of `x` has high qword one.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_high_one_lhs(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq and the one-high-limb
+    // precondition.
+    unsafe {
+        // `b` is y's low qword and `c` is its high qword moved to the low
+        // qword of every 128-bit lane.  The mask keeps qwords 0, 2, 4, 6.
+        let b = _mm512_maskz_mov_epi64(0x55, y);
+        let c = _mm512_bsrli_epi128::<8>(y);
+
+        // c · (1 + x + x^2 + x^7), without CLMUL.  The shifts of c by at
+        // most seven bits are split into their low qword and their carry into
+        // the high qword; `c` starts with a zero high qword.
+        let c_low = _mm512_xor_si512(
+            _mm512_xor_si512(c, _mm512_slli_epi64::<1>(c)),
+            _mm512_xor_si512(_mm512_slli_epi64::<2>(c), _mm512_slli_epi64::<7>(c)),
+        );
+        let c_high = _mm512_bslli_epi128::<8>(_mm512_xor_si512(
+            _mm512_xor_si512(_mm512_srli_epi64::<63>(c), _mm512_srli_epi64::<62>(c)),
+            _mm512_srli_epi64::<57>(c),
+        ));
+        let c_poly = _mm512_xor_si512(c_low, c_high);
+
+        let low = _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x00>(x, y), c_poly);
+        let mid = _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x10>(x, y), b);
+        gf2_128_reduce_x4(low, mid)
+    }
+}
+
 // -----------------------------------------------------------------------
 // Split-twiddle ("x^64-companion") product: 5 CLMUL instead of 6.
 //

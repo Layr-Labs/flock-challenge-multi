@@ -3253,12 +3253,15 @@ pub(crate) struct LigeroWitness {
     pub tree: Vec<Hash>,
     pub block_len: usize,
     pub num_interleaved: usize,
+    /// Whether `tree` contains only the original full tree's internal suffix.
+    pub tree_omits_leaves: bool,
+    pub merkle_hash: HashKind,
 }
 
 // Recycle the codeword matrix through the F128 scratch pool and the Merkle
-// tree through TREE_POOL when a level's witness is replaced/dropped. Ranked
-// L1 is 16 MiB (2^18 leaves x 32 B x ~2); without give_tree the extra-warmup
-// prove munmaps it and the timed path mmap/faults a fresh one.
+// tree through TREE_POOL when a level's witness is replaced/dropped. The
+// ranked compact L1 suffix is 8 MiB (2^18 - 1 hashes); without give_tree the
+// extra-warmup prove munmaps it and the timed path mmap/faults a fresh one.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
@@ -3290,8 +3293,45 @@ impl LigeroWitness {
 
     #[inline]
     pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
+        if self.tree_omits_leaves {
+            self.tree[self.block_len - 2]
+        } else {
+            self.tree[self.tree.len() - 1]
+        }
     }
+
+    #[inline]
+    fn merkle_proof(&self, queries: &[usize]) -> Vec<Hash> {
+        if self.tree_omits_leaves {
+            merkle_cut_multi_proof(
+                &self.tree,
+                self.merkle_hash,
+                &self.mat,
+                self.block_len,
+                queries,
+            )
+        } else {
+            merkle_multi_proof_for(&self.tree, self.block_len, queries)
+        }
+    }
+}
+
+/// Conservative selector for the ranked recursive commitment ladder. This is
+/// intentionally the exact production sequence (L1 through L5): diagnostic
+/// and test configurations retain the conventional full-tree code path, and
+/// a process-wide kill switch restores that path for this geometry as well.
+fn lig_merkle_cut_enabled(
+    block_len: usize,
+    num_interleaved: usize,
+    leaf_size_bytes: usize,
+    kind: HashKind,
+) -> bool {
+    !cfg!(test)
+        && std::env::var_os("FLOCK_NO_LIG_MERKLE_CUT").is_none()
+        && matches!(block_len, 262_144 | 65_536 | 16_384 | 4_096 | 1_024)
+        && num_interleaved == 8
+        && leaf_size_bytes == 128
+        && kind == HashKind::Blake3
 }
 
 /// Reshape `poly` (length `num_interleaved · msg_cols`) into a
@@ -3385,20 +3425,48 @@ pub(crate) fn ligero_commit(
         let faults_before = if ot { minor_faults() } else { 0 };
         let mat_cap = mat.capacity();
         let t_encode = std::time::Instant::now();
-        let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
-        let folded = crate::pcs::commit::fused_encode_leaves_subtree(
-            ntt,
-            poly,
-            &mut mat,
-            num_interleaved,
-            &mut tree,
-            block_len,
-            leaf_size_bytes,
-            kind,
-        );
+        let compact_tree = lig_merkle_cut_enabled(block_len, num_interleaved, leaf_size_bytes, kind);
+        let mut tree = crate::pcs::commit::take_tree(if compact_tree {
+            block_len - 1
+        } else {
+            2 * block_len - 1
+        });
+        let folded = if compact_tree {
+            crate::pcs::commit::fused_encode_leaves_subtree_compact(
+                ntt,
+                poly,
+                &mut mat,
+                num_interleaved,
+                &mut tree,
+                block_len,
+                leaf_size_bytes,
+                kind,
+            )
+        } else {
+            crate::pcs::commit::fused_encode_leaves_subtree(
+                ntt,
+                poly,
+                &mut mat,
+                num_interleaved,
+                &mut tree,
+                block_len,
+                leaf_size_bytes,
+                kind,
+            )
+        };
         let fused_ms = t_encode.elapsed().as_secs_f64() * 1e3;
         let t_upper = std::time::Instant::now();
-        crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
+        if compact_tree {
+            let compact_leaves = block_len >> 1;
+            let from_nodes = if folded == 0 {
+                compact_leaves
+            } else {
+                compact_leaves >> (folded - 1)
+            };
+            crate::pcs::commit::build_upper_levels(&mut tree, compact_leaves, from_nodes, kind);
+        } else {
+            crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
+        }
         if ot {
             eprintln!(
                 "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
@@ -3416,6 +3484,8 @@ pub(crate) fn ligero_commit(
             tree,
             block_len,
             num_interleaved,
+            tree_omits_leaves: compact_tree,
+            merkle_hash: kind,
         };
     }
 
@@ -3445,7 +3515,7 @@ pub(crate) fn ligero_commit(
     let mut leaves_ms = 0.0f64;
     let tree = gpu_tree.unwrap_or_else(|| {
         // Same write-before-read contract as merkle_tree(); take from TREE_POOL
-        // so the ranked L1 16 MiB tree is already resident after untimed warmup
+        // so the conventional ranked L1 16 MiB tree is resident after untimed warmup
         // (LigeroWitness::drop parks it). Public merkle_tree() stays unpooled
         // so tests/oracles cannot steal the L0 64 MiB slot.
         let t_ta = std::time::Instant::now();
@@ -3477,6 +3547,8 @@ pub(crate) fn ligero_commit(
         tree,
         block_len,
         num_interleaved,
+        tree_omits_leaves: false,
+        merkle_hash: kind,
     }
 }
 
@@ -7089,6 +7161,65 @@ fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) ->
     multi_proof_gather(tree, block_len, queries, serial_par_enabled())
 }
 
+/// Compact representation of an externally reused L0 tree.  Its backing
+/// slice contains the original full tree's internal suffix only: old index
+/// `i >= block_len` is stored at `i - block_len`.  L0's codeword remains live
+/// until this proof is assembled, so any leaf sibling can be regenerated from
+/// its canonical row bytes rather than retained for the entire open phase.
+#[derive(Clone, Copy)]
+pub(crate) struct L0MerkleCut<'a> {
+    pub(crate) upper_tree: &'a [Hash],
+    pub(crate) kind: HashKind,
+}
+
+impl L0MerkleCut<'_> {
+    #[inline]
+    fn root(self, block_len: usize) -> Hash {
+        assert_eq!(self.upper_tree.len(), block_len - 1);
+        self.upper_tree[block_len - 2]
+    }
+
+    fn multi_proof(
+        self,
+        codeword: &[F128],
+        block_len: usize,
+        queries: &[usize],
+    ) -> Vec<Hash> {
+        merkle_cut_multi_proof(self.upper_tree, self.kind, codeword, block_len, queries)
+    }
+}
+
+/// Build the conventional octopus proof from a compact internal tree and a
+/// live row-major codeword. The only omitted nodes are canonical leaf hashes.
+fn merkle_cut_multi_proof(
+    upper_tree: &[Hash],
+    kind: HashKind,
+    codeword: &[F128],
+    block_len: usize,
+    queries: &[usize],
+) -> Vec<Hash> {
+    assert_eq!(upper_tree.len(), block_len - 1);
+    let row_len = codeword.len() / block_len;
+    assert_eq!(codeword.len(), block_len * row_len);
+    merkle::merkle_multi_proof_sibling_indices(block_len, queries)
+        .into_iter()
+        .map(|i| {
+            if i < block_len {
+                let row = &codeword[i * row_len..(i + 1) * row_len];
+                let bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(
+                        row.as_ptr() as *const u8,
+                        row.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                merkle::hash_leaf(bytes, kind)
+            } else {
+                upper_tree[i - block_len]
+            }
+        })
+        .collect()
+}
+
 /// Multi-proof body. `par` splits the incumbent walk into its two halves —
 /// a pure index walk (integer arithmetic, no tree reads) followed by an
 /// order-preserving parallel gather of the sibling hashes — which emits the
@@ -7252,6 +7383,8 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
         tree: l0_tree,
         block_len,
         num_interleaved,
+        tree_omits_leaves: false,
+        merkle_hash: config.merkle_hash,
     };
     tlog!("  [ligerito]   L0 commit: REUSED (skipped)");
 
@@ -7307,6 +7440,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
         challenger,
     )
 }
@@ -7335,6 +7469,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7375,6 +7510,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7423,6 +7559,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        None,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7453,6 +7590,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_cut: Option<L0MerkleCut<'_>>,
     round0_uv: (F128, F128),
     fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
@@ -7468,6 +7606,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        l0_cut,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -7493,6 +7632,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_cut: Option<L0MerkleCut<'_>>,
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
@@ -7535,7 +7675,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
-    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
+    if let Some(cut) = l0_cut {
+        assert_eq!(cut.upper_tree.len(), block_len_0 - 1);
+    } else {
+        assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
+    }
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
@@ -7553,7 +7697,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // L0 codeword + tree are borrowed (reused from upstream `pcs::commit`).
     // wtns_0 access reduces to: root (last tree node), row(q), block_len.
-    let initial_root: Hash = l0_tree[l0_tree.len() - 1];
+    let initial_root: Hash = l0_cut
+        .map(|cut| cut.root(block_len_0))
+        .unwrap_or_else(|| l0_tree[l0_tree.len() - 1]);
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
     let l0_row = |q: usize| -> &[F128] {
@@ -7931,7 +8077,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> =
         gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = l0_cut
+        .map(|cut| cut.multi_proof(l0_codeword, l0_block_len, &queries_0))
+        .unwrap_or_else(|| merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0));
     if trace {
         t_opens += _t.elapsed();
     }
@@ -8051,8 +8199,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             let opened_rows_last: Vec<Vec<F128>> =
                 gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = wtns_prev.merkle_proof(&queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -8190,8 +8337,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _t = std::time::Instant::now();
         let opened_rows_i: Vec<Vec<F128>> =
             gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = wtns_prev.merkle_proof(&queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -9358,7 +9504,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
+    let merkle_proof_0 = wtns_0.merkle_proof(&queries_0);
     t_opens += t.elapsed();
     let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0.clone(),
@@ -9434,8 +9580,7 @@ fn recursive_prover_inner<Ch: Challenger>(
                 .iter()
                 .map(|&q| wtns_prev.row(q).to_vec())
                 .collect();
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = wtns_prev.merkle_proof(&queries_last);
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -9490,8 +9635,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
             .collect();
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = wtns_prev.merkle_proof(&queries_i);
         t_opens += t.elapsed();
         recursive_proofs.push(RecursiveProof {
             opened_rows: opened_rows_i.clone(),
@@ -9840,6 +9984,46 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn compact_l0_multiproof_matches_full_tree() {
+        const LEAVES: usize = 64;
+        const ROW_F128: usize = 4;
+        let codeword: Vec<F128> = (0..LEAVES * ROW_F128)
+            .map(|i| F128::new(i as u64 * 0x9E37_79B9_7F4A_7C15, !(i as u64)))
+            .collect();
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(codeword.as_ptr() as *const u8, codeword.len() * 16)
+        };
+        let full = merkle::merkle_tree(bytes, LEAVES, HashKind::Blake3);
+        let cut = L0MerkleCut {
+            upper_tree: &full[LEAVES..],
+            kind: HashKind::Blake3,
+        };
+        let queries = [1usize, 4, 7, 18, 29, 43, 62];
+        let compact_proof = cut.multi_proof(&codeword, LEAVES, &queries);
+        assert_eq!(compact_proof, merkle_multi_proof_for(&full, LEAVES, &queries));
+        assert_eq!(cut.root(LEAVES), *full.last().unwrap());
+
+        let leaves: Vec<Hash> = queries
+            .iter()
+            .map(|&q| {
+                let row = &codeword[q * ROW_F128..(q + 1) * ROW_F128];
+                let row_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 16)
+                };
+                merkle::hash_leaf(row_bytes, HashKind::Blake3)
+            })
+            .collect();
+        assert!(merkle::verify_merkle_multi_proof(
+            full.last().unwrap(),
+            LEAVES,
+            &queries,
+            &leaves,
+            &compact_proof,
+            HashKind::Blake3,
+        ));
+    }
+
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
     /// `iter().map(to_vec)` gather, the multi-proof against the incumbent
@@ -10053,6 +10237,7 @@ mod tests {
             target,
             &wtns_0.mat,
             &wtns_0.tree,
+            None,
             round0,
             None,
             &mut ordinary_challenger,
