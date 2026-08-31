@@ -1246,6 +1246,25 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: identity-C worker-reduce reconstructs each 64-column
+/// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
+/// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
+/// restores the incumbent GPR transpose. Same bytes either way.
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar `scale * out[i]` loops for
+/// the ranked identity-C one-row epilogue. Default uses [`add_scaled`] on
+/// the two live ranges (zero dest ⇒ `scale * src`). Ranked env is cleared.
+fn lc_one_scale_vec_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_SCALE").is_some());
+    *OFF
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1472,6 +1491,20 @@ unsafe fn reduce_worker_plane_block(
         unsafe {
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
+    }
+    // Same 16×64 plane layout as the fused C-drain bank. That leaf already
+    // bit-transposes eight plane-ZMMs and interleaves lo/hi into AoS F128;
+    // the GPR 8×8 path below is the same map on 8-byte groups.
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_plane_f128_enabled() {
+        let bank: &[u8; 1024] = &acc;
+        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(bank, out64);
+        return;
     }
     // The plane rows are contiguous, while the old per-column loop made 16
     // strided byte loads for every F128. Transpose eight 8-byte groups with
@@ -2191,11 +2224,23 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         let half = k / 2;
         let mut one = vec![F128::ZERO; half];
         let scale_lo = F128::ONE + r;
-        for i in 0..1152 {
-            one[i] = scale_lo * out[i];
-        }
-        for i in 15104..15360 {
-            one[i - half] = r * out[i];
+        // Ranked one-rows: 1152 live low slots and 256 live high slots.
+        // `add_scaled` on a zero dest is `scale * src` (XOR-identity). Kill
+        // `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
+        if lc_one_scale_vec_disabled() {
+            for i in 0..1152 {
+                one[i] = scale_lo * out[i];
+            }
+            for i in 15104..15360 {
+                one[i - half] = r * out[i];
+            }
+        } else {
+            crate::field::f128_slice::add_scaled(&mut one[..1152], &out[..1152], scale_lo);
+            crate::field::f128_slice::add_scaled(
+                &mut one[15104 - half..15360 - half],
+                &out[15104..15360],
+                r,
+            );
         }
         Some(one)
     } else {
