@@ -438,9 +438,13 @@ fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
 #[inline]
 fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
-    }
+    // This helper is reached only after the little-endian fast-encoder gate.
+    // A u64 slice has no element padding, so its memory is exactly the
+    // bincode-fixint sequence of its values.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+    };
+    out.extend_from_slice(bytes);
 }
 
 fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
@@ -448,6 +452,331 @@ fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
     for row in rows {
         put_f128_vec(out, row);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct scatter/gather publication
+// ---------------------------------------------------------------------------
+
+/// `FLOCK_NO_SCATTER_PROOF=1` restores the incumbent
+/// `to_bytes()` + `write_all()` publication tail. The scatter path is Linux
+/// little-endian only: it shares the flat encoder's raw-F128 byte contract and
+/// uses a conservative Linux-safe iovec batch size.
+fn scatter_proof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(all(target_os = "linux", target_endian = "little"))
+        && *ON.get_or_init(|| {
+            std::env::var("FLOCK_NO_SCATTER_PROOF").map_or(true, |v| v != "1")
+        })
+}
+
+/// One wire-order fragment. `Control` addresses bytes owned by the plan; a
+/// `Borrowed` fragment is an already wire-compatible proof slice (F128 or
+/// Merkle hashes). Ranges, rather than references into `control`, keep plan
+/// construction safe if appending metadata reallocates the control Vec.
+enum ScatterSegment<'a> {
+    Control(std::ops::Range<usize>),
+    Borrowed(&'a [u8]),
+}
+
+/// Complete bincode-compatible R1CS bundle write plan. It is built in full
+/// before the first file write, so every fallback decision precedes I/O.
+struct ScatterPlan<'a> {
+    control: Vec<u8>,
+    segments: Vec<ScatterSegment<'a>>,
+    total_len: usize,
+}
+
+/// Keeps every owned scatter backing allocation alive until publication has
+/// completed. In particular, dropping the plan before the atomic rename can
+/// put a large allocator deallocation on the measured publication path.
+#[must_use]
+pub(crate) struct ScatterWriteGuard<'a> {
+    plan: ScatterPlan<'a>,
+}
+
+impl ScatterWriteGuard<'_> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.plan.total_len
+    }
+}
+
+impl<'a> ScatterPlan<'a> {
+    fn from_prefix(prefix: Vec<u8>, segment_capacity: usize) -> Self {
+        let total_len = prefix.len();
+        let mut segments = Vec::with_capacity(segment_capacity);
+        if !prefix.is_empty() {
+            segments.push(ScatterSegment::Control(0..prefix.len()));
+        }
+        Self {
+            control: prefix,
+            segments,
+            total_len,
+        }
+    }
+
+    #[inline]
+    fn push_control(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let start = self.control.len();
+        self.control.extend_from_slice(bytes);
+        let end = self.control.len();
+        self.total_len = self
+            .total_len
+            .checked_add(bytes.len())
+            .expect("proof serialization length overflow");
+        if let Some(ScatterSegment::Control(previous)) = self.segments.last_mut()
+            && previous.end == start
+        {
+            previous.end = end;
+        } else {
+            self.segments.push(ScatterSegment::Control(start..end));
+        }
+    }
+
+    #[inline]
+    fn push_borrowed(&mut self, bytes: &'a [u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.total_len = self
+            .total_len
+            .checked_add(bytes.len())
+            .expect("proof serialization length overflow");
+        self.segments.push(ScatterSegment::Borrowed(bytes));
+    }
+
+    #[inline]
+    fn push_u64(&mut self, value: u64) {
+        self.push_control(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn push_f128(&mut self, value: F128) {
+        self.push_u64(value.lo);
+        self.push_u64(value.hi);
+    }
+
+    #[inline]
+    fn push_f128_vec(&mut self, values: &'a [F128]) {
+        self.push_u64(values.len() as u64);
+        // SAFETY: identical contract to `put_f128_vec`: the scatter path is
+        // little-endian only and F128 is two padding-free u64 fields.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        };
+        self.push_borrowed(bytes);
+    }
+
+    #[inline]
+    fn push_hash_vec(&mut self, values: &'a [MerkleHash]) {
+        self.push_u64(values.len() as u64);
+        self.push_borrowed(values.as_flattened());
+    }
+
+    #[inline]
+    fn push_u64_vec(&mut self, values: &'a [u64]) {
+        self.push_u64(values.len() as u64);
+        // The scatter path carries the same little-endian gate as the flat
+        // encoder. u64 has no padding, so the whole vector is already in its
+        // bincode-fixint representation.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        };
+        self.push_borrowed(bytes);
+    }
+
+    fn push_rows(&mut self, rows: &'a [Vec<F128>]) {
+        self.push_u64(rows.len() as u64);
+        for row in rows {
+            self.push_f128_vec(row);
+        }
+    }
+
+    fn push_recursive_proof(&mut self, proof: &'a RecursiveProof) {
+        let RecursiveProof {
+            opened_rows,
+            merkle_proof,
+        } = proof;
+        self.push_rows(opened_rows);
+        self.push_hash_vec(merkle_proof);
+    }
+
+    fn push_pcs_open(&mut self, proof: &'a BatchOpeningProofLigerito) {
+        let BatchOpeningProofLigerito {
+            ring_switches,
+            ligerito,
+        } = proof;
+        self.push_u64(ring_switches.len() as u64);
+        for ring_switch in ring_switches {
+            let RingSwitchProof { s_hat_v } = ring_switch;
+            self.push_f128_vec(s_hat_v);
+        }
+
+        let LigeritoProof {
+            initial_root,
+            initial_proof,
+            recursive_roots,
+            recursive_proofs,
+            final_proof,
+            sumcheck_transcript,
+            grinding_nonces,
+            ood_values,
+            fold_grinding_nonces,
+        } = ligerito;
+        self.push_borrowed(initial_root);
+        self.push_recursive_proof(initial_proof);
+        self.push_hash_vec(recursive_roots);
+        self.push_u64(recursive_proofs.len() as u64);
+        for recursive_proof in recursive_proofs {
+            self.push_recursive_proof(recursive_proof);
+        }
+
+        let FinalProof {
+            yr,
+            opened_rows,
+            merkle_proof,
+        } = final_proof;
+        self.push_f128_vec(yr);
+        self.push_rows(opened_rows);
+        self.push_hash_vec(merkle_proof);
+        self.push_u64(sumcheck_transcript.len() as u64);
+        for message in sumcheck_transcript {
+            let SumcheckMessage { u_0, u_2 } = message;
+            self.push_f128(*u_0);
+            self.push_f128(*u_2);
+        }
+        self.push_u64_vec(grinding_nonces);
+        self.push_f128_vec(ood_values);
+        self.push_u64_vec(fold_grinding_nonces);
+    }
+
+    #[inline]
+    fn segment_bytes(&self, segment: &ScatterSegment<'a>) -> &[u8] {
+        match segment {
+            ScatterSegment::Control(range) => &self.control[range.clone()],
+            ScatterSegment::Borrowed(bytes) => bytes,
+        }
+    }
+}
+
+/// Exact ranked proofs have 527 opened rows, hence a little over one thousand
+/// alternating length/payload segments. Reserve a shape-derived upper bound so
+/// building the plan does not repeatedly move its descriptor array. Arithmetic
+/// failure is an eligibility miss and therefore occurs before any write.
+fn scatter_segment_capacity(proof: &BatchOpeningProofLigerito) -> Option<usize> {
+    let ligerito = &proof.ligerito;
+    let row_count = ligerito
+        .initial_proof
+        .opened_rows
+        .len()
+        .checked_add(
+            ligerito
+                .recursive_proofs
+                .iter()
+                .try_fold(0usize, |sum, recursive| {
+                    sum.checked_add(recursive.opened_rows.len())
+                })?,
+        )?
+        .checked_add(ligerito.final_proof.opened_rows.len())?;
+    row_count
+        .checked_mul(2)?
+        .checked_add(proof.ring_switches.len().checked_mul(2)?)?
+        // Roots, per-level Merkle vectors, yr/OOD/nonces, transcript control,
+        // and the prefix. This is deliberately an upper bound; unused capacity
+        // is descriptor memory only and carries no proof-payload copy.
+        .checked_add(ligerito.recursive_proofs.len().checked_mul(4)?)?
+        .checked_add(64)
+}
+
+/// Write an R1CS bundle without concatenating its ~433 KiB `pcs_open` into a
+/// second contiguous Vec. The returned guard retains the plan's backing storage
+/// so the caller can defer its destruction until after the atomic rename.
+/// `Ok(None)` is returned only before writing any bytes, so the caller may
+/// safely use the unchanged `to_bytes()` fallback. Once writing starts, a short
+/// write or error is reported and must not trigger a fallback append to the
+/// partially overwritten file.
+pub(crate) fn write_r1cs_bundle_scatter<'a, W: io::Write>(
+    writer: &mut W,
+    bundle: &'a R1csProofBundleLigerito,
+) -> io::Result<Option<ScatterWriteGuard<'a>>> {
+    if !scatter_proof_enabled() || !fast_pcs_open_encode_enabled() {
+        return Ok(None);
+    }
+    let Some(segment_capacity) = scatter_segment_capacity(&bundle.proof.pcs_open) else {
+        return Ok(None);
+    };
+    let Some(prefix) = take_matching_pre_encoded(bundle) else {
+        return Ok(None);
+    };
+
+    let mut plan = ScatterPlan::from_prefix(prefix, segment_capacity);
+    plan.push_pcs_open(&bundle.proof.pcs_open);
+    debug_assert_eq!(
+        plan.total_len,
+        plan.segments
+            .iter()
+            .map(|segment| plan.segment_bytes(segment).len())
+            .sum::<usize>()
+    );
+
+    // Linux IOV_MAX is at least 1024; 256 leaves ample headroom while keeping
+    // a ranked proof to only a handful of writev calls. Rebuilding this small
+    // descriptor Vec after a partial write never copies proof payload bytes.
+    const MAX_IOVECS: usize = 256;
+    let mut iovecs: Vec<std::io::IoSlice<'_>> = Vec::with_capacity(MAX_IOVECS);
+    let mut segment_index = 0usize;
+    let mut segment_offset = 0usize;
+    while segment_index < plan.segments.len() {
+        iovecs.clear();
+        let end = (segment_index + MAX_IOVECS).min(plan.segments.len());
+        for (batch_index, segment) in plan.segments[segment_index..end].iter().enumerate() {
+            let bytes = plan.segment_bytes(segment);
+            let bytes = if batch_index == 0 {
+                &bytes[segment_offset..]
+            } else {
+                bytes
+            };
+            iovecs.push(std::io::IoSlice::new(bytes));
+        }
+
+        let written = loop {
+            match writer.write_vectored(&iovecs) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other,
+            }
+        }?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write proof scatter segments",
+            ));
+        }
+
+        let mut advanced = written;
+        while advanced > 0 {
+            let segment_len = plan.segment_bytes(&plan.segments[segment_index]).len();
+            let remaining = segment_len - segment_offset;
+            if advanced < remaining {
+                segment_offset += advanced;
+                advanced = 0;
+            } else {
+                advanced -= remaining;
+                segment_index += 1;
+                segment_offset = 0;
+            }
+        }
+    }
+    Ok(Some(ScatterWriteGuard { plan }))
 }
 
 impl ChainProofBundleLigerito {

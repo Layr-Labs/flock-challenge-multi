@@ -573,16 +573,41 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    let bytes = bundle.to_bytes();
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.set_len(bytes.len() as u64)?;
+    let scatter_guard = crate::proof_io::write_r1cs_bundle_scatter(&mut file, &bundle)?;
+    let mut contiguous = None;
+    let written = match scatter_guard.as_ref() {
+        Some(guard) => guard.len(),
+        None => {
+            // Every scatter eligibility decision happens before its first
+            // write, so this fallback always starts at file offset zero and is
+            // exactly the incumbent publication path.
+            let bytes = bundle.to_bytes();
+            file.write_all(&bytes)?;
+            let written = bytes.len();
+            contiguous = Some(bytes);
+            written
+        }
+    };
+    let exact_len = u64::try_from(written).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "serialized proof length does not fit u64",
+        )
+    })?;
+    file.set_len(exact_len)?;
     drop(file);
-    std::fs::rename(temporary, path)
+    std::fs::rename(temporary, path)?;
+    // Keep both possible serialization backings alive through the rename. This
+    // matches the incumbent Vec lifetime and moves any large deallocation out
+    // of the timed publication tail.
+    drop(scatter_guard);
+    drop(contiguous);
+    Ok(())
 }
 
 /// Rehearse the publication tail during the UNTIMED window.
