@@ -760,6 +760,14 @@ const DIRECT_FOLD_TILE_STRIPES: usize = 8;
 const BLOCK_MAJOR_FACTORED_EQ_N_LOG: usize = 18;
 const BLOCK_MAJOR_FACTORED_EQ_LO_LOG: usize = 9;
 
+#[derive(Clone, Copy)]
+struct FactorizedEq<'a> {
+    lo: &'a [F128],
+    hi: &'a [F128],
+    log_b: usize,
+    lo_mask: usize,
+}
+
 /// Transpose one F128 row-group from 8 consecutive outer blocks into the byte
 /// shape consumed by a lincheck sum table. Output byte `b` has bit `r` equal
 /// to bit `b` of `lanes[r]`.
@@ -847,6 +855,7 @@ pub fn partial_fold_packed_z_block_major_padded(
         useful_bits,
         |outer_base| std::array::from_fn(|r| eq_outer[outer_base + r]),
         None,
+        None,
     )
 }
 
@@ -900,14 +909,111 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         m,
         k_log,
         useful_bits,
-        |outer_base| {
-            std::array::from_fn(|r| {
-                let outer = outer_base + r;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
-        },
+        |outer_base| eq8_from_factors(eq_lo, eq_hi, outer_base, log_b, lo_mask),
         top_bind,
+        Some(FactorizedEq {
+            lo: eq_lo,
+            hi: eq_hi,
+            log_b,
+            lo_mask,
+        }),
     )
+}
+
+/// `FLOCK_NO_LC_EQ8_X4=1` restores eight scalar `eq_lo * eq_hi` products per
+/// stripe. Default: two 4-lane `ghash_mul_x4` products. Same 8 field
+/// elements; F128 multiply is the canonical mod-p product either way.
+fn lc_eq8_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EQ8_X4").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_FUSED_EQ_MATS=1` restores the public PR2306 chain:
+/// factorized products materialize as `[F128; 8]`, then the AoS values are
+/// reloaded and transposed into the sixteen GFNI matrices. Default keeps the
+/// ranked 9+9 stripe in registers from factor loads through matrix stores.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+fn lc_fused_eq_mats_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FUSED_EQ_MATS").is_none());
+    *ON
+}
+
+/// Eight consecutive factorized outer weights starting at `outer_base`.
+fn eq8_from_factors(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_eq8_x4_enabled() {
+        // SAFETY: cfg supplies avx512f+vpclmulqdq; the 8 indices are the
+        // same formula as the scalar loop (lo_mask / log_b).
+        return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
+    }
+    std::array::from_fn(|r| {
+        let outer = outer_base + r;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
+}
+
+/// Four-then-four 4-lane products of the factorized eq tensor. Bit-identical
+/// to eight scalar `eq_lo[i]*eq_hi[i]` because `ghash_mul_x4` is the same
+/// canonical reduction as `Mul`.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq`. `outer_base .. outer_base+8` is in-range for
+/// the factorized tensor (`eq_lo.len() * eq_hi.len()`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn eq8_from_factors_x4(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    let mut out = [F128::ZERO; 8];
+    // SAFETY: eight consecutive factorized indices; each load is an F128
+    // the scalar loop would read, packed into one ZMM of four lanes.
+    unsafe {
+        for g in 0..2 {
+            let mut lo = [F128::ZERO; 4];
+            let mut hi = [F128::ZERO; 4];
+            for r in 0..4 {
+                let outer = outer_base + 4 * g + r;
+                lo[r] = eq_lo[outer & lo_mask];
+                hi[r] = eq_hi[outer >> log_b];
+            }
+            let prod = ghash_mul_x4(
+                _mm512_loadu_si512(lo.as_ptr() as *const __m512i),
+                _mm512_loadu_si512(hi.as_ptr() as *const __m512i),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(4 * g) as *mut __m512i, prod);
+        }
+    }
+    out
 }
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
@@ -977,6 +1083,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top(
             useful_bits,
             |outer_base| std::array::from_fn(|lane| eq_x_outer[outer_base + lane]),
             Some(r_top),
+            None,
         )
     }
 }
@@ -1013,6 +1120,12 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
         },
         Some(r_top),
         true,
+        Some(FactorizedEq {
+            lo: &eq_lo,
+            hi: &eq_hi,
+            log_b,
+            lo_mask,
+        }),
     );
     (full, one.expect("ranked one-row fold requested"))
 }
@@ -1246,6 +1359,25 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: identity-C worker-reduce reconstructs each 64-column
+/// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
+/// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
+/// restores the incumbent GPR transpose. Same bytes either way.
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar `scale * out[i]` loops for
+/// the ranked identity-C one-row epilogue. Default uses [`add_scaled`] on
+/// the two live ranges (zero dest ⇒ `scale * src`). Ranked env is cleared.
+fn lc_one_scale_vec_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_SCALE").is_some());
+    *OFF
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1473,6 +1605,20 @@ unsafe fn reduce_worker_plane_block(
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
     }
+    // Same 16×64 plane layout as the fused C-drain bank. That leaf already
+    // bit-transposes eight plane-ZMMs and interleaves lo/hi into AoS F128;
+    // the GPR 8×8 path below is the same map on 8-byte groups.
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_plane_f128_enabled() {
+        let bank: &[u8; 1024] = &acc;
+        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(bank, out64);
+        return;
+    }
     // The plane rows are contiguous, while the old per-column loop made 16
     // strided byte loads for every F128. Transpose eight 8-byte groups with
     // GPR delta-swaps so every load is a contiguous u64.
@@ -1515,6 +1661,7 @@ fn fold_block_major_gfni(
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     top_bind: Option<F128>,
     ranked_one_rows: bool,
+    factorized_eq: Option<FactorizedEq<'_>>,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
@@ -1573,6 +1720,17 @@ fn fold_block_major_gfni(
             // inside the tile / chunk / stripe loops).
             #[cfg(target_feature = "avx512vbmi")]
             let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+            // The ranked 9+9 equality split makes every eight-weight stripe
+            // two contiguous low-factor loads multiplied by one shared high
+            // factor. Keep those products in ZMMs through the GFNI matrix
+            // transpose instead of returning an `[F128; 8]` through memory.
+            #[cfg(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512dq",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq"
+            ))]
+            let fused_eq_mats = factorized_eq.is_some() && lc_fused_eq_mats_enabled();
             loop {
                 let tile = if claim_lo < claim_hi {
                     claim_lo += 1;
@@ -1589,9 +1747,33 @@ fn fold_block_major_gfni(
                     break;
                 };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
-                for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                    let eq8 = eq8_at(8 * (stripe_base + t));
-                    kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                #[cfg(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512dq",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if fused_eq_mats {
+                    let factors = factorized_eq.expect("fused factorized matrices");
+                    // SAFETY: the cfg supplies every named ISA feature; the
+                    // factorized tensor checks guarantee this complete
+                    // 64-weight tile is live and shares one high factor.
+                    unsafe {
+                        kernels::fold_mats_tile_from_factorized_x4(
+                            factors.lo,
+                            factors.hi,
+                            8 * stripe_base,
+                            factors.log_b,
+                            factors.lo_mask,
+                            &mut mats,
+                        );
+                    }
+                } else {
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let outer_base = 8 * (stripe_base + t);
+                        let eq8 = eq8_at(outer_base);
+                        kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                    }
                 }
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
@@ -1834,6 +2016,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
     useful_bits: usize,
     eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
     top_bind: Option<F128>,
+    factorized_eq: Option<FactorizedEq<'_>>,
 ) -> Vec<F128> {
     partial_fold_packed_z_block_major_padded_with_tables_result(
         z_packed,
@@ -1843,6 +2026,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
         eq8_at,
         top_bind,
         false,
+        factorized_eq,
     )
     .0
 }
@@ -1855,6 +2039,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
     top_bind: Option<F128>,
     ranked_one_rows: bool,
+    factorized_eq: Option<FactorizedEq<'_>>,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
 
@@ -1915,6 +2100,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             &eq8_at,
             top_bind,
             ranked_one_rows,
+            factorized_eq,
         );
     }
 
@@ -2191,11 +2377,23 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         let half = k / 2;
         let mut one = vec![F128::ZERO; half];
         let scale_lo = F128::ONE + r;
-        for i in 0..1152 {
-            one[i] = scale_lo * out[i];
-        }
-        for i in 15104..15360 {
-            one[i - half] = r * out[i];
+        // Ranked one-rows: 1152 live low slots and 256 live high slots.
+        // `add_scaled` on a zero dest is `scale * src` (XOR-identity). Kill
+        // `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
+        if lc_one_scale_vec_disabled() {
+            for i in 0..1152 {
+                one[i] = scale_lo * out[i];
+            }
+            for i in 15104..15360 {
+                one[i - half] = r * out[i];
+            }
+        } else {
+            crate::field::f128_slice::add_scaled(&mut one[..1152], &out[..1152], scale_lo);
+            crate::field::f128_slice::add_scaled(
+                &mut one[15104 - half..15360 - half],
+                &out[15104..15360],
+                r,
+            );
         }
         Some(one)
     } else {
@@ -4287,6 +4485,45 @@ mod tests {
                     "affine(mats, {v}) must equal table[{v}]"
                 );
             }
+        }
+    }
+
+    /// The ranked fused leaf is exactly the composition of factorized field
+    /// multiplication and the established GFNI matrix builder, including
+    /// stripes on both sides of a 512-entry low-factor wrap.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold_mats_tile_from_factorized_x4_matches_composed_builder() {
+        let mut rng = Rng::new(0xF05E_DA7A);
+        let eq_lo = rng.f128_vec(512);
+        let eq_hi = rng.f128_vec(8);
+        for outer_base in [0usize, 512, 1024, 2048, 3584] {
+            let mut want = [0u64; 128];
+            for stripe in 0..8 {
+                let stripe_base = outer_base + 8 * stripe;
+                let eq8: [F128; 8] = std::array::from_fn(|lane| {
+                    let outer = stripe_base + lane;
+                    eq_lo[outer & 511] * eq_hi[outer >> 9]
+                });
+                kernels::fold_mats_from_basis(&eq8, &mut want[stripe * 16..(stripe + 1) * 16]);
+            }
+            let mut got = [0u64; 128];
+            // SAFETY: the cfg supplies the ISA and each selected base starts
+            // a complete 64-weight tile in the 512x8 tensor.
+            unsafe {
+                kernels::fold_mats_tile_from_factorized_x4(
+                    &eq_lo, &eq_hi, outer_base, 9, 511, &mut got,
+                );
+            }
+            assert_eq!(got, want, "outer_base={outer_base}");
         }
     }
 

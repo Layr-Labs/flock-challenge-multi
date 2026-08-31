@@ -12,6 +12,16 @@ mod x86_64;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) use x86_64::fold_mats_tile_from_factorized_x4;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
     target_feature = "gfni"
 ))]
 pub use x86_64::partial_fold_packed_z_x86_gfni_padded;

@@ -322,6 +322,54 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     }
 }
 
+/// `FLOCK_NO_LC_MATS_AOS=1` restores sixteen scalar `.lo`/`.hi` extracts.
+/// Default: two `loadu` of the AoS `[F128; 8]` and one even/odd qword
+/// deinterleave into the lo/hi lane arrays the bit-transpose already
+/// consumes. Same 16 qwords.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_mats_aos_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_MATS_AOS").is_none())
+}
+
+/// Deinterleave eight AoS F128 into lo-qword and hi-qword lane arrays.
+///
+/// # Safety
+/// `eq8.len() == 8`. `avx512f`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
+    use core::arch::x86_64::*;
+    let mut lo_lanes = [0u64; 8];
+    let mut hi_lanes = [0u64; 8];
+    // SAFETY: eight contiguous F128 (128 bytes) = two ZMM. F128 is lo||hi
+    // qwords, so even qwords are `.lo` and odd qwords are `.hi`.
+    unsafe {
+        let p = eq8.as_ptr() as *const __m512i;
+        let v0 = _mm512_loadu_si512(p);
+        let v1 = _mm512_loadu_si512(p.add(1));
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        _mm512_storeu_si512(
+            lo_lanes.as_mut_ptr() as *mut __m512i,
+            _mm512_permutex2var_epi64(v0, lo_idx, v1),
+        );
+        _mm512_storeu_si512(
+            hi_lanes.as_mut_ptr() as *mut __m512i,
+            _mm512_permutex2var_epi64(v0, hi_idx, v1),
+        );
+    }
+    (lo_lanes, hi_lanes)
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
@@ -343,8 +391,15 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
 
-    let lo_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].lo);
-    let hi_lanes: [u64; 8] = std::array::from_fn(|j| eq8[j].hi);
+    let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
+        // SAFETY: len==8 asserted; cfg supplies avx512f.
+        unsafe { aos8_lohi(eq8) }
+    } else {
+        (
+            std::array::from_fn(|j| eq8[j].lo),
+            std::array::from_fn(|j| eq8[j].hi),
+        )
+    };
     let mut lo_bytes = [0u8; 64];
     let mut hi_bytes = [0u8; 64];
     crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
@@ -359,6 +414,88 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
         let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
         mats[c] = u64::from_le_bytes(lo).swap_bytes();
         mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    }
+}
+
+/// Ranked 9+9 factorized equality tile directly to its 8x16 GFNI fold
+/// matrices. Each eight-weight stripe has contiguous low factors, and all 64
+/// weights in the tile share one high factor. Sixteen `ghash_mul_x4` calls
+/// feed deinterleave and the final bit transpose in ZMMs.
+///
+/// This fuses the public PR2306 `eq8_from_factors_x4` and AoS matrix-builder
+/// leaves. It removes the scalar staging gathers, the 128-byte product
+/// store/reload handoff, and the sixteen-scalar-`movbe` matrix-store tail.
+///
+/// # Safety
+/// The named target features must be available. `outer_base` begins a full
+/// aligned 64-weight tile in the factorized tensor; each stripe's low indices
+/// are contiguous and all 64 indices share one high factor.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vbmi,gfni,vpclmulqdq")]
+pub(crate) unsafe fn fold_mats_tile_from_factorized_x4(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+    mats: &mut [u64],
+) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(mats.len(), 128);
+    debug_assert_eq!(outer_base & 63, 0);
+    let hi_index = outer_base >> log_b;
+    debug_assert!(hi_index < eq_hi.len());
+    debug_assert_eq!((outer_base + 63) >> log_b, hi_index);
+
+    // SAFETY: slice and stripe bounds are asserted above; the function's
+    // target_feature contract supplies all intrinsics and ghash_mul_x4.
+    unsafe {
+        let h = eq_hi[hi_index];
+        let high = _mm512_broadcast_i32x4(_mm_set_epi64x(h.hi as i64, h.lo as i64));
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        const I: [u8; 64] = [
+            56, 48, 40, 32, 24, 16, 8, 0, 57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10,
+            2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36, 28, 20, 12, 4, 61, 53, 45, 37, 29,
+            21, 13, 5, 62, 54, 46, 38, 30, 22, 14, 6, 63, 55, 47, 39, 31, 23, 15, 7,
+        ];
+        let indices = _mm512_loadu_si512(I.as_ptr() as *const __m512i);
+        // Reversing the identity operand's basis bytes makes GFNI emit byte
+        // j from the incumbent transpose at byte 7-j. That is exactly the
+        // following scalar `swap_bytes`, fused into the affine instruction.
+        let reversed_ident = _mm512_set1_epi64(0x0102_0408_1020_4080u64 as i64);
+        for stripe in 0..8 {
+            let stripe_base = outer_base + 8 * stripe;
+            let lo_base = stripe_base & lo_mask;
+            debug_assert!(lo_base + 8 <= eq_lo.len());
+            let lo0 = _mm512_loadu_si512(eq_lo.as_ptr().add(lo_base) as *const __m512i);
+            let lo1 = _mm512_loadu_si512(eq_lo.as_ptr().add(lo_base + 4) as *const __m512i);
+            let prod0 = ghash_mul_x4(lo0, high);
+            let prod1 = ghash_mul_x4(lo1, high);
+            let lo_lanes = _mm512_permutex2var_epi64(prod0, lo_idx, prod1);
+            let hi_lanes = _mm512_permutex2var_epi64(prod0, hi_idx, prod1);
+            let lo_bytes = _mm512_gf2p8affine_epi64_epi8::<0>(
+                reversed_ident,
+                _mm512_permutexvar_epi8(indices, lo_lanes),
+            );
+            let hi_bytes = _mm512_gf2p8affine_epi64_epi8::<0>(
+                reversed_ident,
+                _mm512_permutexvar_epi8(indices, hi_lanes),
+            );
+            let dst = mats.as_mut_ptr().add(stripe * 16);
+            _mm512_storeu_si512(dst as *mut __m512i, lo_bytes);
+            _mm512_storeu_si512(dst.add(8) as *mut __m512i, hi_bytes);
+        }
     }
 }
 
