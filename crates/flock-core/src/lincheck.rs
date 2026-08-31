@@ -1661,8 +1661,13 @@ fn fold_block_major_gfni(
                             }
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
+                            // Ranked grouped geometry is (`stripe_stride`,
+                            // `n_blocks64`) = (128, 2); the shaped monomorph
+                            // folds those factors. Kill
+                            // `FLOCK_NO_LC_GFNI_TILE_SHAPE=1` keeps runtime
+                            // addressing in the same binary.
                             unsafe {
-                                kernels::gfni_fold_tile(
+                                kernels::gfni_fold_tile_shaped::<128, 2>(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
                                     2,

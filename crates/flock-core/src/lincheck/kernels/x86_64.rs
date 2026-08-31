@@ -369,6 +369,11 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 /// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
 /// later tiles still `loadu` the running acc. Bit-identical to loadu-of-zeros.
 ///
+/// `STRIDE`/`NBLK` are 0 to use the runtime `stripe_stride`/`n_blocks64`, or
+/// the exact runtime values so LLVM folds the eight row addresses and the
+/// two (ranked grouped) 64-column plane bases to one pointer plus
+/// displacements. Same loads, same 128 GFNI affines, same stores.
+///
 /// # Safety
 /// - `tile_bytes_ptr` must point to at least `7 * stripe_stride + n_blocks64 * 64` bytes.
 /// - `mats` holds the tile's 8×16 matrices.
@@ -377,13 +382,16 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 ///   kernel seeds registers from zero and stores every byte of every block.
 ///   With `seed_zero = false`, the full output range must already be
 ///   initialized because every 64-byte plane is loaded before being updated.
+/// - When `STRIDE != 0`, `stripe_stride == STRIDE`. When `NBLK != 0`,
+///   `n_blocks64 == NBLK`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline]
 #[target_feature(enable = "avx512f,gfni")]
-pub(crate) unsafe fn gfni_fold_tile(
+unsafe fn gfni_fold_tile_impl<const STRIDE: usize, const NBLK: usize>(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
     n_blocks64: usize,
@@ -392,6 +400,8 @@ pub(crate) unsafe fn gfni_fold_tile(
     seed_zero: bool,
 ) {
     use core::arch::x86_64::*;
+    let stripe_stride = if STRIDE != 0 { STRIDE } else { stripe_stride };
+    let n_blocks64 = if NBLK != 0 { NBLK } else { n_blocks64 };
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
         for block in 0..n_blocks64 {
@@ -420,6 +430,97 @@ pub(crate) unsafe fn gfni_fold_tile(
                 }
                 _mm512_storeu_si512(plane_ptr, acc);
             }
+        }
+    }
+}
+
+/// `FLOCK_NO_LC_GFNI_TILE_SHAPE=1` restores runtime `stripe_stride` /
+/// `n_blocks64` addressing inside the same binary. Ranked env is cleared,
+/// so the shaped monomorph runs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline]
+fn gfni_tile_shape_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LC_GFNI_TILE_SHAPE").is_some())
+}
+
+/// Runtime-geometry [`gfni_fold_tile_impl`]. Used by the stripe fold and as
+/// the kill-switch body of [`gfni_fold_tile_shaped`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    // SAFETY: forwarded caller contract; STRIDE=NBLK=0 keeps runtime factors.
+    unsafe {
+        gfni_fold_tile_impl::<0, 0>(
+            tile_bytes_ptr,
+            stripe_stride,
+            n_blocks64,
+            mats,
+            out_planes_ptr,
+            seed_zero,
+        )
+    }
+}
+
+/// Ranked identity-C grouped tile: `stripe_stride == STRIDE` and
+/// `n_blocks64 == NBLK` (production is `<128, 2>`). Same bytes as
+/// [`gfni_fold_tile`].
+///
+/// # Safety
+/// Same contract as [`gfni_fold_tile`], plus the shape equalities when the
+/// kill switch is off.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile_shaped<const STRIDE: usize, const NBLK: usize>(
+    tile_bytes_ptr: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[u64; 128],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    // SAFETY: forwarded caller contract; the kill switch uses the runtime
+    // impl, the shaped arm substitutes equal compile-time factors.
+    unsafe {
+        if gfni_tile_shape_disabled() {
+            gfni_fold_tile_impl::<0, 0>(
+                tile_bytes_ptr,
+                stripe_stride,
+                n_blocks64,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            )
+        } else {
+            debug_assert_eq!(stripe_stride, STRIDE);
+            debug_assert_eq!(n_blocks64, NBLK);
+            gfni_fold_tile_impl::<STRIDE, NBLK>(
+                tile_bytes_ptr,
+                STRIDE,
+                NBLK,
+                mats,
+                out_planes_ptr,
+                seed_zero,
+            )
         }
     }
 }
