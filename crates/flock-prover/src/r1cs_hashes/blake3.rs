@@ -2525,7 +2525,8 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
+    let one_rows_elided = cfg!(target_feature = "avx512f")
+        && ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()

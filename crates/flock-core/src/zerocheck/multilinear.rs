@@ -1415,11 +1415,26 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
                     eq_h * out[5],
                     eq_h * out[6],
                     eq_h * out[7],
+                    // W1 carrier probe: slots 6..18 are the width-3 tensor
+                    // coefficients. Left ZERO so the transcript is unchanged
+                    // while the reduction carries the width-3 payload type.
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
                 ],
             )
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 18]),
             |(s1, sinf, sa), (c1, cinf, ca)| {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
@@ -1438,7 +1453,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
 /// them in), all accumulated on the odd lane's weight `r·eq_next`; one `r⁻¹`
 /// puts them back on `eq_next`.
 #[inline]
-fn lookahead_from_odd_weighted(agg: &[F128; 6], r_inv: F128) -> Round3Lookahead {
+fn lookahead_from_odd_weighted(agg: &[F128; 18], r_inv: F128) -> Round3Lookahead {
     let w1 = r_inv * agg[0];
     let w2 = r_inv * agg[1];
     let w0 = r_inv * agg[2];
@@ -1679,11 +1694,26 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     eq_h * out[5],
                     eq_h * out[6],
                     eq_h * out[7],
+                    // W1 carrier probe: width-3 tensor slots, left ZERO
+                    // so the transcript is unchanged while the
+                    // reduction carries the width-3 payload type.
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
                 ],
             )
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 18]),
             |(s1, sinf, sa), (c1, cinf, ca)| {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
@@ -1943,11 +1973,26 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     eq_h * out[5],
                     eq_h * out[6],
                     eq_h * out[7],
+                    // W1 carrier probe: width-3 tensor slots, left ZERO
+                    // so the transcript is unchanged while the
+                    // reduction carries the width-3 payload type.
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
                 ],
             )
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 18]),
             |(s1, sinf, sa), (c1, cinf, ca)| {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
@@ -2852,11 +2897,26 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
                     eq_h * out[5],
                     eq_h * out[6],
                     eq_h * out[7],
+                    // W1 carrier probe: width-3 tensor slots, left ZERO
+                    // so the transcript is unchanged while the
+                    // reduction carries the width-3 payload type.
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
                 ],
             )
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 18]),
             |(s1, sinf, sa), (c1, cinf, ca)| {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
