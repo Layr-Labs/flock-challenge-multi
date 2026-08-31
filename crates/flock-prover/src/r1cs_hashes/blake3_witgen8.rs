@@ -27,8 +27,8 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
-    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
-    round1_ab_table_images,
+    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window30_k0,
+    round1_ab_inner_window_with_images, round1_ab_table_images,
 };
 
 const REC_C0: usize = 0;
@@ -958,7 +958,7 @@ impl StreamProj<'_> {
                 rows.publish_sparse_30(j,q.add(j));
                 let a=&*q.add(j).cast::<[u8;64]>();
                 let out=&mut *self.out.add(j*BYTES_PER_BLOCK+30*64).cast::<[u8;64]>();
-                round1_ab_inner_window_with_images(a,&RANKED_B30.0,out,30,self.inv_table,plan,imgs);
+                round1_ab_inner_window30_k0(a,&RANKED_B30.0,out,self.inv_table,plan,imgs,30);
                 j+=1;
             }
         }

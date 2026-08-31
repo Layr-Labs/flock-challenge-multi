@@ -475,6 +475,45 @@ unsafe fn residual_2img_offw_k2_7(
     }
 }
 
+/// Ranked window 30: only K0 is live (A words 480–481, B = 0x0001_ffff_ffff_ffff
+/// then zeros). Horner of y_1..y_7 = 0 collapses to y_0 = T(A0)·T(B0).
+///
+/// # Safety
+/// `a`/`b` each supply eight readable bytes at offset 0; `out` is 64-byte
+/// aligned; `imgs` are the table's base and σ₈ image. Caller sfence.
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "gfni,avx512f,avx512bw")]
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_window30_k0(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let apply = |bytes: *const u8| {
+            let row = |img: *const u8, i: usize| {
+                _mm512_loadu_si512(img.add(*bytes.add(i) as usize * 64).cast::<__m512i>())
+            };
+            let u0 = _mm512_xor_si512(row(imgs.0, 0), row(imgs.1, 1));
+            let u1 = _mm512_xor_si512(row(imgs.0, 2), row(imgs.1, 3));
+            let u2 = _mm512_xor_si512(row(imgs.0, 4), row(imgs.1, 5));
+            let u3 = _mm512_xor_si512(row(imgs.0, 6), row(imgs.1, 7));
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        };
+        let acc = _mm512_gf2p8mul_epi8(apply(a.as_ptr()), apply(b.as_ptr()));
+        _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
 /// Explicit ranked block-29 subset of [`horner_2img_offw`].
 #[inline(always)]
 #[cfg(all(

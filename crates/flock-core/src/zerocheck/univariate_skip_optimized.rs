@@ -1137,6 +1137,55 @@ pub unsafe fn round1_ab_inner_window_with_images(
     );
 }
 
+/// Ranked default collapses window 30's eight-K Horner to the live K0
+/// product. `FLOCK_NO_R1_WIN30_K0=1` restores the generic eight-K body.
+#[inline]
+pub fn r1_win30_k0_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R1_WIN30_K0").is_none())
+}
+
+/// Window 30: only the first eight bytes of A and B are live. Same bytes as
+/// [`round1_ab_inner_window_with_images`] for this geometry because y_1..y_7
+/// are zero.
+///
+/// # Safety
+/// As [`round1_ab_inner_window_with_images`], with `out` 64-byte aligned for
+/// the ranked nt=2 stream store. Caller sfence.
+#[inline]
+pub unsafe fn round1_ab_inner_window30_k0(
+    a_window: &[u8; 64],
+    b_window: &[u8; 64],
+    out: &mut [u8; 64],
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    if r1_win30_k0_enabled() && plan.nt == 2 && plan.kernel.uses_images() {
+        unsafe {
+            kernels::x86_64::shift_reduce_inner_ab_x86_avx512_window30_k0(
+                a_window,
+                b_window,
+                out,
+                (imgs.0, imgs.1),
+            );
+        }
+        return;
+    }
+    unsafe {
+        round1_ab_inner_window_with_images(
+            a_window, b_window, out, blk, inv_table, plan, imgs,
+        );
+    }
+}
+
 /// `u16` count of one window-block's pre-scaled offset block for
 /// [`round1_ab_inner_window_from_offsets`].
 pub const ROUND1_AB_OFF_WORDS: usize = 128;
