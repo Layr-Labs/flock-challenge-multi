@@ -10,6 +10,15 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_LOW_OUTER_FUSED2=1` restores the general outer product in
+/// row-from fused-two transforms. The low form is selected only after checking
+/// the actual outer twiddle, so non-eligible rows retain the incumbent path.
+#[inline]
+fn low_outer_fused2_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED2").is_some())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -478,28 +487,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, false>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
-        } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, false>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
+        let outer_low = !low_outer_fused2_disabled() && twiddles[0].hi == 0;
+        match (mul_diet_disabled(), outer_low) {
+            (true, false) => butterfly_fused_2layer_row_from_geo_impl::<false, false, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (true, true) => butterfly_fused_2layer_row_from_geo_impl::<true, false, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_geo_impl::<false, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_geo_impl::<true, true, false>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
         }
     }
 }
@@ -527,28 +528,20 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
     debug_assert_eq!(dst as usize % 16, 0);
     // SAFETY: forwarded caller contract.
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_geo_impl::<false, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
-        } else {
-            butterfly_fused_2layer_row_from_geo_impl::<true, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst,
-                dst_quarter,
-                dst_r,
-                num_ntts,
-                twiddles,
-            )
+        let outer_low = !low_outer_fused2_disabled() && twiddles[0].hi == 0;
+        match (mul_diet_disabled(), outer_low) {
+            (true, false) => butterfly_fused_2layer_row_from_geo_impl::<false, false, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (true, true) => butterfly_fused_2layer_row_from_geo_impl::<true, false, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_geo_impl::<false, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_geo_impl::<true, true, true>(
+                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, twiddles,
+            ),
         }
     }
 }
@@ -559,7 +552,11 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo_nt(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: bool>(
+unsafe fn butterfly_fused_2layer_row_from_geo_impl<
+    const OUTER_LOW: bool,
+    const DIET: bool,
+    const NT: bool,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -575,7 +572,8 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
     // SAFETY: caller guarantees target features, pointer geometry, and
     // non-aliasing src/dst.
     unsafe {
-        let outer = tw_x4::<false, DIET>(t_outer);
+        debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
         let inner_a = tw_x4::<false, DIET>(t_inner_a);
         let inner_b = tw_x4::<false, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
@@ -588,10 +586,10 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<const DIET: bool, const NT: b
             let mut vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
             let mut vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
+            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
             vc = _mm512_xor_si512(vc, new_a);
             va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
+            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
             vd = _mm512_xor_si512(vd, new_b);
             vb = new_b;
 
@@ -919,32 +917,24 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     pf_src: *const F128,
 ) {
     unsafe {
-        if mul_diet_disabled() {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false>(
-                src,
-                src_quarter,
-                src_r,
-                dst_sparse,
-                dst_dense,
-                dst_quarter,
-                num_ntts,
-                right_twiddle,
-                dense_tw,
-                pf_src,
-            )
-        } else {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true>(
-                src,
-                src_quarter,
-                src_r,
-                dst_sparse,
-                dst_dense,
-                dst_quarter,
-                num_ntts,
-                right_twiddle,
-                dense_tw,
-                pf_src,
-            )
+        let outer_low = !low_outer_fused2_disabled() && dense_tw[0].hi == 0;
+        match (mul_diet_disabled(), outer_low) {
+            (true, false) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts,
+                right_twiddle, dense_tw, pf_src,
+            ),
+            (true, true) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts,
+                right_twiddle, dense_tw, pf_src,
+            ),
+            (false, false) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, false>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts,
+                right_twiddle, dense_tw, pf_src,
+            ),
+            (false, true) => butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts,
+                right_twiddle, dense_tw, pf_src,
+            ),
         }
     }
 }
@@ -954,7 +944,10 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool>(
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
+    const DIET: bool,
+    const OUTER_LOW: bool,
+>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -970,8 +963,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     let pf = !pf_src.is_null();
     unsafe {
+        debug_assert!(!OUTER_LOW || t_outer.hi == 0);
         let sparse_b = tw_x4::<false, DIET>(right_twiddle);
-        let outer = tw_x4::<false, DIET>(t_outer);
+        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
         let inner_a = tw_x4::<false, DIET>(t_inner_a);
         let inner_b = tw_x4::<false, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
@@ -1004,10 +998,10 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
             _mm512_storeu_si512(sp_row(2).add(lane) as *mut __m512i, sc);
             _mm512_storeu_si512(sp_row(3).add(lane) as *mut __m512i, sd);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(outer, vc));
+            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
             let vc = _mm512_xor_si512(vc, new_a);
             let va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<false, DIET>(outer, vd));
+            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
             let vd = _mm512_xor_si512(vd, new_b);
             let vb = new_b;
             let new_a = _mm512_xor_si512(va, mul_x4::<false, DIET>(inner_a, vb));
@@ -2064,7 +2058,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_geo_impl::<true, false>(
+                        butterfly_fused_2layer_row_from_geo_impl::<false, true, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2075,7 +2069,7 @@ mod diet_tests {
                             &tw3,
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_geo_impl::<false, false>(
+                        butterfly_fused_2layer_row_from_geo_impl::<false, false, false>(
                             src.as_ptr(),
                             1,
                             0,

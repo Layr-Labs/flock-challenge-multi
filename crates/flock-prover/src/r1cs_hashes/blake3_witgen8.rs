@@ -106,6 +106,30 @@ struct PreparedInputs {
     flags: V8,
 }
 
+/// `FLOCK_NO_EY_DEAD_W31=1` restores the incumbent projection of ranked
+/// window 31. Default ON; the ranked worker's cleared environment never
+/// disables it.
+///
+/// Window 31 is `w = 1, b_med = 15`. Round one reads window `w * 16 + b_med`
+/// only for `b_med < n_b_med[w]`, and `build_b_med_counts` gives
+/// `n_b_med[1] = ceil((USEFUL_BITS - 8192) / 512) = 15` at the pinned BLAKE3
+/// shape (`K_LOG = 14`, `USEFUL_BITS = 15409`), so `b_med = 15` is past the
+/// last live window. Nothing else reads those bytes: every `ab_inner`
+/// consumer is one of the three `b_med < n_b_med` copy loops, and the cold
+/// `restore_full_if_ranked_one_rows_elided` fallback recomputes the whole
+/// buffer from raw a/b rather than reading it.
+///
+/// Same precedent as the elided one-rows: under `one_rows_elided` windows 0
+/// and 1 are already left unwritten because round one starts at
+/// `first_b_med = 2`. The elision is gated on that same brand, so the exact
+/// shape assumptions above are the ones already asserted for it.
+#[inline(always)]
+fn ey_dead_w31_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EY_DEAD_W31").is_none());
+    *ON
+}
+
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
 /// handles the low limbs; the two cross-products supply bits 32..63. The
 /// high×high term is above bit 63 and is discarded, exactly like
@@ -1578,10 +1602,18 @@ impl Drain8<'_> {
             let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
             let b_g1=if E||self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
             let (sa, sb) = proj.sides();
+            // Window 31 is `w = 1, b_med = 15`, one past round one's last live
+            // b_med at the pinned BLAKE3 shape — its 64 output bytes are never
+            // read, exactly as windows 0 and 1 are never read under the same
+            // `one_rows_elided` brand. Resolved once per call, not per window.
+            let dead_w31 = E && proj.one_rows_elided && ey_dead_w31_enabled();
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
+                if dead_w31 && blk == 31 {
+                    continue;
+                }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
                     let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
