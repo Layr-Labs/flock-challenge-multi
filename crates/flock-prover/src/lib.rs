@@ -40,3 +40,18 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 #[used]
 static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+
+/// Layout probe. A used static of fixed size; its presence and size move the
+/// placement of the objects laid out after it, without changing any code path.
+#[used]
+static EY_V_ROLL: [u8; 992] = [0u8; 992];
+
+/// Qualified public layout probes PR #2270, #2273 and #2279, stacked
+/// under unique symbols so their independently retained perturbations can
+/// be measured together without changing any executable code path.
+#[used]
+static EY_V_ROLL_320_STACK: [u8; 320] = [0u8; 320];
+#[used]
+static EY_V_ROLL_2048_STACK: [u8; 2048] = [0u8; 2048];
+#[used]
+static EY_V_ROLL_703_STACK: [u8; 703] = [0u8; 703];
