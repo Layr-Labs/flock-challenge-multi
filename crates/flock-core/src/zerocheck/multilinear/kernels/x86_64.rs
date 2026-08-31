@@ -67,7 +67,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
@@ -75,14 +75,20 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
 
     // Fold four adjacent output elements and return them in one ZMM.
+    // `SPLIT` is the 5-CLMUL split product with a hoisted `r·x^64`
+    // companion; the kill switch restores the incumbent 6-CLMUL
+    // `ghash_mul_x4`. Field-identical either way (reduction is a ring
+    // homomorphism). The bool is process-constant.
     #[inline(always)]
     unsafe fn fold_x4(
         src: *const F128,
         r: __m512i,
+        r64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
+        split: bool,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split};
         use core::arch::x86_64::*;
 
         // SAFETY: caller supplies eight readable F128 values at src.
@@ -91,7 +97,13 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            let diff = _mm512_xor_si512(even, odd);
+            let prod = if split {
+                ghash_mul_x4_split(diff, r, r64)
+            } else {
+                ghash_mul_x4(r, diff)
+            };
+            _mm512_xor_si512(even, prod)
         }
     }
 
@@ -99,6 +111,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     // cfg gate supplies every intrinsic feature.
     unsafe {
         let r = _mm512_broadcast_i32x4(_mm_set_epi64x(r_fold.hi as i64, r_fold.lo as i64));
+        let split = zc_fold_split_enabled();
+        // Companion is one CLMUL, hoisted once per worker chunk — the same
+        // amortisation `fold_pairs` and the round-2 `wsplit` path already use.
+        let r64 = if split { ghash_shift64_x4(r) } else { r };
         // Select even/odd F128 lanes from two concatenated ZMM inputs. The same
         // selectors deinterleave fold inputs and gather message a0/a1 lanes.
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
@@ -111,10 +127,24 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 
         while x_lo + 4 <= eq_lo.len() {
             let output = 2 * x_lo;
-            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let a_hi = fold_x4(a_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
-            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_hi = fold_x4(b_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
+            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+            let a_hi = fold_x4(
+                a_in.as_ptr().add(2 * (output + 4)),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
+            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+            let b_hi = fold_x4(
+                b_in.as_ptr().add(2 * (output + 4)),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -137,8 +167,22 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         if x_lo < eq_lo.len() {
             debug_assert_eq!(eq_lo.len() - x_lo, 2);
             let output = 2 * x_lo;
-            let a_folded = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_folded = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
+            let a_folded = fold_x4(
+                a_in.as_ptr().add(2 * output),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
+            let b_folded = fold_x4(
+                b_in.as_ptr().add(2 * output),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -1365,6 +1409,15 @@ pub(crate) fn zc_wtab_enabled() -> bool {
 pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
+    *ON
+}
+
+/// Ranked default: the generic-tail fused fold uses the 5-CLMUL split
+/// product with a chunk-hoisted `r·x^64` companion. `FLOCK_NO_ZC_FOLD_SPLIT=1`
+/// restores the incumbent 6-CLMUL `ghash_mul_x4` in the same binary.
+fn zc_fold_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_SPLIT").is_none());
     *ON
 }
 
