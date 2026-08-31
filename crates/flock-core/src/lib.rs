@@ -502,7 +502,6 @@ pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     rayon::join(op, || ()).0
 }
 
-
 /// Best-effort `madvise(MADV_COLLAPSE)` over an already-touched buffer: where
 /// the first-touch faults lost the THP lottery under fragmentation, this asks
 /// the kernel to assemble the range into 2 MiB pages synchronously; where they
@@ -548,7 +547,6 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
-
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.

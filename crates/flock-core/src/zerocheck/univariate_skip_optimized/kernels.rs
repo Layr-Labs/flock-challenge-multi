@@ -644,7 +644,6 @@ pub(super) fn stage_c_group(src: &[u8], dst: &mut [u8; 4 * 16 * 64]) {
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[inline]
 /// First-write form of [`accumulate_c_banks_fold4_fused_gfni`], for the first
 /// live group of a band.
 #[cfg(all(
@@ -668,7 +667,15 @@ pub(super) fn write_c_banks_fold4_fused_gfni(
         x86_64::write_c_banks_fold4_fused_x86_gfni(c_group, n_b_med, mats, plane_banks);
     }
 }
-
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
 pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],

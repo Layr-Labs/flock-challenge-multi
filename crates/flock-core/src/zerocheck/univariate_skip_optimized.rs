@@ -2436,9 +2436,8 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
 /// clear-then-accumulate form, which is the byte-identity oracle.
 #[inline]
 fn c_plane_first_write_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none());
     *ON
 }
 

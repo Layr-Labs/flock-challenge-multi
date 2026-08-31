@@ -590,7 +590,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 2 * 64).cast::<[u8; 64]>();
+                let out = &mut *proj
+                    .out
+                    .add(j * BYTES_PER_BLOCK + 2 * 64)
+                    .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
@@ -608,7 +611,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + 29 * 64).cast::<[u8; 64]>();
+                let out = &mut *proj
+                    .out
+                    .add(j * BYTES_PER_BLOCK + 29 * 64)
+                    .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
@@ -626,7 +632,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline(
         let mut j = 0usize;
         while j != 8 {
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-            let out = &mut *proj.out.add(j * BYTES_PER_BLOCK + blk * 64).cast::<[u8; 64]>();
+            let out = &mut *proj
+                .out
+                .add(j * BYTES_PER_BLOCK + blk * 64)
+                .cast::<[u8; 64]>();
             if plan.bcomplement_static_eligible() {
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
                     &*off
@@ -2555,8 +2564,14 @@ mod tests {
                     _mm512_storeu_si512(got_b.as_mut_ptr().cast::<__m512i>(), b_rows[row]);
                     let mut rollback_a = [0u32; STEP_WORDS];
                     let mut rollback_b = [0u32; STEP_WORDS];
-                    _mm512_storeu_si512(rollback_a.as_mut_ptr().cast::<__m512i>(), rollback_a_rows[row]);
-                    _mm512_storeu_si512(rollback_b.as_mut_ptr().cast::<__m512i>(), rollback_b_rows[row]);
+                    _mm512_storeu_si512(
+                        rollback_a.as_mut_ptr().cast::<__m512i>(),
+                        rollback_a_rows[row],
+                    );
+                    _mm512_storeu_si512(
+                        rollback_b.as_mut_ptr().cast::<__m512i>(),
+                        rollback_b_rows[row],
+                    );
                     assert_eq!(
                         &staged.a[row * STEP_WORDS..(row + 1) * STEP_WORDS],
                         &got_a,
@@ -2567,11 +2582,23 @@ mod tests {
                         &got_b,
                         "staged b row mismatch, case={case} row={row}"
                     );
-                    assert_eq!(rollback_a, got_a, "rollback a row mismatch, case={case} row={row}");
-                    assert_eq!(rollback_b, got_b, "rollback b row mismatch, case={case} row={row}");
+                    assert_eq!(
+                        rollback_a, got_a,
+                        "rollback a row mismatch, case={case} row={row}"
+                    );
+                    assert_eq!(
+                        rollback_b, got_b,
+                        "rollback b row mismatch, case={case} row={row}"
+                    );
                 }
-                assert_eq!(inline_off.0, staged_off.0, "inline offset mismatch, case={case}");
-                assert_eq!(rollback_off.0, staged_off.0, "rollback offset mismatch, case={case}");
+                assert_eq!(
+                    inline_off.0, staged_off.0,
+                    "inline offset mismatch, case={case}"
+                );
+                assert_eq!(
+                    rollback_off.0, staged_off.0,
+                    "rollback offset mismatch, case={case}"
+                );
 
                 let mut staged_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                 let mut staged_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
@@ -2579,10 +2606,16 @@ mod tests {
                 let mut direct_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                 let mut direct_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                 let mut direct_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
-                let staged_rows =
-                    RankedRows::new(staged_z.0.as_mut_ptr(), staged_a.0.as_mut_ptr(), staged_b.0.as_mut_ptr());
-                let direct_rows =
-                    RankedRows::new(direct_z.0.as_mut_ptr(), direct_a.0.as_mut_ptr(), direct_b.0.as_mut_ptr());
+                let staged_rows = RankedRows::new(
+                    staged_z.0.as_mut_ptr(),
+                    staged_a.0.as_mut_ptr(),
+                    staged_b.0.as_mut_ptr(),
+                );
+                let direct_rows = RankedRows::new(
+                    direct_z.0.as_mut_ptr(),
+                    direct_a.0.as_mut_ptr(),
+                    direct_b.0.as_mut_ptr(),
+                );
                 for j in 0..8 {
                     staged_rows.publish_dense(j, staged.a.as_ptr(), staged.b.as_ptr());
                     direct_rows.publish_dense_values(j, a_rows[j], b_rows[j]);
