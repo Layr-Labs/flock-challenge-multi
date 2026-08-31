@@ -1246,6 +1246,15 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: skip kernel-zero of the identity-C reduce output.
+/// Every slot is stored by `reduce_block`. `FLOCK_NO_LC_REDUCE_UNINIT=1`
+/// restores `vec![F128::ZERO]`.
+fn lc_reduce_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_UNINIT").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1756,11 +1765,22 @@ fn fold_block_major_gfni(
         .collect();
     let live_blocks = useful_bits.div_ceil(64);
     let out_len = if top_bind.is_some() { k / 2 } else { k };
-    // Keep output initialized as F128 throughout. The much larger plane
-    // buffer carries the dead zero-fill; avoiding this comparatively small
-    // clear would require a separate MaybeUninit ownership conversion.
-    let mut out = vec![F128::ZERO; out_len];
-    let mut one = ranked_one_rows.then(|| vec![F128::ZERO; out_len]);
+    // Every 64-column slot is stored by `reduce_block` (live GFNI planes or
+    // an explicit padding zero). Kernel-zeroing the output is dead; the
+    // plane buffer still carries MaybeUninit. `FLOCK_NO_LC_REDUCE_UNINIT=1`
+    // restores `vec![ZERO]`.
+    let mut out = if lc_reduce_uninit_enabled() {
+        crate::alloc_uninit_f128_vec(out_len)
+    } else {
+        vec![F128::ZERO; out_len]
+    };
+    let mut one = ranked_one_rows.then(|| {
+        if lc_reduce_uninit_enabled() {
+            crate::alloc_uninit_f128_vec(out_len)
+        } else {
+            vec![F128::ZERO; out_len]
+        }
+    });
     debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
     let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
         if blk < live_blocks {
