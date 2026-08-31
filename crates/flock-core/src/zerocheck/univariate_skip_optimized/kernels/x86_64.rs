@@ -1979,9 +1979,29 @@ pub(crate) unsafe fn accumulate_c_banks_fold4_fused_x86_gfni(
     mats: &[u64; C_FOLD4_MATS_PER_GROUP],
     plane_banks: &mut [u8; C_PLANE_BANK_BYTES],
 ) {
-    // SAFETY: same contract as this function's own.
+    // The ranked BLAKE3 shape repeats [16, 15, 16, 15] across a four-window
+    // group. In that shape exactly one row is absent: b_med=15 in the fourth
+    // window. The const-specialized loader removes the per-row bounds tests
+    // while preserving the same zero row. All other padding shapes retain
+    // the general checked loader.
+    let partial_alt = c_partial_matrix_enabled() && *n_b_med == [16, 15, 16, 15];
+    // SAFETY: both implementations have this function's contract.
     unsafe {
-        accumulate_c_banks_fold4_fused_x86_gfni_impl::<false>(c_group, n_b_med, mats, plane_banks);
+        if partial_alt {
+            accumulate_c_banks_fold4_fused_x86_gfni_impl::<false, true>(
+                c_group,
+                n_b_med,
+                mats,
+                plane_banks,
+            );
+        } else {
+            accumulate_c_banks_fold4_fused_x86_gfni_impl::<false, false>(
+                c_group,
+                n_b_med,
+                mats,
+                plane_banks,
+            );
+        }
     }
 }
 
@@ -2011,10 +2031,33 @@ pub(crate) unsafe fn write_c_banks_fold4_fused_x86_gfni(
     mats: &[u64; C_FOLD4_MATS_PER_GROUP],
     plane_banks: &mut [u8; C_PLANE_BANK_BYTES],
 ) {
-    // SAFETY: same contract as the accumulating twin.
+    let partial_alt = c_partial_matrix_enabled() && *n_b_med == [16, 15, 16, 15];
+    // SAFETY: both implementations have this function's contract.
     unsafe {
-        accumulate_c_banks_fold4_fused_x86_gfni_impl::<true>(c_group, n_b_med, mats, plane_banks);
+        if partial_alt {
+            accumulate_c_banks_fold4_fused_x86_gfni_impl::<true, true>(
+                c_group,
+                n_b_med,
+                mats,
+                plane_banks,
+            );
+        } else {
+            accumulate_c_banks_fold4_fused_x86_gfni_impl::<true, false>(
+                c_group,
+                n_b_med,
+                mats,
+                plane_banks,
+            );
+        }
     }
+}
+
+/// Same-binary rollback for the ranked partial-row matrix loader.
+#[inline]
+fn c_partial_matrix_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C_PARTIAL_MATRIX").is_none());
+    *ON
 }
 
 #[inline]
@@ -2027,7 +2070,10 @@ pub(crate) unsafe fn write_c_banks_fold4_fused_x86_gfni(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
+unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<
+    const FIRST_WRITE: bool,
+    const PARTIAL_ALT: bool,
+>(
     c_group: &[u8],
     n_b_med: &[usize; 4],
     mats: &[u64; C_FOLD4_MATS_PER_GROUP],
@@ -2058,15 +2104,51 @@ unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
                 // medium row `4*j + q`; dead rows stay zero exactly as the
                 // incumbent's `dst.fill(0)` leaves them.
                 let mut rows = [_mm512_setzero_si512(); 8];
-                for wj in 0..2usize {
-                    let w = 2 * half + wj;
-                    let live = n_b_med[w];
-                    for j in 0..4usize {
-                        let b_med = 4 * j + q;
-                        if b_med < live {
-                            rows[4 * wj + j] =
-                                _mm512_loadu_si512(base.add(w * WINDOW_BYTES + b_med * ROW_BYTES)
-                                    as *const __m512i);
+                if PARTIAL_ALT {
+                    // The only missing row in [16,15,16,15] is b_med=15
+                    // (the fourth row of the second window) when q=3.
+                    // Spell out the fixed geometry so the hot path has no
+                    // live-count comparisons or loop branches.
+                    rows[0] = _mm512_loadu_si512(
+                        base.add((0 * WINDOW_BYTES + q * ROW_BYTES)) as *const __m512i
+                    );
+                    rows[1] = _mm512_loadu_si512(
+                        base.add((0 * WINDOW_BYTES + (4 + q) * ROW_BYTES)) as *const __m512i,
+                    );
+                    rows[2] = _mm512_loadu_si512(
+                        base.add((0 * WINDOW_BYTES + (8 + q) * ROW_BYTES)) as *const __m512i,
+                    );
+                    rows[3] = _mm512_loadu_si512(
+                        base.add((0 * WINDOW_BYTES + (12 + q) * ROW_BYTES)) as *const __m512i,
+                    );
+                    rows[4] = _mm512_loadu_si512(
+                        base.add((2 * WINDOW_BYTES + q * ROW_BYTES)) as *const __m512i
+                    );
+                    rows[5] = _mm512_loadu_si512(
+                        base.add((2 * WINDOW_BYTES + (4 + q) * ROW_BYTES)) as *const __m512i,
+                    );
+                    rows[6] = _mm512_loadu_si512(
+                        base.add((2 * WINDOW_BYTES + (8 + q) * ROW_BYTES)) as *const __m512i,
+                    );
+                    rows[7] = if q == 3 {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(
+                            base.add((2 * WINDOW_BYTES + (12 + q) * ROW_BYTES)) as *const __m512i
+                        )
+                    };
+                } else {
+                    for wj in 0..2usize {
+                        let w = 2 * half + wj;
+                        let live = n_b_med[w];
+                        for j in 0..4usize {
+                            let b_med = 4 * j + q;
+                            if b_med < live {
+                                rows[4 * wj + j] = _mm512_loadu_si512(
+                                    base.add(w * WINDOW_BYTES + b_med * ROW_BYTES)
+                                        as *const __m512i,
+                                );
+                            }
                         }
                     }
                 }
