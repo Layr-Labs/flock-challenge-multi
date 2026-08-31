@@ -901,13 +901,76 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         k_log,
         useful_bits,
         |outer_base| {
-            std::array::from_fn(|r| {
-                let outer = outer_base + r;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
+            eq8_from_factors(eq_lo, eq_hi, outer_base, log_b, lo_mask)
         },
         top_bind,
     )
+}
+
+/// Eight consecutive factorized outer weights starting at `outer_base`.
+/// The ranked GFNI caller supplies eight-aligned bases. In that geometry the
+/// high factor is shared by all lanes and the low factors are contiguous, so
+/// use the split four-lane multiply. Other geometries stay scalar.
+fn eq8_from_factors(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if log_b >= 3 && outer_base % 8 == 0 {
+        return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
+    }
+    std::array::from_fn(|r| {
+        let outer = outer_base + r;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
+}
+
+/// Two split 4-lane products of the factorized equality tensor.
+///
+/// # Safety
+/// The caller must run with AVX-512F and VPCLMULQDQ. The dispatcher proves
+/// the shared-high geometry and the caller supplies an in-range full stripe.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn eq8_from_factors_x4(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{
+        f128x4_loadu, f128x4_set, ghash_mul_x4_split, ghash_shift64_x4,
+    };
+    use core::arch::x86_64::*;
+    let lo_base = outer_base & lo_mask;
+    debug_assert!(lo_base + 8 <= eq_lo.len());
+    debug_assert_eq!(outer_base >> log_b, (outer_base + 7) >> log_b);
+    let t = eq_hi[outer_base >> log_b];
+    let mut out = [F128::ZERO; 8];
+    // SAFETY: the dispatcher proves the geometry; loads/stores cover exactly
+    // the eight scalar low factors and output lanes.
+    unsafe {
+        let tb = f128x4_set(t, t, t, t);
+        let tx = ghash_shift64_x4(tb);
+        let p = eq_lo.as_ptr().add(lo_base);
+        let r0 = ghash_mul_x4_split(f128x4_loadu(p), tb, tx);
+        let r1 = ghash_mul_x4_split(f128x4_loadu(p.add(4)), tb, tx);
+        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, r0);
+        _mm512_storeu_si512(out.as_mut_ptr().add(4) as *mut __m512i, r1);
+    }
+    out
 }
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
