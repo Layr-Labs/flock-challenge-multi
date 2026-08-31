@@ -1145,16 +1145,17 @@ macro_rules! pushf8 {
 }
 
 #[inline(always)]
-fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8, V8) {
+fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8) {
     // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
     // `left = x ^ cin` and `right = y ^ cin`, and both collapse algebraically
     // (`left = sum ^ y`, `right = sum ^ x`). Computing them off `sum` removes
     // the carry-in XOR chain entirely — bit-identical outputs, one op less.
+    // Every G-site discarded the fourth return (`carry = left & right`).
+    // Materialising that AND is dead vector work on the ranked 8-wide G.
     let sum = add_v8(x, y);
     let left = xor_v8(sum, y);
     let right = xor_v8(sum, x);
-    let carry = and_v8(left, right);
-    (sum, left, right, carry)
+    (sum, left, right)
 }
 
 #[inline(always)]
@@ -2067,25 +2068,25 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
-                let (t0, l0, r0, _) = add_carry_parts_v8(state[$la], state[$lb]);
+                let (t0, l0, r0) = add_carry_parts_v8(state[$la], state[$lb]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                let (a1, l1, r1, _) = add_carry_parts_v8(t0, m[$mx]);
+                let (a1, l1, r1) = add_carry_parts_v8(t0, m[$mx]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
-                let (c1s, l2, r2, _) = add_carry_parts_v8(state[$lc], d1);
+                let (c1s, l2, r2) = add_carry_parts_v8(state[$lc], d1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
-                let (t1, l3, r3, _) = add_carry_parts_v8(a1, b1);
+                let (t1, l3, r3) = add_carry_parts_v8(a1, b1);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                let (a2, l4, r4, _) = add_carry_parts_v8(t1, m[$my]);
+                let (a2, l4, r4) = add_carry_parts_v8(t1, m[$my]);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
-                let (c2s, l5, r5, _) = add_carry_parts_v8(c1s, d2);
+                let (c2s, l5, r5) = add_carry_parts_v8(c1s, d2);
                 pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                 pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
