@@ -60,3 +60,4 @@ static EY_V_ROLL_703_STACK: [u8; 703] = [0u8; 703];
 /// can coexist with the earlier retained layout inputs.
 #[used]
 static EY_V_ROLL_2491_STACK: [u8; 2491] = [0u8; 2491];
+// zarar-crown-redraw-001: public frontier resample marker; no executable change.
