@@ -363,7 +363,8 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
 }
 
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
-/// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
+/// accumulators fold the eight stripes' GFNI products. Issue all eight
+/// independent affines before their XOR tree to cover GFNI latency.
 ///
 /// `seed_zero` replaces the first-tile `_mm512_loadu_si512` of a known-zero
 /// plane buffer with `_mm512_setzero_si512`. XOR identity: `0 ⊕ x = x`, so
@@ -407,17 +408,42 @@ pub(crate) unsafe fn gfni_fold_tile(
                 } else {
                     _mm512_loadu_si512(plane_ptr as *const __m512i)
                 };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                }
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[byte_k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + byte_k] as i64),
+                );
+                let g2 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + byte_k] as i64),
+                );
+                let g3 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + byte_k] as i64),
+                );
+                let g4 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + byte_k] as i64),
+                );
+                let g5 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + byte_k] as i64),
+                );
+                let g6 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + byte_k] as i64),
+                );
+                let g7 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g2, g3);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g4, g5);
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g6, g7);
                 _mm512_storeu_si512(plane_ptr, acc);
             }
         }
