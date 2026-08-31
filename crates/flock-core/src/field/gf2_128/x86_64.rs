@@ -612,6 +612,51 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// Accumulate two adjacent products per lane using Karatsuba.
+    ///
+    /// Each 128-bit lane packs the matching limbs of two adjacent source
+    /// values. The `00` and `11` products therefore contribute the two
+    /// independent banks; [`Self::finish_karatsuba`] reconstructs the middle
+    /// coefficient after all pairs are accumulated.
+    ///
+    /// # Safety
+    /// The operands must use the paired-limb lane layout above; the caller
+    /// must ensure `avx512f` and `vpclmulqdq`.
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_paired_karatsuba(
+        &mut self,
+        x_lo: __m512i,
+        x_hi: __m512i,
+        w_lo: __m512i,
+        w_hi: __m512i,
+    ) {
+        let lower = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(x_lo, w_lo),
+            _mm512_clmulepi64_epi128::<0x11>(x_lo, w_lo),
+        );
+        let upper = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(x_hi, w_hi),
+            _mm512_clmulepi64_epi128::<0x11>(x_hi, w_hi),
+        );
+        let x_sum = _mm512_xor_si512(x_lo, x_hi);
+        let w_sum = _mm512_xor_si512(w_lo, w_hi);
+        let diagonal = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(x_sum, w_sum),
+            _mm512_clmulepi64_epi128::<0x11>(x_sum, w_sum),
+        );
+        self.lo = _mm512_xor_si512(self.lo, lower);
+        self.hi = _mm512_xor_si512(self.hi, upper);
+        self.mid = _mm512_xor_si512(self.mid, diagonal);
+    }
+
+    /// Convert the accumulated Karatsuba diagonal into the true middle term.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn finish_karatsuba(&mut self) {
+        self.mid = _mm512_xor_si512(self.mid, _mm512_xor_si512(self.lo, self.hi));
+    }
+
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
     /// operand, specialized.
     ///

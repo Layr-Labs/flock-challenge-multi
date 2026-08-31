@@ -243,16 +243,38 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
-            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        let wb: [(__m512i, __m512i); 8] = core::array::from_fn(|pair| {
+            let even = 2 * pair;
+            let odd = even + 1;
+            let lo = _mm512_set_epi64(
+                w[odd].lo as i64,
+                w[even].lo as i64,
+                w[odd].lo as i64,
+                w[even].lo as i64,
+                w[odd].lo as i64,
+                w[even].lo as i64,
+                w[odd].lo as i64,
+                w[even].lo as i64,
+            );
+            let hi = _mm512_set_epi64(
+                w[odd].hi as i64,
+                w[even].hi as i64,
+                w[odd].hi as i64,
+                w[even].hi as i64,
+                w[odd].hi as i64,
+                w[even].hi as i64,
+                w[odd].hi as i64,
+                w[even].hi as i64,
+            );
+            (lo, hi)
         });
         // 4×4 transpose of 128-bit lanes: stage-1 index vectors interleave
         // lanes {0,1} / {2,3} of two inputs; stage 2 gathers lanes {0,1} /
         // {2,3} of the two stage-1 results.
         let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
         let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let pair_lo = _mm512_set_epi64(14, 10, 12, 8, 6, 2, 4, 0);
+        let pair_hi = _mm512_set_epi64(15, 11, 13, 9, 7, 3, 5, 1);
         let quads = dst.len() & !3;
         let pf_ahead = fold16_pf_ahead();
         let pf_limit = src.len().saturating_sub(64);
@@ -281,15 +303,16 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1); // [a0.L2 a1.L2 a0.L3 a1.L3]
                 let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
                 let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2); // bank 4g+0 over slots 0..4
-                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
-                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
-                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                let x01_lo = _mm512_permutex2var_epi64(t0, pair_lo, t2);
+                let x01_hi = _mm512_permutex2var_epi64(t0, pair_hi, t2);
+                let x23_lo = _mm512_permutex2var_epi64(t1, pair_lo, t3);
+                let x23_hi = _mm512_permutex2var_epi64(t1, pair_hi, t3);
+                let (w01_lo, w01_hi) = wb[2 * g];
+                let (w23_lo, w23_hi) = wb[2 * g + 1];
+                acc.mul_acc_paired_karatsuba(x01_lo, x01_hi, w01_lo, w01_hi);
+                acc.mul_acc_paired_karatsuba(x23_lo, x23_hi, w23_lo, w23_hi);
             }
+            acc.finish_karatsuba();
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
         }
