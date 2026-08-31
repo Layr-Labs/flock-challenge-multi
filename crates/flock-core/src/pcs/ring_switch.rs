@@ -1489,15 +1489,17 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
 
     if x_inner_rest_tail.len() == 7 {
         // Ranked shape: retain six coordinates and bind the sole remaining
-        // coordinate with the characteristic-two one-multiply form.
+        // coordinate with the characteristic-two one-multiply form. Keep the
+        // low half in the result buffer so the architecture-dispatching
+        // split-bind leaf can consume complete contiguous chunks.
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
-        let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        let mut out = z0.to_vec();
+        let chunk_len = (half / rayon::current_num_threads().max(1)).max(64);
+        out.par_chunks_mut(chunk_len)
+            .zip(z1.par_chunks(chunk_len))
+            .for_each(|(lo, hi)| crate::field::f128_slice::bind_split_half(lo, hi, r));
         return out;
     }
 
@@ -2107,6 +2109,91 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
         w = crate::field::mul_by_x(w);
     }
     cols
+}
+/// The AVX-512 DirectFold8 consumer repeatedly composes the same fixed byte
+/// map with different `e_hi` values. Precompute the two 64-bit input halves of
+/// that map once so each block only generates `X^b · e_hi` and applies the
+/// existing two-map GFNI leaf.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(crate) struct GfniDirectFoldMap {
+    low: [u64; 128],
+    high: [u64; 128],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline]
+pub(crate) fn build_gfni_direct_fold_map_from_generators(
+    generators: &[F128],
+) -> GfniDirectFoldMap {
+    assert_eq!(generators.len(), 1 << LOG_PACKING);
+    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+    GfniDirectFoldMap {
+        low: build_row_fold_mats_from_cols(&generators[..64]),
+        high: build_row_fold_mats_from_cols(&generators[64..]),
+    }
+}
+
+/// Compose a fixed byte-linear fold map with multiplication by `e_hi`,
+/// returning the two GFNI matrix blocks needed for the low and high halves of
+/// the input. The composition is emitted directly by the map-plane kernel:
+/// neither the 128 intermediate `F128` columns nor their second transpose is
+/// materialized.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline(always)]
+pub(crate) fn compose_block_mats_gfni(
+    map: &GfniDirectFoldMap,
+    e_hi: F128,
+) -> ([u64; 128], [u64; 128]) {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
+
+    let mut low_mats = [0u64; 128];
+    let mut high_mats = [0u64; 128];
+    let mut low_rows = [0u64; 64];
+    let mut high_rows = [0u64; 64];
+    let mut w = e_hi;
+    for chunk in 0..2 {
+        for lane in 0..64 {
+            low_rows[lane] = w.lo;
+            high_rows[lane] = w.hi;
+            w = crate::field::mul_by_x(w);
+        }
+        let mats = if chunk == 0 {
+            &mut low_mats
+        } else {
+            &mut high_mats
+        };
+        // SAFETY: both row arrays hold 64 initialized u64 values, the output
+        // matrix block is fully overwritten, and this function's cfg supplies
+        // every target feature required by the leaf.
+        unsafe {
+            gfni_fold64_two_maps_to_mats(
+                low_rows.as_ptr().cast::<u8>(),
+                &map.low,
+                high_rows.as_ptr().cast::<u8>(),
+                &map.high,
+                mats,
+            );
+        }
+    }
+    (low_mats, high_mats)
 }
 
 #[inline(always)]
