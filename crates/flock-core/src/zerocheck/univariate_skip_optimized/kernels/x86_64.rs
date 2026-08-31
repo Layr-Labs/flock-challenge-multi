@@ -1273,7 +1273,8 @@ mod tests {
     #[cfg(target_feature = "gfni")]
     use super::{
         accumulate_convert_ab_nomul_x86_gfni, accumulate_convert_ab_nomul_x86_gfni_dynamic,
-        accumulate_convert_ab_nomul_x86_gfni_fixed,
+        accumulate_convert_ab_nomul_x86_gfni_fixed, accumulate_convert_ab_nomul_x86_gfni_ptr,
+        write_convert_ab_nomul_x86_gfni_ptr,
     };
 
     #[test]
@@ -1486,6 +1487,70 @@ mod tests {
             assert_eq!(fixed, dynamic, "fixed n_b_med={n_b_med}");
         }
     }
+
+    #[test]
+    fn accumulate_convert_ab_gfni_direct_rows_match_temporary_rows() {
+        let mut chunk_ab_bytes = [[0u8; 64]; 16];
+        for (row, bytes) in chunk_ab_bytes.iter_mut().enumerate() {
+            for (lane, byte) in bytes.iter_mut().enumerate() {
+                *byte = (row as u8).wrapping_mul(0x71)
+                    ^ (lane as u8).wrapping_mul(0x2d)
+                    ^ ((row * 11 + lane * 7) >> 2) as u8;
+            }
+        }
+        let mut mats = [0u64; 256];
+        for (i, matrix) in mats.iter_mut().enumerate() {
+            *matrix = (i as u64)
+                .wrapping_mul(0xd6e8_feb8_6659_fd93)
+                .rotate_left((i & 31) as u32)
+                ^ 0x9e37_79b9_7f4a_7c15;
+        }
+        let mut seed = [0u8; 16 * 64];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(0x43) ^ (i >> 1) as u8;
+        }
+
+        for (row_start, n_b_med) in [(0usize, 0usize), (0, 15), (0, 16), (2, 2), (2, 15), (2, 16)] {
+            let mut rows = chunk_ab_bytes;
+            rows[..row_start].fill([0u8; 64]);
+            let mut expected = seed;
+            let mut got = seed;
+            unsafe {
+                accumulate_convert_ab_nomul_x86_gfni_dynamic(&rows, n_b_med, &mats, &mut expected);
+                let rows_ptr = chunk_ab_bytes.as_ptr().cast::<u8>().add(row_start * 64);
+                accumulate_convert_ab_nomul_x86_gfni_ptr(
+                    rows_ptr, row_start, n_b_med, &mats, &mut got,
+                );
+            }
+            assert_eq!(
+                got, expected,
+                "accumulate row_start={row_start} n={n_b_med}"
+            );
+
+            let mut expected_write = [0u8; 16 * 64];
+            let mut got_write = [0u8; 16 * 64];
+            unsafe {
+                accumulate_convert_ab_nomul_x86_gfni_dynamic(
+                    &rows,
+                    n_b_med,
+                    &mats,
+                    &mut expected_write,
+                );
+                let rows_ptr = chunk_ab_bytes.as_ptr().cast::<u8>().add(row_start * 64);
+                write_convert_ab_nomul_x86_gfni_ptr(
+                    rows_ptr,
+                    row_start,
+                    n_b_med,
+                    &mats,
+                    &mut got_write,
+                );
+            }
+            assert_eq!(
+                got_write, expected_write,
+                "first-write row_start={row_start} n={n_b_med}"
+            );
+        }
+    }
 }
 
 /// /// GFNI twin of [`accumulate_convert_ab_nomul_x86_avx512`]: the 256-entry
@@ -1615,6 +1680,216 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_range2(
             ),
             _ => core::hint::unreachable_unchecked(),
         }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_ptr_fixed<
+    const ROW_START: usize,
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    rows_ptr: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(ROW_START <= N && N <= 1 << N_MEDIUM);
+    // SAFETY: the caller supplies one contiguous 64-byte row for every
+    // `ROW_START..N`; the fixed bank covers all sixteen plane stores.
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        let mut bm = ROW_START;
+        while bm < N {
+            rows[bm] =
+                _mm512_loadu_si512(rows_ptr.add((bm - ROW_START) * ELL) as *const __m512i);
+            bm += 1;
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = ROW_START;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_ptr_impl<const FIRST_WRITE: bool>(
+    rows_ptr: *const u8,
+    row_start: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(row_start <= n_b_med && n_b_med <= 1 << N_MEDIUM);
+    // SAFETY: the caller supplies one contiguous 64-byte row for every
+    // `row_start..n_b_med`; the fixed bank covers all sixteen plane stores.
+    unsafe {
+        match (row_start, n_b_med) {
+            (0, 15) => {
+                return accumulate_convert_ab_nomul_x86_gfni_ptr_fixed::<0, 15, FIRST_WRITE>(
+                    rows_ptr,
+                    mats,
+                    bank_planes,
+                );
+            }
+            (0, 16) => {
+                return accumulate_convert_ab_nomul_x86_gfni_ptr_fixed::<0, 16, FIRST_WRITE>(
+                    rows_ptr,
+                    mats,
+                    bank_planes,
+                );
+            }
+            (2, 15) => {
+                return accumulate_convert_ab_nomul_x86_gfni_ptr_fixed::<2, 15, FIRST_WRITE>(
+                    rows_ptr,
+                    mats,
+                    bank_planes,
+                );
+            }
+            (2, 16) => {
+                return accumulate_convert_ab_nomul_x86_gfni_ptr_fixed::<2, 16, FIRST_WRITE>(
+                    rows_ptr,
+                    mats,
+                    bank_planes,
+                );
+            }
+            _ => {}
+        }
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in row_start..n_b_med {
+            rows[bm] =
+                _mm512_loadu_si512(rows_ptr.add((bm - row_start) * ELL) as *const __m512i);
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            let mut bm = row_start;
+            while bm + 1 < n_b_med {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < n_b_med {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+/// Direct-row twin of the fixed-array GFNI drain. `rows_ptr` points at the
+/// first live medium row, while `row_start` preserves the original matrix
+/// row indices when the ranked identity-C path elides rows zero and one.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni_ptr(
+    rows_ptr: *const u8,
+    row_start: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    // SAFETY: forwarded to the pointer kernel with the same row and plane
+    // bounds; this form preserves existing bank contents.
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ptr_impl::<false>(
+            rows_ptr,
+            row_start,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// First-write direct-row twin. The caller proves that every output plane is
+/// dead, so the pointer form avoids both the temporary row copy and the
+/// destination load.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni_ptr(
+    rows_ptr: *const u8,
+    row_start: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+) {
+    // SAFETY: forwarded to the first-write specialization; the caller's
+    // proof permits every plane to start from zero.
+    unsafe {
+        accumulate_convert_ab_nomul_x86_gfni_ptr_impl::<true>(
+            rows_ptr,
+            row_start,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
     }
 }
 

@@ -579,6 +579,63 @@ pub(super) fn write_convert_ab_nomul_gfni_range2(
     }
 }
 
+/// Direct-row twin used by the ranked AB-only sweep. The source rows are
+/// already contiguous in `ab_inner`, so the wrapper avoids copying them into
+/// the worker's temporary sixteen-row array before the GFNI drain.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_gfni_ptr(
+    rows_ptr: *const u8,
+    row_start: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: the caller passes one 64-byte row per
+    // `row_start..n_b_med`, and the fixed plane bank is fully covered.
+    unsafe {
+        x86_64::accumulate_convert_ab_nomul_x86_gfni_ptr(
+            rows_ptr,
+            row_start,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
+/// First-write direct-row twin; all output planes are assigned from zero.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+pub(super) fn write_convert_ab_nomul_gfni_ptr(
+    rows_ptr: *const u8,
+    row_start: usize,
+    n_b_med: usize,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * 64],
+) {
+    // SAFETY: the caller proves that every plane is dead before this write.
+    unsafe {
+        x86_64::write_convert_ab_nomul_x86_gfni_ptr(
+            rows_ptr,
+            row_start,
+            n_b_med,
+            mats,
+            bank_planes,
+        );
+    }
+}
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
@@ -669,6 +726,14 @@ pub(super) fn write_c_banks_fold4_fused_gfni(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],
