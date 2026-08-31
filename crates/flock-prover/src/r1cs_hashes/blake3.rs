@@ -2168,7 +2168,17 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
+    // The ranked residual representation (`project_blocks_ranked_hot_offsets_residual`,
+    // `publish_static`, and zerocheck's matching `ranked_one_rows_elided` reader) is only
+    // correct on the AVX-512 staging shape. On a plain AVX2 host it produces a proof the
+    // TRUSTED verifier rejects with `Zerocheck(SumcheckFinalFailed)` at the ranked 2^18
+    // shape, while 2^14 passes (the mechanism self-gates on `== 1 << 18`). The env kill
+    // switch cannot roll it back: the worker runs inside the verifier's bwrap sandbox with
+    // a cleared environment, so `FLOCK_NO_R1_ONE_REUSE` never reaches it. Compile-time
+    // gate instead: codegen is unchanged wherever AVX-512 is present (the ranked runner),
+    // and proofs are correct where it is not.
+    let one_rows_elided = cfg!(target_feature = "avx512f")
+        && ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
