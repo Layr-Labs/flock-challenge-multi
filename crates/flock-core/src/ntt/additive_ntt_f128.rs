@@ -251,6 +251,16 @@ fn ntt_seed_top_fusion_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
 }
 
+/// `FLOCK_NO_NTT_TOP9_FUSION=1` restores the promoted nine-layer seed/top
+/// pass and 2 MiB deep sub-groups. The default ranked shape pairs seed tasks
+/// `r` and `r + 1024`, applies layer 9 before their direct publish, and leaves
+/// a ten-layer 4+4+2 cache-resident tail.
+#[inline]
+fn ntt_top9_fusion_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_TOP9_FUSION").is_some())
+}
+
 /// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
 /// fused-two scratch stores followed by the separate non-temporal scatter.
 /// Read once per process, outside every row/quad loop.
@@ -1249,6 +1259,7 @@ impl StFmpPair {
 fn st_fmp_run(
     n_tasks: usize,
     row_len: usize,
+    staging_rows: usize,
     seed: &(dyn Fn(*mut F128, usize) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
@@ -1282,7 +1293,7 @@ fn st_fmp_run(
             );
         }
     }
-    let stride = 512 * row_len;
+    let stride = staging_rows * row_len;
     let states: Vec<StFmpPair> = (0..n_pairs).map(|_| StFmpPair::new()).collect();
     let next = AtomicUsize::new(0);
     let states = &states;
@@ -1359,9 +1370,9 @@ fn st_fmp_run(
         }
 
         // ---- the M+P sibling: seed, then publish what F has folded ----
-        // `nbuf` back-to-back 512-row staging blocks; the pair works on two of
+        // `nbuf` back-to-back staging blocks; the pair works on two of
         // them at a time.
-        let mut staging = staging_block(512 * nbuf, row_len);
+        let mut staging = staging_block(staging_rows * nbuf, row_len);
         let bufp = staging.as_mut_ptr();
         st.bufp.store(bufp as usize, Ordering::Release);
         // Declared AFTER the staging allocation so it drops BEFORE it: on a
@@ -2570,6 +2581,81 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Complete layers 7–9 for a pair of ranked seed/top tasks whose `r`
+    /// indices differ by 1024, then publish their 1024 rows directly. Those
+    /// are exactly the row pairs of layer 9's 2048-row blocks.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn seed_top_direct_publish3<const ALIGNED_ZMM: bool>(
+        &self,
+        bufp: *mut F128,
+        base: *mut F128,
+        row_len: usize,
+        block_size: usize,
+        sub_stride: usize,
+        r: usize,
+        lanes: usize,
+        stage_perm: bool,
+        tw9: &[[F128; 4]],
+    ) {
+        debug_assert_eq!(row_len, 64);
+        debug_assert_eq!(block_size, 1 << 17);
+        debug_assert_eq!(sub_stride, 1 << 11);
+        debug_assert!(r < sub_stride / 2);
+        debug_assert_eq!(tw9.len(), 8 * 16);
+        // SAFETY: the caller provides the complete 1024-row paired staging
+        // allocation, so the second half begins exactly here.
+        let botp = unsafe { bufp.add(512 * row_len) };
+        let g2_stride = if stage_perm { 16 } else { 1 };
+        let step = g2_stride * row_len;
+        // SAFETY: each `(block, m)` owns four corresponding rows from each
+        // private staging half and publishes the eight disjoint layer-9 rows.
+        unsafe {
+            for block in 0..8usize {
+                let top = bufp.add(block * 64 * row_len);
+                let bot = botp.add(block * 64 * row_len);
+                for m in 0..16usize {
+                    let outer_block = block * 16 + m;
+                    let t_outer = self.twiddle(7, outer_block);
+                    let t_inner_a = self.twiddle(8, 2 * outer_block);
+                    let t_inner_b = self.twiddle(8, 2 * outer_block + 1);
+                    let k = 4 * m;
+                    let src_row = seed_top_stage_row(k, stage_perm);
+                    let dst_row = |rr: usize, kk: usize| {
+                        base.add(
+                            seed_top_codeword_row(block, rr, kk, block_size, sub_stride) * row_len,
+                        )
+                    };
+                    kernels::butterfly_fused_2layer_pair_layer_publish_nt::<ALIGNED_ZMM>(
+                        top.add(src_row * row_len),
+                        bot.add(src_row * row_len),
+                        step,
+                        [
+                            dst_row(r, k),
+                            dst_row(r, k + 1),
+                            dst_row(r, k + 2),
+                            dst_row(r, k + 3),
+                            dst_row(r + sub_stride / 2, k),
+                            dst_row(r + sub_stride / 2, k + 1),
+                            dst_row(r + sub_stride / 2, k + 2),
+                            dst_row(r + sub_stride / 2, k + 3),
+                        ],
+                        lanes,
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        &tw9[outer_block],
+                    );
+                }
+            }
+        }
+    }
+
     #[allow(clippy::manual_is_multiple_of)]
     fn seed_top_fused8_pass(
         &self,
@@ -2578,6 +2664,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         log_d: usize,
         odd_tail: usize,
+        fuse_layer9: bool,
     ) {
         use rayon::prelude::*;
         #[cfg(test)]
@@ -2634,6 +2721,26 @@ impl AdditiveNttF128 {
                 tw
             })
             .collect();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let tw9: Vec<[F128; 4]> = if fuse_layer9 {
+            (0..8 * 16)
+                .map(|quad| {
+                    let k = 4 * quad;
+                    [
+                        self.twiddle(9, k),
+                        self.twiddle(9, k + 1),
+                        self.twiddle(9, k + 2),
+                        self.twiddle(9, k + 3),
+                    ]
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
@@ -2982,6 +3089,69 @@ impl AdditiveNttF128 {
             }
         };
 
+        // Ranked layer-9 extension: tasks `r` and `r+1024` are the two
+        // halves of every layer-9 butterfly. Keep both halves in one 1 MiB
+        // staging allocation, retain the incumbent F || (M+P) sibling split,
+        // and publish the eight post-layer-9 rows directly from registers.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        if fuse_layer9 && direct_publish {
+            debug_assert_eq!(sub_stride, 1 << 11);
+            let paired_tasks = sub_stride / 2;
+            let seed_pair = |bufp: *mut F128, r: usize| {
+                seed(bufp, r);
+                // SAFETY: the second 512-row half belongs to this paired task.
+                seed(unsafe { bufp.add(512 * row_len) }, r + paired_tasks);
+            };
+            let fold_pair = |bufp: *mut F128, r: usize| {
+                fold4(bufp, r);
+                // SAFETY: the second 512-row half belongs to this paired task.
+                fold4(unsafe { bufp.add(512 * row_len) }, r + paired_tasks);
+            };
+            let publish_pair = |bufp: *mut F128, r: usize| {
+                let lanes = row_lanes(r, num_ntts, lanes2_tail);
+                // SAFETY: the two staging halves are fully seeded/folded;
+                // distinct `r` own disjoint layer-9 destination row pairs.
+                unsafe {
+                    let base = base_addr as *mut F128;
+                    if direct_publish_zmm {
+                        self.seed_top_direct_publish3::<true>(
+                            bufp, base, row_len, block_size, sub_stride, r, lanes, stage_perm, &tw9,
+                        );
+                    } else {
+                        self.seed_top_direct_publish3::<false>(
+                            bufp, base, row_len, block_size, sub_stride, r, lanes, stage_perm, &tw9,
+                        );
+                    }
+                    core::arch::x86_64::_mm_sfence();
+                }
+            };
+            if st_fmp_run(
+                paired_tasks,
+                row_len,
+                1024,
+                &seed_pair,
+                &fold_pair,
+                &publish_pair,
+            ) {
+                return;
+            }
+            (0..paired_tasks).into_par_iter().for_each_init(
+                || staging_block(1024, row_len),
+                |buf, r| {
+                    let p = buf.as_mut_ptr();
+                    seed_pair(p, r);
+                    fold_pair(p, r);
+                    publish_pair(p, r);
+                },
+            );
+            return;
+        }
+
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // (all lanes) before the layer loops read any of them, so the
@@ -3004,7 +3174,7 @@ impl AdditiveNttF128 {
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2) {
+            if direct_publish && st_fmp_run(sub_stride, row_len, 512, &seed, &fold4, &publish2) {
                 return;
             }
             (0..sub_stride)
@@ -3197,6 +3367,21 @@ impl AdditiveNttF128 {
         // Not applied on the (dead-on-x86) ordered-streaming arm.
         let top_fusion_ok =
             Self::top_fusion_available() && stream.is_none() && !ntt_top_fusion_disabled();
+        let fuse_seed_top_layer9 = cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )) && log_d == ZERO_TAIL_LOG_D
+            && num_ntts == ZERO_TAIL_NUM_NTTS
+            && start_layer == 3
+            && seed_msg.is_some()
+            && top_fusion_ok
+            && n_top == 9
+            && !ntt_top9_fusion_disabled();
+        if fuse_seed_top_layer9 {
+            n_top = 10;
+        }
         // Seed fusion: `seed_msg` means layers 1–2 have NOT been applied yet
         // and the caller expects the first top task to apply them from the
         // message. That is only possible when layers 3..8 are all top layers;
@@ -3254,9 +3439,16 @@ impl AdditiveNttF128 {
             if let Some(msg) = seed_msg.take() {
                 // Checked above: layer == 3, top fusion on, n_top ≥ 9.
                 debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
-                self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
+                self.seed_top_fused8_pass(
+                    msg,
+                    data,
+                    num_ntts,
+                    log_d,
+                    odd_tail,
+                    fuse_seed_top_layer9,
+                );
                 crate::gaptime::mark("ntt: seed+top fused pass done");
-                layer += 6;
+                layer += if fuse_seed_top_layer9 { 7 } else { 6 };
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
                 layer += 6;
@@ -3409,7 +3601,7 @@ impl AdditiveNttF128 {
         // so the output bytes are identical. `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1`
         // restores the sweep schedule (exact same-binary A/B).
         let fuse_blocks = deep_fused4_ok
-            && log_d == n_top + 11
+            && (log_d == n_top + 11 || log_d == n_top + 10)
             && start_layer <= n_top
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
@@ -3460,6 +3652,65 @@ impl AdditiveNttF128 {
                 let block_bytes4 = block_size4 * num_ntts;
                 let sixteenth4 = block_size4 >> 4;
                 let layer3 = n_top + 8;
+
+                // The layer-9 seed/top extension leaves ten deep layers.
+                // Preserve the same cache-hot block schedule as the promoted
+                // 4+4+3 tail, but finish each 64-row block with sixteen
+                // fused-two quads. Merkle consumes 128 rows per leaf batch,
+                // so adjacent finished blocks are handed off together.
+                if log_d == n_top + 10 {
+                    debug_assert_eq!(block_size4, 64);
+                    for bp in 0..8usize {
+                        for b in 2 * bp..2 * bp + 2 {
+                            let g4 = sub_idx * 16 + b;
+                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                            tw[0] = self.twiddle(layer4, g4);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+                            }
+                            for s in 0..8 {
+                                tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+                            }
+                            let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
+                            butterfly_interleaved_fused_4layer_rows(
+                                blk,
+                                &tw,
+                                sixteenth4,
+                                num_ntts,
+                                if sixteenth4.is_multiple_of(2) {
+                                    odd_tail
+                                } else {
+                                    0
+                                },
+                                hint,
+                            );
+                            for j in 0..16usize {
+                                let g2 = g4 * 16 + j;
+                                let four = &mut blk[j * 4 * num_ntts..(j + 1) * 4 * num_ntts];
+                                butterfly_interleaved_fused_2layer_par_rows(
+                                    four,
+                                    self.twiddle(layer3, g2),
+                                    self.twiddle(layer3 + 1, 2 * g2),
+                                    self.twiddle(layer3 + 1, 2 * g2 + 1),
+                                    1,
+                                    num_ntts,
+                                    0,
+                                );
+                            }
+                        }
+                        let first = 2 * bp * block_bytes4;
+                        let lo = sub_idx * sub_size_positions + 2 * bp * block_size4;
+                        cb(
+                            lo..lo + 2 * block_size4,
+                            &sub_data[first..first + 2 * block_bytes4],
+                        );
+                    }
+                    return true;
+                }
+
                 let dense_lanes = num_ntts - odd_tail;
                 #[cfg(test)]
                 FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4802,7 +5053,7 @@ mod tests {
                     }
                     published[r].fetch_add(1, Ordering::Relaxed);
                 };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish));
+                assert!(st_fmp_run(n_tasks, ROW_LEN, 512, &seed, &fold, &publish));
                 for r in 0..n_tasks {
                     assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
                     assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
