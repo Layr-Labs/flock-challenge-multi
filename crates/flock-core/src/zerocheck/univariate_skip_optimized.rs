@@ -3245,14 +3245,26 @@ fn process_one_x_hi_ab_only(
                 pf_one(b_med);
             }
         }
-        for b_med in first_b_med..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
-            #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med >= next_first_b_med && b_med < n_next {
-                pf_one(b_med);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        if eq_fold.is_none() {
+            for b_med in first_b_med..n_b_med {
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
             }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        for b_med in first_b_med..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
         }
@@ -3278,38 +3290,29 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
+            debug_assert!(first_b_med <= n_b_med);
+            // In the rank-shaped AB-only sweep the transformed rows are
+            // already contiguous in `ab_inner`: each medium row is exactly
+            // eight 8-byte chunks. Feed that stream directly to the GFNI
+            // drain instead of copying it into `chunk_ab_bytes`.
+            let rows_ptr =
+                unsafe { ab_inner_ptr.add(chunk_byte_base + first_b_med * N_CHUNKS * 8) };
             if plane_first_write && w_idx == 0 {
-                if first_b_med == 2 {
-                    kernels::write_convert_ab_nomul_gfni_range2(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
-                } else {
-                    kernels::write_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
-                }
+                kernels::write_convert_ab_nomul_gfni_ptr(
+                    rows_ptr,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
             } else {
-                if first_b_med == 2 {
-                    kernels::accumulate_convert_ab_nomul_gfni_range2(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
-                } else {
-                    kernels::accumulate_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
-                }
+                kernels::accumulate_convert_ab_nomul_gfni_ptr(
+                    rows_ptr,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
             }
         } else {
             if first_b_med == 2 {
