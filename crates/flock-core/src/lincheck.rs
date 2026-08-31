@@ -900,14 +900,86 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         m,
         k_log,
         useful_bits,
-        |outer_base| {
-            std::array::from_fn(|r| {
-                let outer = outer_base + r;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
-        },
+        |outer_base| eq8_from_factors(eq_lo, eq_hi, outer_base, log_b, lo_mask),
         top_bind,
     )
+}
+
+/// `FLOCK_NO_LC_EQ8_X4=1` restores eight scalar `eq_lo * eq_hi` products per
+/// stripe. Default: two 4-lane `ghash_mul_x4` products. Same 8 field
+/// elements; F128 multiply is the canonical mod-p product either way.
+fn lc_eq8_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EQ8_X4").is_none());
+    *ON
+}
+
+/// Eight consecutive factorized outer weights starting at `outer_base`.
+fn eq8_from_factors(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_eq8_x4_enabled() {
+        // SAFETY: cfg supplies avx512f+vpclmulqdq; the 8 indices are the
+        // same formula as the scalar loop (lo_mask / log_b).
+        return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
+    }
+    std::array::from_fn(|r| {
+        let outer = outer_base + r;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
+}
+
+/// Four-then-four 4-lane products of the factorized eq tensor. Bit-identical
+/// to eight scalar `eq_lo[i]*eq_hi[i]` because `ghash_mul_x4` is the same
+/// canonical reduction as `Mul`.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq`. `outer_base .. outer_base+8` is in-range for
+/// the factorized tensor (`eq_lo.len() * eq_hi.len()`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn eq8_from_factors_x4(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    let mut out = [F128::ZERO; 8];
+    // SAFETY: eight consecutive factorized indices; each load is an F128
+    // the scalar loop would read, packed into one ZMM of four lanes.
+    unsafe {
+        for g in 0..2 {
+            let mut lo = [F128::ZERO; 4];
+            let mut hi = [F128::ZERO; 4];
+            for r in 0..4 {
+                let outer = outer_base + 4 * g + r;
+                lo[r] = eq_lo[outer & lo_mask];
+                hi[r] = eq_hi[outer >> log_b];
+            }
+            let prod = ghash_mul_x4(
+                _mm512_loadu_si512(lo.as_ptr() as *const __m512i),
+                _mm512_loadu_si512(hi.as_ptr() as *const __m512i),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(4 * g) as *mut __m512i, prod);
+        }
+    }
+    out
 }
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
