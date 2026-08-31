@@ -621,15 +621,22 @@ impl WideGhashX4 {
     ///   `hi  = x.hi*0 = 0`,
     ///   `mid = x.hi*1 ^ x.lo*0 = x.hi`  (moved into the lane's low qword).
     /// So the four CLMULs collapse to one masked move and one lane-wise byte
-    /// shift. Bit-identical to `mul_acc(x, ONE)`.
+    /// shift. Bit-identical to `mul_acc(x, ONE)` -- asserted by
+    /// `mul_acc_one_matches_mul_acc_with_one`.
     ///
     /// # Safety
-    /// `avx512f` + `avx512bw` available (cfg-gated).
+    /// `avx512f` available (cfg-gated).
     #[inline]
-    #[target_feature(enable = "avx512f,avx512bw")]
+    #[target_feature(enable = "avx512f")]
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
+        // Register-only; cfg-gated. `hi` is untouched (it stays zero).
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
-        self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
+        // `hi` of each lane moved into that lane's low qword: pick qwords
+        // 1/3/5/7 into slots 0/2/4/6 and zero the odd slots. `vpermq` with a
+        // zeroing mask is AVX512F-only (a lane-wise byte shift would need
+        // AVX512BW, which AVX512F does not imply).
+        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
+        self.mid = _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
