@@ -1246,6 +1246,16 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: identity-C worker-reduce reconstructs each 64-column
+/// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
+/// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
+/// restores the incumbent GPR transpose. Same bytes either way.
+fn lc_plane_f128_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1472,6 +1482,20 @@ unsafe fn reduce_worker_plane_block(
         unsafe {
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
+    }
+    // Same 16×64 plane layout as the fused C-drain bank. That leaf already
+    // bit-transposes eight plane-ZMMs and interleaves lo/hi into AoS F128;
+    // the GPR 8×8 path below is the same map on 8-byte groups.
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_plane_f128_enabled() {
+        let bank: &[u8; 1024] = &acc;
+        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
+        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(bank, out64);
+        return;
     }
     // The plane rows are contiguous, while the old per-column loop made 16
     // strided byte loads for every F128. Transpose eight 8-byte groups with

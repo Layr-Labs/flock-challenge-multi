@@ -40,6 +40,20 @@ use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, 
 
 mod kernels;
 
+/// Ranked C-drain reconstruct: 16×64 byte-planes → 64 F128. Identity-C
+/// lincheck worker-reduce has the same plane layout.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn c_plane_bank_to_f128(bank_planes: &[u8; 1024], out: &mut [F128; 64]) {
+    kernels::c_plane_bank_to_f128(bank_planes, out)
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
