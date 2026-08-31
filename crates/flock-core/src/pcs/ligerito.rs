@@ -6193,9 +6193,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::{
-        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-    };
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -6205,11 +6203,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
-    let direct_tables: Vec<Vec<F128>> = claims
+    let direct_generator_mats: Vec<[u64; 256]> = claims
         .par_iter()
         .map(|claim| {
             let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            super::ring_switch::build_direct_fold8_generator_mats(&generators)
         })
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
@@ -6236,14 +6234,16 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
-                let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
-                let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                let (mats0_lo, mats0_hi) =
+                    super::ring_switch::compose_direct_fold8_row_mats(
+                        &direct_generator_mats[0],
+                        claim0.eq_hi[block],
+                    );
+                let (mats1_lo, mats1_hi) =
+                    super::ring_switch::compose_direct_fold8_row_mats(
+                        &direct_generator_mats[1],
+                        claim1.eq_hi[block],
+                    );
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
@@ -6406,13 +6406,35 @@ fn materialize_direct_fold8(
     )))]
     let _ = l1_precommit;
 
-    let direct_tables: Vec<Vec<F128>> = claims
-        .par_iter()
-        .map(|claim| {
-            let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
-        })
-        .collect();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_generator_mats: Vec<[u64; 256]> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_generator_mats(&generators)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
+        Vec::new()
+    } else {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect()
+    };
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -6539,22 +6561,18 @@ fn materialize_direct_fold8(
                     target_feature = "gfni"
                 ))]
                 if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
+                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
-                        claim0.eq_hi[block],
-                    );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
-                        claim1.eq_hi[block],
-                    );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                    let (mats0_lo, mats0_hi) =
+                        super::ring_switch::compose_direct_fold8_row_mats(
+                            &direct_generator_mats[0],
+                            claim0.eq_hi[block],
+                        );
+                    let (mats1_lo, mats1_hi) =
+                        super::ring_switch::compose_direct_fold8_row_mats(
+                            &direct_generator_mats[1],
+                            claim1.eq_hi[block],
+                        );
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;

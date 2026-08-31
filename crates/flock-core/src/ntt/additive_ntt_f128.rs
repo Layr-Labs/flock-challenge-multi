@@ -1936,10 +1936,6 @@ impl AdditiveNttF128 {
     /// Apple may publish with non-temporal stores unless `FLOCK_NO_SEED_NT`
     /// is set — the destination is next read by a later transform pass, so
     /// write-allocate is waste. Do not lift `seed_fused_2layer_row_group_nt`.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     fn seed_rate_half_layers_1_through_2(
         &self,
         msg: &[F128],
@@ -2310,10 +2306,6 @@ impl AdditiveNttF128 {
     /// one task. Byte-identical to seed pass + top pass by construction (same
     /// kernels, same twiddles, same lane bounds; the seed kernels write all
     /// lanes, so the structurally zero tail lanes stay zero).
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     /// `FLOCK_NO_NTT_SCATTER_NT=1` restores plain write-allocate publish
     /// stores in the seed-fused top pass (exact same-binary A/B); the ranked
     /// worker's cleared env never sets it.
@@ -3061,20 +3053,12 @@ impl AdditiveNttF128 {
     /// inputs to avoid rayon overhead; for large inputs it uses an in-place
     /// scalar butterfly per lane (per-lane vectorization is future work — the
     /// big win at large `m` is cache locality + thread parallelism).
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     pub fn forward_transform_interleaved_parallel(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, 0);
     }
 
     /// Parallel interleaved forward NTT from `start_layer` (see
     /// [`Self::forward_transform_interleaved_from_layer`]).
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     pub fn forward_transform_interleaved_parallel_from_layer(
         &self,
         data: &mut [F128],
@@ -3145,10 +3129,6 @@ impl AdditiveNttF128 {
         }
     }
 
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
     #[allow(
         clippy::collapsible_if,
         clippy::manual_option_zip,

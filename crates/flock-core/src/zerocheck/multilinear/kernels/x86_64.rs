@@ -2165,6 +2165,7 @@ pub(crate) fn build_row_fold_mats_from_cols(cols: &[F128]) -> [u64; 128] {
     mats
 }
 
+
 /// Fold 64 consecutive packed 8-byte rows through the univariate-skip byte
 /// tables in one GFNI batch: `out[r] = Σ_j T_j[rows[8r + j]]`, bit-identical
 /// to eight gathers per row (same XOR terms, reassociated).

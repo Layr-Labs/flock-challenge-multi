@@ -83,11 +83,6 @@ pub(super) fn butterfly_fused_2layer_gen<const OUTER_LOW: bool, const INNER_LOW:
 /// The caller guarantees that every selected source and destination row is
 /// valid, source and destination do not overlap, and concurrent calls write
 /// disjoint destination row groups.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
-#[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from(
     src: *const F128,
     dst: *mut F128,
@@ -153,11 +148,6 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
 /// The caller guarantees that every selected source and destination row is
 /// valid, source and destination do not overlap, and concurrent calls write
 /// disjoint destination row groups.
-#[cfg(any(
-    all(target_arch = "aarch64", target_feature = "aes"),
-    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-))]
-#[inline]
 pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
     src: *const F128,
     dst: *mut F128,

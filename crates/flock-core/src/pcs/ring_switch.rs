@@ -2108,6 +2108,108 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
     }
     cols
 }
+/// Emit one input-byte group's GFNI matrices from its eight F128 columns.
+/// The shared transpose produces the column-to-row layout expected by
+/// `VGF2P8AFFINE`, and the byte reversal preserves its row encoding.
+#[inline(always)]
+fn emit_row_fold_matrix_group(cols: &[F128; 8], mats: &mut [u64]) {
+    debug_assert_eq!(mats.len(), 16);
+    let lo_lanes: [u64; 8] = core::array::from_fn(|b| cols[b].lo);
+    let hi_lanes: [u64; 8] = core::array::from_fn(|b| cols[b].hi);
+    let mut lo_bytes = [0u8; 64];
+    let mut hi_bytes = [0u8; 64];
+    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+    for c in 0..8 {
+        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+        mats[c] = u64::from_le_bytes(lo).swap_bytes();
+        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    }
+}
+
+/// Compose a GFNI matrix `m` after a GFNI matrix `r`.
+///
+/// Both matrices use the encoding consumed by
+/// `_mm512_gf2p8affine_epi64_epi8`: row `i` is stored in byte `7 - i` and
+/// its bits select the input row. Keeping the composition in this encoding
+/// avoids constructing the 128 composed F128 columns or a 64 KiB byte table.
+#[allow(dead_code)] // Used by the native DirectFold8 consumer.
+#[inline(always)]
+fn compose_gfni_matrix(m: u64, r: u64) -> u64 {
+    let mut out = 0u64;
+    for row in 0..8 {
+        let mut selected = ((m >> (56 - 8 * row)) & 0xff) as u8;
+        let mut value = 0u8;
+        while selected != 0 {
+            let bit = selected.trailing_zeros() as usize;
+            value ^= ((r >> (56 - 8 * bit)) & 0xff) as u8;
+            selected &= selected - 1;
+        }
+        out |= (value as u64) << (56 - 8 * row);
+    }
+    out
+}
+
+/// Build the sixteen GFNI byte-matrix planes for a DirectFold8 generator map.
+/// The returned layout is sixteen input-byte groups by sixteen output bytes.
+#[allow(dead_code)] // The ranked consumer is cfg-gated to AVX-512 GFNI.
+pub(crate) fn build_direct_fold8_generator_mats(generators: &[F128]) -> [u64; 256] {
+    debug_assert_eq!(generators.len(), 128);
+    let mut mats = [0u64; 256];
+    for group in 0..16 {
+        let cols: [F128; 8] = core::array::from_fn(|bit| generators[group * 8 + bit]);
+        emit_row_fold_matrix_group(&cols, &mut mats[group * 16..group * 16 + 16]);
+    }
+    mats
+}
+
+/// Build the two GFNI map halves for `M(x * e_hi)` from the already-emitted
+/// generator matrices for `M`.
+///
+/// The multiplier `x ↦ x * e_hi` is emitted in the same form from its exact
+/// `mul_by_x` basis chain, then the two maps are composed over GF(2). This
+/// keeps the DirectFold8 GFNI consumer in its native row-matrix
+/// representation: no composed F128-column array and no intermediate byte
+/// lookup table are materialized.
+#[allow(dead_code)] // The ranked consumer is cfg-gated to AVX-512 GFNI.
+pub(crate) fn compose_direct_fold8_row_mats(
+    generator_mats: &[u64; 256],
+    e_hi: F128,
+) -> ([u64; 128], [u64; 128]) {
+    let mut multiplier_mats = [0u64; 256];
+    let mut basis_product = e_hi;
+    for group in 0..16 {
+        let mut cols = [F128::ZERO; 8];
+        for col in &mut cols {
+            *col = basis_product;
+            basis_product = crate::field::mul_by_x(basis_product);
+        }
+        emit_row_fold_matrix_group(&cols, &mut multiplier_mats[group * 16..group * 16 + 16]);
+    }
+
+    let mut low = [0u64; 128];
+    let mut high = [0u64; 128];
+    for input_group in 0..16 {
+        let (out, group) = if input_group < 8 {
+            (&mut low, input_group)
+        } else {
+            (&mut high, input_group - 8)
+        };
+        for output_byte in 0..16 {
+            let mut composed = 0u64;
+            for middle_group in 0..16 {
+                composed ^= compose_gfni_matrix(
+                    generator_mats[middle_group * 16 + output_byte],
+                    multiplier_mats[input_group * 16 + middle_group],
+                );
+            }
+            out[group * 16 + output_byte] = composed;
+        }
+    }
+    (low, high)
+}
+
 
 #[inline(always)]
 pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
@@ -5345,6 +5447,74 @@ mod tests {
             }
         }
     }
+    /// The generator-derived GFNI matrices must implement the same composed
+    /// linear map as the legacy byte-table oracle. Exercise every basis bit
+    /// and random dense inputs through the matrix encoding without requiring
+    /// AVX-512, so this guards the composition before the native consumer.
+    #[test]
+    fn composed_generator_mats_match_table_map() {
+        fn apply_matrix(matrix: u64, input: u8) -> u8 {
+            let mut output = 0u8;
+            for row in 0..8 {
+                let coefficients = ((matrix >> (56 - 8 * row)) & 0xff) as u8;
+                output |= ((coefficients & input).count_ones() as u8 & 1) << row;
+            }
+            output
+        }
+
+        fn apply_map(low: &[u64; 128], high: &[u64; 128], value: F128) -> F128 {
+            let low_bytes = value.lo.to_le_bytes();
+            let high_bytes = value.hi.to_le_bytes();
+            let mut output = [0u8; 16];
+            for group in 0..8 {
+                for output_byte in 0..16 {
+                    output[output_byte] ^= apply_matrix(
+                        low[group * 16 + output_byte],
+                        low_bytes[group],
+                    );
+                    output[output_byte] ^= apply_matrix(
+                        high[group * 16 + output_byte],
+                        high_bytes[group],
+                    );
+                }
+            }
+            F128::new(
+                u64::from_le_bytes(output[..8].try_into().unwrap()),
+                u64::from_le_bytes(output[8..].try_into().unwrap()),
+            )
+        }
+
+        let mut rng = Rng::new(0xD1CE_8ACE_5EED);
+        for trial in 0..4 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_direct_fold8_table_from_generators(&generators);
+            let e_hi = rng.f128();
+            let generator_mats = build_direct_fold8_generator_mats(&generators);
+            let (low, high) = compose_direct_fold8_row_mats(&generator_mats, e_hi);
+
+            for bit in 0..128 {
+                let value = if bit < 64 {
+                    F128::new(1u64 << bit, 0)
+                } else {
+                    F128::new(0, 1u64 << (bit - 64))
+                };
+                assert_eq!(
+                    apply_map(&low, &high, value),
+                    fold_one_slot(value * e_hi, &base),
+                    "trial {trial}, basis bit {bit}",
+                );
+            }
+            for _ in 0..32 {
+                let value = rng.f128();
+                assert_eq!(
+                    apply_map(&low, &high, value),
+                    fold_one_slot(value * e_hi, &base),
+                    "trial {trial}, dense input",
+                );
+            }
+        }
+    }
+
 
     /// The open-phase materializers hand `compose_block_table` a RECYCLED
     /// buffer (see `crate::scratch::LocalBuf`), so its documented
