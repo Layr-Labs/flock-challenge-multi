@@ -243,8 +243,10 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
-            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        let wb: [(__m512i, __m512i, __m512i); 16] = core::array::from_fn(|b| {
+            let lo = _mm512_maskz_mov_epi64(0x55, _mm512_set1_epi64(w[b].lo as i64));
+            let hi = _mm512_maskz_mov_epi64(0x55, _mm512_set1_epi64(w[b].hi as i64));
+            (lo, hi, _mm512_xor_si512(lo, hi))
         });
         // 4×4 transpose of 128-bit lanes: stage-1 index vectors interleave
         // lanes {0,1} / {2,3} of two inputs; stage 2 gathers lanes {0,1} /
@@ -285,10 +287,14 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
                 let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
                 let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                let (w0_lo, w0_hi, w0_sum) = wb[4 * g];
+                let (w1_lo, w1_hi, w1_sum) = wb[4 * g + 1];
+                let (w2_lo, w2_hi, w2_sum) = wb[4 * g + 2];
+                let (w3_lo, w3_hi, w3_sum) = wb[4 * g + 3];
+                acc.mul_acc_karatsuba(u0, w0_lo, w0_hi, w0_sum);
+                acc.mul_acc_karatsuba(u1, w1_lo, w1_hi, w1_sum);
+                acc.mul_acc_karatsuba(u2, w2_lo, w2_hi, w2_sum);
+                acc.mul_acc_karatsuba(u3, w3_lo, w3_hi, w3_sum);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;

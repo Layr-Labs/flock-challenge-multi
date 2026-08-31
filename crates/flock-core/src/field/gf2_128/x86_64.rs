@@ -612,6 +612,42 @@ impl WideGhashX4 {
         self.mid = _mm512_xor_si512(self.mid, m);
     }
 
+    /// XOR-accumulate four unreduced products by one pre-split multiplier
+    /// using the three-product Karatsuba identity.
+    ///
+    /// For `x = x0 + x1 X^64` and `w = w0 + w1 X^64`, the ordinary
+    /// four-product expansion has limbs `(L, M, H)`, where `L = x0*w0`,
+    /// `H = x1*w1`, and `M = x0*w1 + x1*w0`. Here `M` is reconstructed as
+    /// `(x0+x1)*(w0+w1) + L + H`, saving one carry-less multiply per lane.
+    /// Each pre-split operand has its scalar in the low qword of every
+    /// 128-bit lane and zero in the high qword.
+    ///
+    /// # Safety
+    /// `x_lo`, `x_hi`, `w_lo`, `w_hi`, and `w_sum` must respect that lane
+    /// layout; the caller must ensure `avx512f` and `vpclmulqdq`.
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc_karatsuba(
+        &mut self,
+        x: __m512i,
+        w_lo: __m512i,
+        w_hi: __m512i,
+        w_sum: __m512i,
+    ) {
+        let lo = _mm512_maskz_mov_epi64(0x55, x);
+        let hi_index = _mm512_set_epi64(0, 7, 0, 5, 0, 3, 0, 1);
+        let hi = _mm512_maskz_permutexvar_epi64(0x55, hi_index, x);
+        let lower = _mm512_clmulepi64_epi128::<0x00>(lo, w_lo);
+        let upper = _mm512_clmulepi64_epi128::<0x00>(hi, w_hi);
+        let cross = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(_mm512_xor_si512(lo, hi), w_sum),
+            _mm512_xor_si512(lower, upper),
+        );
+        self.lo = _mm512_xor_si512(self.lo, lower);
+        self.hi = _mm512_xor_si512(self.hi, upper);
+        self.mid = _mm512_xor_si512(self.mid, cross);
+    }
+
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
     /// operand, specialized.
     ///
