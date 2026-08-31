@@ -6103,6 +6103,95 @@ fn direct_fold8_b_gfni_enabled() -> bool {
     *ON
 }
 
+/// Ranked default folds the two DirectFold8 claims as two half-pairs through
+/// [`gfni_fold64_two_maps`]: each pair shares one inverse transpose, and the
+/// second pair XOR-adds into the first while the 64 F128s are already the
+/// destination. That deletes the 16-plane `gfni_tmp` bounce
+/// [`gfni_fold64_four_maps_staged`] uses between the two claim pairs.
+/// Inverse-transpose is F2-linear, so
+/// `T(m0⊕m1) ⊕ T(m2⊕m3) = T(m0⊕m1⊕m2⊕m3)` — same 64 F128s as the staged
+/// kernel. `FLOCK_NO_DF8_TWO_MAPS=1` restores the bounce.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn direct_fold8_two_maps_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_TWO_MAPS").is_none());
+    *ON
+}
+
+/// One 64-slot DirectFold8 b-side batch: two claims × (lo, hi) packed-u64
+/// maps. Kill switch keeps the staged four-map bounce as the same-binary A/B.
+///
+/// # Safety
+/// Each row pointer covers 512 bytes, `out` covers 64 F128s, and when the
+/// staged arm is selected `planes` covers sixteen ZMMs. AVX-512F/VBMI/GFNI
+/// are cfg-gated at the call site.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+unsafe fn df8_gfni_fold_two_claims(
+    rows0_lo: *const u8,
+    mats0_lo: &[u64; 128],
+    rows0_hi: *const u8,
+    mats0_hi: &[u64; 128],
+    rows1_lo: *const u8,
+    mats1_lo: &[u64; 128],
+    rows1_hi: *const u8,
+    mats1_hi: &[u64; 128],
+    out: *mut F128,
+    planes: *mut core::arch::x86_64::__m512i,
+) {
+    use crate::zerocheck::multilinear::kernels::x86_64::{
+        gfni_fold64_four_maps_staged, gfni_fold64_two_maps,
+    };
+    // SAFETY: forwarded from the caller; ADD=false compiles the add loads
+    // out, so the null pointer is never dereferenced on the first pair.
+    unsafe {
+        if direct_fold8_two_maps_enabled() {
+            gfni_fold64_two_maps::<false>(
+                rows0_lo,
+                mats0_lo,
+                rows0_hi,
+                mats0_hi,
+                out,
+                core::ptr::null(),
+            );
+            gfni_fold64_two_maps::<true>(
+                rows1_lo,
+                mats1_lo,
+                rows1_hi,
+                mats1_hi,
+                out,
+                out,
+            );
+        } else {
+            gfni_fold64_four_maps_staged(
+                rows0_lo,
+                mats0_lo,
+                rows0_hi,
+                mats0_hi,
+                rows1_lo,
+                mats1_lo,
+                rows1_hi,
+                mats1_hi,
+                out,
+                planes,
+            );
+        }
+    }
+}
+
 /// Commit parameters for the ranked DirectFold8 -> L1 overlap. This carries
 /// no challenger: the early arm can only compute (not observe) the future
 /// root.
@@ -6193,9 +6282,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::{
-        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-    };
+    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -6250,7 +6337,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                     // outputs cover 64 F128s, and this helper's cfg fixes all
                     // target features required by the kernel.
                     unsafe {
-                        gfni_fold64_four_maps_staged(
+                        df8_gfni_fold_two_claims(
                             rows0.0.as_ptr().add(slot).cast::<u8>(),
                             &mats0_lo,
                             rows0.1.as_ptr().add(slot).cast::<u8>(),
@@ -6539,9 +6626,7 @@ fn materialize_direct_fold8(
                     target_feature = "gfni"
                 ))]
                 if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
+                    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let cols0 = super::ring_switch::compose_block_cols(
                         &direct_tables[0],
@@ -6560,7 +6645,7 @@ fn materialize_direct_fold8(
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
                         // both output buffers cover 64 F128s; cfg features hold.
                         unsafe {
-                            gfni_fold64_four_maps_staged(
+                            df8_gfni_fold_two_claims(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
                                 &mats0_lo,
                                 rows0.1.as_ptr().add(slot).cast::<u8>(),
