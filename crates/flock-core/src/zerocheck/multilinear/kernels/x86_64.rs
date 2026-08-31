@@ -2549,6 +2549,26 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
     use core::arch::x86_64::*;
     // SAFETY: caller supplies all pointer extents and target features.
     unsafe {
+        let z0: [__m512i; 8] =
+            core::array::from_fn(|i| _mm512_loadu_si512(rows0.add(64 * i) as *const __m512i));
+        let z1: [__m512i; 8] =
+            core::array::from_fn(|i| _mm512_loadu_si512(rows1.add(64 * i) as *const __m512i));
+        gfni_fold64_two_maps_regs::<ADD>(z0, mats0, z1, mats1, out, add);
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_two_maps_regs<const ADD: bool>(
+    z0: [core::arch::x86_64::__m512i; 8],
+    mats0: &[u64; 128],
+    z1: [core::arch::x86_64::__m512i; 8],
+    mats1: &[u64; 128],
+    out: *mut F128,
+    add: *const F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller supplies all pointer extents and target features.
+    unsafe {
         #[rustfmt::skip]
         const BT: [i8; 64] = [
             0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57,
@@ -2589,9 +2609,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
                 _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
             ]
         };
-        let input_planes = |rows: *const u8| -> [__m512i; 8] {
-            let z: [__m512i; 8] =
-                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i) as *const __m512i));
+        let input_planes_regs = |z: [__m512i; 8]| -> [__m512i; 8] {
             let t = z.map(|v| _mm512_permutexvar_epi8(bt, v));
             qword_transpose(t)
         };
@@ -2604,14 +2622,8 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
             _mm512_xor_si512(v2, v3)
         };
-        // Form the first map's 16 output-byte planes before loading the
-        // second map. Keeping both eight-plane inputs live while creating
-        // sixteen accumulators exceeds the SPR ZMM file once transpose
-        // constants and temporaries are included, and LLVM then spills a
-        // large fraction of the batch. Sequential accumulation has the same
-        // GF(2) reassociation but caps the durable live set at 16 + 8 ZMMs.
         let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
-            let p = input_planes(rows0);
+            let p = input_planes_regs(z0);
             (
                 map_plane(&p, mats0, 0),
                 map_plane(&p, mats0, 1),
@@ -2632,7 +2644,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
             )
         };
         let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
-            let p = input_planes(rows1);
+            let p = input_planes_regs(z1);
             (
                 _mm512_xor_si512(a0, map_plane(&p, mats1, 0)),
                 _mm512_xor_si512(a1, map_plane(&p, mats1, 1)),
@@ -2672,6 +2684,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         }
     }
 }
+
 
 
 /// Compose a two-map GFNI fold directly into its 8-byte-input matrix.

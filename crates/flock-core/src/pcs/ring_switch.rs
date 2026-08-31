@@ -1489,15 +1489,17 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
 
     if x_inner_rest_tail.len() == 7 {
         // Ranked shape: retain six coordinates and bind the sole remaining
-        // coordinate with the characteristic-two one-multiply form.
+        // coordinate with the characteristic-two one-multiply form. Keep the
+        // low half in the result buffer so the architecture-dispatching
+        // split-bind leaf can consume complete contiguous chunks.
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
-        let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &even), &odd)| *out = even + r * (even + odd));
+        let mut out = z0.to_vec();
+        let chunk_len = (half / rayon::current_num_threads().max(1)).max(64);
+        out.par_chunks_mut(chunk_len)
+            .zip(z1.par_chunks(chunk_len))
+            .for_each(|(lo, hi)| crate::field::f128_slice::bind_split_half(lo, hi, r));
         return out;
     }
 
@@ -2107,6 +2109,109 @@ pub(crate) fn compose_block_cols(base: &[F128], e_hi: F128) -> [F128; 128] {
         w = crate::field::mul_by_x(w);
     }
     cols
+}
+/// The AVX-512 DirectFold8 consumer repeatedly composes the same fixed byte
+/// map with different `e_hi` values. Precompute the two 64-bit input halves of
+/// that map once so each block only generates `X^b · e_hi` and applies the
+/// existing two-map GFNI leaf.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(crate) struct GfniDirectFoldMap {
+    low: [u64; 128],
+    high: [u64; 128],
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline]
+pub(crate) fn build_gfni_direct_fold_map_from_generators(
+    generators: &[F128],
+) -> GfniDirectFoldMap {
+    assert_eq!(generators.len(), 1 << LOG_PACKING);
+    use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+    GfniDirectFoldMap {
+        low: build_row_fold_mats_from_cols(&generators[..64]),
+        high: build_row_fold_mats_from_cols(&generators[64..]),
+    }
+}
+
+/// Build the same fixed-map representation directly from a full byte table.
+/// Each one-hot table entry is one column of the represented F2-linear map.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline]
+pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirectFoldMap {
+    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
+    let generators: [F128; 128] = core::array::from_fn(|i| {
+        table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]
+    });
+    build_gfni_direct_fold_map_from_generators(&generators)
+}
+
+/// Compose a fixed byte-linear fold map with multiplication by `e_hi`,
+/// returning the two GFNI matrix blocks needed for the low and high halves of
+/// the input. The composition is emitted directly by the map-plane kernel:
+/// neither the 128 intermediate `F128` columns nor their second transpose is
+/// materialized.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline(always)]
+pub(crate) fn compose_block_mats_gfni(
+    map: &GfniDirectFoldMap,
+    e_hi: F128,
+) -> ([u64; 128], [u64; 128]) {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
+
+    let mut low_mats = [0u64; 128];
+    let mut high_mats = [0u64; 128];
+    let mut low_rows = [0u64; 64];
+    let mut high_rows = [0u64; 64];
+    let mut w = e_hi;
+    for chunk in 0..2 {
+        for lane in 0..64 {
+            low_rows[lane] = w.lo;
+            high_rows[lane] = w.hi;
+            w = crate::field::mul_by_x(w);
+        }
+        let mats = if chunk == 0 {
+            &mut low_mats
+        } else {
+            &mut high_mats
+        };
+        // SAFETY: both row arrays hold 64 initialized u64 values, the output
+        // matrix block is fully overwritten, and this function's cfg supplies
+        // every target feature required by the leaf.
+        unsafe {
+            gfni_fold64_two_maps_to_mats(
+                low_rows.as_ptr().cast::<u8>(),
+                &map.low,
+                high_rows.as_ptr().cast::<u8>(),
+                &map.high,
+                mats,
+            );
+        }
+    }
+    (low_mats, high_mats)
 }
 
 #[inline(always)]
@@ -2849,11 +2954,155 @@ fn direct_fold8_states_seq(
     (a_state, w_state, round0)
 }
 
-/// Value-identical full-width form of [`direct_fold8_states_seq`]. The 64
-/// `d_low` doubling chains and the 64 bank transposes are mutually
-/// independent (each is a pure function of its own `low_eq[d]` / bank
-/// stripe), the bit-major gather writes disjoint 64-lane rows, and the
-/// round-0 reduce is an XOR sum — no ordering choice here can change a byte.
+/// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather state build.
+#[inline]
+fn df8_state_direct_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
+    });
+    *OFF
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,vpclmulqdq,gfni")]
+#[inline(never)]
+unsafe fn direct_fold8_w_state_gfni(
+    low_eq: &[F128; 64],
+    table: &[F128],
+    w_state: &mut [F128],
+) {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_regs;
+    use core::arch::x86_64::*;
+
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(w_state.len(), 64 * n_packed);
+    let map = build_gfni_direct_fold_map_from_table(table);
+
+    // SAFETY: caller cfg supplies avx512f, avx512vbmi, vpclmulqdq, gfni.
+    unsafe {
+        let mut vals: [__m512i; 16] = core::array::from_fn(|i| {
+            _mm512_loadu_si512(low_eq.as_ptr().add(4 * i) as *const __m512i)
+        });
+
+        let idx_lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+        let idx_hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+        let perm_carry_idx = _mm512_setr_epi64(0, 0, 2, 2, 4, 4, 6, 6);
+        let perm_mask_idx = _mm512_setr_epi64(1, 1, 3, 3, 5, 5, 7, 7);
+        let poly_87 = _mm512_set1_epi64(0x87);
+
+        #[inline(always)]
+        unsafe fn mul_by_x_x4(
+            v: __m512i,
+            perm_carry_idx: __m512i,
+            perm_mask_idx: __m512i,
+            poly_87: __m512i,
+        ) -> __m512i {
+            let shl = _mm512_slli_epi64::<1>(v);
+            let srli = _mm512_srli_epi64::<63>(v);
+            let hi_carry = _mm512_maskz_permutexvar_epi64(0xAA, perm_carry_idx, srli);
+            let sra = _mm512_srai_epi64::<63>(v);
+            let mask_lo = _mm512_maskz_permutexvar_epi64(0x55, perm_mask_idx, sra);
+            let poly_term = _mm512_and_si512(mask_lo, poly_87);
+            _mm512_ternarylogic_epi64::<0x96>(shl, hi_carry, poly_term)
+        }
+
+        for bit in 0..n_packed {
+            let low_z: [__m512i; 8] = core::array::from_fn(|i| {
+                _mm512_permutex2var_epi64(vals[2 * i], idx_lo, vals[2 * i + 1])
+            });
+            let high_z: [__m512i; 8] = core::array::from_fn(|i| {
+                _mm512_permutex2var_epi64(vals[2 * i], idx_hi, vals[2 * i + 1])
+            });
+
+            gfni_fold64_two_maps_regs::<false>(
+                low_z,
+                &map.low,
+                high_z,
+                &map.high,
+                w_state.as_mut_ptr().add(bit * 64),
+                core::ptr::null(),
+            );
+
+            if bit + 1 < n_packed {
+                for v in &mut vals {
+                    *v = mul_by_x_x4(*v, perm_carry_idx, perm_mask_idx, poly_87);
+                }
+            }
+        }
+    }
+}
+
+fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(w_state.len(), 64 * n_packed);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        unsafe {
+            direct_fold8_w_state_gfni(low_eq, table, w_state);
+        }
+        return;
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    {
+        use rayon::prelude::*;
+        let w_addr = w_state.as_mut_ptr() as usize;
+        (0..64usize).into_par_iter().for_each(|d_low| {
+            let w = w_addr as *mut F128;
+            let mut basis_product = low_eq[d_low];
+            // SAFETY: each d_low owns one disjoint lane in every output row.
+            unsafe {
+                *w.add(d_low) = fold_one_slot(basis_product, table);
+                for bit in 1..n_packed {
+                    basis_product = crate::field::mul_by_x(basis_product);
+                    *w.add(bit * 64 + d_low) = fold_one_slot(basis_product, table);
+                }
+            }
+        });
+    }
+}
+
+fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(fold8.len(), 64 * n_packed);
+    assert_eq!(a_state.len(), 64 * n_packed);
+    let a_addr = a_state.as_mut_ptr() as usize;
+    (0..64usize).into_par_iter().for_each(|e| {
+        let transposed = tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]);
+        let a = a_addr as *mut F128;
+        // SAFETY: each e owns one disjoint lane in every output row.
+        unsafe {
+            for (bit, value) in transposed.into_iter().enumerate() {
+                *a.add(bit * 64 + e) = value;
+            }
+        }
+    });
+}
+
+/// Value-identical full-width form of [`direct_fold8_states_seq`]. Default
+/// producers write both bit-major states directly, avoiding the two
+/// chain-major `Vec<Vec<F128>>` values and their gather. When allocation reuse
+/// is enabled, A is completed first and the no-longer-read `fold8` allocation
+/// is then fully overwritten as W; this ordering prevents scatter stores from
+/// clobbering another producer's input bank.
 fn direct_fold8_states_par(
     fold8: Vec<F128>,
     low_eq: &[F128; 64],
@@ -2861,46 +3110,66 @@ fn direct_fold8_states_par(
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
-    let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|d_low| {
-                    let mut row = Vec::with_capacity(n_packed);
-                    let mut basis_product = low_eq[d_low];
-                    row.push(fold_one_slot(basis_product, table));
-                    for _ in 1..n_packed {
-                        basis_product = crate::field::mul_by_x(basis_product);
+    let state_len = 64 * n_packed;
+    assert_eq!(fold8.len(), state_len);
+
+    if df8_state_direct_disabled() {
+        let (w_rows, a_rows): (Vec<Vec<F128>>, Vec<Vec<F128>>) = rayon::join(
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|d_low| {
+                        let mut row = Vec::with_capacity(n_packed);
+                        let mut basis_product = low_eq[d_low];
                         row.push(fold_one_slot(basis_product, table));
-                    }
-                    row
-                })
-                .collect()
-        },
-        || {
-            (0..64usize)
-                .into_par_iter()
-                .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
-                .collect()
-        },
-    );
-    let mut w_state = vec![F128::ZERO; 64 * n_packed];
-    let mut a_state = if rs_reuse_fold8_a_state_enabled() && fold8.len() == 64 * n_packed {
-        fold8
+                        for _ in 1..n_packed {
+                            basis_product = crate::field::mul_by_x(basis_product);
+                            row.push(fold_one_slot(basis_product, table));
+                        }
+                        row
+                    })
+                    .collect()
+            },
+            || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|e| tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]))
+                    .collect()
+            },
+        );
+        let mut w_state = vec![F128::ZERO; state_len];
+        let mut a_state = if rs_reuse_fold8_a_state_enabled() {
+            fold8
+        } else {
+            vec![F128::ZERO; state_len]
+        };
+        w_state
+            .par_chunks_mut(64)
+            .zip(a_state.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(bit, (w_row, a_row))| {
+                for lane in 0..64 {
+                    w_row[lane] = w_rows[lane][bit];
+                    a_row[lane] = a_rows[lane][bit];
+                }
+            });
+        let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+        return (a_state, w_state, round0);
+    }
+
+    let mut a_state = vec![F128::ZERO; state_len];
+    let mut w_state;
+    if rs_reuse_fold8_a_state_enabled() {
+        direct_fold8_a_state_into(&fold8, &mut a_state);
+        w_state = fold8;
+        direct_fold8_w_state_into(low_eq, table, &mut w_state);
     } else {
-        vec![F128::ZERO; 64 * n_packed]
-    };
-    debug_assert_eq!(a_state.len(), 64 * n_packed);
-    w_state
-        .par_chunks_mut(64)
-        .zip(a_state.par_chunks_mut(64))
-        .enumerate()
-        .for_each(|(bit, (w_row, a_row))| {
-            for lane in 0..64 {
-                w_row[lane] = w_rows[lane][bit];
-                a_row[lane] = a_rows[lane][bit];
-            }
-        });
+        w_state = vec![F128::ZERO; state_len];
+        rayon::join(
+            || direct_fold8_w_state_into(low_eq, table, &mut w_state),
+            || direct_fold8_a_state_into(&fold8, &mut a_state),
+        );
+    }
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }
