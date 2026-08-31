@@ -1246,6 +1246,15 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar `scale * out[i]` loops for
+/// the ranked identity-C one-row epilogue. Default uses [`add_scaled`] on
+/// the two live ranges (zero dest ⇒ `scale * src`). Ranked env is cleared.
+fn lc_one_scale_vec_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_SCALE").is_some());
+    *OFF
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2191,11 +2200,23 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         let half = k / 2;
         let mut one = vec![F128::ZERO; half];
         let scale_lo = F128::ONE + r;
-        for i in 0..1152 {
-            one[i] = scale_lo * out[i];
-        }
-        for i in 15104..15360 {
-            one[i - half] = r * out[i];
+        // Ranked one-rows: 1152 live low slots and 256 live high slots.
+        // `add_scaled` on a zero dest is `scale * src` (XOR-identity). Kill
+        // `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
+        if lc_one_scale_vec_disabled() {
+            for i in 0..1152 {
+                one[i] = scale_lo * out[i];
+            }
+            for i in 15104..15360 {
+                one[i - half] = r * out[i];
+            }
+        } else {
+            crate::field::f128_slice::add_scaled(&mut one[..1152], &out[..1152], scale_lo);
+            crate::field::f128_slice::add_scaled(
+                &mut one[15104 - half..15360 - half],
+                &out[15104..15360],
+                r,
+            );
         }
         Some(one)
     } else {
