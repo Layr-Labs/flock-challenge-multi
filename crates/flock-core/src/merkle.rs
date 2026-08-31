@@ -324,20 +324,23 @@ fn blake3_hash_many<const N: usize>(
     flags_start: u8,
     flags_end: u8,
 ) {
-    debug_assert_eq!(data.len(), out.len() * N);
+    assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
+        let base_ptr = msgs.as_ptr();
+        // SAFETY: the entry assertion gives every `n`-element output chunk
+        // exactly `n * N` initialized message bytes. All call-site
+        // monomorphizations have `N > 0`, `0 <= i < n`, and `[u8; N]` has
+        // byte alignment, so each pointer below addresses one complete input.
+        // Unused tail slots retain the valid first input and are not passed.
+        let first: &[u8; N] = unsafe { &*(base_ptr as *const [u8; N]) };
         let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+        for i in 0..n {
+            inputs[i] = unsafe { &*(base_ptr.add(i * N) as *const [u8; N]) };
         }
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
@@ -497,6 +500,36 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
                 }
             }
         }
+    }
+}
+
+/// Hash consecutive leaf pairs directly to their parent CVs without retaining
+/// the leaf CV level. The result is byte-identical to `hash_leaves_serial`
+/// followed by `hash_pairs_level_serial`; only the transient leaf hashes live
+/// in this function's per-thread stack scratch.
+pub(crate) fn hash_leaf_pairs_serial(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+    kind: HashKind,
+) {
+    const SCRATCH_LEAVES: usize = BLAKE3_GROUP;
+    assert_eq!(data.len(), 2 * out.len() * leaf_size);
+
+    let mut scratch = core::mem::MaybeUninit::<[Hash; SCRATCH_LEAVES]>::uninit();
+    for (parents, leaves) in out
+        .chunks_mut(SCRATCH_LEAVES / 2)
+        .zip(data.chunks(SCRATCH_LEAVES * leaf_size))
+    {
+        let leaf_count = 2 * parents.len();
+        // SAFETY: the scratch is correctly aligned for `Hash`, and
+        // `hash_leaves_serial` writes all `leaf_count` entries before
+        // `hash_pairs_level_serial` reads them.
+        let leaf_hashes = unsafe {
+            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<Hash>(), leaf_count)
+        };
+        hash_leaves_serial(leaves, leaf_size, leaf_hashes, kind);
+        hash_pairs_level_serial(leaf_hashes, parents, kind);
     }
 }
 
