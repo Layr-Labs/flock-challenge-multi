@@ -2050,6 +2050,12 @@ unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
         let ident = _mm512_set1_epi64(BIT_TRANSPOSE_ID);
         let planes = plane_banks.as_mut_ptr();
         let base = c_group.as_ptr();
+        // These 32 matrix words are reused for every retained-q mask. Keep
+        // their broadcasted ZMM forms resident across the q loop.
+        let matrix_lo: [__m512i; 16] =
+            core::array::from_fn(|plane| _mm512_set1_epi64(mats[plane] as i64));
+        let matrix_hi: [__m512i; 16] =
+            core::array::from_fn(|plane| _mm512_set1_epi64(mats[16 + plane] as i64));
 
         for q in 0..N_C_Q {
             let mut masks = [[_mm512_setzero_si512(); N_C_BANKS]; 2];
@@ -2078,8 +2084,8 @@ unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
             // One VGF2P8AFFINEQB per (mask half, output byte plane); both
             // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
             for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+                let m_lo = matrix_lo[plane];
+                let m_hi = matrix_hi[plane];
                 for bank in 0..N_C_BANKS {
                     let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
                     let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
