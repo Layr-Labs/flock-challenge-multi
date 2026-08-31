@@ -1534,6 +1534,16 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
 /// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
 /// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
 /// addition is XOR.
+/// Ranked default: parallelize the 64-bank `add_scaled` collapse of
+/// DirectFold8 s_hat_v (XOR-reduce of per-thread accumulators; XOR is
+/// commutative so bank order is free). `FLOCK_NO_SHAT_COLLAPSE_PAR=1`
+/// restores the incumbent serial 64-bank loop.
+fn shat_collapse_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SHAT_COLLAPSE_PAR").is_none());
+    *ON
+}
+
 pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
@@ -1544,6 +1554,31 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         // Same bank-major accumulation through the vectorized `add_scaled`
         // leaf — identical per-element operation in identical order, so the
         // result is bit-identical to the scalar loop below.
+        if shat_collapse_par_enabled() {
+            use rayon::prelude::*;
+            return (0..64usize)
+                .into_par_iter()
+                .fold(
+                    || vec![F128::ZERO; n_packed],
+                    |mut acc, bank| {
+                        crate::field::f128_slice::add_scaled(
+                            &mut acc,
+                            &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed],
+                            low_eq[bank],
+                        );
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![F128::ZERO; n_packed],
+                    |mut a, b| {
+                        for (dst, src) in a.iter_mut().zip(b) {
+                            *dst += src;
+                        }
+                        a
+                    },
+                );
+        }
         for bank in 0..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
