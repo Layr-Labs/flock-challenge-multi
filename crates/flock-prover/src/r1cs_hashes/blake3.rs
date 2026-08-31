@@ -1012,6 +1012,131 @@ fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
         && lc_adjoint_enabled()
 }
 
+/// Inject `α·eq[r]` / `eq[r]` at `a_roots[r]` / `b_roots[r]` with 4-wide
+/// split AVX-512 GHASH. `alpha` is a loop constant, so its `x^64` companion
+/// is hoisted once; the body is `unroll=4` groups of [`ghash_mul_x4_split`]
+/// plus an aligned x4 tail — not the scalar `F128::mul` over K=16384.
+///
+/// # Safety
+/// `avx512f`+`vpclmulqdq` compiled in; `eq_inner.len() == K`; every root is
+/// a valid node id; `acc.len() == n_nodes`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn inject_alpha_e_x4(
+    acc: &mut [F128],
+    a_roots: &[u32],
+    b_roots: &[u32],
+    n_rows: usize,
+    alpha: F128,
+    eq_inner: &[F128],
+) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    use flock_core::field::gf2_128::x86_64::{
+        f128x4_extract, f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
+        ghash_mul_x4_split_unroll4,
+    };
+
+    // SAFETY: features compiled in; eq_inner.len()==K; roots/acc in bounds.
+    unsafe {
+        let (t, t_x64) = ghash_broadcast_split(alpha);
+        let accp = acc.as_mut_ptr();
+        let ap = a_roots.as_ptr();
+        let bp = b_roots.as_ptr();
+        let eqp = eq_inner.as_ptr();
+
+        // Scatter one x4 group: extract α·e, XOR into a_roots; e stays in L1.
+        macro_rules! scatter4 {
+            ($r:expr, $ea:expr) => {{
+                let r = $r;
+                let ea4 = f128x4_extract($ea);
+                *accp.add(*ap.add(r) as usize) += ea4[0];
+                *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                *accp.add(*ap.add(r + 1) as usize) += ea4[1];
+                *accp.add(*bp.add(r + 1) as usize) += *eqp.add(r + 1);
+                *accp.add(*ap.add(r + 2) as usize) += ea4[2];
+                *accp.add(*bp.add(r + 2) as usize) += *eqp.add(r + 2);
+                *accp.add(*ap.add(r + 3) as usize) += ea4[3];
+                *accp.add(*bp.add(r + 3) as usize) += *eqp.add(r + 3);
+            }};
+        }
+        macro_rules! pf_group {
+            ($r:expr) => {{
+                let r = $r;
+                _mm_prefetch(eqp.add(r) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(ap.add(r) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(bp.add(r) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*ap.add(r) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*bp.add(r) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*ap.add(r + 1) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*bp.add(r + 1) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*ap.add(r + 2) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*bp.add(r + 2) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*ap.add(r + 3) as usize) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(accp.add(*bp.add(r + 3) as usize) as *const i8, _MM_HINT_T0);
+            }};
+        }
+
+        // K=16384 is 16-aligned. Round the live prefix up to 4 so the tail is
+        // one aligned x4 (rows [n_rows, n) are ADJ_ZERO padding).
+        let n = (n_rows + 3) & !3;
+        debug_assert!(n <= eq_inner.len());
+        const WIDTH: usize = 4;
+        const UNROLL: usize = 4;
+        let span = WIDTH * UNROLL;
+        let unroll_end = n & !(span - 1);
+
+        let mut r = 0usize;
+        if r + span <= unroll_end {
+            pf_group!(0);
+            pf_group!(4);
+            pf_group!(8);
+            pf_group!(12);
+            let mut e0 = f128x4_loadu(eqp.add(0));
+            let mut e1 = f128x4_loadu(eqp.add(4));
+            let mut e2 = f128x4_loadu(eqp.add(8));
+            let mut e3 = f128x4_loadu(eqp.add(12));
+            let (mut p0, mut p1, mut p2, mut p3) =
+                ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+            r = span;
+            while r < unroll_end {
+                pf_group!(r);
+                pf_group!(r + 4);
+                pf_group!(r + 8);
+                pf_group!(r + 12);
+                e0 = f128x4_loadu(eqp.add(r));
+                e1 = f128x4_loadu(eqp.add(r + 4));
+                e2 = f128x4_loadu(eqp.add(r + 8));
+                e3 = f128x4_loadu(eqp.add(r + 12));
+                let nxt = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                scatter4!(r - span, p0);
+                scatter4!(r - span + 4, p1);
+                scatter4!(r - span + 8, p2);
+                scatter4!(r - span + 12, p3);
+                p0 = nxt.0;
+                p1 = nxt.1;
+                p2 = nxt.2;
+                p3 = nxt.3;
+                r += span;
+            }
+            scatter4!(unroll_end - span, p0);
+            scatter4!(unroll_end - span + 4, p1);
+            scatter4!(unroll_end - span + 8, p2);
+            scatter4!(unroll_end - span + 12, p3);
+        }
+        while r < n {
+            pf_group!(r);
+            let e = f128x4_loadu(eqp.add(r));
+            let p = ghash_mul_x4_split(e, t, t_x64);
+            scatter4!(r, p);
+            r += WIDTH;
+        }
+    }
+}
+
 impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     fn n_cols(&self) -> usize {
         K
@@ -1027,7 +1152,31 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
 
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
-        // so empty rows need no branch.
+        // so empty rows need no branch. AVX-512 path: 4-wide split GHASH on
+        // the loop-constant α, unroll-4 + aligned x4 tail.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: features compiled in; roots are valid node ids by `build`;
+        // `eq_inner.len() == K` (asserted); `acc.len() == n_nodes`.
+        unsafe {
+            inject_alpha_e_x4(
+                &mut acc,
+                &self.a_roots,
+                &self.b_roots,
+                self.n_rows,
+                alpha,
+                eq_inner,
+            );
+        }
+
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         for r in 0..self.n_rows {
             let e = eq_inner[r];
             let ea = alpha * e;
@@ -1043,7 +1192,19 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // before it, so `ADJ_BASE + i`'s children are both `< ADJ_BASE + i`
         // and descending `i` visits every parent before either child.
         let base = ADJ_BASE as usize;
-        for i in (0..self.children.len()).rev() {
+        let n_int = self.children.len();
+        for i in (0..n_int).rev() {
+            #[cfg(target_arch = "x86_64")]
+            if i >= 16 {
+                // SAFETY: i-16 is in-range; prefetch is architecturally a hint.
+                unsafe {
+                    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                    let [pp, qq] = *self.children.get_unchecked(i - 16);
+                    _mm_prefetch(acc.as_ptr().add(pp as usize) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(acc.as_ptr().add(qq as usize) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(acc.as_ptr().add(base + i - 16) as *const i8, _MM_HINT_T0);
+                }
+            }
             let v = acc[base + i];
             // SAFETY: children are node ids `< base + i < n_nodes`.
             let [p, q] = unsafe { *self.children.get_unchecked(i) };
@@ -2168,14 +2329,6 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
-        && skip_blocks == 0
-        && z.len() / F128_PER_BLOCK == 1 << 18
-        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
-        && flock_core::pcs::ranked_direct_fold8_enabled();
-    if one_rows_elided {
-        ab_inner.set_ranked_one_rows_elided();
-    }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2291,7 +2444,6 @@ fn generate_round1_inner_octa(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
                                 inv_table,
                                 plan: win_plan,
-                                one_rows_elided,
                             }
                         }).unwrap_unchecked();
                         blake3_witgen8::build_octa_witness_ab_stream_elide(

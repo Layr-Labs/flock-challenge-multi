@@ -405,7 +405,11 @@ pub unsafe fn ghash_shift64_x4(t: __m512i) -> __m512i {
 /// form: `t` and `t_x64 = t·x^64 mod p` (see [`ghash_shift64_x4`]). Both
 /// twiddle operands are normally lane-broadcast loop constants.
 ///
-/// Field-identical to [`ghash_mul_x4`]`(t, v)` — 5 CLMUL instead of 6.
+/// Compiled-in 4-wide dispatch (`x4_width=4`, `use_split=true`): this is the
+/// live GF(2^128) mul 4-wide kernels call, not [`ghash_mul_x4`]. Field-identical
+/// to [`ghash_mul_x4`]`(t, v)` — 5 CLMUL instead of 6. Callers hoist the
+/// companion once (`ghash_broadcast_split`) and apply `unroll=4` via
+/// [`ghash_mul_x4_split_unroll4`].
 ///
 /// # Safety
 /// Caller must ensure `avx512f` + `vpclmulqdq` (statically satisfied by the
@@ -433,6 +437,50 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
     }
 }
 
+/// Broadcast a scalar twiddle to all 4 lanes and materialise `t·x^64 mod p`.
+/// Hoist once per loop-constant multiplier, then feed [`ghash_mul_x4_split`].
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_broadcast_split(t: F128) -> (__m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        (tv, ghash_shift64_x4(tv))
+    }
+}
+
+/// Four independent [`ghash_mul_x4_split`] products of `v0..v3` by the same
+/// split twiddle. Compiled-in dispatch: `x4_width=4`, `use_split=true`,
+/// `unroll=4`.
+///
+/// # Safety
+/// Same contract as [`ghash_mul_x4_split`] on every operand.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_unroll4(
+    v0: __m512i,
+    v1: __m512i,
+    v2: __m512i,
+    v3: __m512i,
+    t: __m512i,
+    t_x64: __m512i,
+) -> (__m512i, __m512i, __m512i, __m512i) {
+    // SAFETY: forwarded; four independent lane groups, same companion.
+    unsafe {
+        (
+            ghash_mul_x4_split(v0, t, t_x64),
+            ghash_mul_x4_split(v1, t, t_x64),
+            ghash_mul_x4_split(v2, t, t_x64),
+            ghash_mul_x4_split(v3, t, t_x64),
+        )
+    }
+}
+
 // -----------------------------------------------------------------------
 // Deferred-reduction 4-lane accumulator (port of binius `WideGhashProduct`,
 // 4 lanes wide). Widen each product with 4 CLMULs but DON'T reduce; XOR many
@@ -455,6 +503,54 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
 pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
     // SAFETY: caller guarantees 4 readable F128 at p.
     unsafe { _mm512_loadu_si512(p as *const __m512i) }
+}
+
+/// Store 4 contiguous `F128` from a `__m512i` (lane i → `p[i]`).
+///
+/// # Safety
+/// `p` must point to 4 writable `F128`; `avx512f` available (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn f128x4_storeu(p: *mut F128, v: __m512i) {
+    // SAFETY: caller guarantees 4 writable F128 at p.
+    unsafe { _mm512_storeu_si512(p as *mut __m512i, v) }
+}
+
+/// Extract 4 `F128` lanes from a `__m512i` (lane 0 = `out[0]`, …).
+///
+/// # Safety
+/// `avx512f` + `sse4.1` available (cfg-gated).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,sse4.1")]
+pub unsafe fn f128x4_extract(v: __m512i) -> [F128; 4] {
+    // SAFETY: lane extracts are register-only; sse4.1 is x86_64-v3 baseline
+    // on every avx512f target this crate builds.
+    unsafe {
+        let l0 = _mm512_extracti32x4_epi32::<0>(v);
+        let l1 = _mm512_extracti32x4_epi32::<1>(v);
+        let l2 = _mm512_extracti32x4_epi32::<2>(v);
+        let l3 = _mm512_extracti32x4_epi32::<3>(v);
+        [
+            F128 {
+                lo: _mm_extract_epi64::<0>(l0) as u64,
+                hi: _mm_extract_epi64::<1>(l0) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l1) as u64,
+                hi: _mm_extract_epi64::<1>(l1) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l2) as u64,
+                hi: _mm_extract_epi64::<1>(l2) as u64,
+            },
+            F128 {
+                lo: _mm_extract_epi64::<0>(l3) as u64,
+                hi: _mm_extract_epi64::<1>(l3) as u64,
+            },
+        ]
+    }
 }
 
 /// Pack 4 `F128` scalars into a `__m512i` (lane 0 = `a`, …, lane 3 = `d`).
@@ -532,28 +628,6 @@ impl WideGhashX4 {
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
         self.mid = _mm512_xor_si512(self.mid, m);
-    }
-
-    /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
-    /// operand, specialized.
-    ///
-    /// With `y = F128::ONE = { lo: 1, hi: 0 }` the three limbs of
-    /// [`Self::mul_acc`] degenerate exactly:
-    ///   `lo  = x.lo*1 = x.lo`  (low qword of each lane, high qword zero),
-    ///   `hi  = x.hi*0 = 0`,
-    ///   `mid = x.hi*1 ^ x.lo*0 = x.hi`  (moved into the lane's low qword).
-    /// So the four CLMULs collapse to one masked move and one lane-wise byte
-    /// shift. Bit-identical to `mul_acc(x, ONE)`.
-    ///
-    /// # Safety
-    /// `avx512f` available (cfg-gated).
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
-        self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
-        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
-        self.mid =
-            _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
