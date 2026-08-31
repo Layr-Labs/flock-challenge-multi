@@ -58,7 +58,9 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // Process start, on the (unpinned) main thread, after the global pool
     // exists. This is the only place the zerocheck round-1 half-pools may be
     // built: see `smt_split`.
-    smt_split::init();
+    // nosp37: the round-1 half-pool split schedule is removed at its call
+    // site; the pools are never built (module kept for rollback).
+    // smt_split::init();
     built
 }
 
