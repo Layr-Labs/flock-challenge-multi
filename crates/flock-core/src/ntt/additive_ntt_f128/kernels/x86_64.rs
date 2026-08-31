@@ -10,6 +10,16 @@ fn mul_diet_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
 
+/// `FLOCK_NO_NTT_HOLD4_TAIL_OUTLINE=1` forces a call to the scalar remainder
+/// of the hold-4 seed kernel even when `num_ntts` is a multiple of 4, so a
+/// candidate/control pair differs only in whether that dead tail sits in
+/// I-cache of the 4-wide leaf. Ranked env is cleared, so the call is skipped.
+#[inline]
+fn hold4_tail_outline_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HOLD4_TAIL_OUTLINE").is_some())
+}
+
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
 /// form [`crate::field::gf2_128::x86_64::ghash_mul_x4_split`] consumes:
 /// `.0 = t`, `.1 = t·x^64 mod p`. The companion limb is only materialised
@@ -1022,7 +1032,44 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
             _mm512_storeu_si512(dn_row(3).add(lane) as *mut __m512i, vd);
             lane += 4;
         }
-        while lane < num_ntts {
+        // Ranked L0 / recursive seed pass `num_ntts ∈ {64, 8}`: this remainder
+        // is dead. Keep it out of this leaf's I-cache so the 4-wide body is
+        // what SPR fetches. Kill `FLOCK_NO_NTT_HOLD4_TAIL_OUTLINE=1` restores
+        // an in-line tail (the outlined symbol is still the only body; the
+        // kill forces a always-taken call so I-cache includes it).
+        if lane < num_ntts || hold4_tail_outline_disabled() {
+            sparse_dense_geo_scalar_tail(
+                src_row,
+                sp_row,
+                dn_row,
+                right_twiddle,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                lane,
+                num_ntts,
+            );
+        }
+    }
+}
+
+/// Scalar remainder of [`butterfly_fused_2layer_row_from_sparse_dense_geo_impl`].
+/// Outlined so the ranked 4-wide body does not carry a 40-line never-taken
+/// tail in I-cache. Same stores, same algebra.
+#[inline(never)]
+fn sparse_dense_geo_scalar_tail(
+    src_row: impl Fn(usize) -> *const F128,
+    sp_row: impl Fn(usize) -> *mut F128,
+    dn_row: impl Fn(usize) -> *mut F128,
+    right_twiddle: F128,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    mut lane: usize,
+    num_ntts: usize,
+) {
+    while lane < num_ntts {
+        unsafe {
             let a = *src_row(0).add(lane);
             let b = *src_row(1).add(lane);
             let c = *src_row(2).add(lane);
@@ -1058,8 +1105,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<const DIET: bool
             *dn_row(1).add(lane) = vb;
             *dn_row(2).add(lane) = vc;
             *dn_row(3).add(lane) = vd;
-            lane += 1;
         }
+        lane += 1;
     }
 }
 
