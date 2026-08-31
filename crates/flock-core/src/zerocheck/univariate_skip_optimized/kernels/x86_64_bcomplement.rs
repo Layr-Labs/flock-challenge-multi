@@ -71,6 +71,11 @@ const WINDOW_PLANS: [WindowPlan; 28] = build_window_plans();
 /// geometry, so every byte represented by a nonzero mode is a structural
 /// 0xff, not a sampled witness value.
 ///
+/// Ranked default takes the per-window monomorphized straight-line body
+/// ([`bcomplement_window_spec`]); `FLOCK_NO_R1_BCOMP_SPEC=1` restores the
+/// incumbent runtime per-K mode dispatch loop. Both arms compute identical
+/// bytes from identical table addresses.
+///
 /// # Safety
 /// - The CPU supports GFNI, AVX-512F and AVX-512BW.
 /// - imgs are the base and sigma-8 images of the exact checked inverse-NTT
@@ -86,8 +91,36 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2(
 ) {
     debug_assert!((2..=29).contains(&blk));
     unsafe {
-        let plan = WINDOW_PLANS[blk - 2];
-        let mut modes = plan.modes;
+        let acc = if spec_windows_enabled() {
+            bcomplement_window_spec(imgs, op, blk)
+        } else {
+            bcomplement_window_generic(imgs, op, WINDOW_PLANS[blk - 2].modes)
+        };
+        _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
+/// Cached default-on switch for the monomorphized window bodies.
+/// `FLOCK_NO_R1_BCOMP_SPEC=1` restores the runtime per-K mode dispatch.
+#[inline]
+fn spec_windows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_BCOMP_SPEC").is_none());
+    *ON
+}
+
+/// Incumbent runtime-dispatch window Horner (kill-switch arm and test
+/// oracle). Per K-row this decodes one mode byte and takes a 16-way dispatch;
+/// the window's mode word is a compile-time constant, so the ranked arm
+/// resolves all of that statically instead.
+#[inline(always)]
+unsafe fn bcomplement_window_generic(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    plan_modes: u64,
+) -> __m512i {
+    unsafe {
+        let mut modes = plan_modes;
         let apply = |p| apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, p);
         let mut acc = _mm512_gf2p8mul_epi8(
             apply(op.add(7 * 8)),
@@ -101,7 +134,106 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2(
             let product = _mm512_gf2p8mul_epi8(av, bv);
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), product);
         }
-        _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+        acc
+    }
+}
+
+/// One ranked window through the monomorphized body for its static mode plan.
+/// Identical value and identical table addresses to
+/// [`bcomplement_window_generic`] over the same offsets: only the dispatch
+/// moves from run time to compile time (one 28-way window select here versus
+/// eight 16-way per-K selects plus the mode shift chain and K loop control in
+/// the generic arm).
+#[inline(always)]
+unsafe fn bcomplement_window_spec(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    blk: usize,
+) -> __m512i {
+    macro_rules! arm {
+        ($b:literal) => {
+            window_horner_spec::<{ WINDOW_PLANS[$b - 2].modes }>(imgs, op)
+        };
+    }
+    unsafe {
+        match blk {
+            2 => arm!(2),
+            3 => arm!(3),
+            4 => arm!(4),
+            5 => arm!(5),
+            6 => arm!(6),
+            7 => arm!(7),
+            8 => arm!(8),
+            9 => arm!(9),
+            10 => arm!(10),
+            11 => arm!(11),
+            12 => arm!(12),
+            13 => arm!(13),
+            14 => arm!(14),
+            15 => arm!(15),
+            16 => arm!(16),
+            17 => arm!(17),
+            18 => arm!(18),
+            19 => arm!(19),
+            20 => arm!(20),
+            21 => arm!(21),
+            22 => arm!(22),
+            23 => arm!(23),
+            24 => arm!(24),
+            25 => arm!(25),
+            26 => arm!(26),
+            27 => arm!(27),
+            28 => arm!(28),
+            29 => arm!(29),
+            // Callers guarantee 2..=29 (debug-asserted at the entry point).
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+}
+
+/// Monomorphized whole-window Horner for the const mode word `MODES` (K7 in
+/// the least-significant byte, exactly [`WindowPlan::modes`]). The K rows are
+/// written with literal indices so every [`apply_b_mode`] match folds at
+/// compile time and no K control loop survives; kept out of line so the 28
+/// straight-line bodies are shared by every inlined caller of the entry
+/// point instead of bloating each.
+///
+/// # Safety
+/// As for [`shift_reduce_bcomplement_offw_nt2`].
+#[inline(never)]
+unsafe fn window_horner_spec<const MODES: u64>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> __m512i {
+    unsafe {
+        let apply = |p| apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, p);
+        macro_rules! bmode {
+            ($k:literal) => {
+                apply_b_mode(
+                    imgs,
+                    op.add(64 + $k * 8),
+                    ((MODES >> (8 * (7 - $k))) & 0xff) as u8,
+                )
+            };
+        }
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), bmode!(7));
+        let x = _mm512_set1_epi8(2);
+        macro_rules! krow {
+            ($k:literal) => {
+                let av = apply(op.add($k * 8));
+                let bv = bmode!($k);
+                let product = _mm512_gf2p8mul_epi8(av, bv);
+                acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), product);
+            };
+        }
+        krow!(6);
+        krow!(5);
+        krow!(4);
+        krow!(3);
+        krow!(2);
+        krow!(1);
+        krow!(0);
+        acc
     }
 }
 
@@ -256,6 +388,44 @@ mod tests {
             8..=14 => (0xffu16 << (15 - mode)) as u8,
             15 => 0xff,
             _ => 0,
+        }
+    }
+
+    /// The monomorphized window bodies must be bit-identical to the incumbent
+    /// runtime-dispatch loop for EVERY window plan over arbitrary offsets —
+    /// the two arms are the same arithmetic modulo dispatch, so equality may
+    /// not depend on the ranked witness geometry at all.
+    #[test]
+    fn spec_windows_match_generic_dispatch_for_arbitrary_offsets() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(64));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let imgs = table.image_ptrs();
+
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for blk in 2..=29usize {
+            for _trial in 0..8 {
+                let off: [u16; 128] = core::array::from_fn(|_| ((next() & 0xff) as u16) << 6);
+                let (spec, generic) = unsafe {
+                    (
+                        bcomplement_window_spec(imgs, off.as_ptr(), blk),
+                        bcomplement_window_generic(
+                            imgs,
+                            off.as_ptr(),
+                            WINDOW_PLANS[blk - 2].modes,
+                        ),
+                    )
+                };
+                let spec: [u8; 64] = unsafe { core::mem::transmute(spec) };
+                let generic: [u8; 64] = unsafe { core::mem::transmute(generic) };
+                assert_eq!(spec, generic, "blk={blk}");
+            }
         }
     }
 
