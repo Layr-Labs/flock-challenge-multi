@@ -579,6 +579,7 @@ pub(super) fn write_convert_ab_nomul_gfni_range2(
     }
 }
 
+
 /// Reassemble one byte-plane C bank (`[plane][lane]`) into its 64 F128 lanes:
 /// `out[lane] = sum_k plane[k][lane] << 8k` over the low eight planes for
 /// `lo` and the high eight for `hi`. Run once per bank per band by the fused
@@ -669,6 +670,14 @@ pub(super) fn write_c_banks_fold4_fused_gfni(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 pub(super) fn accumulate_c_banks_fold4_fused_gfni(
     c_group: &[u8],
     n_b_med: &[usize; 4],

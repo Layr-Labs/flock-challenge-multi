@@ -301,14 +301,64 @@ fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
 ))]
 const AB_EQ_FOLD_MATS_PAR_MIN_W: usize = 8;
 
+/// Build one 16-qword GFNI matrix block with the four-lane field multiplier.
+/// The old builder performed eight scalar F128 products per medium byte and
+/// extracted every matrix bit in nested loops. Two VPCLMULQDQ calls produce
+/// those eight scaled basis columns together, and the established 8×8 byte
+/// transpose emits the exact affine encoding consumed by the GFNI drain.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn build_ab_eq_fold_mats_block(scale: F128, convert_block: &[F128], out: &mut [u64]) {
+    use crate::bits::transpose_8_u64s_to_64_bytes;
+    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use core::arch::x86_64::{__m512i, _mm512_storeu_si512};
+
+    debug_assert_eq!(convert_block.len(), 256);
+    debug_assert_eq!(out.len(), 16);
+    let scale_x4 = unsafe { f128x4_set(scale, scale, scale, scale) };
+    let mut basis = [F128::ZERO; 8];
+    for j in (0..8).step_by(4) {
+        let basis_x4 = unsafe {
+            f128x4_set(
+                convert_block[1 << j],
+                convert_block[1 << (j + 1)],
+                convert_block[1 << (j + 2)],
+                convert_block[1 << (j + 3)],
+            )
+        };
+        let scaled = unsafe { ghash_mul_x4(scale_x4, basis_x4) };
+        unsafe {
+            _mm512_storeu_si512(
+                basis.as_mut_ptr().add(j).cast::<__m512i>(),
+                scaled,
+            );
+        }
+    }
+    let lo_lanes = std::array::from_fn(|j| basis[j].lo);
+    let hi_lanes = std::array::from_fn(|j| basis[j].hi);
+    let mut lo_bytes = [0u8; 64];
+    let mut hi_bytes = [0u8; 64];
+    transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+    transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+    for k in 0..8 {
+        let lo: [u8; 8] = lo_bytes[k * 8..k * 8 + 8].try_into().unwrap();
+        let hi: [u8; 8] = hi_bytes[k * 8..k * 8 + 8].try_into().unwrap();
+        out[k] = u64::from_le_bytes(lo).swap_bytes();
+        out[k + 8] = u64::from_le_bytes(hi).swap_bytes();
+    }
+}
+
 /// Body of [`build_ab_eq_fold_mats`]. The per-`w` row — eight basis scales
 /// plus a 128×8 bit transpose into sixteen 8×8 matrices — is a pure function
 /// of `eq_top_scaled[w]` writing its own disjoint 256-qword row, so `par`
 /// fans the 32 ranked rows across the pool with an order-preserving indexed
-/// map; the incumbent ran them on ONE core immediately ahead of round one's
-/// wide region. Identical per-row body either way, so the table is
-/// bit-identical; `false` is the incumbent sequential build, kept as the
-/// kill-switch path and the byte-identity oracle (`FLOCK_NO_SERIAL_PAR=1`).
+/// map. The sequential branch retains the same SIMD row body for small calls
+/// where rayon setup would dominate; both scheduling branches are byte-identical.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -318,25 +368,8 @@ const AB_EQ_FOLD_MATS_PAR_MIN_W: usize = 8;
 fn build_ab_eq_fold_mats_gated(eq_top_scaled: &[F128], convert: &[F128], par: bool) -> Vec<u64> {
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
     let fill_row = |scale: &F128, row: &mut [u64]| {
-        for bm in 0..16 {
-            let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
-            for k in 0..16 {
-                let mut qword = 0u64;
-                for i in 0..8 {
-                    let bit_index = 8 * k + i;
-                    let mut row_bits = 0u8;
-                    for (j, b) in basis.iter().enumerate() {
-                        let bit = if bit_index < 64 {
-                            (b.lo >> bit_index) & 1
-                        } else {
-                            (b.hi >> (bit_index - 64)) & 1
-                        };
-                        row_bits |= (bit as u8) << j;
-                    }
-                    qword |= (row_bits as u64) << (8 * (7 - i));
-                }
-                row[bm * 16 + k] = qword;
-            }
+        for (bm, out) in row.chunks_exact_mut(16).enumerate() {
+            build_ab_eq_fold_mats_block(*scale, &convert[bm * 256..(bm + 1) * 256], out);
         }
     };
     let mut mats = vec![0u64; eq_top_scaled.len() * 256];
@@ -3155,6 +3188,7 @@ fn process_one_x_hi_ab_only(
     state: &mut WorkerStateAbOnly,
 ) {
     state.partial_ab.fill(F128::ZERO);
+    let r1_eqfold_x4 = r1_eqfold_x4_enabled();
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
     if let Some((eq_bot, _, _)) = eq_fold {
         let plane_len = eq_bot.len() * 16 * ELL;
@@ -3246,15 +3280,9 @@ fn process_one_x_hi_ab_only(
             }
         }
         for b_med in first_b_med..n_b_med {
-            // Spread delivery: one hint per copy step, so each hint is
-            // issued next to one demand line rather than the whole block
-            // queueing ahead of the copy. Same lines, same look-ahead.
-            #[cfg(target_arch = "x86_64")]
-            if pf_spread && b_med >= next_first_b_med && b_med < n_next {
-                pf_one(b_med);
-            }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            state.chunk_ab_bytes[b_med]
+                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
         }
         #[cfg(target_arch = "x86_64")]
         if pf_spread {
@@ -3278,8 +3306,8 @@ fn process_one_x_hi_ab_only(
                 [u * 16 * ELL..(u + 1) * 16 * ELL])
                 .try_into()
                 .expect("one plane bank per low index");
-            if plane_first_write && w_idx == 0 {
-                if first_b_med == 2 {
+            if first_b_med == 2 {
+                if plane_first_write && w_idx == 0 {
                     kernels::write_convert_ab_nomul_gfni_range2(
                         &state.chunk_ab_bytes,
                         n_b_med,
@@ -3287,29 +3315,27 @@ fn process_one_x_hi_ab_only(
                         bank,
                     );
                 } else {
-                    kernels::write_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
-                }
-            } else {
-                if first_b_med == 2 {
                     kernels::accumulate_convert_ab_nomul_gfni_range2(
                         &state.chunk_ab_bytes,
                         n_b_med,
                         mats_w,
                         bank,
                     );
-                } else {
-                    kernels::accumulate_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
-                        n_b_med,
-                        mats_w,
-                        bank,
-                    );
                 }
+            } else if plane_first_write && w_idx == 0 {
+                kernels::write_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
+            } else {
+                kernels::accumulate_convert_ab_nomul_gfni(
+                    &state.chunk_ab_bytes,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                );
             }
         } else {
             if first_b_med == 2 {
@@ -3351,7 +3377,7 @@ fn process_one_x_hi_ab_only(
         // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
         // shared `add_scaled` leaf, which selects the architecture kernel.
         let mut bank_f128 = [F128::ZERO; ELL];
-        let wide = r1_eqfold_x4_enabled();
+        let wide = r1_eqfold_x4;
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
             let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
                 .try_into()
@@ -3370,7 +3396,7 @@ fn process_one_x_hi_ab_only(
             }
         }
     }
-    if r1_eqfold_x4_enabled() {
+    if r1_eqfold_x4 {
         let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
         crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
     } else {
@@ -3973,6 +3999,55 @@ mod tests {
                 "corrupted scale went undetected n_w={n_w}"
             );
         }
+    }
+
+    /// The vectorized basis products and shared transpose must preserve the
+    /// original bit-extracted GFNI matrix encoding.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn ab_eq_fold_mats_matches_scalar_reference() {
+        let convert = convert_table();
+        let scales = [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: 0x0123_4567_89ab_cdef,
+                hi: 0xfedc_ba98_7654_3210,
+            },
+        ];
+        let got = build_ab_eq_fold_mats_gated(&scales, convert, false);
+        let mut want = vec![0u64; scales.len() * 256];
+        for (w, scale) in scales.iter().enumerate() {
+            let row = &mut want[w * 256..(w + 1) * 256];
+            for bm in 0..16 {
+                let basis: [F128; 8] = std::array::from_fn(|j| {
+                    convert[bm * 256 + (1 << j)] * *scale
+                });
+                for k in 0..16 {
+                    let mut qword = 0u64;
+                    for i in 0..8 {
+                        let bit_index = 8 * k + i;
+                        let mut row_bits = 0u8;
+                        for (j, b) in basis.iter().enumerate() {
+                            let bit = if bit_index < 64 {
+                                (b.lo >> bit_index) & 1
+                            } else {
+                                (b.hi >> (bit_index - 64)) & 1
+                            };
+                            row_bits |= (bit as u8) << j;
+                        }
+                        qword |= (row_bits as u64) << (8 * (7 - i));
+                    }
+                    row[bm * 16 + k] = qword;
+                }
+            }
+        }
+        assert_eq!(got, want);
     }
 
     /// A first-visit bank overwrite must equal the incumbent accumulate into
