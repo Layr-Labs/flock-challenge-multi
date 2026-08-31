@@ -483,12 +483,9 @@ pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
 #[inline]
 #[target_feature(enable = "avx512f")]
 unsafe fn xor4_lanes(v: __m512i) -> __m128i {
-    // Register-only lane extracts + XOR; avx512f cfg-gated.
-    let l0 = _mm512_extracti32x4_epi32::<0>(v);
-    let l1 = _mm512_extracti32x4_epi32::<1>(v);
-    let l2 = _mm512_extracti32x4_epi32::<2>(v);
-    let l3 = _mm512_extracti32x4_epi32::<3>(v);
-    _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+    // Register-only 2-stage tree reduction: 512->256->128
+    let v256 = _mm256_xor_si256(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64::<1>(v));
+    _mm_xor_si128(_mm256_castsi256_si128(v256), _mm256_extracti128_si256::<1>(v256))
 }
 
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
@@ -527,11 +524,11 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
@@ -548,12 +545,10 @@ impl WideGhashX4 {
     /// # Safety
     /// `avx512f` available (cfg-gated).
     #[inline]
-    #[target_feature(enable = "avx512f")]
+    #[target_feature(enable = "avx512f,avx512bw")]
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
-        let mid_idx = _mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1);
-        self.mid =
-            _mm512_xor_si512(self.mid, _mm512_maskz_permutexvar_epi64(0x55, mid_idx, x));
+        self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the
