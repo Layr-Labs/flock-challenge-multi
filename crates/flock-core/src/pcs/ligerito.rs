@@ -4199,6 +4199,25 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// Ranked x86 remaining opening after DirectFold8 starts at `half = 2^17`.
+/// Default enables the existing NT leaf there. `FLOCK_NO_OPEN_NT_17=1`
+/// restores the incumbent 2^21 DRAM-cold floor.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_nt_min_half_x86() -> usize {
+    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_OPEN_NT_17").is_some() {
+            1usize << 21
+        } else {
+            1usize << 17
+        }
+    });
+    *MIN
+}
+
 fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
@@ -4304,9 +4323,12 @@ fn fold_and_msg_lsb_inner(
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
-    // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port;
-    // this is the leftover L0-fold site (~960 MiB RFO across the four
-    // rounds with half ≥ 2^21). `FLOCK_NO_OPEN_NT` is the same-binary A/B.
+    // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port.
+    // DirectFold8 consumes the 2^26→2^18 folds; the remaining opening starts
+    // at n=2^18 so half=2^17 never reached the old 2^21 gate. Default min
+    // half is 2^17 so that first remaining round (2 MiB/buffer) uses the
+    // existing NT leaf. `FLOCK_NO_OPEN_NT` still disables the leaf.
+    // `FLOCK_NO_OPEN_NT_17=1` restores the 2^21 floor.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4314,7 +4336,7 @@ fn fold_and_msg_lsb_inner(
     ))]
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
-        && half >= (1usize << 21)
+        && half >= open_nt_min_half_x86()
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
