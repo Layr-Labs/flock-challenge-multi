@@ -199,7 +199,18 @@ unsafe impl GlobalAlloc for RecycleAlloc {
     }
 }
 
-#[cfg(test)]
+// These tests observe the behaviour of THIS allocator through `Vec`, so they
+// are only meaningful where it is actually registered as `#[global_allocator]`
+// — see the identical `cfg` in `lib.rs`. On a host without AVX-512 the
+// registration is absent, allocations go to the system allocator, and the
+// 64-alignment premise is simply false rather than broken.
+#[cfg(all(
+    test,
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx512f")
+    )
+))]
 mod tests {
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the

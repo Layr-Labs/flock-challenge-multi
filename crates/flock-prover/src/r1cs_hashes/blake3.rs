@@ -989,6 +989,45 @@ fn lc_adjoint_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LC_ADJ_CZ_AGG=1` restores the per-row `b_roots` scatter.
+///
+/// Inert on the ranked runner: the harness calls `env_clear()` and the worker
+/// runs inside the verifier's sandbox, so this is a local A/B surface only and
+/// the aggregated arm is the compiled-in default.
+#[inline]
+fn adj_cz_agg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ADJ_CZ_AGG").is_none());
+    *ON
+}
+
+/// The rows whose B-support is exactly the constant pin, i.e.
+/// `b_roots[r] == Z_CONST_POS`. Three disjoint ascending ranges:
+///
+/// 1. `[0, GS_BASE)` — CV inputs, `out_lo`, the `Z_CONST` tautology row, and the
+///    M/T_LO/T_HI/BLEN/FLAGS inputs (`build`: the `input_emit` closure, the
+///    `a_roots[Z_CONST_POS]`/`b_roots[Z_CONST_POS]` pin, and the `out_lo` loop).
+/// 2. The trailing `LIN_WORDS_PER_G * WORD_BITS` linear rows of each G
+///    invocation (`build`: the `LIN_B_NEW` and `LIN_D_NEW` loops). The
+///    `ADDS_PER_G * CARRY_BITS_PER_ADD` carry rows before them take ordinary
+///    DAG roots and are deliberately excluded.
+/// 3. `[OUT_HI_BASE, USEFUL_BITS)` — the `out_hi` rows.
+///
+/// Total length `GS_BASE + N_G * LIN_WORDS_PER_G * WORD_BITS
+/// + (USEFUL_BITS - OUT_HI_BASE)` = `1153 + 56*64 + 256` = `4993`, i.e. just
+/// under a third of the `USEFUL_BITS` live rows all XOR into one slot.
+#[inline]
+fn adj_const_pin_ranges() -> impl Iterator<Item = (usize, usize)> {
+    const LIN_ROWS_PER_G: usize = LIN_WORDS_PER_G * WORD_BITS; // 64
+    const CARRY_ROWS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD; // 186
+    std::iter::once((0usize, GS_BASE))
+        .chain((0..N_G).map(|g| {
+            let lin = GS_BASE + G_STRIDE * g + CARRY_ROWS_PER_G;
+            (lin, lin + LIN_ROWS_PER_G)
+        }))
+        .chain(std::iter::once((OUT_HI_BASE, USEFUL_BITS)))
+}
+
 /// FAIL-CLOSED shape gate. [`Blake3AdjointPlan`] hard-codes the geometry that
 /// `build_matrices` produces; it is valid for that `(A_0, B_0)` pair and
 /// nothing else. Every dimension the plan assumes is checked here, and any
@@ -1028,6 +1067,9 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
         // so empty rows need no branch.
+        //
+        // A side: unchanged for every row. Vectorizing the `alpha * e` product
+        // is a SEPARATE mechanism and is deliberately not done here.
         for r in 0..self.n_rows {
             let e = eq_inner[r];
             let ea = alpha * e;
@@ -1035,7 +1077,55 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
             // construction in `build`, and `r < n_rows <= K == eq_inner.len()`.
             unsafe {
                 *acc.get_unchecked_mut(*self.a_roots.get_unchecked(r) as usize) += ea;
-                *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
+            }
+        }
+
+        // B side. `adj_const_pin_ranges` covers 4993 of the 15409 live rows,
+        // every one of which has `b_roots[r] == Z_CONST_POS`: nearly a third of
+        // the injection hammers one accumulator slot, serializing on one cache
+        // line. `F128` addition is XOR, so those updates reassociate EXACTLY —
+        // reduce them and publish once. Rows outside the ranges keep their
+        // indexed scatter, in ascending row order.
+        if adj_cz_agg_enabled()
+            && self.n_rows == USEFUL_BITS
+            && self.const_pin == Some(Z_CONST_POS)
+        {
+            let mut cz_acc = F128::ZERO;
+            let mut next = 0usize;
+            for (lo, hi) in adj_const_pin_ranges() {
+                for r in next..lo {
+                    let e = eq_inner[r];
+                    // SAFETY: as above.
+                    unsafe {
+                        *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
+                    }
+                }
+                for r in lo..hi {
+                    debug_assert_eq!(
+                        self.b_roots[r] as usize,
+                        Z_CONST_POS,
+                        "row {r} classified constant-pin but its B root is {}",
+                        self.b_roots[r]
+                    );
+                    cz_acc += eq_inner[r];
+                }
+                next = hi;
+            }
+            for r in next..self.n_rows {
+                let e = eq_inner[r];
+                // SAFETY: as above.
+                unsafe {
+                    *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
+                }
+            }
+            acc[Z_CONST_POS] += cz_acc;
+        } else {
+            for r in 0..self.n_rows {
+                let e = eq_inner[r];
+                // SAFETY: as above.
+                unsafe {
+                    *acc.get_unchecked_mut(*self.b_roots.get_unchecked(r) as usize) += e;
+                }
             }
         }
 
@@ -2168,7 +2258,17 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * BYTES_PER_BLOCK;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
+    // The ranked residual representation (`project_blocks_ranked_hot_offsets_residual`,
+    // `publish_static`, and zerocheck's matching `ranked_one_rows_elided` reader) is only
+    // correct on the AVX-512 staging shape. On a plain AVX2 host it produces a proof the
+    // TRUSTED verifier rejects with `Zerocheck(SumcheckFinalFailed)` at the ranked 2^18
+    // shape, while 2^14 passes (the mechanism self-gates on `== 1 << 18`). The env kill
+    // switch cannot roll it back: the worker runs inside the verifier's bwrap sandbox with
+    // a cleared environment, so `FLOCK_NO_R1_ONE_REUSE` never reaches it. Compile-time
+    // gate instead: codegen is unchanged wherever AVX-512 is present (the ranked runner),
+    // and proofs are correct where it is not.
+    let one_rows_elided = cfg!(target_feature = "avx512f")
+        && ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
@@ -2207,13 +2307,23 @@ fn generate_round1_inner_octa(
                 // the dump writes every window byte before the projection
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
+                // `build_octa_witness_ab_stream_elide` consumes a `StreamProj`
+                // unconditionally, so a staging region must exist on EVERY
+                // arm — including `!ab_stream && !ab_nt`, where the old code
+                // built the projection from a `None` pointer via
+                // `unwrap_unchecked` and the kernel then wrote through it
+                // (reproducible SIGSEGV in
+                // `round1_inner_ab_nt_fused_matches_kill_switch`). The window
+                // side keeps the front of the allocation so `win_ab`'s
+                // geometry is untouched; the staging tail is appended.
+                let win_lines = if ab_stream {
+                    0
                 } else if ab_nt {
                     WIN_LINES
                 } else {
                     0
                 };
+                let want = win_lines + STAGE_LINES;
                 if want != 0 {
                     v.reserve_exact(want);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
@@ -2235,11 +2345,16 @@ fn generate_round1_inner_octa(
                 } else {
                     None
                 };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
-                } else {
-                    None
+                let stage = {
+                    // Mirrors the init closure's split: window prefix (only
+                    // when the fused non-streaming arm needs one) then the
+                    // STAGE_LINES staging tail.
+                    let win_lines = if !ab_stream && ab_nt { WIN_LINES } else { 0 };
+                    debug_assert_eq!(win.len(), win_lines + STAGE_LINES);
+                    // SAFETY: the init reserved `win_lines + STAGE_LINES` lines,
+                    // so the staging tail is in bounds and disjoint from the
+                    // window prefix that `win_ab` hands out.
+                    unsafe { win.as_mut_ptr().add(win_lines).cast::<u32>() }
                 };
                 // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
                 // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
@@ -2285,15 +2400,13 @@ fn generate_round1_inner_octa(
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
-                                inv_table,
-                                plan: win_plan,
-                                one_rows_elided,
-                            }
-                        }).unwrap_unchecked();
+                        let proj = blake3_witgen8::StreamProj {
+                            stage,
+                            out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided,
+                        };
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2333,7 +2446,10 @@ fn generate_round1_inner_octa(
                 // the dump loop above could not cover (unreachable at every
                 // power-of-two shape ≥ 8; kept so the two arms stay observably
                 // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
+                // `stage` is now always a valid pointer, so the old
+                // `stage.is_some()` test is replaced by the condition it stood
+                // for: the streaming arm ran iff `ab_stream`.
+                let j0 = if win_ab.is_some() || ab_stream {
                     (n_here / SIMD) * SIMD
                 } else {
                     0
@@ -5005,6 +5121,81 @@ mod tests {
                 reference.as_bytes_mut(),
                 "streamed ab_inner differs from the incumbent reference (ranked_meta={ranked_meta})"
             );
+        }
+    }
+
+    /// The constant-pin aggregation must be a pure reassociation: the same
+    /// `comb_vec`, element for element, as the per-row scatter it replaces.
+    ///
+    /// Fully checkable on a non-AVX-512 host: the arm under test is the scalar
+    /// three-range reduction, so this is a real correctness oracle here rather
+    /// than a vacuous pass.
+    #[test]
+    fn adj_cz_aggregation_matches_row_scatter() {
+        use flock_core::lincheck::LincheckCircuit;
+        let plan = Blake3AdjointPlan::build();
+        assert_eq!(plan.n_rows, USEFUL_BITS, "ranked shape");
+        assert_eq!(plan.const_pin, Some(Z_CONST_POS));
+
+        // Every row the aggregation claims is constant-pin must actually be so,
+        // and the ranges must be disjoint, ascending, and total 4993.
+        let mut covered = 0usize;
+        let mut prev_end = 0usize;
+        for (lo, hi) in adj_const_pin_ranges() {
+            assert!(lo >= prev_end, "ranges must be ascending and disjoint");
+            assert!(hi <= plan.n_rows, "range past n_rows");
+            for r in lo..hi {
+                assert_eq!(plan.b_roots[r] as usize, Z_CONST_POS, "row {r}");
+            }
+            covered += hi - lo;
+            prev_end = hi;
+        }
+        assert_eq!(covered, 4993, "constant-pin row count");
+        assert_eq!(
+            covered,
+            GS_BASE + N_G * LIN_WORDS_PER_G * WORD_BITS + (USEFUL_BITS - OUT_HI_BASE)
+        );
+
+        // No row OUTSIDE those ranges may be constant-pin, or the aggregation
+        // is leaving work in the scatter that belongs in the reduction —
+        // correct, but a silent loss of the mechanism.
+        let in_range = |r: usize| adj_const_pin_ranges().any(|(lo, hi)| r >= lo && r < hi);
+        let strays = (0..plan.n_rows)
+            .filter(|&r| !in_range(r) && plan.b_roots[r] as usize == Z_CONST_POS)
+            .count();
+        assert_eq!(strays, 0, "constant-pin rows outside the classified ranges");
+
+        // The payload: identical output against the unaggregated definition.
+        let mut state = 0x5DEE_CE66_D15C_0FFEu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..3 {
+            let alpha = F128::new(next(), next());
+            let eq: Vec<F128> = (0..K)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+
+            let got = plan.fold_alpha_batched(alpha, &eq);
+
+            let mut want = vec![F128::ZERO; plan.n_nodes];
+            for r in 0..plan.n_rows {
+                want[plan.a_roots[r] as usize] += alpha * eq[r];
+                want[plan.b_roots[r] as usize] += eq[r];
+            }
+            let base = ADJ_BASE as usize;
+            for i in (0..plan.children.len()).rev() {
+                let v = want[base + i];
+                let [p, q] = plan.children[i];
+                want[p as usize] += v;
+                want[q as usize] += v;
+            }
+            want.truncate(K);
+
+            assert_eq!(got, want, "aggregated fold differs from row scatter (case {case})");
         }
     }
 
