@@ -45,6 +45,22 @@ use univariate_skip_optimized::{
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
 
+/// Stateless source for the ranked packed A/B witness operands.
+///
+/// The producer owns the circuit-specific replay logic; zerocheck only asks
+/// for whole, contiguous witness blocks. Implementations must reproduce the
+/// exact packed bytes that the materialized witness path would have supplied.
+/// Calls may run concurrently on Rayon workers.
+pub trait PackedAbReplay: Sync {
+    fn replay_blocks(
+        &self,
+        first_block: usize,
+        block_count: usize,
+        a_out: &mut [u8],
+        b_out: &mut [u8],
+    );
+}
+
 /// Test-only forced-off latch for the two-challenge lookahead. Production
 /// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
 /// instead so it never has to mutate the process environment. Flipping it
@@ -169,6 +185,14 @@ fn cascade5_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
 }
 
+/// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted five-level cap. The
+/// default keeps composing the remaining value-identical round pairs through
+/// the ranked 26-variable tail.
+#[inline]
+fn deep_cascade_off() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+}
+
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
@@ -179,6 +203,11 @@ fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
 /// The worker's mandatory untimed proof initializes it before measurements.
 static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
     std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
+
+#[inline]
+pub fn shared_urm_inv_table() -> &'static InvNttTableByteSingleGf8 {
+    &URM_INV_TABLE_K_SKIP
+}
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -327,7 +356,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, None, None, challenger,
     );
     (proof, claim)
 }
@@ -348,7 +377,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, None, None, challenger,
     );
     (
         proof,
@@ -393,6 +422,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         true,
         Some(ab_inner),
         None,
+        None,
         challenger,
     );
     (
@@ -428,6 +458,46 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
         true,
         Some(ab_inner),
         Some(c_identity_z),
+        None,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Exact-ranked identity-C specialization whose packed A/B operands are
+/// replayed one worker chunk at a time instead of retained as two 512 MiB
+/// tables. The Compact29 round-one representation is a hard precondition:
+/// it has no invalid prefix and therefore round one never needs raw A/B.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_replayed_ab_and_identity_c<C: Challenger>(
+    replay: &dyn PackedAbReplay,
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    assert_eq!(m, 32, "stateless A/B is ranked m=32 only");
+    assert_eq!(padding.k_log, 14, "stateless A/B fixes k_log=14");
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    assert!(ab_inner.ranked_compact());
+    assert!(ab_inner.ranked_one_rows_elided());
+    assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        &[],
+        &[],
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(c_identity_z),
+        Some(replay),
         challenger,
     );
     (
@@ -439,14 +509,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
 
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
+    mut a_packed: &[u8],
+    mut b_packed: &[u8],
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     c_identity_z: Option<&[F128]>,
+    ab_replay: Option<&dyn PackedAbReplay>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -457,8 +528,20 @@ fn prove_packed_padded_inner<C: Challenger>(
         k_skip + N_INNER
     );
     let expected_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    if ab_replay.is_some() {
+        assert!(a_packed.is_empty());
+        assert!(b_packed.is_empty());
+        let ab = precomputed_ab
+            .as_ref()
+            .expect("stateless A/B requires precomputed round-one AB");
+        assert!(ab.ranked_compact());
+        assert!(ab.ranked_one_rows_elided());
+        assert_eq!(ab.invalid_prefix_bytes(), 0);
+        assert!(c_identity_z.is_some());
+    } else {
+        assert_eq!(a_packed.len(), expected_bytes);
+        assert_eq!(b_packed.len(), expected_bytes);
+    }
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -740,6 +823,32 @@ fn prove_packed_padded_inner<C: Challenger>(
         // independently built split.
         .filter(|eq| eq.n_lo >= 3);
 
+    // The replay representation is valid only for the two packed no-materialize
+    // passes. Any diagnostic switch or algebraic precondition that selects an
+    // incumbent materializing route first reconstructs the canonical full A/B
+    // tables, then calls that route unchanged. This is cold (the ranked fixed
+    // constants make `use_nomat` true) but keeps every random-challenge and
+    // same-binary kill-switch fallback complete.
+    let replayed_full_ab = if let Some(replay) = ab_replay.filter(|_| !use_nomat) {
+        let block_bytes = (1usize << padding.k_log) / 8;
+        assert_eq!(expected_bytes % block_bytes, 0);
+        let n_f128 = expected_bytes / core::mem::size_of::<F128>();
+        let mut a = vec![F128::ZERO; n_f128];
+        let mut b = vec![F128::ZERO; n_f128];
+        let a_bytes =
+            unsafe { core::slice::from_raw_parts_mut(a.as_mut_ptr().cast::<u8>(), expected_bytes) };
+        let b_bytes =
+            unsafe { core::slice::from_raw_parts_mut(b.as_mut_ptr().cast::<u8>(), expected_bytes) };
+        replay.replay_blocks(0, expected_bytes / block_bytes, a_bytes, b_bytes);
+        Some((a, b))
+    } else {
+        None
+    };
+    if let Some((a, b)) = replayed_full_ab.as_ref() {
+        a_packed = unsafe { core::slice::from_raw_parts(a.as_ptr().cast::<u8>(), expected_bytes) };
+        b_packed = unsafe { core::slice::from_raw_parts(b.as_ptr().cast::<u8>(), expected_bytes) };
+    }
+
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
         let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             a_packed,
@@ -750,6 +859,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
             packed_eq.as_ref(),
+            ab_replay,
         );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
@@ -867,19 +977,41 @@ fn prove_packed_padded_inner<C: Challenger>(
         use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
+    let use_cascade6 =
+        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO && !deep_cascade_off();
+    let use_cascade7 = use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO;
+    let use_cascade8 = use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO;
+    let use_cascade9 = use_cascade8 && n_mlv >= 20 && r[k_skip + 17] != F128::ZERO;
+    let use_cascade10 = use_cascade9 && n_mlv >= 22 && r[k_skip + 19] != F128::ZERO;
+    let use_cascade11 = use_cascade10 && n_mlv >= 24 && r[k_skip + 21] != F128::ZERO;
+    let use_cascade12 = use_cascade11 && n_mlv >= 26 && r[k_skip + 23] != F128::ZERO;
     let n_levels = match (
         use_lookahead,
         use_cascade2,
         use_cascade3,
         use_cascade4,
         use_cascade5,
+        use_cascade6,
+        use_cascade7,
+        use_cascade8,
+        use_cascade9,
+        use_cascade10,
+        use_cascade11,
+        use_cascade12,
     ) {
         (false, ..) => 0,
         (true, false, ..) => 1,
         (true, true, false, ..) => 2,
-        (true, true, true, false, _) => 3,
-        (true, true, true, true, false) => 4,
-        (true, true, true, true, true) => 5,
+        (true, true, true, false, ..) => 3,
+        (true, true, true, true, false, ..) => 4,
+        (true, true, true, true, true, false, ..) => 5,
+        (true, true, true, true, true, true, false, ..) => 6,
+        (true, true, true, true, true, true, true, false, ..) => 7,
+        (true, true, true, true, true, true, true, true, false, ..) => 8,
+        (true, true, true, true, true, true, true, true, true, false, ..) => 9,
+        (true, true, true, true, true, true, true, true, true, true, false, ..) => 10,
+        (true, true, true, true, true, true, true, true, true, true, true, false) => 11,
+        (true, true, true, true, true, true, true, true, true, true, true, true) => 12,
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
@@ -933,6 +1065,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[1],
                 &r_next,
                 eq_override,
+                ab_replay,
             );
             a_mlv = a4;
             b_mlv = b4;

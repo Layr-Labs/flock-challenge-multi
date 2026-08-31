@@ -111,6 +111,13 @@ pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
 
+#[inline]
+fn witgen_urm_share_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_URM_SHARE").is_none());
+    *ON
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -989,6 +996,22 @@ fn lc_adjoint_enabled() -> bool {
     *ON
 }
 
+/// Coalesce the statically-constant B roots in the adjoint injector. The
+/// BLAKE3 row layout has 4,993 rows whose B support is the constant pin; their
+/// weights can be XORed in registers and published to that one accumulator
+/// slot once. `FLOCK_NO_LC_ADJ_CZ_AGG=1` restores the per-row B scatters.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn lc_adj_cz_aggregate_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ADJ_CZ_AGG").is_none());
+    *ON
+}
+
 /// FAIL-CLOSED shape gate. [`Blake3AdjointPlan`] hard-codes the geometry that
 /// `build_matrices` produces; it is valid for that `(A_0, B_0)` pair and
 /// nothing else. Every dimension the plan assumes is checked here, and any
@@ -1012,6 +1035,261 @@ fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
         && lc_adjoint_enabled()
 }
 
+/// Inject `alpha * eq[r]` and `eq[r]` at the A/B adjoint roots with four-wide
+/// split AVX-512 GHASH. The scalar `alpha` and its `x^64` companion are
+/// materialized once for the whole live row prefix.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` must be available. Let `round4` be `n_rows`
+/// rounded up to four: both root slices and `eq_inner` must contain at least
+/// `round4` entries, padded roots in `n_rows..round4` must equal `ADJ_ZERO`,
+/// every root must index `acc`, and the slices must not alias `acc`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn inject_alpha_e_x4(
+    acc: &mut [F128],
+    a_roots: &[u32],
+    b_roots: &[u32],
+    n_rows: usize,
+    alpha: F128,
+    eq_inner: &[F128],
+) {
+    use core::arch::x86_64::{_mm512_setzero_si512, _mm512_xor_si512};
+    use flock_core::field::gf2_128::x86_64::{
+        f128x4_extract, f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
+        ghash_mul_x4_split_unroll4,
+    };
+
+    let round4 = (n_rows + 3) & !3;
+    assert!(round4 <= eq_inner.len());
+    assert!(round4 <= a_roots.len());
+    assert!(round4 <= b_roots.len());
+    assert!(a_roots[n_rows..round4].iter().all(|&root| root == ADJ_ZERO));
+    assert!(b_roots[n_rows..round4].iter().all(|&root| root == ADJ_ZERO));
+
+    // SAFETY: checked slice extents cover every four-lane load. Root validity
+    // and non-aliasing are invariants of Blake3AdjointPlan::build and this
+    // helper's contract; target features are declared above.
+    unsafe {
+        let (t, t_x64) = ghash_broadcast_split(alpha);
+        let accp = acc.as_mut_ptr();
+        let ap = a_roots.as_ptr();
+        let bp = b_roots.as_ptr();
+        let eqp = eq_inner.as_ptr();
+
+        if lc_adj_cz_aggregate_enabled() {
+            // The B roots have a fixed row-type layout:
+            //
+            //   [0, GS_BASE)                         B = const
+            //   each G's first 6*31 rows             carry roots
+            //   each G's final 2*32 rows             B = const
+            //   [OUT_HI_BASE, USEFUL_BITS)           B = const
+            //
+            // Thus exactly 1153 + 56*64 + 256 = 4993 rows target `cz`.
+            // Walk those ranges directly: no root comparison or row-kind
+            // branch appears in the hot loops. A keeps the incumbent whole-
+            // prefix four-wide split-GHASH loop unchanged; B gets a separate
+            // static-range pass. The three SIMD padding rows retain their old
+            // zero-node scatters after the live prefix.
+            const CARRY_ROWS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
+            const CONST_ROWS_PER_G: usize = LIN_WORDS_PER_G * WORD_BITS;
+            const B_CONST_ROWS: usize =
+                GS_BASE + N_G * CONST_ROWS_PER_G + (USEFUL_BITS - OUT_HI_BASE);
+            const {
+                assert!(CARRY_ROWS_PER_G + CONST_ROWS_PER_G == G_STRIDE);
+                assert!(OUT_HI_BASE == GS_BASE + N_G * G_STRIDE);
+                assert!(B_CONST_ROWS == 4993);
+            }
+            assert_eq!(
+                n_rows, USEFUL_BITS,
+                "cz aggregation requires the pinned BLAKE3 row prefix"
+            );
+            debug_assert!(b_roots[..GS_BASE]
+                .iter()
+                .all(|&root| root == Z_CONST_POS as u32));
+            debug_assert!(b_roots[OUT_HI_BASE..USEFUL_BITS]
+                .iter()
+                .all(|&root| root == Z_CONST_POS as u32));
+            debug_assert!((0..N_G).all(|g| {
+                let const_begin = GS_BASE + g * G_STRIDE + CARRY_ROWS_PER_G;
+                b_roots[const_begin..GS_BASE + (g + 1) * G_STRIDE]
+                    .iter()
+                    .all(|&root| root == Z_CONST_POS as u32)
+            }));
+
+            // A side: byte-for-byte the incumbent x4/unroll4 walk, minus the
+            // interleaved B writes. Keeping one whole-prefix walk avoids the
+            // 113 scalar A rows that independent static-range walks would
+            // leave (the 1-row prefix tail plus 2 carry tails for each G).
+            macro_rules! scatter_a4 {
+                ($r:expr, $ea:expr) => {{
+                    let r = $r;
+                    let ea4 = f128x4_extract($ea);
+                    *accp.add(*ap.add(r) as usize) += ea4[0];
+                    *accp.add(*ap.add(r + 1) as usize) += ea4[1];
+                    *accp.add(*ap.add(r + 2) as usize) += ea4[2];
+                    *accp.add(*ap.add(r + 3) as usize) += ea4[3];
+                }};
+            }
+
+            const WIDTH: usize = 4;
+            const UNROLL: usize = 4;
+            const SPAN: usize = WIDTH * UNROLL;
+            let unroll_end = round4 & !(SPAN - 1);
+            let mut r = 0usize;
+            if unroll_end >= SPAN {
+                let mut e0 = f128x4_loadu(eqp);
+                let mut e1 = f128x4_loadu(eqp.add(4));
+                let mut e2 = f128x4_loadu(eqp.add(8));
+                let mut e3 = f128x4_loadu(eqp.add(12));
+                let (mut p0, mut p1, mut p2, mut p3) =
+                    ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                r = SPAN;
+                while r < unroll_end {
+                    e0 = f128x4_loadu(eqp.add(r));
+                    e1 = f128x4_loadu(eqp.add(r + 4));
+                    e2 = f128x4_loadu(eqp.add(r + 8));
+                    e3 = f128x4_loadu(eqp.add(r + 12));
+                    let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                    scatter_a4!(r - SPAN, p0);
+                    scatter_a4!(r - SPAN + 4, p1);
+                    scatter_a4!(r - SPAN + 8, p2);
+                    scatter_a4!(r - SPAN + 12, p3);
+                    p0 = next.0;
+                    p1 = next.1;
+                    p2 = next.2;
+                    p3 = next.3;
+                    r += SPAN;
+                }
+                scatter_a4!(unroll_end - SPAN, p0);
+                scatter_a4!(unroll_end - SPAN + 4, p1);
+                scatter_a4!(unroll_end - SPAN + 8, p2);
+                scatter_a4!(unroll_end - SPAN + 12, p3);
+            }
+            while r < round4 {
+                let e = f128x4_loadu(eqp.add(r));
+                let product = ghash_mul_x4_split(e, t, t_x64);
+                scatter_a4!(r, product);
+                r += WIDTH;
+            }
+
+            // B side: the constant-pin ranges reduce in ZMM registers. Carry
+            // ranges keep one scatter per row, in their original row order.
+            let mut cz4 = _mm512_setzero_si512();
+            let mut cz_tail = F128::ZERO;
+            macro_rules! aggregate_cz_range {
+                ($begin:expr, $end:expr) => {{
+                    let end = $end;
+                    let mut r = $begin;
+                    while r + WIDTH <= end {
+                        cz4 = _mm512_xor_si512(cz4, f128x4_loadu(eqp.add(r)));
+                        r += WIDTH;
+                    }
+                    while r < end {
+                        cz_tail += *eqp.add(r);
+                        r += 1;
+                    }
+                }};
+            }
+            macro_rules! scatter_b_range {
+                ($begin:expr, $end:expr) => {{
+                    let end = $end;
+                    let mut r = $begin;
+                    while r + WIDTH <= end {
+                        let e4 = f128x4_extract(f128x4_loadu(eqp.add(r)));
+                        *accp.add(*bp.add(r) as usize) += e4[0];
+                        *accp.add(*bp.add(r + 1) as usize) += e4[1];
+                        *accp.add(*bp.add(r + 2) as usize) += e4[2];
+                        *accp.add(*bp.add(r + 3) as usize) += e4[3];
+                        r += WIDTH;
+                    }
+                    while r < end {
+                        *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                        r += 1;
+                    }
+                }};
+            }
+
+            aggregate_cz_range!(0, GS_BASE);
+            for g in 0..N_G {
+                let g0 = GS_BASE + g * G_STRIDE;
+                let carry_end = g0 + CARRY_ROWS_PER_G;
+                scatter_b_range!(g0, carry_end);
+                aggregate_cz_range!(carry_end, g0 + G_STRIDE);
+            }
+            aggregate_cz_range!(OUT_HI_BASE, USEFUL_BITS);
+            scatter_b_range!(n_rows, round4);
+
+            let lanes = f128x4_extract(cz4);
+            let cz_sum = cz_tail + lanes[0] + lanes[1] + lanes[2] + lanes[3];
+            *accp.add(Z_CONST_POS) += cz_sum;
+            return;
+        }
+
+        macro_rules! scatter4 {
+            ($r:expr, $ea:expr) => {{
+                let r = $r;
+                let ea4 = f128x4_extract($ea);
+                *accp.add(*ap.add(r) as usize) += ea4[0];
+                *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                *accp.add(*ap.add(r + 1) as usize) += ea4[1];
+                *accp.add(*bp.add(r + 1) as usize) += *eqp.add(r + 1);
+                *accp.add(*ap.add(r + 2) as usize) += ea4[2];
+                *accp.add(*bp.add(r + 2) as usize) += *eqp.add(r + 2);
+                *accp.add(*ap.add(r + 3) as usize) += ea4[3];
+                *accp.add(*bp.add(r + 3) as usize) += *eqp.add(r + 3);
+            }};
+        }
+
+        const WIDTH: usize = 4;
+        const UNROLL: usize = 4;
+        const SPAN: usize = WIDTH * UNROLL;
+        let unroll_end = round4 & !(SPAN - 1);
+        let mut r = 0usize;
+
+        if unroll_end >= SPAN {
+            let mut e0 = f128x4_loadu(eqp);
+            let mut e1 = f128x4_loadu(eqp.add(4));
+            let mut e2 = f128x4_loadu(eqp.add(8));
+            let mut e3 = f128x4_loadu(eqp.add(12));
+            let (mut p0, mut p1, mut p2, mut p3) =
+                ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+            r = SPAN;
+            while r < unroll_end {
+                e0 = f128x4_loadu(eqp.add(r));
+                e1 = f128x4_loadu(eqp.add(r + 4));
+                e2 = f128x4_loadu(eqp.add(r + 8));
+                e3 = f128x4_loadu(eqp.add(r + 12));
+                let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                scatter4!(r - SPAN, p0);
+                scatter4!(r - SPAN + 4, p1);
+                scatter4!(r - SPAN + 8, p2);
+                scatter4!(r - SPAN + 12, p3);
+                p0 = next.0;
+                p1 = next.1;
+                p2 = next.2;
+                p3 = next.3;
+                r += SPAN;
+            }
+            scatter4!(unroll_end - SPAN, p0);
+            scatter4!(unroll_end - SPAN + 4, p1);
+            scatter4!(unroll_end - SPAN + 8, p2);
+            scatter4!(unroll_end - SPAN + 12, p3);
+        }
+
+        while r < round4 {
+            let e = f128x4_loadu(eqp.add(r));
+            let product = ghash_mul_x4_split(e, t, t_x64);
+            scatter4!(r, product);
+            r += WIDTH;
+        }
+    }
+}
+
 impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     fn n_cols(&self) -> usize {
         K
@@ -1028,6 +1306,29 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
         // so empty rows need no branch.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: build creates K roots, every root is below n_nodes, and all
+        // entries after n_rows are ADJ_ZERO. eq_inner has length K above.
+        unsafe {
+            inject_alpha_e_x4(
+                &mut acc,
+                &self.a_roots,
+                &self.b_roots,
+                self.n_rows,
+                alpha,
+                eq_inner,
+            );
+        }
+
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         for r in 0..self.n_rows {
             let e = eq_inner[r];
             let ea = alpha * e;
@@ -1707,6 +2008,171 @@ fn build_block_witness_ab_packed_into(
     write_aligned_lin_words(OUT_LO_BASE, &out_lo, z, a, b);
 }
 
+/// Circuit-specific implementation of zerocheck's stateless packed-A/B
+/// source. `BlockSource` is Copy and Sync: slice mode borrows immutable input,
+/// while closed mode contains only `(init, len)`. Each call owns disjoint
+/// output blocks, so concurrent Rayon calls share no mutable state.
+pub(crate) struct Blake3AbReplay<'a> {
+    blocks: crate::seed_pipe::BlockSource<'a>,
+    padding: Compression,
+}
+
+impl<'a> Blake3AbReplay<'a> {
+    fn new(blocks: crate::seed_pipe::BlockSource<'a>) -> Self {
+        Self {
+            blocks,
+            padding: ([0u32; 8], [0u32; 16], 0, 0, 0),
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn replay_octa(
+        &self,
+        first_block: usize,
+        a_out: &mut [u8],
+        b_out: &mut [u8],
+    ) {
+        const SIMD: usize = 8;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        assert_eq!(a_out.len(), SIMD * BYTES_PER_BLOCK);
+        assert_eq!(b_out.len(), SIMD * BYTES_PER_BLOCK);
+
+        let staged: [Compression; SIMD];
+        let octa = match self.blocks {
+            crate::seed_pipe::BlockSource::Slice(s) => {
+                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                    s.get(first_block + j).unwrap_or(&self.padding)
+                }))
+            }
+            crate::seed_pipe::BlockSource::Closed { init, len }
+                if first_block + SIMD <= len =>
+            {
+                blake3_witgen8::OctaInputs::Closed {
+                    init,
+                    base: first_block,
+                }
+            }
+            crate::seed_pipe::BlockSource::Closed { init, len } => {
+                staged = std::array::from_fn(|j| {
+                    let index = first_block + j;
+                    if index < len {
+                        crate::seed_pipe::gen_block(init, index)
+                    } else {
+                        self.padding
+                    }
+                });
+                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| &staged[j]))
+            }
+        };
+
+        // SAFETY: both destinations own eight disjoint contiguous packed
+        // blocks. The replay monomorph uses only unaligned ordinary stores,
+        // never touches its shared z dummy, and retains no borrow.
+        unsafe {
+            blake3_witgen8::build_octa_witness_ab_replay(
+                octa,
+                a_out.as_mut_ptr().cast::<u32>(),
+                b_out.as_mut_ptr().cast::<u32>(),
+            );
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn stateless_ab_octa_replay_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_STATELESS_AB_OCTA_REPLAY").is_none()
+    });
+    *ON
+}
+
+impl flock_core::zerocheck::PackedAbReplay for Blake3AbReplay<'_> {
+    fn replay_blocks(
+        &self,
+        first_block: usize,
+        block_count: usize,
+        a_out: &mut [u8],
+        b_out: &mut [u8],
+    ) {
+        use rayon::prelude::*;
+        const BYTES_PER_BLOCK: usize = K / 8;
+        const U64_PER_BLOCK: usize = K / 64;
+        assert_eq!(a_out.len(), block_count * BYTES_PER_BLOCK);
+        assert_eq!(b_out.len(), block_count * BYTES_PER_BLOCK);
+        assert_eq!((a_out.as_ptr() as usize) % core::mem::align_of::<u64>(), 0);
+        assert_eq!((b_out.as_ptr() as usize) % core::mem::align_of::<u64>(), 0);
+
+        // Exact ranked replay requests either one 32-block worker chunk or the
+        // complete padded table. Both are octa-aligned. Keep scalar replay as
+        // the independent fallback for ragged/general calls and for same-binary
+        // screening through FLOCK_NO_STATELESS_AB_OCTA_REPLAY.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if stateless_ab_octa_replay_enabled() && block_count.is_multiple_of(8) {
+            const SIMD: usize = 8;
+            const OCTA_BYTES: usize = SIMD * BYTES_PER_BLOCK;
+            if block_count <= 32 {
+                for (octa_index, (a, b)) in a_out
+                    .chunks_exact_mut(OCTA_BYTES)
+                    .zip(b_out.chunks_exact_mut(OCTA_BYTES))
+                    .enumerate()
+                {
+                    self.replay_octa(first_block + SIMD * octa_index, a, b);
+                }
+            } else {
+                a_out
+                    .par_chunks_exact_mut(OCTA_BYTES)
+                    .zip(b_out.par_chunks_exact_mut(OCTA_BYTES))
+                    .enumerate()
+                    .for_each(|(octa_index, (a, b))| {
+                        self.replay_octa(first_block + SIMD * octa_index, a, b);
+                    });
+            }
+            return;
+        }
+
+        let fill_one = |offset: usize, a_block: &mut [u8], b_block: &mut [u8], z: &mut [u64]| {
+            let a = unsafe {
+                core::slice::from_raw_parts_mut(a_block.as_mut_ptr().cast::<u64>(), U64_PER_BLOCK)
+            };
+            let b = unsafe {
+                core::slice::from_raw_parts_mut(b_block.as_mut_ptr().cast::<u64>(), U64_PER_BLOCK)
+            };
+            self.blocks
+                .with_block(first_block + offset, &self.padding, |block| {
+                    let (cv, msg, counter, block_len, flags) = block;
+                    build_block_witness_ab_packed_into(
+                        cv, msg, *counter, *block_len, *flags, z, a, b,
+                    );
+                });
+        };
+
+        // The hot consumers already parallelize 32-block chunks; keep replay
+        // serial inside each worker to avoid nested Rayon scheduling. The cold
+        // full-materialization fallback receives the whole ranked table and
+        // fans it out here.
+        if block_count <= 32 {
+            let mut z = [0u64; U64_PER_BLOCK];
+            for (offset, (a, b)) in a_out
+                .chunks_exact_mut(BYTES_PER_BLOCK)
+                .zip(b_out.chunks_exact_mut(BYTES_PER_BLOCK))
+                .enumerate()
+            {
+                fill_one(offset, a, b, &mut z);
+            }
+        } else {
+            a_out
+                .par_chunks_exact_mut(BYTES_PER_BLOCK)
+                .zip(b_out.par_chunks_exact_mut(BYTES_PER_BLOCK))
+                .enumerate()
+                .for_each_init(
+                    || [0u64; U64_PER_BLOCK],
+                    |z, (offset, (a, b))| fill_one(offset, a, b, z),
+                );
+        }
+    }
+}
+
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
 /// vectors — no bool intermediates, no `pack_witness` step, no
 /// `apply_block_diag_packed`. Parallel across compression instances via rayon.
@@ -1796,6 +2262,64 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Exact ranked selector for deleting the two global packed A/B tables.
+/// Every miss executes the incumbent materialized producer.
+#[inline]
+fn ranked_stateless_ab_enabled(r1cs: &BlockR1cs, n_blocks_log: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    {
+        n_blocks_log == 18
+            && r1cs.m == 32
+            && r1cs.k_log == K_LOG
+            && r1cs.k_skip == K_SKIP
+            && r1cs.useful_bits == USEFUL_BITS
+            && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+            && crate::prover::ranked_stateless_ab_available(r1cs)
+            && std::env::var_os("FLOCK_NO_STATELESS_AB").is_none()
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
+    {
+        let _ = (r1cs, n_blocks_log);
+        false
+    }
+}
+
+fn generate_witness_with_stateless_ab_and_round1_inner_from(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> Option<(
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+)> {
+    let (z, a, b, ab_inner) = generate_witness_with_ab_packed_and_round1_inner_impl_mode(
+        blocks,
+        n_blocks_log,
+        false,
+        live_witgen_simd_enabled(),
+        witgen_simd::witgen_ab_nt_enabled(),
+        true,
+    )?;
+    assert!(a.is_empty() && b.is_empty());
+    assert!(ab_inner.ranked_compact());
+    assert!(ab_inner.ranked_one_rows_elided());
+    assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    Some((z, ab_inner))
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -1871,6 +2395,35 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     Vec<F128>,
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
+    generate_witness_with_ab_packed_and_round1_inner_impl_mode(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        use_simd,
+        ab_nt,
+        false,
+    )
+    .expect("materialized witness mode is always available")
+}
+
+/// Shared witness backend. Stateless mode is deliberately fallible: if this
+/// run cannot produce the exact ranked Compact29 representation, the caller
+/// reruns the unchanged materialized producer. A cold z scratch provenance
+/// miss is supported: it requires a complete z publish but never materializes
+/// the two global A/B tables.
+fn generate_witness_with_ab_packed_and_round1_inner_impl_mode(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    use_nt: bool,
+    use_simd: bool,
+    ab_nt: bool,
+    stateless_ab: bool,
+) -> Option<(
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+)> {
     use rayon::prelude::*;
 
     const F128_PER_BLOCK: usize = K / 128;
@@ -1898,25 +2451,87 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
     // the incumbent full writes. Tagged takes go FIRST so z's untagged take
     // cannot consume a provenance-carrying buffer of the same size class.
-    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
-    );
-    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-    );
+    let (mut a, a_tok) = if stateless_ab {
+        (Vec::new(), false)
+    } else {
+        flock_core::scratch::take_f128_tagged(
+            n_f128,
+            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+        )
+    };
+    let (mut b, b_tok) = if stateless_ab {
+        (Vec::new(), false)
+    } else {
+        flock_core::scratch::take_f128_tagged(
+            n_f128,
+            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+        )
+    };
     let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
-    let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
-        n_total * BYTES_PER_BLOCK,
-    );
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let ranked_compact = {
+        // Compact storage is valid only when this exact prove selects the
+        // ranked-static A/B projection. Its brand is independent of z's
+        // scratch provenance: a cold z buffer receives every row, including
+        // an explicit zero publish for row 31, while stateless A/B remain
+        // local to the projection. The plan check mirrors
+        // `build_octa_witness_ab_stream_elide`'s second half of the brand,
+        // including its same-binary offsets rollback.
+        let elide_on = witgen_simd::const_elide_enabled();
+        let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+        let ranked_static = stateless_ab || (a_tok && ab_elide && b_tok && ab_elide);
+        let ranked_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                inv_table,
+                &[],
+                false,
+            );
+        use_simd
+            && !use_nt
+            && n_total >= 8
+            && ab_nt
+            && witgen_simd::witgen_ab_winstream_enabled()
+            && skip_blocks == 0
+            && n_total == 1 << 18
+            && ranked_static
+            && ranked_plan.offsets_eligible(2)
+            && blake3_witgen8::ey_dead_w31_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::pcs::ranked_direct_fold8_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled()
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let ranked_compact = false;
+    if stateless_ab && !ranked_compact {
+        flock_core::scratch::give_f128(z);
+        return None;
+    }
+    let mut ab_inner = if ranked_compact {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    } else {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    };
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -1951,21 +2566,28 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut ab_inner,
             &inv_table,
             &padding,
-            [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
+            if stateless_ab {
+                [z_tok && elide_on, true, true]
+            } else {
+                [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide]
+            },
             ab_nt,
+            stateless_ab,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
         // shared `&[u8]` views only, so the buffers reach their release
         // untouched — arm the provenance for the next prove's takes.
-        flock_core::scratch::register_pending_tag(
-            a.as_ptr(),
-            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
-        );
-        flock_core::scratch::register_pending_tag(
-            b.as_ptr(),
-            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-        );
+        if !stateless_ab {
+            flock_core::scratch::register_pending_tag(
+                a.as_ptr(),
+                witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+            );
+            flock_core::scratch::register_pending_tag(
+                b.as_ptr(),
+                witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+            );
+        }
         // z is read-only from here to its release inside the open's
         // materialize (commit encode, zerocheck c-view, lincheck repack all
         // take shared views), so its provenance survives to the next prove.
@@ -1973,12 +2595,16 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             z.as_ptr(),
             witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
         );
-        return (z, a, b, ab_inner);
+        return Some((z, a, b, ab_inner));
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let _ = (ab_nt, a_tok, b_tok, z_tok);
+    assert!(
+        !stateless_ab,
+        "stateless A/B requires the ranked octa drain"
+    );
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -2097,19 +2723,21 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 
     // The scalar/NT arms write every word, so a/b also hold a completed
     // witgen of this layout here — arm the provenance for the next prove.
-    flock_core::scratch::register_pending_tag(
-        a.as_ptr(),
-        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
-    );
-    flock_core::scratch::register_pending_tag(
-        b.as_ptr(),
-        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-    );
+    if !stateless_ab {
+        flock_core::scratch::register_pending_tag(
+            a.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+        );
+        flock_core::scratch::register_pending_tag(
+            b.as_ptr(),
+            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+        );
+    }
     flock_core::scratch::register_pending_tag(
         z.as_ptr(),
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
-    (z, a, b, ab_inner)
+    Some((z, a, b, ab_inner))
 }
 
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
@@ -2153,6 +2781,7 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    stateless_ab: bool,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -2160,14 +2789,30 @@ fn generate_round1_inner_octa(
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
+    const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
-    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let compact = ab_inner.ranked_compact();
+    let ab_block_bytes = if compact {
+        COMPACT_BYTES_PER_BLOCK
+    } else {
+        BYTES_PER_BLOCK
+    };
+    let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    if stateless_ab {
+        assert!(a.is_empty() && b.is_empty());
+        assert!(compact && ab_stream && elide[1] && elide[2]);
+    } else {
+        assert_eq!(a.len(), z.len());
+        assert_eq!(b.len(), z.len());
+    }
+    let a_base = a.as_mut_ptr() as usize;
+    let b_base = b.as_mut_ptr() as usize;
     let one_rows_elided = ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
@@ -2176,6 +2821,7 @@ fn generate_round1_inner_octa(
     if one_rows_elided {
         ab_inner.set_ranked_one_rows_elided();
     }
+    assert!(!compact || one_rows_elided);
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2194,8 +2840,6 @@ fn generate_round1_inner_octa(
         abinner_nt,
     );
     z.par_chunks_mut(group_f128)
-        .zip(a.par_chunks_mut(group_f128))
-        .zip(b.par_chunks_mut(group_f128))
         .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
         .enumerate()
         .for_each_init(
@@ -2222,8 +2866,21 @@ fn generate_round1_inner_octa(
                 }
                 v
             },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
+            |win, (g, (z_out, ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
+                // Materialized mode maps this enumerated group to its unique
+                // A/B ranges. Stateless mode supplies z as a valid aligned
+                // dummy address; the octa drain is branded not to publish A/B.
+                let a_out = if stateless_ab {
+                    z_out.as_mut_ptr()
+                } else {
+                    unsafe { (a_base as *mut F128).add(g * group_f128) }
+                };
+                let b_out = if stateless_ab {
+                    z_out.as_mut_ptr()
+                } else {
+                    unsafe { (b_base as *mut F128).add(g * group_f128) }
+                };
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
@@ -2288,7 +2945,11 @@ fn generate_round1_inner_octa(
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
                                 stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                                out: ab_out
+                                    .as_mut_ptr()
+                                    .add(half * SIMD * ab_block_bytes),
+                                out_stride: ab_block_bytes,
+                                out_bias: if compact { 2 * 64 } else { 0 },
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
@@ -2297,10 +2958,11 @@ fn generate_round1_inner_octa(
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
-                            a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.add(off).cast::<u32>(),
+                            b_out.add(off).cast::<u32>(),
                             proj,
                             elide,
+                            !stateless_ab,
                         );
                         // Fused arm: project THIS octa's eight blocks now, off
                         // the just-written windows, while they are L1-hot. Same
@@ -2338,18 +3000,19 @@ fn generate_round1_inner_octa(
                 } else {
                     0
                 };
+                assert!(!compact || j0 == n_here);
                 for j in j0..n_here {
                     let block_idx = GROUP * g + j;
                     if block_idx >= skip_blocks {
                         let a_bytes = unsafe {
                             std::slice::from_raw_parts(
-                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                a_out.add(j * F128_PER_BLOCK).cast::<u8>(),
                                 BYTES_PER_BLOCK,
                             )
                         };
                         let b_bytes = unsafe {
                             std::slice::from_raw_parts(
-                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                                b_out.add(j * F128_PER_BLOCK).cast::<u8>(),
                                 BYTES_PER_BLOCK,
                             )
                         };
@@ -3761,6 +4424,61 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
+                if ranked_stateless_ab_enabled(&self.r1cs, self.n_blocks_log()) {
+                    let replay_blocks = blocks;
+                    let (codeword, generated) =
+                        crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                            flock_core::gaptime::mark("witness: stateless pool entered");
+                            let r =
+                                flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                                    generate_witness_with_stateless_ab_and_round1_inner_from(
+                                        blocks,
+                                        self.n_blocks_log(),
+                                    )
+                                });
+                            flock_core::gaptime::mark("witness: stateless work done");
+                            r
+                        });
+                    if let Some((z_packed, ab_inner)) = generated {
+                        flock_core::gaptime::mark("witness: stateless pool exited");
+                        let lc_circuit = self.lincheck_circuit();
+                        let replay = Blake3AbReplay::new(replay_blocks);
+                        return crate::prover::prove_fast_ligerito_from_block_major_witness_with_replayed_ab(
+                            &self.r1cs,
+                            &self.pcs_params,
+                            z_packed,
+                            ab_inner,
+                            &replay,
+                            lc_circuit,
+                            codeword,
+                            challenger,
+                        );
+                    }
+
+                    // A representation gate missed before transcript work.
+                    // Reuse the already-prefaulted codeword and rebuild with
+                    // the byte-identical incumbent global-A/B producer. Cold
+                    // z provenance is handled by the stateless arm above.
+                    let (z_packed, a_packed_f128, b_packed_f128, ab_inner) =
+                        crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                            generate_witness_with_ab_packed_and_round1_inner_from(
+                                blocks,
+                                self.n_blocks_log(),
+                            )
+                        });
+                    let lc_circuit = self.lincheck_circuit();
+                    return crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        ab_inner,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    );
+                }
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
@@ -4715,6 +5433,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    false,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)

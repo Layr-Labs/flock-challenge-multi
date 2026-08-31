@@ -122,6 +122,13 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
+/// Shared exact gate for the BLAKE3 stateless-A/B producer. Keeping it here
+/// prevents witness selection from drifting away from the identity-C
+/// consumer preconditions that make raw A/B unnecessary in round one.
+pub(crate) fn ranked_stateless_ab_available(r1cs: &BlockR1cs) -> bool {
+    ranked_identity_c_fold_enabled(r1cs)
+}
+
 /// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
 /// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
 #[inline]
@@ -497,6 +504,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         a_packed_f128,
         b_packed_f128,
         None,
+        None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
@@ -524,6 +532,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
+        None,
         None,
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
@@ -554,6 +563,39 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         a_packed_f128,
         b_packed_f128,
         Some(ab_inner),
+        None,
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+/// Exact-ranked block-major path with Compact29 round-one AB and a stateless
+/// packed-A/B replay source. No global A/B allocation reaches this entry.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_from_block_major_witness_with_replayed_ab<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    ab_replay: &dyn zerocheck::PackedAbReplay,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    assert!(ranked_identity_c_fold_enabled(r1cs));
+    assert!(ab_inner.ranked_compact());
+    assert!(ab_inner.ranked_one_rows_elided());
+    assert_eq!(ab_inner.invalid_prefix_bytes(), 0);
+    prove_fast_ligerito_from_witness_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        Vec::new(),
+        Vec::new(),
+        Some(ab_inner),
+        Some(ab_replay),
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
@@ -569,6 +611,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
+    ab_replay: Option<&dyn zerocheck::PackedAbReplay>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
@@ -596,6 +639,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         a_packed_f128,
         b_packed_f128,
         ab_inner,
+        ab_replay,
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
@@ -624,16 +668,18 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     } else {
         None
     };
-    let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
-        z_packed,
-        &prover_data,
-        &commitment,
-        &[ab.clone(), c.clone()],
-        &[pre_ab, pre_c],
-        &padding,
-        &lig_config,
-        challenger,
-    ));
+    let pcs_open = flock_core::in_pool(|| {
+        open_claims_with_precomputed_ligerito(
+            z_packed,
+            &prover_data,
+            &commitment,
+            &[ab.clone(), c.clone()],
+            &[pre_ab, pre_c],
+            &padding,
+            &lig_config,
+            challenger,
+        )
+    });
     if let Some(handle) = stash {
         // Finished long ago (µs vs the ~20 ms open); join keeps the thread
         // from outliving the prove.
@@ -827,6 +873,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         a_packed_f128,
         b_packed_f128,
         None,
+        None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
@@ -842,11 +889,18 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
+    ab_replay: Option<&dyn zerocheck::PackedAbReplay>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    if ab_replay.is_some() {
+        assert!(a_packed_f128.is_empty());
+        assert!(b_packed_f128.is_empty());
+        assert!(ab_inner.is_some());
+        assert!(ranked_identity_c_fold_enabled(r1cs));
+    }
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         assert_eq!(
             r1cs.layout,
@@ -928,8 +982,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || flock_core::in_pool(|| {
+    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        flock_core::in_pool(|| {
             flock_core::gaptime::mark("zerocheck: pool entered");
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
@@ -951,26 +1005,51 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 )
             };
             flock_core::gaptime::mark("zerocheck: views built");
-            let r = match c_identity_z {
-            Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
-                    a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
-                    challenger,
-                )
-            }
-            None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-            ),
-        };
+            let r = match (c_identity_z, ab_replay) {
+                (Some(c_identity_z), Some(replay)) => {
+                    zerocheck::prove_packed_padded_capture_s_hat_v_c_with_replayed_ab_and_identity_c(
+                        replay, c_packed, c_identity_z, r1cs.m, &padding, ab_inner, challenger,
+                    )
+                }
+                (Some(c_identity_z), None) => {
+                    zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
+                        a_packed,
+                        b_packed,
+                        c_packed,
+                        c_identity_z,
+                        r1cs.m,
+                        &padding,
+                        ab_inner,
+                        challenger,
+                    )
+                }
+                (None, None) => {
+                    zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                        a_packed,
+                        b_packed,
+                        c_packed,
+                        r1cs.m,
+                        &padding,
+                        ab_inner,
+                        challenger,
+                    )
+                }
+                (None, Some(_)) => unreachable!("stateless A/B requires ranked identity-C"),
+            };
             flock_core::gaptime::mark("zerocheck: work done");
             r
-        }));
+        })
+    });
     flock_core::gaptime::mark("zerocheck: pool exited");
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if !a_packed_f128.is_empty() {
+        flock_core::scratch::give_f128(a_packed_f128);
+    }
+    if !b_packed_f128.is_empty() {
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
     flock_core::gaptime::mark("a/b recycled to scratch pool");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
