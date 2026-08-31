@@ -2199,16 +2199,21 @@ pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *
     }
 }
 
-/// Fold two independent packed-u64 row maps into one batch of 64 F128s.
-/// This is the DirectFold8 basis materializer's natural half-pair: low/high
-/// halves of one claim, or the corresponding halves of a second claim.
-/// Both input transposes feed one output-plane accumulation and one inverse
-/// transpose. With `ADD`, the reassembled values are XORed with an existing
-/// 64-row batch while still in registers.
+/// Compose a two-map GFNI fold directly into its 8-byte-input matrix.
+///
+/// The older two-map composition reassembles 64 output `F128`s and a
+/// subsequent caller transposes every group of eight outputs back into the
+/// byte matrices consumed by the fold drain. DirectFold8's per-block
+/// composition only needs those matrices, not the intermediate field values:
+/// the map-plane registers already contain each output byte for the 64 input
+/// rows. Store each plane once, reconstruct the eight field-byte lanes for
+/// each input-byte group, and run the proven 8×8 bit transpose used by
+/// [`build_row_fold_mats_from_cols`]. The bit transpose is essential: the
+/// plane bytes are values for eight columns, not matrix rows.
 ///
 /// # Safety
-/// Each row pointer covers 512 bytes, `out` covers 64 F128s, and when `ADD`
-/// is true `add` covers 64 F128s. AVX-512F/VBMI/GFNI are required.
+/// Each row pointer covers 512 readable bytes, `out` covers 128 writable
+/// `u64`s, and AVX-512F/VBMI/GFNI are available.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2217,16 +2222,16 @@ pub(crate) unsafe fn gfni_fold64_rows(rows: *const u8, mats: &[u64; 128], out: *
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
+pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
     rows0: *const u8,
     mats0: &[u64; 128],
     rows1: *const u8,
     mats1: &[u64; 128],
-    out: *mut F128,
-    add: *const F128,
+    out: &mut [u64; 128],
 ) {
     use core::arch::x86_64::*;
-    // SAFETY: caller supplies all pointer extents and target features.
+
+    // SAFETY: forwarded from this function's pointer and feature contract.
     unsafe {
         #[rustfmt::skip]
         const BT: [i8; 64] = [
@@ -2235,7 +2240,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
             4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61,
             6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
         ];
-        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
         let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
         let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
         let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
@@ -2270,87 +2275,60 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         };
         let input_planes = |rows: *const u8| -> [__m512i; 8] {
             let z: [__m512i; 8] =
-                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i) as *const __m512i));
+                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
             let t = z.map(|v| _mm512_permutexvar_epi8(bt, v));
             qword_transpose(t)
         };
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
             let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
             _mm512_xor_si512(v2, v3)
         };
-        // Form the first map's 16 output-byte planes before loading the
-        // second map. Keeping both eight-plane inputs live while creating
-        // sixteen accumulators exceeds the SPR ZMM file once transpose
-        // constants and temporaries are included, and LLVM then spills a
-        // large fraction of the batch. Sequential accumulation has the same
-        // GF(2) reassociation but caps the durable live set at 16 + 8 ZMMs.
-        let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
-            let p = input_planes(rows0);
-            (
-                map_plane(&p, mats0, 0),
-                map_plane(&p, mats0, 1),
-                map_plane(&p, mats0, 2),
-                map_plane(&p, mats0, 3),
-                map_plane(&p, mats0, 4),
-                map_plane(&p, mats0, 5),
-                map_plane(&p, mats0, 6),
-                map_plane(&p, mats0, 7),
-                map_plane(&p, mats0, 8),
-                map_plane(&p, mats0, 9),
-                map_plane(&p, mats0, 10),
-                map_plane(&p, mats0, 11),
-                map_plane(&p, mats0, 12),
-                map_plane(&p, mats0, 13),
-                map_plane(&p, mats0, 14),
-                map_plane(&p, mats0, 15),
-            )
-        };
-        let (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) = {
-            let p = input_planes(rows1);
-            (
-                _mm512_xor_si512(a0, map_plane(&p, mats1, 0)),
-                _mm512_xor_si512(a1, map_plane(&p, mats1, 1)),
-                _mm512_xor_si512(a2, map_plane(&p, mats1, 2)),
-                _mm512_xor_si512(a3, map_plane(&p, mats1, 3)),
-                _mm512_xor_si512(a4, map_plane(&p, mats1, 4)),
-                _mm512_xor_si512(a5, map_plane(&p, mats1, 5)),
-                _mm512_xor_si512(a6, map_plane(&p, mats1, 6)),
-                _mm512_xor_si512(a7, map_plane(&p, mats1, 7)),
-                _mm512_xor_si512(a8, map_plane(&p, mats1, 8)),
-                _mm512_xor_si512(a9, map_plane(&p, mats1, 9)),
-                _mm512_xor_si512(a10, map_plane(&p, mats1, 10)),
-                _mm512_xor_si512(a11, map_plane(&p, mats1, 11)),
-                _mm512_xor_si512(a12, map_plane(&p, mats1, 12)),
-                _mm512_xor_si512(a13, map_plane(&p, mats1, 13)),
-                _mm512_xor_si512(a14, map_plane(&p, mats1, 14)),
-                _mm512_xor_si512(a15, map_plane(&p, mats1, 15)),
-            )
-        };
 
-        let lo_half = qword_transpose([a0, a1, a2, a3, a4, a5, a6, a7]);
-        let hi_half = qword_transpose([a8, a9, a10, a11, a12, a13, a14, a15]);
-        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-        for i in 0..8 {
-            let lo = _mm512_permutexvar_epi8(bt, lo_half[i]);
-            let hi = _mm512_permutexvar_epi8(bt, hi_half[i]);
-            let mut v0 = _mm512_permutex2var_epi64(lo, il_lo, hi);
-            let mut v1 = _mm512_permutex2var_epi64(lo, il_hi, hi);
-            if ADD {
-                v0 = _mm512_xor_si512(v0, _mm512_loadu_si512(add.add(8 * i) as *const __m512i));
-                v1 = _mm512_xor_si512(v1, _mm512_loadu_si512(add.add(8 * i + 4) as *const __m512i));
+        let p0 = input_planes(rows0);
+        let p1 = input_planes(rows1);
+        let mut plane_bytes = [0u8; 16 * 64];
+        for k in 0..16 {
+            let value =
+                _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
+            _mm512_storeu_si512(plane_bytes[k * 64..].as_mut_ptr().cast::<__m512i>(), value);
+        }
+        for group in 0..8 {
+            let lo_lanes: [u64; 8] = core::array::from_fn(|row| {
+                (0..8).fold(0u64, |value, byte| {
+                    value | ((plane_bytes[byte * 64 + group * 8 + row] as u64) << (byte * 8))
+                })
+            });
+            let hi_lanes: [u64; 8] = core::array::from_fn(|row| {
+                (0..8).fold(0u64, |value, byte| {
+                    value
+                        | ((plane_bytes[(byte + 8) * 64 + group * 8 + row] as u64)
+                            << (byte * 8))
+                })
+            });
+            let mut lo_bytes = [0u8; 64];
+            let mut hi_bytes = [0u8; 64];
+            crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+            crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+            for byte in 0..8 {
+                let lo: [u8; 8] =
+                    lo_bytes[byte * 8..byte * 8 + 8].try_into().unwrap();
+                let hi: [u8; 8] =
+                    hi_bytes[byte * 8..byte * 8 + 8].try_into().unwrap();
+                out[group * 16 + byte] = u64::from_le_bytes(lo).swap_bytes();
+                out[group * 16 + byte + 8] = u64::from_le_bytes(hi).swap_bytes();
             }
-            let out_ptr = out.add(8 * i) as *mut __m512i;
-            _mm512_storeu_si512(out_ptr, v0);
-            _mm512_storeu_si512(out_ptr.add(1), v1);
         }
     }
 }
+
 
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
