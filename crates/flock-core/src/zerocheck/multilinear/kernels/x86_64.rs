@@ -67,7 +67,7 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
@@ -75,14 +75,20 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
 
     // Fold four adjacent output elements and return them in one ZMM.
+    // `SPLIT` is the 5-CLMUL split product with a hoisted `r·x^64`
+    // companion; the kill switch restores the incumbent 6-CLMUL
+    // `ghash_mul_x4`. Field-identical either way (reduction is a ring
+    // homomorphism). The bool is process-constant.
     #[inline(always)]
     unsafe fn fold_x4(
         src: *const F128,
         r: __m512i,
+        r64: __m512i,
         even_idx: __m512i,
         odd_idx: __m512i,
+        split: bool,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split};
         use core::arch::x86_64::*;
 
         // SAFETY: caller supplies eight readable F128 values at src.
@@ -91,7 +97,13 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             let hi = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            let diff = _mm512_xor_si512(even, odd);
+            let prod = if split {
+                ghash_mul_x4_split(diff, r, r64)
+            } else {
+                ghash_mul_x4(r, diff)
+            };
+            _mm512_xor_si512(even, prod)
         }
     }
 
@@ -99,6 +111,10 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     // cfg gate supplies every intrinsic feature.
     unsafe {
         let r = _mm512_broadcast_i32x4(_mm_set_epi64x(r_fold.hi as i64, r_fold.lo as i64));
+        let split = zc_fold_split_enabled();
+        // Companion is one CLMUL, hoisted once per worker chunk — the same
+        // amortisation `fold_pairs` and the round-2 `wsplit` path already use.
+        let r64 = if split { ghash_shift64_x4(r) } else { r };
         // Select even/odd F128 lanes from two concatenated ZMM inputs. The same
         // selectors deinterleave fold inputs and gather message a0/a1 lanes.
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
@@ -111,10 +127,24 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 
         while x_lo + 4 <= eq_lo.len() {
             let output = 2 * x_lo;
-            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let a_hi = fold_x4(a_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
-            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_hi = fold_x4(b_in.as_ptr().add(2 * (output + 4)), r, even_idx, odd_idx);
+            let a_lo = fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+            let a_hi = fold_x4(
+                a_in.as_ptr().add(2 * (output + 4)),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
+            let b_lo = fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+            let b_hi = fold_x4(
+                b_in.as_ptr().add(2 * (output + 4)),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
 
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_lo);
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output + 4).cast::<__m512i>(), a_hi);
@@ -137,8 +167,22 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
         if x_lo < eq_lo.len() {
             debug_assert_eq!(eq_lo.len() - x_lo, 2);
             let output = 2 * x_lo;
-            let a_folded = fold_x4(a_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
-            let b_folded = fold_x4(b_in.as_ptr().add(2 * output), r, even_idx, odd_idx);
+            let a_folded = fold_x4(
+                a_in.as_ptr().add(2 * output),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
+            let b_folded = fold_x4(
+                b_in.as_ptr().add(2 * output),
+                r,
+                r64,
+                even_idx,
+                odd_idx,
+                split,
+            );
             _mm512_storeu_si512(a_out.as_mut_ptr().add(output).cast::<__m512i>(), a_folded);
             _mm512_storeu_si512(b_out.as_mut_ptr().add(output).cast::<__m512i>(), b_folded);
 
@@ -298,9 +342,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
         } else {
             None
         };
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let b_canonical_direct = tr_bcast && zc_b_canonical_direct_enabled();
+        // A partial cache is permitted only for the next scheduled special
+        // window in this tile. The raw guard sets this tag, every refill
+        // clears it, and the matching consumer takes it exactly once.
+        let mut b_direct_pending = false;
+        #[allow(unused_mut)]
+        let mut b_direct_folded = F128::ZERO;
         while x_lo + 8 <= lo_size {
             #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
             if use_batch && x_lo.is_multiple_of(32) {
+                b_direct_pending = false;
                 // Refill both caches for pairs x_lo..x_lo+32 (rows
                 // row_base+2*x_lo .. +64 per side) — the same bytes the
                 // gather path reads.
@@ -321,26 +374,55 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     gfni_fold64_rows_masked_tr_bcast(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     // Global row phase only schedules a possible fast path;
                     // the helper checks all 128 raw bytes before omitting
-                    // one whole 16-row GFNI group. All cache slots are still
-                    // initialized in the same residue-major layout.
+                    // one whole 16-row GFNI group. Direct consumption also
+                    // omits that group's cache stores, but only when its
+                    // local window is exactly the scheduled special window.
                     match (b_canonical_values.as_ref(), g0 & 255) {
                         (Some(values), 0) if b_ones_on => {
-                            gfni_fold64_rows_tr_bcast_b_canonical(
-                                b_pkt.add(g0 * 8),
-                                m,
-                                fb.as_mut_ptr(),
-                                0,
-                                values[0],
-                            );
+                            if b_canonical_direct
+                                && b_special_head == x_lo
+                                && b_special_kind == B_SPECIAL_ONES
+                            {
+                                b_direct_pending = gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    0,
+                                    values[0],
+                                );
+                                b_direct_folded = values[0];
+                            } else {
+                                gfni_fold64_rows_tr_bcast_b_canonical(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    0,
+                                    values[0],
+                                );
+                            }
                         }
                         (Some(values), 192) if b_sparse_on => {
-                            gfni_fold64_rows_tr_bcast_b_canonical(
-                                b_pkt.add(g0 * 8),
-                                m,
-                                fb.as_mut_ptr(),
-                                3,
-                                values[1],
-                            );
+                            if b_canonical_direct
+                                && b_special_head == x_lo + 24
+                                && b_special_kind == B_SPECIAL_SPARSE
+                            {
+                                b_direct_pending = gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    3,
+                                    values[1],
+                                );
+                                b_direct_folded = values[1];
+                            } else {
+                                gfni_fold64_rows_tr_bcast_b_canonical(
+                                    b_pkt.add(g0 * 8),
+                                    m,
+                                    fb.as_mut_ptr(),
+                                    3,
+                                    values[1],
+                                );
+                            }
                         }
                         _ => gfni_fold64_rows_masked_tr_bcast(
                             b_pkt.add(g0 * 8),
@@ -404,6 +486,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
             // padded pairs' cached rows are already zero (zero raw rows
             // through zero-preserving fold tables), matching the explicit
             // zero stores of the scalar arm.
+            let b_special_now = x_lo == b_special_head;
             let (a0, a1, a2, a3, b0, b1, b2, b3) = if use_batch && zc_regfold_enabled() {
                 let r0 = 2 * (x_lo % 32);
                 if tr_emit {
@@ -414,16 +497,35 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     let ld = |base: *const F128, k: usize| {
                         _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
                     };
-                    (
+                    let (a0, a1, a2, a3) = (
                         ld(fa.as_ptr(), 0),
                         ld(fa.as_ptr(), 1),
                         ld(fa.as_ptr(), 2),
                         ld(fa.as_ptr(), 3),
-                        ld(fb.as_ptr(), 0),
-                        ld(fb.as_ptr(), 1),
-                        ld(fb.as_ptr(), 2),
-                        ld(fb.as_ptr(), 3),
-                    )
+                    );
+                    let (b0, b1, b2, b3) = if b_special_now && b_direct_pending {
+                        // This group's four cache lines were not written.
+                        // Reconstruct the exact current-map images instead;
+                        // an all-one packed word need not map to field ONE.
+                        let value = _mm512_broadcast_i32x4(_mm_set_epi64x(
+                            b_direct_folded.hi as i64,
+                            b_direct_folded.lo as i64,
+                        ));
+                        if b_special_kind == B_SPECIAL_ONES {
+                            (value, value, value, value)
+                        } else {
+                            let zero = _mm512_setzero_si512();
+                            (_mm512_maskz_mov_epi64(0x03, value), zero, zero, zero)
+                        }
+                    } else {
+                        (
+                            ld(fb.as_ptr(), 0),
+                            ld(fb.as_ptr(), 1),
+                            ld(fb.as_ptr(), 2),
+                            ld(fb.as_ptr(), 3),
+                        )
+                    };
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
                 } else {
                     let fap = fa.as_ptr().add(r0).cast::<__m512i>();
                     let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
@@ -506,7 +608,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     f128x4_loadu(b[3].as_ptr()),
                 )
             };
-            if x_lo == b_special_head {
+            if b_special_now {
+                let b_direct = b_direct_pending;
+                b_direct_pending = false;
                 let special_kind = b_special_kind;
                 if b_ones_on && b_sparse_on {
                     if special_kind == B_SPECIAL_ONES {
@@ -521,12 +625,17 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     b_special_head = b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS);
                 }
                 if special_kind == B_SPECIAL_ONES {
-                    let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
-                    let all = _mm512_cmpeq_epi64_mask(b0, one)
-                        & _mm512_cmpeq_epi64_mask(b1, one)
-                        & _mm512_cmpeq_epi64_mask(b2, one)
-                        & _mm512_cmpeq_epi64_mask(b3, one);
-                    if all == 0xff {
+                    let is_one = if b_direct {
+                        b_direct_folded == F128::ONE
+                    } else {
+                        let one = _mm512_broadcast_i32x4(_mm_set_epi64x(0, 1));
+                        let all = _mm512_cmpeq_epi64_mask(b0, one)
+                            & _mm512_cmpeq_epi64_mask(b1, one)
+                            & _mm512_cmpeq_epi64_mask(b2, one)
+                            & _mm512_cmpeq_epi64_mask(b3, one);
+                        all == 0xff
+                    };
+                    if is_one {
                         let (a1w, a2w, a3w) = if let Some(wt) = wtab {
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
@@ -567,13 +676,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                         continue;
                     }
                 } else {
-                    let zero = _mm512_setzero_si512();
-                    let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
-                    let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
-                        & _mm512_cmpeq_epi64_mask(b1, zero)
-                        & _mm512_cmpeq_epi64_mask(b2, zero)
-                        & _mm512_cmpeq_epi64_mask(b3, zero);
-                    if all == 0xff {
+                    let (b0_lane0, is_sparse) = if b_direct {
+                        (b0, true)
+                    } else {
+                        let zero = _mm512_setzero_si512();
+                        let b0_lane0 = _mm512_maskz_mov_epi64(0x03, b0);
+                        let all = _mm512_cmpeq_epi64_mask(b0, b0_lane0)
+                            & _mm512_cmpeq_epi64_mask(b1, zero)
+                            & _mm512_cmpeq_epi64_mask(b2, zero)
+                            & _mm512_cmpeq_epi64_mask(b3, zero);
+                        (b0_lane0, all == 0xff)
+                    };
+                    if is_sparse {
                         #[cfg(test)]
                         B_SPARSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let a1_msg = _mm512_xor_si512(a0, a1);
@@ -1368,6 +1482,15 @@ pub(crate) fn zc_wsplit_enabled() -> bool {
     *ON
 }
 
+/// Ranked default: the generic-tail fused fold uses the 5-CLMUL split
+/// product with a chunk-hoisted `r·x^64` companion. `FLOCK_NO_ZC_FOLD_SPLIT=1`
+/// restores the incumbent 6-CLMUL `ghash_mul_x4` in the same binary.
+fn zc_fold_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_SPLIT").is_none());
+    *ON
+}
+
 #[cfg(test)]
 pub(crate) static B_ONES_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1394,6 +1517,18 @@ fn zc_b_sparse_enabled() -> bool {
 fn zc_b_canonical_prefold_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
+    });
+    *ENABLED
+}
+
+/// `FLOCK_NO_ZC_B_CANONICAL_DIRECT=1` restores full canonical cache stores,
+/// readback, and the downstream folded-value guards. The direct arm reuses
+/// the original raw-byte guard and this proof's actual fold-map images.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline]
+fn zc_b_canonical_direct_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_DIRECT").is_none()
     });
     *ENABLED
 }
@@ -2351,6 +2486,138 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         }
     }
 }
+
+
+/// Compose a two-map GFNI fold directly into its 8-byte-input matrix.
+///
+/// The older two-map composition reassembles 64 output `F128`s and a
+/// subsequent caller transposes every group of eight outputs back into the
+/// byte matrices consumed by the fold drain. DirectFold8's per-block
+/// composition only needs those matrices, not the intermediate field values:
+/// the map-plane registers already contain each output byte for the 64 input
+/// rows. Store each plane once, reconstruct the eight field-byte lanes for
+/// each input-byte group, and run the proven 8×8 bit transpose used by
+/// [`build_row_fold_mats_from_cols`]. The bit transpose is essential: the
+/// plane bytes are values for eight columns, not matrix rows.
+///
+/// # Safety
+/// Each row pointer covers 512 readable bytes, `out` covers 128 writable
+/// `u64`s, and AVX-512F/VBMI/GFNI are available.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
+    rows0: *const u8,
+    mats0: &[u64; 128],
+    rows1: *const u8,
+    mats1: &[u64; 128],
+    out: &mut [u64; 128],
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: forwarded from this function's pointer and feature contract.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+        let input_planes = |rows: *const u8| -> [__m512i; 8] {
+            let z: [__m512i; 8] =
+                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
+            let t = z.map(|v| _mm512_permutexvar_epi8(bt, v));
+            qword_transpose(t)
+        };
+        let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
+            let g = |j: usize| {
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    p[j],
+                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
+                )
+            };
+            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+            _mm512_xor_si512(v2, v3)
+        };
+
+        let p0 = input_planes(rows0);
+        let p1 = input_planes(rows1);
+        let mut plane_bytes = [0u8; 16 * 64];
+        for k in 0..16 {
+            let value =
+                _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
+            _mm512_storeu_si512(plane_bytes[k * 64..].as_mut_ptr().cast::<__m512i>(), value);
+        }
+        for group in 0..8 {
+            let lo_lanes: [u64; 8] = core::array::from_fn(|row| {
+                (0..8).fold(0u64, |value, byte| {
+                    value | ((plane_bytes[byte * 64 + group * 8 + row] as u64) << (byte * 8))
+                })
+            });
+            let hi_lanes: [u64; 8] = core::array::from_fn(|row| {
+                (0..8).fold(0u64, |value, byte| {
+                    value
+                        | ((plane_bytes[(byte + 8) * 64 + group * 8 + row] as u64)
+                            << (byte * 8))
+                })
+            });
+            let mut lo_bytes = [0u8; 64];
+            let mut hi_bytes = [0u8; 64];
+            crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+            crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+            for byte in 0..8 {
+                let lo: [u8; 8] =
+                    lo_bytes[byte * 8..byte * 8 + 8].try_into().unwrap();
+                let hi: [u8; 8] =
+                    hi_bytes[byte * 8..byte * 8 + 8].try_into().unwrap();
+                out[group * 16 + byte] = u64::from_le_bytes(lo).swap_bytes();
+                out[group * 16 + byte + 8] = u64::from_le_bytes(hi).swap_bytes();
+            }
+        }
+    }
+}
+
 
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
@@ -3452,6 +3719,34 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
     group: u8,
     folded: F128,
 ) -> bool {
+    // SAFETY: this entry retains the complete-cache contract, including on
+    // raw-guard misses, for the rollback path and independent callers.
+    unsafe { gfni_fold64_rows_tr_bcast_b_canonical_impl::<true>(rows, mats, out, group, folded) }
+}
+
+/// With `WRITE_CANONICAL=false`, a successful raw guard leaves only the
+/// checked group's four ZMMs unwritten. A miss still writes all 64 outputs.
+///
+/// # Safety
+/// As [`gfni_fold64_rows_tr_bcast_b_canonical`]. On a partial-cache hit the
+/// caller must not read F128 slots `16*k + 4*group .. +4`, k=0..4; it must
+/// reconstruct that window from `folded` and the guarded group instead.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool>(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    group: u8,
+    folded: F128,
+) -> bool {
     use core::arch::x86_64::*;
     // SAFETY: both guard loads are inside the caller's 512-byte extent. A
     // successful guard proves the skipped input group's exact contents;
@@ -3477,19 +3772,20 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
             gfni_fold64_rows_masked_tr_bcast(rows, mats, out, 0);
             return false;
         }
-        gfni_fold64_rows_tr_bcast_b_canonical_leaf(rows, mats, out, group, folded);
+        gfni_fold64_rows_tr_bcast_b_canonical_leaf::<WRITE_CANONICAL>(rows, mats, out, group, folded);
         true
     }
 }
 
-/// The checked canonical path keeps the full prefold cache, but computes
-/// exactly three dense groups: 3 * 2 row halves * 2 output-byte halves *
+/// The checked canonical path computes exactly three dense groups:
+/// 3 * 2 row halves * 2 output-byte halves *
 /// 8 input chunks = 96 GFNI operations. The skipped group's 32 operations
 /// are absent, rather than executed with masked lanes. Keep this boundary
 /// out of the message loop's large persistent accumulator live set.
+/// `WRITE_CANONICAL` selects complete-cache or direct-consumer publication.
 ///
 /// # Safety
-/// As [`gfni_fold64_rows_tr_bcast_b_canonical`], and its raw guard must have
+/// As [`gfni_fold64_rows_tr_bcast_b_canonical_impl`], and its raw guard must have
 /// succeeded for `group`, which must be zero or three.
 #[cfg(all(
     target_arch = "x86_64",
@@ -3500,7 +3796,7 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<const WRITE_CANONICAL: bool>(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
@@ -3511,7 +3807,9 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
     debug_assert!(group == 0 || group == 3);
     // SAFETY: the guard established the canonical group; every other input
     // line is read into the local octet scratch before any output is stored.
-    // All 64 scratch qwords and all 64 output F128s are initialized below.
+    // The dense loop skips the canonical group, so it reads exactly the six
+    // scratch lines initialized below. The 48 dense output F128s are always
+    // initialized; the remaining 16 are written iff WRITE_CANONICAL.
     unsafe {
         #[rustfmt::skip]
         const BT: [i8; 64] = [
@@ -3523,20 +3821,14 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
         let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
         #[repr(C, align(64))]
         struct Octs([u64; 64]);
-        let mut octs = Octs([0u64; 64]);
-        let op = octs.0.as_mut_ptr();
+        // Keep the 64-byte alignment without zeroing the whole 512-byte
+        // staging object. The six live lines are written in full before the
+        // only reads below; the skipped canonical group's two lines are never
+        // addressed by the dense loop or the conditional publication arm.
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = octs.as_mut_ptr().cast::<u64>();
         let skipped = usize::from(group);
         let first_g = if group == 0 { 1 } else { 0 };
-
-        // Explicitly write all eight scratch lines, as in the full helper.
-        // The canonical group's two lines are never consumed by the dense
-        // loop; writing zeros avoids partially initialized scratch and does
-        // not rely on partial-write dead-store elimination for correctness.
-        {
-            let zero = _mm512_setzero_si512();
-            _mm512_storeu_si512(op.add(16 * skipped).cast::<__m512i>(), zero);
-            _mm512_storeu_si512(op.add(16 * skipped + 8).cast::<__m512i>(), zero);
-        }
         for relative in 0..6 {
             let i = 2 * first_g + relative;
             let z = _mm512_loadu_si512(rows.add(64 * i).cast::<__m512i>());
@@ -3583,21 +3875,23 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
             _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
         }
 
-        // Complete the cache in the incumbent residue-major layout:
-        // out[16*k + 4*g + lane] = fold(row 16*g + 4*lane + k).
-        let dst = out.cast::<__m512i>().add(skipped);
-        let value = _mm512_broadcast_i32x4(_mm_set_epi64x(folded.hi as i64, folded.lo as i64));
-        if group == 0 {
-            _mm512_storeu_si512(dst, value);
-            _mm512_storeu_si512(dst.add(4), value);
-            _mm512_storeu_si512(dst.add(8), value);
-            _mm512_storeu_si512(dst.add(12), value);
-        } else {
-            let zero = _mm512_setzero_si512();
-            _mm512_storeu_si512(dst, _mm512_maskz_mov_epi64(0x03, value));
-            _mm512_storeu_si512(dst.add(4), zero);
-            _mm512_storeu_si512(dst.add(8), zero);
-            _mm512_storeu_si512(dst.add(12), zero);
+        if WRITE_CANONICAL {
+            // Complete the cache in the incumbent residue-major layout:
+            // out[16*k + 4*g + lane] = fold(row 16*g + 4*lane + k).
+            let dst = out.cast::<__m512i>().add(skipped);
+            let value = _mm512_broadcast_i32x4(_mm_set_epi64x(folded.hi as i64, folded.lo as i64));
+            if group == 0 {
+                _mm512_storeu_si512(dst, value);
+                _mm512_storeu_si512(dst.add(4), value);
+                _mm512_storeu_si512(dst.add(8), value);
+                _mm512_storeu_si512(dst.add(12), value);
+            } else {
+                let zero = _mm512_setzero_si512();
+                _mm512_storeu_si512(dst, _mm512_maskz_mov_epi64(0x03, value));
+                _mm512_storeu_si512(dst.add(4), zero);
+                _mm512_storeu_si512(dst.add(8), zero);
+                _mm512_storeu_si512(dst.add(12), zero);
+            }
         }
     }
 }
