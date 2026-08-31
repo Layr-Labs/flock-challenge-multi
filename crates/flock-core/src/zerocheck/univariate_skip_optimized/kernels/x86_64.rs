@@ -841,11 +841,14 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
         };
 
     #[inline(always)]
-    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
+    unsafe fn lookup8_pair(idx0: __m512i, idx1: __m512i, table: *const u64) -> (__m512i, __m512i) {
         unsafe {
             let a = _mm512_load_si512(table as *const __m512i);
             let b = _mm512_load_si512(table.add(8) as *const __m512i);
-            _mm512_permutex2var_epi64(a, idx, b)
+            (
+                _mm512_permutex2var_epi64(a, idx0, b),
+                _mm512_permutex2var_epi64(a, idx1, b),
+            )
         }
     }
 
@@ -868,41 +871,34 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         for lane_base in (0..ELL).step_by(16) {
-            let mut los = [_mm512_setzero_si512(); 2];
-            let mut his = [_mm512_setzero_si512(); 2];
+            let mut los0 = _mm512_setzero_si512();
+            let mut his0 = _mm512_setzero_si512();
+            let mut los1 = _mm512_setzero_si512();
+            let mut his1 = _mm512_setzero_si512();
             for b_med in 0..n_b_med {
                 let row_ptr = chunk_ab_bytes[b_med].as_ptr().add(lane_base);
                 let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
                 let row = _mm512_cvtepu8_epi32(row_bytes);
                 let n0 = _mm512_and_si512(row, nibble_mask);
                 let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(row), nibble_mask);
-                for group in 0..2 {
-                    let n0_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
-                    };
-                    let n1_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
-                    };
-                    los[group] = _mm512_xor_si512(
-                        los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
-                    );
-                    his[group] = _mm512_xor_si512(
-                        his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
-                    );
-                }
+
+                let n0_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0));
+                let n1_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1));
+                let n0_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0));
+                let n1_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1));
+
+                let (l0_0, l0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.n0_lo[b_med].as_ptr());
+                let (l1_0, l1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.n1_lo[b_med].as_ptr());
+                los0 = _mm512_ternarylogic_epi64::<0x96>(los0, l0_0, l1_0);
+                los1 = _mm512_ternarylogic_epi64::<0x96>(los1, l0_1, l1_1);
+
+                let (h0_0, h0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.n0_hi[b_med].as_ptr());
+                let (h1_0, h1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.n1_hi[b_med].as_ptr());
+                his0 = _mm512_ternarylogic_epi64::<0x96>(his0, h0_0, h1_0);
+                his1 = _mm512_ternarylogic_epi64::<0x96>(his1, h0_1, h1_1);
             }
+            let los = [los0, los1];
+            let his = [his0, his1];
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
                 let scaled0 = ghash_mul_x4(aos0, eq);
@@ -1165,59 +1161,39 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
                 let n2 = _mm512_and_si512(hi16, nibble_mask);
                 let n3 = _mm512_and_si512(_mm512_srli_epi32::<4>(hi16), nibble_mask);
 
-                for group in 0..2 {
-                    let n0_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
-                    };
-                    let n1_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
-                    };
-                    let n2_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n2))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n2))
-                    };
-                    let n3_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n3))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3))
-                    };
+                let n0_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0));
+                let n0_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0));
+                let n1_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1));
+                let n1_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1));
+                let n2_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n2));
+                let n2_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n2));
+                let n3_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n3));
+                let n3_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3));
 
-                    let los = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_lo.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_lo.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_lo.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_lo.as_ptr()),
-                        ),
-                    );
-                    let his = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_hi.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_hi.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_hi.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_hi.as_ptr()),
-                        ),
-                    );
-                    let (aos0, aos1) = interleave_aos(los, his);
-                    let partial_ptr = bank.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
-                    _mm512_storeu_si512(
-                        partial_ptr,
-                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr), aos0),
-                    );
-                    _mm512_storeu_si512(
-                        partial_ptr.add(1),
-                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr.add(1)), aos1),
-                    );
-                }
+                let (l0_0, l0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.lo_n0_lo.as_ptr());
+                let (l1_0, l1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.lo_n1_lo.as_ptr());
+                let (l2_0, l2_1) = lookup8_pair(n2_8_0, n2_8_1, lut.hi_n0_lo.as_ptr());
+                let (l3_0, l3_1) = lookup8_pair(n3_8_0, n3_8_1, lut.hi_n1_lo.as_ptr());
+                let los0 = _mm512_ternarylogic_epi64::<0x96>(l0_0, l1_0, _mm512_xor_si512(l2_0, l3_0));
+                let los1 = _mm512_ternarylogic_epi64::<0x96>(l0_1, l1_1, _mm512_xor_si512(l2_1, l3_1));
+
+                let (h0_0, h0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.lo_n0_hi.as_ptr());
+                let (h1_0, h1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.lo_n1_hi.as_ptr());
+                let (h2_0, h2_1) = lookup8_pair(n2_8_0, n2_8_1, lut.hi_n0_hi.as_ptr());
+                let (h3_0, h3_1) = lookup8_pair(n3_8_0, n3_8_1, lut.hi_n1_hi.as_ptr());
+                let his0 = _mm512_ternarylogic_epi64::<0x96>(h0_0, h1_0, _mm512_xor_si512(h2_0, h3_0));
+                let his1 = _mm512_ternarylogic_epi64::<0x96>(h0_1, h1_1, _mm512_xor_si512(h2_1, h3_1));
+
+                let (aos0_0, aos0_1) = interleave_aos(los0, his0);
+                let (aos1_0, aos1_1) = interleave_aos(los1, his1);
+
+                let p0 = bank.as_mut_ptr().add(lane_base) as *mut __m512i;
+                let p1 = bank.as_mut_ptr().add(lane_base + 8) as *mut __m512i;
+
+                _mm512_storeu_si512(p0, _mm512_xor_si512(_mm512_loadu_si512(p0), aos0_0));
+                _mm512_storeu_si512(p0.add(1), _mm512_xor_si512(_mm512_loadu_si512(p0.add(1)), aos0_1));
+                _mm512_storeu_si512(p1, _mm512_xor_si512(_mm512_loadu_si512(p1), aos1_0));
+                _mm512_storeu_si512(p1.add(1), _mm512_xor_si512(_mm512_loadu_si512(p1.add(1)), aos1_1));
             }
         }
     }
@@ -1641,34 +1617,50 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_range2<
         for bm in 2..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = if FIRST_WRITE {
+        for k in (0..16).step_by(2) {
+            let p0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let p1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = if FIRST_WRITE {
                 _mm512_setzero_si512()
             } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
+                _mm512_loadu_si512(p0 as *const __m512i)
+            };
+            let mut acc1 = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(p1 as *const __m512i)
             };
             let mut bm = 2;
             while bm + 1 < N {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
+                let r0 = rows[bm];
+                let r1 = rows[bm + 1];
+                let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
+                let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
                     _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
                 );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
                 bm += 2;
             }
             if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
-                );
-                acc = _mm512_xor_si512(acc, g);
+                let r = rows[bm];
+                acc0 = _mm512_xor_si512(acc0, _mm512_gf2p8affine_epi64_epi8::<0>(r, _mm512_set1_epi64(mats[bm * 16 + k] as i64)));
+                acc1 = _mm512_xor_si512(acc1, _mm512_gf2p8affine_epi64_epi8::<0>(r, _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64)));
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(p0, acc0);
+            _mm512_storeu_si512(p1, acc1);
         }
     }
 }
@@ -1757,30 +1749,42 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         for bm in 0..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+        for k in (0..16).step_by(2) {
+            let p0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let p1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = _mm512_loadu_si512(p0 as *const __m512i);
+            let mut acc1 = _mm512_loadu_si512(p1 as *const __m512i);
             let mut bm = 0;
             while bm + 1 < N {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
+                let r0 = rows[bm];
+                let r1 = rows[bm + 1];
+                let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
+                let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
                     _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
                 );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
                 bm += 2;
             }
             if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
-                );
-                acc = _mm512_xor_si512(acc, g);
+                let r = rows[bm];
+                acc0 = _mm512_xor_si512(acc0, _mm512_gf2p8affine_epi64_epi8::<0>(r, _mm512_set1_epi64(mats[bm * 16 + k] as i64)));
+                acc1 = _mm512_xor_si512(acc1, _mm512_gf2p8affine_epi64_epi8::<0>(r, _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64)));
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(p0, acc0);
+            _mm512_storeu_si512(p1, acc1);
         }
     }
 }

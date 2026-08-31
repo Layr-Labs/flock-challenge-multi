@@ -280,17 +280,32 @@ unsafe fn all_static_acc<const IMG2: bool>(
 ) -> __m512i {
     // SAFETY: forwarded from the caller's contract.
     unsafe {
-        let mut acc = _mm512_setzero_si512();
-        for k in 0..8usize {
-            let av = if IMG2 {
-                apply_full_2img(table, table8, a_base.add(k * N_CHUNKS))
-            } else {
-                apply_full(table, a_base.add(k * N_CHUNKS))
-            };
-            let part = _mm512_load_si512(parts.add(k * 64) as *const __m512i);
-            acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, part));
+        macro_rules! step_k {
+            ($k:literal) => {{
+                let av = if IMG2 {
+                    apply_full_2img(table, table8, a_base.add($k * N_CHUNKS))
+                } else {
+                    apply_full(table, a_base.add($k * N_CHUNKS))
+                };
+                let part = _mm512_load_si512(parts.add($k * 64) as *const __m512i);
+                _mm512_gf2p8mul_epi8(av, part)
+            }};
         }
-        acc
+        let p0 = step_k!(0);
+        let p1 = step_k!(1);
+        let p2 = step_k!(2);
+        let p3 = step_k!(3);
+        let p4 = step_k!(4);
+        let p5 = step_k!(5);
+        let p6 = step_k!(6);
+        let p7 = step_k!(7);
+        let u01 = _mm512_xor_si512(p0, p1);
+        let u23 = _mm512_xor_si512(p2, p3);
+        let u45 = _mm512_xor_si512(p4, p5);
+        let u67 = _mm512_xor_si512(p6, p7);
+        let u0123 = _mm512_xor_si512(u01, u23);
+        let u4567 = _mm512_xor_si512(u45, u67);
+        _mm512_xor_si512(u0123, u4567)
     }
 }
 
