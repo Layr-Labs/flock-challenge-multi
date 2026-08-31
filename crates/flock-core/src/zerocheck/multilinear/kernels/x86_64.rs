@@ -3477,7 +3477,13 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
             gfni_fold64_rows_masked_tr_bcast(rows, mats, out, 0);
             return false;
         }
-        gfni_fold64_rows_tr_bcast_b_canonical_leaf(rows, mats, out, group, folded);
+        // The unchanged raw guard admits only groups 0 and 3. Specialize
+        // that already-established choice; no additional input check.
+        if group == 0 {
+            gfni_fold64_rows_tr_bcast_b_canonical_leaf::<0>(rows, mats, out, folded);
+        } else {
+            gfni_fold64_rows_tr_bcast_b_canonical_leaf::<3>(rows, mats, out, folded);
+        }
         true
     }
 }
@@ -3490,7 +3496,8 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_tr_bcast_b_canonical`], and its raw guard must have
-/// succeeded for `group`, which must be zero or three.
+/// succeeded for `GROUP`, which must be zero or three. Scratch remains in
+/// MaybeUninit storage: only the six live lines are written or read.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -3500,18 +3507,19 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_b_canonical(
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<const GROUP: usize>(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
-    group: u8,
     folded: F128,
 ) {
     use core::arch::x86_64::*;
-    debug_assert!(group == 0 || group == 3);
+    const { assert!(GROUP == 0 || GROUP == 3) };
     // SAFETY: the guard established the canonical group; every other input
     // line is read into the local octet scratch before any output is stored.
-    // All 64 scratch qwords and all 64 output F128s are initialized below.
+    // Every consumed scratch qword and all 64 output F128s are initialized
+    // below. The two skipped scratch lines are neither read nor made into
+    // an initialized Octs value or reference.
     unsafe {
         #[rustfmt::skip]
         const BT: [i8; 64] = [
@@ -3523,20 +3531,15 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
         let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
         #[repr(C, align(64))]
         struct Octs([u64; 64]);
-        let mut octs = Octs([0u64; 64]);
-        let op = octs.0.as_mut_ptr();
-        let skipped = usize::from(group);
-        let first_g = if group == 0 { 1 } else { 0 };
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        // repr(C) puts the sole array field at offset zero. This raw pointer
+        // does not form a reference to the uninitialized array.
+        let op = octs.as_mut_ptr().cast::<u64>();
+        let first_g = if GROUP == 0 { 1 } else { 0 };
 
-        // Explicitly write all eight scratch lines, as in the full helper.
-        // The canonical group's two lines are never consumed by the dense
-        // loop; writing zeros avoids partially initialized scratch and does
-        // not rely on partial-write dead-store elimination for correctness.
-        {
-            let zero = _mm512_setzero_si512();
-            _mm512_storeu_si512(op.add(16 * skipped).cast::<__m512i>(), zero);
-            _mm512_storeu_si512(op.add(16 * skipped + 8).cast::<__m512i>(), zero);
-        }
+        // GROUP=0 writes lines 2..8; GROUP=3 writes lines 0..6. The dense
+        // loop below uses g=first_g..first_g+3 and i=2*g+half, so its qword
+        // indices 8*i+j (j=0..8) lie exactly in these initialized lines.
         for relative in 0..6 {
             let i = 2 * first_g + relative;
             let z = _mm512_loadu_si512(rows.add(64 * i).cast::<__m512i>());
@@ -3585,9 +3588,9 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf(
 
         // Complete the cache in the incumbent residue-major layout:
         // out[16*k + 4*g + lane] = fold(row 16*g + 4*lane + k).
-        let dst = out.cast::<__m512i>().add(skipped);
+        let dst = out.cast::<__m512i>().add(GROUP);
         let value = _mm512_broadcast_i32x4(_mm_set_epi64x(folded.hi as i64, folded.lo as i64));
-        if group == 0 {
+        if GROUP == 0 {
             _mm512_storeu_si512(dst, value);
             _mm512_storeu_si512(dst.add(4), value);
             _mm512_storeu_si512(dst.add(8), value);
