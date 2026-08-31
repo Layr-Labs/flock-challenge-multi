@@ -535,12 +535,33 @@ pub(crate) fn take_tree(total_nodes: usize) -> Vec<Hash> {
     crate::alloc_uninit_vec(total_nodes)
 }
 
+/// `FLOCK_NO_TREE_COLLAPSE=1` skips `madvise(MADV_COLLAPSE)` when parking a
+/// Merkle tree. Ranked env is cleared, so the untimed prove's first-touched
+/// 4/16/64 MiB trees are collapsed before the timed prove takes them.
+fn tree_collapse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TREE_COLLAPSE").is_none());
+    *ON
+}
+
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
     // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
     // leaves, 131071 nodes) is recycled alongside L0 (64 MiB) and L1 (16 MiB).
     if tree.capacity() < (1 << 16) {
         return;
+    }
+    // Untimed warmup first-touches these pages; collapse upgrades 4 KiB
+    // stretches to 2 MiB before the timed prove retakes the buffer. F128
+    // scratch already collapses in `prewarm_prover`; TREE_POOL did not. Use
+    // the live tree length instead of the full allocation capacity. The
+    // kernel may round the final partial page, but the separate 96-page
+    // layout tail is otherwise outside the requested range.
+    if tree_collapse_enabled() {
+        crate::collapse_hugepages(
+            tree.as_mut_ptr().cast::<u8>(),
+            tree.len() * core::mem::size_of::<Hash>(),
+        );
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {
