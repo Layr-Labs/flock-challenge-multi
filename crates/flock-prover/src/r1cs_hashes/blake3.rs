@@ -1012,6 +1012,42 @@ fn lc_adj_cz_aggregate_enabled() -> bool {
     *ON
 }
 
+/// Vectorized 128-bit SIMD scatter helpers for the adjoint injector.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn xor_scatter_xmm(dst: *mut F128, idx: u32, val: core::arch::x86_64::__m128i) {
+    use core::arch::x86_64::*;
+    let p = dst.add(idx as usize).cast::<__m128i>();
+    _mm_storeu_si128(p, _mm_xor_si128(_mm_loadu_si128(p), val));
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn scatter_a4_simd(
+    accp: *mut F128,
+    ap: *const u32,
+    r: usize,
+    ea: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    let l0 = _mm512_castsi512_si128(ea);
+    let l1 = _mm512_extracti32x4_epi32::<1>(ea);
+    let l2 = _mm512_extracti32x4_epi32::<2>(ea);
+    let l3 = _mm512_extracti32x4_epi32::<3>(ea);
+    xor_scatter_xmm(accp, *ap.add(r), l0);
+    xor_scatter_xmm(accp, *ap.add(r + 1), l1);
+    xor_scatter_xmm(accp, *ap.add(r + 2), l2);
+    xor_scatter_xmm(accp, *ap.add(r + 3), l3);
+}
+
 /// FAIL-CLOSED shape gate. [`Blake3AdjointPlan`] hard-codes the geometry that
 /// `build_matrices` produces; it is valid for that `(A_0, B_0)` pair and
 /// nothing else. Every dimension the plan assumes is checked here, and any
@@ -1058,9 +1094,9 @@ unsafe fn inject_alpha_e_x4(
     alpha: F128,
     eq_inner: &[F128],
 ) {
-    use core::arch::x86_64::{_mm512_setzero_si512, _mm512_xor_si512};
+    use core::arch::x86_64::{_mm512_setzero_si512, _mm512_xor_si512, _mm_setzero_si128, _mm_loadu_si128, _mm_xor_si128};
     use flock_core::field::gf2_128::x86_64::{
-        f128x4_extract, f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
+        f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
         ghash_mul_x4_split_unroll4,
     };
 
@@ -1075,7 +1111,6 @@ unsafe fn inject_alpha_e_x4(
     // and non-aliasing are invariants of Blake3AdjointPlan::build and this
     // helper's contract; target features are declared above.
     unsafe {
-        let (t, t_x64) = ghash_broadcast_split(alpha);
         let accp = acc.as_mut_ptr();
         let ap = a_roots.as_ptr();
         let bp = b_roots.as_ptr();
@@ -1121,22 +1156,9 @@ unsafe fn inject_alpha_e_x4(
                     .all(|&root| root == Z_CONST_POS as u32)
             }));
 
-            // A side: byte-for-byte the incumbent x4/unroll4 walk, minus the
-            // interleaved B writes. Keeping one whole-prefix walk avoids the
-            // 113 scalar A rows that independent static-range walks would
-            // leave (the 1-row prefix tail plus 2 carry tails for each G).
-            macro_rules! scatter_a4 {
-                ($r:expr, $ea:expr) => {{
-                    let r = $r;
-                    let ea4 = f128x4_extract($ea);
-                    *accp.add(*ap.add(r) as usize) += ea4[0];
-                    *accp.add(*ap.add(r + 1) as usize) += ea4[1];
-                    *accp.add(*ap.add(r + 2) as usize) += ea4[2];
-                    *accp.add(*ap.add(r + 3) as usize) += ea4[3];
-                }};
-            }
-
             const WIDTH: usize = 4;
+            let (t, t_x64) = ghash_broadcast_split(alpha);
+
             const UNROLL: usize = 4;
             const SPAN: usize = WIDTH * UNROLL;
             let unroll_end = round4 & !(SPAN - 1);
@@ -1155,32 +1177,32 @@ unsafe fn inject_alpha_e_x4(
                     e2 = f128x4_loadu(eqp.add(r + 8));
                     e3 = f128x4_loadu(eqp.add(r + 12));
                     let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
-                    scatter_a4!(r - SPAN, p0);
-                    scatter_a4!(r - SPAN + 4, p1);
-                    scatter_a4!(r - SPAN + 8, p2);
-                    scatter_a4!(r - SPAN + 12, p3);
+                    scatter_a4_simd(accp, ap, r - SPAN, p0);
+                    scatter_a4_simd(accp, ap, r - SPAN + 4, p1);
+                    scatter_a4_simd(accp, ap, r - SPAN + 8, p2);
+                    scatter_a4_simd(accp, ap, r - SPAN + 12, p3);
                     p0 = next.0;
                     p1 = next.1;
                     p2 = next.2;
                     p3 = next.3;
                     r += SPAN;
                 }
-                scatter_a4!(unroll_end - SPAN, p0);
-                scatter_a4!(unroll_end - SPAN + 4, p1);
-                scatter_a4!(unroll_end - SPAN + 8, p2);
-                scatter_a4!(unroll_end - SPAN + 12, p3);
+                scatter_a4_simd(accp, ap, unroll_end - SPAN, p0);
+                scatter_a4_simd(accp, ap, unroll_end - SPAN + 4, p1);
+                scatter_a4_simd(accp, ap, unroll_end - SPAN + 8, p2);
+                scatter_a4_simd(accp, ap, unroll_end - SPAN + 12, p3);
             }
             while r < round4 {
                 let e = f128x4_loadu(eqp.add(r));
                 let product = ghash_mul_x4_split(e, t, t_x64);
-                scatter_a4!(r, product);
+                scatter_a4_simd(accp, ap, r, product);
                 r += WIDTH;
             }
 
             // B side: the constant-pin ranges reduce in ZMM registers. Carry
             // ranges keep one scatter per row, in their original row order.
             let mut cz4 = _mm512_setzero_si512();
-            let mut cz_tail = F128::ZERO;
+            let mut cz_tail = _mm_setzero_si128();
             macro_rules! aggregate_cz_range {
                 ($begin:expr, $end:expr) => {{
                     let end = $end;
@@ -1190,7 +1212,10 @@ unsafe fn inject_alpha_e_x4(
                         r += WIDTH;
                     }
                     while r < end {
-                        cz_tail += *eqp.add(r);
+                        cz_tail = _mm_xor_si128(
+                            cz_tail,
+                            _mm_loadu_si128(eqp.add(r).cast::<__m128i>()),
+                        );
                         r += 1;
                     }
                 }};
@@ -1200,15 +1225,19 @@ unsafe fn inject_alpha_e_x4(
                     let end = $end;
                     let mut r = $begin;
                     while r + WIDTH <= end {
-                        let e4 = f128x4_extract(f128x4_loadu(eqp.add(r)));
-                        *accp.add(*bp.add(r) as usize) += e4[0];
-                        *accp.add(*bp.add(r + 1) as usize) += e4[1];
-                        *accp.add(*bp.add(r + 2) as usize) += e4[2];
-                        *accp.add(*bp.add(r + 3) as usize) += e4[3];
+                        let e0 = _mm_loadu_si128(eqp.add(r).cast::<__m128i>());
+                        let e1 = _mm_loadu_si128(eqp.add(r + 1).cast::<__m128i>());
+                        let e2 = _mm_loadu_si128(eqp.add(r + 2).cast::<__m128i>());
+                        let e3 = _mm_loadu_si128(eqp.add(r + 3).cast::<__m128i>());
+                        xor_scatter_xmm(accp, *bp.add(r), e0);
+                        xor_scatter_xmm(accp, *bp.add(r + 1), e1);
+                        xor_scatter_xmm(accp, *bp.add(r + 2), e2);
+                        xor_scatter_xmm(accp, *bp.add(r + 3), e3);
                         r += WIDTH;
                     }
                     while r < end {
-                        *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                        let e = _mm_loadu_si128(eqp.add(r).cast::<__m128i>());
+                        xor_scatter_xmm(accp, *bp.add(r), e);
                         r += 1;
                     }
                 }};
@@ -1224,24 +1253,38 @@ unsafe fn inject_alpha_e_x4(
             aggregate_cz_range!(OUT_HI_BASE, USEFUL_BITS);
             scatter_b_range!(n_rows, round4);
 
-            let lanes = f128x4_extract(cz4);
-            let cz_sum = cz_tail + lanes[0] + lanes[1] + lanes[2] + lanes[3];
-            *accp.add(Z_CONST_POS) += cz_sum;
+            let l0 = _mm512_castsi512_si128(cz4);
+            let l1 = _mm512_extracti32x4_epi32::<1>(cz4);
+            let l2 = _mm512_extracti32x4_epi32::<2>(cz4);
+            let l3 = _mm512_extracti32x4_epi32::<3>(cz4);
+            let cz_sum = _mm_xor_si128(
+                _mm_xor_si128(l0, l1),
+                _mm_xor_si128(_mm_xor_si128(l2, l3), cz_tail),
+            );
+            xor_scatter_xmm(accp, Z_CONST_POS as u32, cz_sum);
             return;
         }
 
+        let (t, t_x64) = ghash_broadcast_split(alpha);
         macro_rules! scatter4 {
             ($r:expr, $ea:expr) => {{
                 let r = $r;
-                let ea4 = f128x4_extract($ea);
-                *accp.add(*ap.add(r) as usize) += ea4[0];
-                *accp.add(*bp.add(r) as usize) += *eqp.add(r);
-                *accp.add(*ap.add(r + 1) as usize) += ea4[1];
-                *accp.add(*bp.add(r + 1) as usize) += *eqp.add(r + 1);
-                *accp.add(*ap.add(r + 2) as usize) += ea4[2];
-                *accp.add(*bp.add(r + 2) as usize) += *eqp.add(r + 2);
-                *accp.add(*ap.add(r + 3) as usize) += ea4[3];
-                *accp.add(*bp.add(r + 3) as usize) += *eqp.add(r + 3);
+                let l0 = _mm512_castsi512_si128($ea);
+                let l1 = _mm512_extracti32x4_epi32::<1>($ea);
+                let l2 = _mm512_extracti32x4_epi32::<2>($ea);
+                let l3 = _mm512_extracti32x4_epi32::<3>($ea);
+                let e0 = _mm_loadu_si128(eqp.add(r).cast::<__m128i>());
+                let e1 = _mm_loadu_si128(eqp.add(r + 1).cast::<__m128i>());
+                let e2 = _mm_loadu_si128(eqp.add(r + 2).cast::<__m128i>());
+                let e3 = _mm_loadu_si128(eqp.add(r + 3).cast::<__m128i>());
+                xor_scatter_xmm(accp, *ap.add(r), l0);
+                xor_scatter_xmm(accp, *bp.add(r), e0);
+                xor_scatter_xmm(accp, *ap.add(r + 1), l1);
+                xor_scatter_xmm(accp, *bp.add(r + 1), e1);
+                xor_scatter_xmm(accp, *ap.add(r + 2), l2);
+                xor_scatter_xmm(accp, *bp.add(r + 2), e2);
+                xor_scatter_xmm(accp, *ap.add(r + 3), l3);
+                xor_scatter_xmm(accp, *bp.add(r + 3), e3);
             }};
         }
 
@@ -1343,14 +1386,41 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // One reverse-topological sweep: a node's children were interned
         // before it, so `ADJ_BASE + i`'s children are both `< ADJ_BASE + i`
         // and descending `i` visits every parent before either child.
-        let base = ADJ_BASE as usize;
-        for i in (0..self.children.len()).rev() {
-            let v = acc[base + i];
-            // SAFETY: children are node ids `< base + i < n_nodes`.
-            let [p, q] = unsafe { *self.children.get_unchecked(i) };
-            unsafe {
-                *acc.get_unchecked_mut(p as usize) += v;
-                *acc.get_unchecked_mut(q as usize) += v;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            use core::arch::x86_64::*;
+            let base = ADJ_BASE as usize;
+            let accp = acc.as_mut_ptr().cast::<__m128i>();
+            let children = self.children.as_ptr();
+            for i in (0..self.children.len()).rev() {
+                let v = _mm_loadu_si128(accp.add(base + i));
+                let [p, q] = *children.add(i);
+                let pp = accp.add(p as usize);
+                _mm_storeu_si128(pp, _mm_xor_si128(_mm_loadu_si128(pp), v));
+                let qp = accp.add(q as usize);
+                _mm_storeu_si128(qp, _mm_xor_si128(_mm_loadu_si128(qp), v));
+            }
+        }
+
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            let base = ADJ_BASE as usize;
+            for i in (0..self.children.len()).rev() {
+                let v = acc[base + i];
+                // SAFETY: children are node ids `< base + i < n_nodes`.
+                let [p, q] = unsafe { *self.children.get_unchecked(i) };
+                unsafe {
+                    *acc.get_unchecked_mut(p as usize) += v;
+                    *acc.get_unchecked_mut(q as usize) += v;
+                }
             }
         }
 
