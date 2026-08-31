@@ -171,17 +171,14 @@ pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: 
             // Layer r0: adjacent pairs → [low0, high0, low1, high1] / [low2, …].
             let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
             let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
-            let mid01 = _mm512_xor_si512(
-                even01,
-                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
-            );
             let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
             let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
-            let mid23 = _mm512_xor_si512(
-                even23,
-                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
-            );
-
+            let d01 = _mm512_xor_si512(even01, odd01);
+            let d23 = _mm512_xor_si512(even23, odd23);
+            let m01 = ghash_mul_x4_split(d01, r0_bcast, r0_x64);
+            let m23 = ghash_mul_x4_split(d23, r0_bcast, r0_x64);
+            let mid01 = _mm512_xor_si512(even01, m01);
+            let mid23 = _mm512_xor_si512(even23, m23);
             // Layer r1: (low, high) pairs → [out0, out1, out2, out3].
             let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
             let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);

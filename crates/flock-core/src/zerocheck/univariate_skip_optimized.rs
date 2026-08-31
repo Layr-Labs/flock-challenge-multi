@@ -1317,8 +1317,11 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
+///
+/// # Safety
+/// Caller guarantees target features and aligned buffers.
 #[inline(always)]
-#[allow(unused_variables)]
+#[allow(unused_variables, clippy::missing_safety_doc)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
@@ -2436,9 +2439,8 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
 /// clear-then-accumulate form, which is the byte-identity oracle.
 #[inline]
 fn c_plane_first_write_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none());
     *ON
 }
 

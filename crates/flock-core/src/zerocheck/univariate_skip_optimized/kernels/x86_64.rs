@@ -10,6 +10,8 @@ use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q}
 use super::super::{ELL, F128, N_MEDIUM};
 #[cfg(target_feature = "gfni")]
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+use core::arch::x86_64::*;
 
 /// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
 /// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
@@ -804,6 +806,57 @@ fn production_convert_nibble_lut() -> &'static ConvertNibbleLut {
     LUT.get_or_init(|| build_convert_nibble_lut(super::super::convert_table()))
 }
 
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+unsafe fn lookup8_pair(idx0: __m512i, idx1: __m512i, table: *const u64) -> (__m512i, __m512i) {
+    unsafe {
+        let a = _mm512_load_si512(table as *const __m512i);
+        let b = _mm512_load_si512(table.add(8) as *const __m512i);
+        (
+            _mm512_permutex2var_epi64(a, idx0, b),
+            _mm512_permutex2var_epi64(a, idx1, b),
+        )
+    }
+}
+
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+unsafe fn interleave_aos(los: __m512i, his: __m512i) -> (__m512i, __m512i) {
+    unsafe {
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        (
+            _mm512_permutex2var_epi64(los, idx0, his),
+            _mm512_permutex2var_epi64(los, idx1, his),
+        )
+    }
+}
+
+#[inline]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+unsafe fn extract16(v: __m512i, chunk: usize) -> __m128i {
+    unsafe {
+        match chunk {
+            0 => _mm512_castsi512_si128(v),
+            1 => _mm512_extracti32x4_epi32::<1>(v),
+            2 => _mm512_extracti32x4_epi32::<2>(v),
+            _ => _mm512_extracti32x4_epi32::<3>(v),
+        }
+    }
+}
+
 /// F₂-linear nibble-LUT AB convert. Production `convert[b][v] = γ^b · φ₈(v)`
 /// is F₂-linear in the bits of `v`: `φ₈` is a field homomorphism (AES-GF(256)
 /// addition is XOR) and multiplication by `γ^b` is F₂-linear, so
@@ -840,27 +893,6 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
             &owned
         };
 
-    #[inline(always)]
-    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
-        unsafe {
-            let a = _mm512_load_si512(table as *const __m512i);
-            let b = _mm512_load_si512(table.add(8) as *const __m512i);
-            _mm512_permutex2var_epi64(a, idx, b)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn interleave_aos(los: __m512i, his: __m512i) -> (__m512i, __m512i) {
-        unsafe {
-            let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
-            let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
-            (
-                _mm512_permutex2var_epi64(los, idx0, his),
-                _mm512_permutex2var_epi64(los, idx1, his),
-            )
-        }
-    }
-
     // SAFETY: each 16-byte row load is inside a 64-byte AB row; nibble
     // indices are 0..=15 by AND-0xf so every vpermi2q stays in a 16-entry
     // table half. Eq scaling and partial XOR cover four F128s per store.
@@ -868,41 +900,34 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
         let nibble_mask = _mm512_set1_epi32(0xf);
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         for lane_base in (0..ELL).step_by(16) {
-            let mut los = [_mm512_setzero_si512(); 2];
-            let mut his = [_mm512_setzero_si512(); 2];
+            let mut los0 = _mm512_setzero_si512();
+            let mut his0 = _mm512_setzero_si512();
+            let mut los1 = _mm512_setzero_si512();
+            let mut his1 = _mm512_setzero_si512();
             for b_med in 0..n_b_med {
                 let row_ptr = chunk_ab_bytes[b_med].as_ptr().add(lane_base);
                 let row_bytes = _mm_loadu_si128(row_ptr as *const __m128i);
                 let row = _mm512_cvtepu8_epi32(row_bytes);
                 let n0 = _mm512_and_si512(row, nibble_mask);
                 let n1 = _mm512_and_si512(_mm512_srli_epi32::<4>(row), nibble_mask);
-                for group in 0..2 {
-                    let n0_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
-                    };
-                    let n1_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
-                    };
-                    los[group] = _mm512_xor_si512(
-                        los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
-                    );
-                    his[group] = _mm512_xor_si512(
-                        his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
-                    );
-                }
+
+                let n0_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0));
+                let n1_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1));
+                let n0_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0));
+                let n1_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1));
+
+                let (l0_0, l0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.n0_lo[b_med].as_ptr());
+                let (l1_0, l1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.n1_lo[b_med].as_ptr());
+                los0 = _mm512_ternarylogic_epi64::<0x96>(los0, l0_0, l1_0);
+                los1 = _mm512_ternarylogic_epi64::<0x96>(los1, l0_1, l1_1);
+
+                let (h0_0, h0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.n0_hi[b_med].as_ptr());
+                let (h1_0, h1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.n1_hi[b_med].as_ptr());
+                his0 = _mm512_ternarylogic_epi64::<0x96>(his0, h0_0, h1_0);
+                his1 = _mm512_ternarylogic_epi64::<0x96>(his1, h0_1, h1_1);
             }
+            let los = [los0, los1];
+            let his = [his0, his1];
             for group in 0..2 {
                 let (aos0, aos1) = interleave_aos(los[group], his[group]);
                 let scaled0 = ghash_mul_x4(aos0, eq);
@@ -1082,39 +1107,6 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
     debug_assert_eq!(ELL, 64);
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
 
-    #[inline(always)]
-    unsafe fn lookup8(idx: __m512i, table: *const u64) -> __m512i {
-        unsafe {
-            let a = _mm512_load_si512(table as *const __m512i);
-            let b = _mm512_load_si512(table.add(8) as *const __m512i);
-            _mm512_permutex2var_epi64(a, idx, b)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn interleave_aos(los: __m512i, his: __m512i) -> (__m512i, __m512i) {
-        unsafe {
-            let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
-            let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
-            (
-                _mm512_permutex2var_epi64(los, idx0, his),
-                _mm512_permutex2var_epi64(los, idx1, his),
-            )
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn extract16(v: __m512i, chunk: usize) -> __m128i {
-        unsafe {
-            match chunk {
-                0 => _mm512_castsi512_si128(v),
-                1 => _mm512_extracti32x4_epi32::<1>(v),
-                2 => _mm512_extracti32x4_epi32::<2>(v),
-                _ => _mm512_extracti32x4_epi32::<3>(v),
-            }
-        }
-    }
-
     // SAFETY: each `b_med` load reads a full 64-byte C row (`ELL == 64`);
     // `n_b_med <= 16` bounds the row. Bank bits are the eight C-byte bits.
     // Lo/hi planes reconstruct the same 16-bit subset index the i32 path
@@ -1165,59 +1157,49 @@ pub(crate) unsafe fn accumulate_c_banks_x86_avx512_nibble_prebuilt(
                 let n2 = _mm512_and_si512(hi16, nibble_mask);
                 let n3 = _mm512_and_si512(_mm512_srli_epi32::<4>(hi16), nibble_mask);
 
-                for group in 0..2 {
-                    let n0_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0))
-                    };
-                    let n1_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
-                    };
-                    let n2_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n2))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n2))
-                    };
-                    let n3_8 = if group == 0 {
-                        _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n3))
-                    } else {
-                        _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3))
-                    };
+                let n0_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n0));
+                let n0_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n0));
+                let n1_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n1));
+                let n1_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1));
+                let n2_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n2));
+                let n2_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n2));
+                let n3_8_0 = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(n3));
+                let n3_8_1 = _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n3));
 
-                    let los = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_lo.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_lo.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_lo.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_lo.as_ptr()),
-                        ),
-                    );
-                    let his = _mm512_xor_si512(
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.lo_n0_hi.as_ptr()),
-                            lookup8(n1_8, lut.lo_n1_hi.as_ptr()),
-                        ),
-                        _mm512_xor_si512(
-                            lookup8(n2_8, lut.hi_n0_hi.as_ptr()),
-                            lookup8(n3_8, lut.hi_n1_hi.as_ptr()),
-                        ),
-                    );
-                    let (aos0, aos1) = interleave_aos(los, his);
-                    let partial_ptr = bank.as_mut_ptr().add(lane_base + group * 8) as *mut __m512i;
-                    _mm512_storeu_si512(
-                        partial_ptr,
-                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr), aos0),
-                    );
-                    _mm512_storeu_si512(
-                        partial_ptr.add(1),
-                        _mm512_xor_si512(_mm512_loadu_si512(partial_ptr.add(1)), aos1),
-                    );
-                }
+                let (l0_0, l0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.lo_n0_lo.as_ptr());
+                let (l1_0, l1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.lo_n1_lo.as_ptr());
+                let (l2_0, l2_1) = lookup8_pair(n2_8_0, n2_8_1, lut.hi_n0_lo.as_ptr());
+                let (l3_0, l3_1) = lookup8_pair(n3_8_0, n3_8_1, lut.hi_n1_lo.as_ptr());
+                let los0 =
+                    _mm512_ternarylogic_epi64::<0x96>(l0_0, l1_0, _mm512_xor_si512(l2_0, l3_0));
+                let los1 =
+                    _mm512_ternarylogic_epi64::<0x96>(l0_1, l1_1, _mm512_xor_si512(l2_1, l3_1));
+
+                let (h0_0, h0_1) = lookup8_pair(n0_8_0, n0_8_1, lut.lo_n0_hi.as_ptr());
+                let (h1_0, h1_1) = lookup8_pair(n1_8_0, n1_8_1, lut.lo_n1_hi.as_ptr());
+                let (h2_0, h2_1) = lookup8_pair(n2_8_0, n2_8_1, lut.hi_n0_hi.as_ptr());
+                let (h3_0, h3_1) = lookup8_pair(n3_8_0, n3_8_1, lut.hi_n1_hi.as_ptr());
+                let his0 =
+                    _mm512_ternarylogic_epi64::<0x96>(h0_0, h1_0, _mm512_xor_si512(h2_0, h3_0));
+                let his1 =
+                    _mm512_ternarylogic_epi64::<0x96>(h0_1, h1_1, _mm512_xor_si512(h2_1, h3_1));
+
+                let (aos0_0, aos0_1) = interleave_aos(los0, his0);
+                let (aos1_0, aos1_1) = interleave_aos(los1, his1);
+
+                let p0 = bank.as_mut_ptr().add(lane_base) as *mut __m512i;
+                let p1 = bank.as_mut_ptr().add(lane_base + 8) as *mut __m512i;
+
+                _mm512_storeu_si512(p0, _mm512_xor_si512(_mm512_loadu_si512(p0), aos0_0));
+                _mm512_storeu_si512(
+                    p0.add(1),
+                    _mm512_xor_si512(_mm512_loadu_si512(p0.add(1)), aos0_1),
+                );
+                _mm512_storeu_si512(p1, _mm512_xor_si512(_mm512_loadu_si512(p1), aos1_0));
+                _mm512_storeu_si512(
+                    p1.add(1),
+                    _mm512_xor_si512(_mm512_loadu_si512(p1.add(1)), aos1_1),
+                );
             }
         }
     }
@@ -1641,34 +1623,62 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed_range2<
         for bm in 2..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = if FIRST_WRITE {
+        for k in (0..16).step_by(2) {
+            let p0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let p1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = if FIRST_WRITE {
                 _mm512_setzero_si512()
             } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
+                _mm512_loadu_si512(p0 as *const __m512i)
+            };
+            let mut acc1 = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(p1 as *const __m512i)
             };
             let mut bm = 2;
             while bm + 1 < N {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
+                let r0 = rows[bm];
+                let r1 = rows[bm + 1];
+                let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
+                let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
                     _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
                 );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
                 bm += 2;
             }
             if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                let r = rows[bm];
+                acc0 = _mm512_xor_si512(
+                    acc0,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r,
+                        _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    ),
                 );
-                acc = _mm512_xor_si512(acc, g);
+                acc1 = _mm512_xor_si512(
+                    acc1,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r,
+                        _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                    ),
+                );
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(p0, acc0);
+            _mm512_storeu_si512(p1, acc1);
         }
     }
 }
@@ -1757,30 +1767,54 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         for bm in 0..N {
             rows[bm] = _mm512_loadu_si512(chunk_ab_bytes[bm].as_ptr() as *const __m512i);
         }
-        for k in 0..16 {
-            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+        for k in (0..16).step_by(2) {
+            let p0 = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
+            let p1 = bank_planes.as_mut_ptr().add((k + 1) * ELL) as *mut __m512i;
+            let mut acc0 = _mm512_loadu_si512(p0 as *const __m512i);
+            let mut acc1 = _mm512_loadu_si512(p1 as *const __m512i);
             let mut bm = 0;
             while bm + 1 < N {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
+                let r0 = rows[bm];
+                let r1 = rows[bm + 1];
+                let g0_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm + 1],
+                let g0_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r0,
+                    _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                );
+                let g1_0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
                     _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
                 );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let g1_1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r1,
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k + 1] as i64),
+                );
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0_0, g1_0);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0_1, g1_1);
                 bm += 2;
             }
             if bm < N {
-                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[bm],
-                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                let r = rows[bm];
+                acc0 = _mm512_xor_si512(
+                    acc0,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r,
+                        _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                    ),
                 );
-                acc = _mm512_xor_si512(acc, g);
+                acc1 = _mm512_xor_si512(
+                    acc1,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        r,
+                        _mm512_set1_epi64(mats[bm * 16 + k + 1] as i64),
+                    ),
+                );
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(p0, acc0);
+            _mm512_storeu_si512(p1, acc1);
         }
     }
 }
@@ -1840,60 +1874,90 @@ unsafe fn byte_transpose_8x64<const REV: bool>(
     rows: [core::arch::x86_64::__m512i; 8],
 ) -> [core::arch::x86_64::__m512i; 8] {
     use core::arch::x86_64::*;
+    #[repr(C, align(64))]
+    struct TransposeConsts {
+        t4a: [i64; 8],
+        t4b: [i64; 8],
+        t2a: [i64; 8],
+        t2b: [i64; 8],
+        t1a: [i64; 8],
+        t1b: [i64; 8],
+        idx: [i8; 64],
+        idx_rev: [i8; 64],
+    }
     #[rustfmt::skip]
-    const IDX: [i8; 64] = [
-         0,  8, 16, 24, 32, 40, 48, 56,
-         1,  9, 17, 25, 33, 41, 49, 57,
-         2, 10, 18, 26, 34, 42, 50, 58,
-         3, 11, 19, 27, 35, 43, 51, 59,
-         4, 12, 20, 28, 36, 44, 52, 60,
-         5, 13, 21, 29, 37, 45, 53, 61,
-         6, 14, 22, 30, 38, 46, 54, 62,
-         7, 15, 23, 31, 39, 47, 55, 63,
-    ];
-    #[rustfmt::skip]
-    const IDX_REV: [i8; 64] = [
-        56, 48, 40, 32, 24, 16,  8,  0,
-        57, 49, 41, 33, 25, 17,  9,  1,
-        58, 50, 42, 34, 26, 18, 10,  2,
-        59, 51, 43, 35, 27, 19, 11,  3,
-        60, 52, 44, 36, 28, 20, 12,  4,
-        61, 53, 45, 37, 29, 21, 13,  5,
-        62, 54, 46, 38, 30, 22, 14,  6,
-        63, 55, 47, 39, 31, 23, 15,  7,
-    ];
-    const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
-    const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
-    const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
-    const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
-    const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
-    const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
+    static CONSTS: TransposeConsts = TransposeConsts {
+        t4a: [0, 1, 2, 3, 8, 9, 10, 11],
+        t4b: [4, 5, 6, 7, 12, 13, 14, 15],
+        t2a: [0, 1, 8, 9, 4, 5, 12, 13],
+        t2b: [2, 3, 10, 11, 6, 7, 14, 15],
+        t1a: [0, 8, 2, 10, 4, 12, 6, 14],
+        t1b: [1, 9, 3, 11, 5, 13, 7, 15],
+        idx: [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50,
+            58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37,
+            45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ],
+        idx_rev: [
+            56, 48, 40, 32, 24, 16, 8, 0, 57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18,
+            10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36, 28, 20, 12, 4, 61, 53, 45, 37,
+            29, 21, 13, 5, 62, 54, 46, 38, 30, 22, 14, 6, 63, 55, 47, 39, 31, 23, 15, 7,
+        ],
+    };
 
     // SAFETY: only register-to-register shuffles plus loads of the fixed
     // 64-byte index constants; the cfg gate supplies the target features.
     unsafe {
-        let mut cur = rows;
-        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
-            let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
-            let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
-            let mut next = [_mm512_setzero_si512(); 8];
-            for r in 0..8usize {
-                if r & d == 0 {
-                    let x = cur[r];
-                    let y = cur[r | d];
-                    next[r] = _mm512_permutex2var_epi64(x, ia, y);
-                    next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
-                }
-            }
-            cur = next;
-        }
-        let table = if REV { IDX_REV.as_ptr() } else { IDX.as_ptr() };
-        let idx = _mm512_loadu_si512(table as *const __m512i);
-        let mut out = [_mm512_setzero_si512(); 8];
-        for k in 0..8usize {
-            out[k] = _mm512_permutexvar_epi8(idx, cur[k]);
-        }
-        out
+        let t4a = _mm512_load_si512(CONSTS.t4a.as_ptr() as *const __m512i);
+        let t4b = _mm512_load_si512(CONSTS.t4b.as_ptr() as *const __m512i);
+        let t2a = _mm512_load_si512(CONSTS.t2a.as_ptr() as *const __m512i);
+        let t2b = _mm512_load_si512(CONSTS.t2b.as_ptr() as *const __m512i);
+        let t1a = _mm512_load_si512(CONSTS.t1a.as_ptr() as *const __m512i);
+        let t1b = _mm512_load_si512(CONSTS.t1b.as_ptr() as *const __m512i);
+
+        let r0 = _mm512_permutex2var_epi64(rows[0], t4a, rows[4]);
+        let r4 = _mm512_permutex2var_epi64(rows[0], t4b, rows[4]);
+        let r1 = _mm512_permutex2var_epi64(rows[1], t4a, rows[5]);
+        let r5 = _mm512_permutex2var_epi64(rows[1], t4b, rows[5]);
+        let r2 = _mm512_permutex2var_epi64(rows[2], t4a, rows[6]);
+        let r6 = _mm512_permutex2var_epi64(rows[2], t4b, rows[6]);
+        let r3 = _mm512_permutex2var_epi64(rows[3], t4a, rows[7]);
+        let r7 = _mm512_permutex2var_epi64(rows[3], t4b, rows[7]);
+
+        let s0 = _mm512_permutex2var_epi64(r0, t2a, r2);
+        let s2 = _mm512_permutex2var_epi64(r0, t2b, r2);
+        let s1 = _mm512_permutex2var_epi64(r1, t2a, r3);
+        let s3 = _mm512_permutex2var_epi64(r1, t2b, r3);
+        let s4 = _mm512_permutex2var_epi64(r4, t2a, r6);
+        let s6 = _mm512_permutex2var_epi64(r4, t2b, r6);
+        let s5 = _mm512_permutex2var_epi64(r5, t2a, r7);
+        let s7 = _mm512_permutex2var_epi64(r5, t2b, r7);
+
+        let u0 = _mm512_permutex2var_epi64(s0, t1a, s1);
+        let u1 = _mm512_permutex2var_epi64(s0, t1b, s1);
+        let u2 = _mm512_permutex2var_epi64(s2, t1a, s3);
+        let u3 = _mm512_permutex2var_epi64(s2, t1b, s3);
+        let u4 = _mm512_permutex2var_epi64(s4, t1a, s5);
+        let u5 = _mm512_permutex2var_epi64(s4, t1b, s5);
+        let u6 = _mm512_permutex2var_epi64(s6, t1a, s7);
+        let u7 = _mm512_permutex2var_epi64(s6, t1b, s7);
+
+        let idx = if REV {
+            _mm512_load_si512(CONSTS.idx_rev.as_ptr() as *const __m512i)
+        } else {
+            _mm512_load_si512(CONSTS.idx.as_ptr() as *const __m512i)
+        };
+
+        [
+            _mm512_permutexvar_epi8(idx, u0),
+            _mm512_permutexvar_epi8(idx, u1),
+            _mm512_permutexvar_epi8(idx, u2),
+            _mm512_permutexvar_epi8(idx, u3),
+            _mm512_permutexvar_epi8(idx, u4),
+            _mm512_permutexvar_epi8(idx, u5),
+            _mm512_permutexvar_epi8(idx, u6),
+            _mm512_permutexvar_epi8(idx, u7),
+        ]
     }
 }
 
@@ -2077,24 +2141,44 @@ unsafe fn accumulate_c_banks_fold4_fused_x86_gfni_impl<const FIRST_WRITE: bool>(
             }
             // One VGF2P8AFFINEQB per (mask half, output byte plane); both
             // halves fold into the plane with one vpternlogq (0x96 = a^b^c).
-            for plane in 0..16usize {
-                let m_lo = _mm512_set1_epi64(mats[plane] as i64);
-                let m_hi = _mm512_set1_epi64(mats[16 + plane] as i64);
+            for plane in (0..16usize).step_by(2) {
+                let m_lo0 = _mm512_set1_epi64(mats[plane] as i64);
+                let m_hi0 = _mm512_set1_epi64(mats[16 + plane] as i64);
+                let m_lo1 = _mm512_set1_epi64(mats[plane + 1] as i64);
+                let m_hi1 = _mm512_set1_epi64(mats[16 + plane + 1] as i64);
                 for bank in 0..N_C_BANKS {
-                    let g_lo = _mm512_gf2p8affine_epi64_epi8::<0>(masks[0][bank], m_lo);
-                    let g_hi = _mm512_gf2p8affine_epi64_epi8::<0>(masks[1][bank], m_hi);
-                    let ptr =
+                    let m0 = masks[0][bank];
+                    let m1 = masks[1][bank];
+                    let g_lo0 = _mm512_gf2p8affine_epi64_epi8::<0>(m0, m_lo0);
+                    let g_hi0 = _mm512_gf2p8affine_epi64_epi8::<0>(m1, m_hi0);
+                    let g_lo1 = _mm512_gf2p8affine_epi64_epi8::<0>(m0, m_lo1);
+                    let g_hi1 = _mm512_gf2p8affine_epi64_epi8::<0>(m1, m_hi1);
+                    let ptr0 =
                         planes.add(((q * N_C_BANKS + bank) * 16 + plane) * ELL) as *mut __m512i;
+                    let ptr1 =
+                        planes.add(((q * N_C_BANKS + bank) * 16 + plane + 1) * ELL) as *mut __m512i;
                     _mm512_storeu_si512(
-                        ptr,
+                        ptr0,
                         _mm512_ternarylogic_epi64::<0x96>(
                             if FIRST_WRITE {
                                 _mm512_setzero_si512()
                             } else {
-                                _mm512_loadu_si512(ptr as *const __m512i)
+                                _mm512_loadu_si512(ptr0 as *const __m512i)
                             },
-                            g_lo,
-                            g_hi,
+                            g_lo0,
+                            g_hi0,
+                        ),
+                    );
+                    _mm512_storeu_si512(
+                        ptr1,
+                        _mm512_ternarylogic_epi64::<0x96>(
+                            if FIRST_WRITE {
+                                _mm512_setzero_si512()
+                            } else {
+                                _mm512_loadu_si512(ptr1 as *const __m512i)
+                            },
+                            g_lo1,
+                            g_hi1,
                         ),
                     );
                 }

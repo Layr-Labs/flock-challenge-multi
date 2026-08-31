@@ -624,16 +624,18 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     } else {
         None
     };
-    let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
-        z_packed,
-        &prover_data,
-        &commitment,
-        &[ab.clone(), c.clone()],
-        &[pre_ab, pre_c],
-        &padding,
-        &lig_config,
-        challenger,
-    ));
+    let pcs_open = flock_core::in_pool(|| {
+        open_claims_with_precomputed_ligerito(
+            z_packed,
+            &prover_data,
+            &commitment,
+            &[ab.clone(), c.clone()],
+            &[pre_ab, pre_c],
+            &padding,
+            &lig_config,
+            challenger,
+        )
+    });
     if let Some(handle) = stash {
         // Finished long ago (µs vs the ~20 ms open); join keeps the thread
         // from outliving the prove.
@@ -928,8 +930,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || flock_core::in_pool(|| {
+    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        flock_core::in_pool(|| {
             flock_core::gaptime::mark("zerocheck: pool entered");
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
@@ -964,7 +966,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         };
             flock_core::gaptime::mark("zerocheck: work done");
             r
-        }));
+        })
+    });
     flock_core::gaptime::mark("zerocheck: pool exited");
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
