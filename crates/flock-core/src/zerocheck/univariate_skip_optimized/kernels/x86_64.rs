@@ -1470,13 +1470,13 @@ mod tests {
                     &mut dynamic,
                 );
                 if n_b_med == 15 {
-                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<15, false>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
                     );
                 } else {
-                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(
+                    accumulate_convert_ab_nomul_x86_gfni_fixed::<16, false>(
                         &chunk_ab_bytes,
                         &mats,
                         &mut fixed,
@@ -1541,15 +1541,38 @@ pub(crate) unsafe fn write_convert_ab_nomul_x86_gfni(
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
 ) {
-    // SAFETY: forwarded unchanged to the shared target-feature body; the
-    // caller's write-before-read proof permits the overwrite specialization.
+    // SAFETY: each callee has this entry point's fixed-array and feature
+    // contract. Ranked 15/16 use the same const-N body as accumulate, with
+    // FIRST_WRITE so the first visit does not load dead planes. Counts
+    // outside that pair keep the generic first-write impl.
     unsafe {
-        accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
-            chunk_ab_bytes,
-            n_b_med,
-            mats,
-            bank_planes,
-        );
+        if !r1_ab_write_fixed_enabled() {
+            accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            );
+            return;
+        }
+        match n_b_med {
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16, true>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            _ => accumulate_convert_ab_nomul_x86_gfni_impl::<true>(
+                chunk_ab_bytes,
+                n_b_med,
+                mats,
+                bank_planes,
+            ),
+        }
     }
 }
 
@@ -1732,9 +1755,27 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
     }
 }
 
+/// Ranked first-write 15/16 uses the same const-N GFNI body as accumulate.
+/// `FLOCK_NO_R1_AB_WRITE_FIXED=1` restores the generic first-write impl.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+fn r1_ab_write_fixed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none()
+    });
+    *ON
+}
+
 /// Ranked fixed-row body. BLAKE3's two padding classes contain exactly
 /// fifteen and sixteen live medium rows; making that count a monomorphized
 /// constant removes LLVM's per-plane bounds ladder from the GFNI battery.
+/// `FIRST_WRITE` starts each plane from a zero register instead of loading
+/// dead bytes — the same split range2 already uses.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1743,7 +1784,7 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,gfni")]
-unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
+unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize, const FIRST_WRITE: bool>(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     mats: &[u64; 256],
     bank_planes: &mut [u8; 16 * ELL],
@@ -1759,7 +1800,11 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_fixed<const N: usize>(
         }
         for k in 0..16 {
             let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL) as *mut __m512i;
-            let mut acc = _mm512_loadu_si512(plane_ptr as *const __m512i);
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
             let mut bm = 0;
             while bm + 1 < N {
                 let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -1803,12 +1848,16 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     // contract. Counts outside the ranked pair retain the incumbent body.
     unsafe {
         match n_b_med {
-            15 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<15>(chunk_ab_bytes, mats, bank_planes)
-            }
-            16 => {
-                accumulate_convert_ab_nomul_x86_gfni_fixed::<16>(chunk_ab_bytes, mats, bank_planes)
-            }
+            15 => accumulate_convert_ab_nomul_x86_gfni_fixed::<15, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
+            16 => accumulate_convert_ab_nomul_x86_gfni_fixed::<16, false>(
+                chunk_ab_bytes,
+                mats,
+                bank_planes,
+            ),
             _ => accumulate_convert_ab_nomul_x86_gfni_dynamic(
                 chunk_ab_bytes,
                 n_b_med,
