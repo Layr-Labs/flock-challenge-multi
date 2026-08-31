@@ -362,6 +362,21 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
 }
 
+/// `FLOCK_NO_LC_GFNI_SHARE_MATS=1` restores the per-block matrix broadcast
+/// nest. Default: a two-block tile (the ranked grouped arm's 128-bit chunk)
+/// broadcasts each of the 128 stripe×plane matrices once and applies that
+/// operand to both 64-column blocks. Same affine products, same XOR
+/// association, same stores.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lc_gfni_share_mats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_GFNI_SHARE_MATS").is_none())
+}
+
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
@@ -394,6 +409,45 @@ pub(crate) unsafe fn gfni_fold_tile(
     use core::arch::x86_64::*;
     // SAFETY: caller upholds the pointer/length contract above.
     unsafe {
+        // Ranked grouped visits pass `n_blocks64 = 2` (a full 128-bit chunk).
+        // Both blocks use the same 128 matrices; broadcasting each qword
+        // twice was duplicate p5 work. One broadcast feeds both affine
+        // products. The ragged last chunk stays on the one-block nest.
+        if n_blocks64 == 2 && lc_gfni_share_mats_enabled() {
+            let rows0: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride) as *const __m512i)
+            });
+            let rows1: [__m512i; 8] = core::array::from_fn(|t| {
+                _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + 64) as *const __m512i)
+            });
+            for byte_k in 0..16 {
+                let plane0 = out_planes_ptr.add(byte_k * 64) as *mut __m512i;
+                let plane1 = out_planes_ptr.add(1024 + byte_k * 64) as *mut __m512i;
+                let mut acc0 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane0 as *const __m512i)
+                };
+                let mut acc1 = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane1 as *const __m512i)
+                };
+                for t in (0..8).step_by(2) {
+                    let m0 = _mm512_set1_epi64(mats[t * 16 + byte_k] as i64);
+                    let m1 = _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64);
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t], m0);
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(rows0[t + 1], m1);
+                    acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0, g1);
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t], m0);
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(rows1[t + 1], m1);
+                    acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, g0, g1);
+                }
+                _mm512_storeu_si512(plane0, acc0);
+                _mm512_storeu_si512(plane1, acc1);
+            }
+            return;
+        }
         for block in 0..n_blocks64 {
             let bs = block * 64;
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
