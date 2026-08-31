@@ -111,6 +111,13 @@ pub const K: usize = 1 << K_LOG;
 /// Univariate-skip dim — must match [`flock_core::zerocheck::K_SKIP`].
 pub const K_SKIP: usize = 6;
 
+#[inline]
+fn witgen_urm_share_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_URM_SHARE").is_none());
+    *ON
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -1012,6 +1019,111 @@ fn adjoint_plan_arms(r1cs: &BlockR1cs) -> bool {
         && lc_adjoint_enabled()
 }
 
+/// Inject `alpha * eq[r]` and `eq[r]` at the A/B adjoint roots with four-wide
+/// split AVX-512 GHASH. The scalar `alpha` and its `x^64` companion are
+/// materialized once for the whole live row prefix.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq` must be available. Let `round4` be `n_rows`
+/// rounded up to four: both root slices and `eq_inner` must contain at least
+/// `round4` entries, padded roots in `n_rows..round4` must equal `ADJ_ZERO`,
+/// every root must index `acc`, and the slices must not alias `acc`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq,sse4.1")]
+unsafe fn inject_alpha_e_x4(
+    acc: &mut [F128],
+    a_roots: &[u32],
+    b_roots: &[u32],
+    n_rows: usize,
+    alpha: F128,
+    eq_inner: &[F128],
+) {
+    use flock_core::field::gf2_128::x86_64::{
+        f128x4_extract, f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
+        ghash_mul_x4_split_unroll4,
+    };
+
+    let round4 = (n_rows + 3) & !3;
+    assert!(round4 <= eq_inner.len());
+    assert!(round4 <= a_roots.len());
+    assert!(round4 <= b_roots.len());
+    assert!(a_roots[n_rows..round4].iter().all(|&root| root == ADJ_ZERO));
+    assert!(b_roots[n_rows..round4].iter().all(|&root| root == ADJ_ZERO));
+
+    // SAFETY: checked slice extents cover every four-lane load. Root validity
+    // and non-aliasing are invariants of Blake3AdjointPlan::build and this
+    // helper's contract; target features are declared above.
+    unsafe {
+        let (t, t_x64) = ghash_broadcast_split(alpha);
+        let accp = acc.as_mut_ptr();
+        let ap = a_roots.as_ptr();
+        let bp = b_roots.as_ptr();
+        let eqp = eq_inner.as_ptr();
+
+        macro_rules! scatter4 {
+            ($r:expr, $ea:expr) => {{
+                let r = $r;
+                let ea4 = f128x4_extract($ea);
+                *accp.add(*ap.add(r) as usize) += ea4[0];
+                *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                *accp.add(*ap.add(r + 1) as usize) += ea4[1];
+                *accp.add(*bp.add(r + 1) as usize) += *eqp.add(r + 1);
+                *accp.add(*ap.add(r + 2) as usize) += ea4[2];
+                *accp.add(*bp.add(r + 2) as usize) += *eqp.add(r + 2);
+                *accp.add(*ap.add(r + 3) as usize) += ea4[3];
+                *accp.add(*bp.add(r + 3) as usize) += *eqp.add(r + 3);
+            }};
+        }
+
+        const WIDTH: usize = 4;
+        const UNROLL: usize = 4;
+        const SPAN: usize = WIDTH * UNROLL;
+        let unroll_end = round4 & !(SPAN - 1);
+        let mut r = 0usize;
+
+        if unroll_end >= SPAN {
+            let mut e0 = f128x4_loadu(eqp);
+            let mut e1 = f128x4_loadu(eqp.add(4));
+            let mut e2 = f128x4_loadu(eqp.add(8));
+            let mut e3 = f128x4_loadu(eqp.add(12));
+            let (mut p0, mut p1, mut p2, mut p3) =
+                ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+            r = SPAN;
+            while r < unroll_end {
+                e0 = f128x4_loadu(eqp.add(r));
+                e1 = f128x4_loadu(eqp.add(r + 4));
+                e2 = f128x4_loadu(eqp.add(r + 8));
+                e3 = f128x4_loadu(eqp.add(r + 12));
+                let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                scatter4!(r - SPAN, p0);
+                scatter4!(r - SPAN + 4, p1);
+                scatter4!(r - SPAN + 8, p2);
+                scatter4!(r - SPAN + 12, p3);
+                p0 = next.0;
+                p1 = next.1;
+                p2 = next.2;
+                p3 = next.3;
+                r += SPAN;
+            }
+            scatter4!(unroll_end - SPAN, p0);
+            scatter4!(unroll_end - SPAN + 4, p1);
+            scatter4!(unroll_end - SPAN + 8, p2);
+            scatter4!(unroll_end - SPAN + 12, p3);
+        }
+
+        while r < round4 {
+            let e = f128x4_loadu(eqp.add(r));
+            let product = ghash_mul_x4_split(e, t, t_x64);
+            scatter4!(r, product);
+            r += WIDTH;
+        }
+    }
+}
+
 impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     fn n_cols(&self) -> usize {
         K
@@ -1028,6 +1140,29 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
         // so empty rows need no branch.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: build creates K roots, every root is below n_nodes, and all
+        // entries after n_rows are ADJ_ZERO. eq_inner has length K above.
+        unsafe {
+            inject_alpha_e_x4(
+                &mut acc,
+                &self.a_roots,
+                &self.b_roots,
+                self.n_rows,
+                alpha,
+                eq_inner,
+            );
+        }
+
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         for r in 0..self.n_rows {
             let e = eq_inner[r];
             let ea = alpha * e;
@@ -1910,13 +2045,62 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
-    let mut ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
-        n_total * BYTES_PER_BLOCK,
-    );
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let ranked_compact = {
+        // Compact storage is valid only when this exact prove selects the
+        // ranked-static drain. Cold/provenance-miss drains still project rows
+        // 0, 1 and 31 even though the downstream ranked consumer ignores
+        // them, so those runs retain the dense allocation. The plan check
+        // mirrors `build_octa_witness_ab_stream_elide`'s second half of the
+        // `ranked_static` brand, including its same-binary offsets rollback.
+        let elide_on = witgen_simd::const_elide_enabled();
+        let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+        let ranked_static = z_tok && elide_on && a_tok && ab_elide && b_tok && ab_elide;
+        let ranked_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                inv_table,
+                &[],
+                false,
+            );
+        use_simd
+            && !use_nt
+            && n_total >= 8
+            && ab_nt
+            && witgen_simd::witgen_ab_winstream_enabled()
+            && skip_blocks == 0
+            && n_total == 1 << 18
+            && ranked_static
+            && ranked_plan.offsets_eligible(2)
+            && blake3_witgen8::ey_dead_w31_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::pcs::ranked_direct_fold8_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled()
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let ranked_compact = false;
+    let mut ab_inner = if ranked_compact {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    } else {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    };
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2160,12 +2344,19 @@ fn generate_round1_inner_octa(
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
+    const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
-    let group_bytes = GROUP * BYTES_PER_BLOCK;
+    let compact = ab_inner.ranked_compact();
+    let ab_block_bytes = if compact {
+        COMPACT_BYTES_PER_BLOCK
+    } else {
+        BYTES_PER_BLOCK
+    };
+    let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
     let one_rows_elided = ab_stream
@@ -2176,6 +2367,7 @@ fn generate_round1_inner_octa(
     if one_rows_elided {
         ab_inner.set_ranked_one_rows_elided();
     }
+    assert!(!compact || one_rows_elided);
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2288,7 +2480,11 @@ fn generate_round1_inner_octa(
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
                                 stage: st,
-                                out: ab_out.as_mut_ptr().add(half * SIMD * BYTES_PER_BLOCK),
+                                out: ab_out
+                                    .as_mut_ptr()
+                                    .add(half * SIMD * ab_block_bytes),
+                                out_stride: ab_block_bytes,
+                                out_bias: if compact { 2 * 64 } else { 0 },
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
@@ -2338,6 +2534,7 @@ fn generate_round1_inner_octa(
                 } else {
                     0
                 };
+                assert!(!compact || j0 == n_here);
                 for j in j0..n_here {
                     let block_idx = GROUP * g + j;
                     if block_idx >= skip_blocks {
