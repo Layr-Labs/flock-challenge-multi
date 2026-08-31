@@ -16,6 +16,7 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//! Candidate archive marker F; no runtime interface is changed.
 
 pub mod bits;
 pub mod challenger;
