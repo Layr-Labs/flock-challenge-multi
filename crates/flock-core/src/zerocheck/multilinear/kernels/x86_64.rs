@@ -237,8 +237,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                 B_SPECIAL_ONES,
             ),
             (false, true) => (
-                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block)
-                    & (B_ONES_BLOCK_PAIRS - 1),
+                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block) & (B_ONES_BLOCK_PAIRS - 1),
                 B_SPECIAL_SPARSE,
             ),
             (false, false) => (usize::MAX, B_SPECIAL_NONE),
@@ -541,21 +540,18 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
                                 (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                                 )
                             } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
+                                (
+                                    ghash_mul_x4(w, a1),
+                                    ghash_mul_x4(w, a2),
+                                    ghash_mul_x4(w, a3),
+                                )
                             }
                         };
                         #[cfg(test)]
@@ -583,19 +579,14 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
                             let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                         } else {
                             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                             } else {
                                 ghash_mul_x4(w, b0_lane0)
                             }
@@ -644,18 +635,23 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool>(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
@@ -1116,18 +1112,23 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
@@ -1392,9 +1393,8 @@ fn zc_b_sparse_enabled() -> bool {
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline]
 fn zc_b_canonical_prefold_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
-    });
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none());
     *ENABLED
 }
 
@@ -1803,7 +1803,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 {
                     // `4·xg` is the tile's global row start (output x ← rows
                     // 4x..4x+4), so its block position decides the dead lines.
-                // `prefold_dead_line_mask_gated` is opt-in behind
+                    // `prefold_dead_line_mask_gated` is opt-in behind
                     // `FLOCK_PREFOLD_ROW_SKIP=1`; the ranked runner starts the
                     // worker with a cleared environment, so the gate is off and
                     // the mask is a constant 0 on every one of the ~2.1 M leaf
@@ -2046,18 +2046,23 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     )
                 }
             };
-            acc[0].mul_acc(a1w, b1);
-            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-            acc[2].mul_acc(a3w, b3);
-            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-            acc[4].mul_acc(a2w, b2);
+            let a01w = _mm512_xor_si512(a0w, a1w);
+            let b01 = _mm512_xor_si512(b0, b1);
+            let a23w = _mm512_xor_si512(a2w, a3w);
+            let b23 = _mm512_xor_si512(b2, b3);
             let e_aw = _mm512_xor_si512(a0w, a2w);
             let e_b = _mm512_xor_si512(b0, b2);
             let o_aw = _mm512_xor_si512(a1w, a3w);
             let o_b = _mm512_xor_si512(b1, b3);
+
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(a01w, b01);
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(a23w, b23);
+            acc[4].mul_acc(a2w, b2);
             acc[5].mul_acc(e_aw, e_b);
             acc[6].mul_acc(o_aw, o_b);
-            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            acc[7].mul_acc(_mm512_xor_si512(a01w, a23w), _mm512_xor_si512(b01, b23));
             x_lo += 8;
         }
 
