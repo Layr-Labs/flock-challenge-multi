@@ -1470,6 +1470,16 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
 /// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
+/// Ranked default: the 7-coordinate s_hat_v fold8 bind uses the existing
+/// 4-lane `bind_split_half` leaf (broadcast-r 5-CLMUL split product).
+/// `FLOCK_NO_SHAT_FOLD8_BIND=1` restores the incumbent per-element rayon
+/// scalar loop. Same bytes: `even + r*(even+odd)`.
+fn shat_fold8_bind_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SHAT_FOLD8_BIND").is_none());
+    *ON
+}
+
 pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -1493,6 +1503,11 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
+        if shat_fold8_bind_x4_enabled() {
+            let mut out = z0.to_vec();
+            crate::field::f128_slice::bind_split_half(&mut out, z1, r);
+            return out;
+        }
         let mut out = vec![F128::ZERO; half];
         out.par_iter_mut()
             .zip(z0.par_iter())
