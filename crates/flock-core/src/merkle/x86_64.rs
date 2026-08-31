@@ -11,19 +11,13 @@ unsafe fn schedule(v0: __m128i, v1: __m128i, v2: __m128i, v3: __m128i) -> __m128
 }
 
 #[inline(always)]
-unsafe fn rounds4(
+unsafe fn rounds4<const GROUP: usize>(
     abef: &mut [__m128i; 4],
     cdgh: &mut [__m128i; 4],
     words: &[__m128i; 4],
-    group: usize,
 ) {
     unsafe {
-        let k = _mm_set_epi32(
-            SHA256_K[4 * group + 3] as i32,
-            SHA256_K[4 * group + 2] as i32,
-            SHA256_K[4 * group + 1] as i32,
-            SHA256_K[4 * group] as i32,
-        );
+        let k = _mm_loadu_si128(SHA256_K.as_ptr().add(4 * GROUP).cast::<__m128i>());
         for stream in 0..4 {
             let wk = _mm_add_epi32(words[stream], k);
             cdgh[stream] = _mm_sha256rnds2_epu32(cdgh[stream], abef[stream], wk);
@@ -65,14 +59,14 @@ unsafe fn compress4(abef: &mut [__m128i; 4], cdgh: &mut [__m128i; 4], blocks: [*
                 for stream in 0..4 {
                     $dst[stream] = schedule($dst[stream], $v1[stream], $v2[stream], $v3[stream]);
                 }
-                rounds4(abef, cdgh, &$dst, $group);
+                rounds4::<$group>(abef, cdgh, &$dst);
             }};
         }
 
-        rounds4(abef, cdgh, &w0, 0);
-        rounds4(abef, cdgh, &w1, 1);
-        rounds4(abef, cdgh, &w2, 2);
-        rounds4(abef, cdgh, &w3, 3);
+        rounds4::<0>(abef, cdgh, &w0);
+        rounds4::<1>(abef, cdgh, &w1);
+        rounds4::<2>(abef, cdgh, &w2);
+        rounds4::<3>(abef, cdgh, &w3);
         schedule_rounds4!(w0, w1, w2, w3, 4);
         schedule_rounds4!(w1, w2, w3, w0, 5);
         schedule_rounds4!(w2, w3, w0, w1, 6);
@@ -85,7 +79,6 @@ unsafe fn compress4(abef: &mut [__m128i; 4], cdgh: &mut [__m128i; 4], blocks: [*
         schedule_rounds4!(w1, w2, w3, w0, 13);
         schedule_rounds4!(w2, w3, w0, w1, 14);
         schedule_rounds4!(w3, w0, w1, w2, 15);
-
         for stream in 0..4 {
             abef[stream] = _mm_add_epi32(abef[stream], abef_saved[stream]);
             cdgh[stream] = _mm_add_epi32(cdgh[stream], cdgh_saved[stream]);
