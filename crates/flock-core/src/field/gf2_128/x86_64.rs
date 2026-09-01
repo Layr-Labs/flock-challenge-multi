@@ -282,9 +282,10 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        let shifted = _mm512_bslli_epi128::<8>(t1);
+        let carry = _mm512_clmulepi64_epi128::<0x01>(t1, poly);
+        // 0x96 = a ^ b ^ c. Fuse the reduction's two XORs.
+        _mm512_ternarylogic_epi64::<0x96>(t0, shifted, carry)
     }
 }
 
