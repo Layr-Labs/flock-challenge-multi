@@ -378,8 +378,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
                 // tiles. Feeding the constant in directly drops the per-tile
                 // `OnceLock` acquire load and the eight-bit mask build, and
                 // lets the fold kernels take their unpredicated line path.
-                let dead = 0u8;
-                let _ = (pair_in_block_mask, useful_pairs_inclusive);
+                let dead = prefold_dead_line_mask_gated(
+                    g0,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
                 if tr_bcast {
                     // Baked route: A rows leave the prefold already scaled by
                     // their broadcast-octet weight `S(i)`, B rows by this
@@ -2131,8 +2134,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     // tiles. Feeding the constant in directly drops the per-tile
                     // `OnceLock` acquire load and the eight-bit mask build, and
                     // lets the fold kernels take their unpredicated line path.
-                    let dead = 0u8;
-                    let _ = (pair_in_block_mask, useful_pairs_inclusive);
+                    let dead = prefold_dead_line_mask_gated(
+                        4 * xg,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
                     if use_c4 {
                         let c = cfold.unwrap();
                         if c4_bcast {

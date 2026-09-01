@@ -242,7 +242,9 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
 ))]
 #[inline]
 fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
-    sha256x4::hash4_equal_len(inputs, outs);
+    unsafe {
+        sha256x4::hash4_equal_len(inputs, outs);
+    }
 }
 
 #[cfg(not(any(
@@ -519,8 +521,22 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
     match kind {
         HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
         HashKind::Sha256 => {
-            for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
-                *o = Sha256::digest(children).into();
+            for (outs, children_chunk) in write.chunks_mut(4).zip(read_bytes.chunks(4 * 64)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children_chunk[..64],
+                            &children_chunk[64..128],
+                            &children_chunk[128..192],
+                            &children_chunk[192..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (o, children) in outs.iter_mut().zip(children_chunk.chunks(64)) {
+                        *o = Sha256::digest(children).into();
+                    }
+                }
             }
         }
     }
