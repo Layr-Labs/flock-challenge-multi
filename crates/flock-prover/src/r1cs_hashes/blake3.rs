@@ -2525,7 +2525,8 @@ fn generate_round1_inner_octa(
     let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
-    let one_rows_elided = ab_stream
+    let one_rows_elided = cfg!(target_feature = "avx512f")
+        && ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
@@ -2565,13 +2566,23 @@ fn generate_round1_inner_octa(
                 // the dump writes every window byte before the projection
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
+                // `build_octa_witness_ab_stream_elide` consumes a `StreamProj`
+                // unconditionally, so a staging region must exist on EVERY
+                // arm — including `!ab_stream`, where the old code built the
+                // projection from a `None` pointer via `unwrap_unchecked`
+                // and the kernel then wrote through it (reproducible
+                // SIGSEGV in `round1_inner_ab_nt_fused_matches_kill_switch`
+                // on non-AVX-512 hosts). The window side keeps the front of
+                // the allocation so `win_ab`'s geometry is untouched; the
+                // staging tail is appended.
+                let win_lines = if ab_stream {
+                    0
                 } else if ab_nt {
                     WIN_LINES
                 } else {
                     0
                 };
+                let want = win_lines + STAGE_LINES;
                 if want != 0 {
                     v.reserve_exact(want);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
@@ -2586,18 +2597,24 @@ fn generate_round1_inner_octa(
                 // allocation: `[a windows | b windows]`, each 8 blocks of
                 // U32_PER_BLOCK words in the same row-major geometry as a/b.
                 let win_ab = if ab_nt && !ab_stream {
-                    debug_assert_eq!(win.len(), WIN_LINES);
+                    debug_assert_eq!(win.len(), WIN_LINES + STAGE_LINES);
                     let wa = win.as_mut_ptr().cast::<u32>();
-                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s in its
+                    // WIN_LINES prefix (the staging tail is disjoint).
                     Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
                 } else {
                     None
                 };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
-                } else {
-                    None
+                let stage = {
+                    // Mirrors the init closure's split: window prefix (only
+                    // when the fused non-streaming arm needs one) then the
+                    // STAGE_LINES staging tail.
+                    let win_lines = if !ab_stream && ab_nt { WIN_LINES } else { 0 };
+                    debug_assert_eq!(win.len(), win_lines + STAGE_LINES);
+                    // SAFETY: the init reserved `win_lines + STAGE_LINES`
+                    // lines, so the staging tail is in bounds and disjoint
+                    // from the window prefix that `win_ab` hands out.
+                    unsafe { win.as_mut_ptr().add(win_lines).cast::<u32>() }
                 };
                 // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
                 // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
@@ -2643,19 +2660,17 @@ fn generate_round1_inner_octa(
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out
-                                    .as_mut_ptr()
-                                    .add(half * SIMD * ab_block_bytes),
-                                out_stride: ab_block_bytes,
-                                out_bias: if compact { 2 * 64 } else { 0 },
-                                inv_table,
-                                plan: win_plan,
-                                one_rows_elided,
-                            }
-                        }).unwrap_unchecked();
+                        let proj = blake3_witgen8::StreamProj {
+                            stage,
+                            out: ab_out
+                                .as_mut_ptr()
+                                .add(half * SIMD * ab_block_bytes),
+                            out_stride: ab_block_bytes,
+                            out_bias: if compact { 2 * 64 } else { 0 },
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided,
+                        };
                         blake3_witgen8::build_octa_witness_ab_stream_elide(
                             octa,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2695,7 +2710,10 @@ fn generate_round1_inner_octa(
                 // the dump loop above could not cover (unreachable at every
                 // power-of-two shape ≥ 8; kept so the two arms stay observably
                 // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
+                // `stage` is now always a valid pointer, so the old
+                // `stage.is_some()` test is replaced by the condition it stood
+                // for: the streaming arm ran iff `ab_stream`.
+                let j0 = if win_ab.is_some() || ab_stream {
                     (n_here / SIMD) * SIMD
                 } else {
                     0
