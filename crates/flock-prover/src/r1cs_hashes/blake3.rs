@@ -1012,6 +1012,23 @@ fn lc_adj_cz_aggregate_enabled() -> bool {
     *ON
 }
 
+/// Restore the scalar A-side injector that preceded the four-wide
+/// load/extract/scatter schedule. This is deliberately narrower than the
+/// constant-root B aggregation switch: the independently positive B-side
+/// reduction remains active. `FLOCK_NO_LC_ADJ_SCALAR_A=1` restores the donor's
+/// x4 A walk for same-binary attribution.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn lc_adj_scalar_a_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ADJ_SCALAR_A").is_some());
+    *ON
+}
+
 /// FAIL-CLOSED shape gate. [`Blake3AdjointPlan`] hard-codes the geometry that
 /// `build_matrices` produces; it is valid for that `(A_0, B_0)` pair and
 /// nothing else. Every dimension the plan assumes is checked here, and any
@@ -1058,7 +1075,7 @@ unsafe fn inject_alpha_e_x4(
     alpha: F128,
     eq_inner: &[F128],
 ) {
-    use core::arch::x86_64::{_mm512_setzero_si512, _mm512_xor_si512};
+    use core::arch::x86_64::{_mm512_setzero_si512, _mm512_storeu_si512, _mm512_xor_si512};
     use flock_core::field::gf2_128::x86_64::{
         f128x4_extract, f128x4_loadu, ghash_broadcast_split, ghash_mul_x4_split,
         ghash_mul_x4_split_unroll4,
@@ -1075,7 +1092,6 @@ unsafe fn inject_alpha_e_x4(
     // and non-aliasing are invariants of Blake3AdjointPlan::build and this
     // helper's contract; target features are declared above.
     unsafe {
-        let (t, t_x64) = ghash_broadcast_split(alpha);
         let accp = acc.as_mut_ptr();
         let ap = a_roots.as_ptr();
         let bp = b_roots.as_ptr();
@@ -1121,72 +1137,95 @@ unsafe fn inject_alpha_e_x4(
                     .all(|&root| root == Z_CONST_POS as u32)
             }));
 
-            // A side: byte-for-byte the incumbent x4/unroll4 walk, minus the
-            // interleaved B writes. Keeping one whole-prefix walk avoids the
-            // 113 scalar A rows that independent static-range walks would
-            // leave (the 1-row prefix tail plus 2 carry tails for each G).
-            macro_rules! scatter_a4 {
-                ($r:expr, $ea:expr) => {{
-                    let r = $r;
-                    let ea4 = f128x4_extract($ea);
-                    *accp.add(*ap.add(r) as usize) += ea4[0];
-                    *accp.add(*ap.add(r + 1) as usize) += ea4[1];
-                    *accp.add(*ap.add(r + 2) as usize) += ea4[2];
-                    *accp.add(*ap.add(r + 3) as usize) += ea4[3];
-                }};
-            }
-
             const WIDTH: usize = 4;
-            const UNROLL: usize = 4;
-            const SPAN: usize = WIDTH * UNROLL;
-            let unroll_end = round4 & !(SPAN - 1);
-            let mut r = 0usize;
-            if unroll_end >= SPAN {
-                let mut e0 = f128x4_loadu(eqp);
-                let mut e1 = f128x4_loadu(eqp.add(4));
-                let mut e2 = f128x4_loadu(eqp.add(8));
-                let mut e3 = f128x4_loadu(eqp.add(12));
-                let (mut p0, mut p1, mut p2, mut p3) =
-                    ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
-                r = SPAN;
-                while r < unroll_end {
-                    e0 = f128x4_loadu(eqp.add(r));
-                    e1 = f128x4_loadu(eqp.add(r + 4));
-                    e2 = f128x4_loadu(eqp.add(r + 8));
-                    e3 = f128x4_loadu(eqp.add(r + 12));
-                    let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
-                    scatter_a4!(r - SPAN, p0);
-                    scatter_a4!(r - SPAN + 4, p1);
-                    scatter_a4!(r - SPAN + 8, p2);
-                    scatter_a4!(r - SPAN + 12, p3);
-                    p0 = next.0;
-                    p1 = next.1;
-                    p2 = next.2;
-                    p3 = next.3;
-                    r += SPAN;
+            if lc_adj_scalar_a_enabled() {
+                // PR2306's scalar A schedule, kept separate from the later
+                // constant-root B reduction. Padding rows target ADJ_ZERO and
+                // are intentionally omitted, as in the scalar predecessor.
+                for r in 0..n_rows {
+                    let ea = alpha * *eqp.add(r);
+                    *accp.add(*ap.add(r) as usize) += ea;
                 }
-                scatter_a4!(unroll_end - SPAN, p0);
-                scatter_a4!(unroll_end - SPAN + 4, p1);
-                scatter_a4!(unroll_end - SPAN + 8, p2);
-                scatter_a4!(unroll_end - SPAN + 12, p3);
-            }
-            while r < round4 {
-                let e = f128x4_loadu(eqp.add(r));
-                let product = ghash_mul_x4_split(e, t, t_x64);
-                scatter_a4!(r, product);
-                r += WIDTH;
+            } else {
+                // Exact PR2311 donor A path for same-binary rollback.
+                let (t, t_x64) = ghash_broadcast_split(alpha);
+                let mut buf = core::mem::MaybeUninit::<[F128; 16]>::uninit();
+                let bufp = buf.as_mut_ptr() as *mut F128;
+
+                const UNROLL: usize = 4;
+                const SPAN: usize = WIDTH * UNROLL;
+                let unroll_end = round4 & !(SPAN - 1);
+                let mut r = 0usize;
+                if unroll_end >= SPAN {
+                    let mut e0 = f128x4_loadu(eqp);
+                    let mut e1 = f128x4_loadu(eqp.add(4));
+                    let mut e2 = f128x4_loadu(eqp.add(8));
+                    let mut e3 = f128x4_loadu(eqp.add(12));
+                    let (mut p0, mut p1, mut p2, mut p3) =
+                        ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                    r = SPAN;
+                    while r < unroll_end {
+                        e0 = f128x4_loadu(eqp.add(r));
+                        e1 = f128x4_loadu(eqp.add(r + 4));
+                        e2 = f128x4_loadu(eqp.add(r + 8));
+                        e3 = f128x4_loadu(eqp.add(r + 12));
+                        let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                        _mm512_storeu_si512(bufp.add(0) as *mut _, p0);
+                        _mm512_storeu_si512(bufp.add(4) as *mut _, p1);
+                        _mm512_storeu_si512(bufp.add(8) as *mut _, p2);
+                        _mm512_storeu_si512(bufp.add(12) as *mut _, p3);
+                        let items = buf.assume_init();
+                        for k in 0..16 {
+                            *accp.add(*ap.add(r - SPAN + k) as usize) += items[k];
+                        }
+                        p0 = next.0;
+                        p1 = next.1;
+                        p2 = next.2;
+                        p3 = next.3;
+                        r += SPAN;
+                    }
+                    _mm512_storeu_si512(bufp.add(0) as *mut _, p0);
+                    _mm512_storeu_si512(bufp.add(4) as *mut _, p1);
+                    _mm512_storeu_si512(bufp.add(8) as *mut _, p2);
+                    _mm512_storeu_si512(bufp.add(12) as *mut _, p3);
+                    let items = buf.assume_init();
+                    for k in 0..16 {
+                        *accp.add(*ap.add(unroll_end - SPAN + k) as usize) += items[k];
+                    }
+                }
+                while r < round4 {
+                    let e = f128x4_loadu(eqp.add(r));
+                    let product = ghash_mul_x4_split(e, t, t_x64);
+                    let mut tail_buf = core::mem::MaybeUninit::<[F128; 4]>::uninit();
+                    _mm512_storeu_si512(tail_buf.as_mut_ptr() as *mut _, product);
+                    let items = tail_buf.assume_init();
+                    for k in 0..WIDTH {
+                        *accp.add(*ap.add(r + k) as usize) += items[k];
+                    }
+                    r += WIDTH;
+                }
             }
 
             // B side: the constant-pin ranges reduce in ZMM registers. Carry
             // ranges keep one scatter per row, in their original row order.
-            let mut cz4 = _mm512_setzero_si512();
+            let mut cz0 = _mm512_setzero_si512();
+            let mut cz1 = _mm512_setzero_si512();
+            let mut cz2 = _mm512_setzero_si512();
+            let mut cz3 = _mm512_setzero_si512();
             let mut cz_tail = F128::ZERO;
             macro_rules! aggregate_cz_range {
                 ($begin:expr, $end:expr) => {{
                     let end = $end;
                     let mut r = $begin;
+                    while r + 4 * WIDTH <= end {
+                        cz0 = _mm512_xor_si512(cz0, f128x4_loadu(eqp.add(r)));
+                        cz1 = _mm512_xor_si512(cz1, f128x4_loadu(eqp.add(r + WIDTH)));
+                        cz2 = _mm512_xor_si512(cz2, f128x4_loadu(eqp.add(r + 2 * WIDTH)));
+                        cz3 = _mm512_xor_si512(cz3, f128x4_loadu(eqp.add(r + 3 * WIDTH)));
+                        r += 4 * WIDTH;
+                    }
                     while r + WIDTH <= end {
-                        cz4 = _mm512_xor_si512(cz4, f128x4_loadu(eqp.add(r)));
+                        cz0 = _mm512_xor_si512(cz0, f128x4_loadu(eqp.add(r)));
                         r += WIDTH;
                     }
                     while r < end {
@@ -1199,14 +1238,6 @@ unsafe fn inject_alpha_e_x4(
                 ($begin:expr, $end:expr) => {{
                     let end = $end;
                     let mut r = $begin;
-                    while r + WIDTH <= end {
-                        let e4 = f128x4_extract(f128x4_loadu(eqp.add(r)));
-                        *accp.add(*bp.add(r) as usize) += e4[0];
-                        *accp.add(*bp.add(r + 1) as usize) += e4[1];
-                        *accp.add(*bp.add(r + 2) as usize) += e4[2];
-                        *accp.add(*bp.add(r + 3) as usize) += e4[3];
-                        r += WIDTH;
-                    }
                     while r < end {
                         *accp.add(*bp.add(r) as usize) += *eqp.add(r);
                         r += 1;
@@ -1224,12 +1255,19 @@ unsafe fn inject_alpha_e_x4(
             aggregate_cz_range!(OUT_HI_BASE, USEFUL_BITS);
             scatter_b_range!(n_rows, round4);
 
-            let lanes = f128x4_extract(cz4);
+            let cz4 = _mm512_xor_si512(
+                _mm512_xor_si512(cz0, cz1),
+                _mm512_xor_si512(cz2, cz3),
+            );
+            let mut cz_buf = core::mem::MaybeUninit::<[F128; 4]>::uninit();
+            _mm512_storeu_si512(cz_buf.as_mut_ptr() as *mut _, cz4);
+            let lanes = cz_buf.assume_init();
             let cz_sum = cz_tail + lanes[0] + lanes[1] + lanes[2] + lanes[3];
             *accp.add(Z_CONST_POS) += cz_sum;
             return;
         }
 
+        let (t, t_x64) = ghash_broadcast_split(alpha);
         macro_rules! scatter4 {
             ($r:expr, $ea:expr) => {{
                 let r = $r;
@@ -1344,13 +1382,20 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
         // before it, so `ADJ_BASE + i`'s children are both `< ADJ_BASE + i`
         // and descending `i` visits every parent before either child.
         let base = ADJ_BASE as usize;
+        let accp = acc.as_mut_ptr();
+        let child_ptr = self.children.as_ptr();
         for i in (0..self.children.len()).rev() {
-            let v = acc[base + i];
-            // SAFETY: children are node ids `< base + i < n_nodes`.
-            let [p, q] = unsafe { *self.children.get_unchecked(i) };
             unsafe {
-                *acc.get_unchecked_mut(p as usize) += v;
-                *acc.get_unchecked_mut(q as usize) += v;
+                let v = *accp.add(base + i);
+                if (v.lo | v.hi) != 0 {
+                    let [p, q] = *child_ptr.add(i);
+                    let target_p = accp.add(p as usize);
+                    let target_q = accp.add(q as usize);
+                    (*target_p).lo ^= v.lo;
+                    (*target_p).hi ^= v.hi;
+                    (*target_q).lo ^= v.lo;
+                    (*target_q).hi ^= v.hi;
+                }
             }
         }
 
