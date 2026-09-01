@@ -1870,6 +1870,128 @@ fn open_basis_x4_enabled() -> bool {
 ///   `enforced_sum = Σ_i eq(α, i_bin) · ⟨opened_rows[i], eq(v_challenges, ·)⟩`
 /// Cheap: O(num_queries × num_interleaved). Verifier needs this at level
 /// intro time (before residual challenges are known).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn dot_product_avx512(a: &[F128], b: &[F128]) -> F128 {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = a.len();
+    debug_assert_eq!(b.len(), len);
+    let mut acc = WideGhashX4::zero();
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    let unroll_lanes = len & !7;
+    let mut k = 0;
+    while k < unroll_lanes {
+        let a0 = _mm512_loadu_si512(a_ptr.add(k) as *const __m512i);
+        let b0 = _mm512_loadu_si512(b_ptr.add(k) as *const __m512i);
+        let a1 = _mm512_loadu_si512(a_ptr.add(k + 4) as *const __m512i);
+        let b1 = _mm512_loadu_si512(b_ptr.add(k + 4) as *const __m512i);
+        acc.mul_acc2(a0, b0, a1, b1);
+        k += 8;
+    }
+
+    if k + 4 <= len {
+        let a0 = _mm512_loadu_si512(a_ptr.add(k) as *const __m512i);
+        let b0 = _mm512_loadu_si512(b_ptr.add(k) as *const __m512i);
+        acc.mul_acc(a0, b0);
+        k += 4;
+    }
+
+    let mut res = acc.fold().reduce();
+    while k < len {
+        res += *a_ptr.add(k) * *b_ptr.add(k);
+        k += 1;
+    }
+    res
+}
+
+#[inline(always)]
+pub(crate) fn dot_product(a: &[F128], b: &[F128]) -> F128 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        unsafe { dot_product_avx512(a, b) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x * y)
+            .fold(F128::ZERO, |x, y| x + y)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn dot_product_sum_avx512(a: &[F128], b: &[F128], w: &[F128]) -> F128 {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+
+    let len = a.len();
+    debug_assert_eq!(b.len(), len);
+    debug_assert_eq!(w.len(), len);
+    let mut acc = WideGhashX4::zero();
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let w_ptr = w.as_ptr();
+
+    let unroll_lanes = len & !7;
+    let mut k = 0;
+    while k < unroll_lanes {
+        let a0 = _mm512_loadu_si512(a_ptr.add(k) as *const __m512i);
+        let b0 = _mm512_loadu_si512(b_ptr.add(k) as *const __m512i);
+        let s0 = _mm512_xor_si512(a0, b0);
+        let w0 = _mm512_loadu_si512(w_ptr.add(k) as *const __m512i);
+
+        let a1 = _mm512_loadu_si512(a_ptr.add(k + 4) as *const __m512i);
+        let b1 = _mm512_loadu_si512(b_ptr.add(k + 4) as *const __m512i);
+        let s1 = _mm512_xor_si512(a1, b1);
+        let w1 = _mm512_loadu_si512(w_ptr.add(k + 4) as *const __m512i);
+
+        acc.mul_acc2(s0, w0, s1, w1);
+        k += 8;
+    }
+
+    if k + 4 <= len {
+        let a0 = _mm512_loadu_si512(a_ptr.add(k) as *const __m512i);
+        let b0 = _mm512_loadu_si512(b_ptr.add(k) as *const __m512i);
+        let s0 = _mm512_xor_si512(a0, b0);
+        let w0 = _mm512_loadu_si512(w_ptr.add(k) as *const __m512i);
+        acc.mul_acc(s0, w0);
+        k += 4;
+    }
+
+    let mut res = acc.fold().reduce();
+    while k < len {
+        res += (*a_ptr.add(k) + *b_ptr.add(k)) * *w_ptr.add(k);
+        k += 1;
+    }
+    res
+}
+
+#[inline(always)]
+pub(crate) fn dot_product_sum(a: &[F128], b: &[F128], w: &[F128]) -> F128 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), w.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
+        unsafe { dot_product_sum_avx512(a, b, w) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    {
+        a.iter()
+            .zip(b.iter())
+            .zip(w.iter())
+            .map(|((&lo, &hi), &weight)| (lo + hi) * weight)
+            .fold(F128::ZERO, |x, y| x + y)
+    }
+}
+
 pub(crate) fn induce_sumcheck_enforced_sum(
     opened_rows: &[Vec<F128>],
     v_challenges: &[F128],
@@ -1887,11 +2009,7 @@ pub(crate) fn induce_sumcheck_enforced_sum(
     let mut sum = F128::ZERO;
     for (i, row) in opened_rows.iter().enumerate() {
         debug_assert_eq!(row.len(), eq.len());
-        let dot: F128 = row
-            .iter()
-            .zip(eq.iter())
-            .map(|(&r, &e)| r * e)
-            .fold(F128::ZERO, |a, v| a + v);
+        let dot = dot_product(row, &eq);
         sum += alpha_weights[i] * dot;
     }
     sum
@@ -2097,11 +2215,7 @@ pub(crate) fn induce_sumcheck_poly(
                 let q = queries[i];
                 let ap = alpha_pows[i];
 
-                let dot: F128 = row
-                    .iter()
-                    .zip(eq.iter())
-                    .map(|(&r, &e)| r * e)
-                    .fold(F128::ZERO, |a, v| a + v);
+                let dot = dot_product(row, &eq);
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
@@ -2552,11 +2666,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 
     let mut enforced_sum = F128::ZERO;
     for i in 0..n_queries {
-        let dot: F128 = opened_rows[i]
-            .iter()
-            .zip(eq.iter())
-            .map(|(&r, &e)| r * e)
-            .fold(F128::ZERO, |a, v| a + v);
+        let dot = dot_product(&opened_rows[i], &eq);
         enforced_sum += dot * alpha_pows[i];
     }
 
@@ -2685,11 +2795,7 @@ impl SparseDualL0 {
                 for (j, value) in cached[..cache_len].iter_mut().enumerate() {
                     let row = &l0_codeword
                         [(base + j) * num_interleaved..(base + j + 1) * num_interleaved];
-                    *value = row
-                        .iter()
-                        .zip(&lane_weights)
-                        .map(|(&v, &w)| v * w)
-                        .fold(F128::ZERO, |x, y| x + y);
+                    *value = dot_product(row, &lane_weights);
                 }
                 // Reuse the queried row already lane-folded for the sparse
                 // cache instead of dotting the opened row a second time.
@@ -2743,16 +2849,8 @@ impl SparseDualL0 {
         let local = &residue[cache_off..cache_off + block_len];
 
         let half = block_len >> 1;
-        let f0 = local[..half]
-            .iter()
-            .zip(fold_weights)
-            .map(|(&v, &w)| v * w)
-            .fold(F128::ZERO, |x, y| x + y);
-        let f1 = local[half..]
-            .iter()
-            .zip(fold_weights)
-            .map(|(&v, &w)| v * w)
-            .fold(F128::ZERO, |x, y| x + y);
+        let f0 = dot_product(&local[..half], fold_weights);
+        let f1 = dot_product(&local[half..], fold_weights);
         let pair_sum = f0 + f1;
 
         // `row = H_s^T e_q`, where H_s is exactly the final `s`
@@ -2771,17 +2869,8 @@ impl SparseDualL0 {
             F128::ONE,
             &mut row[..block_len],
         );
-        let dot_u0 = row[..half]
-            .iter()
-            .zip(fold_weights)
-            .map(|(&r, &w)| r * w)
-            .fold(F128::ZERO, |x, y| x + y);
-        let dot_u2 = row[..half]
-            .iter()
-            .zip(&row[half..block_len])
-            .zip(fold_weights)
-            .map(|((&lo, &hi), &w)| (lo + hi) * w)
-            .fold(F128::ZERO, |x, y| x + y);
+        let dot_u0 = dot_product(&row[..half], fold_weights);
+        let dot_u2 = dot_product_sum(&row[..half], &row[half..block_len], fold_weights);
         SumcheckMessage {
             u_0: alpha * f0 * dot_u0,
             u_2: alpha * pair_sum * dot_u2,
@@ -2875,11 +2964,7 @@ impl SparseDualL0 {
                 F128::ONE,
                 &mut row[..block_len],
             );
-            let local_value = row[..block_len]
-                .iter()
-                .zip(&fold_weights)
-                .map(|(&r, &w)| r * w)
-                .fold(F128::ZERO, |x, y| x + y);
+            let local_value = dot_product(&row[..block_len], &fold_weights);
             positions.push(query >> k);
             values.push(alpha * local_value);
         }
@@ -4107,7 +4192,29 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         let mut s_acc = WideGhashX4::zero();
         let lanes = weights.len() & !3;
         let mut j = 0usize;
-        while j < lanes {
+        let unroll8 = lanes & !7;
+        while j < unroll8 {
+            let f0_0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
+            let f1_0 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
+            let w0 = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
+            let even0 = _mm512_shuffle_i32x4::<0x88>(f0_0, f1_0);
+            let f0_sum0 = _mm512_xor_si512(f0_0, _mm512_shuffle_i32x4::<0xB1>(f0_0, f0_0));
+            let f1_sum0 = _mm512_xor_si512(f1_0, _mm512_shuffle_i32x4::<0xB1>(f1_0, f1_0));
+            let sum0 = _mm512_shuffle_i32x4::<0x88>(f0_sum0, f1_sum0);
+
+            let f0_1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 8) as *const __m512i);
+            let f1_1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 12) as *const __m512i);
+            let w1 = _mm512_loadu_si512(weights.as_ptr().add(j + 4) as *const __m512i);
+            let even1 = _mm512_shuffle_i32x4::<0x88>(f0_1, f1_1);
+            let f0_sum1 = _mm512_xor_si512(f0_1, _mm512_shuffle_i32x4::<0xB1>(f0_1, f0_1));
+            let f1_sum1 = _mm512_xor_si512(f1_1, _mm512_shuffle_i32x4::<0xB1>(f1_1, f1_1));
+            let sum1 = _mm512_shuffle_i32x4::<0x88>(f0_sum1, f1_sum1);
+
+            a_acc.mul_acc2(even0, w0, even1, w1);
+            s_acc.mul_acc2(sum0, w0, sum1, w1);
+            j += 8;
+        }
+        if j + 4 <= lanes {
             let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
             let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
             let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
@@ -4262,25 +4369,52 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
     // Process 8 F128 (4 message pairs) per iteration.
-    let lanes = len & !7;
-    let mut u0_acc = WideGhashX4::zero();
-    let mut u2_acc = WideGhashX4::zero();
-
+    let unroll16 = len & !15;
     let mut k = 0;
-    while k < lanes {
-        // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
+    while k < unroll16 {
         let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
         let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
         let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
         let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-        // u0: products at even pair-positions k, k+2, k+4, k+6.
+        let f_even0 = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+        let b_even0 = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+        let f_sum0 = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+        let b_sum0 = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+
+        let f2 = _mm512_loadu_si512(fc.as_ptr().add(k + 8) as *const __m512i);
+        let f3 = _mm512_loadu_si512(fc.as_ptr().add(k + 12) as *const __m512i);
+        let b2 = _mm512_loadu_si512(bc.as_ptr().add(k + 8) as *const __m512i);
+        let b3 = _mm512_loadu_si512(bc.as_ptr().add(k + 12) as *const __m512i);
+
+        let f_even1 = _mm512_shuffle_i32x4::<0x88>(f2, f3);
+        let b_even1 = _mm512_shuffle_i32x4::<0x88>(b2, b3);
+        let f2s = _mm512_xor_si512(f2, _mm512_shuffle_i32x4::<0xB1>(f2, f2));
+        let f3s = _mm512_xor_si512(f3, _mm512_shuffle_i32x4::<0xB1>(f3, f3));
+        let f_sum1 = _mm512_shuffle_i32x4::<0x88>(f2s, f3s);
+        let b2s = _mm512_xor_si512(b2, _mm512_shuffle_i32x4::<0xB1>(b2, b2));
+        let b3s = _mm512_xor_si512(b3, _mm512_shuffle_i32x4::<0xB1>(b3, b3));
+        let b_sum1 = _mm512_shuffle_i32x4::<0x88>(b2s, b3s);
+
+        u0_acc.mul_acc2(f_even0, b_even0, f_even1, b_even1);
+        u2_acc.mul_acc2(f_sum0, b_sum0, f_sum1, b_sum1);
+        k += 16;
+    }
+
+    if k + 8 <= len {
+        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
         let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
         let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
         u0_acc.mul_acc(f_even, b_even);
 
-        // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
-        //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
         let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
         let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
         let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
@@ -4352,8 +4486,7 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             u2_acc.mul_acc(f_sum, b_sum);
 
             // y is the inner product over EVERY slot, so both registers feed it.
-            y_acc.mul_acc(f0, b0);
-            y_acc.mul_acc(f1, b1);
+            y_acc.mul_acc2(f0, b0, f1, b1);
 
             k += 8;
         }

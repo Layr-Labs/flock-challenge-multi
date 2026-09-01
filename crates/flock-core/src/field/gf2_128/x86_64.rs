@@ -561,12 +561,12 @@ pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
 #[inline]
 #[target_feature(enable = "avx512f")]
 unsafe fn xor4_lanes(v: __m512i) -> __m128i {
-    // Register-only lane extracts + XOR; avx512f cfg-gated.
-    let l0 = _mm512_extracti32x4_epi32::<0>(v);
-    let l1 = _mm512_extracti32x4_epi32::<1>(v);
-    let l2 = _mm512_extracti32x4_epi32::<2>(v);
-    let l3 = _mm512_extracti32x4_epi32::<3>(v);
-    _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+    let lo256 = _mm512_castsi512_si256(v);
+    let hi256 = _mm512_extracti64x4_epi64::<1>(v);
+    let x256 = _mm256_xor_si256(lo256, hi256);
+    let lo128 = _mm256_castsi256_si128(x256);
+    let hi128 = _mm256_extracti128_si256::<1>(x256);
+    _mm_xor_si128(lo128, hi128)
 }
 
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
@@ -638,8 +638,9 @@ impl WideGhashX4 {
         // 0x96 = a ^ b ^ c.
         self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
         self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+        let m0 = _mm512_xor_si512(c01_0, c10_0);
+        let m1 = _mm512_xor_si512(c01_1, c10_1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, m0, m1);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
