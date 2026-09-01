@@ -2591,6 +2591,7 @@ struct SparseDualL0 {
 }
 
 const SPARSE_DUAL_MAX_DEPTH: usize = 4;
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
 
 /// Apply a prefix of the local transform represented by `data`. The slice is
 /// aligned to its full length; `end_layer` may stop before its final layer.
@@ -6520,7 +6521,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(RANKED_SPARSE_DUAL_DEFAULT_DEPTH);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
