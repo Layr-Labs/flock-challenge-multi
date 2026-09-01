@@ -81,6 +81,17 @@ pub(crate) fn open_fill_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_LUNA_MULACC2=1` restores the incumbent single-product
+/// `WideGhashX4::mul_acc` scheduling in the open-phase message leaves. Both
+/// arms are bit-identical: `mul_acc2` is only an associative regrouping of the
+/// same XOR-accumulate, and the unrolled loops compute exactly the same
+/// canonical products. Default ON (the ranked worker clears its env).
+pub(crate) fn luna_mulacc2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LUNA_MULACC2").is_none());
+    *ON
+}
+
 // ===================================================================
 // Config
 // ===================================================================
@@ -2577,7 +2588,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 /// Research representation for the exact ranked L0 induced basis.  The
 /// basis itself is `P F^T q`; retaining the sparse query vector lets up to
 /// four LSB folds commute through the corresponding final forward-NTT layers.
-/// Each query caches one inverse-local residue of 8, 16, or 32 codeword rows.
+/// Each query caches one inverse-local residue of 4, 8, 16, or 32 codeword rows.
 /// The fixed 32-slot backing avoids one heap allocation per query while only
 /// the prefix selected by `cache_len` is constructed or read.
 struct SparseDualL0 {
@@ -2659,7 +2670,7 @@ impl SparseDualL0 {
         alpha: &[F128],
     ) -> (Self, F128) {
         use rayon::prelude::*;
-        assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
         assert_eq!(num_interleaved, 1usize << lane_challenges.len());
         assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
         assert_eq!(opened_rows.len(), queries.len());
@@ -4105,19 +4116,47 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
         debug_assert_eq!(f.len(), 2 * weights.len());
         let mut a_acc = WideGhashX4::zero();
         let mut s_acc = WideGhashX4::zero();
-        let lanes = weights.len() & !3;
         let mut j = 0usize;
-        while j < lanes {
-            let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
-            let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
-            let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
-            let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
-            a_acc.mul_acc(even, w);
-            s_acc.mul_acc(sum, w);
-            j += 4;
+        if luna_mulacc2_enabled() {
+            // Two 4-weight blocks per iteration: fuse the two even-products into
+            // a_acc and the two sum-products into s_acc with `mul_acc2`. The
+            // products and the XOR-accumulate are exactly the same; only the
+            // schedule changes.
+            let lanes = weights.len() & !7;
+            while j < lanes {
+                let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
+                let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
+                let f2 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 8) as *const __m512i);
+                let f3 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 12) as *const __m512i);
+                let w0 = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
+                let w1 = _mm512_loadu_si512(weights.as_ptr().add(j + 4) as *const __m512i);
+
+                let even0 = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+                let even1 = _mm512_shuffle_i32x4::<0x88>(f2, f3);
+                let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+                let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+                let f2_sum = _mm512_xor_si512(f2, _mm512_shuffle_i32x4::<0xB1>(f2, f2));
+                let f3_sum = _mm512_xor_si512(f3, _mm512_shuffle_i32x4::<0xB1>(f3, f3));
+                let sum0 = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
+                let sum1 = _mm512_shuffle_i32x4::<0x88>(f2_sum, f3_sum);
+                a_acc.mul_acc2(even0, w0, even1, w1);
+                s_acc.mul_acc2(sum0, w0, sum1, w1);
+                j += 8;
+            }
+        } else {
+            let lanes = weights.len() & !3;
+            while j < lanes {
+                let f0 = _mm512_loadu_si512(f.as_ptr().add(2 * j) as *const __m512i);
+                let f1 = _mm512_loadu_si512(f.as_ptr().add(2 * j + 4) as *const __m512i);
+                let w = _mm512_loadu_si512(weights.as_ptr().add(j) as *const __m512i);
+                let even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+                let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+                let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+                let sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
+                a_acc.mul_acc(even, w);
+                s_acc.mul_acc(sum, w);
+                j += 4;
+            }
         }
         let mut a = a_acc.fold().reduce();
         let mut s = s_acc.fold().reduce();
@@ -4255,41 +4294,81 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// Requires `avx512f` and `vpclmulqdq` (cfg-gated at call site).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
 
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
-    // Process 8 F128 (4 message pairs) per iteration.
-    let lanes = len & !7;
     let mut u0_acc = WideGhashX4::zero();
     let mut u2_acc = WideGhashX4::zero();
 
     let mut k = 0;
-    while k < lanes {
-        // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
-        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+    if luna_mulacc2_enabled() {
+        // Process 16 F128 (8 message pairs) per iteration. The two even-products
+        // go to u0_acc and the two sum-products go to u2_acc via `mul_acc2`,
+        // halving the accumulator read/write traffic versus two `mul_acc` calls.
+        let lanes = len & !15;
+        while k < lanes {
+            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+            let f2 = _mm512_loadu_si512(fc.as_ptr().add(k + 8) as *const __m512i);
+            let f3 = _mm512_loadu_si512(fc.as_ptr().add(k + 12) as *const __m512i);
+            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+            let b2 = _mm512_loadu_si512(bc.as_ptr().add(k + 8) as *const __m512i);
+            let b3 = _mm512_loadu_si512(bc.as_ptr().add(k + 12) as *const __m512i);
 
-        // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-        u0_acc.mul_acc(f_even, b_even);
+            let f_even0 = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even0 = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            let f_even1 = _mm512_shuffle_i32x4::<0x88>(f2, f3);
+            let b_even1 = _mm512_shuffle_i32x4::<0x88>(b2, b3);
+            u0_acc.mul_acc2(f_even0, b_even0, f_even1, b_even1);
 
-        // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
-        //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-        u2_acc.mul_acc(f_sum, b_sum);
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum0 = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum0 = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            let f2s = _mm512_xor_si512(f2, _mm512_shuffle_i32x4::<0xB1>(f2, f2));
+            let f3s = _mm512_xor_si512(f3, _mm512_shuffle_i32x4::<0xB1>(f3, f3));
+            let f_sum1 = _mm512_shuffle_i32x4::<0x88>(f2s, f3s);
+            let b2s = _mm512_xor_si512(b2, _mm512_shuffle_i32x4::<0xB1>(b2, b2));
+            let b3s = _mm512_xor_si512(b3, _mm512_shuffle_i32x4::<0xB1>(b3, b3));
+            let b_sum1 = _mm512_shuffle_i32x4::<0x88>(b2s, b3s);
+            u2_acc.mul_acc2(f_sum0, b_sum0, f_sum1, b_sum1);
 
-        k += 8;
+            k += 16;
+        }
+    } else {
+        // Process 8 F128 (4 message pairs) per iteration.
+        let lanes = len & !7;
+        while k < lanes {
+            // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
+            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+            // u0: products at even pair-positions k, k+2, k+4, k+6.
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
+            //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            k += 8;
+        }
     }
 
     // Fold the 4-lane unreduced accumulators to scalar F128.
@@ -4324,7 +4403,6 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
 
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
-    let lanes = len & !7;
     // SAFETY: caller carries the target features; every load below is inside
     // the equal-length slices.
     unsafe {
@@ -4333,29 +4411,73 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
         let mut y_acc = WideGhashX4::zero();
 
         let mut k = 0;
-        while k < lanes {
-            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+        if luna_mulacc2_enabled() {
+            // Process 16 F128 (8 message pairs) per iteration. Each accumulator
+            // sees two products via `mul_acc2`, cutting accumulator XOR uops.
+            let lanes = len & !15;
+            while k < lanes {
+                let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+                let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+                let f2 = _mm512_loadu_si512(fc.as_ptr().add(k + 8) as *const __m512i);
+                let f3 = _mm512_loadu_si512(fc.as_ptr().add(k + 12) as *const __m512i);
+                let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+                let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+                let b2 = _mm512_loadu_si512(bc.as_ptr().add(k + 8) as *const __m512i);
+                let b3 = _mm512_loadu_si512(bc.as_ptr().add(k + 12) as *const __m512i);
 
-            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-            u0_acc.mul_acc(f_even, b_even);
+                let f_even0 = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+                let b_even0 = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+                let f_even1 = _mm512_shuffle_i32x4::<0x88>(f2, f3);
+                let b_even1 = _mm512_shuffle_i32x4::<0x88>(b2, b3);
+                u0_acc.mul_acc2(f_even0, b_even0, f_even1, b_even1);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-            u2_acc.mul_acc(f_sum, b_sum);
+                let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+                let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+                let f_sum0 = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+                let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+                let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+                let b_sum0 = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+                let f2s = _mm512_xor_si512(f2, _mm512_shuffle_i32x4::<0xB1>(f2, f2));
+                let f3s = _mm512_xor_si512(f3, _mm512_shuffle_i32x4::<0xB1>(f3, f3));
+                let f_sum1 = _mm512_shuffle_i32x4::<0x88>(f2s, f3s);
+                let b2s = _mm512_xor_si512(b2, _mm512_shuffle_i32x4::<0xB1>(b2, b2));
+                let b3s = _mm512_xor_si512(b3, _mm512_shuffle_i32x4::<0xB1>(b3, b3));
+                let b_sum1 = _mm512_shuffle_i32x4::<0x88>(b2s, b3s);
+                u2_acc.mul_acc2(f_sum0, b_sum0, f_sum1, b_sum1);
 
-            // y is the inner product over EVERY slot, so both registers feed it.
-            y_acc.mul_acc(f0, b0);
-            y_acc.mul_acc(f1, b1);
+                // y is the inner product over EVERY slot, so all four registers feed it.
+                y_acc.mul_acc2(f0, b0, f1, b1);
+                y_acc.mul_acc2(f2, b2, f3, b3);
 
-            k += 8;
+                k += 16;
+            }
+        } else {
+            // Process 8 F128 (4 message pairs) per iteration.
+            let lanes = len & !7;
+            while k < lanes {
+                let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+                let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+                let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+                let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+
+                let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+                let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+                u0_acc.mul_acc(f_even, b_even);
+
+                let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+                let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+                let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+                let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+                let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+                let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+                u2_acc.mul_acc(f_sum, b_sum);
+
+                // y is the inner product over EVERY slot, so both registers feed it.
+                y_acc.mul_acc(f0, b0);
+                y_acc.mul_acc(f1, b1);
+
+                k += 8;
+            }
         }
 
         let mut u0 = u0_acc.fold().reduce();
@@ -6353,6 +6475,8 @@ const ENV_NO_LIG_DEFER_INDUCED_GLUE: &str = "FLOCK_NO_LIG_DEFER_INDUCED_GLUE";
 const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
+const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
 #[cfg(test)]
 thread_local! {
     static SPARSE_DUAL_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -6463,8 +6587,28 @@ fn ranked_sparse_dual_l0_depth_selected(
     if !selected {
         return None;
     }
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
+}
+
+#[inline]
+fn ranked_sparse_dual_l0_depth_setting(
+    explicit_depth: Option<&str>,
+    depth2_disabled: bool,
+) -> usize {
+    let depth = explicit_depth
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 1, 2, 3, or 4")
+        })
+        .unwrap_or(if depth2_disabled {
+            SPARSE_DUAL_MAX_DEPTH
+        } else {
+            RANKED_SPARSE_DUAL_DEFAULT_DEPTH
+        });
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    depth
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6483,7 +6627,7 @@ fn ranked_sparse_dual_l0_depth(
     {
         let forced = SPARSE_DUAL_TEST_DEPTH.with(std::cell::Cell::get);
         if forced != 0 {
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
+            assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
             return Some(forced);
         }
     }
@@ -6513,15 +6657,11 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
-        })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
+    let depth = ranked_sparse_dual_l0_depth_setting(
+        explicit_depth.as_deref(),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+    );
     Some(depth)
 }
 
@@ -12093,7 +12233,7 @@ mod tests {
                 &queries,
                 &alpha,
             );
-            for target_depth in 3..=4 {
+            for target_depth in 1..=4 {
                 let (dual, dual_enforced) = SparseDualL0::new(
                     target_depth,
                     log_d,
@@ -12411,6 +12551,24 @@ mod tests {
         let mut wrong_shape = config.clone();
         wrong_shape.recursive_ks[0] = 4;
         assert_eq!(select(&wrong_shape, false, false), None);
+    }
+
+    #[test]
+    fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
+        for depth in 1..=4 {
+            let value = depth.to_string();
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
+                depth
+            );
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
+                depth,
+                "explicit depth must override the depth2 rollback"
+            );
+        }
     }
 
     /// Exact ranked post-DirectFold8-state oracle and component timer. This allocates
@@ -15675,3 +15833,9 @@ mod tests {
         }
     }
 }
+
+// draw marker: sparse-dual depth selection, redraw 1
+
+// draw marker 2
+
+// draw marker 3
