@@ -49,6 +49,106 @@ unsafe fn tw_x4<const LOW: bool, const DIET: bool>(value: F128) -> TwX4 {
     }
 }
 
+struct RowPairCache {
+    twiddle: F128,
+    tw: TwX4,
+    diet: bool,
+    low: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static ROW_PAIR_CACHE: std::cell::UnsafeCell<RowPairCache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct Fused2Cache {
+    tw: [F128; 3],
+    res: [TwX4; 3],
+    outer_low: bool,
+    inner_low: bool,
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static FUSED2_CACHE: std::cell::UnsafeCell<Fused2Cache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct Fused2NtCache {
+    tw: [F128; 3],
+    res: [TwX4; 3],
+    outer_low: bool,
+    inner_low: bool,
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static FUSED2_NT_CACHE: std::cell::UnsafeCell<Fused2NtCache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct Fused2GeoCache {
+    tw: [F128; 3],
+    res: [TwX4; 3],
+    outer_low: bool,
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static FUSED2_GEO_CACHE: std::cell::UnsafeCell<Fused2GeoCache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct SparseGeoCache {
+    right: F128,
+    tw: TwX4,
+    inner_low: bool,
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static SPARSE_GEO_CACHE: std::cell::UnsafeCell<SparseGeoCache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct SparseDenseGeoCache {
+    right: F128,
+    dense: [F128; 3],
+    res: (TwX4, TwX4, TwX4, TwX4),
+    outer_low: bool,
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static SPARSE_DENSE_GEO_CACHE: std::cell::UnsafeCell<SparseDenseGeoCache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
+struct Fused4Cache {
+    twiddles: [F128; 15],
+    tw: [TwX4; 15],
+    diet: bool,
+    valid: bool,
+}
+
+thread_local! {
+    static FUSED4_CACHE: std::cell::UnsafeCell<Fused4Cache> = const {
+        std::cell::UnsafeCell::new(unsafe { core::mem::zeroed() })
+    };
+}
+
 /// Broadcast-twiddle product. `LOW` asserts the twiddle's high limb is zero
 /// in every lane (3 CLMUL); otherwise `DIET` picks the 5-CLMUL split form
 /// over the incumbent 6-CLMUL `ghash_mul_x4`. Monomorphized, so the choice
@@ -189,7 +289,20 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
     // SAFETY: caller guarantees the target features and equal slice lengths.
     unsafe {
         debug_assert!(!LOW || twiddle.hi == 0);
-        let tw = tw_x4::<LOW, DIET>(twiddle);
+        let tw = ROW_PAIR_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            if cache.valid && cache.diet == DIET && cache.low == LOW && cache.twiddle == twiddle {
+                cache.tw
+            } else {
+                let t = tw_x4::<LOW, DIET>(twiddle);
+                cache.twiddle = twiddle;
+                cache.tw = t;
+                cache.diet = DIET;
+                cache.low = LOW;
+                cache.valid = true;
+                t
+            }
+        });
         let lanes = top.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -272,9 +385,24 @@ unsafe fn butterfly_fused_2layer_impl<
 
     // SAFETY: caller guarantees the target features and equal slice lengths.
     unsafe {
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
-        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+        let (outer, inner_a, inner_b) = FUSED2_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            let key = [t_outer, t_inner_a, t_inner_b];
+            if cache.valid && cache.diet == DIET && cache.outer_low == OUTER_LOW && cache.inner_low == INNER_LOW && cache.tw == key {
+                (cache.res[0], cache.res[1], cache.res[2])
+            } else {
+                let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+                let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+                let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+                cache.tw = key;
+                cache.res = [outer, inner_a, inner_b];
+                cache.outer_low = OUTER_LOW;
+                cache.inner_low = INNER_LOW;
+                cache.diet = DIET;
+                cache.valid = true;
+                (outer, inner_a, inner_b)
+            }
+        });
         let lanes = a.len() & !3;
         let mut i = 0;
         while i < lanes {
@@ -427,9 +555,24 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         let b = src.add(src_step);
         let c = src.add(2 * src_step);
         let d = src.add(3 * src_step);
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
-        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+        let (outer, inner_a, inner_b) = FUSED2_NT_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            let key = [t_outer, t_inner_a, t_inner_b];
+            if cache.valid && cache.diet == DIET && cache.outer_low == OUTER_LOW && cache.inner_low == INNER_LOW && cache.tw == key {
+                (cache.res[0], cache.res[1], cache.res[2])
+            } else {
+                let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+                let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+                let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+                cache.tw = key;
+                cache.res = [outer, inner_a, inner_b];
+                cache.outer_low = OUTER_LOW;
+                cache.inner_low = INNER_LOW;
+                cache.diet = DIET;
+                cache.valid = true;
+                (outer, inner_a, inner_b)
+            }
+        });
 
         let mut i = 0;
         while i < lanes {
@@ -643,9 +786,22 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<
     // non-aliasing src/dst.
     unsafe {
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let (outer, inner_a, inner_b) = FUSED2_GEO_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            if cache.valid && cache.diet == DIET && cache.outer_low == OUTER_LOW && cache.tw == *twiddles {
+                (cache.res[0], cache.res[1], cache.res[2])
+            } else {
+                let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+                let inner_a = tw_x4::<false, DIET>(t_inner_a);
+                let inner_b = tw_x4::<false, DIET>(t_inner_b);
+                cache.tw = *twiddles;
+                cache.res = [outer, inner_a, inner_b];
+                cache.outer_low = OUTER_LOW;
+                cache.diet = DIET;
+                cache.valid = true;
+                (outer, inner_a, inner_b)
+            }
+        });
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
@@ -923,7 +1079,20 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
     // non-aliasing src/dst.
     unsafe {
         debug_assert!(!INNER_LOW || right_twiddle.hi == 0);
-        let inner_b = tw_x4::<INNER_LOW, DIET>(right_twiddle);
+        let inner_b = SPARSE_GEO_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            if cache.valid && cache.diet == DIET && cache.inner_low == INNER_LOW && cache.right == right_twiddle {
+                cache.tw
+            } else {
+                let inner_b = tw_x4::<INNER_LOW, DIET>(right_twiddle);
+                cache.right = right_twiddle;
+                cache.tw = inner_b;
+                cache.inner_low = INNER_LOW;
+                cache.diet = DIET;
+                cache.valid = true;
+                inner_b
+            }
+        });
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
@@ -1075,10 +1244,30 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
     let pf = !pf_src.is_null();
     unsafe {
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
-        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
+        let (sparse_b, outer, inner_a, inner_b) = SPARSE_DENSE_GEO_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            if cache.valid
+                && cache.diet == DIET
+                && cache.outer_low == OUTER_LOW
+                && cache.right == right_twiddle
+                && cache.dense == *dense_tw
+            {
+                cache.res
+            } else {
+                let sparse_b = tw_x4::<false, DIET>(right_twiddle);
+                let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+                let inner_a = tw_x4::<false, DIET>(t_inner_a);
+                let inner_b = tw_x4::<false, DIET>(t_inner_b);
+                let res = (sparse_b, outer, inner_a, inner_b);
+                cache.right = right_twiddle;
+                cache.dense = *dense_tw;
+                cache.res = res;
+                cache.outer_low = OUTER_LOW;
+                cache.diet = DIET;
+                cache.valid = true;
+                res
+            }
+        });
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let sp_row = |i: usize| dst_sparse.add((i * dst_quarter) * num_ntts);
         let dn_row = |i: usize| dst_dense.add((i * dst_quarter) * num_ntts);
@@ -1370,98 +1559,100 @@ unsafe fn butterfly_fused_4layer_row_impl<
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
         // steps of savings.
-        let zero = _mm512_setzero_si512();
-        let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
-        }
-        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
-        let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
-        let lanes = active_lanes & !3;
-        let mut lane = 0;
-        while lane < lanes {
-            // Hint DELIVERY, not hint content: the same sixteen lines of the
-            // next row group are still requested exactly once per lane step,
-            // four at a time at four points spaced through the body instead
-            // of all sixteen back to back at its head. The incumbent burst
-            // put sixteen prefetch uops on the load ports immediately in
-            // front of the sixteen DEMAND loads of this lane step, which are
-            // on the critical path; the three other hot prefetch sites in
-            // this prover (`seed_pf_spread`, `zc_r1ab_pf_spread`,
-            // `zc_tail_pf_spread`) already ship exactly this delivery and
-            // each is worth several percent of its window. Architecturally
-            // invisible: a prefetch moves no value.
-            macro_rules! pf_quad {
-                ($g:expr) => {{
-                    if H != 0 {
-                        let off = lane * core::mem::size_of::<F128>();
-                        for i in (4 * $g)..(4 * $g + 4) {
-                            let p = pf_row(i).add(off);
-                            if H == 1 {
-                                _mm_prefetch::<_MM_HINT_T0>(p);
-                            } else {
-                                _mm_prefetch::<_MM_HINT_T1>(p);
+        FUSED4_CACHE.with(|cell| {
+            let cache = &mut *cell.get();
+            let tw: &[TwX4; 15] = if cache.valid && cache.diet == DIET && cache.twiddles == *twiddles {
+                &cache.tw
+            } else {
+                let zero = _mm512_setzero_si512();
+                let mut tw = [(zero, zero); 15];
+                for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+                    *slot = tw_x4::<false, DIET>(*value);
+                }
+                cache.twiddles = *twiddles;
+                cache.tw = tw;
+                cache.diet = DIET;
+                cache.valid = true;
+                &cache.tw
+            };
+            let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+            let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
+            let lanes = active_lanes & !3;
+            let mut lane = 0;
+            let zero = _mm512_setzero_si512();
+            while lane < lanes {
+                macro_rules! pf_quad {
+                    ($g:expr) => {{
+                        if H != 0 {
+                            let off = lane * core::mem::size_of::<F128>();
+                            for i in (4 * $g)..(4 * $g + 4) {
+                                let p = pf_row(i).add(off);
+                                if H == 1 {
+                                    _mm_prefetch::<_MM_HINT_T0>(p);
+                                } else {
+                                    _mm_prefetch::<_MM_HINT_T1>(p);
+                                }
                             }
                         }
+                    }};
+                }
+                let mut values = [zero; 16];
+                for (i, value) in values.iter_mut().enumerate() {
+                    *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+                }
+
+                macro_rules! butterfly {
+                    ($u:expr, $v:expr, $twiddle:expr) => {{
+                        let new_u =
+                            _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                        values[$v] = _mm512_xor_si512(values[$v], new_u);
+                        values[$u] = new_u;
+                    }};
+                }
+
+                pf_quad!(0);
+                let outer = tw[0];
+                for i in 0..8 {
+                    butterfly!(i, i + 8, outer);
+                }
+                pf_quad!(1);
+                for s in 0..2 {
+                    let twiddle = tw[1 + s];
+                    for i in 0..4 {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
                     }
-                }};
-            }
-            let mut values = [zero; 16];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
-            }
-
-            macro_rules! butterfly {
-                ($u:expr, $v:expr, $twiddle:expr) => {{
-                    let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
-                    values[$v] = _mm512_xor_si512(values[$v], new_u);
-                    values[$u] = new_u;
-                }};
-            }
-
-            pf_quad!(0);
-            let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
-            }
-            pf_quad!(1);
-            for s in 0..2 {
-                let twiddle = tw[1 + s];
-                for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
                 }
-            }
-            pf_quad!(2);
-            for s in 0..4 {
-                let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                pf_quad!(2);
+                for s in 0..4 {
+                    let twiddle = tw[3 + s];
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
                 }
-            }
-            pf_quad!(3);
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                pf_quad!(3);
+                for s in 0..8 {
+                    let twiddle = tw[7 + s];
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
+
+                for (i, value) in values.iter().enumerate() {
+                    _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                }
+                lane += 4;
             }
 
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            while lane < active_lanes {
+                let mut values = [F128::ZERO; 16];
+                for (i, value) in values.iter_mut().enumerate() {
+                    *value = *row(i).add(lane);
+                }
+                super::portable::butterfly_fused_4layer(&mut values, twiddles);
+                for (i, value) in values.iter().enumerate() {
+                    *row(i).add(lane) = *value;
+                }
+                lane += 1;
             }
-            lane += 4;
-        }
-
-        while lane < active_lanes {
-            let mut values = [F128::ZERO; 16];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *row(i).add(lane);
-            }
-            super::portable::butterfly_fused_4layer(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *row(i).add(lane) = *value;
-            }
-            lane += 1;
-        }
+        });
     }
 }
 
