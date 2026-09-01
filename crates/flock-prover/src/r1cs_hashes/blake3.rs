@@ -1075,7 +1075,6 @@ unsafe fn inject_alpha_e_x4(
     // and non-aliasing are invariants of Blake3AdjointPlan::build and this
     // helper's contract; target features are declared above.
     unsafe {
-        let (t, t_x64) = ghash_broadcast_split(alpha);
         let accp = acc.as_mut_ptr();
         let ap = a_roots.as_ptr();
         let bp = b_roots.as_ptr();
@@ -1090,11 +1089,11 @@ unsafe fn inject_alpha_e_x4(
             //   [OUT_HI_BASE, USEFUL_BITS)           B = const
             //
             // Thus exactly 1153 + 56*64 + 256 = 4993 rows target `cz`.
-            // Walk those ranges directly: no root comparison or row-kind
-            // branch appears in the hot loops. A keeps the incumbent whole-
-            // prefix four-wide split-GHASH loop unchanged; B gets a separate
-            // static-range pass. The three SIMD padding rows retain their old
-            // zero-node scatters after the live prefix.
+            // Walk those ranges directly in a single fused A/B pass:
+            // eqp is loaded once per vector, A products are computed with
+            // four-wide split GHASH unrolled 4x, B constant roots are
+            // accumulated directly in ZMM registers with vector XOR, and
+            // carry roots are scattered to bp in the same iteration.
             const CARRY_ROWS_PER_G: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
             const CONST_ROWS_PER_G: usize = LIN_WORDS_PER_G * WORD_BITS;
             const B_CONST_ROWS: usize =
@@ -1121,10 +1120,7 @@ unsafe fn inject_alpha_e_x4(
                     .all(|&root| root == Z_CONST_POS as u32)
             }));
 
-            // A side: byte-for-byte the incumbent x4/unroll4 walk, minus the
-            // interleaved B writes. Keeping one whole-prefix walk avoids the
-            // 113 scalar A rows that independent static-range walks would
-            // leave (the 1-row prefix tail plus 2 carry tails for each G).
+            let (t, t_x64) = ghash_broadcast_split(alpha);
             macro_rules! scatter_a4 {
                 ($r:expr, $ea:expr) => {{
                     let r = $r;
@@ -1135,94 +1131,103 @@ unsafe fn inject_alpha_e_x4(
                     *accp.add(*ap.add(r + 3) as usize) += ea4[3];
                 }};
             }
-
-            const WIDTH: usize = 4;
-            const UNROLL: usize = 4;
-            const SPAN: usize = WIDTH * UNROLL;
-            let unroll_end = round4 & !(SPAN - 1);
-            let mut r = 0usize;
-            if unroll_end >= SPAN {
-                let mut e0 = f128x4_loadu(eqp);
-                let mut e1 = f128x4_loadu(eqp.add(4));
-                let mut e2 = f128x4_loadu(eqp.add(8));
-                let mut e3 = f128x4_loadu(eqp.add(12));
-                let (mut p0, mut p1, mut p2, mut p3) =
-                    ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
-                r = SPAN;
-                while r < unroll_end {
-                    e0 = f128x4_loadu(eqp.add(r));
-                    e1 = f128x4_loadu(eqp.add(r + 4));
-                    e2 = f128x4_loadu(eqp.add(r + 8));
-                    e3 = f128x4_loadu(eqp.add(r + 12));
-                    let next = ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
-                    scatter_a4!(r - SPAN, p0);
-                    scatter_a4!(r - SPAN + 4, p1);
-                    scatter_a4!(r - SPAN + 8, p2);
-                    scatter_a4!(r - SPAN + 12, p3);
-                    p0 = next.0;
-                    p1 = next.1;
-                    p2 = next.2;
-                    p3 = next.3;
-                    r += SPAN;
-                }
-                scatter_a4!(unroll_end - SPAN, p0);
-                scatter_a4!(unroll_end - SPAN + 4, p1);
-                scatter_a4!(unroll_end - SPAN + 8, p2);
-                scatter_a4!(unroll_end - SPAN + 12, p3);
-            }
-            while r < round4 {
-                let e = f128x4_loadu(eqp.add(r));
-                let product = ghash_mul_x4_split(e, t, t_x64);
-                scatter_a4!(r, product);
-                r += WIDTH;
+            macro_rules! scatter_b4 {
+                ($r:expr, $e:expr) => {{
+                    let r = $r;
+                    let e4 = f128x4_extract($e);
+                    *accp.add(*bp.add(r) as usize) += e4[0];
+                    *accp.add(*bp.add(r + 1) as usize) += e4[1];
+                    *accp.add(*bp.add(r + 2) as usize) += e4[2];
+                    *accp.add(*bp.add(r + 3) as usize) += e4[3];
+                }};
             }
 
-            // B side: the constant-pin ranges reduce in ZMM registers. Carry
-            // ranges keep one scatter per row, in their original row order.
             let mut cz4 = _mm512_setzero_si512();
             let mut cz_tail = F128::ZERO;
-            macro_rules! aggregate_cz_range {
+
+            macro_rules! process_const_b_range {
                 ($begin:expr, $end:expr) => {{
                     let end = $end;
                     let mut r = $begin;
-                    while r + WIDTH <= end {
-                        cz4 = _mm512_xor_si512(cz4, f128x4_loadu(eqp.add(r)));
-                        r += WIDTH;
+                    while r + 16 <= end {
+                        let e0 = f128x4_loadu(eqp.add(r));
+                        let e1 = f128x4_loadu(eqp.add(r + 4));
+                        let e2 = f128x4_loadu(eqp.add(r + 8));
+                        let e3 = f128x4_loadu(eqp.add(r + 12));
+                        cz4 = _mm512_xor_si512(
+                            cz4,
+                            _mm512_xor_si512(_mm512_xor_si512(e0, e1), _mm512_xor_si512(e2, e3)),
+                        );
+                        let (p0, p1, p2, p3) =
+                            ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                        scatter_a4!(r, p0);
+                        scatter_a4!(r + 4, p1);
+                        scatter_a4!(r + 8, p2);
+                        scatter_a4!(r + 12, p3);
+                        r += 16;
+                    }
+                    while r + 4 <= end {
+                        let e = f128x4_loadu(eqp.add(r));
+                        cz4 = _mm512_xor_si512(cz4, e);
+                        let product = ghash_mul_x4_split(e, t, t_x64);
+                        scatter_a4!(r, product);
+                        r += 4;
                     }
                     while r < end {
-                        cz_tail += *eqp.add(r);
-                        r += 1;
-                    }
-                }};
-            }
-            macro_rules! scatter_b_range {
-                ($begin:expr, $end:expr) => {{
-                    let end = $end;
-                    let mut r = $begin;
-                    while r + WIDTH <= end {
-                        let e4 = f128x4_extract(f128x4_loadu(eqp.add(r)));
-                        *accp.add(*bp.add(r) as usize) += e4[0];
-                        *accp.add(*bp.add(r + 1) as usize) += e4[1];
-                        *accp.add(*bp.add(r + 2) as usize) += e4[2];
-                        *accp.add(*bp.add(r + 3) as usize) += e4[3];
-                        r += WIDTH;
-                    }
-                    while r < end {
-                        *accp.add(*bp.add(r) as usize) += *eqp.add(r);
+                        let e = *eqp.add(r);
+                        cz_tail += e;
+                        *accp.add(*ap.add(r) as usize) += alpha * e;
                         r += 1;
                     }
                 }};
             }
 
-            aggregate_cz_range!(0, GS_BASE);
+            macro_rules! process_carry_b_range {
+                ($begin:expr, $end:expr) => {{
+                    let end = $end;
+                    let mut r = $begin;
+                    while r + 16 <= end {
+                        let e0 = f128x4_loadu(eqp.add(r));
+                        let e1 = f128x4_loadu(eqp.add(r + 4));
+                        let e2 = f128x4_loadu(eqp.add(r + 8));
+                        let e3 = f128x4_loadu(eqp.add(r + 12));
+                        let (p0, p1, p2, p3) =
+                            ghash_mul_x4_split_unroll4(e0, e1, e2, e3, t, t_x64);
+                        scatter_a4!(r, p0);
+                        scatter_b4!(r, e0);
+                        scatter_a4!(r + 4, p1);
+                        scatter_b4!(r + 4, e1);
+                        scatter_a4!(r + 8, p2);
+                        scatter_b4!(r + 8, e2);
+                        scatter_a4!(r + 12, p3);
+                        scatter_b4!(r + 12, e3);
+                        r += 16;
+                    }
+                    while r + 4 <= end {
+                        let e = f128x4_loadu(eqp.add(r));
+                        let product = ghash_mul_x4_split(e, t, t_x64);
+                        scatter_a4!(r, product);
+                        scatter_b4!(r, e);
+                        r += 4;
+                    }
+                    while r < end {
+                        let e = *eqp.add(r);
+                        *accp.add(*ap.add(r) as usize) += alpha * e;
+                        *accp.add(*bp.add(r) as usize) += e;
+                        r += 1;
+                    }
+                }};
+            }
+
+            process_const_b_range!(0, GS_BASE);
             for g in 0..N_G {
                 let g0 = GS_BASE + g * G_STRIDE;
                 let carry_end = g0 + CARRY_ROWS_PER_G;
-                scatter_b_range!(g0, carry_end);
-                aggregate_cz_range!(carry_end, g0 + G_STRIDE);
+                process_carry_b_range!(g0, carry_end);
+                process_const_b_range!(carry_end, g0 + G_STRIDE);
             }
-            aggregate_cz_range!(OUT_HI_BASE, USEFUL_BITS);
-            scatter_b_range!(n_rows, round4);
+            process_const_b_range!(OUT_HI_BASE, USEFUL_BITS);
+            process_carry_b_range!(n_rows, round4);
 
             let lanes = f128x4_extract(cz4);
             let cz_sum = cz_tail + lanes[0] + lanes[1] + lanes[2] + lanes[3];
@@ -1230,6 +1235,7 @@ unsafe fn inject_alpha_e_x4(
             return;
         }
 
+        let (t, t_x64) = ghash_broadcast_split(alpha);
         macro_rules! scatter4 {
             ($r:expr, $ea:expr) => {{
                 let r = $r;
