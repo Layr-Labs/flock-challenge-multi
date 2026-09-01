@@ -638,8 +638,9 @@ impl WideGhashX4 {
         // 0x96 = a ^ b ^ c.
         self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
         self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+        let m0 = _mm512_xor_si512(c01_0, c10_0);
+        let m1 = _mm512_xor_si512(c01_1, c10_1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, m0, m1);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
