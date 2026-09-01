@@ -511,7 +511,10 @@ impl Round1AbInner {
         assert_eq!(self.invalid_prefix_bytes, 0);
         if self.ranked_compact {
             assert_eq!(self.dense_len_bytes, 1usize << 29);
-            assert_eq!(self.as_bytes().len(), (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES);
+            assert_eq!(
+                self.as_bytes().len(),
+                (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES
+            );
         }
         self.ranked_one_rows_elided = true;
     }
@@ -547,9 +550,8 @@ impl Round1AbInner {
         assert_eq!(b_packed.len(), self.dense_len_bytes);
         assert_eq!(inv_table.k, K_SKIP);
         if self.ranked_compact {
-            let dense = crate::scratch::take_f128(
-                self.dense_len_bytes / core::mem::size_of::<F128>(),
-            );
+            let dense =
+                crate::scratch::take_f128(self.dense_len_bytes / core::mem::size_of::<F128>());
             crate::scratch::give_f128(core::mem::replace(&mut self.storage, dense));
             self.ranked_compact = false;
         }
@@ -1258,9 +1260,7 @@ pub unsafe fn round1_ab_inner_window30_k0(
         return;
     }
     unsafe {
-        round1_ab_inner_window_with_images(
-            a_window, b_window, out, blk, inv_table, plan, imgs,
-        );
+        round1_ab_inner_window_with_images(a_window, b_window, out, blk, inv_table, plan, imgs);
     }
 }
 
@@ -2613,9 +2613,8 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
 /// clear-then-accumulate form, which is the byte-identity oracle.
 #[inline]
 fn c_plane_first_write_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none());
     *ON
 }
 
@@ -3390,8 +3389,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         if compact {
             let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
             debug_assert!((2..31).contains(&row_in_block));
-            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES
-                + (row_in_block - 2) * ELL
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
         } else {
             x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
         }
@@ -3435,13 +3433,12 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             let x_next = x_outer_lo + pf_windows;
             let x_next_outer = x_next | (x_hi << n_lo);
             let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_first = if ranked_one_rows_elided
-                && ((x_outer + pf_windows) & within_outer_mask) == 0
-            {
-                2
-            } else {
-                0
-            };
+            let next_first =
+                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                };
             (
                 n_next,
                 live_row_base(x_next_outer, next_first, ranked_compact),
@@ -3511,8 +3508,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
                 // Borrow only initialized, consumed rows. In particular, do
                 // not form a full-window array reference over the two omitted
                 // prefix rows or the odd window's unused final row.
-                let live_rows = &ab_inner
-                    [live_base..live_base + (n_b_med - first_b_med) * ELL];
+                let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
                 let prefetch = kernels::AbDirectPrefetch {
                     next_window: if pf_windows == 0 {
                         core::ptr::null()

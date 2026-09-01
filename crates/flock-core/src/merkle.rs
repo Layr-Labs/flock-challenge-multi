@@ -387,20 +387,17 @@ pub(crate) fn hash_indexed_blake3_1k(data: &[u8], indices: &[usize], out: &mut [
             let base_ptr = data.as_ptr();
             // SAFETY: chunks are non-empty and the entry assertions prove each
             // indexed 1 KiB message lies in `data`. Shared inputs may alias.
-            let first: &[u8; LEAF_SIZE] = unsafe {
-                &*(base_ptr.add(positions[0] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-            };
+            let first: &[u8; LEAF_SIZE] =
+                unsafe { &*(base_ptr.add(positions[0] * LEAF_SIZE) as *const [u8; LEAF_SIZE]) };
             let mut inputs: [&[u8; LEAF_SIZE]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
             for i in 0..n {
-                inputs[i] = unsafe {
-                    &*(base_ptr.add(positions[i] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-                };
+                inputs[i] =
+                    unsafe { &*(base_ptr.add(positions[i] * LEAF_SIZE) as *const [u8; LEAF_SIZE]) };
             }
             // SAFETY: Hash is exactly 32 initialized bytes; `hash_many`
             // overwrites every byte in this output chunk.
-            let out_bytes = unsafe {
-                core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32)
-            };
+            let out_bytes =
+                unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32) };
             blake3_platform().hash_many(
                 &inputs[..n],
                 &BLAKE3_IV,
