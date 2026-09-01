@@ -515,7 +515,7 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
         return;
     }
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_none());
     if *DISABLED {
         return;
     }
