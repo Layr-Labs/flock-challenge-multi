@@ -30,17 +30,33 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     // SAFETY: the caller guarantees all table and row bounds. Every table
     // entry is 16-byte aligned because F128 has align(16).
     unsafe {
-        let rows = [a0_bytes, a1_bytes, b0_bytes, b1_bytes];
-        let mut acc = [_mm_setzero_si128(); 4];
+        let r0 = core::ptr::read_unaligned(a0_bytes.cast::<u64>());
+        let r1 = core::ptr::read_unaligned(a1_bytes.cast::<u64>());
+        let r2 = core::ptr::read_unaligned(b0_bytes.cast::<u64>());
+        let r3 = core::ptr::read_unaligned(b1_bytes.cast::<u64>());
+        let mut acc0 = _mm_setzero_si128();
+        let mut acc1 = _mm_setzero_si128();
+        let mut acc2 = _mm_setzero_si128();
+        let mut acc3 = _mm_setzero_si128();
+
         for chunk in 0..8 {
             let table_chunk = table_data.add(chunk * 256);
-            for lane in 0..4 {
-                let entry = table_chunk.add(*rows[lane].add(chunk) as usize);
-                acc[lane] = _mm_xor_si128(acc[lane], _mm_load_si128(entry.cast::<__m128i>()));
-            }
+            let b0 = ((r0 >> (chunk * 8)) & 0xFF) as usize;
+            let b1 = ((r1 >> (chunk * 8)) & 0xFF) as usize;
+            let b2 = ((r2 >> (chunk * 8)) & 0xFF) as usize;
+            let b3 = ((r3 >> (chunk * 8)) & 0xFF) as usize;
+
+            acc0 = _mm_xor_si128(acc0, _mm_load_si128(table_chunk.add(b0).cast::<__m128i>()));
+            acc1 = _mm_xor_si128(acc1, _mm_load_si128(table_chunk.add(b1).cast::<__m128i>()));
+            acc2 = _mm_xor_si128(acc2, _mm_load_si128(table_chunk.add(b2).cast::<__m128i>()));
+            acc3 = _mm_xor_si128(acc3, _mm_load_si128(table_chunk.add(b3).cast::<__m128i>()));
         }
-        // F128 is exactly two u64 words and accepts every bit pattern.
-        acc.map(|value| core::mem::transmute::<__m128i, F128>(value))
+        [
+            core::mem::transmute::<__m128i, F128>(acc0),
+            core::mem::transmute::<__m128i, F128>(acc1),
+            core::mem::transmute::<__m128i, F128>(acc2),
+            core::mem::transmute::<__m128i, F128>(acc3),
+        ]
     }
 }
 

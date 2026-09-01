@@ -324,29 +324,26 @@ fn blake3_hash_many<const N: usize>(
     flags_start: u8,
     flags_end: u8,
 ) {
-    assert_eq!(data.len(), out.len() * N);
+    debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
-    for (outs, msgs) in out
-        .chunks_mut(BLAKE3_BATCH)
-        .zip(data.chunks(BLAKE3_BATCH * N))
-    {
-        let n = outs.len();
-        let base_ptr = msgs.as_ptr();
-        // SAFETY: the entry assertion gives every `n`-element output chunk
-        // exactly `n * N` initialized message bytes. All call-site
-        // monomorphizations have `N > 0`, `0 <= i < n`, and `[u8; N]` has
-        // byte alignment, so each pointer below addresses one complete input.
-        // Unused tail slots retain the valid first input and are not passed.
-        let first: &[u8; N] = unsafe { &*(base_ptr as *const [u8; N]) };
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for i in 0..n {
-            inputs[i] = unsafe { &*(base_ptr.add(i * N) as *const [u8; N]) };
-        }
-        // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
-        // initialized, contiguous, unpadded storage — the amount `hash_many`
-        // writes for `n` inputs.
-        let out_bytes: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+    let data_ptr = data.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let total = out.len();
+    let mut offset = 0;
+    while offset < total {
+        let n = (total - offset).min(BLAKE3_BATCH);
+        let inputs: [&[u8; N]; BLAKE3_BATCH] = unsafe {
+            let p = data_ptr.add(offset * N);
+            let first: &[u8; N] = &*(p as *const [u8; N]);
+            let mut arr = [first; BLAKE3_BATCH];
+            for i in 1..n {
+                arr[i] = &*(p.add(i * N) as *const [u8; N]);
+            }
+            arr
+        };
+        let out_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.add(offset) as *mut u8, n * 32)
+        };
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
@@ -357,6 +354,7 @@ fn blake3_hash_many<const N: usize>(
             flags_end,
             out_bytes,
         );
+        offset += n;
     }
 }
 
@@ -523,12 +521,7 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
-            for (outs, leaves) in out
-                .chunks_mut(BLAKE3_GROUP)
-                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
-            {
-                blake3_hash_many_leaves(leaves, leaf_size, outs);
-            }
+            blake3_hash_many_leaves(data, leaf_size, out);
         }
         HashKind::Blake3 => {
             for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
