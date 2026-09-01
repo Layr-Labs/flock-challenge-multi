@@ -1265,16 +1265,7 @@ pub unsafe fn round1_ab_inner_window30_k0(
 }
 
 /// `u16` count of one window-block's pre-scaled offset block for
-/// [`round1_ab_inner_window_from_offsets`]: 64 A-side offsets then 64 B-side
-/// offsets, each `byte * 64`.
-///
-/// The consumers take a layout parameter `P`. `P = false` is byte order
-/// (offset `i` of a side at word `i`, so K-row `k` is the eight words at
-/// `8k`). `P = true` is the parity split a `vpmaddubsw` widen produces: the
-/// side's 32 even-byte offsets first, then its 32 odd-byte offsets (offset
-/// `i` at word `(i & 1) * 32 + (i >> 1)`), so K-row `k` is the even word at
-/// `4k` and the odd word at `32 + 4k`. Both layouts address identical table
-/// rows in identical order; only the arena slots differ.
+/// [`round1_ab_inner_window_from_offsets`].
 pub const ROUND1_AB_OFF_WORDS: usize = 128;
 
 impl Round1AbWindowPlan {
@@ -1335,7 +1326,7 @@ pub unsafe fn round1_ab_window_offsets(
 /// window-block's a/b bytes and `plan.offsets_eligible(blk)` true.
 #[inline]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1349,7 +1340,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
     ))]
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off(
             off.as_ptr(),
             out,
             plan.nt,
@@ -1376,7 +1367,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
 /// [`abinner_publish_fence`] before publishing the output across threads.
 #[inline]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1392,7 +1383,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
     ))]
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1417,7 +1408,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
 /// geometry above. This wrapper does no per-window raw-B guard by design.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1435,7 +1426,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2::<P>(
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1455,7 +1446,6 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
     const BLK: usize,
-    const P: bool,
 >(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
@@ -1473,7 +1463,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK>(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1492,7 +1482,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1509,7 +1499,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
