@@ -5239,6 +5239,25 @@ fn materialize_direct_fold4(
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
                     for slot in (0..block_len).step_by(64) {
+                        // Prefetch the next block's packed-witness slab into L2
+                        // while the GFNI b-side is compute-bound. Same density as
+                        // the scalar path: one cache line per four output slots.
+                        // Prefetch is architecturally invisible, so this is
+                        // bit-identical to the no-prefetch arm.
+                        #[cfg(target_arch = "x86_64")]
+                        if !pf_base.is_null() {
+                            unsafe {
+                                for _ in 0..16 {
+                                    if pf_at < pf_span {
+                                        core::arch::x86_64::_mm_prefetch(
+                                            pf_base.add(pf_at).cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T1,
+                                        );
+                                        pf_at += 64;
+                                    }
+                                }
+                            }
+                        }
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate
                         // supplies every feature required by the kernel.
