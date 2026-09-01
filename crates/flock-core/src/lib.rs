@@ -238,7 +238,7 @@ pub(crate) mod smt_split {
 
     /// Compile-time rollback. `false` restores the incumbent schedule and
     /// builds no pools at all.
-    pub(crate) const ZC_R1_SMT_SPLIT: bool = true;
+    pub(crate) const ZC_R1_SMT_SPLIT: bool = false;
 
     static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
 
