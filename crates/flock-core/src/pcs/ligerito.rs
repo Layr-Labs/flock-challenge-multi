@@ -4950,6 +4950,18 @@ fn mdf4_pf_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_MDF4_PIPE=1` restores the incumbent `materialize_direct_fold4`
+/// schedule that runs the full f-side fold, then the full b-side fold, then
+/// the message reduction. The pipelined arm instead processes the block in
+/// sub-blocks so the memory-bound f-side of the next sub-block overlaps with
+/// the compute-bound b-side of the current sub-block. Same proof bytes.
+#[cfg(target_arch = "x86_64")]
+fn mdf4_pipeline_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MDF4_PIPE").is_none());
+    *ON
+}
+
 /// Same-binary rollback for the ranked DirectFold4 two-claim GFNI b-side.
 /// Every other shape retains the table-hot scalar path below.
 #[cfg(all(
@@ -5164,69 +5176,15 @@ fn materialize_direct_fold4(
                 };
                 #[cfg(target_arch = "x86_64")]
                 let mut pf_at = 0usize;
-                if deferred_reduce {
-                    // ---- f: 16:1 in one deferred-reduction pass (one reduce
-                    // per output lane; same field element as the nested form).
-                    crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
-                } else {
-                    // ---- f: 16:1 nested pair folds, sub-block at a time.
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &f_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut f_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
-                    }
-                }
-                // ---- b: ordinary basis (if any) folded 16:1 with the same weights.
-                if has_ordinary {
-                    let b_in = &ordinary_basis[start..start + 16 * block_len];
-                    let mut slot = 0usize;
-                    while slot < block_len {
-                        let n = SUB.min(block_len - slot);
-                        let mid = &mut mid[..4 * n];
-                        crate::field::f128_slice::fold4_nested(
-                            &b_in[16 * slot..16 * (slot + n)],
-                            mid,
-                            r0,
-                            r1,
-                        );
-                        crate::field::f128_slice::fold4_nested(
-                            mid,
-                            &mut b_out[slot..slot + n],
-                            r2,
-                            r3,
-                        );
-                        slot += n;
-                    }
-                }
-                // ---- b: direct claims. The ranked two-claim GFNI route folds
-                // the low/high words of both maps together. Its no-prefetch
-                // stack-plane schedule avoids disturbing the fused kernel's
-                // 1 KiB temporary; every other geometry is the incumbent
-                // table-hot scalar schedule.
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "avx512vbmi",
-                    target_feature = "vpclmulqdq",
-                    target_feature = "gfni"
-                ))]
-                if b_gfni_on {
+                if deferred_reduce && b_gfni_on && !has_ordinary && mdf4_pipeline_enabled() {
+                    // ---- Pipelined sub-block path (ranked DirectFold4 only).
+                    // Process the block in SUB-slot chunks so the memory-bound
+                    // f-side fold of the next chunk overlaps with the compute-
+                    // bound GFNI b-side of the current chunk.
+                    let mut u0_acc = F128::ZERO;
+                    let mut u2_acc = F128::ZERO;
                     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
                     use core::arch::x86_64::_mm512_setzero_si512;
-
                     let (claim0, claim1) = (&claims[0], &claims[1]);
                     let (mats0_lo, mats0_hi) = super::ring_switch::compose_block_mats_gfni(
                         &direct_gfni_mats[0],
@@ -5237,75 +5195,189 @@ fn materialize_direct_fold4(
                         claim1.eq_hi[block],
                     );
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
-                    for slot in (0..block_len).step_by(64) {
-                        // SAFETY: each row half supplies 512 bytes, the four
-                        // maps cover 64 output slots, and the cfg gate
-                        // supplies every feature required by the kernel.
-                        unsafe {
-                            gfni_fold64_four_maps_staged(
-                                rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
-                                rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
-                                rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
-                                rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
-                                b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
-                            );
-                        }
-                    }
-                }
-                if !b_gfni_on {
-                    let table = &mut scratch[..table_len];
-                    let mut claims_iter = claims.iter().zip(direct_tables.iter());
-                    let (first, first_table) = claims_iter
-                        .next()
-                        .expect("materialize_direct_fold4: claims non-empty");
-                    super::ring_switch::compose_block_table(first_table, first.eq_hi[block], table);
-                    let mut s = 0usize;
-                    while s + 3 < block_len {
-                        #[cfg(target_arch = "x86_64")]
-                        if !pf_base.is_null() && pf_at < pf_span {
-                            // SAFETY: `pf_at < pf_span` and the slab is
-                            // `pf_span` bytes, so the address is inside
-                            // `packed_witness`. Prefetch has no architectural
-                            // effect, so this arm is bit-identical to the
-                            // kill-switched one.
+                    for sub_start in (0..block_len).step_by(SUB) {
+                        let sub_end = (sub_start + SUB).min(block_len);
+                        // f-side: 16:1 deferred reduction for this sub-block.
+                        crate::field::f128_slice::fold16_banked(
+                            &f_in[16 * sub_start..16 * sub_end],
+                            &mut f_out[sub_start..sub_end],
+                            &fold_weight,
+                        );
+                        // b-side: GFNI two-claim fold for this sub-block.
+                        let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                        for slot in (sub_start..sub_end).step_by(64) {
+                            // Prefetch the next block's packed-witness slab
+                            // into L2 while the b-side is compute-bound.
+                            #[cfg(target_arch = "x86_64")]
+                            if !pf_base.is_null() {
+                                unsafe {
+                                    for _ in 0..16 {
+                                        if pf_at < pf_span {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                pf_base.add(pf_at).cast::<i8>(),
+                                                core::arch::x86_64::_MM_HINT_T1,
+                                            );
+                                            pf_at += 64;
+                                        }
+                                    }
+                                }
+                            }
+                            // SAFETY: same contract as the incumbent GFNI arm.
                             unsafe {
-                                core::arch::x86_64::_mm_prefetch(
-                                    pf_base.add(pf_at).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T1,
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                                 );
                             }
-                            pf_at += 64;
                         }
-                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
-                        b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
-                        b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
-                        b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
-                        s += 4;
+                        // Message reduction for this sub-block.
+                        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                        {
+                            let (u0_sub, u2_sub) = unsafe {
+                                msg_reduce_avx512(
+                                    &f_out[sub_start..sub_end],
+                                    &b_out[sub_start..sub_end],
+                                )
+                            };
+                            u0_acc += u0_sub;
+                            u2_acc += u2_sub;
+                        }
+                        #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                        {
+                            let mut k = sub_start;
+                            while k + 1 < sub_end {
+                                let f0 = f_out[k];
+                                let f1 = f_out[k + 1];
+                                let b0 = b_out[k];
+                                let b1 = b_out[k + 1];
+                                u0_acc += f0 * b0;
+                                u2_acc += (f0 + f1) * (b0 + b1);
+                                k += 2;
+                            }
+                        }
                     }
-                    while s < block_len {
-                        b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
-                        s += 1;
+                    (u0_acc, u2_acc)
+                } else {
+                    // ---- Incumbent full-block path.
+                    if deferred_reduce {
+                        // f: 16:1 in one deferred-reduction pass.
+                        crate::field::f128_slice::fold16_banked(f_in, f_out, &fold_weight);
+                    } else {
+                        // f: 16:1 nested pair folds, sub-block at a time.
+                        let mut slot = 0usize;
+                        while slot < block_len {
+                            let n = SUB.min(block_len - slot);
+                            let mid = &mut mid[..4 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &f_in[16 * slot..16 * (slot + n)],
+                                mid,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                mid,
+                                &mut f_out[slot..slot + n],
+                                r2,
+                                r3,
+                            );
+                            slot += n;
+                        }
                     }
-                    for (claim, direct_table) in claims_iter {
-                        super::ring_switch::compose_block_table(
-                            direct_table,
-                            claim.eq_hi[block],
-                            table,
+                    // b: ordinary basis (if any) folded 16:1 with the same weights.
+                    if has_ordinary {
+                        let b_in = &ordinary_basis[start..start + 16 * block_len];
+                        let mut slot = 0usize;
+                        while slot < block_len {
+                            let n = SUB.min(block_len - slot);
+                            let mid = &mut mid[..4 * n];
+                            crate::field::f128_slice::fold4_nested(
+                                &b_in[16 * slot..16 * (slot + n)],
+                                mid,
+                                r0,
+                                r1,
+                            );
+                            crate::field::f128_slice::fold4_nested(
+                                mid,
+                                &mut b_out[slot..slot + n],
+                                r2,
+                                r3,
+                            );
+                            slot += n;
+                        }
+                    }
+                    // b: direct claims. GFNI route or scalar route.
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vbmi",
+                        target_feature = "vpclmulqdq",
+                        target_feature = "gfni"
+                    ))]
+                    if b_gfni_on {
+                        use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+                        use core::arch::x86_64::_mm512_setzero_si512;
+
+                        let (claim0, claim1) = (&claims[0], &claims[1]);
+                        let (mats0_lo, mats0_hi) = super::ring_switch::compose_block_mats_gfni(
+                            &direct_gfni_mats[0],
+                            claim0.eq_hi[block],
                         );
+                        let (mats1_lo, mats1_hi) = super::ring_switch::compose_block_mats_gfni(
+                            &direct_gfni_mats[1],
+                            claim1.eq_hi[block],
+                        );
+                        let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                        let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                        for slot in (0..block_len).step_by(64) {
+                            #[cfg(target_arch = "x86_64")]
+                            if !pf_base.is_null() {
+                                unsafe {
+                                    for _ in 0..16 {
+                                        if pf_at < pf_span {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                pf_base.add(pf_at).cast::<i8>(),
+                                                core::arch::x86_64::_MM_HINT_T1,
+                                            );
+                                            pf_at += 64;
+                                        }
+                                    }
+                                }
+                            }
+                            unsafe {
+                                gfni_fold64_four_maps_staged(
+                                    rows0.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_lo,
+                                    rows0.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats0_hi,
+                                    rows1.0.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_lo,
+                                    rows1.1.as_ptr().add(slot).cast::<u8>(),
+                                    &mats1_hi,
+                                    b_out.as_mut_ptr().add(slot),
+                                    planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
+                                );
+                            }
+                        }
+                    }
+                    if !b_gfni_on {
+                        let table = &mut scratch[..table_len];
+                        let mut claims_iter = claims.iter().zip(direct_tables.iter());
+                        let (first, first_table) = claims_iter
+                            .next()
+                            .expect("materialize_direct_fold4: claims non-empty");
+                        super::ring_switch::compose_block_table(first_table, first.eq_hi[block], table);
                         let mut s = 0usize;
                         while s + 3 < block_len {
                             #[cfg(target_arch = "x86_64")]
                             if !pf_base.is_null() && pf_at < pf_span {
-                                // SAFETY: `pf_at < pf_span` and the slab is
-                                // `pf_span` bytes, so the address is inside
-                                // `packed_witness`. Prefetch has no
-                                // architectural effect.
                                 unsafe {
                                     core::arch::x86_64::_mm_prefetch(
                                         pf_base.add(pf_at).cast::<i8>(),
@@ -5314,43 +5386,72 @@ fn materialize_direct_fold4(
                                 }
                                 pf_at += 64;
                             }
-                            b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
-                            b_out[s + 1] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
-                            b_out[s + 2] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
-                            b_out[s + 3] +=
-                                super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
+                            b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
+                            b_out[s + 1] = super::ring_switch::fold_one_slot(first.eq_lo[s + 1], table);
+                            b_out[s + 2] = super::ring_switch::fold_one_slot(first.eq_lo[s + 2], table);
+                            b_out[s + 3] = super::ring_switch::fold_one_slot(first.eq_lo[s + 3], table);
                             s += 4;
                         }
                         while s < block_len {
-                            b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
+                            b_out[s] = super::ring_switch::fold_one_slot(first.eq_lo[s], table);
                             s += 1;
                         }
+                        for (claim, direct_table) in claims_iter {
+                            super::ring_switch::compose_block_table(
+                                direct_table,
+                                claim.eq_hi[block],
+                                table,
+                            );
+                            let mut s = 0usize;
+                            while s + 3 < block_len {
+                                #[cfg(target_arch = "x86_64")]
+                                if !pf_base.is_null() && pf_at < pf_span {
+                                    unsafe {
+                                        core::arch::x86_64::_mm_prefetch(
+                                            pf_base.add(pf_at).cast::<i8>(),
+                                            core::arch::x86_64::_MM_HINT_T1,
+                                        );
+                                    }
+                                    pf_at += 64;
+                                }
+                                b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
+                                b_out[s + 1] +=
+                                    super::ring_switch::fold_one_slot(claim.eq_lo[s + 1], table);
+                                b_out[s + 2] +=
+                                    super::ring_switch::fold_one_slot(claim.eq_lo[s + 2], table);
+                                b_out[s + 3] +=
+                                    super::ring_switch::fold_one_slot(claim.eq_lo[s + 3], table);
+                                s += 4;
+                            }
+                            while s < block_len {
+                                b_out[s] += super::ring_switch::fold_one_slot(claim.eq_lo[s], table);
+                                s += 1;
+                            }
+                        }
                     }
-                }
-                // Vectorized message-term reduction over the folded chunk.
-                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-                {
-                    // SAFETY: target features cfg-guaranteed; f_out/b_out
-                    // have equal length (block_len, a multiple of 2).
-                    unsafe { msg_reduce_avx512(f_out, b_out) }
-                }
-                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-                {
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    let mut k = 0;
-                    while k + 1 < f_out.len() {
-                        let f0 = f_out[k];
-                        let f1 = f_out[k + 1];
-                        let b0 = b_out[k];
-                        let b1 = b_out[k + 1];
-                        u0 += f0 * b0;
-                        u2 += (f0 + f1) * (b0 + b1);
-                        k += 2;
+                    // Vectorized message-term reduction over the folded chunk.
+                    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    {
+                        // SAFETY: target features cfg-guaranteed; f_out/b_out
+                        // have equal length (block_len, a multiple of 2).
+                        unsafe { msg_reduce_avx512(f_out, b_out) }
                     }
-                    (u0, u2)
+                    #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                    {
+                        let mut u0 = F128::ZERO;
+                        let mut u2 = F128::ZERO;
+                        let mut k = 0;
+                        while k + 1 < f_out.len() {
+                            let f0 = f_out[k];
+                            let f1 = f_out[k + 1];
+                            let b0 = b_out[k];
+                            let b1 = b_out[k + 1];
+                            u0 += f0 * b0;
+                            u2 += (f0 + f1) * (b0 + b1);
+                            k += 2;
+                        }
+                        (u0, u2)
+                    }
                 }
             },
         )
@@ -6520,7 +6621,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(2);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
