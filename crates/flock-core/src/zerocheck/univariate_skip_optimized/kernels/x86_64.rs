@@ -84,12 +84,17 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
             inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
             let a_ptr = a_col.as_ptr() as *const u8;
             let b_ptr = b_col.as_ptr() as *const u8;
-            let xk = _mm_set1_epi8((1u8 << k) as i8); // x^k as an F_8 byte; k=0 ⇒ 1
             for c in 0..4usize {
                 let av = _mm_loadu_si128(a_ptr.add(c * 16) as *const __m128i);
                 let bv = _mm_loadu_si128(b_ptr.add(c * 16) as *const __m128i);
-                // y = (a·b) · x^k in F_8. For k=0, xk=1 ⇒ second mul is identity.
-                let y = _mm_gf2p8mul_epi8(_mm_gf2p8mul_epi8(av, bv), xk);
+                let product = _mm_gf2p8mul_epi8(av, bv);
+                // x^0 is the multiplicative identity, so avoid one GFNI operation
+                // for the first row.
+                let y = if k == 0 {
+                    product
+                } else {
+                    _mm_gf2p8mul_epi8(product, _mm_set1_epi8((1u8 << k) as i8))
+                };
                 acc[c] = _mm_xor_si128(acc[c], y);
             }
         }
