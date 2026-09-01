@@ -27,11 +27,14 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    UniSkipFoldTable, eval_round3_lookahead, eval_round4_lookahead,
+    fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
-    fold2_plain_and_round_pair_lookahead_into, fold2_plain_and_round4_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
-    packed_round2_split_eq, round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
+    fold2_plain_and_round_pair_lookahead_into, fold2_plain_and_round_pair_lookahead2_into,
+    fold2_plain_and_round4_into, fold3_plain_and_round_pair_lookahead_into,
+    fold3_plain_and_round6_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    marginalize_eq_low2, packed_round2_split_eq, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
     uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq,
 };
@@ -175,6 +178,30 @@ fn cascade5_off() -> bool {
 #[inline]
 fn deep_cascade_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+}
+/// Test-only forced-off latch for the width-3 cascade.
+#[cfg(test)]
+pub(crate) static ZC_WIDTH3_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: number of width-3 levels the last prove ran with, so the
+/// transcript-identity test can assert the arm really engaged.
+#[cfg(test)]
+pub(crate) static ZC_WIDTH3_LAST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// `FLOCK_NO_ZC_WIDTH3=1` restores the all-width-2 cascade ladder. The
+/// default composes three rounds per pass from cascade level 2 while the
+/// iteration count and parity weights allow (value-identical reassociation,
+/// same argument as the width-2 cascade one variable further); the ranked
+/// worker's cleared environment never sets it.
+#[inline]
+fn width3_off() -> bool {
+    #[cfg(test)]
+    if ZC_WIDTH3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_WIDTH3").is_some()
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -918,12 +945,66 @@ fn prove_packed_padded_inner<C: Challenger>(
     };
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
+    // Width-3 cascade schedule (`FLOCK_NO_ZC_WIDTH3` restores the
+    // all-width-2 ladder). Levels 0 (packed/plain) and 1 (plain,
+    // la2-extended) keep their incumbent shapes; from iteration base 4
+    // each pass composes THREE rounds while the iteration count and the
+    // parity weights allow, then incumbent width-2 levels finish. The la
+    // chain drains exactly as the incumbent ladder's does — the last
+    // composed level emits no lookahead and the generic tail loop resumes
+    // from the current table. Every pass is the cascade's own
+    // value-identical reassociation applied one variable further, so the
+    // transcript is byte-identical either way.
+    let n_tail_iters = n_mlv - 1;
+    let mut w3_levels = 0usize;
+    let mut w3_terminal = false;
+    if n_levels >= 2 && n_in >= 128 && r[k_skip + 6] != F128::ZERO && !width3_off() {
+        while n_tail_iters - 4 - 3 * w3_levels > 3 {
+            let b = 4 + 3 * w3_levels;
+            // The n-gate comes first: `(n_in >> b) >= 64` is exactly
+            // `b <= n_mlv - 6`, which is also the bound that keeps the
+            // parity-weight reads r[k_skip + b + 5] inside r (len m).
+            if (n_in >> b) < 64
+                || r[k_skip + b + 4] == F128::ZERO
+                || r[k_skip + b + 5] == F128::ZERO
+            {
+                break;
+            }
+            w3_levels += 1;
+        }
+        let rem = n_tail_iters - 4 - 3 * w3_levels;
+        let b = 4 + 3 * w3_levels;
+        if rem == 3
+            && (n_in >> b) >= 64
+            && r[k_skip + b + 4] != F128::ZERO
+            && r[k_skip + b + 5] != F128::ZERO
+        {
+            w3_terminal = true;
+        }
+        if n_tail_iters - 4 - 3 * w3_levels - if w3_terminal { 3 } else { 0 } == 1 {
+            // A stranded la1 with a single leftover iteration cannot
+            // drain; drop one la-emitting level so the width-2 finish
+            // covers the last four iterations.
+            w3_levels = w3_levels.saturating_sub(1);
+        }
+    }
+    let use_width3 = w3_levels > 0 || w3_terminal;
+    let incumbent_levels = if use_width3 { 0 } else { n_levels };
+    #[cfg(test)]
+    ZC_WIDTH3_LAST.store(
+        if use_width3 {
+            w3_levels + w3_terminal as usize
+        } else {
+            0
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2·levels needs no other change.
     let mut la = lookahead;
-    for level in 0..n_levels {
+    for level in 0..incumbent_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level]);
@@ -1015,7 +1096,282 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
     }
-    let loop_start = 2 * n_levels;
+    let mut loop_start = 2 * incumbent_levels;
+    if use_width3 {
+        // Assigned by the level-1 block before any width-3 level reads it.
+        let mut la2: Option<multilinear::Round4Lookahead>;
+
+        // ---- Level 0: incumbent shape (packed nomat or plain first) ----
+        {
+            let la_cur = la.take().expect("cascade level without a deferred message");
+            let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[0]);
+            multilinear_msgs.push((m_odd_1, m_odd_inf));
+            challenger.observe_f128(m_odd_1);
+            challenger.observe_f128(m_odd_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let n_cur = n_in;
+            let log_n_cur = n_cur.trailing_zeros() as usize;
+            let quarter = n_cur / 4;
+            let mut r_next = vec![F128::ONE; log_n_cur - 2];
+            r_next[1..].copy_from_slice(&r[k_skip + 3..]);
+            let (m_even_1, m_even_inf) = if use_nomat {
+                // Identical to the incumbent level-0 nomat arm.
+                let mut a4 = crate::scratch::take_f128(quarter);
+                let mut b4 = crate::scratch::take_f128(quarter);
+                let round2_eq = packed_eq.take();
+                let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
+                let eq_override = match (&eq_lo, &round2_eq) {
+                    (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
+                    _ => None,
+                };
+                let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
+                    a_packed,
+                    b_packed,
+                    m,
+                    k_skip,
+                    &fold_table,
+                    padding,
+                    &mut a4,
+                    &mut b4,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next,
+                    eq_override,
+                );
+                a_mlv = a4;
+                b_mlv = b4;
+                la = Some(la_next);
+                (m1, mi)
+            } else {
+                let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next,
+                );
+                la = Some(la_next);
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(quarter);
+                b_mlv.truncate(quarter);
+                (m1, mi)
+            };
+            crate::gaptime::mark("zc: rounds 3+4 composed fold done");
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m_even_1, m_even_inf));
+            challenger.observe_f128(m_even_1);
+            challenger.observe_f128(m_even_inf);
+            mlv_rhos.push(challenger.sample_f128());
+        }
+
+        // ---- Level 1: plain width-2, la2-extended (first width-3 rung) ----
+        {
+            let la_cur = la.take().expect("cascade level without a deferred message");
+            let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2]);
+            multilinear_msgs.push((m_odd_1, m_odd_inf));
+            challenger.observe_f128(m_odd_1);
+            challenger.observe_f128(m_odd_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let n_cur = a_mlv.len();
+            let log_n_cur = n_cur.trailing_zeros() as usize;
+            let quarter = n_cur / 4;
+            let mut r_next = vec![F128::ONE; log_n_cur - 2];
+            r_next[1..].copy_from_slice(&r[k_skip + 5..]);
+            let (m1, mi, la_next, la2_next) = fold2_plain_and_round_pair_lookahead2_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..quarter],
+                &mut b_nxt[..quarter],
+                mlv_rhos[2],
+                mlv_rhos[3],
+                &r_next,
+            );
+            la = Some(la_next);
+            la2 = Some(la2_next);
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(quarter);
+            b_mlv.truncate(quarter);
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m1, mi));
+            challenger.observe_f128(m1);
+            challenger.observe_f128(mi);
+            mlv_rhos.push(challenger.sample_f128());
+        }
+
+        // ---- Width-3 levels: three rounds per pass, both lookaheads ----
+        for j in 0..w3_levels {
+            let b = 4 + 3 * j;
+            let la_cur = la.take().expect("cascade level without a deferred message");
+            let (m_a_1, m_a_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[b]);
+            multilinear_msgs.push((m_a_1, m_a_inf));
+            challenger.observe_f128(m_a_1);
+            challenger.observe_f128(m_a_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let la2_cur = la2.take().expect("width-3 level without a bivariate lookahead");
+            let (m_b_1, m_b_inf) =
+                eval_round4_lookahead(&la2_cur, mlv_rhos[b], mlv_rhos[b + 1]);
+            multilinear_msgs.push((m_b_1, m_b_inf));
+            challenger.observe_f128(m_b_1);
+            challenger.observe_f128(m_b_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let n_cur = a_mlv.len();
+            let log_n_cur = n_cur.trailing_zeros() as usize;
+            let eighth = n_cur / 8;
+            let mut r_next = vec![F128::ONE; log_n_cur - 3];
+            r_next[1..].copy_from_slice(&r[k_skip + b + 4..]);
+            let (m1, mi, la_next, la2_next) = fold3_plain_and_round_pair_lookahead_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..eighth],
+                &mut b_nxt[..eighth],
+                mlv_rhos[b],
+                mlv_rhos[b + 1],
+                mlv_rhos[b + 2],
+                &r_next,
+            );
+            la = Some(la_next);
+            la2 = Some(la2_next);
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(eighth);
+            b_mlv.truncate(eighth);
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m1, mi));
+            challenger.observe_f128(m1);
+            challenger.observe_f128(mi);
+            mlv_rhos.push(challenger.sample_f128());
+        }
+
+        // ---- Terminal width-3 level: no lookahead emission ----
+        if w3_terminal {
+            let b = 4 + 3 * w3_levels;
+            let la_cur = la.take().expect("cascade level without a deferred message");
+            let (m_a_1, m_a_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[b]);
+            multilinear_msgs.push((m_a_1, m_a_inf));
+            challenger.observe_f128(m_a_1);
+            challenger.observe_f128(m_a_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let la2_cur = la2.take().expect("width-3 level without a bivariate lookahead");
+            let (m_b_1, m_b_inf) =
+                eval_round4_lookahead(&la2_cur, mlv_rhos[b], mlv_rhos[b + 1]);
+            multilinear_msgs.push((m_b_1, m_b_inf));
+            challenger.observe_f128(m_b_1);
+            challenger.observe_f128(m_b_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let n_cur = a_mlv.len();
+            let log_n_cur = n_cur.trailing_zeros() as usize;
+            let eighth = n_cur / 8;
+            let mut r_next = vec![F128::ONE; log_n_cur - 3];
+            r_next[1..].copy_from_slice(&r[k_skip + b + 4..]);
+            let (m1, mi) = fold3_plain_and_round6_into(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..eighth],
+                &mut b_nxt[..eighth],
+                mlv_rhos[b],
+                mlv_rhos[b + 1],
+                mlv_rhos[b + 2],
+                &r_next,
+            );
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(eighth);
+            b_mlv.truncate(eighth);
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m1, mi));
+            challenger.observe_f128(m1);
+            challenger.observe_f128(mi);
+            mlv_rhos.push(challenger.sample_f128());
+        }
+
+        // ---- Incumbent width-2 finish (la2 dropped if the run stopped) ----
+        // Composed levels need n ≥ 16 (their own assert); smaller tables go
+        // to the generic tail loop. An unconsumed deferred message is simply
+        // dropped there: the generic loop recomputes the identical value
+        // from the table — the deferral is a pure reassociation, so the
+        // transcript is byte-identical either way.
+        let mut base = 4 + 3 * w3_levels + if w3_terminal { 3 } else { 0 };
+        while n_tail_iters - base >= 2 && a_mlv.len() >= 16 {
+            let la_cur = la.take().expect("cascade level without a deferred message");
+            let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[base]);
+            multilinear_msgs.push((m_odd_1, m_odd_inf));
+            challenger.observe_f128(m_odd_1);
+            challenger.observe_f128(m_odd_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            let t_round = std::time::Instant::now();
+            let n_cur = a_mlv.len();
+            let log_n_cur = n_cur.trailing_zeros() as usize;
+            let quarter = n_cur / 4;
+            let mut r_next = vec![F128::ONE; log_n_cur - 2];
+            r_next[1..].copy_from_slice(&r[k_skip + base + 3..]);
+            // The last width-2 level is terminal: when fewer than four
+            // iterations remain (an odd leftover goes to the generic loop,
+            // exactly as the incumbent ladder) or when the next level's
+            // table would drop below the composed minimum.
+            let (m_even_1, m_even_inf) = if n_tail_iters - base >= 4 && a_mlv.len() >= 64 {
+                let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    mlv_rhos[base],
+                    mlv_rhos[base + 1],
+                    &r_next,
+                );
+                la = Some(la_next);
+                (m1, mi)
+            } else {
+                fold2_plain_and_round4_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    mlv_rhos[base],
+                    mlv_rhos[base + 1],
+                    &r_next,
+                )
+            };
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(quarter);
+            b_mlv.truncate(quarter);
+            if zc_timing {
+                tail_round_ms.push((log_n_cur, t_round.elapsed().as_secs_f64() * 1e3));
+            }
+            multilinear_msgs.push((m_even_1, m_even_inf));
+            challenger.observe_f128(m_even_1);
+            challenger.observe_f128(m_even_inf);
+            mlv_rhos.push(challenger.sample_f128());
+            base += 2;
+        }
+        // Drop any unconsumed deferred messages (see above).
+        la = None;
+        la2 = None;
+        loop_start = base;
+    }
 
     for i in loop_start..(n_mlv - 1) {
         let t_round = std::time::Instant::now();
@@ -1410,6 +1766,7 @@ mod tests {
         for &(m, padded) in &[
             (13usize, false),
             (14, false),
+            (16, false),
             (17, false),
             (18, false),
             (19, false),
@@ -1439,16 +1796,17 @@ mod tests {
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
             // Arms: (lookahead, cascade2, cascade3, cascade4, cascade5,
-            // nomat) forced-off flags.
+            // nomat, width3) forced-off flags.
             let arms = [
-                (false, false, false, false, false, false), // full: nomat sweep + every level
-                (false, false, false, false, false, true),  // materializing sweep + every level
-                (false, false, false, false, true, false),  // cascade capped at level 3
-                (false, false, false, true, true, false),   // capped at level 2 (frontier)
-                (false, false, true, true, true, false),    // nomat + lookahead + cascade2
-                (false, true, true, true, true, false),     // nomat + lookahead only
-                (false, true, true, true, true, true), // materializing lookahead only (5d4d2a9)
-                (true, true, true, true, true, true),  // incumbent
+                (false, false, false, false, false, false, false), // full: nomat sweep + every level
+                (false, false, false, false, false, true, false), // materializing sweep + every level
+                (false, false, false, false, true, false, false), // cascade capped at level 3
+                (false, false, false, true, true, false, false), // capped at level 2 (frontier)
+                (false, false, true, true, true, false, false), // nomat + lookahead + cascade2
+                (false, true, true, true, true, false, false), // nomat + lookahead only
+                (false, true, true, true, true, true, false), // materializing lookahead only (5d4d2a9)
+                (true, true, true, true, true, true, false),  // incumbent
+                (false, false, false, false, false, false, true), // full, width-3 off
             ];
             let n_mlv = m - K_SKIP;
             let all = if n_mlv >= 12 {
@@ -1462,16 +1820,32 @@ mod tests {
             } else {
                 1
             };
-            let expect_levels = [all, all, all.min(4), all.min(3), all.min(2), 1, 1, 0];
-            let expect_nomat = [true, false, true, true, true, true, false, false];
+            let expect_levels = [all, all, all.min(4), all.min(3), all.min(2), 1, 1, 0, all];
+            let expect_nomat = [true, false, true, true, true, true, false, false, true];
+            // Expected width-3 levels for arms that do not force the ladder
+            // below two levels or the switch off. From the schedule: m=13
+            // and m=14 leave too few iterations (or too small a table) after
+            // levels 0+1; m=16 and m=17 run one width-3 level (the next
+            // base's table is < 64); m=18 one (table gate at base 7);
+            // m=19 two.
+            let w3_by_m = |m: usize| match m {
+                16 | 17 | 18 => 1,
+                19 => 2,
+                _ => 0,
+            };
+            let w3 = w3_by_m(m);
+            let expect_w3 = [w3, w3, w3, w3, w3, 0, 0, 0, 0];
             let mut results = Vec::new();
-            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off)) in arms.iter().enumerate() {
+            for (k, &(la_off, c2_off, c3_off, c4_off, c5_off, nm_off, w3_off)) in
+                arms.iter().enumerate()
+            {
                 ZC_LOOKAHEAD_FORCED_OFF.store(la_off, Ordering::Relaxed);
                 ZC_CASCADE2_FORCED_OFF.store(c2_off, Ordering::Relaxed);
                 ZC_CASCADE3_FORCED_OFF.store(c3_off, Ordering::Relaxed);
                 ZC_CASCADE4_FORCED_OFF.store(c4_off, Ordering::Relaxed);
                 ZC_CASCADE5_FORCED_OFF.store(c5_off, Ordering::Relaxed);
                 ZC_NOMAT_FORCED_OFF.store(nm_off, Ordering::Relaxed);
+                ZC_WIDTH3_FORCED_OFF.store(w3_off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 results.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
                 assert_eq!(
@@ -1484,6 +1858,11 @@ mod tests {
                     expect_nomat[k],
                     "arm {k} nomat engagement wrong at m={m}"
                 );
+                assert_eq!(
+                    ZC_WIDTH3_LAST.load(Ordering::Relaxed),
+                    expect_w3[k],
+                    "arm {k} width-3 engagement wrong at m={m}"
+                );
             }
             ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
@@ -1491,6 +1870,7 @@ mod tests {
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_WIDTH3_FORCED_OFF.store(false, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
             for (k, (proof, claim)) in results.iter().enumerate().skip(1) {
