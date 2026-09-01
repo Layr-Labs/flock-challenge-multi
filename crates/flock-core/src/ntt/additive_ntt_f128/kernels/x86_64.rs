@@ -1005,45 +1005,42 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 ) {
     unsafe {
         let diet_disabled = mul_diet_disabled();
+        // Same INNER_LOW predicate as the NT sparse-geo sibling: ranked
+        // seed-NT block 0 has `right_twiddle.hi == 0`, so the sparse
+        // group's only remaining product is the 3-CLMUL LOW form.
+        let inner_low = !low_inner_sparse_disabled() && right_twiddle.hi == 0;
+        macro_rules! sd_impl {
+            ($ol:literal, $diet:literal, $il:literal) => {
+                butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<$ol, $diet, $il>(
+                    src,
+                    src_quarter,
+                    src_r,
+                    dst_sparse,
+                    dst_dense,
+                    dst_quarter,
+                    num_ntts,
+                    right_twiddle,
+                    dense_tw,
+                    pf_src,
+                )
+            };
+        }
         if !diet_disabled && dense_tw[0].hi == 0 {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst_sparse,
-                dst_dense,
-                dst_quarter,
-                num_ntts,
-                right_twiddle,
-                dense_tw,
-                pf_src,
-            );
+            if inner_low {
+                sd_impl!(true, true, true);
+            } else {
+                sd_impl!(true, true, false);
+            }
         } else if diet_disabled {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
-                src,
-                src_quarter,
-                src_r,
-                dst_sparse,
-                dst_dense,
-                dst_quarter,
-                num_ntts,
-                right_twiddle,
-                dense_tw,
-                pf_src,
-            )
+            if inner_low {
+                sd_impl!(false, false, true);
+            } else {
+                sd_impl!(false, false, false);
+            }
+        } else if inner_low {
+            sd_impl!(false, true, true);
         } else {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
-                src,
-                src_quarter,
-                src_r,
-                dst_sparse,
-                dst_dense,
-                dst_quarter,
-                num_ntts,
-                right_twiddle,
-                dense_tw,
-                pf_src,
-            )
+            sd_impl!(false, true, false);
         }
     }
 }
@@ -1051,13 +1048,15 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
 /// # Safety
 /// Same contract as [`butterfly_fused_2layer_row_from_sparse_dense_geo`].
 /// `OUTER_LOW` additionally requires the dense outer twiddle's high limb to be
-/// zero.
+/// zero. `INNER_LOW` additionally requires `right_twiddle.hi == 0` (the sparse
+/// group's inner-b product).
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
     const OUTER_LOW: bool,
     const DIET: bool,
+    const INNER_LOW: bool,
 >(
     src: *const F128,
     src_quarter: usize,
@@ -1075,7 +1074,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
     let pf = !pf_src.is_null();
     unsafe {
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
-        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
+        debug_assert!(!INNER_LOW || right_twiddle.hi == 0);
+        let sparse_b = tw_x4::<INNER_LOW, DIET>(right_twiddle);
         let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
         let inner_a = tw_x4::<false, DIET>(t_inner_a);
         let inner_b = tw_x4::<false, DIET>(t_inner_b);
@@ -1101,7 +1101,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
             let mut sc = _mm512_xor_si512(vc, va);
             let mut sd = _mm512_xor_si512(vd, vb);
             sb = _mm512_xor_si512(sb, va);
-            let new_c = _mm512_xor_si512(sc, mul_x4::<false, DIET>(sparse_b, sd));
+            let new_c = _mm512_xor_si512(sc, mul_x4::<INNER_LOW, DIET>(sparse_b, sd));
             sd = _mm512_xor_si512(sd, new_c);
             sc = new_c;
             _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, va);
@@ -2375,7 +2375,7 @@ mod diet_tests {
                 // disjoint, and low_tw3[0].hi == 0 in the OUTER_LOW arm.
                 unsafe {
                     if outer_low {
-                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2388,7 +2388,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true, false>(
                             src.as_ptr(),
                             1,
                             0,
