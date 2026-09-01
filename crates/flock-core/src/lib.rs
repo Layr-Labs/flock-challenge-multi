@@ -477,7 +477,7 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-/// Prewarm marker ab
+/// Prewarm marker k9
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
 /// Run `op` on a pool worker instead of the calling thread.
