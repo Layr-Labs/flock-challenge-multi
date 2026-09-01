@@ -1,3 +1,4 @@
+//! Repeated-draw instrument marker: RD2-I1 (codegen-inert; see note).
 //! Lincheck PIOP for **block-diagonal** R1CS over GF(2).
 //!
 //! Reduces three MLE evaluation claims (`â(x)=v`, `b̂(x')=v'`, `ĉ(x'')=v''`)
