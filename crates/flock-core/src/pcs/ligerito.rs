@@ -2577,7 +2577,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 /// Research representation for the exact ranked L0 induced basis.  The
 /// basis itself is `P F^T q`; retaining the sparse query vector lets up to
 /// four LSB folds commute through the corresponding final forward-NTT layers.
-/// Each query caches one inverse-local residue of 8, 16, or 32 codeword rows.
+/// Each query caches one inverse-local residue of 4, 8, 16, or 32 codeword rows.
 /// The fixed 32-slot backing avoids one heap allocation per query while only
 /// the prefix selected by `cache_len` is constructed or read.
 struct SparseDualL0 {
@@ -2659,7 +2659,7 @@ impl SparseDualL0 {
         alpha: &[F128],
     ) -> (Self, F128) {
         use rayon::prelude::*;
-        assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
         assert_eq!(num_interleaved, 1usize << lane_challenges.len());
         assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
         assert_eq!(opened_rows.len(), queries.len());
@@ -4434,16 +4434,23 @@ fn open_ood_x4_enabled() -> bool {
 /// challenge's broadcast and split-reduction companion so every worker chunk
 /// in a round shares one `ghash_shift64_x4` result.
 ///
+/// `CORR` applies the deferred ordinary-basis fold and/or the lazy-OOD
+/// equality correction to the b-side **before** the message accumulate,
+/// matching [`fold_and_msg_lsb_inner`]'s generic chunk. Those rounds pass
+/// `stream = false`: the mixed working set is not the DRAM-cold NT case.
+///
 /// # Safety
 /// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length.
-/// `f`/`b` contain `2 * (base + fc.len())` elements.
+/// `f`/`b` contain `2 * (base + fc.len())` elements. When `CORR`, `deferred`
+/// covers the same source pairs as `b`, and `ood.0[t]` is the folded-domain
+/// equality factor for output slot `t`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn fold_and_msg_chunk_x86(
+unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -4453,6 +4460,8 @@ unsafe fn fold_and_msg_chunk_x86(
     r_x4: core::arch::x86_64::__m512i,
     r_x64: core::arch::x86_64::__m512i,
     stream: bool,
+    deferred: Option<(&[F128], F128)>,
+    ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
     use core::arch::x86_64::*;
@@ -4460,6 +4469,14 @@ unsafe fn fold_and_msg_chunk_x86(
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
     debug_assert!(len.is_multiple_of(2));
+    if CORR {
+        if let Some((basis, _)) = deferred {
+            debug_assert!(basis.len() >= 2 * (base + len));
+        }
+        if let Some((eq_lo, _)) = ood {
+            debug_assert!(eq_lo.len() >= len);
+        }
+    }
 
     // The fold and the next message consume the same eight results. Keep
     // those results in ZMM registers until the two message accumulators have
@@ -4474,6 +4491,25 @@ unsafe fn fold_and_msg_chunk_x86(
         let bc_ptr = bc.as_mut_ptr();
         let dst_aligned =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
+
+        let deferred_vec = if CORR {
+            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+            deferred.map(|(basis, alpha)| {
+                let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
+                (basis.as_ptr(), ax, ghash_shift64_x4(ax))
+            })
+        } else {
+            None
+        };
+        let ood_vec = if CORR {
+            use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+            ood.map(|(eq_lo, scale)| {
+                let sx = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+                (eq_lo.as_ptr(), sx, ghash_shift64_x4(sx))
+            })
+        } else {
+            None
+        };
 
         let fold4 = |ptr: *const F128, source: usize| -> __m512i {
             let lo = _mm512_loadu_si512(ptr.add(source) as *const __m512i);
@@ -4512,8 +4548,26 @@ unsafe fn fold_and_msg_chunk_x86(
         while t + 8 <= len {
             let f0 = fold4(f_ptr, 2 * (base + t));
             let f1 = fold4(f_ptr, 2 * (base + t + 4));
-            let b0 = fold4(b_ptr, 2 * (base + t));
-            let b1 = fold4(b_ptr, 2 * (base + t + 4));
+            let mut b0 = fold4(b_ptr, 2 * (base + t));
+            let mut b1 = fold4(b_ptr, 2 * (base + t + 4));
+            if CORR {
+                if let Some((dptr, ax, ax64)) = deferred_vec {
+                    b0 = _mm512_xor_si512(
+                        b0,
+                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t)), ax, ax64),
+                    );
+                    b1 = _mm512_xor_si512(
+                        b1,
+                        ghash_mul_x4_split(fold4(dptr, 2 * (base + t + 4)), ax, ax64),
+                    );
+                }
+                if let Some((eptr, sx, sx64)) = ood_vec {
+                    let e0 = _mm512_loadu_si512(eptr.add(t) as *const __m512i);
+                    let e1 = _mm512_loadu_si512(eptr.add(t + 4) as *const __m512i);
+                    b0 = _mm512_xor_si512(b0, ghash_mul_x4_split(e0, sx, sx64));
+                    b1 = _mm512_xor_si512(b1, ghash_mul_x4_split(e1, sx, sx64));
+                }
+            }
 
             let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
             let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
@@ -4540,8 +4594,22 @@ unsafe fn fold_and_msg_chunk_x86(
             let source = 2 * (base + t);
             let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
             let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
-            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            let mut b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
+            let mut b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            if CORR {
+                if let Some((basis, alpha)) = deferred {
+                    let dptr = basis.as_ptr();
+                    let d0 = *dptr.add(source) + r * (*dptr.add(source) + *dptr.add(source + 1));
+                    let d1 =
+                        *dptr.add(source + 2) + r * (*dptr.add(source + 2) + *dptr.add(source + 3));
+                    b0 += alpha * d0;
+                    b1 += alpha * d1;
+                }
+                if let Some((eq_lo, scale)) = ood {
+                    b0 += scale * *eq_lo.as_ptr().add(t);
+                    b1 += scale * *eq_lo.as_ptr().add(t + 1);
+                }
+            }
             *fc_ptr.add(t) = f0;
             *fc_ptr.add(t + 1) = f1;
             *bc_ptr.add(t) = b0;
@@ -4771,12 +4839,35 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if lazy_ood.is_none() && deferred_basis.is_none() {
-                // Fold, accumulate both message terms, and publish directly;
-                // `use_nt` selects streaming only for DRAM-cold large rounds.
-                // SAFETY: target features and chunk geometry are guaranteed.
+            {
+                if lazy_ood.is_none() && deferred_basis.is_none() {
+                    // Fold, accumulate both message terms, and publish directly;
+                    // `use_nt` selects streaming only for DRAM-cold large rounds.
+                    // SAFETY: target features and chunk geometry are guaranteed.
+                    return unsafe {
+                        fold_and_msg_chunk_x86::<false>(
+                            f, b, base, fc, bc, r, r_x4, r_x64, use_nt, None, None,
+                        )
+                    };
+                }
+                // Lazy-OOD / deferred-basis rounds: same register-resident leaf,
+                // ordinary stores. NT publish of this mixed working set is a
+                // closed DRAM-cold family.
                 return unsafe {
-                    fold_and_msg_chunk_x86(f, b, base, fc, bc, r, r_x4, r_x64, use_nt)
+                    let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
+                    fold_and_msg_chunk_x86::<true>(
+                        f,
+                        b,
+                        base,
+                        fc,
+                        bc,
+                        r,
+                        r_x4,
+                        r_x64,
+                        false,
+                        deferred_basis,
+                        ood,
+                    )
                 };
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -4802,42 +4893,49 @@ fn fold_and_msg_lsb_inner(
                 }
 
             }
-            let len = fc.len();
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            if let Some((basis, alpha)) = deferred_basis {
-                crate::field::f128_slice::fold_pairs_with_scaled_addend(
-                    b, basis, base, bc, r, alpha,
-                );
-            } else {
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            }
-            if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
-                let scale = gamma * eq_hi[ci];
-                crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
-            }
-            #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
             {
-                // SAFETY: target features cfg-guaranteed; fc/bc have equal
-                // even length (caller asserts n ≥ 2, power of two).
-                let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
-                (u0, u2)
-            }
-            #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
-            {
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                let mut k = 0;
-                while k + 1 < len {
-                    let f0 = fc[k];
-                    let f1 = fc[k + 1];
-                    let b0 = bc[k];
-                    let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
-                    k += 2;
+                let len = fc.len();
+                // Fold this slice, then pair up the just-folded values for the msg.
+                crate::field::f128_slice::fold_pairs(f, base, fc, r);
+                if let Some((basis, alpha)) = deferred_basis {
+                    crate::field::f128_slice::fold_pairs_with_scaled_addend(
+                        b, basis, base, bc, r, alpha,
+                    );
+                } else {
+                    crate::field::f128_slice::fold_pairs(b, base, bc, r);
                 }
-                (u0, u2)
+                if let Some((eq_lo, eq_hi, gamma)) = lazy_ood {
+                    let scale = gamma * eq_hi[ci];
+                    crate::field::f128_slice::add_scaled(bc, &eq_lo[..len], scale);
+                }
+                #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                {
+                    // SAFETY: target features cfg-guaranteed; fc/bc have equal
+                    // even length (caller asserts n ≥ 2, power of two).
+                    let (u0, u2) = unsafe { msg_reduce_avx512(fc, bc) };
+                    (u0, u2)
+                }
+                #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+                {
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    let mut k = 0;
+                    while k + 1 < len {
+                        let f0 = fc[k];
+                        let f1 = fc[k + 1];
+                        let b0 = bc[k];
+                        let b1 = bc[k + 1];
+                        u0 += f0 * b0;
+                        u2 += (f0 + f1) * (b0 + b1);
+                        k += 2;
+                    }
+                    (u0, u2)
+                }
             }
         })
         .reduce(
@@ -6353,6 +6451,8 @@ const ENV_NO_LIG_DEFER_INDUCED_GLUE: &str = "FLOCK_NO_LIG_DEFER_INDUCED_GLUE";
 const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
+const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
 #[cfg(test)]
 thread_local! {
     static SPARSE_DUAL_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -6463,8 +6563,28 @@ fn ranked_sparse_dual_l0_depth_selected(
     if !selected {
         return None;
     }
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
+}
+
+#[inline]
+fn ranked_sparse_dual_l0_depth_setting(
+    explicit_depth: Option<&str>,
+    depth2_disabled: bool,
+) -> usize {
+    let depth = explicit_depth
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 1, 2, 3, or 4")
+        })
+        .unwrap_or(if depth2_disabled {
+            SPARSE_DUAL_MAX_DEPTH
+        } else {
+            RANKED_SPARSE_DUAL_DEFAULT_DEPTH
+        });
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    depth
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6483,7 +6603,7 @@ fn ranked_sparse_dual_l0_depth(
     {
         let forced = SPARSE_DUAL_TEST_DEPTH.with(std::cell::Cell::get);
         if forced != 0 {
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
+            assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
             return Some(forced);
         }
     }
@@ -6513,15 +6633,11 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
-        })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
+    let depth = ranked_sparse_dual_l0_depth_setting(
+        explicit_depth.as_deref(),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+    );
     Some(depth)
 }
 
@@ -11082,8 +11198,9 @@ mod tests {
                 let mut bc_x86 = vec![F128::ZERO; n_pairs];
                 // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
                 let (u0_x86, u2_x86) = unsafe {
-                    super::fold_and_msg_chunk_x86(
-                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream,
+                    super::fold_and_msg_chunk_x86::<false>(
+                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream, None,
+                        None,
                     )
                 };
                 assert_eq!(fc_ref, fc_x86, "folded f mismatch n_pairs={n_pairs}");
@@ -12093,7 +12210,7 @@ mod tests {
                 &queries,
                 &alpha,
             );
-            for target_depth in 3..=4 {
+            for target_depth in 1..=4 {
                 let (dual, dual_enforced) = SparseDualL0::new(
                     target_depth,
                     log_d,
@@ -12411,6 +12528,24 @@ mod tests {
         let mut wrong_shape = config.clone();
         wrong_shape.recursive_ks[0] = 4;
         assert_eq!(select(&wrong_shape, false, false), None);
+    }
+
+    #[test]
+    fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
+        for depth in 1..=4 {
+            let value = depth.to_string();
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
+                depth
+            );
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
+                depth,
+                "explicit depth must override the depth2 rollback"
+            );
+        }
     }
 
     /// Exact ranked post-DirectFold8-state oracle and component timer. This allocates
@@ -15675,3 +15810,9 @@ mod tests {
         }
     }
 }
+
+// draw marker: sparse-dual depth selection, redraw 1
+
+// draw marker 2
+
+// draw marker 3
