@@ -259,6 +259,9 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
 /// AB projection, zerocheck ping-pong, and open-stage transients. This parks
 /// 6.5 GiB at ranked m = 32 instead of 10.5 GiB; release with [`clear`].
 pub fn prewarm_prover(m: usize) {
+    // First thing, before any state exists: one-shot ASLR pin + re-exec
+    // (see `pin_address_space`); the exec replaces this process image.
+    crate::pin_address_space();
     use rayon::prelude::*;
     if m < 7 {
         return;
