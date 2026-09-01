@@ -868,7 +868,11 @@ fn speculative_main(
                     fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
                     BlockSource::Slice(&scratch)
                 };
-                std::hint::black_box(run(setup_addr, src))
+                // Keep the complete proof driver on one of the topology-pinned
+                // global workers.  The inner parallel regions remain nested on
+                // the same pool, while serial phase boundaries no longer run
+                // on this otherwise-unpinned forwarding thread.
+                std::hint::black_box(flock_core::in_pool(|| run(setup_addr, src)))
             }))
             .map(|out| last_warm_out = Some(out))
             .is_ok();
@@ -943,7 +947,9 @@ fn speculative_main(
                 state.blocks = Some(published);
                 shared().signal.notify_all();
             }
-            return run(setup_addr, BlockSource::Closed { init, len: n });
+            return flock_core::in_pool(|| {
+                run(setup_addr, BlockSource::Closed { init, len: n })
+            });
         }
 
         let mut buf = std::mem::take(&mut scratch);
@@ -962,7 +968,7 @@ fn speculative_main(
             state.blocks = Some(SpecBlocks::Full(Arc::clone(&blocks)));
             shared().signal.notify_all();
         }
-        run(setup_addr, BlockSource::Slice(&blocks))
+        flock_core::in_pool(|| run(setup_addr, BlockSource::Slice(&blocks)))
     }));
 
     match (direct_proof_path.as_deref(), outcome) {
