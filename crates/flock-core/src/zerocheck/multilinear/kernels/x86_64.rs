@@ -1392,6 +1392,859 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     }
 }
 
+/// x86 fused width-3 fold plus next-round message and both lookaheads for
+/// one worker chunk — the vectorized leaf of
+/// `fold3_plain_and_round_pair_lookahead_into`, bit-identical to
+/// `fold3_and_message_lookahead_scalar` (the stated oracle).
+///
+/// Each sixteen-lane iteration folds four la-groups of eight outputs (64
+/// inputs per side each), stores the 32 outputs, and accumulates — all on
+/// `wt = eq_lo[4u+3]`, lane-wise across the four groups — the emitted
+/// message (κ₀κ₁, κ₁, κ₀, 1 pair weights), the six univariate-lookahead
+/// aggregates in the incumbent's `[W1, W2, W0, W3, W4, W5]` order, and the
+/// eighteen bivariate evaluations. Returns `[G(1), G(∞), la1 × 6, la2 × 18]`.
+///
+/// # Safety
+/// `a_in.len() == 8 · a_out.len()`, `b_in.len() == 8 · b_out.len()`,
+/// `a_out.len() == 2 · eq_lo.len()`, `eq_lo.len()` a multiple of 4. AVX-512F
+/// and VPCLMULQDQ are cfg-gated.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_and_message_lookahead_x86_avx512(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    kappa0: F128,
+    kappa1: F128,
+    eq_lo: &[F128],
+    nt_out: bool,
+) -> [F128; 26] {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    let lo_size = eq_lo.len();
+    debug_assert_eq!(a_in.len(), 8 * a_out.len());
+    debug_assert_eq!(b_in.len(), 8 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert!(lo_size.is_multiple_of(4));
+
+    #[inline(always)]
+    unsafe fn fold2_regs(
+        lo: __m512i,
+        hi: __m512i,
+        r: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+    ) -> __m512i {
+        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use core::arch::x86_64::*;
+        // SAFETY: register-only; features cfg-gated.
+        unsafe {
+            let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
+            let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
+            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+        }
+    }
+
+    // Composed fold of 64 consecutive inputs at `src` into one la-group of
+    // eight outputs (two ZMM), fully reduced.
+    #[inline(always)]
+    unsafe fn fold64_to_8(
+        src: *const F128,
+        ra: __m512i,
+        rb: __m512i,
+        rc: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+    ) -> [__m512i; 2] {
+        use core::arch::x86_64::*;
+        // SAFETY: caller supplies 64 readable F128 at src.
+        unsafe {
+            let mut t = [_mm512_setzero_si512(); 8];
+            for m in 0..8 {
+                let i0 = _mm512_loadu_si512(src.add(8 * m).cast::<__m512i>());
+                let i1 = _mm512_loadu_si512(src.add(8 * m + 4).cast::<__m512i>());
+                t[m] = fold2_regs(i0, i1, ra, even_idx, odd_idx);
+            }
+            let s0 = fold2_regs(t[0], t[1], rb, even_idx, odd_idx);
+            let s1 = fold2_regs(t[2], t[3], rb, even_idx, odd_idx);
+            let s2 = fold2_regs(t[4], t[5], rb, even_idx, odd_idx);
+            let s3 = fold2_regs(t[6], t[7], rb, even_idx, odd_idx);
+            [
+                fold2_regs(s0, s1, rc, even_idx, odd_idx),
+                fold2_regs(s2, s3, rc, even_idx, odd_idx),
+            ]
+        }
+    }
+
+    // Deferred-reduction variant: per lane,
+    // fold8 = x0 + ra·x01 + rb·x02 + rarb·x0123
+    //       + rc·(x04 + ra·x0145 + rb·x0246 + rarb·x01234567),
+    // one wide accumulator per output ZMM. The four precomputed products
+    // `rc·ra`, `rc·rb`, `rc·ra·rb` (plus `ra·rb`) are loop constants.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fold8_lanes(
+        x: [__m512i; 8],
+        ra: __m512i,
+        rb: __m512i,
+        rarb: __m512i,
+        rc: __m512i,
+        rcra: __m512i,
+        rcrb: __m512i,
+        rcrarb: __m512i,
+    ) -> __m512i {
+        use core::arch::x86_64::*;
+        // SAFETY: register-only; features cfg-gated.
+        unsafe {
+            let x01 = _mm512_xor_si512(x[0], x[1]);
+            let x02 = _mm512_xor_si512(x[0], x[2]);
+            let x0123 = _mm512_xor_si512(x01, _mm512_xor_si512(x[2], x[3]));
+            let x04 = _mm512_xor_si512(x[0], x[4]);
+            let x0145 = _mm512_xor_si512(x01, _mm512_xor_si512(x[4], x[5]));
+            let x0246 = _mm512_xor_si512(x02, _mm512_xor_si512(x[4], x[6]));
+            let x_all = _mm512_xor_si512(
+                x0123,
+                _mm512_xor_si512(
+                    _mm512_xor_si512(x[4], x[5]),
+                    _mm512_xor_si512(x[6], x[7]),
+                ),
+            );
+            let mut acc = WideGhashX4::zero();
+            acc.mul_acc(ra, x01);
+            acc.mul_acc(rb, x02);
+            acc.mul_acc(rarb, x0123);
+            acc.mul_acc(rc, x04);
+            acc.mul_acc(rcra, x0145);
+            acc.mul_acc(rcrb, x0246);
+            acc.mul_acc(rcrarb, x_all);
+            _mm512_xor_si512(x[0], acc.reduce_lanes())
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fold64_to_8_deferred(
+        src: *const F128,
+        ra: __m512i,
+        rb: __m512i,
+        rarb: __m512i,
+        rc: __m512i,
+        rcra: __m512i,
+        rcrb: __m512i,
+        rcrarb: __m512i,
+    ) -> [__m512i; 2] {
+        use core::arch::x86_64::*;
+        // SAFETY: caller supplies 64 readable F128 at src.
+        unsafe {
+            let z = |m: usize| _mm512_loadu_si512(src.add(4 * m).cast::<__m512i>());
+            let xl = transpose4_lanes(z(0), z(2), z(4), z(6));
+            let xh = transpose4_lanes(z(1), z(3), z(5), z(7));
+            let yl = transpose4_lanes(z(8), z(10), z(12), z(14));
+            let yh = transpose4_lanes(z(9), z(11), z(13), z(15));
+            [
+                fold8_lanes(
+                    [xl[0], xl[1], xl[2], xl[3], xh[0], xh[1], xh[2], xh[3]],
+                    ra, rb, rarb, rc, rcra, rcrb, rcrarb,
+                ),
+                fold8_lanes(
+                    [yl[0], yl[1], yl[2], yl[3], yh[0], yh[1], yh[2], yh[3]],
+                    ra, rb, rarb, rc, rcra, rcrb, rcrarb,
+                ),
+            ]
+        }
+    }
+
+    // SAFETY: the function's length invariants bound all loads/stores and the
+    // cfg gate supplies every intrinsic feature.
+    unsafe {
+        let bcast =
+            |r: F128| _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let ra = bcast(rho_a);
+        let rb = bcast(rho_b);
+        let rc = bcast(rho_c);
+        let rho_ab = rho_a * rho_b;
+        let rarb = bcast(rho_ab);
+        let rcra = bcast(rho_c * rho_a);
+        let rcrb = bcast(rho_c * rho_b);
+        let rcrarb = bcast(rho_c * rho_ab);
+        let k0b = bcast(kappa0);
+        let k1b = bcast(kappa1);
+        let k01b = bcast(kappa0 * kappa1);
+        let defer = zc_fold_defer_enabled();
+        let wsplit = zc_wsplit_enabled();
+        let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        // Per-iteration eq weight pick: lanes 3, 7, 11, 15 of the sixteen
+        // loaded eq_lo entries (one wt per la-group).
+        let lane3_idx = _mm512_set_epi64(0, 0, 0, 0, 15, 14, 7, 6);
+        let cat_lo2_idx = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc2 = [WideGhashX4::zero(); 18];
+        let mut tail = [F256Unreduced::ZERO; 26];
+        let mut x_lo = 0;
+        // Input look-ahead, resolved once per worker chunk (never inside the
+        // loop). One body consumes 256 F128 (64 cache lines) from each side.
+        let pf_on = zc_tail_pf_enabled();
+        let pf_spread = zc_tail_pf_spread_enabled();
+        const PF_OFF: usize = ZC_TAIL_PF_TILES * 256 * core::mem::size_of::<F128>();
+
+        while x_lo + 16 <= lo_size {
+            let output = 2 * x_lo;
+            let input = 8 * output;
+            let a_src = a_in.as_ptr().add(input);
+            let b_src = b_in.as_ptr().add(input);
+            let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+            let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+            if pf_on {
+                let hi = if pf_spread { 16 } else { 64 };
+                for l in 0..hi {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            let mut oa = [_mm512_setzero_si512(); 8];
+            let mut ob = [_mm512_setzero_si512(); 8];
+            for g in 0..4 {
+                let pair = if defer {
+                    (
+                        fold64_to_8_deferred(a_src.add(64 * g), ra, rb, rarb, rc, rcra, rcrb, rcrarb),
+                        fold64_to_8_deferred(b_src.add(64 * g), ra, rb, rarb, rc, rcra, rcrb, rcrarb),
+                    )
+                } else {
+                    (
+                        fold64_to_8(a_src.add(64 * g), ra, rb, rc, even_idx, odd_idx),
+                        fold64_to_8(b_src.add(64 * g), ra, rb, rc, even_idx, odd_idx),
+                    )
+                };
+                oa[2 * g] = pair.0[0];
+                oa[2 * g + 1] = pair.0[1];
+                ob[2 * g] = pair.1[0];
+                ob[2 * g + 1] = pair.1[1];
+            }
+            if pf_on && pf_spread {
+                for l in 16..32 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            let ap = a_out.as_mut_ptr().add(output);
+            let bp = b_out.as_mut_ptr().add(output);
+            for g in 0..8 {
+                if nt_out {
+                    stream_zmm_as_xmm4(ap.add(4 * g), oa[g]);
+                    stream_zmm_as_xmm4(bp.add(4 * g), ob[g]);
+                } else {
+                    _mm512_storeu_si512(ap.add(4 * g).cast::<__m512i>(), oa[g]);
+                    _mm512_storeu_si512(bp.add(4 * g).cast::<__m512i>(), ob[g]);
+                }
+            }
+            if pf_on && pf_spread {
+                for l in 32..48 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            // Lane-wise la-group elements: `a[k]` holds element k of each of
+            // the four groups (group g = ZMM pair oa[2g], oa[2g+1]).
+            let alo = transpose4_lanes(oa[0], oa[2], oa[4], oa[6]);
+            let ahi = transpose4_lanes(oa[1], oa[3], oa[5], oa[7]);
+            let blo = transpose4_lanes(ob[0], ob[2], ob[4], ob[6]);
+            let bhi = transpose4_lanes(ob[1], ob[3], ob[5], ob[7]);
+            let a: [__m512i; 8] = [alo[0], alo[1], alo[2], alo[3], ahi[0], ahi[1], ahi[2], ahi[3]];
+            let b: [__m512i; 8] = [blo[0], blo[1], blo[2], blo[3], bhi[0], bhi[1], bhi[2], bhi[3]];
+            if pf_on && pf_spread {
+                for l in 48..64 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            // wt per group = eq_lo lanes 3, 7, 11, 15.
+            let e0 = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+            let e1 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+            let e2 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 8));
+            let e3 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 12));
+            let w01 = _mm512_permutex2var_epi64(e0, lane3_idx, e1);
+            let w23 = _mm512_permutex2var_epi64(e2, lane3_idx, e3);
+            let w = _mm512_permutex2var_epi64(w01, cat_lo2_idx, w23);
+            let k0w = ghash_mul_x4(k0b, w);
+            let k1w = ghash_mul_x4(k1b, w);
+            let k01w = ghash_mul_x4(k01b, w);
+            let (w64, k0w64, k1w64, k01w64) = if wsplit {
+                (
+                    ghash_shift64_x4(w),
+                    ghash_shift64_x4(k0w),
+                    ghash_shift64_x4(k1w),
+                    ghash_shift64_x4(k01w),
+                )
+            } else {
+                (w, k0w, k1w, k01w)
+            };
+            // Weighted-term multiply: split form when enabled (field-
+            // identical, one fewer reduction stage).
+            #[inline(always)]
+            unsafe fn wmul(
+                t: __m512i,
+                wk: __m512i,
+                wk64: __m512i,
+                split: bool,
+            ) -> __m512i {
+                // SAFETY: register-only; features cfg-gated.
+                unsafe {
+                    if split {
+                        ghash_mul_x4_split(t, wk, wk64)
+                    } else {
+                        ghash_mul_x4(wk, t)
+                    }
+                }
+            }
+            // XOR-sum networks (a-side weighted per product, b-side raw).
+            let pa0 = _mm512_xor_si512(a[0], a[1]);
+            let pa1 = _mm512_xor_si512(a[2], a[3]);
+            let pa2 = _mm512_xor_si512(a[4], a[5]);
+            let pa3 = _mm512_xor_si512(a[6], a[7]);
+            let qa = _mm512_xor_si512(pa0, pa1); // a0123
+            let qb = _mm512_xor_si512(pa2, pa3); // a4567
+            let ua = _mm512_xor_si512(qa, qb); // all eight
+            let a02 = _mm512_xor_si512(a[0], a[2]);
+            let a13 = _mm512_xor_si512(a[1], a[3]);
+            let a46 = _mm512_xor_si512(a[4], a[6]);
+            let a57 = _mm512_xor_si512(a[5], a[7]);
+            let a0246 = _mm512_xor_si512(a02, a46);
+            let a1357 = _mm512_xor_si512(a13, a57);
+            let a04 = _mm512_xor_si512(a[0], a[4]);
+            let a26 = _mm512_xor_si512(a[2], a[6]);
+            let a15 = _mm512_xor_si512(a[1], a[5]);
+            let a37 = _mm512_xor_si512(a[3], a[7]);
+            let a0145 = _mm512_xor_si512(pa0, pa2);
+            let a2367 = _mm512_xor_si512(pa1, pa3);
+            let pb0 = _mm512_xor_si512(b[0], b[1]);
+            let pb1 = _mm512_xor_si512(b[2], b[3]);
+            let pb2 = _mm512_xor_si512(b[4], b[5]);
+            let pb3 = _mm512_xor_si512(b[6], b[7]);
+            let rb0123 = _mm512_xor_si512(pb0, pb1);
+            let rb4567 = _mm512_xor_si512(pb2, pb3);
+            let ub = _mm512_xor_si512(rb0123, rb4567);
+            let b02 = _mm512_xor_si512(b[0], b[2]);
+            let b13 = _mm512_xor_si512(b[1], b[3]);
+            let b46 = _mm512_xor_si512(b[4], b[6]);
+            let b57 = _mm512_xor_si512(b[5], b[7]);
+            let b0246 = _mm512_xor_si512(b02, b46);
+            let b1357 = _mm512_xor_si512(b13, b57);
+            let b04 = _mm512_xor_si512(b[0], b[4]);
+            let b26 = _mm512_xor_si512(b[2], b[6]);
+            let b15 = _mm512_xor_si512(b[1], b[5]);
+            let b37 = _mm512_xor_si512(b[3], b[7]);
+            let b0145 = _mm512_xor_si512(pb0, pb2);
+            let b2367 = _mm512_xor_si512(pb1, pb3);
+            // Emitted message: pair weights κ₀κ₁·wt, κ₁·wt, κ₀·wt, wt.
+            acc[0].mul_acc(wmul(a[1], k01w, k01w64, wsplit), b[1]);
+            acc[0].mul_acc(wmul(a[3], k1w, k1w64, wsplit), b[3]);
+            acc[0].mul_acc(wmul(a[5], k0w, k0w64, wsplit), b[5]);
+            acc[0].mul_acc(wmul(a[7], w, w64, wsplit), b[7]);
+            acc[1].mul_acc(wmul(pa0, k01w, k01w64, wsplit), pb0);
+            acc[1].mul_acc(wmul(pa1, k1w, k1w64, wsplit), pb1);
+            acc[1].mul_acc(wmul(pa2, k0w, k0w64, wsplit), pb2);
+            acc[1].mul_acc(wmul(pa3, w, w64, wsplit), pb3);
+            // la1, incumbent order [W1, W2, W0, W3, W4, W5]: pair A
+            // (outputs 0..3) on κ₁·wt, pair B (outputs 4..7) on wt.
+            acc[2].mul_acc(wmul(a[3], k1w, k1w64, wsplit), b[3]);
+            acc[2].mul_acc(wmul(a[7], w, w64, wsplit), b[7]);
+            acc[3].mul_acc(wmul(pa1, k1w, k1w64, wsplit), pb1);
+            acc[3].mul_acc(wmul(pa3, w, w64, wsplit), pb3);
+            acc[4].mul_acc(wmul(a[2], k1w, k1w64, wsplit), b[2]);
+            acc[4].mul_acc(wmul(a[6], w, w64, wsplit), b[6]);
+            acc[5].mul_acc(wmul(a02, k1w, k1w64, wsplit), b02);
+            acc[5].mul_acc(wmul(a46, w, w64, wsplit), b46);
+            acc[6].mul_acc(wmul(a13, k1w, k1w64, wsplit), b13);
+            acc[6].mul_acc(wmul(a57, w, w64, wsplit), b57);
+            acc[7].mul_acc(wmul(qa, k1w, k1w64, wsplit), rb0123);
+            acc[7].mul_acc(wmul(qb, w, w64, wsplit), rb4567);
+            // la2, G(1): w1(i, j) products.
+            acc2[0].mul_acc(wmul(a[4], w, w64, wsplit), b[4]);
+            acc2[1].mul_acc(wmul(a[6], w, w64, wsplit), b[6]);
+            acc2[2].mul_acc(wmul(a46, w, w64, wsplit), b46);
+            acc2[3].mul_acc(wmul(a[5], w, w64, wsplit), b[5]);
+            acc2[4].mul_acc(wmul(a[7], w, w64, wsplit), b[7]);
+            acc2[5].mul_acc(wmul(a57, w, w64, wsplit), b57);
+            acc2[6].mul_acc(wmul(pa2, w, w64, wsplit), pb2);
+            acc2[7].mul_acc(wmul(pa3, w, w64, wsplit), pb3);
+            acc2[8].mul_acc(wmul(qb, w, w64, wsplit), rb4567);
+            // la2, G(∞): (w0 + w1)(i, j) products.
+            acc2[9].mul_acc(wmul(a04, w, w64, wsplit), b04);
+            acc2[10].mul_acc(wmul(a26, w, w64, wsplit), b26);
+            acc2[11].mul_acc(wmul(a0246, w, w64, wsplit), b0246);
+            acc2[12].mul_acc(wmul(a15, w, w64, wsplit), b15);
+            acc2[13].mul_acc(wmul(a37, w, w64, wsplit), b37);
+            acc2[14].mul_acc(wmul(a1357, w, w64, wsplit), b1357);
+            acc2[15].mul_acc(wmul(a0145, w, w64, wsplit), b0145);
+            acc2[16].mul_acc(wmul(a2367, w, w64, wsplit), b2367);
+            acc2[17].mul_acc(wmul(ua, w, w64, wsplit), ub);
+            x_lo += 16;
+        }
+
+        // Small instances (lo_size ∈ {4, 8, 12}) leave whole la-groups:
+        // finish one group (64 inputs, eight outputs) at a time in scalar,
+        // exactly the oracle's per-group body.
+        let k01 = kappa0 * kappa1;
+        while x_lo + 4 <= lo_size {
+            let o = 2 * x_lo;
+            let i = 8 * o;
+            let mut av = [F128::ZERO; 8];
+            let mut bv = [F128::ZERO; 8];
+            for j in 0..8 {
+                let fold8 = |v: &[F128], i: usize| {
+                    let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
+                    let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
+                    let t2 = v[i + 4] + rho_a * (v[i + 4] + v[i + 5]);
+                    let t3 = v[i + 6] + rho_a * (v[i + 6] + v[i + 7]);
+                    let s0 = t0 + rho_b * (t0 + t1);
+                    let s1 = t2 + rho_b * (t2 + t3);
+                    s0 + rho_c * (s0 + s1)
+                };
+                av[j] = fold8(a_in, i + 8 * j);
+                bv[j] = fold8(b_in, i + 8 * j);
+                a_out[o + j] = av[j];
+                b_out[o + j] = bv[j];
+            }
+            let wt = eq_lo[x_lo + 3];
+            for (w, j) in [(k01, 0usize), (kappa1, 2), (kappa0, 4), (F128::ONE, 6)] {
+                let (ae, ao) = (av[j], av[j + 1]);
+                let (be, bo) = (bv[j], bv[j + 1]);
+                tail[0] ^= (w * wt * ao).mul_unreduced(bo);
+                tail[1] ^= (w * wt * (ae + ao)).mul_unreduced(be + bo);
+            }
+            let k1wt = kappa1 * wt;
+            tail[2] ^= (k1wt * av[3]).mul_unreduced(bv[3]);
+            tail[2] ^= (wt * av[7]).mul_unreduced(bv[7]);
+            tail[3] ^= (k1wt * (av[2] + av[3])).mul_unreduced(bv[2] + bv[3]);
+            tail[3] ^= (wt * (av[6] + av[7])).mul_unreduced(bv[6] + bv[7]);
+            tail[4] ^= (k1wt * av[2]).mul_unreduced(bv[2]);
+            tail[4] ^= (wt * av[6]).mul_unreduced(bv[6]);
+            tail[5] ^= (k1wt * (av[0] + av[2])).mul_unreduced(bv[0] + bv[2]);
+            tail[5] ^= (wt * (av[4] + av[6])).mul_unreduced(bv[4] + bv[6]);
+            tail[6] ^= (k1wt * (av[1] + av[3])).mul_unreduced(bv[1] + bv[3]);
+            tail[6] ^= (wt * (av[5] + av[7])).mul_unreduced(bv[5] + bv[7]);
+            tail[7] ^=
+                (k1wt * (av[0] + av[1] + av[2] + av[3])).mul_unreduced(bv[0] + bv[1] + bv[2] + bv[3]);
+            tail[7] ^=
+                (wt * (av[4] + av[5] + av[6] + av[7])).mul_unreduced(bv[4] + bv[5] + bv[6] + bv[7]);
+            let mut la2t = [F256Unreduced::ZERO; 18];
+            crate::zerocheck::multilinear::la2_group_accumulate(&mut la2t, wt, &av, &bv);
+            for j in 0..18 {
+                tail[8 + j] ^= la2t[j];
+            }
+            x_lo += 4;
+        }
+
+        if nt_out {
+            _mm_sfence();
+        }
+        let mut out = [F128::ZERO; 26];
+        for i in 0..8 {
+            tail[i] ^= acc[i].fold();
+            out[i] = tail[i].reduce();
+        }
+        for j in 0..18 {
+            tail[8 + j] ^= acc2[j].fold();
+            out[8 + j] = tail[8 + j].reduce();
+        }
+        out
+    }
+}
+
+/// x86 fused width-2 fold plus next-round message, the univariate lookahead,
+/// AND the bivariate lookahead two rounds ahead for one worker chunk — the
+/// vectorized leaf of `fold2_plain_and_round_pair_lookahead2_into`,
+/// bit-identical to `fold2_and_message_lookahead2_scalar` (the stated
+/// oracle). The incumbent `fold2_and_message_lookahead_x86_avx512` body,
+/// doubled to sixteen eq lanes per iteration so the four la2 quads (eight
+/// outputs each, weighted `wt = eq_lo[4u+3]`) are lane-wise.
+///
+/// Returns `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5',
+/// la2 × 18]`.
+///
+/// # Safety
+/// `a_in.len() == 4 · a_out.len()`, `b_in.len() == 4 · b_out.len()`,
+/// `a_out.len() == 2 · eq_lo.len()`, `eq_lo.len()` a multiple of 4. AVX-512F
+/// and VPCLMULQDQ are cfg-gated. `wtab`, when present, is the per-pass
+/// (w, w·x⁶⁴) pair table of `build_w_pair_table`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_and_message_lookahead2_x86_avx512(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+    wtab: Option<&[F128]>,
+    nt_out: bool,
+) -> [F128; 26] {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    let lo_size = eq_lo.len();
+    debug_assert_eq!(a_in.len(), 4 * a_out.len());
+    debug_assert_eq!(b_in.len(), 4 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert!(lo_size.is_multiple_of(4));
+
+    #[inline(always)]
+    unsafe fn fold2_regs(
+        lo: __m512i,
+        hi: __m512i,
+        r: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+    ) -> __m512i {
+        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use core::arch::x86_64::*;
+        // SAFETY: register-only; features cfg-gated.
+        unsafe {
+            let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
+            let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
+            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fold16_to_4(
+        src: *const F128,
+        ra: __m512i,
+        rb: __m512i,
+        even_idx: __m512i,
+        odd_idx: __m512i,
+    ) -> __m512i {
+        use core::arch::x86_64::*;
+        // SAFETY: caller supplies sixteen readable F128 at src.
+        unsafe {
+            let i0 = _mm512_loadu_si512(src.cast::<__m512i>());
+            let i1 = _mm512_loadu_si512(src.add(4).cast::<__m512i>());
+            let i2 = _mm512_loadu_si512(src.add(8).cast::<__m512i>());
+            let i3 = _mm512_loadu_si512(src.add(12).cast::<__m512i>());
+            let t0 = fold2_regs(i0, i1, ra, even_idx, odd_idx);
+            let t1 = fold2_regs(i2, i3, ra, even_idx, odd_idx);
+            fold2_regs(t0, t1, rb, even_idx, odd_idx)
+        }
+    }
+
+    // The incumbent's eight-accumulator message + univariate-lookahead block
+    // for one half (four groups, weights `w` lane-wise per group).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn msg_la1_half(
+        acc: &mut [WideGhashX4; 8],
+        a: [__m512i; 4],
+        b: [__m512i; 4],
+        w: __m512i,
+        w64: __m512i,
+        split: bool,
+    ) {
+        use core::arch::x86_64::*;
+        // SAFETY: register-only; features cfg-gated.
+        unsafe {
+            let wm = |t: __m512i| {
+                if split {
+                    ghash_mul_x4_split(t, w, w64)
+                } else {
+                    ghash_mul_x4(w, t)
+                }
+            };
+            let a0w = wm(a[0]);
+            let a1w = wm(a[1]);
+            let a2w = wm(a[2]);
+            let a3w = wm(a[3]);
+            acc[0].mul_acc(a1w, b[1]);
+            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b[0], b[1]));
+            acc[2].mul_acc(a3w, b[3]);
+            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b[2], b[3]));
+            acc[4].mul_acc(a2w, b[2]);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b[0], b[2]);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b[1], b[3]);
+            acc[5].mul_acc(e_aw, e_b);
+            acc[6].mul_acc(o_aw, o_b);
+            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+        }
+    }
+
+    // SAFETY: the function's length invariants bound all loads/stores and the
+    // cfg gate supplies every intrinsic feature.
+    unsafe {
+        let ra = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_a.hi as i64, rho_a.lo as i64));
+        let rb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_b.hi as i64, rho_b.lo as i64));
+        let rho_ab = rho_a * rho_b;
+        let rarb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_ab.hi as i64, rho_ab.lo as i64));
+        let defer = zc_fold_defer_enabled();
+        let wsplit = zc_wsplit_enabled();
+        let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
+        let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
+        // la2 weight pick: eq_lo lanes 3, 7, 11, 15 (one wt per quad).
+        let lane3_idx = _mm512_set_epi64(0, 0, 0, 0, 15, 14, 7, 6);
+        let cat_lo2_idx = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc2 = [WideGhashX4::zero(); 18];
+        let mut tail = [F256Unreduced::ZERO; 26];
+        let mut x_lo = 0;
+        // One body consumes 128 F128 (32 cache lines) from each side.
+        let pf_on = zc_tail_pf_enabled();
+        let pf_spread = zc_tail_pf_spread_enabled();
+        const PF_OFF: usize = ZC_TAIL_PF_TILES * 128 * core::mem::size_of::<F128>();
+
+        while x_lo + 16 <= lo_size {
+            let output = 2 * x_lo;
+            let input = 4 * output;
+            let a_src = a_in.as_ptr().add(input);
+            let b_src = b_in.as_ptr().add(input);
+            let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+            let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+            if pf_on {
+                let hi = if pf_spread { 8 } else { 32 };
+                for l in 0..hi {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            let mut oa = [_mm512_setzero_si512(); 8];
+            let mut ob = [_mm512_setzero_si512(); 8];
+            for g in 0..8 {
+                let (x, y) = if defer {
+                    (
+                        fold16_to_4_deferred(a_src.add(16 * g), ra, rb, rarb),
+                        fold16_to_4_deferred(b_src.add(16 * g), ra, rb, rarb),
+                    )
+                } else {
+                    (
+                        fold16_to_4(a_src.add(16 * g), ra, rb, even_idx, odd_idx),
+                        fold16_to_4(b_src.add(16 * g), ra, rb, even_idx, odd_idx),
+                    )
+                };
+                oa[g] = x;
+                ob[g] = y;
+            }
+            if pf_on && pf_spread {
+                for l in 8..16 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            let ap = a_out.as_mut_ptr().add(output);
+            let bp = b_out.as_mut_ptr().add(output);
+            for g in 0..8 {
+                if nt_out {
+                    stream_zmm_as_xmm4(ap.add(4 * g), oa[g]);
+                    stream_zmm_as_xmm4(bp.add(4 * g), ob[g]);
+                } else {
+                    _mm512_storeu_si512(ap.add(4 * g).cast::<__m512i>(), oa[g]);
+                    _mm512_storeu_si512(bp.add(4 * g).cast::<__m512i>(), ob[g]);
+                }
+            }
+            if pf_on && pf_spread {
+                for l in 16..24 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            let ae = transpose4_lanes(oa[0], oa[1], oa[2], oa[3]);
+            let af = transpose4_lanes(oa[4], oa[5], oa[6], oa[7]);
+            let be = transpose4_lanes(ob[0], ob[1], ob[2], ob[3]);
+            let bf = transpose4_lanes(ob[4], ob[5], ob[6], ob[7]);
+            if pf_on && pf_spread {
+                for l in 24..32 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+            }
+            // Message + la1 halves on the odd-lane weights, wtabbed or live.
+            if let Some(wt) = wtab {
+                let wp = wt.as_ptr().add(x_lo) as *const __m512i;
+                let w_lo = _mm512_loadu_si512(wp);
+                let w_lo64 = _mm512_loadu_si512(wp.add(1));
+                let w_hi = _mm512_loadu_si512(wp.add(2));
+                let w_hi64 = _mm512_loadu_si512(wp.add(3));
+                msg_la1_half(&mut acc, ae, be, w_lo, w_lo64, true);
+                msg_la1_half(&mut acc, af, bf, w_hi, w_hi64, true);
+            } else {
+                let e0 = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+                let e1 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+                let e2 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 8));
+                let e3 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 12));
+                let w_lo = _mm512_permutex2var_epi64(e0, odd_idx, e1);
+                let w_hi = _mm512_permutex2var_epi64(e2, odd_idx, e3);
+                if wsplit {
+                    msg_la1_half(&mut acc, ae, be, w_lo, ghash_shift64_x4(w_lo), true);
+                    msg_la1_half(&mut acc, af, bf, w_hi, ghash_shift64_x4(w_hi), true);
+                } else {
+                    msg_la1_half(&mut acc, ae, be, w_lo, w_lo, false);
+                    msg_la1_half(&mut acc, af, bf, w_hi, w_hi, false);
+                }
+            }
+            // la2 quads: V[k] = element k of each quad, lane-wise — the
+            // incumbent even/odd pickers double as the (0, 2) / (1, 3) lane
+            // gathers across the two transpose batches.
+            let e0 = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
+            let e1 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
+            let e2 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 8));
+            let e3 = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 12));
+            let w01 = _mm512_permutex2var_epi64(e0, lane3_idx, e1);
+            let w23 = _mm512_permutex2var_epi64(e2, lane3_idx, e3);
+            let w = _mm512_permutex2var_epi64(w01, cat_lo2_idx, w23);
+            let w64 = if wsplit { ghash_shift64_x4(w) } else { w };
+            let wm = |t: __m512i| {
+                if wsplit {
+                    ghash_mul_x4_split(t, w, w64)
+                } else {
+                    ghash_mul_x4(w, t)
+                }
+            };
+            let mut av = [_mm512_setzero_si512(); 8];
+            let mut bv = [_mm512_setzero_si512(); 8];
+            for k in 0..4 {
+                av[k] = _mm512_permutex2var_epi64(ae[k], even_idx, af[k]);
+                av[4 + k] = _mm512_permutex2var_epi64(ae[k], odd_idx, af[k]);
+                bv[k] = _mm512_permutex2var_epi64(be[k], even_idx, bf[k]);
+                bv[4 + k] = _mm512_permutex2var_epi64(be[k], odd_idx, bf[k]);
+            }
+            // XOR-sum networks.
+            let pa0 = _mm512_xor_si512(av[0], av[1]);
+            let pa1 = _mm512_xor_si512(av[2], av[3]);
+            let pa2 = _mm512_xor_si512(av[4], av[5]);
+            let pa3 = _mm512_xor_si512(av[6], av[7]);
+            let qa = _mm512_xor_si512(pa0, pa1);
+            let qb = _mm512_xor_si512(pa2, pa3);
+            let ua = _mm512_xor_si512(qa, qb);
+            let a02 = _mm512_xor_si512(av[0], av[2]);
+            let a13 = _mm512_xor_si512(av[1], av[3]);
+            let a46 = _mm512_xor_si512(av[4], av[6]);
+            let a57 = _mm512_xor_si512(av[5], av[7]);
+            let a0246 = _mm512_xor_si512(a02, a46);
+            let a1357 = _mm512_xor_si512(a13, a57);
+            let a04 = _mm512_xor_si512(av[0], av[4]);
+            let a26 = _mm512_xor_si512(av[2], av[6]);
+            let a15 = _mm512_xor_si512(av[1], av[5]);
+            let a37 = _mm512_xor_si512(av[3], av[7]);
+            let a0145 = _mm512_xor_si512(pa0, pa2);
+            let a2367 = _mm512_xor_si512(pa1, pa3);
+            let pb0 = _mm512_xor_si512(bv[0], bv[1]);
+            let pb1 = _mm512_xor_si512(bv[2], bv[3]);
+            let pb2 = _mm512_xor_si512(bv[4], bv[5]);
+            let pb3 = _mm512_xor_si512(bv[6], bv[7]);
+            let rb0123 = _mm512_xor_si512(pb0, pb1);
+            let rb4567 = _mm512_xor_si512(pb2, pb3);
+            let ub = _mm512_xor_si512(rb0123, rb4567);
+            let b02 = _mm512_xor_si512(bv[0], bv[2]);
+            let b13 = _mm512_xor_si512(bv[1], bv[3]);
+            let b46 = _mm512_xor_si512(bv[4], bv[6]);
+            let b57 = _mm512_xor_si512(bv[5], bv[7]);
+            let b0246 = _mm512_xor_si512(b02, b46);
+            let b1357 = _mm512_xor_si512(b13, b57);
+            let b04 = _mm512_xor_si512(bv[0], bv[4]);
+            let b26 = _mm512_xor_si512(bv[2], bv[6]);
+            let b15 = _mm512_xor_si512(bv[1], bv[5]);
+            let b37 = _mm512_xor_si512(bv[3], bv[7]);
+            let b0145 = _mm512_xor_si512(pb0, pb2);
+            let b2367 = _mm512_xor_si512(pb1, pb3);
+            // G(1): w1(i, j) products.
+            acc2[0].mul_acc(wm(av[4]), bv[4]);
+            acc2[1].mul_acc(wm(av[6]), bv[6]);
+            acc2[2].mul_acc(wm(a46), b46);
+            acc2[3].mul_acc(wm(av[5]), bv[5]);
+            acc2[4].mul_acc(wm(av[7]), bv[7]);
+            acc2[5].mul_acc(wm(a57), b57);
+            acc2[6].mul_acc(wm(pa2), pb2);
+            acc2[7].mul_acc(wm(pa3), pb3);
+            acc2[8].mul_acc(wm(qb), rb4567);
+            // G(∞): (w0 + w1)(i, j) products.
+            acc2[9].mul_acc(wm(a04), b04);
+            acc2[10].mul_acc(wm(a26), b26);
+            acc2[11].mul_acc(wm(a0246), b0246);
+            acc2[12].mul_acc(wm(a15), b15);
+            acc2[13].mul_acc(wm(a37), b37);
+            acc2[14].mul_acc(wm(a1357), b1357);
+            acc2[15].mul_acc(wm(a0145), b0145);
+            acc2[16].mul_acc(wm(a2367), b2367);
+            acc2[17].mul_acc(wm(ua), ub);
+            x_lo += 16;
+        }
+
+        // Small instances (lo_size ∈ {4, 8, 12}) leave whole quads: finish
+        // one quad (two incumbent groups) at a time in scalar, exactly the
+        // oracle's per-quad body.
+        while x_lo + 4 <= lo_size {
+            let o = 2 * x_lo;
+            let i = 4 * o;
+            let fold4 = |v: &[F128], i: usize| {
+                let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
+                let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
+                t0 + rho_b * (t0 + t1)
+            };
+            let mut av = [F128::ZERO; 8];
+            let mut bv = [F128::ZERO; 8];
+            for j in 0..8 {
+                av[j] = fold4(a_in, i + 4 * j);
+                bv[j] = fold4(b_in, i + 4 * j);
+                a_out[o + j] = av[j];
+                b_out[o + j] = bv[j];
+            }
+            for (wt, g) in [(eq_lo[x_lo + 1], 0usize), (eq_lo[x_lo + 3], 4usize)] {
+                let (a0w, a1w, a2w, a3w) =
+                    (wt * av[g], wt * av[g + 1], wt * av[g + 2], wt * av[g + 3]);
+                let (b0, b1, b2, b3) = (bv[g], bv[g + 1], bv[g + 2], bv[g + 3]);
+                tail[0] ^= a1w.mul_unreduced(b1);
+                tail[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+                tail[2] ^= a3w.mul_unreduced(b3);
+                tail[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+                tail[4] ^= a2w.mul_unreduced(b2);
+                let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+                let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+                tail[5] ^= e_aw.mul_unreduced(e_b);
+                tail[6] ^= o_aw.mul_unreduced(o_b);
+                tail[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+            }
+            let mut la2t = [F256Unreduced::ZERO; 18];
+            crate::zerocheck::multilinear::la2_group_accumulate(
+                &mut la2t,
+                eq_lo[x_lo + 3],
+                &av,
+                &bv,
+            );
+            for j in 0..18 {
+                tail[8 + j] ^= la2t[j];
+            }
+            x_lo += 4;
+        }
+
+        if nt_out {
+            _mm_sfence();
+        }
+        let mut out = [F128::ZERO; 26];
+        for i in 0..8 {
+            tail[i] ^= acc[i].fold();
+            out[i] = tail[i].reduce();
+        }
+        for j in 0..18 {
+            tail[8 + j] ^= acc2[j].fold();
+            out[8 + j] = tail[8 + j].reduce();
+        }
+        out
+    }
+}
+
 /// `FLOCK_NO_ZC_FOLD_NT=1` restores plain write-allocate stores for the
 /// cascade fold outputs (exact same-binary A/B); the ranked worker's cleared
 /// env never sets it.
