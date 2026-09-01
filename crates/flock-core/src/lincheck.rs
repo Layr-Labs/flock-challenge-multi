@@ -1,3 +1,4 @@
+//! Repeated-draw instrument marker: RD2-C1 (codegen-inert; see note).
 //! Lincheck PIOP for **block-diagonal** R1CS over GF(2).
 //!
 //! Reduces three MLE evaluation claims (`â(x)=v`, `b̂(x')=v'`, `ĉ(x'')=v''`)
@@ -875,6 +876,66 @@ fn partial_fold_packed_z_block_major_factorized_padded(
     )
 }
 
+/// The eight factorized-equality weights for one stripe:
+/// `eq_lo[(outer_base + lane) & lo_mask] * eq_hi[(outer_base + lane) >> log_b]`.
+///
+/// FAIL-CLOSED vector arm. When `outer_base % 8 == 0` and `log_b >= 3` the
+/// eight lanes share one `eq_hi` element and read a contiguous eight-aligned
+/// `eq_lo` window, so the whole stripe is two broadcast multiplies. Any other
+/// shape — and every non-AVX-512 build — takes the per-lane scalar product
+/// unchanged.
+#[inline]
+fn eq8_factorized(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    lo_mask: usize,
+    log_b: usize,
+    outer_base: usize,
+) -> [F128; 8] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_eq8_x4_enabled() && log_b >= 3 && outer_base % 8 == 0 {
+        use crate::field::gf2_128::x86_64::{
+            f128x4_loadu, f128x4_set, ghash_mul_x4_split, ghash_shift64_x4,
+        };
+        let lo_base = outer_base & lo_mask;
+        // `log_b >= 3` makes `eq_lo.len()` a multiple of 8, and `lo_base` is a
+        // multiple of 8 because `outer_base` is, so the window cannot straddle
+        // the end of the table.
+        debug_assert!(lo_base + 8 <= eq_lo.len());
+        debug_assert_eq!(outer_base >> log_b, (outer_base + 7) >> log_b);
+        let t = eq_hi[outer_base >> log_b];
+        let mut out = [F128::ZERO; 8];
+        // SAFETY: the cfg gate carries avx512f+vpclmulqdq. Both loads read
+        // four readable `F128` inside `eq_lo[lo_base..lo_base + 8]`, in bounds
+        // by the assertion above; both stores write four `F128` inside `out`.
+        // `t_x64` is produced by `ghash_shift64_x4` from the same broadcast
+        // `t`, which is exactly the companion contract `ghash_mul_x4_split`
+        // requires.
+        unsafe {
+            let tb = f128x4_set(t, t, t, t);
+            let t_x64 = ghash_shift64_x4(tb);
+            let p = eq_lo.as_ptr().add(lo_base);
+            let r0 = ghash_mul_x4_split(f128x4_loadu(p), tb, t_x64);
+            let r1 = ghash_mul_x4_split(f128x4_loadu(p.add(4)), tb, t_x64);
+            let q = out.as_mut_ptr();
+            core::arch::x86_64::_mm512_storeu_si512(q as *mut core::arch::x86_64::__m512i, r0);
+            core::arch::x86_64::_mm512_storeu_si512(
+                q.add(4) as *mut core::arch::x86_64::__m512i,
+                r1,
+            );
+        }
+        return out;
+    }
+    std::array::from_fn(|lane| {
+        let outer = outer_base + lane;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
+}
+
 /// Factorized block-major fold with an optional immediate bind of the top
 /// remaining inner coordinate. The GFNI arm fuses that bind into its existing
 /// cross-worker plane reduce; other targets bind the completed vector.
@@ -900,12 +961,7 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         m,
         k_log,
         useful_bits,
-        |outer_base| {
-            std::array::from_fn(|r| {
-                let outer = outer_base + r;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
-        },
+        |outer_base| eq8_factorized(eq_lo, eq_hi, lo_mask, log_b, outer_base),
         top_bind,
     )
 }
@@ -1005,12 +1061,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
         m,
         k_log,
         useful_bits,
-        |outer_base| {
-            std::array::from_fn(|lane| {
-                let outer = outer_base + lane;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
-        },
+        |outer_base| eq8_factorized(&eq_lo, &eq_hi, lo_mask, log_b, outer_base),
         Some(r_top),
         true,
     );
@@ -1058,6 +1109,23 @@ fn block_major_gfni_enabled() -> bool {
     }
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_BM_GFNI").is_none());
+    *ON
+}
+
+/// 4-lane CLMUL for the factorized-equality weights. `FLOCK_NO_LC_EQ8_X4=1`
+/// restores the per-lane scalar product.
+///
+/// Inert on the ranked runner: the harness calls `env_clear()`, so this is a
+/// local A/B surface only and the vector arm is the compiled-in default.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+fn lc_eq8_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EQ8_X4").is_none());
     *ON
 }
 
@@ -3574,6 +3642,46 @@ pub fn verify<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    /// The 4-lane weight kernel is bit-identical to the per-lane scalar
+    /// product at the ranked geometry, and every non-arming shape still
+    /// matches.
+    #[test]
+    fn eq8_factorized_matches_scalar() {
+        fn scalar(eq_lo: &[F128], eq_hi: &[F128], lo_mask: usize, log_b: usize, ob: usize)
+            -> [F128; 8]
+        {
+            std::array::from_fn(|lane| {
+                let outer = ob + lane;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            })
+        }
+        let mut rng = Rng::new(0x5EED_E98A_11);
+        // Ranked geometry: 512 x 512 = 2^18, log_b = 9.
+        for (lo_log, hi_log) in [(9usize, 9usize), (3, 3), (4, 2), (2, 4), (1, 5)] {
+            let eq_lo: Vec<F128> = (0..1usize << lo_log).map(|_| rng.f128()).collect();
+            let eq_hi: Vec<F128> = (0..1usize << hi_log).map(|_| rng.f128()).collect();
+            let lo_mask = eq_lo.len() - 1;
+            let log_b = lo_log;
+            let n_outer = eq_lo.len() * eq_hi.len();
+            // Every 8-aligned stripe, i.e. exactly what the GFNI arm requests.
+            for ob in (0..n_outer).step_by(8) {
+                assert_eq!(
+                    eq8_factorized(&eq_lo, &eq_hi, lo_mask, log_b, ob),
+                    scalar(&eq_lo, &eq_hi, lo_mask, log_b, ob),
+                    "8-aligned stripe lo_log={lo_log} hi_log={hi_log} ob={ob}"
+                );
+            }
+            // Unaligned bases must fall through to the scalar arm and still agree.
+            for ob in 0..core::cmp::min(n_outer.saturating_sub(8), 32) {
+                assert_eq!(
+                    eq8_factorized(&eq_lo, &eq_hi, lo_mask, log_b, ob),
+                    scalar(&eq_lo, &eq_hi, lo_mask, log_b, ob),
+                    "unaligned base lo_log={lo_log} hi_log={hi_log} ob={ob}"
+                );
+            }
+        }
+    }
 
     /// On the ranked eight-round shape, the first top bind is precisely the
     /// incumbent Fold8 intake's only non-retained-coordinate fold. This is
