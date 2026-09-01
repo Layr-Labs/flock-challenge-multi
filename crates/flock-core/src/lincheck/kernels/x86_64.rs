@@ -336,6 +336,19 @@ fn lc_mats_aos_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LC_MATS_AOS").is_none())
 }
 
+/// `FLOCK_NO_VEC_FOLD_MATS=1` disables the AVX-512/VBMI fused matrix build
+/// and falls back to the scalar `transpose_8_u64s_to_64_bytes` + `swap_bytes`
+/// loop. Default: one `vpermb` deinterleave + `VGF2P8AFFINEQB` per limb.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn vec_fold_mats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_VEC_FOLD_MATS").is_none())
+}
+
 /// Deinterleave eight AoS F128 into lo-qword and hi-qword lane arrays.
 ///
 /// # Safety
@@ -370,18 +383,71 @@ unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
     (lo_lanes, hi_lanes)
 }
 
+/// Vectorized body of [`fold_mats_from_basis`].
+///
+/// One `vpermb` deinterleaves the eight lane bytes into the shape the GFNI
+/// affine qword expects (`y.byte[i] = lane[7 - i%8].byte[i/8]`), then a
+/// single `VGF2P8AFFINEQB` per limb performs the 8×8 bit-transpose. The
+/// source vector is the *reversed* identity (`0x0102_0408_1020_4080`) so
+/// the affine product selects bit `7-b` of matrix row `7-i`; that folds the
+/// scalar `u64::swap_bytes` into the same instruction, producing the final
+/// GFNI matrices directly as eight little-endian qwords.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+unsafe fn fold_mats_from_basis_vec(eq8: &[F128], mats: &mut [u64]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(eq8.len(), 8);
+    debug_assert_eq!(mats.len(), 16);
+
+    // Same byte-deinterleave index used by `bits::transpose_8_u64s_to_64_bytes_gfni`.
+    #[rustfmt::skip]
+    const BIDX: [u8; 64] = [
+        56, 48, 40, 32, 24, 16, 8, 0,
+        57, 49, 41, 33, 25, 17, 9, 1,
+        58, 50, 42, 34, 26, 18, 10, 2,
+        59, 51, 43, 35, 27, 19, 11, 3,
+        60, 52, 44, 36, 28, 20, 12, 4,
+        61, 53, 45, 37, 29, 21, 13, 5,
+        62, 54, 46, 38, 30, 22, 14, 6,
+        63, 55, 47, 39, 31, 23, 15, 7,
+    ];
+    // Reversed GFNI identity: source byte `b` has only bit `7-b` set, so the
+    // affine product `A * x` returns `A.row[7-i].bit[7-b]` in `DEST.byte[b].bit[i]`.
+    // That is exactly `u64::swap_bytes` of the unswapped bit-transposed group.
+    let swap_id = _mm512_set1_epi64(0x0102_0408_1020_4080u64 as i64);
+
+    // SAFETY: the `cfg` gate supplies exactly the features the callee enables.
+    unsafe {
+        let (lo_lanes, hi_lanes) = aos8_lohi(eq8);
+        let bidx = _mm512_loadu_si512(BIDX.as_ptr() as *const __m512i);
+        let lo = _mm512_loadu_si512(lo_lanes.as_ptr() as *const __m512i);
+        let hi = _mm512_loadu_si512(hi_lanes.as_ptr() as *const __m512i);
+        let lo_t = _mm512_permutexvar_epi8(bidx, lo);
+        let hi_t = _mm512_permutexvar_epi8(bidx, hi);
+        let lo_mats = _mm512_gf2p8affine_epi64_epi8::<0>(swap_id, lo_t);
+        let hi_mats = _mm512_gf2p8affine_epi64_epi8::<0>(swap_id, hi_t);
+        _mm512_storeu_si512(mats.as_mut_ptr() as *mut __m512i, lo_mats);
+        _mm512_storeu_si512(mats.as_mut_ptr().add(8) as *mut __m512i, hi_mats);
+    }
+}
+
 /// The sixteen `VGF2P8AFFINEQB` matrices of one stripe's sum table, straight
 /// from its eight `eq_outer` basis values (encoding: `out.bit[i] =
 /// parity(byte[7-i] & in)`; input bit `j` ↔ stripe bit `j`, matching
 /// `build_sum_table`'s `T[1 << j] = eq8[j]`).
 ///
-/// Built as two 8×64 bit-transposes (lo / hi limbs) plus per-byte-group
-/// `swap_bytes`. The scalar extractor walked 16 × 8 × 8 isolated bits;
-/// `transpose_8_u64s_to_64_bytes` is the already-proven ISA kernel for
-/// that exact 8-lane → 8-byte-group map, and the GFNI affine qword stores
-/// row `i` at byte `7 − i`, which is `u64::swap_bytes` of the little-endian
-/// group. Bit-identical to the bit-extract loop: see
-/// `fold_mats_from_basis_matches_sum_table`.
+/// The fast path keeps the existing [`aos8_lohi`] deinterleave and replaces
+/// the scalar `transpose_8_u64s_to_64_bytes` + `swap_bytes` loop with one
+/// `vpermb` + `VGF2P8AFFINEQB` per limb, folding the byte-swap into the
+/// affine identity. The result is bit-identical to the scalar extractor:
+/// see `fold_mats_from_basis_matches_sum_table`. Set
+/// `FLOCK_NO_VEC_FOLD_MATS=1` to force the scalar reference path.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -390,6 +456,20 @@ unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
+
+    if vec_fold_mats_enabled()
+        && cfg!(all(
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi"
+        ))
+    {
+        // SAFETY: the inner function is cfg- and target_feature-gated for the
+        // exact ISA it uses; the runtime gate is only a diagnostic switch.
+        unsafe {
+            fold_mats_from_basis_vec(eq8, mats);
+        }
+        return;
+    }
 
     let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
         // SAFETY: len==8 asserted; cfg supplies avx512f.
