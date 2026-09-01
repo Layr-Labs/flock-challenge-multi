@@ -508,30 +508,12 @@ pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
 #[inline]
 #[target_feature(enable = "avx512f,sse4.1")]
 pub unsafe fn f128x4_extract(v: __m512i) -> [F128; 4] {
-    // SAFETY: register-only lane extraction under the declared features.
+    // SAFETY: `[F128; 4]` is a contiguous 64-byte `repr(C)` array, and the
+    // store initializes every byte before `assume_init`.
     unsafe {
-        let l0 = _mm512_extracti32x4_epi32::<0>(v);
-        let l1 = _mm512_extracti32x4_epi32::<1>(v);
-        let l2 = _mm512_extracti32x4_epi32::<2>(v);
-        let l3 = _mm512_extracti32x4_epi32::<3>(v);
-        [
-            F128 {
-                lo: _mm_extract_epi64::<0>(l0) as u64,
-                hi: _mm_extract_epi64::<1>(l0) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l1) as u64,
-                hi: _mm_extract_epi64::<1>(l1) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l2) as u64,
-                hi: _mm_extract_epi64::<1>(l2) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l3) as u64,
-                hi: _mm_extract_epi64::<1>(l3) as u64,
-            },
-        ]
+        let mut out = core::mem::MaybeUninit::<[F128; 4]>::uninit();
+        _mm512_storeu_si512(out.as_mut_ptr().cast::<__m512i>(), v);
+        out.assume_init()
     }
 }
 
