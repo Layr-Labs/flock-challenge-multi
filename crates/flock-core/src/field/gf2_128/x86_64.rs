@@ -278,13 +278,13 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+unsafe fn gf2_128_reduce_x4(t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        let shifted = _mm512_bslli_epi128::<8>(t1);
+        let red = _mm512_clmulepi64_epi128::<0x01>(t1, poly);
+        _mm512_ternarylogic_epi64::<0x96>(t0, shifted, red)
     }
 }
 
@@ -398,7 +398,12 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub unsafe fn ghash_shift64_x4(t: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
-    unsafe { gf2_128_reduce_x4(_mm512_setzero_si512(), t) }
+    unsafe {
+        let poly = ghash_poly_x4();
+        let shifted = _mm512_bslli_epi128::<8>(t);
+        let red = _mm512_clmulepi64_epi128::<0x01>(t, poly);
+        _mm512_xor_si512(shifted, red)
+    }
 }
 
 /// 4 independent GF(2^128) products `v[i]·t` for a twiddle supplied in split
@@ -638,8 +643,9 @@ impl WideGhashX4 {
         // 0x96 = a ^ b ^ c.
         self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
         self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+        let m0 = _mm512_xor_si512(c01_0, c10_0);
+        let m1 = _mm512_xor_si512(c01_1, c10_1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, m0, m1);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
