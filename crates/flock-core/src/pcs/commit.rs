@@ -729,7 +729,7 @@ pub(crate) fn subtree_parents_enabled() -> bool {
 }
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
-const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
+const RANKED_PARENT_SUBGROUP_LEAVES: usize = 1024;
 
 /// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
 /// every 2048-leaf subgroup. Regroup only that exact production shape; every
@@ -1380,10 +1380,10 @@ mod tests {
             calls
         };
         let old_calls = 8_192 * platform_calls(RANKED_PARENT_BLOCK_LEAVES) + platform_calls(8_192);
-        let new_calls = 512 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES) + platform_calls(512);
+        let new_calls = 1024 * platform_calls(RANKED_PARENT_SUBGROUP_LEAVES) + platform_calls(1024);
         assert_eq!(
             (old_calls, new_calls, old_calls - new_calls),
-            (90_627, 67_107, 23_520),
+            (90_627, 68_675, 21_952),
         );
 
         build_upper_levels(

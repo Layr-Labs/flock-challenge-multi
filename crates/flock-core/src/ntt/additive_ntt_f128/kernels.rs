@@ -225,6 +225,56 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     }
 }
 
+/// Apply the same final fused-two butterfly to two staging quads, then pair
+/// corresponding rows through the next layer and publish all eight results.
+/// This is the ranked seed/top layer-9 direct publisher.
+///
+/// # Safety
+/// `src_top` and `src_bot` each expose four readable 64-element rows at
+/// `src + i * src_step`. Every pointer in `dst` exposes 64 writable elements;
+/// the eight destinations are disjoint and satisfy the alignment selected by
+/// `ALIGNED_ZMM`. Sources and destinations do not overlap. `lanes` is 60 or
+/// 64, and the architecture cfg supplies AVX-512 VPCLMULQDQ.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_pair_layer_publish_nt<const ALIGNED_ZMM: bool>(
+    src_top: *const F128,
+    src_bot: *const F128,
+    src_step: usize,
+    dst: [*mut F128; 8],
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    t_pair: &[F128; 4],
+) {
+    debug_assert!(lanes == 60 || lanes == 64);
+    for p in dst {
+        debug_assert_eq!(p as usize % 16, 0);
+        debug_assert!(!ALIGNED_ZMM || p as usize % 64 == 0);
+    }
+    // At ranked layers 7 and 8 only the all-zero block twiddle has a zero high
+    // limb (1/128 and 1/256 entries respectively), and no fused-two quad has
+    // both inner twiddles low. Duplicating this already-large eight-row kernel
+    // for the low arms costs far more I-cache than that one degenerate quad
+    // saves, so keep the general split product here.
+    // SAFETY: all requirements are forwarded from this function's caller.
+    unsafe {
+        x86_64::butterfly_fused_2layer_pair_layer_publish_nt_gen::<
+            false,
+            false,
+            ALIGNED_ZMM,
+        >(
+            src_top, src_bot, src_step, dst, lanes, t_outer, t_inner_a, t_inner_b, t_pair,
+        )
+    }
+}
+
 /// Process one fused-two-layer row group from a separate source buffer.
 ///
 /// # Safety

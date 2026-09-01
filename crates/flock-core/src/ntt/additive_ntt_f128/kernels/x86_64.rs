@@ -474,6 +474,152 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
     }
 }
 
+/// Ranked direct-publish kernel for two fused-two staging quads followed by
+/// the layer that pairs corresponding rows of those quads.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_pair_layer_publish_nt_gen<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src_top: *const F128,
+    src_bot: *const F128,
+    src_step: usize,
+    dst: [*mut F128; 8],
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    t_pair: &[F128; 4],
+) {
+    // SAFETY: forwarded caller contract; the process-cached multiply choice
+    // remains outside the lane loop exactly as in the incumbent publisher.
+    unsafe {
+        if mul_diet_disabled() {
+            butterfly_fused_2layer_pair_layer_publish_nt_impl::<
+                OUTER_LOW,
+                INNER_LOW,
+                false,
+                ALIGNED_ZMM,
+            >(
+                src_top, src_bot, src_step, dst, lanes, t_outer, t_inner_a, t_inner_b, t_pair,
+            )
+        } else {
+            butterfly_fused_2layer_pair_layer_publish_nt_impl::<
+                OUTER_LOW,
+                INNER_LOW,
+                true,
+                ALIGNED_ZMM,
+            >(
+                src_top, src_bot, src_step, dst, lanes, t_outer, t_inner_a, t_inner_b, t_pair,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_pair_layer_publish_nt_impl<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const DIET: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src_top: *const F128,
+    src_bot: *const F128,
+    src_step: usize,
+    dst: [*mut F128; 8],
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    t_pair: &[F128; 4],
+) {
+    use core::arch::x86_64::*;
+
+    // SAFETY: the caller provides two readable quads, eight disjoint aligned
+    // destinations and all target-feature/twiddle-form preconditions.
+    unsafe {
+        debug_assert!(lanes == 60 || lanes == 64);
+        debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+        debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
+        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
+        let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
+        let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
+        // Layer 9 is not one of the standard basis's two universally-low
+        // deepest layers, so retain the general split multiply for all four
+        // independent twiddles.
+        let pair = [
+            tw_x4::<false, DIET>(t_pair[0]),
+            tw_x4::<false, DIET>(t_pair[1]),
+            tw_x4::<false, DIET>(t_pair[2]),
+            tw_x4::<false, DIET>(t_pair[3]),
+        ];
+
+        let mut i = 0usize;
+        while i < lanes {
+            let mut va = _mm512_loadu_si512(src_top.add(i) as *const __m512i);
+            let mut vb = _mm512_loadu_si512(src_top.add(src_step + i) as *const __m512i);
+            let mut vc = _mm512_loadu_si512(src_top.add(2 * src_step + i) as *const __m512i);
+            let mut vd = _mm512_loadu_si512(src_top.add(3 * src_step + i) as *const __m512i);
+            let mut ve = _mm512_loadu_si512(src_bot.add(i) as *const __m512i);
+            let mut vf = _mm512_loadu_si512(src_bot.add(src_step + i) as *const __m512i);
+            let mut vg = _mm512_loadu_si512(src_bot.add(2 * src_step + i) as *const __m512i);
+            let mut vh = _mm512_loadu_si512(src_bot.add(3 * src_step + i) as *const __m512i);
+
+            let next = |a: &mut __m512i, b: &mut __m512i, c: &mut __m512i, d: &mut __m512i| {
+                let na = _mm512_xor_si512(*a, mul_x4::<OUTER_LOW, DIET>(outer, *c));
+                *c = _mm512_xor_si512(*c, na);
+                *a = na;
+                let nb = _mm512_xor_si512(*b, mul_x4::<OUTER_LOW, DIET>(outer, *d));
+                *d = _mm512_xor_si512(*d, nb);
+                *b = nb;
+                let na = _mm512_xor_si512(*a, mul_x4::<INNER_LOW, DIET>(inner_a, *b));
+                *b = _mm512_xor_si512(*b, na);
+                *a = na;
+                let nc = _mm512_xor_si512(*c, mul_x4::<INNER_LOW, DIET>(inner_b, *d));
+                *d = _mm512_xor_si512(*d, nc);
+                *c = nc;
+            };
+            next(&mut va, &mut vb, &mut vc, &mut vd);
+            next(&mut ve, &mut vf, &mut vg, &mut vh);
+
+            let na = _mm512_xor_si512(va, mul_x4::<false, DIET>(pair[0], ve));
+            ve = _mm512_xor_si512(ve, na);
+            va = na;
+            let nb = _mm512_xor_si512(vb, mul_x4::<false, DIET>(pair[1], vf));
+            vf = _mm512_xor_si512(vf, nb);
+            vb = nb;
+            let nc = _mm512_xor_si512(vc, mul_x4::<false, DIET>(pair[2], vg));
+            vg = _mm512_xor_si512(vg, nc);
+            vc = nc;
+            let nd = _mm512_xor_si512(vd, mul_x4::<false, DIET>(pair[3], vh));
+            vh = _mm512_xor_si512(vh, nd);
+            vd = nd;
+
+            stream_f128x4::<ALIGNED_ZMM>(dst[0].add(i), va);
+            stream_f128x4::<ALIGNED_ZMM>(dst[1].add(i), vb);
+            stream_f128x4::<ALIGNED_ZMM>(dst[2].add(i), vc);
+            stream_f128x4::<ALIGNED_ZMM>(dst[3].add(i), vd);
+            stream_f128x4::<ALIGNED_ZMM>(dst[4].add(i), ve);
+            stream_f128x4::<ALIGNED_ZMM>(dst[5].add(i), vf);
+            stream_f128x4::<ALIGNED_ZMM>(dst[6].add(i), vg);
+            stream_f128x4::<ALIGNED_ZMM>(dst[7].add(i), vh);
+            i += 4;
+        }
+        if i < 64 {
+            debug_assert_eq!(i, 60);
+            let zero = _mm512_setzero_si512();
+            for p in dst {
+                stream_f128x4::<ALIGNED_ZMM>(p.add(i), zero);
+            }
+        }
+    }
+}
+
 /// Out-of-place fused two-layer forward butterfly (layers 1–2 seed).
 /// Same algebra as [`butterfly_fused_2layer`], loads from `src` and stores
 /// to `dst`. Source and destination must not overlap.
