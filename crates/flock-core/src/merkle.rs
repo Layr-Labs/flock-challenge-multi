@@ -242,7 +242,9 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
 ))]
 #[inline]
 fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
-    sha256x4::hash4_equal_len(inputs, outs);
+    unsafe {
+        sha256x4::hash4_equal_len(inputs, outs);
+    }
 }
 
 #[cfg(not(any(
@@ -315,7 +317,6 @@ const BLAKE3_BATCH: usize = 16;
 /// node type (chunk vs parent).
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
-/// `Vec`-per-call formulation this costs nothing per batch.
 #[inline]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
@@ -326,24 +327,24 @@ fn blake3_hash_many<const N: usize>(
 ) {
     debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
-    for (outs, msgs) in out
-        .chunks_mut(BLAKE3_BATCH)
-        .zip(data.chunks(BLAKE3_BATCH * N))
-    {
-        let n = outs.len();
-        // Fill a stack array of input pointers. Slot 0 seeds the array so the
-        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
-        // holds a valid reference rather than uninitialized memory.
-        let first: &[u8; N] = msgs[..N].try_into().unwrap();
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
-        }
-        // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
-        // initialized, contiguous, unpadded storage — the amount `hash_many`
-        // writes for `n` inputs.
-        let out_bytes: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+    let data_ptr = data.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let total = out.len();
+    let mut offset = 0;
+    while offset < total {
+        let n = (total - offset).min(BLAKE3_BATCH);
+        let inputs: [&[u8; N]; BLAKE3_BATCH] = unsafe {
+            let p = data_ptr.add(offset * N);
+            let first: &[u8; N] = &*(p as *const [u8; N]);
+            let mut arr = [first; BLAKE3_BATCH];
+            for i in 1..n {
+                arr[i] = &*(p.add(i * N) as *const [u8; N]);
+            }
+            arr
+        };
+        let out_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.add(offset) as *mut u8, n * 32)
+        };
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
@@ -354,6 +355,7 @@ fn blake3_hash_many<const N: usize>(
             flags_end,
             out_bytes,
         );
+        offset += n;
     }
 }
 
@@ -519,8 +521,27 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
     match kind {
         HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
         HashKind::Sha256 => {
-            for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
-                *o = Sha256::digest(children).into();
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        let mut h = Sha256::new();
+                        h.update(l);
+                        h.update(r);
+                        *out = h.finalize().into();
+                    }
+                }
             }
         }
     }
