@@ -695,3 +695,6 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// Public-crown redraw marker 8; anonymous and unreferenced.
+const _: usize = 8;
