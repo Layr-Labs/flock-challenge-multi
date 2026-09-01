@@ -163,16 +163,16 @@ fn bstatic_28_enabled() -> bool {
 /// AVX-512 box (single-thread hot, production entry point, plan-shaped
 /// inputs): 0 and 1 (every K-row's b word is all-ones: 0.70×), 30 (seven
 /// structurally-zero rows plus one fully static row: 0.23×), 31 (all eight
-/// rows zero: 0.10×). Blocks with a mix of static and generic rows measured
-/// 1.03–1.16× on this generation of the kernel body (the fully unrolled
-/// specialised body pays ~3.5 ns/call over the incumbent's compact loop, more
-/// than its partial-row savings recover), so they stay on the incumbent.
+/// rows zero: 0.10×). Block 29 uses the compact row-class body below; the
+/// remaining mixed plans stay on the incumbent because the fully unrolled
+/// specialised body measured 1.03–1.16× slower.
 #[cfg(test)]
 pub(crate) const BSTATIC_LIVE: [bool; BSTATIC_BLOCKS] = {
     let mut t = [false; BSTATIC_BLOCKS];
     t[0] = true;
     t[1] = true;
     t[28] = true;
+    t[29] = true;
     t[30] = true;
     t[31] = true;
     t
@@ -470,6 +470,108 @@ unsafe fn kernel<const BLK: usize>(
     }
 }
 
+/// Compact row-class body for the selected mixed plan. Unlike [`kernel`], it
+/// checks each static/zero row locally and returns before the final store on a
+/// miss, so the caller can run the incumbent for the complete window. This
+/// avoids an eight-row scratch sniff and the large straight-line mixed body.
+///
+/// # Safety
+/// As for [`kernel`]; `BLK` is a valid `BSTATIC_PLAN` index.
+#[inline(always)]
+unsafe fn kernel_compact<const BLK: usize>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    partials: &BstaticPartials,
+    out: &mut [u8; 64],
+    nt: u8,
+) -> bool {
+    let table = inv_table.data_ptr();
+    let img2 = partials.img2;
+    let table8 = if img2 {
+        inv_table.half_swapped_data_ptr()
+    } else {
+        table
+    };
+    // SAFETY: forwarded from the caller's contract.
+    unsafe {
+        let a_base = a_packed.as_ptr().add(byte_base_b);
+        let b_base = b_packed.as_ptr().add(byte_base_b);
+        let mut acc = _mm512_setzero_si512();
+        // Keep this compact row-class loop rolled; the selected plan is still
+        // read from the generated table, so ROW_ZERO/ROW_STATIC remain exact.
+        let limit = core::hint::black_box(8usize);
+        let mut k = 0usize;
+        while k < limit {
+            let p = BSTATIC_PLAN[BLK][k];
+            let a_ptr = a_base.add(k * N_CHUNKS);
+            let b_ptr = b_base.add(k * N_CHUNKS);
+            let b_word = if p.kind == ROW_GENERIC {
+                0
+            } else {
+                u64::from_le(core::ptr::read_unaligned(b_ptr as *const u64))
+            };
+            if p.kind == ROW_ZERO {
+                if (b_word & p.mask) != p.expected {
+                    // No store has happened yet; preserve the dispatcher's
+                    // all-or-nothing miss contract and let the caller run
+                    // the incumbent for the complete window.
+                    return false;
+                }
+                k += 1;
+                continue;
+            }
+            if p.kind == ROW_STATIC {
+                if (b_word & p.mask) != p.expected {
+                    // Accumulation is register-only until the final store.
+                    return false;
+                }
+                let av = if img2 {
+                    apply_full_2img(table, table8, a_ptr)
+                } else {
+                    apply_full(table, a_ptr)
+                };
+                let mut bv = _mm512_load_si512(partials.rows[BLK][k].as_ptr() as *const __m512i);
+                if p.vary != 0 {
+                    let mut v = p.vary;
+                    while v != 0 {
+                        let j = v.trailing_zeros() as usize;
+                        let byte = (b_word >> (8 * j)) as u8 as usize;
+                        let row = _mm512_loadu_si512(table.add(byte * 64) as *const __m512i);
+                        bv = _mm512_xor_si512(bv, perm_row(row, j));
+                        v &= v - 1;
+                    }
+                    let prod = _mm512_gf2p8mul_epi8(av, bv);
+                    let scaled = if k == 0 {
+                        prod
+                    } else {
+                        _mm512_gf2p8mul_epi8(prod, _mm512_set1_epi8((1u8 << k) as i8))
+                    };
+                    acc = _mm512_xor_si512(acc, scaled);
+                } else {
+                    acc = _mm512_xor_si512(acc, _mm512_gf2p8mul_epi8(av, bv));
+                }
+            } else {
+                // Generic rows use the incumbent full apply and retain the
+                // exact row scale.
+                let av = apply_full(table, a_ptr);
+                let bv = apply_full(table, b_ptr);
+                let prod = _mm512_gf2p8mul_epi8(av, bv);
+                let scaled = if k == 0 {
+                    prod
+                } else {
+                    _mm512_gf2p8mul_epi8(prod, _mm512_set1_epi8((1u8 << k) as i8))
+                };
+                acc = _mm512_xor_si512(acc, scaled);
+            }
+            k += 1;
+        }
+        super::x86_64::store_out64(out, acc, nt);
+        true
+    }
+}
+
 /// Dispatch one `(w, b_med)` window through its specialised plan. Returns
 /// `false` when the position has no live plan or its b words miss the plan;
 /// the caller must then run the incumbent kernel (nothing has been written).
@@ -560,6 +662,20 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_bstatic_at(
             // Blocks 0 and 1 carry the identical plan (all-ones b on every
             // row), so they share one body and one set of partial images.
             kernel::<0>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                partials,
+                out,
+                nt,
+            )
+        } else if blk == 29 {
+            // Five static rows (one partially varying and four fully static)
+            // and three generic rows use the compact row-class body. A static
+            // miss returns before the store, so the caller keeps its unchanged
+            // complete-window fallback.
+            kernel_compact::<29>(
                 a_packed,
                 b_packed,
                 inv_table,

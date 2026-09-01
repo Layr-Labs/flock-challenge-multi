@@ -82,7 +82,7 @@ pub(super) fn prepare_bstatic(
 /// resolves this once instead of entering the dispatcher per block.
 #[inline]
 pub(super) fn bstatic_window_live(blk: usize) -> bool {
-    blk <= 1 || blk == 28 || blk == 30 || blk == 31
+    blk <= 1 || blk == 28 || blk == 29 || blk == 30 || blk == 31
 }
 
 /// Per-window static-B hint: the BLAKE3 outer-window index `w ∈ {0, 1}` of
@@ -346,11 +346,12 @@ pub(super) fn shift_reduce_inner_ab_at(
         unsafe {
             if let Some(partials) = bstatic {
                 // The outlined static-B dispatcher (`inline(never)`) is live
-                // only for windows 0, 1, 28, 30, 31 — every other `blk` returns
-                // false without writing. The streaming producer still called
-                // it 28/32 of the time. Gate here so those windows stay on
-                // the prepared generic body with no extra call. Unexpected
-                // `blk` keeps the incumbent generic path.
+                // only for windows 0, 1, 28, 29, 30, 31 — every other `blk`
+                // returns false without writing. The streaming producer reaches
+                // this gate for each window, but only these six positions enter
+                // the outlined dispatcher; all other positions stay on the
+                // prepared generic body with no extra call. Unexpected `blk`
+                // keeps the incumbent generic path.
                 if bstatic_window_live(blk)
                     && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic_at(
                         a_packed, b_packed, inv_table, byte_base, blk, partials, out, nt,
