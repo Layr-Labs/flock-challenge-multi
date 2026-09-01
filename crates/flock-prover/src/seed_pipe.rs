@@ -335,6 +335,100 @@ fn bytes_of(v: &[Compression]) -> &[u8] {
 }
 
 // ---------------------------------------------------------------------------
+// CPU keepalive across the ready->seed gap
+// ---------------------------------------------------------------------------
+
+/// Spin SCHED_IDLE threads on every logical CPU between the warm-up condvar
+/// signal and the arrival of the harness seed. The seed-pipe thread itself
+/// blocks on `read_line_fd(real_stdin)` during this gap, so no ranked thread
+/// is runnable; without the keepalive the runner's vCPUs can clock-gate or
+/// sleep, adding latency to the timed prove that follows.
+#[cfg(target_os = "linux")]
+mod cpu_keepalive {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub static KEEPALIVE_STOP: AtomicBool = AtomicBool::new(false);
+
+    /// `FLOCK_NO_CPU_KEEPALIVE=1` disables the facility. Read once per process.
+    fn disabled() -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_CPU_KEEPALIVE")
+                .as_deref()
+                .is_some_and(|v| v == std::ffi::OsStr::new("1"))
+        })
+    }
+
+    pub fn start_cpu_keepalive() {
+        if disabled() {
+            return;
+        }
+        let ncpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(16);
+        for cpu in 0..ncpus {
+            // Dropping the `JoinHandle` detaches the thread, which is exactly
+            // what we want: these threads terminate when `KEEPALIVE_STOP` is
+            // set and never need to be joined.
+            let _ = std::thread::spawn(move || keepalive_thread(cpu));
+        }
+    }
+
+    pub fn stop_cpu_keepalive() {
+        KEEPALIVE_STOP.store(true, Ordering::Relaxed);
+    }
+
+    fn keepalive_thread(cpu: usize) {
+        // Pin this thread to exactly one CPU. Failures are silent: the thread
+        // simply returns rather than spinning without the intended affinity.
+        const CPU_SET_BYTES: usize = 128; // 1024 CPUs, glibc's default size.
+        let mut set = [0u8; CPU_SET_BYTES];
+        let bits_per_word = 8 * std::mem::size_of::<libc::c_ulong>();
+        let word = cpu / bits_per_word;
+        let bit = cpu % bits_per_word;
+        if word >= CPU_SET_BYTES / std::mem::size_of::<libc::c_ulong>() {
+            return;
+        }
+        // SAFETY: `set` is a zeroed byte array of the size `sched_setaffinity`
+        // expects; we set exactly one bit inside its bounds.
+        unsafe {
+            let bits = set.as_mut_ptr().cast::<libc::c_ulong>();
+            *bits.add(word) |= (1 as libc::c_ulong) << bit;
+            if libc::sched_setaffinity(0, CPU_SET_BYTES, set.as_ptr().cast::<libc::cpu_set_t>()) != 0
+            {
+                return;
+            }
+            let param = libc::sched_param { sched_priority: 0 };
+            // SCHED_IDLE == 5. A priority of 0 is the only valid value for the
+            // idle policy, and the call must succeed for us to be low-impact.
+            if libc::sched_setscheduler(0, 5, &param) != 0 {
+                return;
+            }
+        }
+
+        // Dependent integer chain: the compiler cannot eliminate the work
+        // because `black_box` keeps the value live.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        while !KEEPALIVE_STOP.load(Ordering::Relaxed) {
+            for _ in 0..16 {
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = x.rotate_left(13);
+                x ^= 0x94D0_49BB_1331_11EB;
+                std::hint::black_box(x);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod cpu_keepalive {
+    pub fn start_cpu_keepalive() {}
+    pub fn stop_cpu_keepalive() {}
+}
+
+use cpu_keepalive::{start_cpu_keepalive, stop_cpu_keepalive};
+
+// ---------------------------------------------------------------------------
 // Pipe state
 // ---------------------------------------------------------------------------
 
@@ -898,12 +992,15 @@ fn speculative_main(
     }
     drop(warm);
 
+    start_cpu_keepalive();
     let Some(line) = read_line_fd(real_stdin) else {
+        stop_cpu_keepalive();
         close_fd(real_stdin);
         close_fd(writer);
         mark_dead();
         return;
     };
+    stop_cpu_keepalive();
     close_fd(real_stdin);
 
     let parsed = std::str::from_utf8(&line)
