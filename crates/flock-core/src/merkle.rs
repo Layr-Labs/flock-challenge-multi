@@ -242,7 +242,9 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
 ))]
 #[inline]
 fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
-    sha256x4::hash4_equal_len(inputs, outs);
+    unsafe {
+        sha256x4::hash4_equal_len(inputs, outs);
+    }
 }
 
 #[cfg(not(any(
@@ -315,7 +317,6 @@ const BLAKE3_BATCH: usize = 16;
 /// node type (chunk vs parent).
 ///
 /// Allocation-free: the pointer array lives on the stack, so unlike a
-/// `Vec`-per-call formulation this costs nothing per batch.
 #[inline]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
@@ -324,29 +325,26 @@ fn blake3_hash_many<const N: usize>(
     flags_start: u8,
     flags_end: u8,
 ) {
-    assert_eq!(data.len(), out.len() * N);
+    debug_assert_eq!(data.len(), out.len() * N);
     let plat = blake3_platform();
-    for (outs, msgs) in out
-        .chunks_mut(BLAKE3_BATCH)
-        .zip(data.chunks(BLAKE3_BATCH * N))
-    {
-        let n = outs.len();
-        let base_ptr = msgs.as_ptr();
-        // SAFETY: the entry assertion gives every `n`-element output chunk
-        // exactly `n * N` initialized message bytes. All call-site
-        // monomorphizations have `N > 0`, `0 <= i < n`, and `[u8; N]` has
-        // byte alignment, so each pointer below addresses one complete input.
-        // Unused tail slots retain the valid first input and are not passed.
-        let first: &[u8; N] = unsafe { &*(base_ptr as *const [u8; N]) };
-        let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for i in 0..n {
-            inputs[i] = unsafe { &*(base_ptr.add(i * N) as *const [u8; N]) };
-        }
-        // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
-        // initialized, contiguous, unpadded storage — the amount `hash_many`
-        // writes for `n` inputs.
-        let out_bytes: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
+    let data_ptr = data.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let total = out.len();
+    let mut offset = 0;
+    while offset < total {
+        let n = (total - offset).min(BLAKE3_BATCH);
+        let inputs: [&[u8; N]; BLAKE3_BATCH] = unsafe {
+            let p = data_ptr.add(offset * N);
+            let first: &[u8; N] = &*(p as *const [u8; N]);
+            let mut arr = [first; BLAKE3_BATCH];
+            for i in 1..n {
+                arr[i] = &*(p.add(i * N) as *const [u8; N]);
+            }
+            arr
+        };
+        let out_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.add(offset) as *mut u8, n * 32)
+        };
         plat.hash_many(
             &inputs[..n],
             &BLAKE3_IV,
@@ -357,61 +355,8 @@ fn blake3_hash_many<const N: usize>(
             flags_end,
             out_bytes,
         );
+        offset += n;
     }
-}
-
-/// Hash sparse 1 KiB BLAKE3 leaves selected by `indices`, preserving their
-/// order in `out`. Ranked cut1 openings use exactly this leaf size. The rows
-/// stay in place; each rayon task builds only a 64-entry pointer array and
-/// submits it to BLAKE3 `hash_many`.
-pub(crate) fn hash_indexed_blake3_1k(data: &[u8], indices: &[usize], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(indices.len(), out.len());
-    assert_eq!(data.len() % LEAF_SIZE, 0);
-    let n_leaves = data.len() / LEAF_SIZE;
-    assert!(indices.iter().all(|&i| i < n_leaves));
-    #[cfg(feature = "hash-count")]
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
-        hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
-            Relaxed,
-        );
-    }
-
-    out.par_chunks_mut(BLAKE3_BATCH)
-        .zip(indices.par_chunks(BLAKE3_BATCH))
-        .for_each(|(outs, positions)| {
-            let n = outs.len();
-            let base_ptr = data.as_ptr();
-            // SAFETY: chunks are non-empty and the entry assertions prove each
-            // indexed 1 KiB message lies in `data`. Shared inputs may alias.
-            let first: &[u8; LEAF_SIZE] = unsafe {
-                &*(base_ptr.add(positions[0] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-            };
-            let mut inputs: [&[u8; LEAF_SIZE]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-            for i in 0..n {
-                inputs[i] = unsafe {
-                    &*(base_ptr.add(positions[i] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-                };
-            }
-            // SAFETY: Hash is exactly 32 initialized bytes; `hash_many`
-            // overwrites every byte in this output chunk.
-            let out_bytes = unsafe {
-                core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32)
-            };
-            blake3_platform().hash_many(
-                &inputs[..n],
-                &BLAKE3_IV,
-                0,
-                blake3::IncrementCounter::No,
-                0,
-                BLAKE3_CHUNK_START,
-                BLAKE3_CHUNK_END,
-                out_bytes,
-            );
-        });
 }
 
 /// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
@@ -523,12 +468,7 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
-            for (outs, leaves) in out
-                .chunks_mut(BLAKE3_GROUP)
-                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
-            {
-                blake3_hash_many_leaves(leaves, leaf_size, outs);
-            }
+            blake3_hash_many_leaves(data, leaf_size, out);
         }
         HashKind::Blake3 => {
             for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
@@ -557,36 +497,6 @@ pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash]
     }
 }
 
-/// Hash consecutive leaf pairs directly to their parent CVs without retaining
-/// the leaf CV level. The result is byte-identical to `hash_leaves_serial`
-/// followed by `hash_pairs_level_serial`; only the transient leaf hashes live
-/// in this function's per-thread stack scratch.
-pub(crate) fn hash_leaf_pairs_serial(
-    data: &[u8],
-    leaf_size: usize,
-    out: &mut [Hash],
-    kind: HashKind,
-) {
-    const SCRATCH_LEAVES: usize = BLAKE3_GROUP;
-    assert_eq!(data.len(), 2 * out.len() * leaf_size);
-
-    let mut scratch = core::mem::MaybeUninit::<[Hash; SCRATCH_LEAVES]>::uninit();
-    for (parents, leaves) in out
-        .chunks_mut(SCRATCH_LEAVES / 2)
-        .zip(data.chunks(SCRATCH_LEAVES * leaf_size))
-    {
-        let leaf_count = 2 * parents.len();
-        // SAFETY: the scratch is correctly aligned for `Hash`, and
-        // `hash_leaves_serial` writes all `leaf_count` entries before
-        // `hash_pairs_level_serial` reads them.
-        let leaf_hashes = unsafe {
-            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<Hash>(), leaf_count)
-        };
-        hash_leaves_serial(leaves, leaf_size, leaf_hashes, kind);
-        hash_pairs_level_serial(leaf_hashes, parents, kind);
-    }
-}
-
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -606,8 +516,27 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
     match kind {
         HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
         HashKind::Sha256 => {
-            for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
-                *o = Sha256::digest(children).into();
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        let mut h = Sha256::new();
+                        h.update(l);
+                        h.update(r);
+                        *out = h.finalize().into();
+                    }
+                }
             }
         }
     }
