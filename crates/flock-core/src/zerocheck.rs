@@ -1371,6 +1371,13 @@ mod tests {
     /// through the fused parallel kernel (log_n ≥ 10).
     #[test]
     fn prove_fused_tail_matches_unfused_two_pass() {
+        // The FLOCK_NO_TAIL_FUSION env kill switch gates `use_lookahead`
+        // (zerocheck.rs:709–733) process-globally; take the shared fusion
+        // test guard so parallel tests reading the same route stay
+        // deterministic.
+        let _g = crate::ntt::additive_ntt_f128::fusion_test_guard::GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for &m in &[17usize, 18] {
             let mut rng = Rng::new(4200 + m as u64);
             let a = rng.bits(1 << m);
@@ -1407,6 +1414,11 @@ mod tests {
     #[test]
     fn prove_transcript_identical_with_and_without_lookahead() {
         use std::sync::atomic::Ordering;
+        // Same global latches as the NTT fusion tests; take the shared test
+        // guard so parallel `cargo test` stays deterministic.
+        let _g = crate::ntt::additive_ntt_f128::fusion_test_guard::GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for &(m, padded) in &[
             (13usize, false),
             (14, false),
