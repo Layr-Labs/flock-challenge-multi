@@ -2473,7 +2473,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 struct AbWinLine([u64; 8]);
 
 /// 8-wide AVX2 lockstep for the ranked round1_inner generator. One rayon
-/// task owns 16 contiguous padded slots (two octa dumps).
+/// task owns `GROUP` contiguous padded slots (eight octa dumps at GROUP=64).
 ///
 /// With `ab_nt` (the default; `FLOCK_NO_WITGEN_AB_NT=1` restores the other
 /// arm) the octa dump publishes a/b NON-TEMPORALLY and simultaneously fills a
@@ -2483,7 +2483,7 @@ struct AbWinLine([u64; 8]);
 /// write-allocate RFO (1 GiB at the ranked shape).
 ///
 /// Without `ab_nt` this is the incumbent: temporal a/b dumps followed by one
-/// projection loop over the task's 16 blocks reading a/b back.
+/// projection loop over the task's `GROUP` blocks reading a/b back.
 ///
 /// `elide` forwards the per-buffer constant-region skips (z, a, b) — pass
 /// `true` ONLY for a buffer whose pool provenance token verified it still
@@ -2509,9 +2509,9 @@ fn generate_round1_inner_octa(
     const BYTES_PER_BLOCK: usize = K / 8;
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
-    const GROUP: usize = 16;
+    const GROUP: usize = 64;
     const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
-    // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
+    // 64-byte lines backing one task's 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
