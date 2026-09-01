@@ -63,4 +63,13 @@ static EY_V_ROLL_2491_STACK: [u8; 2491] = [0u8; 2491];
 
 /// Layout probe: a used static of fixed size.
 #[used]
-static EY_PROBE_1861_REDRAW_1: [u8; 1861] = [0u8; 1861];
+static PROBE_C: [u8; 2112] = [0u8; 2112];
+
+/// Alignment-knob probe: 4096-aligned used static. Forces the linker to pad
+/// the containing section so everything after it (all of .text) re-aligns
+/// to 4096 boundaries — a layout coordinate family the size knob cannot
+/// reach (size shifts preserve mod-64 offsets; alignment changes them).
+#[repr(align(4096))]
+struct Align4096([u8; 16]);
+#[used]
+static ANGEL_ALIGN_PROBE_4096: Align4096 = Align4096([0u8; 16]);

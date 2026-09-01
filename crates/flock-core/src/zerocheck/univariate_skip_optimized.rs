@@ -605,6 +605,7 @@ impl Round1AbInner {
                     b_col,
                     None,
                     0,
+                    false,
                 );
             },
         );
@@ -727,6 +728,23 @@ fn precompute_round1_ab_inner_packed_padded_impl(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
+    // Dead-window plan (same geometry `round2_row_zero` proves for the
+    // round-2 prefold): at the ranked BLAKE3 padding, rows
+    // first_dead_row..=rows_per_block-1 of every padding block are
+    // provably-zero packed chunks. Each outer chunk covers
+    // `chunk_rows` rows and its last `2^N_INNER`-row window is entirely
+    // inside that zero tail exactly when the chunk is the block's second
+    // half — there the shift_reduce output is provably zero and the
+    // kernel call collapses to a zero store, bit-identically. Every
+    // premise is re-derived from the PaddingSpec and refuses off-shape,
+    // mirroring `prefold_line_plan_matches_exact_padding_derivation`.
+    let rows_per_block = 1usize << padding.k_log.saturating_sub(k_skip);
+    let first_dead_row = padding
+        .useful_bits_per_block
+        .div_ceil(1usize << k_skip.min(padding.k_log));
+    let chunk_rows = (1usize << N_INNER) * (1usize << N_MEDIUM);
+    let dead_geometry = first_dead_row < rows_per_block && chunk_rows <= rows_per_block;
+
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
@@ -736,6 +754,17 @@ fn precompute_round1_ab_inner_packed_padded_impl(
                 let within_hash_outer = x_outer & within_outer_mask;
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
+                // True only when this chunk is a full-width chunk whose
+                // final window lies wholly in the block's zero tail.
+                let dead_last = dead_geometry
+                    && n_b_med == (1usize << N_MEDIUM)
+                    && {
+                        let window_first = (x_outer * chunk_rows + chunk_rows
+                            - (1usize << N_INNER))
+                            % rows_per_block;
+                        window_first >= first_dead_row
+                            && window_first + (1usize << N_INNER) <= rows_per_block
+                    };
 
                 shift_reduce_windows_into_blocks(
                     a_packed,
@@ -748,6 +777,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
                     b_col,
                     bstatic_ctx.map(|p| (within_hash_outer, p)),
                     0,
+                    dead_last,
                 );
                 out_outer[n_b_med * 64..].fill(0);
             },
@@ -898,9 +928,19 @@ fn shift_reduce_windows_into_blocks(
     b_col: &mut [F8],
     bstatic: kernels::BstaticHint,
     nt: u8,
+    dead_last: bool,
 ) {
     let mut b_med = 0;
+    // When the caller proves the final window of this chunk is an all-zero
+    // padding window, stop pairing before it: shift_reduce of all-zero
+    // inputs is provably all-zero (every NTT-extended value of a zero chunk
+    // is zero), so zero-storing its output slot produces exactly the bytes
+    // the kernel would have written, without the 128-byte load pair or the
+    // multiply/accumulate/reduce work.
     while b_med + 1 < n_b_med {
+        if dead_last && b_med + 2 == n_b_med {
+            break;
+        }
         let (blk0, rest) = out_outer[b_med * 64..].split_at_mut(64);
         let out0: &mut [u8; 64] = blk0.try_into().expect("one transformed b_med block");
         let out1: &mut [u8; 64] = (&mut rest[..64])
@@ -922,21 +962,43 @@ fn shift_reduce_windows_into_blocks(
         b_med += 2;
     }
     if b_med < n_b_med {
-        let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-            .try_into()
-            .expect("one transformed b_med block");
-        shift_reduce_inner_ab(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            dst,
-            a_col,
-            b_col,
-            bstatic,
-            nt,
-        );
+        if dead_last && b_med + 2 == n_b_med {
+            // `b_med` is the last live window (it straddles the padding
+            // boundary and must be computed); window `b_med + 1` is fully
+            // dead. The single-window kernel is byte-identical to the x2
+            // wavefront's first half.
+            let (live, dead) = out_outer[b_med * 64..].split_at_mut(64);
+            let dst: &mut [u8; 64] = live.try_into().expect("one transformed b_med block");
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+                bstatic,
+                nt,
+            );
+            dead[..64].fill(0);
+        } else {
+            let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block");
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+                bstatic,
+                nt,
+            );
+        }
     }
 }
 
@@ -1022,6 +1084,7 @@ pub fn precompute_round1_ab_inner_windows(
             &mut b_col,
             bstatic_ctx.map(|p| (outer & 1, p)),
             nt,
+            false,
         );
     }
 }
@@ -1265,16 +1328,7 @@ pub unsafe fn round1_ab_inner_window30_k0(
 }
 
 /// `u16` count of one window-block's pre-scaled offset block for
-/// [`round1_ab_inner_window_from_offsets`]: 64 A-side offsets then 64 B-side
-/// offsets, each `byte * 64`.
-///
-/// The consumers take a layout parameter `P`. `P = false` is byte order
-/// (offset `i` of a side at word `i`, so K-row `k` is the eight words at
-/// `8k`). `P = true` is the parity split a `vpmaddubsw` widen produces: the
-/// side's 32 even-byte offsets first, then its 32 odd-byte offsets (offset
-/// `i` at word `(i & 1) * 32 + (i >> 1)`), so K-row `k` is the even word at
-/// `4k` and the odd word at `32 + 4k`. Both layouts address identical table
-/// rows in identical order; only the arena slots differ.
+/// [`round1_ab_inner_window_from_offsets`].
 pub const ROUND1_AB_OFF_WORDS: usize = 128;
 
 impl Round1AbWindowPlan {
@@ -1335,7 +1389,7 @@ pub unsafe fn round1_ab_window_offsets(
 /// window-block's a/b bytes and `plan.offsets_eligible(blk)` true.
 #[inline]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1349,7 +1403,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
     ))]
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off(
             off.as_ptr(),
             out,
             plan.nt,
@@ -1376,7 +1430,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets<const P: bool>(
 /// [`abinner_publish_fence`] before publishing the output across threads.
 #[inline]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1392,7 +1446,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
     ))]
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1417,7 +1471,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2<const P: bool>(
 /// geometry above. This wrapper does no per-window raw-B guard by design.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1435,7 +1489,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2::<P>(
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1455,7 +1509,6 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
     const BLK: usize,
-    const P: bool,
 >(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
@@ -1473,7 +1526,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK>(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
@@ -1492,7 +1545,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
@@ -1509,7 +1562,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
