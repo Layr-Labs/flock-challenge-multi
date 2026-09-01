@@ -324,23 +324,6 @@ unsafe fn widen_off_line(v: __m512i, op: *mut u16) {
     }
 }
 
-/// `FLOCK_NO_WIDEN_MADDUBS=1` restores the byte-order offset arena and its
-/// `vpmovzxbw` + `vpsllw` widen. Default ON; the ranked worker's cleared
-/// environment never disables it.
-#[inline(always)]
-fn widen_maddubs_enabled() -> bool {
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-    {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WIDEN_MADDUBS").is_none());
-        *ON
-    }
-    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
-    {
-        false
-    }
-}
-
 /// The two `vpmaddubsw` multipliers of [`widen_off_line_parity`], resolved
 /// once per drain call and carried in registers: byte pairs `{64, 0}` keep
 /// each even byte, `{0, 64}` each odd byte.
@@ -1797,7 +1780,11 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
         unsafe {
-            if self.ranked_static{self.drain_range_spread::<true>(&self.proj,base_word,ring_word,words)}else{self.drain_range_spread::<false>(&self.proj,base_word,ring_word,words)};
+            if self.ranked_static {
+                self.drain_range_spread::<true, true>(&self.proj, base_word, ring_word, words);
+            } else {
+                self.drain_range_spread::<false, false>(&self.proj, base_word, ring_word, words);
+            }
         }
     }
 
@@ -1819,7 +1806,7 @@ impl Drain8<'_> {
     /// spread costs no extra call or spill traffic.
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn drain_range_spread<const E:bool>(
+    unsafe fn drain_range_spread<const E:bool,const P:bool>(
         &self,
         proj: &StreamProj<'_>,
         base_word: usize,
@@ -1827,6 +1814,7 @@ impl Drain8<'_> {
         words: usize,
     ) {
         unsafe {
+            const { assert!(E || !P); }
             let z_g1=if E||self.elide[0]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
             let a_g1=if E||self.elide[1]{ELIDE_ZERO_CHUNK}else{DUMP_CHUNKS};
             let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
@@ -1837,12 +1825,9 @@ impl Drain8<'_> {
             // read, exactly as windows 0 and 1 are never read under the same
             // `one_rows_elided` brand. Resolved once per call, not per window.
             let dead_w31 = E && proj.one_rows_elided && ey_dead_w31_enabled();
-            // Parity-split offset widen (`vpmaddubsw`) and its two multiplier
-            // vectors, resolved once per call so the loop carries them in
-            // registers. `FLOCK_NO_WIDEN_MADDUBS=1` selects the byte-order
-            // arena and its incumbent widen through the same publishers.
-            #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
-            let maddubs = E && widen_maddubs_enabled();
+            // This single-arm artifact fixes its ranked offset layout at
+            // compile time. The chosen `P` body preserves the same E=true
+            // ranked geometry; E=false remains the generic byte-order arm.
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             let wc = WidenConsts::new();
             for off in (0..words).step_by(STEP_WORDS) {
@@ -1924,12 +1909,12 @@ impl Drain8<'_> {
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
-                                if maddubs {
+                                if P {
                                     project_blocks_ranked_hot_offsets_direct_inline::<true>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc);
                                 } else {
                                     project_blocks_ranked_hot_offsets_direct_inline::<false>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc);
                                 }
-                            } else if maddubs {
+                            } else if P {
                                 let a_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.ast,rw,op,wc);
                                 let b_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.bs,rw,op.add(64),wc);
                                 proj.project_blocks_ranked_hot_offsets_direct_rollback::<true>(blk,plan,imgs,rows,&a_rows,&b_rows,op as *const u16);
@@ -1938,7 +1923,7 @@ impl Drain8<'_> {
                                 let b_rows=ranked_dense_rows_and_offsets_rollback::<false>(self.bs,rw,op.add(64),wc);
                                 proj.project_blocks_ranked_hot_offsets_direct_rollback::<false>(blk,plan,imgs,rows,&a_rows,&b_rows,op as *const u16);
                             }
-                        } else if maddubs {
+                        } else if P {
                             stage_ranked_dense_side::<true>(self.ast,rw,sa,op,wc);
                             stage_ranked_dense_side::<true>(self.bs,rw,sb,op.add(64),wc);
                             proj.project_blocks_ranked_hot_offsets::<true>(blk,plan,imgs,rows,op as *const u16);
