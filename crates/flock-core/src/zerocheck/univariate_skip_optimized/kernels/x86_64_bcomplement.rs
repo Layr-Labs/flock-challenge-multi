@@ -121,43 +121,94 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
     imgs: (*const u8, *const u8),
 ) {
     debug_assert!((3..=28).contains(&BLK));
+    const PLAN: WindowPlan = WINDOW_PLANS[BLK - 2];
+    const MODE_7: u8 = (PLAN.modes) as u8;
+    const MODE_6: u8 = (PLAN.modes >> 8) as u8;
+    const MODE_5: u8 = (PLAN.modes >> 16) as u8;
+    const MODE_4: u8 = (PLAN.modes >> 24) as u8;
+    const MODE_3: u8 = (PLAN.modes >> 32) as u8;
+    const MODE_2: u8 = (PLAN.modes >> 40) as u8;
+    const MODE_1: u8 = (PLAN.modes >> 48) as u8;
+    const MODE_0: u8 = (PLAN.modes >> 56) as u8;
+
     unsafe {
-        let plan = WINDOW_PLANS[BLK - 2];
         let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode::<P>(
+        let (bv, correction) = apply_b_mode_const::<MODE_7, P>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
-            plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = if MODE_7 == 15 {
+            correction
+        } else if MODE_7 == 0 {
+            _mm512_gf2p8mul_epi8(av, bv)
+        } else {
+            _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
+        };
         let x = _mm512_set1_epi8(2);
         macro_rules! step {
-            ($k:expr, $shift:expr) => {{
+            ($k:expr, $mode:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode::<P>(
+                let (bv, correction) = apply_b_mode_const::<$mode, P>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
-                    (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
-                acc = _mm512_ternarylogic_epi64::<0x96>(
-                    _mm512_gf2p8mul_epi8(acc, x),
-                    product,
-                    correction,
-                );
+                if $mode == 15 {
+                    acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), correction);
+                } else if $mode == 0 {
+                    let product = _mm512_gf2p8mul_epi8(av, bv);
+                    acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), product);
+                } else {
+                    let product = _mm512_gf2p8mul_epi8(av, bv);
+                    acc = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_gf2p8mul_epi8(acc, x),
+                        product,
+                        correction,
+                    );
+                }
             }};
         }
-        step!(6, 8);
-        step!(5, 16);
-        step!(4, 24);
-        step!(3, 32);
-        step!(2, 40);
-        step!(1, 48);
-        step!(0, 56);
+        step!(6, MODE_6);
+        step!(5, MODE_5);
+        step!(4, MODE_4);
+        step!(3, MODE_3);
+        step!(2, MODE_2);
+        step!(1, MODE_1);
+        step!(0, MODE_0);
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
+#[inline(always)]
+unsafe fn apply_b_mode_const<const MODE: u8, const P: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    av: __m512i,
+) -> (__m512i, __m512i) {
+    unsafe {
+        match MODE {
+            1 => (apply_b_complement::<1, 8, P>(imgs, op), av),
+            2 => (apply_b_complement::<2, 8, P>(imgs, op), av),
+            3 => (apply_b_complement::<3, 8, P>(imgs, op), av),
+            4 => (apply_b_complement::<4, 8, P>(imgs, op), av),
+            5 => (apply_b_complement::<5, 8, P>(imgs, op), av),
+            6 => (apply_b_complement::<6, 8, P>(imgs, op), av),
+            7 => (apply_b_complement::<7, 8, P>(imgs, op), av),
+            8 => (apply_b_complement::<0, 7, P>(imgs, op), av),
+            9 => (apply_b_complement::<0, 6, P>(imgs, op), av),
+            10 => (apply_b_complement::<0, 5, P>(imgs, op), av),
+            11 => (apply_b_complement::<0, 4, P>(imgs, op), av),
+            12 => (apply_b_complement::<0, 3, P>(imgs, op), av),
+            13 => (apply_b_complement::<0, 2, P>(imgs, op), av),
+            14 => (apply_b_complement::<0, 1, P>(imgs, op), av),
+            15 => (_mm512_setzero_si512(), av),
+            _ => (
+                apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, op),
+                _mm512_setzero_si512(),
+            ),
+        }
     }
 }
 
