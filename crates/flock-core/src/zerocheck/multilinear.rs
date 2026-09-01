@@ -145,7 +145,7 @@ fn lookahead_inv_factors(r: F128) -> (F128, F128) {
 fn prefold_row_skip_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_PREFOLD_ROW_SKIP").as_deref() == Some(std::ffi::OsStr::new("1"))
+        std::env::var_os("FLOCK_NO_PREFOLD_ROW_SKIP").as_deref() != Some(std::ffi::OsStr::new("1"))
     })
 }
 
