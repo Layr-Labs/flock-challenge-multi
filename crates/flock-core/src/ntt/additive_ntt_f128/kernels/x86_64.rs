@@ -105,19 +105,33 @@ unsafe fn mul_x4_high_one(
     }
 }
 
-/// Store four F128 lanes. `NT` uses XMM `MOVNTDQ` so a cold codeword publish
+/// Store four F128 lanes. `NT` uses `MOVNTDQ` so a cold codeword publish
 /// skips write-allocate; dest must be 16-byte aligned. Temporal `storeu`
 /// otherwise. Scalar twin: [`store_f128`].
 ///
+/// `zmm` additionally promises 64-byte alignment, which is what the whole
+/// line needs to be published by ONE `VMOVNTDQ zmm` — the same fused publish
+/// [`stream_f128x4`] already owns for the seed-top path — instead of four
+/// 16-byte streams that each only partially fill the line's write-combining
+/// buffer. The flag is a pure function of the row-set base pointer, so it is
+/// loop-invariant at every call site and the arm is resolved once per row
+/// set, not per lane.
+///
 /// # Safety
-/// `avx512f`; `p` covers four F128; when `NT`, `p` is 16-byte aligned.
+/// `avx512f`; `p` covers four F128; when `NT`, `p` is 16-byte aligned, and
+/// 64-byte aligned when `zmm`.
 #[inline]
 #[target_feature(enable = "avx512f")]
-unsafe fn store_row4<const NT: bool>(p: *mut F128, v: core::arch::x86_64::__m512i) {
+unsafe fn store_row4<const NT: bool>(p: *mut F128, v: core::arch::x86_64::__m512i, zmm: bool) {
     use core::arch::x86_64::*;
     // SAFETY: forwarded by the caller; SSE2 is x86_64 baseline.
     unsafe {
         if NT {
+            if zmm {
+                debug_assert_eq!(p as usize % 64, 0);
+                _mm512_stream_si512(p as *mut __m512i, v);
+                return;
+            }
             let d = p as *mut __m128i;
             _mm_stream_si128(d, _mm512_castsi512_si128(v));
             _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
@@ -648,6 +662,12 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<
         let inner_b = tw_x4::<false, DIET>(t_inner_b);
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
+        // Every published lane group starts at `dst + (i*dst_quarter +
+        // dst_r)*num_ntts + lane` elements; `num_ntts` and `lane` are both
+        // multiples of four F128 (= 64 bytes) on this loop, so a 64-byte
+        // aligned `dst` makes EVERY destination line-aligned and the whole
+        // row set publishes one line per `VMOVNTDQ zmm`.
+        let nt_zmm = NT && (dst as usize).is_multiple_of(64) && num_ntts.is_multiple_of(4);
         let lanes = num_ntts & !3;
         let mut lane = 0;
         while lane < lanes {
@@ -670,10 +690,10 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
-            store_row4::<NT>(dst_row(0).add(lane), va);
-            store_row4::<NT>(dst_row(1).add(lane), vb);
-            store_row4::<NT>(dst_row(2).add(lane), vc);
-            store_row4::<NT>(dst_row(3).add(lane), vd);
+            store_row4::<NT>(dst_row(0).add(lane), va, nt_zmm);
+            store_row4::<NT>(dst_row(1).add(lane), vb, nt_zmm);
+            store_row4::<NT>(dst_row(2).add(lane), vc, nt_zmm);
+            store_row4::<NT>(dst_row(3).add(lane), vd, nt_zmm);
             lane += 4;
         }
         while lane < num_ntts {
@@ -927,6 +947,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
         let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
+        // Same line-alignment argument as the dense row publisher.
+        let nt_zmm = NT && (dst as usize).is_multiple_of(64) && num_ntts.is_multiple_of(4);
         let lanes = num_ntts & !3;
         let mut lane = 0;
         while lane < lanes {
@@ -950,10 +972,10 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
-            store_row4::<NT>(dst_row(0).add(lane), va);
-            store_row4::<NT>(dst_row(1).add(lane), vb);
-            store_row4::<NT>(dst_row(2).add(lane), vc);
-            store_row4::<NT>(dst_row(3).add(lane), vd);
+            store_row4::<NT>(dst_row(0).add(lane), va, nt_zmm);
+            store_row4::<NT>(dst_row(1).add(lane), vb, nt_zmm);
+            store_row4::<NT>(dst_row(2).add(lane), vc, nt_zmm);
+            store_row4::<NT>(dst_row(3).add(lane), vd, nt_zmm);
             lane += 4;
         }
         while lane < num_ntts {
