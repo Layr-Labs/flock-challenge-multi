@@ -264,7 +264,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_pidx(
         _mm512_store_si512(op.add(96) as *mut __m512i, scale(b0.add(32)));
 
         let acc = if offw {
-            horner_2img_offw::<false>(imgs, op)
+            horner_2img_offw(imgs, op)
         } else {
             horner_2img_off_narrow(inv_table, op)
         };
@@ -312,13 +312,9 @@ pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8,
 /// [`shift_reduce_ab_offsets_build`]. Bit-identical output: identical table
 /// addresses, identical arithmetic, identical store class.
 ///
-/// `P` selects the arena layout: byte order (`false`) or the parity split
-/// (`true`, see [`crate::ntt::inv_table::apply_x86_avx512_register_2img_offp_at`]).
-///
 /// # Safety
-/// `op` holds this window-block's 128 pre-scaled offsets in the `P` layout;
-/// `imgs` are the table's base and σ₈ image pointers; `out`/`nt` as for
-/// [`store_out64`].
+/// `op` holds this window-block's 128 pre-scaled offsets; `imgs` are the
+/// table's base and σ₈ image pointers; `out`/`nt` as for [`store_out64`].
 #[inline]
 #[cfg(all(
     target_arch = "x86_64",
@@ -327,7 +323,7 @@ pub(crate) unsafe fn shift_reduce_ab_offsets_build(a0: *const u8, b0: *const u8,
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
-pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off<const P: bool>(
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off(
     op: *const u16,
     out: &mut [u8; 64],
     nt: u8,
@@ -335,7 +331,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off<const P: bool>(
 ) {
     // SAFETY: forwarded from this function's contract.
     unsafe {
-        let acc = horner_2img_offw::<P>(imgs, op);
+        let acc = horner_2img_offw(imgs, op);
         store_out64(out, acc, nt);
     }
 }
@@ -357,7 +353,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off<const P: bool>(
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
-pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2<const P: bool>(
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -366,7 +362,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2<const P: bool
     // SAFETY: forwarded from this function's contract. Unlike the generic
     // twin, ranked nt=2 makes alignment/store class invariant by construction.
     unsafe {
-        let acc = horner_2img_offw::<P>(imgs, op);
+        let acc = horner_2img_offw(imgs, op);
         _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }
 }
@@ -381,7 +377,7 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2<const P: bool
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<const P: bool>(
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -390,8 +386,8 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<cons
     use core::arch::x86_64::*;
     unsafe {
         let acc = match keep {
-            0xfc => residual_2img_offw_k2_7::<P>(imgs, op),
-            0x0f => residual_2img_offw_k0_3::<P>(imgs, op),
+            0xfc => residual_2img_offw_k2_7(imgs, op),
+            0x0f => residual_2img_offw_k0_3(imgs, op),
             _ => core::hint::unreachable_unchecked(),
         };
         _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
@@ -407,12 +403,11 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<cons
 ///
 /// The eight pre-scaled `u16` offsets of every apply are fetched as two
 /// 64-bit reads and split with shifts. `imgs` are the table images the caller
-/// resolved for this run of windows. `P` is the arena layout (byte order or
-/// parity split); either way each K-row costs the same two word reads.
+/// resolved for this run of windows.
 ///
 /// # Safety
 /// As for [`shift_reduce_inner_ab_x86_avx512_pidx`], with `imgs` the table's
-/// base and σ₈ image pointers and `op` in the `P` layout.
+/// base and σ₈ image pointers.
 #[inline(always)]
 #[cfg(all(
     target_arch = "x86_64",
@@ -420,23 +415,21 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<cons
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-unsafe fn horner_2img_offw<const P: bool>(
+unsafe fn horner_2img_offw(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
-    use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     // SAFETY: forwarded from the caller's contract.
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
         let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(
-            apply(op.add(offw_krow_words::<P>(7))),
-            apply(op.add(64 + offw_krow_words::<P>(7))),
-        );
+        let mut acc = _mm512_gf2p8mul_epi8(apply(op.add(7 * 8)), apply(op.add(64 + 7 * 8)));
         for k in (0..7usize).rev() {
-            let av = apply(op.add(offw_krow_words::<P>(k)));
-            let bv = apply(op.add(64 + offw_krow_words::<P>(k)));
+            let av = apply(op.add(k * 8));
+            let bv = apply(op.add(64 + k * 8));
             let product = _mm512_gf2p8mul_epi8(av, bv);
             acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
         }
@@ -453,20 +446,19 @@ unsafe fn horner_2img_offw<const P: bool>(
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-unsafe fn residual_2img_offw_k2_7<const P: bool>(
+unsafe fn residual_2img_offw_k2_7(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
-    use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
         macro_rules! scaled {
             ($k:literal) => {{
-                let product = _mm512_gf2p8mul_epi8(
-                    apply(op.add(offw_krow_words::<P>($k))),
-                    apply(op.add(64 + offw_krow_words::<P>($k))),
-                );
+                let product =
+                    _mm512_gf2p8mul_epi8(apply(op.add($k * 8)), apply(op.add(64 + $k * 8)));
                 _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
             }};
         }
@@ -530,21 +522,20 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_window30_k0(
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-unsafe fn residual_2img_offw_k0_3<const P: bool>(
+unsafe fn residual_2img_offw_k0_3(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> core::arch::x86_64::__m512i {
-    use crate::ntt::inv_table::{apply_x86_avx512_register_2img_krow_at, offw_krow_words};
     use core::arch::x86_64::*;
     unsafe {
-        let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        let apply = |o: *const u16| {
+            crate::ntt::inv_table::apply_x86_avx512_register_2img_offw_at(imgs.0, imgs.1, o)
+        };
         let p0 = _mm512_gf2p8mul_epi8(apply(op), apply(op.add(64)));
         macro_rules! scaled {
             ($k:literal) => {{
-                let product = _mm512_gf2p8mul_epi8(
-                    apply(op.add(offw_krow_words::<P>($k))),
-                    apply(op.add(64 + offw_krow_words::<P>($k))),
-                );
+                let product =
+                    _mm512_gf2p8mul_epi8(apply(op.add($k * 8)), apply(op.add(64 + $k * 8)));
                 _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
             }};
         }
