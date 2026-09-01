@@ -1759,6 +1759,45 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
     s * s + s_at_root * s
 }
 
+/// Serial Montgomery batch inversion for the short denominator vectors used
+/// by dense Ligerito basis induction. Zero inputs remain zero, matching the
+/// previous element-wise inversion contract.
+fn batch_inverse_or_zero(values: &[F128]) -> Vec<F128> {
+    if values.len() < 2 {
+        return values
+            .iter()
+            .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+            .collect();
+    }
+
+    let mut inverses = vec![F128::ZERO; values.len()];
+    let Some(first_nonzero) = values.iter().position(|v| !v.is_zero()) else {
+        return inverses;
+    };
+
+    let mut product = values[first_nonzero];
+    for index in first_nonzero + 1..values.len() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] = product;
+        product *= value;
+    }
+
+    let mut suffix_inverse = product.inv();
+    for index in (first_nonzero + 1..values.len()).rev() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] *= suffix_inverse;
+        suffix_inverse *= value;
+    }
+    inverses[first_nonzero] = suffix_inverse;
+    inverses
+}
+
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
 /// Only depends on `log_n`, so callers cache.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
@@ -2068,10 +2107,7 @@ pub(crate) fn induce_sumcheck_poly(
     };
 
     // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    let inv_sks_vks = batch_inverse_or_zero(sks_vks);
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -4106,97 +4142,157 @@ fn open_ood_x4_enabled() -> bool {
     *ON
 }
 
-/// Publish `n` F128s with XMM non-temporal stores (`_mm_stream_si128` /
-/// `MOVNTDQ`). Same helper shape as the promoted seed-fused publish
-/// (`AdditiveNttF128::publish_row_nt`): XMM, not ZMM, because large pool /
-/// arena slices on this lineage land 16 mod 64 — a 64-byte gate in front of
-/// `_mm512_stream_si512` would silently never fire.
+/// x86 fold+message leaf for one [`fold_and_msg_lsb`] chunk.
+///
+/// Folds `f` and `b`, accumulates the next message from the folded values
+/// while they remain in ZMM registers, and publishes the outputs directly.
+/// This avoids both the old stage-buffer write and its reload before the
+/// message reduction. When `stream` is true, XMM streaming stores preserve
+/// the large-round non-temporal policy; smaller rounds use ordinary stores so
+/// the next reader can stay cache-resident. The caller supplies the fold
+/// challenge's broadcast and split-reduction companion so every worker chunk
+/// in a round shares one `ghash_shift64_x4` result.
 ///
 /// # Safety
-/// `src`/`dst` cover `n` F128s; `dst` is 16-byte aligned. SSE2 is x86_64
-/// baseline.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[allow(dead_code)] // Retained same-binary non-temporal publish rollback.
-unsafe fn publish_f128_row_nt(src: *const F128, dst: *mut F128, n: usize) {
-    use core::arch::x86_64::*;
-    // SAFETY: bounds and 16-byte dest alignment are the caller's contract;
-    // `_mm_loadu_si128` accepts any src alignment.
-    unsafe {
-        let s = src as *const __m128i;
-        let d = dst as *mut __m128i;
-        for i in 0..n {
-            _mm_stream_si128(d.add(i), _mm_loadu_si128(s.add(i)));
-        }
-    }
-}
-
-/// x86 NT leaf for one [`fold_and_msg_lsb`] chunk.
-///
-/// Value-identical to the generic chunk body (`fold_pairs` on `f`/`b` then
-/// [`msg_reduce_avx512`] on the folded slices). The existing AVX-512 kernels
-/// write a reused L1-resident stage; the message reduce reads that stage
-/// (no destination reload); the destination is published with XMM streaming
-/// stores so each output line skips write-allocate RFO. Next reader is the
-/// following sumcheck round, after a Fiat–Shamir grind — DRAM-cold when
-/// `half >= 2^21` (32 MiB per buffer, 64 MiB for the pair).
-///
-/// # Safety
-/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length
-/// `<= stage_f.len()`. `f`/`b` contain `2 * (base + fc.len())` elements.
-/// `stage_*` are write-before-read scratch owned by this worker.
+/// Requires `avx512f` + `vpclmulqdq`. `fc`/`bc` have equal even length.
+/// `f`/`b` contain `2 * (base + fc.len())` elements.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn fold_and_msg_chunk_nt_x86(
+unsafe fn fold_and_msg_chunk_x86(
     f: &[F128],
     b: &[F128],
     base: usize,
     fc: &mut [F128],
     bc: &mut [F128],
     r: F128,
-    stage_f: &mut [F128],
-    stage_b: &mut [F128],
+    r_x4: core::arch::x86_64::__m512i,
+    r_x64: core::arch::x86_64::__m512i,
+    stream: bool,
 ) -> (F128, F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
+    use core::arch::x86_64::*;
+
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
-    debug_assert!(len <= stage_f.len() && len <= stage_b.len());
     debug_assert!(len.is_multiple_of(2));
 
-    crate::field::f128_slice::fold_pairs(f, base, &mut stage_f[..len], r);
-    crate::field::f128_slice::fold_pairs(b, base, &mut stage_b[..len], r);
-    // SAFETY: target features cfg-guaranteed; stage slices have equal even
-    // length (caller / debug_assert).
-    let (u0, u2) = unsafe { msg_reduce_avx512(&stage_f[..len], &stage_b[..len]) };
+    // The fold and the next message consume the same eight results. Keep
+    // those results in ZMM registers until the two message accumulators have
+    // seen them; only then publish the folded output. This removes the
+    // previous stage-F/stage-B write and reload from every NT chunk.
+    unsafe {
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
+        let f_ptr = f.as_ptr();
+        let b_ptr = b.as_ptr();
+        let fc_ptr = fc.as_mut_ptr();
+        let bc_ptr = bc.as_mut_ptr();
+        let dst_aligned =
+            (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
 
-    let dst_aligned = (fc.as_mut_ptr() as usize).is_multiple_of(16)
-        && (bc.as_mut_ptr() as usize).is_multiple_of(16);
-    if dst_aligned {
-        // SAFETY: dest slices are 16-aligned F128 buffers of length `len`;
-        // stage is the just-written source of the same length.
-        unsafe {
-            publish_f128_row_nt(stage_f.as_ptr(), fc.as_mut_ptr(), len);
-            publish_f128_row_nt(stage_b.as_ptr(), bc.as_mut_ptr(), len);
-            core::arch::x86_64::_mm_sfence();
+        let fold4 = |ptr: *const F128, source: usize| -> __m512i {
+            let lo = _mm512_loadu_si512(ptr.add(source) as *const __m512i);
+            let hi = _mm512_loadu_si512(ptr.add(source + 4) as *const __m512i);
+            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r_x4, r_x64),
+            )
+        };
+        let store4 = |value: __m512i, ptr: *mut F128| {
+            if stream && dst_aligned {
+                _mm_stream_si128(
+                    ptr.cast::<__m128i>(),
+                    _mm512_extracti32x4_epi32::<0>(value),
+                );
+                _mm_stream_si128(
+                    ptr.add(1).cast::<__m128i>(),
+                    _mm512_extracti32x4_epi32::<1>(value),
+                );
+                _mm_stream_si128(
+                    ptr.add(2).cast::<__m128i>(),
+                    _mm512_extracti32x4_epi32::<2>(value),
+                );
+                _mm_stream_si128(
+                    ptr.add(3).cast::<__m128i>(),
+                    _mm512_extracti32x4_epi32::<3>(value),
+                );
+            } else {
+                _mm512_storeu_si512(ptr.cast::<__m512i>(), value);
+            }
+        };
+
+        let mut t = 0usize;
+        while t + 8 <= len {
+            let f0 = fold4(f_ptr, 2 * (base + t));
+            let f1 = fold4(f_ptr, 2 * (base + t + 4));
+            let b0 = fold4(b_ptr, 2 * (base + t));
+            let b1 = fold4(b_ptr, 2 * (base + t + 4));
+
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            u0_acc.mul_acc(f_even, b_even);
+
+            let f0_sum = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1_sum = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0_sum, f1_sum);
+            let b0_sum = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1_sum = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0_sum, b1_sum);
+            u2_acc.mul_acc(f_sum, b_sum);
+
+            store4(f0, fc_ptr.add(t));
+            store4(f1, fc_ptr.add(t + 4));
+            store4(b0, bc_ptr.add(t));
+            store4(b1, bc_ptr.add(t + 4));
+            t += 8;
         }
-    } else {
-        fc.copy_from_slice(&stage_f[..len]);
-        bc.copy_from_slice(&stage_b[..len]);
+
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+        while t + 1 < len {
+            let source = 2 * (base + t);
+            let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
+            let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
+            let b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
+            let b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            *fc_ptr.add(t) = f0;
+            *fc_ptr.add(t + 1) = f1;
+            *bc_ptr.add(t) = b0;
+            *bc_ptr.add(t + 1) = b1;
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            t += 2;
+        }
+        if stream && dst_aligned {
+            _mm_sfence();
+        }
+        (u0, u2)
     }
-    (u0, u2)
 }
 
+/// Ranked x86 remaining opening after DirectFold8 starts at `half = 2^17`.
+/// Default enables NT publication in the fused x86 leaf there.
+/// `FLOCK_NO_OPEN_NT_17=1` restores the incumbent 2^21 floor.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-thread_local! {
-    static OPEN_NT_STAGE: std::cell::RefCell<(Vec<F128>, Vec<F128>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+fn open_nt_min_half_x86() -> usize {
+    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_OPEN_NT_17").is_some() {
+            1usize << 21
+        } else {
+            1usize << 17
+        }
+    });
+    *MIN
 }
 
 fn fold_and_msg_lsb(
@@ -4304,9 +4400,14 @@ fn fold_and_msg_lsb_inner(
         && half >= (1usize << 21)
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     // Same DRAM-cold next-reader gate as the aarch64 NT leaf, now on the
-    // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port;
-    // this is the leftover L0-fold site (~960 MiB RFO across the four
-    // rounds with half ≥ 2^21). `FLOCK_NO_OPEN_NT` is the same-binary A/B.
+    // ranked x86 SPR path. `#158` landed the seed-fused *publish* NT port.
+    // DirectFold8 materializes packed 2^25 / 64 = 2^19. The first recursive
+    // fold carries the deferred corrections; the next ordinary fold has
+    // half=2^17 and never reached the old 2^21 gate. Default min half is
+    // 2^17 so that ordinary round (2 MiB/buffer) uses the
+    // fused x86 leaf's NT publish mode. `FLOCK_NO_OPEN_NT` still disables
+    // non-temporal publication while retaining fused fold+message.
+    // `FLOCK_NO_OPEN_NT_17=1` restores the 2^21 floor.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4314,8 +4415,23 @@ fn fold_and_msg_lsb_inner(
     ))]
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
-        && half >= (1usize << 21)
+        && half >= open_nt_min_half_x86()
         && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // Every dense x86 worker chunk folds with the same challenge. Build its
+    // broadcast and split-reduction companion once per round instead of once
+    // per chunk.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let (r_x4, r_x64) = unsafe {
+        use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+        use core::arch::x86_64::*;
+        let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        (r_x4, ghash_shift64_x4(r_x4))
+    };
+
     // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
     // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
     // leaf (local diagnostics / A-B; the ranked worker's cleared environment
@@ -4374,23 +4490,13 @@ fn fold_and_msg_lsb_inner(
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if use_nt {
-                // Per-worker L1 stage: fold + msg_reduce stay on ~64 KiB
-                // reused scratch; dest sees only the NT publish.
-                return OPEN_NT_STAGE.with(|cell| {
-                    let mut st = cell.borrow_mut();
-                    if st.0.len() < CHUNK {
-                        st.0 = crate::alloc_uninit_vec(CHUNK);
-                        st.1 = crate::alloc_uninit_vec(CHUNK);
-                    }
-                    // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; chunk
-                    // geometry matches fold_and_msg_lsb's even-length
-                    // power-of-two split; stage capacity is CHUNK.
-                    unsafe {
-                        let (sf, sb) = &mut *st;
-                        fold_and_msg_chunk_nt_x86(f, b, base, fc, bc, r, sf, sb)
-                    }
-                });
+            if lazy_ood.is_none() && deferred_basis.is_none() {
+                // Fold, accumulate both message terms, and publish directly;
+                // `use_nt` selects streaming only for DRAM-cold large rounds.
+                // SAFETY: target features and chunk geometry are guaranteed.
+                return unsafe {
+                    fold_and_msg_chunk_x86(f, b, base, fc, bc, r, r_x4, r_x64, use_nt)
+                };
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
@@ -4413,6 +4519,7 @@ fn fold_and_msg_lsb_inner(
                 if use_nt {
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
+
             }
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
@@ -4707,6 +4814,21 @@ fn materialize_direct_fold4(
     } else {
         Vec::new()
     };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
+        direct_tables
+            .par_iter()
+            .map(|table| super::ring_switch::build_gfni_direct_fold_map_from_table(table))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let table_len = super::ring_switch::FOLD_TABLE_TOTAL;
     // f-side sub-block: 256 output slots ⇒ 4096 inputs (64 KiB) → 1024 mids (16 KiB).
@@ -4821,24 +4943,18 @@ fn materialize_direct_fold4(
                     target_feature = "gfni"
                 ))]
                 if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
+                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
                     use core::arch::x86_64::_mm512_setzero_si512;
 
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let (mats0_lo, mats0_hi) = super::ring_switch::compose_block_mats_gfni(
+                        &direct_gfni_mats[0],
                         claim0.eq_hi[block],
                     );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let (mats1_lo, mats1_hi) = super::ring_switch::compose_block_mats_gfni(
+                        &direct_gfni_mats[1],
                         claim1.eq_hi[block],
                     );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
                     for slot in (0..block_len).step_by(64) {
@@ -4856,7 +4972,7 @@ fn materialize_direct_fold4(
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
                                 &mats1_hi,
                                 b_out.as_mut_ptr().add(slot),
-                                planes.as_mut_ptr(),
+                                planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
                         }
                     }
@@ -6193,9 +6309,8 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::{
-        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-    };
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+    use crate::pcs::ring_switch::compose_block_mats_gfni;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -6205,11 +6320,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
     }));
 
-    let direct_tables: Vec<Vec<F128>> = claims
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = claims
         .par_iter()
         .map(|claim| {
             let generators = direct_fold8_final_generators(claim, challenges[5]);
-            super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
         })
         .collect();
     let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
@@ -6236,14 +6351,14 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let cols0 =
-                    super::ring_switch::compose_block_cols(&direct_tables[0], claim0.eq_hi[block]);
-                let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                let cols1 =
-                    super::ring_switch::compose_block_cols(&direct_tables[1], claim1.eq_hi[block]);
-                let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
+                let (mats0_lo, mats0_hi) = compose_block_mats_gfni(
+                    &direct_gfni_mats[0],
+                    claim0.eq_hi[block],
+                );
+                let (mats1_lo, mats1_hi) = compose_block_mats_gfni(
+                    &direct_gfni_mats[1],
+                    claim1.eq_hi[block],
+                );
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
@@ -6406,6 +6521,31 @@ fn materialize_direct_fold8(
     )))]
     let _ = l1_precommit;
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_tables: Vec<Vec<F128>> = if b_gfni_on {
+        Vec::new()
+    } else {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_direct_fold8_table_from_generators(&generators)
+            })
+            .collect()
+    };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )))]
     let direct_tables: Vec<Vec<F128>> = claims
         .par_iter()
         .map(|claim| {
@@ -6429,6 +6569,24 @@ fn materialize_direct_fold8(
                     claim.eq_lo.iter().map(|x| x.lo).collect(),
                     claim.eq_lo.iter().map(|x| x.hi).collect(),
                 )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    let direct_gfni_mats: Vec<super::ring_switch::GfniDirectFoldMap> = if b_gfni_on {
+        claims
+            .par_iter()
+            .map(|claim| {
+                let generators = direct_fold8_final_generators(claim, challenges[5]);
+                super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
             })
             .collect()
     } else {
@@ -6539,22 +6697,17 @@ fn materialize_direct_fold8(
                     target_feature = "gfni"
                 ))]
                 if b_gfni_on {
-                    use crate::zerocheck::multilinear::kernels::x86_64::{
-                        build_row_fold_mats_from_cols, gfni_fold64_four_maps_staged,
-                    };
+                    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+                    use crate::pcs::ring_switch::compose_block_mats_gfni;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let cols0 = super::ring_switch::compose_block_cols(
-                        &direct_tables[0],
+                    let (mats0_lo, mats0_hi) = compose_block_mats_gfni(
+                        &direct_gfni_mats[0],
                         claim0.eq_hi[block],
                     );
-                    let mats0_lo = build_row_fold_mats_from_cols(&cols0[..64]);
-                    let mats0_hi = build_row_fold_mats_from_cols(&cols0[64..]);
-                    let cols1 = super::ring_switch::compose_block_cols(
-                        &direct_tables[1],
+                    let (mats1_lo, mats1_hi) = compose_block_mats_gfni(
+                        &direct_gfni_mats[1],
                         claim1.eq_hi[block],
                     );
-                    let mats1_lo = build_row_fold_mats_from_cols(&cols1[..64]);
-                    let mats1_hi = build_row_fold_mats_from_cols(&cols1[64..]);
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
@@ -7089,6 +7242,116 @@ fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) ->
     multi_proof_gather(tree, block_len, queries, serial_par_enabled())
 }
 
+/// Exact ranked selector for batching the sparse L0 authentication leaves.
+/// `FLOCK_NO_L0_AUTH_BATCH=1` restores the per-index `hash_leaf` gather.
+#[inline]
+fn ranked_l0_auth_batch_enabled(
+    tree_len: usize,
+    block_len: usize,
+    num_interleaved: usize,
+    n_queries: usize,
+    kind: HashKind,
+) -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_L0_AUTH_BATCH").is_none());
+    cfg!(all(target_arch = "x86_64", target_feature = "avx512f"))
+        && *ON
+        && tree_len == block_len - 1
+        && block_len == (1 << 20)
+        && num_interleaved == 64
+        && n_queries == 218
+        && kind == HashKind::Blake3
+}
+
+/// L0 counterpart that also accepts the ranked depth-one compact tree. The
+/// canonical proof walk still uses the original `block_len`: omitted level-0
+/// siblings are rehashed from their codeword rows, while every level at or
+/// above one has the same relative order in the compact tree at index
+/// `full_index - block_len`.
+fn merkle_multi_proof_for_l0(
+    tree: &[Hash],
+    codeword: &[F128],
+    block_len: usize,
+    num_interleaved: usize,
+    queries: &[usize],
+    kind: HashKind,
+) -> Vec<Hash> {
+    if tree.len() == 2 * block_len - 1 {
+        return merkle_multi_proof_for(tree, block_len, queries);
+    }
+    assert_eq!(tree.len(), block_len - 1, "unsupported compact L0 tree");
+    assert_eq!(codeword.len(), block_len * num_interleaved);
+
+    use rayon::prelude::*;
+    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+    let leaf_size = num_interleaved * core::mem::size_of::<F128>();
+    // SAFETY: `F128` has no padding and the full codeword slice remains alive
+    // for the duration of this gather.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr().cast::<u8>(),
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
+
+    if ranked_l0_auth_batch_enabled(
+        tree.len(),
+        block_len,
+        num_interleaved,
+        queries.len(),
+        kind,
+    ) {
+        // The canonical index walk emits one complete level at a time. Since
+        // cut1 omits only level 0, all rehashed leaf siblings are exactly this
+        // prefix; every remaining index maps to the retained compact tree.
+        let leaf_siblings = indices.partition_point(|&i| i < block_len);
+        debug_assert!(indices[leaf_siblings..].iter().all(|&i| i >= block_len));
+        let mut proof: Vec<Hash> = crate::alloc_uninit_vec(indices.len());
+        debug_assert_eq!(leaf_size, 1024);
+        let (leaf_out, stored_out) = proof.split_at_mut(leaf_siblings);
+        let leaf_indices = &indices[..leaf_siblings];
+        let stored_indices = &indices[leaf_siblings..];
+        rayon::join(
+            || merkle::hash_indexed_blake3_1k(bytes, leaf_indices, leaf_out),
+            || {
+                if serial_par_enabled()
+                    && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS
+                {
+                    stored_out
+                        .par_iter_mut()
+                        .zip(stored_indices.par_iter())
+                        .with_min_len(MULTIPROOF_PAR_CHUNK)
+                        .for_each(|(out, &i)| *out = tree[i - block_len]);
+                } else {
+                    for (out, &i) in stored_out.iter_mut().zip(stored_indices) {
+                        *out = tree[i - block_len];
+                    }
+                }
+            },
+        );
+        return proof;
+    }
+
+    let gather = |&i: &usize| {
+        if i < block_len {
+            let start = i * leaf_size;
+            merkle::hash_leaf(&bytes[start..start + leaf_size], kind)
+        } else {
+            tree[i - block_len]
+        }
+    };
+
+    if serial_par_enabled() && indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
+        indices
+            .par_iter()
+            .with_min_len(MULTIPROOF_PAR_CHUNK)
+            .map(gather)
+            .collect()
+    } else {
+        indices.iter().map(gather).collect()
+    }
+}
+
 /// Multi-proof body. `par` splits the incumbent walk into its two halves —
 /// a pure index walk (integer arithmetic, no tree reads) followed by an
 /// order-preserving parallel gather of the sibling hashes — which emits the
@@ -7535,7 +7798,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
-    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
+    assert!(
+        l0_tree.len() == 2 * block_len_0 - 1 || l0_tree.len() == block_len_0 - 1,
+        "external L0 tree has unsupported layout"
+    );
 
     let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
@@ -7931,7 +8197,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> =
         gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = merkle_multi_proof_for_l0(
+        l0_tree,
+        l0_codeword,
+        l0_block_len,
+        l0_num_interleaved,
+        &queries_0,
+        config.merkle_hash,
+    );
     if trace {
         t_opens += _t.elapsed();
     }
@@ -9840,6 +10113,42 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn batch_inverse_or_zero_matches_scalar_and_preserves_positions() {
+        let assert_matches = |values: &[F128]| {
+            let expected: Vec<F128> = values
+                .iter()
+                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+                .collect();
+            let actual = batch_inverse_or_zero(values);
+            assert_eq!(actual, expected);
+            for (&value, &inverse) in values.iter().zip(actual.iter()) {
+                if value.is_zero() {
+                    assert_eq!(inverse, F128::ZERO);
+                } else {
+                    assert_eq!(value * inverse, F128::ONE);
+                }
+            }
+        };
+
+        for values in [
+            vec![],
+            vec![F128::ZERO],
+            vec![F128::ONE],
+            vec![F128::ZERO, F128::ZERO],
+            vec![F128::ZERO, F128::generator(), F128::ZERO],
+            vec![F128::generator(), F128::ZERO, F128::ONE],
+        ] {
+            assert_matches(&values);
+        }
+
+        for log_n in 0..=25usize {
+            let sks_vks = eval_sk_at_vks(log_n);
+            assert!(sks_vks.iter().all(|v| !v.is_zero()), "log_n={log_n}");
+            assert_matches(&sks_vks);
+        }
+    }
+
     /// The gated parallel query-phase gathers must match the sequential
     /// oracles bit-for-bit — the opened rows against the incumbent
     /// `iter().map(to_vec)` gather, the multi-proof against the incumbent
@@ -10259,7 +10568,7 @@ mod tests {
         target_feature = "vpclmulqdq"
     ))]
     #[test]
-    fn fold_and_msg_nt_leaf_x86_matches_generic() {
+    fn fold_and_msg_leaf_x86_matches_generic() {
         let mut state = 0x1234_5678_9abc_def0_u64;
         let mut next = || {
             state = state
@@ -10290,28 +10599,28 @@ mod tests {
                 u2_ref += (f0 + f1) * (b0 + b1);
                 k += 2;
             }
-
-            let mut fc_nt = vec![F128::ZERO; n_pairs];
-            let mut bc_nt = vec![F128::ZERO; n_pairs];
-            let mut stage_f = vec![F128::ZERO; n_pairs.max(8)];
-            let mut stage_b = vec![F128::ZERO; n_pairs.max(8)];
-            // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
-            let (u0_nt, u2_nt) = unsafe {
-                super::fold_and_msg_chunk_nt_x86(
-                    &f,
-                    &b,
-                    base,
-                    &mut fc_nt,
-                    &mut bc_nt,
-                    r,
-                    &mut stage_f,
-                    &mut stage_b,
-                )
+            let (r_x4, r_x64) = unsafe {
+                use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+                use core::arch::x86_64::*;
+                let r_x4 =
+                    _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+                (r_x4, ghash_shift64_x4(r_x4))
             };
-            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
-            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
-            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
-            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+
+            for stream in [false, true] {
+                let mut fc_x86 = vec![F128::ZERO; n_pairs];
+                let mut bc_x86 = vec![F128::ZERO; n_pairs];
+                // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
+                let (u0_x86, u2_x86) = unsafe {
+                    super::fold_and_msg_chunk_x86(
+                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream,
+                    )
+                };
+                assert_eq!(fc_ref, fc_x86, "folded f mismatch n_pairs={n_pairs}");
+                assert_eq!(bc_ref, bc_x86, "folded b mismatch n_pairs={n_pairs}");
+                assert_eq!(u0_ref, u0_x86, "u0 mismatch n_pairs={n_pairs}");
+                assert_eq!(u2_ref, u2_x86, "u2 mismatch n_pairs={n_pairs}");
+            }
         }
     }
 
@@ -12829,6 +13138,48 @@ mod tests {
             assert_eq!(got[slot], expect, "slot {slot}");
         }
     }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn direct_fold8_composed_mats_match_column_builder() {
+        use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
+
+        let mut state = 0xD1CE_F008_5EED_191Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3 {
+            let generators: Vec<F128> = (0..128)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+            let table = super::super::ring_switch::build_fold_byte_table(&generators);
+            let e_hi = F128::new(next(), next());
+            let map =
+                super::super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators);
+            let (got_lo, got_hi) =
+                super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
+            let cols = super::super::ring_switch::compose_block_cols(&table, e_hi);
+            assert_eq!(
+                got_lo,
+                build_row_fold_mats_from_cols(&cols[..64]),
+                "low matrix mismatch"
+            );
+            assert_eq!(
+                got_hi,
+                build_row_fold_mats_from_cols(&cols[64..]),
+                "high matrix mismatch"
+            );
+        }
+    }
+
 
     #[test]
     fn direct_fold4_gfni_gate_is_ranked_shape_only() {
