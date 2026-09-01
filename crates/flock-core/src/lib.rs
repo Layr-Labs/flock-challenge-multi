@@ -695,3 +695,5 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// public redraw marker: 11
