@@ -363,6 +363,38 @@ impl WidenConsts {
         }
     }
 }
+/// The six `vpermi2d` permutation index vectors of [`tr8x16_zmm`], resolved
+/// once per drain call and carried in registers:
+/// - Layer 1: `i10`, `i11` (4x4 grouping)
+/// - Layer 2: `i20`, `i21` (8x2 grouping)
+/// - Layer 3: `i30`, `i31` (16x1 grouping)
+#[cfg(target_feature = "avx512f")]
+#[derive(Clone, Copy)]
+struct Tr8x16Consts {
+    i10: __m512i,
+    i11: __m512i,
+    i20: __m512i,
+    i21: __m512i,
+    i30: __m512i,
+    i31: __m512i,
+}
+
+#[cfg(target_feature = "avx512f")]
+impl Tr8x16Consts {
+    #[inline(always)]
+    fn new() -> Self {
+        unsafe {
+            Self {
+                i10: _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27),
+                i11: _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31),
+                i20: _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23),
+                i21: _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31),
+                i30: _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23),
+                i31: _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31),
+            }
+        }
+    }
+}
 
 /// Parity-split twin of [`widen_off_line`]: the same `byte * 64` values, but
 /// produced by two `vpmaddubsw` (port 0) against the register-resident
@@ -516,7 +548,7 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 /// `stage[w..w+16]` contains sixteen initialized `V8`s. AVX-512F is enabled.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
-unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+unsafe fn tr8x16_zmm(stage: *const V8, w: usize, tc: Tr8x16Consts) -> [__m512i; 8] {
     unsafe {
         debug_assert!(w + STEP_WORDS <= RING_WORDS);
         debug_assert!(w.is_multiple_of(STEP_WORDS));
@@ -531,39 +563,33 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
         let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
 
-        let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
-        let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
-        let p00 = _mm512_permutex2var_epi32(x0, i10, x1);
-        let p01 = _mm512_permutex2var_epi32(x0, i11, x1);
-        let p10 = _mm512_permutex2var_epi32(x2, i10, x3);
-        let p11 = _mm512_permutex2var_epi32(x2, i11, x3);
-        let p20 = _mm512_permutex2var_epi32(x4, i10, x5);
-        let p21 = _mm512_permutex2var_epi32(x4, i11, x5);
-        let p30 = _mm512_permutex2var_epi32(x6, i10, x7);
-        let p31 = _mm512_permutex2var_epi32(x6, i11, x7);
+        let p00 = _mm512_permutex2var_epi32(x0, tc.i10, x1);
+        let p01 = _mm512_permutex2var_epi32(x0, tc.i11, x1);
+        let p10 = _mm512_permutex2var_epi32(x2, tc.i10, x3);
+        let p11 = _mm512_permutex2var_epi32(x2, tc.i11, x3);
+        let p20 = _mm512_permutex2var_epi32(x4, tc.i10, x5);
+        let p21 = _mm512_permutex2var_epi32(x4, tc.i11, x5);
+        let p30 = _mm512_permutex2var_epi32(x6, tc.i10, x7);
+        let p31 = _mm512_permutex2var_epi32(x6, tc.i11, x7);
 
-        let i20 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
-        let i21 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
-        let q00 = _mm512_permutex2var_epi32(p00, i20, p10);
-        let q01 = _mm512_permutex2var_epi32(p00, i21, p10);
-        let q02 = _mm512_permutex2var_epi32(p01, i20, p11);
-        let q03 = _mm512_permutex2var_epi32(p01, i21, p11);
-        let q10 = _mm512_permutex2var_epi32(p20, i20, p30);
-        let q11 = _mm512_permutex2var_epi32(p20, i21, p30);
-        let q12 = _mm512_permutex2var_epi32(p21, i20, p31);
-        let q13 = _mm512_permutex2var_epi32(p21, i21, p31);
+        let q00 = _mm512_permutex2var_epi32(p00, tc.i20, p10);
+        let q01 = _mm512_permutex2var_epi32(p00, tc.i21, p10);
+        let q02 = _mm512_permutex2var_epi32(p01, tc.i20, p11);
+        let q03 = _mm512_permutex2var_epi32(p01, tc.i21, p11);
+        let q10 = _mm512_permutex2var_epi32(p20, tc.i20, p30);
+        let q11 = _mm512_permutex2var_epi32(p20, tc.i21, p30);
+        let q12 = _mm512_permutex2var_epi32(p21, tc.i20, p31);
+        let q13 = _mm512_permutex2var_epi32(p21, tc.i21, p31);
 
-        let i30 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
-        let i31 = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
         [
-            _mm512_permutex2var_epi32(q00, i30, q10),
-            _mm512_permutex2var_epi32(q00, i31, q10),
-            _mm512_permutex2var_epi32(q01, i30, q11),
-            _mm512_permutex2var_epi32(q01, i31, q11),
-            _mm512_permutex2var_epi32(q02, i30, q12),
-            _mm512_permutex2var_epi32(q02, i31, q12),
-            _mm512_permutex2var_epi32(q03, i30, q13),
-            _mm512_permutex2var_epi32(q03, i31, q13),
+            _mm512_permutex2var_epi32(q00, tc.i30, q10),
+            _mm512_permutex2var_epi32(q00, tc.i31, q10),
+            _mm512_permutex2var_epi32(q01, tc.i30, q11),
+            _mm512_permutex2var_epi32(q01, tc.i31, q11),
+            _mm512_permutex2var_epi32(q02, tc.i30, q12),
+            _mm512_permutex2var_epi32(q02, tc.i31, q12),
+            _mm512_permutex2var_epi32(q03, tc.i30, q13),
+            _mm512_permutex2var_epi32(q03, tc.i31, q13),
         ]
     }
 }
@@ -577,9 +603,10 @@ unsafe fn ranked_dense_rows_and_offsets_rollback<const P: bool>(
     w: usize,
     op: *mut u16,
     c: WidenConsts,
+    tc: Tr8x16Consts,
 ) -> [__m512i; 8] {
     unsafe {
-        let rows = tr8x16_zmm(ring, w);
+        let rows = tr8x16_zmm(ring, w, tc);
         widen_ranked_dense_rows::<P>(&rows, op, c);
         rows
     }
@@ -666,9 +693,10 @@ unsafe fn stage_ranked_dense_side<const P: bool>(
     stage: *mut u32,
     op: *mut u16,
     c: WidenConsts,
+    tc: Tr8x16Consts,
 ) {
     unsafe {
-        let rows = tr8x16_zmm(ring, w);
+        let rows = tr8x16_zmm(ring, w, tc);
         widen_ranked_dense_rows::<P>(&rows, op, c);
         let mut r = 0usize;
         while r != 8 {
@@ -694,14 +722,14 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
     rw: usize,
     off: *mut u16,
     c: WidenConsts,
+    tc: Tr8x16Consts,
 ) {
     unsafe {
         debug_assert!(blk > 1 && blk < 30);
-        let a_rows = tr8x16_zmm(a_ring, rw);
+        let a_rows = tr8x16_zmm(a_ring, rw, tc);
         widen_ranked_dense_rows::<P>(&a_rows, off, c);
-        let b_rows = tr8x16_zmm(b_ring, rw);
+        let b_rows = tr8x16_zmm(b_ring, rw, tc);
         widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
-
         if proj.one_rows_elided && blk == 2 {
             let mut j = 0usize;
             while j != 8 {
@@ -1845,6 +1873,8 @@ impl Drain8<'_> {
             let maddubs = E && widen_maddubs_enabled();
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             let wc = WidenConsts::new();
+            #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+            let tc = Tr8x16Consts::new();
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
@@ -1925,26 +1955,26 @@ impl Drain8<'_> {
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
                                 if maddubs {
-                                    project_blocks_ranked_hot_offsets_direct_inline::<true>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc);
+                                    project_blocks_ranked_hot_offsets_direct_inline::<true>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc,tc);
                                 } else {
-                                    project_blocks_ranked_hot_offsets_direct_inline::<false>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc);
+                                    project_blocks_ranked_hot_offsets_direct_inline::<false>(proj,blk,plan,imgs,rows,self.ast,self.bs,rw,op,wc,tc);
                                 }
                             } else if maddubs {
-                                let a_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.ast,rw,op,wc);
-                                let b_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.bs,rw,op.add(64),wc);
+                                let a_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.ast,rw,op,wc,tc);
+                                let b_rows=ranked_dense_rows_and_offsets_rollback::<true>(self.bs,rw,op.add(64),wc,tc);
                                 proj.project_blocks_ranked_hot_offsets_direct_rollback::<true>(blk,plan,imgs,rows,&a_rows,&b_rows,op as *const u16);
                             } else {
-                                let a_rows=ranked_dense_rows_and_offsets_rollback::<false>(self.ast,rw,op,wc);
-                                let b_rows=ranked_dense_rows_and_offsets_rollback::<false>(self.bs,rw,op.add(64),wc);
+                                let a_rows=ranked_dense_rows_and_offsets_rollback::<false>(self.ast,rw,op,wc,tc);
+                                let b_rows=ranked_dense_rows_and_offsets_rollback::<false>(self.bs,rw,op.add(64),wc,tc);
                                 proj.project_blocks_ranked_hot_offsets_direct_rollback::<false>(blk,plan,imgs,rows,&a_rows,&b_rows,op as *const u16);
                             }
                         } else if maddubs {
-                            stage_ranked_dense_side::<true>(self.ast,rw,sa,op,wc);
-                            stage_ranked_dense_side::<true>(self.bs,rw,sb,op.add(64),wc);
+                            stage_ranked_dense_side::<true>(self.ast,rw,sa,op,wc,tc);
+                            stage_ranked_dense_side::<true>(self.bs,rw,sb,op.add(64),wc,tc);
                             proj.project_blocks_ranked_hot_offsets::<true>(blk,plan,imgs,rows,op as *const u16);
                         } else {
-                            stage_ranked_dense_side::<false>(self.ast,rw,sa,op,wc);
-                            stage_ranked_dense_side::<false>(self.bs,rw,sb,op.add(64),wc);
+                            stage_ranked_dense_side::<false>(self.ast,rw,sa,op,wc,tc);
+                            stage_ranked_dense_side::<false>(self.bs,rw,sb,op.add(64),wc,tc);
                             proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                         }
                     }
@@ -2731,8 +2761,9 @@ mod tests {
         let input = Input(core::array::from_fn(|word| {
             core::array::from_fn(|block| (1000 * word + block) as u32)
         }));
+        let tc = Tr8x16Consts::new();
         unsafe {
-            let out = tr8x16_zmm(input.0.as_ptr().cast::<V8>(), 0);
+            let out = tr8x16_zmm(input.0.as_ptr().cast::<V8>(), 0, tc);
             for (block, row) in out.into_iter().enumerate() {
                 let mut got = [0u32; STEP_WORDS];
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
@@ -2784,8 +2815,9 @@ mod tests {
                     })
                 }));
 
-                let a_rows = tr8x16_zmm(a_input.0.as_ptr().cast::<V8>(), 0);
-                let b_rows = tr8x16_zmm(b_input.0.as_ptr().cast::<V8>(), 0);
+                let tc = Tr8x16Consts::new();
+                let a_rows = tr8x16_zmm(a_input.0.as_ptr().cast::<V8>(), 0, tc);
+                let b_rows = tr8x16_zmm(b_input.0.as_ptr().cast::<V8>(), 0, tc);
                 let wc = WidenConsts::new();
                 let mut inline_off = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
                 widen_ranked_dense_rows::<false>(&a_rows, inline_off.0.as_mut_ptr(), wc);
@@ -2797,12 +2829,14 @@ mod tests {
                     0,
                     rollback_off.0.as_mut_ptr(),
                     wc,
+                    tc,
                 );
                 let rollback_b_rows = ranked_dense_rows_and_offsets_rollback::<false>(
                     b_input.0.as_ptr().cast::<V8>(),
                     0,
                     rollback_off.0.as_mut_ptr().add(64),
                     wc,
+                    tc,
                 );
 
                 let mut staged = Stage {
@@ -2816,6 +2850,7 @@ mod tests {
                     staged.a.as_mut_ptr(),
                     staged_off.0.as_mut_ptr(),
                     wc,
+                    tc,
                 );
                 stage_ranked_dense_side::<false>(
                     b_input.0.as_ptr().cast::<V8>(),
@@ -2823,6 +2858,7 @@ mod tests {
                     staged.b.as_mut_ptr(),
                     staged_off.0.as_mut_ptr().add(64),
                     wc,
+                    tc,
                 );
 
                 // Parity-split widen of the same rows, through all three
@@ -2837,12 +2873,14 @@ mod tests {
                     0,
                     parity_rollback_off.0.as_mut_ptr(),
                     wc,
+                    tc,
                 );
                 let _ = ranked_dense_rows_and_offsets_rollback::<true>(
                     b_input.0.as_ptr().cast::<V8>(),
                     0,
                     parity_rollback_off.0.as_mut_ptr().add(64),
                     wc,
+                    tc,
                 );
                 let mut parity_staged = Stage {
                     a: [0u32; 8 * STEP_WORDS],
@@ -2855,6 +2893,7 @@ mod tests {
                     parity_staged.a.as_mut_ptr(),
                     parity_staged_off.0.as_mut_ptr(),
                     wc,
+                    tc,
                 );
                 stage_ranked_dense_side::<true>(
                     b_input.0.as_ptr().cast::<V8>(),
@@ -2862,6 +2901,7 @@ mod tests {
                     parity_staged.b.as_mut_ptr(),
                     parity_staged_off.0.as_mut_ptr().add(64),
                     wc,
+                    tc,
                 );
                 assert_eq!(parity_staged.a, staged.a, "parity staged a, case={case}");
                 assert_eq!(parity_staged.b, staged.b, "parity staged b, case={case}");
@@ -2984,13 +3024,14 @@ mod tests {
         }
         unsafe {
             let wc = WidenConsts::new();
+            let tc = Tr8x16Consts::new();
             for case in 0..8usize {
                 let a_input = Input(core::array::from_fn(|_| core::array::from_fn(|_| next())));
                 let b_input = Input(core::array::from_fn(|_| {
                     core::array::from_fn(|_| if case == 7 { u32::MAX } else { next() })
                 }));
-                let a_rows = tr8x16_zmm(a_input.0.as_ptr().cast::<V8>(), 0);
-                let b_rows = tr8x16_zmm(b_input.0.as_ptr().cast::<V8>(), 0);
+                let a_rows = tr8x16_zmm(a_input.0.as_ptr().cast::<V8>(), 0, tc);
+                let b_rows = tr8x16_zmm(b_input.0.as_ptr().cast::<V8>(), 0, tc);
                 let mut off_w = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
                 widen_ranked_dense_rows::<false>(&a_rows, off_w.0.as_mut_ptr(), wc);
                 widen_ranked_dense_rows::<false>(&b_rows, off_w.0.as_mut_ptr().add(64), wc);
