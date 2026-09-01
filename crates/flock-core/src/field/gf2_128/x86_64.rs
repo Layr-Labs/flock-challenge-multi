@@ -559,14 +559,17 @@ pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
 /// XOR the four 128-bit lanes of `v` into a single `__m128i`.
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx2")]
 unsafe fn xor4_lanes(v: __m512i) -> __m128i {
-    // Register-only lane extracts + XOR; avx512f cfg-gated.
-    let l0 = _mm512_extracti32x4_epi32::<0>(v);
-    let l1 = _mm512_extracti32x4_epi32::<1>(v);
-    let l2 = _mm512_extracti32x4_epi32::<2>(v);
-    let l3 = _mm512_extracti32x4_epi32::<3>(v);
-    _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+    // Fold the register as two 256-bit halves before the final 128-bit XOR.
+    // This replaces four 128-bit extracts with one 256-bit extract.
+    let lo = _mm512_castsi512_si256(v);
+    let hi = _mm512_extracti64x4_epi64::<1>(v);
+    let halves = _mm256_xor_si256(lo, hi);
+    _mm_xor_si128(
+        _mm256_castsi256_si128(halves),
+        _mm256_extracti128_si256::<1>(halves),
+    )
 }
 
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
