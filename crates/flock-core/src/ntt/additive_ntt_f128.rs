@@ -668,6 +668,15 @@ enum StagingInit {
     Poison,
 }
 
+/// Test-only cross-file gate: the fusion equality tests (NTT seed/top
+/// staging arms here and the zerocheck lookahead probe) all assert on
+/// process-global latches; serialize them so parallel `cargo test` is
+/// deterministic (a per-test GUARD only serialized one test's arms).
+#[cfg(test)]
+pub(crate) mod fusion_test_guard {
+    pub(crate) static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 /// Test override for [`staging_init_mode`]; 0 = env-derived.
 #[cfg(test)]
 static STAGING_INIT_TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -5619,6 +5628,12 @@ mod tests {
     #[test]
     fn top_fusion_matches_incumbent_schedule() {
         use std::sync::atomic::Ordering;
+        // TOP_FUSION_TEST_OFF is a process-global latch (this test's
+        // fused_staging_poison sibling shares the same route flags); take
+        // the shared fusion test guard for deterministic parallel runs.
+        let _g = crate::ntt::additive_ntt_f128::fusion_test_guard::GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut rng = Rng::new(0x70F6);
         // (log_d, num_ntts, start_layer, pool threads)
         for &(log_d, num_ntts, start_layer, threads) in &[
@@ -5746,6 +5761,9 @@ mod tests {
     #[test]
     fn seed_top_fusion_matches_seed_pass() {
         use std::sync::atomic::Ordering;
+        let _g = crate::ntt::additive_ntt_f128::fusion_test_guard::GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut rng = Rng::new(0x5EED_F8);
         // (log_d, num_ntts, threads): n_top ≥ 9 in each (log_d − 8 ≥ 9 caps at log_d ≥ 17)
         for &(log_d, num_ntts, threads) in
@@ -5907,10 +5925,11 @@ mod tests {
     #[test]
     fn fused_staging_poison_does_not_change_output() {
         use std::sync::atomic::Ordering;
-        // The staging mode is process-global; keep the three arms serialized
-        // against each other.
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // The staging mode is process-global; the shared fusion_test_guard
+        // also serializes against the seed and zerocheck fusion tests.
+        let _g = crate::ntt::additive_ntt_f128::fusion_test_guard::GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let mut rng = Rng::new(0x5741_6E47);
         for &(log_d, num_ntts, threads) in &[(17usize, 8usize, 512usize), (17, 4, 512)] {
