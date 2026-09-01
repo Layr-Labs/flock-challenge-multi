@@ -658,7 +658,7 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw")]
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
-        self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
+        self.lo = _mm512_mask_xor_epi64(self.lo, 0x55, self.lo, x);
         self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
     }
 
