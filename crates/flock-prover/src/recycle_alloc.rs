@@ -199,7 +199,17 @@ unsafe impl GlobalAlloc for RecycleAlloc {
     }
 }
 
-#[cfg(test)]
+// The `#[global_allocator]` registration in `lib.rs` is gated on `aarch64`
+// or `x86_64 + avx512f`; off those targets the system allocator serves
+// these allocations and the 64-alignment premise is false, so the test
+// module carries the same `cfg` as the registration it observes.
+#[cfg(all(
+    test,
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx512f")
+    )
+))]
 mod tests {
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
