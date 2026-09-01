@@ -6513,6 +6513,13 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
+    // Compiled default 2, not the structural maximum 4. Construction cost is
+    // `cache_len = 1 << (depth + 1)` rows of inverse-local transform per query,
+    // all paid before the first message is emitted, while each covered fold
+    // buys one O(1) factorised message. `SPARSE_DUAL_MAX_DEPTH` stays 4 as the
+    // ceiling fixed by the `[F128; 32]` backing, and the env override still
+    // reaches both arms in one binary.
+    const SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
     let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
         .ok()
         .map(|value| {
@@ -6520,7 +6527,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(SPARSE_DUAL_DEFAULT_DEPTH);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
@@ -6857,6 +6864,8 @@ fn materialize_direct_fold8(
                 out_len,
                 (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
             );
+            let timing = open_timing();
+            let t_all = std::time::Instant::now();
             let mut folded_f = crate::scratch::take_f128(out_len);
             materialize_direct_fold8_f_for_precommit(
                 &packed_witness,
@@ -6866,31 +6875,44 @@ fn materialize_direct_fold8(
                 r4,
                 r5,
             );
+            let t_f_ms = t_all.elapsed().as_secs_f64() * 1e3;
             // Preserve incumbent buffer custody: acquire both folded outputs
             // before returning the much larger input to the shared pool.
             let folded_b = crate::scratch::take_f128(out_len);
             crate::scratch::give_f128(packed_witness);
             crate::scratch::give_f128(ordinary_basis);
 
-            let (precommitted, (folded_b, msg)) = rayon::join(
+            let t_join = std::time::Instant::now();
+            let ((precommitted, t_c_ms), ((folded_b, msg), t_b_ms)) = rayon::join(
                 || {
+                    let t = std::time::Instant::now();
                     let ntt =
                         AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
-                    ligero_commit(
+                    let w = ligero_commit(
                         &folded_f,
                         precommit.log_msg_cols,
                         precommit.log_num_interleaved,
                         precommit.log_inv_rate,
                         &ntt,
                         precommit.kind,
-                    )
+                    );
+                    (w, t.elapsed().as_secs_f64() * 1e3)
                 },
                 || {
-                    materialize_direct_fold8_b_gfni_for_precommit(
+                    let t = std::time::Instant::now();
+                    let r = materialize_direct_fold8_b_gfni_for_precommit(
                         &folded_f, folded_b, claims, challenges, block_len,
-                    )
+                    );
+                    (r, t.elapsed().as_secs_f64() * 1e3)
                 },
             );
+            if timing {
+                eprintln!(
+                    "[open-timing] fold8 precommit route: f-pass {t_f_ms:.2} ms | join {:.2} ms (L1 commit {t_c_ms:.2} ms || b-gfni+M6 {t_b_ms:.2} ms) | total {:.2} ms",
+                    t_join.elapsed().as_secs_f64() * 1e3,
+                    t_all.elapsed().as_secs_f64() * 1e3
+                );
+            }
             return (folded_f, folded_b, msg, Some(precommitted));
         }
     }

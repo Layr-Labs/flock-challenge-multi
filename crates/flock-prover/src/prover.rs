@@ -912,7 +912,15 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // Last-ρ leftover z-fold: arm before zerocheck so the last ML ρ can
     // start today's one-shot fold. Guard keeps `z_packed` live until
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
-    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+    // Arm only from a non-pool thread: the kicked fold's parallel region
+    // runs on the global pool and lincheck blocks on the fold's OS thread,
+    // so the blocking join must never sit on a rayon worker (see the
+    // lincheck placement below). The ranked worker always proves from a
+    // plain OS thread; a pool-resident caller simply keeps the sequential
+    // one-shot fold.
+    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor)
+        && rayon::current_thread_index().is_none()
+    {
         Some(lincheck::prepare_last_rho_z_fold(
             &z_packed,
             r1cs.m,
@@ -984,7 +992,15 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
-    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| match lincheck_input {
+    // With a last-ρ kick armed, the kicked fold's parallel region runs on the
+    // global pool while lincheck must block on the fold's OS thread. That
+    // blocking join MUST NOT sit on a pool worker: a worker waiting inside
+    // the fold's region can pop the injected lincheck job and run it nested,
+    // and its join then waits on a region that waits on it (measured
+    // deadlock). So run lincheck on this (non-pool) thread when the kick is
+    // live; the disabled arm keeps the incumbent `in_pool` placement.
+    let lincheck_on_caller = _last_rho.is_some() && lincheck::last_rho_kick_enabled();
+    let lincheck_run = || match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
             let result = lincheck::prove_padded_capture_z_vec_mode(
                 &z_packed_lincheck,
@@ -1013,7 +1029,12 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             ab_capture_mode(r1cs, &s_hat_v_c),
             challenger,
         ),
-    });
+    };
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = if lincheck_on_caller {
+        lincheck_run()
+    } else {
+        flock_core::in_pool(lincheck_run)
+    };
     flock_core::gaptime::mark("lincheck: done");
 
     let ab = ZClaim {
