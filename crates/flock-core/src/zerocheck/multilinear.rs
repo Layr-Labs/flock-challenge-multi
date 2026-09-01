@@ -681,7 +681,7 @@ impl UniSkipFoldTable {
                 if (v & (v - 1)) == 0 {
                     continue; // skip powers of 2 (already written)
                 }
-                let lo_bit = v.isolate_lowest_one();
+                let lo_bit = v & v.wrapping_neg();
                 let parent = v ^ lo_bit;
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
@@ -1565,7 +1565,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     // matrix sets (A per broadcast octet, B per 32-pair batch) plus a
     // period-two lane vector, so the message block consumes pre-weighted rows
     // and its four `ghash_mul_x4_split` prescales per four-group iteration
-    // disappear. `FLOCK_NO_R2_EQ_BAKE=1` rolls back to the prescales. Ranked draw 2 marker.
+    // disappear. `FLOCK_NO_R2_EQ_BAKE=1` rolls back to the prescales.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
