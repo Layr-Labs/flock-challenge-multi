@@ -118,6 +118,14 @@ fn witgen_urm_share_enabled() -> bool {
     *ON
 }
 
+#[inline]
+fn witgen_persistent_scratch_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_WITGEN_PERSISTENT_SCRATCH").is_none()
+    });
+    *ON
+}
+
 /// Number of BLAKE3 rounds.
 pub const N_ROUNDS: usize = 7;
 /// Number of G calls per round (4 column + 4 diagonal).
@@ -1124,12 +1132,16 @@ unsafe fn inject_alpha_e_x4(
                 n_rows, USEFUL_BITS,
                 "cz aggregation requires the pinned BLAKE3 row prefix"
             );
-            debug_assert!(b_roots[..GS_BASE]
-                .iter()
-                .all(|&root| root == Z_CONST_POS as u32));
-            debug_assert!(b_roots[OUT_HI_BASE..USEFUL_BITS]
-                .iter()
-                .all(|&root| root == Z_CONST_POS as u32));
+            debug_assert!(
+                b_roots[..GS_BASE]
+                    .iter()
+                    .all(|&root| root == Z_CONST_POS as u32)
+            );
+            debug_assert!(
+                b_roots[OUT_HI_BASE..USEFUL_BITS]
+                    .iter()
+                    .all(|&root| root == Z_CONST_POS as u32)
+            );
             debug_assert!((0..N_G).all(|g| {
                 let const_begin = GS_BASE + g * G_STRIDE + CARRY_ROWS_PER_G;
                 b_roots[const_begin..GS_BASE + (g + 1) * G_STRIDE]
@@ -2534,7 +2546,7 @@ fn generate_round1_inner_octa(
     const BYTES_PER_BLOCK: usize = K / 8;
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
-    const GROUP: usize = 16;
+    const GROUP: usize = 64;
     const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
@@ -2576,183 +2588,218 @@ fn generate_round1_inner_octa(
         ab_inner_bytes,
         abinner_nt,
     );
-    z.par_chunks_mut(group_f128)
-        .zip(a.par_chunks_mut(group_f128))
-        .zip(b.par_chunks_mut(group_f128))
-        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
-        .enumerate()
-        .for_each_init(
-            || {
-                // Rayon splits this down to one bout per GROUP under stealing
-                // pressure, so the init runs about as often as the dump does —
-                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
-                // allocation (64-aligned via `AbWinLine`) and skips the fill;
-                // the dump writes every window byte before the projection
-                // reads any.
-                let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
-                    WIN_LINES
-                } else {
-                    0
+    std::thread_local! {
+        static WITGEN_SCRATCH: std::cell::RefCell<Vec<core::mem::MaybeUninit<AbWinLine>>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+    const SCRATCH_LINES: usize = if WIN_LINES >= STAGE_LINES {
+        WIN_LINES
+    } else {
+        STAGE_LINES
+    };
+
+    let process_chunk = |win: &mut Vec<core::mem::MaybeUninit<AbWinLine>>,
+                         g: usize,
+                         z_out: &mut [F128],
+                         a_out: &mut [F128],
+                         b_out: &mut [F128],
+                         ab_out: &mut [u8]| {
+        let n_here = z_out.len() / F128_PER_BLOCK;
+        // The two window sides live back-to-back in one 64-aligned
+        // allocation: `[a windows | b windows]`, each 8 blocks of
+        // U32_PER_BLOCK words in the same row-major geometry as a/b.
+        let win_ab = if ab_nt && !ab_stream {
+            debug_assert!(win.len() >= WIN_LINES);
+            let wa = win.as_mut_ptr().cast::<u32>();
+            // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+            Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+        } else {
+            None
+        };
+        let stage = if ab_stream {
+            debug_assert!(win.len() >= STAGE_LINES);
+            Some(win.as_mut_ptr().cast::<u32>())
+        } else {
+            None
+        };
+        // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
+        // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
+        // contiguous 512-word blocks disjoint from every witness buffer.
+        // Last rayon chunk may be 8-wide. `elide` skips only
+        // token-verified constant chunks of a/b/z; the windows are
+        // always written in full.
+        unsafe {
+            for half in 0..(n_here / SIMD) {
+                let base = GROUP * g + half * SIMD;
+                // Lead 2: a full closed-form octa carries only init/base
+                // into the witness kernel, which generates all 25 draws
+                // directly in word-major SIMD lanes. Slice input still
+                // borrows in place; only a ragged closed octa uses the
+                // scalar staging needed to preserve padding semantics.
+                let staged: [Compression; SIMD];
+                let octa = match blocks {
+                    crate::seed_pipe::BlockSource::Slice(s) => {
+                        blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                            s.get(base + j).unwrap_or(padding)
+                        }))
+                    }
+                    crate::seed_pipe::BlockSource::Closed { init, len } if base + SIMD <= len => {
+                        blake3_witgen8::OctaInputs::Closed { init, base }
+                    }
+                    crate::seed_pipe::BlockSource::Closed { init, len } => {
+                        staged = std::array::from_fn(|j| {
+                            let idx = base + j;
+                            if idx < len {
+                                crate::seed_pipe::gen_block(init, idx)
+                            } else {
+                                *padding
+                            }
+                        });
+                        blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| &staged[j]))
+                    }
                 };
-                if want != 0 {
-                    v.reserve_exact(want);
-                    // SAFETY: `MaybeUninit<T>` needs no initialization, and
-                    // `reserve_exact` guaranteed the capacity.
-                    unsafe { v.set_len(want) };
-                }
-                v
-            },
-            |win, (g, (((z_out, a_out), b_out), ab_out))| {
-                let n_here = z_out.len() / F128_PER_BLOCK;
-                // The two window sides live back-to-back in one 64-aligned
-                // allocation: `[a windows | b windows]`, each 8 blocks of
-                // U32_PER_BLOCK words in the same row-major geometry as a/b.
-                let win_ab = if ab_nt && !ab_stream {
-                    debug_assert_eq!(win.len(), WIN_LINES);
-                    let wa = win.as_mut_ptr().cast::<u32>();
-                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
-                    Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
-                } else {
-                    None
-                };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
-                } else {
-                    None
-                };
-                // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
-                // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
-                // contiguous 512-word blocks disjoint from every witness buffer.
-                // Last rayon chunk may be 8-wide. `elide` skips only
-                // token-verified constant chunks of a/b/z; the windows are
-                // always written in full.
-                unsafe {
-                    for half in 0..(n_here / SIMD) {
-                        let base = GROUP * g + half * SIMD;
-                        // Lead 2: a full closed-form octa carries only init/base
-                        // into the witness kernel, which generates all 25 draws
-                        // directly in word-major SIMD lanes. Slice input still
-                        // borrows in place; only a ragged closed octa uses the
-                        // scalar staging needed to preserve padding semantics.
-                        let staged: [Compression; SIMD];
-                        let octa = match blocks {
-                            crate::seed_pipe::BlockSource::Slice(s) => {
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    s.get(base + j).unwrap_or(padding)
-                                }))
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len }
-                                if base + SIMD <= len =>
-                            {
-                                blake3_witgen8::OctaInputs::Closed { init, base }
-                            }
-                            crate::seed_pipe::BlockSource::Closed { init, len } => {
-                                staged = std::array::from_fn(|j| {
-                                    let idx = base + j;
-                                    if idx < len {
-                                        crate::seed_pipe::gen_block(init, idx)
-                                    } else {
-                                        *padding
-                                    }
-                                });
-                                blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                    &staged[j]
-                                }))
-                            }
-                        };
-                        let off = half * SIMD * F128_PER_BLOCK;
-                        // Streaming arm: the drain transforms each 64-byte
-                        // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out
-                                    .as_mut_ptr()
-                                    .add(half * SIMD * ab_block_bytes),
-                                out_stride: ab_block_bytes,
-                                out_bias: if compact { 2 * 64 } else { 0 },
-                                inv_table,
-                                plan: win_plan,
-                                one_rows_elided,
-                            }
-                        }).unwrap_unchecked();
-                        blake3_witgen8::build_octa_witness_ab_stream_elide(
-                            octa,
-                            z_out.as_mut_ptr().add(off).cast::<u32>(),
-                            a_out.as_mut_ptr().add(off).cast::<u32>(),
-                            b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            proj,
-                            elide,
-                        );
-                        // Fused arm: project THIS octa's eight blocks now, off
-                        // the just-written windows, while they are L1-hot. Same
-                        // ascending block order as the incumbent loop below, so
-                        // ab_inner's NT stream stays sequential per thread.
-                        if let Some((win_a, win_b)) = win_ab {
-                            for j in 0..SIMD {
-                                if base + j < skip_blocks {
-                                    continue;
-                                }
-                                let a_bytes = std::slice::from_raw_parts(
-                                    win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let b_bytes = std::slice::from_raw_parts(
-                                    win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let blk = half * SIMD + j;
-                                let ab_blk =
-                                    &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
-                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                                );
-                            }
+                let off = half * SIMD * F128_PER_BLOCK;
+                // Streaming arm: the drain transforms each 64-byte
+                // round-1 window as it is produced, straight into
+                // this octa's ab_inner blocks.
+                let proj = stage
+                    .map(|st| blake3_witgen8::StreamProj {
+                        stage: st,
+                        out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                        out_stride: ab_block_bytes,
+                        out_bias: if compact { 2 * 64 } else { 0 },
+                        inv_table,
+                        plan: win_plan,
+                        one_rows_elided,
+                    })
+                    .unwrap_unchecked();
+                blake3_witgen8::build_octa_witness_ab_stream_elide(
+                    octa,
+                    z_out.as_mut_ptr().add(off).cast::<u32>(),
+                    a_out.as_mut_ptr().add(off).cast::<u32>(),
+                    b_out.as_mut_ptr().add(off).cast::<u32>(),
+                    proj,
+                    elide,
+                );
+                // Fused arm: project THIS octa's eight blocks now, off
+                // the just-written windows, while they are L1-hot. Same
+                // ascending block order as the incumbent loop below, so
+                // ab_inner's NT stream stays sequential per thread.
+                if let Some((win_a, win_b)) = win_ab {
+                    for j in 0..SIMD {
+                        if base + j < skip_blocks {
+                            continue;
                         }
-                    }
-                }
-                // Incumbent arm — and, under `ab_nt`, only a ragged sub-octa tail
-                // the dump loop above could not cover (unreachable at every
-                // power-of-two shape ≥ 8; kept so the two arms stay observably
-                // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
-                    (n_here / SIMD) * SIMD
-                } else {
-                    0
-                };
-                assert!(!compact || j0 == n_here);
-                for j in j0..n_here {
-                    let block_idx = GROUP * g + j;
-                    if block_idx >= skip_blocks {
-                        let a_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let b_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
-                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                        let a_bytes = std::slice::from_raw_parts(
+                            win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
                         );
+                        let b_bytes = std::slice::from_raw_parts(
+                            win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
+                            BYTES_PER_BLOCK,
+                        );
+                        let blk = half * SIMD + j;
+                        let ab_blk =
+                            &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
+                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                            );
                     }
                 }
-                // Last NT store of the task in every arm — a/b's streams included.
-                if abinner_nt || z_nt || ab_nt {
-                    flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
-                }
-            },
-        );
+            }
+        }
+        // Incumbent arm — and, under `ab_nt`, only a ragged sub-octa tail
+        // the dump loop above could not cover (unreachable at every
+        // power-of-two shape ≥ 8; kept so the two arms stay observably
+        // identical). Reads a/b back.
+        let j0 = if win_ab.is_some() || stage.is_some() {
+            (n_here / SIMD) * SIMD
+        } else {
+            0
+        };
+        assert!(!compact || j0 == n_here);
+        for j in j0..n_here {
+            let block_idx = GROUP * g + j;
+            if block_idx >= skip_blocks {
+                let a_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                        BYTES_PER_BLOCK,
+                    )
+                };
+                let b_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                        BYTES_PER_BLOCK,
+                    )
+                };
+                let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                    );
+            }
+        }
+        // Last NT store of the task in every arm — a/b's streams included.
+        if abinner_nt || z_nt || ab_nt {
+            flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+        }
+    };
+
+    if witgen_persistent_scratch_enabled() {
+        z.par_chunks_mut(group_f128)
+            .zip(a.par_chunks_mut(group_f128))
+            .zip(b.par_chunks_mut(group_f128))
+            .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+            .enumerate()
+            .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
+                WITGEN_SCRATCH.with(|scratch| {
+                    let mut scratch = scratch.borrow_mut();
+                    if scratch.capacity() < SCRATCH_LINES {
+                        scratch.clear();
+                        scratch.reserve_exact(SCRATCH_LINES);
+                        // SAFETY: `MaybeUninit<AbWinLine>` needs no
+                        // initialization; `reserve_exact` guaranteed the
+                        // capacity.
+                        unsafe { scratch.set_len(SCRATCH_LINES) };
+                    }
+                    process_chunk(&mut scratch, g, z_out, a_out, b_out, ab_out);
+                });
+            });
+    } else {
+        z.par_chunks_mut(group_f128)
+            .zip(a.par_chunks_mut(group_f128))
+            .zip(b.par_chunks_mut(group_f128))
+            .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+            .enumerate()
+            .for_each_init(
+                || {
+                    // Rayon splits this down to one bout per GROUP under stealing
+                    // pressure, so the init runs about as often as the dump does —
+                    // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
+                    // allocation (64-aligned via `AbWinLine`) and skips the fill;
+                    // the dump writes every window byte before the projection
+                    // reads any.
+                    let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                    let want = if ab_stream {
+                        STAGE_LINES
+                    } else if ab_nt {
+                        WIN_LINES
+                    } else {
+                        0
+                    };
+                    if want != 0 {
+                        v.reserve_exact(want);
+                        // SAFETY: `MaybeUninit<T>` needs no initialization, and
+                        // `reserve_exact` guaranteed the capacity.
+                        unsafe { v.set_len(want) };
+                    }
+                    v
+                },
+                |win, (g, (((z_out, a_out), b_out), ab_out))| {
+                    process_chunk(win, g, z_out, a_out, b_out, ab_out);
+                },
+            );
+    }
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck

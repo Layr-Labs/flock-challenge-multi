@@ -1183,8 +1183,7 @@ fn build_r2_eq_bake(
     // Scaling a fold table's 64 basis columns scales every XOR-composed image
     // by the same factor, so the matrices of `c · fold` are the matrices of
     // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
-    let cols: [F128; 64] =
-        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
     let scaled = |c: F128| {
         let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
@@ -4304,9 +4303,7 @@ mod tests {
             (64, true),
             (128, true),
         ];
-        for (&(lo_size, canon), unroll16) in
-            shapes.iter().flat_map(|s| [(s, true), (s, false)])
-        {
+        for (&(lo_size, canon), unroll16) in shapes.iter().flat_map(|s| [(s, true), (s, false)]) {
             let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
@@ -4328,8 +4325,7 @@ mod tests {
                         .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
                 }
             }
-            let bake =
-                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let bake = build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
             let mut a_s: [F128; 0] = [];
             let mut b_s: [F128; 0] = [];
             let out_s = round2_lookahead_chunk_scalar::<false>(

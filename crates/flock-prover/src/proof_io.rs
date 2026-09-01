@@ -811,9 +811,7 @@ mod tests {
                 zerocheck: flock_core::zerocheck::ZerocheckProof {
                     round1_ab: f128_vec(&mut rng, 128),
                     round1_c: f128_vec(&mut rng, 128),
-                    multilinear_rounds: (0..25)
-                        .map(|_| (f128(&mut rng), f128(&mut rng)))
-                        .collect(),
+                    multilinear_rounds: (0..25).map(|_| (f128(&mut rng), f128(&mut rng))).collect(),
                     final_a_eval: f128(&mut rng),
                     final_b_eval: f128(&mut rng),
                     final_c_eval: f128(&mut rng),

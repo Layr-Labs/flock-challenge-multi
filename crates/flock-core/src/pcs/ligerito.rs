@@ -4454,7 +4454,7 @@ unsafe fn fold_and_msg_chunk_x86(
     r_x64: core::arch::x86_64::__m512i,
     stream: bool,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split};
     use core::arch::x86_64::*;
 
     let len = fc.len();
@@ -4487,10 +4487,7 @@ unsafe fn fold_and_msg_chunk_x86(
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
             if stream && dst_aligned {
-                _mm_stream_si128(
-                    ptr.cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<0>(value),
-                );
+                _mm_stream_si128(ptr.cast::<__m128i>(), _mm512_extracti32x4_epi32::<0>(value));
                 _mm_stream_si128(
                     ptr.add(1).cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<1>(value),
@@ -4800,7 +4797,6 @@ fn fold_and_msg_lsb_inner(
                 if use_nt {
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
-
             }
             let len = fc.len();
             // Fold this slice, then pair up the just-folded values for the msg.
@@ -6692,8 +6688,8 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
     use crate::pcs::ring_switch::compose_block_mats_gfni;
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -6734,14 +6730,10 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let (mats0_lo, mats0_hi) = compose_block_mats_gfni(
-                    &direct_gfni_mats[0],
-                    claim0.eq_hi[block],
-                );
-                let (mats1_lo, mats1_hi) = compose_block_mats_gfni(
-                    &direct_gfni_mats[1],
-                    claim1.eq_hi[block],
-                );
+                let (mats0_lo, mats0_hi) =
+                    compose_block_mats_gfni(&direct_gfni_mats[0], claim0.eq_hi[block]);
+                let (mats1_lo, mats1_hi) =
+                    compose_block_mats_gfni(&direct_gfni_mats[1], claim1.eq_hi[block]);
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
@@ -7739,13 +7731,7 @@ fn merkle_multi_proof_for_l0(
         )
     };
 
-    if ranked_l0_auth_batch_enabled(
-        tree.len(),
-        block_len,
-        num_interleaved,
-        queries.len(),
-        kind,
-    ) {
+    if ranked_l0_auth_batch_enabled(tree.len(), block_len, num_interleaved, queries.len(), kind) {
         // The canonical index walk emits one complete level at a time. Since
         // cut1 omits only level 0, all rehashed leaf siblings are exactly this
         // prefix; every remaining index maps to the retained compact tree.
@@ -7759,9 +7745,7 @@ fn merkle_multi_proof_for_l0(
         rayon::join(
             || merkle::hash_indexed_blake3_1k(bytes, leaf_indices, leaf_out),
             || {
-                if serial_par_enabled()
-                    && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS
-                {
+                if serial_par_enabled() && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
                     stored_out
                         .par_iter_mut()
                         .zip(stored_indices.par_iter())
@@ -11072,8 +11056,7 @@ mod tests {
             let (r_x4, r_x64) = unsafe {
                 use crate::field::gf2_128::x86_64::ghash_shift64_x4;
                 use core::arch::x86_64::*;
-                let r_x4 =
-                    _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+                let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
                 (r_x4, ghash_shift64_x4(r_x4))
             };
 
@@ -11083,7 +11066,15 @@ mod tests {
                 // SAFETY: avx512f+vpclmulqdq cfg-guaranteed; slices sized per contract.
                 let (u0_x86, u2_x86) = unsafe {
                     super::fold_and_msg_chunk_x86(
-                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream,
+                        &f,
+                        &b,
+                        base,
+                        &mut fc_x86,
+                        &mut bc_x86,
+                        r,
+                        r_x4,
+                        r_x64,
+                        stream,
                     )
                 };
                 assert_eq!(fc_ref, fc_x86, "folded f mismatch n_pairs={n_pairs}");
@@ -12309,13 +12300,8 @@ mod tests {
 
         let log_n = 12usize;
         let initial_k = 2usize;
-        let (p_cfg, v_cfg) = ood_test_configs(
-            log_n,
-            initial_k,
-            &[3, 2],
-            vec![0, 1, 1],
-            vec![0, 0, 0],
-        );
+        let (p_cfg, v_cfg) =
+            ood_test_configs(log_n, initial_k, &[3, 2], vec![0, 1, 1], vec![0, 0, 0]);
         let mut rng = crate::challenger::RandomChallenger::new(0x5A2E_D0A1_0004);
         let poly = rng.sample_f128_vec(1usize << log_n);
         let z = rng.sample_f128_vec(log_n);
@@ -12368,8 +12354,7 @@ mod tests {
             bincode::serialize(&sparse).expect("serialize sparse proof"),
             bincode::serialize(&dense).expect("serialize dense proof")
         );
-        let mut verifier_ch =
-            crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
+        let mut verifier_ch = crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
         assert!(recursive_verifier_with_basis(
             &v_cfg,
             &sparse,
@@ -12382,8 +12367,8 @@ mod tests {
 
     #[test]
     fn sparse_dual_exact_ranked_selector_positive_kill_and_negative() {
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("exact ranked m32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         let select = |cfg: &ProverConfig, sparse_disabled: bool, defer_disabled: bool| {
             ranked_sparse_dual_l0_depth_selected(
@@ -12402,8 +12387,16 @@ mod tests {
             )
         };
         assert_eq!(select(&config, false, false), Some(4));
-        assert_eq!(select(&config, true, false), None, "sparse kill must restore dense");
-        assert_eq!(select(&config, false, true), None, "defer kill must restore dense");
+        assert_eq!(
+            select(&config, true, false),
+            None,
+            "sparse kill must restore dense"
+        );
+        assert_eq!(
+            select(&config, false, true),
+            None,
+            "defer kill must restore dense"
+        );
 
         let mut wrong_queries = config.clone();
         wrong_queries.queries[0] = 217;
@@ -12425,8 +12418,8 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("exact ranked m32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         assert_eq!(
             ranked_sparse_dual_l0_depth_selected(
@@ -12481,9 +12474,7 @@ mod tests {
         ntt.rs_encode_interleaved(&poly, &mut l0_codeword, LANES);
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1e3;
         let mut queries: Vec<usize> = vec![1, 2];
-        queries.extend(
-            (0..Q - 2).map(|index| (index * 4093 + 17) & ((1usize << LOG_D) - 1)),
-        );
+        queries.extend((0..Q - 2).map(|index| (index * 4093 + 17) & ((1usize << LOG_D) - 1)));
         assert_eq!(queries.len(), Q);
         let mut reduced_k4: Vec<usize> = queries.iter().map(|&query| query >> 4).collect();
         reduced_k4.sort_unstable();
@@ -12512,8 +12503,7 @@ mod tests {
         for _ in 0..INTRO_REPEATS {
             black_box(round_msg_lsb(black_box(&f), black_box(&dense_basis)));
         }
-        let dense_intro_ms =
-            dense_intro_start.elapsed().as_secs_f64() * 1e3 / INTRO_REPEATS as f64;
+        let dense_intro_ms = dense_intro_start.elapsed().as_secs_f64() * 1e3 / INTRO_REPEATS as f64;
         let all_fold_challenges = rng.sample_f128_vec(5);
 
         let mut depth4_dual = None;
@@ -12548,8 +12538,7 @@ mod tests {
                     black_box(dual.round_msg(black_box(&all_fold_challenges[..prior])));
                 }
             }
-            let messages_ms = messages_start.elapsed().as_secs_f64() * 1e3
-                / MESSAGE_REPEATS as f64;
+            let messages_ms = messages_start.elapsed().as_secs_f64() * 1e3 / MESSAGE_REPEATS as f64;
             let material_start = Instant::now();
             let materialized = dual.materialize_after_folds(&all_fold_challenges[..depth]);
             let materialize_ms = material_start.elapsed().as_secs_f64() * 1e3;
@@ -12619,7 +12608,10 @@ mod tests {
         let z_l2 = rng.sample_f128_vec(LOG_MSG - 3);
         let (dense_ood_msg, dense_ood_sum) = dense.introduce_new_ood_factorized(&z_l2).unwrap();
         let (sparse_ood_msg, sparse_ood_sum) = sparse.introduce_new_ood_factorized(&z_l2).unwrap();
-        assert_eq!((sparse_ood_msg, sparse_ood_sum), (dense_ood_msg, dense_ood_sum));
+        assert_eq!(
+            (sparse_ood_msg, sparse_ood_sum),
+            (dense_ood_msg, dense_ood_sum)
+        );
         let ood_beta_l2 = rng.sample_f128();
         dense.glue_factorized_ood(ood_beta_l2);
         sparse.glue_factorized_ood(ood_beta_l2);
@@ -12630,7 +12622,10 @@ mod tests {
             .zip(&b1)
             .map(|(&x, &y)| x * y)
             .fold(F128::ZERO, |x, y| x + y);
-        assert_eq!(dense.introduce_new(b1.clone(), h1), sparse.introduce_new(b1, h1));
+        assert_eq!(
+            dense.introduce_new(b1.clone(), h1),
+            sparse.introduce_new(b1, h1)
+        );
         let beta1 = rng.sample_f128();
         dense.glue_deferred_into_factorized_ood_fold(beta1);
         sparse.glue_deferred_into_factorized_ood_fold(beta1);
@@ -12643,7 +12638,10 @@ mod tests {
             dual.materialize_after_folds(&all_fold_challenges[..4]),
             F128::ONE,
         );
-        assert_eq!(sparse.fold(all_fold_challenges[4]), dense.fold(all_fold_challenges[4]));
+        assert_eq!(
+            sparse.fold(all_fold_challenges[4]),
+            dense.fold(all_fold_challenges[4])
+        );
         assert_eq!(&*sparse.f, &*dense.f);
         assert_eq!(&*sparse.combined_basis, &*dense.combined_basis);
         assert_eq!(sparse.t_r, dense.t_r);
@@ -14378,15 +14376,12 @@ mod tests {
             state
         };
         for _ in 0..3 {
-            let generators: Vec<F128> = (0..128)
-                .map(|_| F128::new(next(), next()))
-                .collect();
+            let generators: Vec<F128> = (0..128).map(|_| F128::new(next(), next())).collect();
             let table = super::super::ring_switch::build_fold_byte_table(&generators);
             let e_hi = F128::new(next(), next());
             let map =
                 super::super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators);
-            let (got_lo, got_hi) =
-                super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
+            let (got_lo, got_hi) = super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
             let cols = super::super::ring_switch::compose_block_cols(&table, e_hi);
             assert_eq!(
                 got_lo,
@@ -14400,7 +14395,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn direct_fold4_gfni_gate_is_ranked_shape_only() {
