@@ -278,13 +278,20 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+unsafe fn gf2_128_reduce_x4(t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
+    //
+    // The two-XOR form `t0 ^= (t1<<64); t0 ^= t1.hi·0x87` is one
+    // `_mm512_ternarylogic_epi64::<0x96>` (XOR3) instead of two
+    // `_mm512_xor_si512`. Same bits: 0x96 is the odd-parity table.
+    // VPTERNLOG issues on p0/p5; the deleted XOR was a p0/p5 uop too,
+    // so this is one fewer uop and one fewer register writeback per
+    // reduction stage. Every 4-lane multiply pays this once (split)
+    // or twice (incumbent / deferred-acc fold).
     unsafe {
-        let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        let shifted = _mm512_bslli_epi128::<8>(t1);
+        let folded = _mm512_clmulepi64_epi128::<0x01>(t1, ghash_poly_x4());
+        _mm512_ternarylogic_epi64::<0x96>(t0, shifted, folded)
     }
 }
 
@@ -324,10 +331,14 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
         // Cross terms: x.hi·y.lo (imm 0x01) ^ x.lo·y.hi (imm 0x10), at x^64.
         let t1a = _mm512_clmulepi64_epi128::<0x01>(x, y);
         let t1b = _mm512_clmulepi64_epi128::<0x10>(x, y);
-        let mut t1 = _mm512_xor_si512(t1a, t1b);
-        // High product x.hi·y.hi (imm 0x11), folded into the cross.
+        // High product x.hi·y.hi (imm 0x11). Fuse (t1a⊕t1b⊕(t2<<64))
+        // into one XOR3, then XOR the 0x87 fold — same bits as
+        // `gf2_128_reduce_x4(t1a⊕t1b, t2)`.
         let t2 = _mm512_clmulepi64_epi128::<0x11>(x, y);
-        t1 = gf2_128_reduce_x4(t1, t2);
+        let t1 = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(t1a, t1b, _mm512_bslli_epi128::<8>(t2)),
+            _mm512_clmulepi64_epi128::<0x01>(t2, ghash_poly_x4()),
+        );
         // Low product x.lo·y.lo (imm 0x00), then fold t1 down to the result.
         let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
         gf2_128_reduce_x4(t0, t1)
@@ -605,11 +616,12 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        // mid ^= (x.hi·y.lo ⊕ x.lo·y.hi): one XOR3 instead of two XORs.
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
