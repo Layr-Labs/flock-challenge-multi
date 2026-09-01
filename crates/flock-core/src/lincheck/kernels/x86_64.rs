@@ -769,16 +769,16 @@ pub(crate) unsafe fn fold_block_major_chunk_x86_avx512(
                 let idx = _mm512_cvtepu8_epi64(idx8);
                 let n0 = _mm512_and_si512(idx, nib_mask);
                 let n1 = _mm512_srli_epi64::<4>(idx);
-                let lo = _mm512_xor_si512(
+                acc[g] = _mm512_ternarylogic_epi64::<0x96>(
+                    acc[g],
                     _mm512_permutex2var_epi64(tl_lo0, n0, tl_lo1),
                     _mm512_permutex2var_epi64(th_lo0, n1, th_lo1),
                 );
-                let hi = _mm512_xor_si512(
+                acc[16 + g] = _mm512_ternarylogic_epi64::<0x96>(
+                    acc[16 + g],
                     _mm512_permutex2var_epi64(tl_hi0, n0, tl_hi1),
                     _mm512_permutex2var_epi64(th_hi0, n1, th_hi1),
                 );
-                acc[g] = _mm512_xor_si512(acc[g], lo);
-                acc[16 + g] = _mm512_xor_si512(acc[16 + g], hi);
             }
         }
         // Interleave SoA → AoS and XOR into `partial` (F128 = lo || hi LE).
