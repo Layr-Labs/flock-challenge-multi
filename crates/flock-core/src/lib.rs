@@ -158,7 +158,7 @@ pub(crate) mod topology_pool {
         }
         #[cfg(target_os = "linux")]
         {
-            if std::env::var_os("FLOCK_NO_TOPOLOGY_POOL").is_some() {
+            if std::env::var_os("FLOCK_NO_TOPOLOGY_POOL").is_none() {
                 return None;
             }
             let want: usize = std::env::var("RAYON_NUM_THREADS").ok()?.parse().ok()?;
