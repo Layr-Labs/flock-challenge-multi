@@ -829,23 +829,31 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
     unsafe {
         debug_assert!((3..=28).contains(&BLK));
         debug_assert!(plan.bcomplement_static_eligible());
-        let mut j = 0usize;
-        while j != 8 {
-            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-            let out = &mut *proj
-                .out
-                .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
-                .cast::<[u8; 64]>();
-            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
-                &*off
-                    .add(j * ROUND1_AB_OFF_WORDS)
-                    .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                out,
-                plan,
-                imgs,
-            );
-            j += 1;
+        macro_rules! step {
+            ($j:expr) => {
+                rows.publish_dense_values($j, a_rows[$j], b_rows[$j]);
+                let out = &mut *proj
+                    .out
+                    .add($j * proj.out_stride + BLK * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
+                    &*off
+                        .add($j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                );
+            };
         }
+        step!(0);
+        step!(1);
+        step!(2);
+        step!(3);
+        step!(4);
+        step!(5);
+        step!(6);
+        step!(7);
     }
 }
 
