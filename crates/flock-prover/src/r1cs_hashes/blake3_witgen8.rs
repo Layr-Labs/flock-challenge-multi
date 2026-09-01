@@ -2140,6 +2140,62 @@ unsafe fn dump_elide_win(
     unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
 }
 
+/// Load the per-block metadata (counter_lo, counter_hi, block_len, flags) for
+/// eight slice-compression inputs into four word-major V8s. The `Compression`
+/// tuple lays counter (u64), block_len (u32), and flags (u32) contiguously,
+/// so a 128-bit load per input plus an 8×4 u32 transpose yields the same
+/// vectors as the incumbent scalar loop with fewer scalar stores/loads.
+#[inline(always)]
+unsafe fn load_blocks_meta(inputs: &[&Compression; 8]) -> (V8, V8, V8, V8) {
+    unsafe {
+        let m0 = _mm_loadu_si128(&inputs[0].2 as *const u64 as *const __m128i);
+        let m1 = _mm_loadu_si128(&inputs[1].2 as *const u64 as *const __m128i);
+        let m2 = _mm_loadu_si128(&inputs[2].2 as *const u64 as *const __m128i);
+        let m3 = _mm_loadu_si128(&inputs[3].2 as *const u64 as *const __m128i);
+        let m4 = _mm_loadu_si128(&inputs[4].2 as *const u64 as *const __m128i);
+        let m5 = _mm_loadu_si128(&inputs[5].2 as *const u64 as *const __m128i);
+        let m6 = _mm_loadu_si128(&inputs[6].2 as *const u64 as *const __m128i);
+        let m7 = _mm_loadu_si128(&inputs[7].2 as *const u64 as *const __m128i);
+
+        let t0 = _mm_unpacklo_epi32(m0, m1);
+        let t1 = _mm_unpackhi_epi32(m0, m1);
+        let t2 = _mm_unpacklo_epi32(m2, m3);
+        let t3 = _mm_unpackhi_epi32(m2, m3);
+        let t4 = _mm_unpacklo_epi32(m4, m5);
+        let t5 = _mm_unpackhi_epi32(m4, m5);
+        let t6 = _mm_unpacklo_epi32(m6, m7);
+        let t7 = _mm_unpackhi_epi32(m6, m7);
+
+        let u0 = _mm_unpacklo_epi64(t0, t2);
+        let u1 = _mm_unpackhi_epi64(t0, t2);
+        let u2 = _mm_unpacklo_epi64(t1, t3);
+        let u3 = _mm_unpackhi_epi64(t1, t3);
+        let u4 = _mm_unpacklo_epi64(t4, t6);
+        let u5 = _mm_unpackhi_epi64(t4, t6);
+        let u6 = _mm_unpacklo_epi64(t5, t7);
+        let u7 = _mm_unpackhi_epi64(t5, t7);
+
+        (
+            _mm256_permute2x128_si256::<0x20>(
+                _mm256_castsi128_si256(u0),
+                _mm256_castsi128_si256(u4),
+            ),
+            _mm256_permute2x128_si256::<0x20>(
+                _mm256_castsi128_si256(u1),
+                _mm256_castsi128_si256(u5),
+            ),
+            _mm256_permute2x128_si256::<0x20>(
+                _mm256_castsi128_si256(u2),
+                _mm256_castsi128_si256(u6),
+            ),
+            _mm256_permute2x128_si256::<0x20>(
+                _mm256_castsi128_si256(u3),
+                _mm256_castsi128_si256(u7),
+            ),
+        )
+    }
+}
+
 /// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
 /// Bit-exact with two 4-wide quads and with the scalar driver ×8.
 ///
@@ -2229,23 +2285,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 message[..8].copy_from_slice(&m_lo);
                 message[8..].copy_from_slice(&m_hi);
 
-                let mut tlo_a = [0u32; 8];
-                let mut thi_a = [0u32; 8];
-                let mut bl_a = [0u32; 8];
-                let mut fl_a = [0u32; 8];
-                for j in 0..8 {
-                    tlo_a[j] = inputs[j].2 as u32;
-                    thi_a[j] = (inputs[j].2 >> 32) as u32;
-                    bl_a[j] = inputs[j].3;
-                    fl_a[j] = inputs[j].4;
-                }
+                let (counter_lo, counter_hi, block_len, flags) = load_blocks_meta(&inputs);
                 PreparedInputs {
                     cv,
                     message,
-                    counter_lo: load_v8(tlo_a.as_ptr()),
-                    counter_hi: load_v8(thi_a.as_ptr()),
-                    block_len: load_v8(bl_a.as_ptr()),
-                    flags: load_v8(fl_a.as_ptr()),
+                    counter_lo,
+                    counter_hi,
+                    block_len,
+                    flags,
                 }
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
