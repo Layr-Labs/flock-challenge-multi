@@ -846,7 +846,7 @@ fn speculative_main(
         // 8, not 11: the binding budget is the 1500 s JOB budget, not the
         // 45 s per-worker guard -- ranked benchmark.sh is 808 s/120 trials,
         // leaving ~5.7 s/trial, and 4 extra proves spend ~1.1 s of it.
-        const SPEC_WARMUP_PROVES: usize = 8;
+        const SPEC_WARMUP_PROVES: usize = 3;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
@@ -1318,3 +1318,5 @@ mod tests {
         }
     }
 }
+
+// redraw variant r2126182428236
