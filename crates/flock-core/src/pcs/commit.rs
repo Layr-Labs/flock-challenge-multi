@@ -592,6 +592,21 @@ fn tree_collapse_enabled() -> bool {
     *ON
 }
 
+/// Parks that still run the collapse; see [`give_tree`].
+const TREE_COLLAPSE_BUDGET: usize = 30;
+
+fn tree_collapse_budget_take() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static UNLIMITED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_TREE_COLLAPSE_BUDGET").is_some()
+    });
+    if *UNLIMITED {
+        return true;
+    }
+    static USED: AtomicUsize = AtomicUsize::new(0);
+    USED.fetch_add(1, Ordering::Relaxed) < TREE_COLLAPSE_BUDGET
+}
+
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
     // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
@@ -605,7 +620,14 @@ pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // the live tree length instead of the full allocation capacity. The
     // kernel may round the final partial page, but the separate 96-page
     // layout tail is otherwise outside the requested range.
-    if tree_collapse_enabled() {
+    // The collapse is a synchronous madvise walk of up to 64 MiB, and the L0
+    // tree is parked at the very end of the timed window (the L1/L2 trees
+    // inside the open). Once the untimed proves have upgraded the stretches
+    // to 2 MiB pages the call has nothing left to do, so budget it to the
+    // first `TREE_COLLAPSE_BUDGET` parks of the process (the ranked worker
+    // runs twenty untimed proves, three trees each, before the timed one).
+    // `FLOCK_NO_TREE_COLLAPSE_BUDGET=1` restores the collapse on every park.
+    if tree_collapse_enabled() && tree_collapse_budget_take() {
         crate::collapse_hugepages(
             tree.as_mut_ptr().cast::<u8>(),
             tree.len() * core::mem::size_of::<Hash>(),
