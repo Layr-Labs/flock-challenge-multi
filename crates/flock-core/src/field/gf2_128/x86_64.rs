@@ -278,13 +278,15 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
+unsafe fn gf2_128_reduce_x4(t0: __m512i, t1: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
         let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        _mm512_ternarylogic_epi32::<0x96>(
+            t0,
+            _mm512_bslli_epi128::<8>(t1),
+            _mm512_clmulepi64_epi128::<0x01>(t1, poly),
+        )
     }
 }
 
@@ -561,12 +563,13 @@ pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
 #[inline]
 #[target_feature(enable = "avx512f")]
 unsafe fn xor4_lanes(v: __m512i) -> __m128i {
-    // Register-only lane extracts + XOR; avx512f cfg-gated.
-    let l0 = _mm512_extracti32x4_epi32::<0>(v);
-    let l1 = _mm512_extracti32x4_epi32::<1>(v);
-    let l2 = _mm512_extracti32x4_epi32::<2>(v);
-    let l3 = _mm512_extracti32x4_epi32::<3>(v);
-    _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+    // Register-only hierarchical lane reduction; avx512f cfg-gated.
+    let y0 = _mm512_castsi512_si256(v);
+    let y1 = _mm512_extracti64x4_epi64::<1>(v);
+    let y = _mm256_xor_si256(y0, y1);
+    let x0 = _mm256_castsi256_si128(y);
+    let x1 = _mm256_extracti128_si256::<1>(y);
+    _mm_xor_si128(x0, x1)
 }
 
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
@@ -605,11 +608,11 @@ impl WideGhashX4 {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
+        self.mid = _mm512_ternarylogic_epi32::<0x96>(
+            self.mid,
             _mm512_clmulepi64_epi128::<0x01>(x, y),
             _mm512_clmulepi64_epi128::<0x10>(x, y),
         );
-        self.mid = _mm512_xor_si512(self.mid, m);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
