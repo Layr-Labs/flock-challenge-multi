@@ -64,3 +64,9 @@ static EY_V_ROLL_2491_STACK: [u8; 2491] = [0u8; 2491];
 /// Layout probe: a used static of fixed size.
 #[used]
 static EY_PROBE_1861_REDRAW_1: [u8; 1861] = [0u8; 1861];
+
+/// Layout probe. A used static of fixed size; its presence and size
+/// move the placement of the objects laid out after it, without changing
+/// any code path. Nothing reads it.
+#[used]
+static EY_PROBE_2733: [u8; 2733] = [0u8; 2733];
