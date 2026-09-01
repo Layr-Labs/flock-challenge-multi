@@ -1576,7 +1576,7 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
 unsafe fn stream_ranked_line(p: *mut u32, v: __m512i) {
-    unsafe { _mm512_stream_si512(p.cast::<__m512i>(), v) }
+    unsafe { _mm512_storeu_si512(p.cast::<__m512i>(), v) }
 }
 
 /// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
