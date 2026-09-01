@@ -417,7 +417,7 @@ fn quadratic_coefficients([at_zero, at_one, leading]: [F128; 3]) -> [F128; 3] {
 /// matching degree-at-most-two coefficient tensor, in row-major coordinate
 /// order. This is the fold3 interpolation algebra generalized to three prior
 /// challenges for the direct-fold4 scaffold.
-fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
+pub(crate) fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
     debug_assert_eq!(values.len(), 3usize.pow(variables as u32));
     for axis in 0..variables {
         let stride = 3usize.pow((variables - axis - 1) as u32);
