@@ -1705,6 +1705,14 @@ unsafe fn inner_product_wide(a: &[F128], b: &[F128]) -> F128 {
         let n = a.len();
         let mut acc = WideGhashX4::zero();
         let mut i = 0usize;
+        while i + 8 <= n {
+            let x0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let y0 = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            let x1 = _mm512_loadu_si512(a.as_ptr().add(i + 4) as *const __m512i);
+            let y1 = _mm512_loadu_si512(b.as_ptr().add(i + 4) as *const __m512i);
+            acc.mul_acc2(x0, y0, x1, y1);
+            i += 8;
+        }
         while i + 4 <= n {
             let x = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let y = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
