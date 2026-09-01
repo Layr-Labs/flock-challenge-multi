@@ -192,6 +192,23 @@ unsafe fn butterfly_row_pair_impl<const LOW: bool, const DIET: bool>(
         let tw = tw_x4::<LOW, DIET>(twiddle);
         let lanes = top.len() & !3;
         let mut i = 0;
+        while i + 8 <= lanes {
+            let top0 = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+            let bot0 = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+            let top1 = _mm512_loadu_si512(top.as_ptr().add(i + 4) as *const __m512i);
+            let bot1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4) as *const __m512i);
+
+            let new_top0 = _mm512_xor_si512(top0, mul_x4::<LOW, DIET>(tw, bot0));
+            let new_top1 = _mm512_xor_si512(top1, mul_x4::<LOW, DIET>(tw, bot1));
+            let new_bot0 = _mm512_xor_si512(bot0, new_top0);
+            let new_bot1 = _mm512_xor_si512(bot1, new_top1);
+
+            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, new_top0);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, new_bot0);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i + 4) as *mut __m512i, new_top1);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i + 4) as *mut __m512i, new_bot1);
+            i += 8;
+        }
         while i < lanes {
             let top_lanes = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let bot_lanes = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
@@ -277,6 +294,56 @@ unsafe fn butterfly_fused_2layer_impl<
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
         let lanes = a.len() & !3;
         let mut i = 0;
+        while i + 8 <= lanes {
+            let mut va0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
+
+            let mut va1 = _mm512_loadu_si512(a.as_ptr().add(i + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(b.as_ptr().add(i + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(c.as_ptr().add(i + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(d.as_ptr().add(i + 4) as *const __m512i);
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            vc0 = _mm512_xor_si512(vc0, new_a0);
+            vc1 = _mm512_xor_si512(vc1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_b0);
+            vd1 = _mm512_xor_si512(vd1, new_b1);
+            vb0 = new_b0;
+            vb1 = new_b1;
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+            vb0 = _mm512_xor_si512(vb0, new_a0);
+            vb1 = _mm512_xor_si512(vb1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va0);
+            _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb0);
+            _mm512_storeu_si512(c.as_mut_ptr().add(i) as *mut __m512i, vc0);
+            _mm512_storeu_si512(d.as_mut_ptr().add(i) as *mut __m512i, vd0);
+
+            _mm512_storeu_si512(a.as_mut_ptr().add(i + 4) as *mut __m512i, va1);
+            _mm512_storeu_si512(b.as_mut_ptr().add(i + 4) as *mut __m512i, vb1);
+            _mm512_storeu_si512(c.as_mut_ptr().add(i + 4) as *mut __m512i, vc1);
+            _mm512_storeu_si512(d.as_mut_ptr().add(i + 4) as *mut __m512i, vd1);
+            i += 8;
+        }
         while i < lanes {
             let mut va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
             let mut vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
@@ -432,6 +499,56 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
 
         let mut i = 0;
+        while i + 8 <= lanes {
+            let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(c.add(i) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+            let mut va1 = _mm512_loadu_si512(a.add(i + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(b.add(i + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(c.add(i + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(d.add(i + 4) as *const __m512i);
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            vc0 = _mm512_xor_si512(vc0, new_a0);
+            vc1 = _mm512_xor_si512(vc1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_b0);
+            vd1 = _mm512_xor_si512(vd1, new_b1);
+            vb0 = new_b0;
+            vb1 = new_b1;
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+            vb0 = _mm512_xor_si512(vb0, new_a0);
+            vb1 = _mm512_xor_si512(vb1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+
+            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+            i += 8;
+        }
         while i < lanes {
             let mut va = _mm512_loadu_si512(a.add(i) as *const __m512i);
             let mut vb = _mm512_loadu_si512(b.add(i) as *const __m512i);
@@ -650,6 +767,56 @@ unsafe fn butterfly_fused_2layer_row_from_geo_impl<
         let dst_row = |i: usize| dst.add((i * dst_quarter + dst_r) * num_ntts);
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        while lane + 8 <= lanes {
+            let mut va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            let mut va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            vc0 = _mm512_xor_si512(vc0, new_a0);
+            vc1 = _mm512_xor_si512(vc1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_b0);
+            vd1 = _mm512_xor_si512(vd1, new_b1);
+            vb0 = new_b0;
+            vb1 = new_b1;
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<false, DIET>(inner_a, vb0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<false, DIET>(inner_a, vb1));
+            vb0 = _mm512_xor_si512(vb0, new_a0);
+            vb1 = _mm512_xor_si512(vb1, new_a1);
+            va0 = new_a0;
+            va1 = new_a1;
+
+            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, DIET>(inner_b, vd0));
+            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, DIET>(inner_b, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            store_row4::<NT>(dst_row(0).add(lane), va0);
+            store_row4::<NT>(dst_row(1).add(lane), vb0);
+            store_row4::<NT>(dst_row(2).add(lane), vc0);
+            store_row4::<NT>(dst_row(3).add(lane), vd0);
+
+            store_row4::<NT>(dst_row(0).add(lane + 4), va1);
+            store_row4::<NT>(dst_row(1).add(lane + 4), vb1);
+            store_row4::<NT>(dst_row(2).add(lane + 4), vc1);
+            store_row4::<NT>(dst_row(3).add(lane + 4), vd1);
+            lane += 8;
+        }
         while lane < lanes {
             let mut va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
             let mut vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
@@ -929,6 +1096,50 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_geo_impl<
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        while lane + 8 <= lanes {
+            if PF {
+                let off0 = lane * core::mem::size_of::<F128>();
+                let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                }
+            }
+            let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let mut vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let mut vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let mut vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+            let mut vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+            let mut vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+            let mut vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+            vc0 = _mm512_xor_si512(vc0, va0);
+            vc1 = _mm512_xor_si512(vc1, va1);
+            vd0 = _mm512_xor_si512(vd0, vb0);
+            vd1 = _mm512_xor_si512(vd1, vb1);
+            vb0 = _mm512_xor_si512(vb0, va0);
+            vb1 = _mm512_xor_si512(vb1, va1);
+
+            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+            vd0 = _mm512_xor_si512(vd0, new_c0);
+            vd1 = _mm512_xor_si512(vd1, new_c1);
+            vc0 = new_c0;
+            vc1 = new_c1;
+
+            store_row4::<NT>(dst_row(0).add(lane), va0);
+            store_row4::<NT>(dst_row(1).add(lane), vb0);
+            store_row4::<NT>(dst_row(2).add(lane), vc0);
+            store_row4::<NT>(dst_row(3).add(lane), vd0);
+
+            store_row4::<NT>(dst_row(0).add(lane + 4), va1);
+            store_row4::<NT>(dst_row(1).add(lane + 4), vb1);
+            store_row4::<NT>(dst_row(2).add(lane + 4), vc1);
+            store_row4::<NT>(dst_row(3).add(lane + 4), vd1);
+            lane += 8;
+        }
         while lane < lanes {
             if PF {
                 let off = lane * core::mem::size_of::<F128>();
@@ -1085,6 +1296,91 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
         let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
         let lanes = num_ntts & !3;
         let mut lane = 0;
+        while lane + 8 <= lanes {
+            if pf {
+                let off0 = lane * core::mem::size_of::<F128>();
+                let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                }
+            }
+            let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+            let vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+            let vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+            let vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+            let mut sb0 = vb0;
+            let mut sc0 = _mm512_xor_si512(vc0, va0);
+            let mut sd0 = _mm512_xor_si512(vd0, vb0);
+            sb0 = _mm512_xor_si512(sb0, va0);
+
+            let mut sb1 = vb1;
+            let mut sc1 = _mm512_xor_si512(vc1, va1);
+            let mut sd1 = _mm512_xor_si512(vd1, vb1);
+            sb1 = _mm512_xor_si512(sb1, va1);
+
+            let new_sc0 = _mm512_xor_si512(sc0, mul_x4::<false, DIET>(sparse_b, sd0));
+            let new_sc1 = _mm512_xor_si512(sc1, mul_x4::<false, DIET>(sparse_b, sd1));
+            sd0 = _mm512_xor_si512(sd0, new_sc0);
+            sd1 = _mm512_xor_si512(sd1, new_sc1);
+            sc0 = new_sc0;
+            sc1 = new_sc1;
+
+            _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, va0);
+            _mm512_storeu_si512(sp_row(1).add(lane) as *mut __m512i, sb0);
+            _mm512_storeu_si512(sp_row(2).add(lane) as *mut __m512i, sc0);
+            _mm512_storeu_si512(sp_row(3).add(lane) as *mut __m512i, sd0);
+
+            _mm512_storeu_si512(sp_row(0).add(lane + 4) as *mut __m512i, va1);
+            _mm512_storeu_si512(sp_row(1).add(lane + 4) as *mut __m512i, sb1);
+            _mm512_storeu_si512(sp_row(2).add(lane + 4) as *mut __m512i, sc1);
+            _mm512_storeu_si512(sp_row(3).add(lane + 4) as *mut __m512i, sd1);
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            let vc0 = _mm512_xor_si512(vc0, new_a0);
+            let vc1 = _mm512_xor_si512(vc1, new_a1);
+            let va0 = new_a0;
+            let va1 = new_a1;
+
+            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            let vd0 = _mm512_xor_si512(vd0, new_b0);
+            let vd1 = _mm512_xor_si512(vd1, new_b1);
+            let vb0 = new_b0;
+            let vb1 = new_b1;
+
+            let new_a0 = _mm512_xor_si512(va0, mul_x4::<false, DIET>(inner_a, vb0));
+            let new_a1 = _mm512_xor_si512(va1, mul_x4::<false, DIET>(inner_a, vb1));
+            let vb0 = _mm512_xor_si512(vb0, new_a0);
+            let vb1 = _mm512_xor_si512(vb1, new_a1);
+            let va0 = new_a0;
+            let va1 = new_a1;
+
+            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, DIET>(inner_b, vd0));
+            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, DIET>(inner_b, vd1));
+            let vd0 = _mm512_xor_si512(vd0, new_c0);
+            let vd1 = _mm512_xor_si512(vd1, new_c1);
+            let vc0 = new_c0;
+            let vc1 = new_c1;
+
+            _mm512_storeu_si512(dn_row(0).add(lane) as *mut __m512i, va0);
+            _mm512_storeu_si512(dn_row(1).add(lane) as *mut __m512i, vb0);
+            _mm512_storeu_si512(dn_row(2).add(lane) as *mut __m512i, vc0);
+            _mm512_storeu_si512(dn_row(3).add(lane) as *mut __m512i, vd0);
+
+            _mm512_storeu_si512(dn_row(0).add(lane + 4) as *mut __m512i, va1);
+            _mm512_storeu_si512(dn_row(1).add(lane + 4) as *mut __m512i, vb1);
+            _mm512_storeu_si512(dn_row(2).add(lane + 4) as *mut __m512i, vc1);
+            _mm512_storeu_si512(dn_row(3).add(lane + 4) as *mut __m512i, vd1);
+            lane += 8;
+        }
         while lane < lanes {
             if pf {
                 let off = lane * core::mem::size_of::<F128>();
