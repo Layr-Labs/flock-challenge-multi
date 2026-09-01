@@ -1318,3 +1318,5 @@ mod tests {
         }
     }
 }
+
+// redraw variant r2038072375483
