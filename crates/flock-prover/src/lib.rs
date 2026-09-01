@@ -59,4 +59,4 @@ static EY_V_ROLL_703_STACK: [u8; 703] = [0u8; 703];
 /// Qualified public layout probe PR #2284, kept under a unique symbol so it
 /// can coexist with the earlier retained layout inputs.
 #[used]
-static EY_V_ROLL_2491_STACK: [u8; 2491] = [0u8; 2491];
+static EY_V_ROLL_2491_STACK_PR2462_R1: [u8; 2491] = [0u8; 2491];

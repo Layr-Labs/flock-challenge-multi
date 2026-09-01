@@ -120,6 +120,7 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 /// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
 /// features required by this function.
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+#[inline]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
     unsafe {
