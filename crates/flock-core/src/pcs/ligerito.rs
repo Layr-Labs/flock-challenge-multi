@@ -29,6 +29,8 @@
 //!    b. Last step: send remaining poly + open f^i.
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
+// Yukon redraw marker: e2cfb76f-201a-44c8-8194-19328f6461c6.
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -2577,7 +2579,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 /// Research representation for the exact ranked L0 induced basis.  The
 /// basis itself is `P F^T q`; retaining the sparse query vector lets up to
 /// four LSB folds commute through the corresponding final forward-NTT layers.
-/// Each query caches one inverse-local residue of 8, 16, or 32 codeword rows.
+/// Each query caches one inverse-local residue of 4, 8, 16, or 32 codeword rows.
 /// The fixed 32-slot backing avoids one heap allocation per query while only
 /// the prefix selected by `cache_len` is constructed or read.
 struct SparseDualL0 {
@@ -2659,7 +2661,7 @@ impl SparseDualL0 {
         alpha: &[F128],
     ) -> (Self, F128) {
         use rayon::prelude::*;
-        assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
         assert_eq!(num_interleaved, 1usize << lane_challenges.len());
         assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
         assert_eq!(opened_rows.len(), queries.len());
@@ -6353,6 +6355,8 @@ const ENV_NO_LIG_DEFER_INDUCED_GLUE: &str = "FLOCK_NO_LIG_DEFER_INDUCED_GLUE";
 const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
+const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
 #[cfg(test)]
 thread_local! {
     static SPARSE_DUAL_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -6463,8 +6467,28 @@ fn ranked_sparse_dual_l0_depth_selected(
     if !selected {
         return None;
     }
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
+}
+
+#[inline]
+fn ranked_sparse_dual_l0_depth_setting(
+    explicit_depth: Option<&str>,
+    depth2_disabled: bool,
+) -> usize {
+    let depth = explicit_depth
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 1, 2, 3, or 4")
+        })
+        .unwrap_or(if depth2_disabled {
+            SPARSE_DUAL_MAX_DEPTH
+        } else {
+            RANKED_SPARSE_DUAL_DEFAULT_DEPTH
+        });
+    assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    depth
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6483,7 +6507,7 @@ fn ranked_sparse_dual_l0_depth(
     {
         let forced = SPARSE_DUAL_TEST_DEPTH.with(std::cell::Cell::get);
         if forced != 0 {
-            assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
+            assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&forced));
             return Some(forced);
         }
     }
@@ -6513,15 +6537,11 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
-        })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
-    assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
+    let depth = ranked_sparse_dual_l0_depth_setting(
+        explicit_depth.as_deref(),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+    );
     Some(depth)
 }
 
@@ -12093,7 +12113,7 @@ mod tests {
                 &queries,
                 &alpha,
             );
-            for target_depth in 3..=4 {
+            for target_depth in 1..=4 {
                 let (dual, dual_enforced) = SparseDualL0::new(
                     target_depth,
                     log_d,
@@ -12411,6 +12431,24 @@ mod tests {
         let mut wrong_shape = config.clone();
         wrong_shape.recursive_ks[0] = 4;
         assert_eq!(select(&wrong_shape, false, false), None);
+    }
+
+    #[test]
+    fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
+        for depth in 1..=4 {
+            let value = depth.to_string();
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
+                depth
+            );
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
+                depth,
+                "explicit depth must override the depth2 rollback"
+            );
+        }
     }
 
     /// Exact ranked post-DirectFold8-state oracle and component timer. This allocates
