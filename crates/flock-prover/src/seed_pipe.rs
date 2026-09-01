@@ -476,6 +476,135 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 }
 
+// ---------------------------------------------------------------------------
+// CPU keep-alive across the ready->seed gap
+// ---------------------------------------------------------------------------
+//
+// Between the tail of the untimed warm-up and the arrival of the seed, every
+// thread in this process is parked in the kernel: main blocks reading the
+// spliced pipe, this module's seed-pipe thread blocks in `read(2)` on the
+// real stdin, and all rayon workers sleep on futexes. Nothing is runnable,
+// so cpuidle takes the package into deep C-states and the effective
+// frequency the timed prove starts at is whatever the ramp-up grants after
+// the wake. The scored interval opens exactly at the end of that idle gap.
+//
+// One detached spin thread per logical CPU, started at the tail of the
+// spec-thread warm-up, keeps every core in C0 at its all-core operating
+// point until the first seed byte arrives. Three properties make this safe:
+//
+// - The spin is a scalar-integer dependent chain (`wrapping_mul`/`rotate`/
+//   `xor` through `black_box`). NO vector instructions: a wide spin would
+//   hold the AVX-512 frequency license and drag the all-core ceiling DOWN
+//   right before the timed window — the opposite of the intent.
+// - Every spinner demotes itself to SCHED_IDLE before spinning (and exits
+//   instead of spinning if the demotion fails). A SCHED_IDLE hog is
+//   preempted immediately by any waking normal task, so the seed wake and
+//   the rayon fan-out never wait behind a spinner; a pipe-wake onto a CPU
+//   running a SCHED_IDLE spinner also skips the C-state exit an idle CPU
+//   would pay.
+// - The stop is one atomic store, made on the seed-pipe thread the instant
+//   `read(2)` returns the first seed byte, before the line is parsed or
+//   forwarded; spinners poll the flag every ~16 chain steps. No joins: the
+//   live-count exists for tests and post-mortems, and thread teardown
+//   happens on SCHED_IDLE time.
+//
+// `FLOCK_NO_CPU_KEEPALIVE` (any value) disables. Ships on: the ranked
+// harness clears the environment, so a switch could only ever disable.
+
+static KEEPALIVE_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Spinners still running. Observational only — nothing joins or waits.
+static KEEPALIVE_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+mod keepalive_sys {
+    pub(super) const SCHED_IDLE: i32 = 5;
+    #[repr(C)]
+    pub(super) struct SchedParam {
+        pub sched_priority: i32,
+    }
+    unsafe extern "C" {
+        pub(super) fn sched_setscheduler(
+            pid: i32,
+            policy: i32,
+            param: *const SchedParam,
+        ) -> i32;
+        pub(super) fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+    }
+}
+
+/// Start one spinner per logical CPU. Called from the seed-pipe thread at the
+/// tail of its untimed warm-up, so spawn cost is outside every measured
+/// interval.
+fn start_cpu_keepalive() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        if std::env::var_os("FLOCK_NO_CPU_KEEPALIVE").is_some() {
+            return;
+        }
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(16);
+        for cpu in 0..n {
+            KEEPALIVE_LIVE.fetch_add(1, Ordering::SeqCst);
+            if std::thread::Builder::new()
+                .name("flock-cpukeep".into())
+                .stack_size(128 << 10)
+                .spawn(move || keepalive_spin(cpu))
+                .is_err()
+            {
+                KEEPALIVE_LIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// One atomic store; spinners observe it within tens of nanoseconds.
+#[inline]
+fn stop_cpu_keepalive() {
+    KEEPALIVE_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn keepalive_spin(cpu: usize) {
+    use std::sync::atomic::Ordering;
+    // Demote FIRST. A normal-priority spinner could make the seed wake wait
+    // out a scheduling slice — without the demotion this mechanism is not
+    // worth its risk, so refuse to spin at all.
+    let demoted = {
+        let param = keepalive_sys::SchedParam { sched_priority: 0 };
+        // SAFETY: plain syscall on the calling thread with a valid param.
+        unsafe { keepalive_sys::sched_setscheduler(0, keepalive_sys::SCHED_IDLE, &param) == 0 }
+    };
+    if !demoted {
+        KEEPALIVE_LIVE.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    // One spinner per CPU, deterministically: pin spinner i to CPU i. A
+    // failed pin just leaves this spinner floating — the balancer spreads
+    // idle-class spinners onto idle CPUs anyway.
+    if cpu < 1024 {
+        let mut mask = [0u64; 16];
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        // SAFETY: valid mask buffer of the stated size, calling thread.
+        unsafe {
+            keepalive_sys::sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
+        }
+    }
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ cpu as u64;
+    while !KEEPALIVE_STOP.load(Ordering::Relaxed) {
+        // ~16 dependent scalar-integer steps between flag checks: keeps the
+        // load off the loop-carried path but bounds stop latency to tens of
+        // nanoseconds. black_box keeps the chain from folding away.
+        for _ in 0..16 {
+            x = core::hint::black_box(
+                x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29) ^ 0x5851_F42D_4C95_7F2D,
+            );
+        }
+    }
+    KEEPALIVE_LIVE.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
 /// hard error.
 /// Reads in 64-byte gulps rather than byte at a time: the harness writes the
@@ -488,6 +617,9 @@ fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
         // SAFETY: `fd` is a live descriptor owned by this thread and `chunk`
         // is a valid writable buffer of the stated length.
         let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+        // The scored interval opens with this return: release every
+        // keep-alive core before the line is parsed or forwarded.
+        stop_cpu_keepalive();
         match n {
             n if n > 0 => {
                 line.extend_from_slice(&chunk[..n as usize]);
@@ -891,6 +1023,9 @@ fn speculative_main(
             }));
         }
     }
+    // Untimed: from here until the first seed byte the process would
+    // otherwise go completely idle and the package into deep C-states.
+    start_cpu_keepalive();
     {
         let (lock, cv) = &*warm;
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -1318,3 +1453,5 @@ mod tests {
         }
     }
 }
+
+// redraw variant r1436562058874

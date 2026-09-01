@@ -6513,6 +6513,21 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
+    // The compiled default is 2, not the structural maximum of 4.
+    //
+    // Depth sets how many low-order folds the sparse object survives before it
+    // converts back to dense. Its construction cost grows as 2^(depth+1) —
+    // `cache_len = 1 << (depth + 1)` rows of inverse-local transform per query,
+    // all of it paid before the first message is emitted — while the saving it
+    // buys is one O(1) factorised message per fold it survives. At the ranked
+    // L0 profile the introduction message and the first fold dominate the
+    // sparse object's lifetime, so covering folds 3 and 4 pays for a cache
+    // four times larger than the one those folds consume.
+    //
+    // `SPARSE_DUAL_MAX_DEPTH` stays 4: it is the structural ceiling, fixed by
+    // the `[F128; 32]` backing (`cache_len = 2^(depth+1) <= 32`), and the env
+    // override still reaches it for same-binary A/B.
+    const SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
     let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
         .ok()
         .map(|value| {
@@ -6520,7 +6535,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(SPARSE_DUAL_DEFAULT_DEPTH);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
