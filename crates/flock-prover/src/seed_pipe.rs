@@ -647,7 +647,7 @@ fn rehearse_publish_tail(path: &Path, out: ProveOut) {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
-fn is_ranked_worker() -> bool {
+pub(crate) fn is_ranked_worker() -> bool {
     ranked_worker_proof_path().is_some()
 }
 
