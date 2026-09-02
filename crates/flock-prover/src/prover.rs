@@ -270,10 +270,84 @@ fn commit_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
     }))
 }
 
+/// Distinct physical cores among the first `n` logical CPUs, from
+/// `thread_siblings_list`. Returns `None` if the topology is not readable or
+/// not uniformly SMT — the caller then leaves the global pool alone.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn physical_core_count(n: usize) -> Option<usize> {
+    let mut seen = vec![false; n];
+    let mut cores = 0usize;
+    for c in 0..n {
+        if seen[c] {
+            continue;
+        }
+        let list = std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+        ))
+        .ok()?;
+        cores += 1;
+        // sysfs writes this either as a comma list ("0,8") or as ranges
+        // ("0-1"), and kernels mix the two ("0-1,8-9"). Handle both; a parse
+        // failure returns None and leaves the global pool alone.
+        for part in list.trim().split(',') {
+            let part = part.trim();
+            let (lo, hi) = match part.split_once('-') {
+                Some((a, b)) => (a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?),
+                None => {
+                    let v = part.parse::<usize>().ok()?;
+                    (v, v)
+                }
+            };
+            for id in lo..=hi {
+                if id < n {
+                    seen[id] = true;
+                }
+            }
+        }
+    }
+    (cores > 0).then_some(cores)
+}
+
+/// Zerocheck pool width on the ranked x86 runner.
+///
+/// The zerocheck fold rounds are compute-bound (measured ~5x above their
+/// memory-bandwidth bound) and dominated by 512-bit vector work. On Sapphire
+/// Rapids 512-bit ops issue only on ports 0 and 5, and **those ports are
+/// shared by the two SMT siblings of a physical core** — so a second
+/// hyperthread adds no vector throughput to a port-bound phase, only private
+/// L2 pressure and extra scheduling. Run this phase one thread per physical
+/// core instead of one per logical CPU.
+///
+/// Schedule only: thread count cannot change the result. Field addition is
+/// XOR — associative and commutative — so every accumulation in this phase is
+/// order-independent, which is the same property the existing forced-split
+/// oracle tests already pin down.
+///
+/// `FLOCK_NO_ZC_PHYSICAL_POOL=1` restores the global pool in the same binary.
+/// The ranked worker's cleared environment never sets it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn zerocheck_physical_width(m: usize) -> Option<usize> {
+    if m < 29 || std::env::var_os("FLOCK_NO_ZC_PHYSICAL_POOL").is_some() {
+        return None;
+    }
+    let global = rayon::current_num_threads().max(1);
+    let cores = physical_core_count(global)?;
+    // Only worth a separate pool when the runner is actually SMT-oversubscribed.
+    (cores < global).then_some(cores)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+fn zerocheck_physical_width(_m: usize) -> Option<usize> {
+    None
+}
+
 fn zerocheck_phase_pool(m: usize) -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    let (_, width) = phase_pool_widths(m)?;
+    let width = match zerocheck_physical_width(m) {
+        Some(w) => w,
+        None => phase_pool_widths(m)?.1,
+    };
     Some(POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(width)
