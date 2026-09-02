@@ -152,11 +152,20 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_SHIFT_REDUCE").is_none())
 }
 
-/// `FLOCK_NO_BSTATIC_28=1` keeps block 28 on the incumbent generic kernel.
-/// Ranked env is cleared, so the specialised mixed body runs for blk 28.
+/// Block 28 runs on the incumbent generic kernel by default: the specialised
+/// mixed body (the one `BSTATIC_LIVE[28]` names) measured 0.35% MORE cycles
+/// per prove than the generic loop on the ranked AVX-512 box (same-binary
+/// ABBA `cycles:u`, 5/5 pairs, −0.21..−0.57% with it off) — its fully
+/// unrolled body pays the per-call cost the note below records for the
+/// other mixed blocks. `FLOCK_NO_GENERIC_BLK28=1` restores the specialised
+/// body (same-binary A/B); the ranked worker's cleared env never sets it.
+/// Value-identical either way: both kernels produce the same rows.
 fn bstatic_28_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BSTATIC_28").is_none())
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_GENERIC_BLK28").is_some()
+            && std::env::var_os("FLOCK_NO_BSTATIC_28").is_none()
+    })
 }
 
 /// Blocks whose specialised kernel measured faster than the incumbent on the
