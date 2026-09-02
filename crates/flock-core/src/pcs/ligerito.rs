@@ -6513,6 +6513,13 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
+    // Compiled default 2, not the structural maximum 4. Construction cost is
+    // `cache_len = 1 << (depth + 1)` rows of inverse-local transform per query,
+    // all paid before the first message is emitted, while each covered fold
+    // buys one O(1) factorised message. `SPARSE_DUAL_MAX_DEPTH` stays 4 as the
+    // ceiling fixed by the `[F128; 32]` backing, and the env override still
+    // reaches both arms in one binary.
+    const SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
     let depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH)
         .ok()
         .map(|value| {
@@ -6520,7 +6527,7 @@ fn ranked_sparse_dual_l0_depth(
                 .parse::<usize>()
                 .expect("FLOCK_OPEN_INDUCE_DUAL_DEPTH must be 2, 3, or 4")
         })
-        .unwrap_or(SPARSE_DUAL_MAX_DEPTH);
+        .unwrap_or(SPARSE_DUAL_DEFAULT_DEPTH);
     assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
     Some(depth)
 }
