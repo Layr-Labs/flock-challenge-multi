@@ -43,11 +43,11 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
         let mask3 = _mm512_set1_epi64(0x00000000F0F0F0F0u64 as i64);
 
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<7>(y)), mask1);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<7>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<7>(t));
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<14>(y)), mask2);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<14>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<14>(t));
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<28>(y)), mask3);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<28>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<28>(t));
 
         _mm512_storeu_si512(output.as_mut_ptr() as *mut __m512i, y);
     }
@@ -98,6 +98,18 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
             _mm_storeu_si128(out_ptr.add(c * 16) as *mut __m128i, acc[c]);
         }
     }
+}
+
+/// `FLOCK_NO_URM_KROW_PARALLEL=1` restores the serial Horner accumulation in
+/// the two-image K-row reduction. The default evaluates the identical
+/// polynomial `Σ_k p_k·x^k` as independent scaled terms folded by a balanced
+/// XOR tree: same `vgf2p8mulb` count, but the eight products no longer chain
+/// through seven dependent multiply-XOR steps. Resolved once per process.
+#[allow(dead_code)] // Retained same-binary rollback selector.
+pub(crate) fn urm_krow_parallel_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_URM_KROW_PARALLEL").is_none());
+    *ON
 }
 
 /// `FLOCK_NO_URM_APPLY_2IMG=1` restores the one-image inverse-NTT table
@@ -186,19 +198,23 @@ unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i
     unsafe {
         if nt == 1 {
             let p = out.as_mut_ptr();
-            _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
-            _mm_stream_si128(
-                p.add(16) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<1>(acc),
-            );
-            _mm_stream_si128(
-                p.add(32) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<2>(acc),
-            );
-            _mm_stream_si128(
-                p.add(48) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<3>(acc),
-            );
+            if (p as usize).is_multiple_of(64) {
+                _mm512_stream_si512(p as *mut __m512i, acc);
+            } else {
+                _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
+                _mm_stream_si128(
+                    p.add(16) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<1>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(32) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<2>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(48) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<3>(acc),
+                );
+            }
         } else {
             _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }
@@ -429,6 +445,38 @@ unsafe fn horner_2img_offw<const P: bool>(
     // SAFETY: forwarded from the caller's contract.
     unsafe {
         let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
+        if urm_krow_parallel_enabled() {
+            // Horner from k=7 down to 0 accumulates exactly Σ_k p_k·x^k with
+            // p_k = a_k·b_k and x = 0x02. For k < 8 the scaling never reduces,
+            // so x^k is the literal `1 << k` — the same constants the ranked
+            // residual arms already apply. Evaluating the terms independently
+            // keeps the multiply count identical and folds them in a depth-3
+            // tree instead of a seven-deep multiply-XOR chain.
+            macro_rules! term {
+                ($k:literal) => {{
+                    let av = apply(op.add(offw_krow_words::<P>($k)));
+                    let bv = apply(op.add(64 + offw_krow_words::<P>($k)));
+                    let product = _mm512_gf2p8mul_epi8(av, bv);
+                    if $k == 0 {
+                        product
+                    } else {
+                        _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
+                    }
+                }};
+            }
+            let t0 = term!(0);
+            let t1 = term!(1);
+            let t2 = term!(2);
+            let t3 = term!(3);
+            let t4 = term!(4);
+            let t5 = term!(5);
+            let t6 = term!(6);
+            let t7 = term!(7);
+            return _mm512_xor_si512(
+                _mm512_xor_si512(_mm512_xor_si512(t0, t1), _mm512_xor_si512(t2, t3)),
+                _mm512_xor_si512(_mm512_xor_si512(t4, t5), _mm512_xor_si512(t6, t7)),
+            );
+        }
         let xb = _mm512_set1_epi8(2);
         let mut acc = _mm512_gf2p8mul_epi8(
             apply(op.add(offw_krow_words::<P>(7))),
@@ -935,20 +983,13 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
                     } else {
                         _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
                     };
-                    los[group] = _mm512_xor_si512(
-                        los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
-                    );
-                    his[group] = _mm512_xor_si512(
-                        his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
-                    );
+                    let l0 = lookup8(n0_8, lut.n0_lo[b_med].as_ptr());
+                    let l1 = lookup8(n1_8, lut.n1_lo[b_med].as_ptr());
+                    los[group] = _mm512_ternarylogic_epi64::<0x96>(los[group], l0, l1);
+
+                    let h0 = lookup8(n0_8, lut.n0_hi[b_med].as_ptr());
+                    let h1 = lookup8(n1_8, lut.n1_hi[b_med].as_ptr());
+                    his[group] = _mm512_ternarylogic_epi64::<0x96>(his[group], h0, h1);
                 }
             }
             for group in 0..2 {
