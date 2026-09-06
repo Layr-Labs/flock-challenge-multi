@@ -380,10 +380,7 @@ fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
                 "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
             ))
             .ok()?;
-            let mut ids = Vec::new();
-            for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
-            }
+            let ids = parse_cpu_list(&list, n)?;
             if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
                 return None;
             }
@@ -405,6 +402,39 @@ fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
         Some(pairs)
     });
     P.as_ref()
+}
+
+/// Linux cpulists use both comma-separated IDs and inclusive ranges.
+/// Bound expansion to the selected pool before allocating or indexing.
+#[cfg(target_os = "linux")]
+fn parse_cpu_list(list: &str, cpu_limit: usize) -> Option<Vec<usize>> {
+    let mut ids = Vec::new();
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        let (start, end) = match part.split_once('-') {
+            Some((start, end)) => (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?),
+            None => {
+                let id = part.parse::<usize>().ok()?;
+                (id, id)
+            }
+        };
+        if start > end || end >= cpu_limit || ids.last().is_some_and(|&last| start <= last) {
+            return None;
+        }
+        ids.extend(start..=end);
+    }
+    Some(ids)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn cpu_list_accepts_linux_ranges_and_rejects_invalid_masks() {
+    assert_eq!(parse_cpu_list("0-1\n", 16), Some(vec![0, 1]));
+    assert_eq!(parse_cpu_list("0,8\n", 16), Some(vec![0, 8]));
+    assert_eq!(parse_cpu_list("0-1,8-9", 16), Some(vec![0, 1, 8, 9]));
+    for invalid in ["", "0-", "1-0", "0-2,2", "0,16", "0-999999999", "x", "0-1-2"] {
+        assert_eq!(parse_cpu_list(invalid, 16), None, "{invalid}");
+    }
 }
 
 /// One deep pass at a time may take over the pool. Two overlapping
@@ -436,8 +466,8 @@ impl Drop for DeepSplitClaim {
 }
 
 /// How many finished blocks a butterfly worker may publish before waiting
-/// for its paired hash worker. Eight blocks cover the fused-tail's natural
-/// production burst while keeping the queued payload within the shared L2.
+/// for its paired hash worker. Four blocks limit the queued payload while
+/// retaining producer/consumer overlap in the shared cache.
 /// `FLOCK_NTT_DEEP_SPLIT_DEPTH` overrides it (diagnostics). Read once per
 /// process — never from inside a loop.
 #[cfg(target_os = "linux")]
@@ -521,7 +551,7 @@ unsafe impl Sync for DeepQueue {}
 #[cfg(target_os = "linux")]
 impl DeepQueue {
     const CAP: usize = 64;
-    const DEFAULT_DEPTH: usize = 8;
+    const DEFAULT_DEPTH: usize = 4;
     fn new() -> Self {
         Self {
             slots: (0..Self::CAP)
@@ -4858,7 +4888,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deep_split_depth_default_override_and_clamp() {
-        assert_eq!(select_deep_split_depth(None), 8);
+        assert_eq!(select_deep_split_depth(None), 4);
         assert_eq!(select_deep_split_depth(Some(0)), 1);
         assert_eq!(select_deep_split_depth(Some(1)), 1);
         assert_eq!(select_deep_split_depth(Some(7)), 7);
@@ -4871,11 +4901,11 @@ mod tests {
 
     /// Exercise the ranked depth through enough publications to wrap the
     /// physical ring repeatedly. The consumer waits for the first full
-    /// depth-sized burst, proving that the producer cannot publish a ninth
+    /// depth-sized burst, proving that the producer cannot publish a fifth
     /// block until the consumer advances `tail`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deep_queue_depth_eight_wraps_without_loss_or_reordering() {
+    fn deep_queue_default_depth_wraps_without_loss_or_reordering() {
         use std::sync::atomic::Ordering;
 
         const N: usize = DeepQueue::CAP * 64;
