@@ -970,7 +970,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        let mut parent_count = 0;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -984,12 +984,15 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
                 proof.push(tree[level_start + (p ^ 1)]);
                 i += 1;
             }
-            next.push(p >> 1);
+            // Each parent consumes at least one child, so this write cannot
+            // overwrite an unread child. Reuse the allocation across levels.
+            active[parent_count] = p >> 1;
+            parent_count += 1;
         }
-        // `next` is sorted-unique by construction: the input was sorted-unique;
+        // The parent prefix is sorted-unique: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        active = next;
+        active.truncate(parent_count);
         level_start += level_len;
         level_len >>= 1;
     }
@@ -1019,7 +1022,7 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        let mut parent_count = 0;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -1030,9 +1033,11 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
                 indices.push(level_start + (p ^ 1));
                 i += 1;
             }
-            next.push(p >> 1);
+            // Writes stay behind the read cursor, including sibling pairs.
+            active[parent_count] = p >> 1;
+            parent_count += 1;
         }
-        active = next;
+        active.truncate(parent_count);
         level_start += level_len;
         level_len >>= 1;
     }
