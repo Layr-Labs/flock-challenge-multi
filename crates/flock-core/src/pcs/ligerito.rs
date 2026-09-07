@@ -6475,7 +6475,15 @@ const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
 const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
-const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
+/// Disable-only rollback for the L0 default depth-3 sparse dual. Setting it
+/// restores the prior tip default of depth 2 while leaving the explicit
+/// `FLOCK_OPEN_INDUCE_DUAL_DEPTH` override and the depth2→MAX kill intact.
+const ENV_NO_OPEN_INDUCE_DUAL_DEPTH3: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH3";
+/// Tip historically shipped L0 at depth 2; depth 4 was measured as a −1.15%
+/// regression. Depth 3 is the unmeasured intermediate (also L4's live depth).
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 3;
+/// Prior tip L0 default, restored by [`ENV_NO_OPEN_INDUCE_DUAL_DEPTH3`].
+const RANKED_SPARSE_DUAL_TIP_DEPTH: usize = 2;
 /// Disable-only, default-ON rollback for the L1..L4 extension of the sparse
 /// dual. Setting it restores the incumbent dense/NTT induce at every
 /// recursive level while leaving L0's dual exactly as it is, so the two arms
@@ -6612,6 +6620,7 @@ fn ranked_sparse_dual_l0_depth_selected(
 fn ranked_sparse_dual_l0_depth_setting(
     explicit_depth: Option<&str>,
     depth2_disabled: bool,
+    depth3_disabled: bool,
 ) -> usize {
     let depth = explicit_depth
         .map(|value| {
@@ -6621,6 +6630,8 @@ fn ranked_sparse_dual_l0_depth_setting(
         })
         .unwrap_or(if depth2_disabled {
             SPARSE_DUAL_MAX_DEPTH
+        } else if depth3_disabled {
+            RANKED_SPARSE_DUAL_TIP_DEPTH
         } else {
             RANKED_SPARSE_DUAL_DEFAULT_DEPTH
         });
@@ -6678,6 +6689,7 @@ fn ranked_sparse_dual_l0_depth(
     let depth = ranked_sparse_dual_l0_depth_setting(
         explicit_depth.as_deref(),
         std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH3).is_some(),
     );
     Some(depth)
 }
@@ -6695,8 +6707,8 @@ fn ranked_sparse_dual_l0_depth(
 /// ```text
 ///   level          L0   L1   L2   L3   L4
 ///   first fold      0    3    6    9   12
-///   depth           4    4    4    4    3
-///   materializes    3    6    9   12   14
+///   depth           3    4    4    4    3
+///   materializes    2    6    9   12   14
 /// ```
 ///
 /// The five materialization folds are pairwise distinct, which is exactly what
@@ -12888,18 +12900,27 @@ mod tests {
 
     #[test]
     fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
-        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
-        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
+        // Default is depth 3; DEPTH2 kill → MAX; DEPTH3 kill → tip depth 2.
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false, false), 3);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true, false), 4);
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false, true), 2);
+        // DEPTH2 kill wins over DEPTH3 kill when both are set.
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true, true), 4);
         for depth in 1..=4 {
             let value = depth.to_string();
             assert_eq!(
-                ranked_sparse_dual_l0_depth_setting(Some(&value), false),
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false, false),
                 depth
             );
             assert_eq!(
-                ranked_sparse_dual_l0_depth_setting(Some(&value), true),
+                ranked_sparse_dual_l0_depth_setting(Some(&value), true, false),
                 depth,
                 "explicit depth must override the depth2 rollback"
+            );
+            assert_eq!(
+                ranked_sparse_dual_l0_depth_setting(Some(&value), false, true),
+                depth,
+                "explicit depth must override the depth3 tip rollback"
             );
         }
     }
