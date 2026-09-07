@@ -6475,7 +6475,7 @@ const ENV_NO_OPEN_INDUCE_DUAL: &str = "FLOCK_NO_OPEN_INDUCE_DUAL";
 const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
 const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
-const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
+const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 4;
 /// Disable-only, default-ON rollback for the L1..L4 extension of the sparse
 /// dual. Setting it restores the incumbent dense/NTT induce at every
 /// recursive level while leaving L0's dual exactly as it is, so the two arms
