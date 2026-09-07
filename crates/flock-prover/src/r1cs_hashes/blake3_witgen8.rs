@@ -633,6 +633,25 @@ fn ranked_b_constwin_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_WITGEN_RANKED_CLOSED_DRAIN_CONST=1` restores the single runtime
+/// `2..=29` arm in [`WitnessAbStreamProducer::drain_range_spread_ranked_closed_exact`].
+/// Default ON: each window monomorphizes a const-`BLK` direct-inline leaf so the
+/// drain match no longer carries a runtime block index into the hot publisher.
+#[inline(always)]
+fn ranked_closed_drain_const_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_RANKED_CLOSED_DRAIN_CONST").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
+}
+
 /// Widen one side's eight transposed rows into the offset arena, in the
 /// byte-order layout (`P = false`, [`widen_off_line`]) or the parity split
 /// (`P = true`, [`widen_off_line_parity`]); `c` is only read by the latter.
@@ -844,6 +863,143 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
                 plan,
                 imgs,
             );
+            j += 1;
+        }
+    }
+}
+
+/// Drain-site const-`BLK` leaf for ranked-closed windows `2..=29`.
+///
+/// Same bytes and publication schedule as
+/// [`project_blocks_ranked_hot_offsets_direct_inline`], but the block index is a
+/// const generic so residual KEEP literals, B-complement const leaves, and the
+/// `BLK * 64` output offset all const-fold at the drain match instead of
+/// surviving as a runtime `blk` through the shared inline publisher.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_const<
+    const BLK: usize,
+    const P: bool,
+>(
+    proj: &StreamProj<'_>,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    a_ring: *const V8,
+    b_ring: *const V8,
+    rw: usize,
+    off: *mut u16,
+    c: WidenConsts,
+) {
+    unsafe {
+        const { assert!(BLK >= 2 && BLK <= 29); }
+        let a_rows = tr8x16_zmm(a_ring, rw);
+        widen_ranked_dense_rows::<P>(&a_rows, off, c);
+        let b_rows = tr8x16_zmm(b_ring, rw);
+        widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+
+        if proj.one_rows_elided && BLK == 2 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0xfc,
+                );
+                j += 1;
+            }
+            return;
+        }
+        if proj.one_rows_elided && BLK == 29 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0x0f,
+                );
+                j += 1;
+            }
+            return;
+        }
+
+        if plan.bcomplement_static_eligible() && ranked_b_constwin_enabled() {
+            match BLK {
+                3 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                4 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                5 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                6 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                7 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                8 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                9 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                10 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<10, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                11 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<11, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                12 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<12, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                13 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<13, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                14 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<14, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                15 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<15, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                16 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<16, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                17 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<17, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                18 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<18, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                19 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<19, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                20 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<20, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                21 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<21, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                22 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<22, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                23 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<23, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                24 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<24, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                25 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<25, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                26 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<26, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                27 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<27, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                28 => return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<28, P>(proj, plan, imgs, rows, &a_rows, &b_rows, off),
+                _ => {}
+            }
+        }
+
+        let mut j = 0usize;
+        while j != 8 {
+            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+            let out = &mut *proj
+                .out
+                .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast::<[u8; 64]>();
+            if plan.bcomplement_static_eligible() {
+                round1_ab_inner_window_from_offsets_nt2_bcomplement_static::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    BLK,
+                );
+            } else {
+                round1_ab_inner_window_from_offsets_nt2::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                );
+            }
             j += 1;
         }
     }
@@ -1898,18 +2054,52 @@ impl Drain8<'_> {
                         let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let (plan, imgs) = preps[blk];
-                        project_blocks_ranked_hot_offsets_direct_inline::<true>(
-                            proj,
-                            blk,
-                            plan,
-                            imgs,
-                            rows,
-                            self.ast,
-                            self.bs,
-                            rw,
-                            op,
-                            wc,
-                        );
+                        if ranked_closed_drain_const_enabled() {
+                            match blk {
+                            2 => project_blocks_ranked_hot_offsets_direct_inline_const::<2, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            3 => project_blocks_ranked_hot_offsets_direct_inline_const::<3, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            4 => project_blocks_ranked_hot_offsets_direct_inline_const::<4, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            5 => project_blocks_ranked_hot_offsets_direct_inline_const::<5, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            6 => project_blocks_ranked_hot_offsets_direct_inline_const::<6, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            7 => project_blocks_ranked_hot_offsets_direct_inline_const::<7, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            8 => project_blocks_ranked_hot_offsets_direct_inline_const::<8, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            9 => project_blocks_ranked_hot_offsets_direct_inline_const::<9, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            10 => project_blocks_ranked_hot_offsets_direct_inline_const::<10, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            11 => project_blocks_ranked_hot_offsets_direct_inline_const::<11, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            12 => project_blocks_ranked_hot_offsets_direct_inline_const::<12, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            13 => project_blocks_ranked_hot_offsets_direct_inline_const::<13, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            14 => project_blocks_ranked_hot_offsets_direct_inline_const::<14, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            15 => project_blocks_ranked_hot_offsets_direct_inline_const::<15, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            16 => project_blocks_ranked_hot_offsets_direct_inline_const::<16, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            17 => project_blocks_ranked_hot_offsets_direct_inline_const::<17, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            18 => project_blocks_ranked_hot_offsets_direct_inline_const::<18, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            19 => project_blocks_ranked_hot_offsets_direct_inline_const::<19, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            20 => project_blocks_ranked_hot_offsets_direct_inline_const::<20, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            21 => project_blocks_ranked_hot_offsets_direct_inline_const::<21, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            22 => project_blocks_ranked_hot_offsets_direct_inline_const::<22, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            23 => project_blocks_ranked_hot_offsets_direct_inline_const::<23, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            24 => project_blocks_ranked_hot_offsets_direct_inline_const::<24, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            25 => project_blocks_ranked_hot_offsets_direct_inline_const::<25, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            26 => project_blocks_ranked_hot_offsets_direct_inline_const::<26, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            27 => project_blocks_ranked_hot_offsets_direct_inline_const::<27, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            28 => project_blocks_ranked_hot_offsets_direct_inline_const::<28, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                            29 => project_blocks_ranked_hot_offsets_direct_inline_const::<29, true>(proj, plan, imgs, rows, self.ast, self.bs, rw, op, wc),
+                                _ => unreachable!("unexpected ranked closed dense window {blk}"),
+                            }
+                        } else {
+                            project_blocks_ranked_hot_offsets_direct_inline::<true>(
+                                proj,
+                                blk,
+                                plan,
+                                imgs,
+                                rows,
+                                self.ast,
+                                self.bs,
+                                rw,
+                                op,
+                                wc,
+                            );
+                        }
                     }
                     _ => unreachable!("unexpected ranked closed window {blk}"),
                 }
