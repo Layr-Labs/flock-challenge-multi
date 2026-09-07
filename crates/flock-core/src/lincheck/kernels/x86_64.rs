@@ -493,24 +493,56 @@ pub(crate) unsafe fn gfni_fold_tile(
 pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) {
     use core::arch::x86_64::*;
     debug_assert_eq!(len % 64, 0);
+    // Tip default: Amal-David 256-byte aligned four-ZMM unroll when both
+    // pointers are 64B-aligned; unaligned callers keep the tip two-ZMM
+    // `loadu`/`storeu` schedule. `FLOCK_NO_LINCHECK_XOR256=1` restores tip's
+    // unaligned-only two-ZMM path for every call.
+    static XOR256_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_XOR256").is_none());
     // SAFETY: caller guarantees `len` bytes at both pointers and 64-byte steps.
     unsafe {
         let mut i = 0;
-        // Two-ZMM unroll matches the Linux `xor_avx512_2` RAID xor_gen kernel
-        // (load pair / vpxor pair / store pair). Odd 64-byte tail is one more.
-        while i + 128 <= len {
-            let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
-            let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
-            let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
-            let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
-            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
-            _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
-            i += 128;
-        }
-        if i < len {
-            let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
-            let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
-            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+        let dst_aligned = (dst as usize).is_multiple_of(64);
+        let src_aligned = (src as usize).is_multiple_of(64);
+        if *XOR256_ON && dst_aligned && src_aligned {
+            while i + 256 <= len {
+                let a0 = _mm512_load_si512(dst.add(i) as *const __m512i);
+                let a1 = _mm512_load_si512(dst.add(i + 64) as *const __m512i);
+                let a2 = _mm512_load_si512(dst.add(i + 128) as *const __m512i);
+                let a3 = _mm512_load_si512(dst.add(i + 192) as *const __m512i);
+                let b0 = _mm512_load_si512(src.add(i) as *const __m512i);
+                let b1 = _mm512_load_si512(src.add(i + 64) as *const __m512i);
+                let b2 = _mm512_load_si512(src.add(i + 128) as *const __m512i);
+                let b3 = _mm512_load_si512(src.add(i + 192) as *const __m512i);
+                _mm512_store_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+                _mm512_store_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+                _mm512_store_si512(dst.add(i + 128) as *mut __m512i, _mm512_xor_si512(a2, b2));
+                _mm512_store_si512(dst.add(i + 192) as *mut __m512i, _mm512_xor_si512(a3, b3));
+                i += 256;
+            }
+            while i < len {
+                let a = _mm512_load_si512(dst.add(i) as *const __m512i);
+                let b = _mm512_load_si512(src.add(i) as *const __m512i);
+                _mm512_store_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                i += 64;
+            }
+        } else {
+            // Two-ZMM unroll matches the Linux `xor_avx512_2` RAID xor_gen kernel
+            // (load pair / vpxor pair / store pair). Odd 64-byte tail is one more.
+            while i + 128 <= len {
+                let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+                let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
+                let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
+                let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
+                _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+                _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+                i += 128;
+            }
+            if i < len {
+                let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+                let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
+                _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+            }
         }
     }
 }
