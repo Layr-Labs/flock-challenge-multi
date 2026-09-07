@@ -43,11 +43,11 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
         let mask3 = _mm512_set1_epi64(0x00000000F0F0F0F0u64 as i64);
 
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<7>(y)), mask1);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<7>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<7>(t));
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<14>(y)), mask2);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<14>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<14>(t));
         let t = _mm512_and_si512(_mm512_xor_si512(y, _mm512_srli_epi64::<28>(y)), mask3);
-        y = _mm512_xor_si512(y, _mm512_xor_si512(t, _mm512_slli_epi64::<28>(t)));
+        y = _mm512_ternarylogic_epi64::<0x96>(y, t, _mm512_slli_epi64::<28>(t));
 
         _mm512_storeu_si512(output.as_mut_ptr() as *mut __m512i, y);
     }
@@ -186,19 +186,23 @@ unsafe fn store_out64_split(out: &mut [u8; 64], acc: core::arch::x86_64::__m512i
     unsafe {
         if nt == 1 {
             let p = out.as_mut_ptr();
-            _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
-            _mm_stream_si128(
-                p.add(16) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<1>(acc),
-            );
-            _mm_stream_si128(
-                p.add(32) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<2>(acc),
-            );
-            _mm_stream_si128(
-                p.add(48) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<3>(acc),
-            );
+            if (p as usize).is_multiple_of(64) {
+                _mm512_stream_si512(p as *mut __m512i, acc);
+            } else {
+                _mm_stream_si128(p as *mut __m128i, _mm512_extracti32x4_epi32::<0>(acc));
+                _mm_stream_si128(
+                    p.add(16) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<1>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(32) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<2>(acc),
+                );
+                _mm_stream_si128(
+                    p.add(48) as *mut __m128i,
+                    _mm512_extracti32x4_epi32::<3>(acc),
+                );
+            }
         } else {
             _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
         }
@@ -935,20 +939,13 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512_nibble(
                     } else {
                         _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(n1))
                     };
-                    los[group] = _mm512_xor_si512(
-                        los[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_lo[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_lo[b_med].as_ptr()),
-                        ),
-                    );
-                    his[group] = _mm512_xor_si512(
-                        his[group],
-                        _mm512_xor_si512(
-                            lookup8(n0_8, lut.n0_hi[b_med].as_ptr()),
-                            lookup8(n1_8, lut.n1_hi[b_med].as_ptr()),
-                        ),
-                    );
+                    let l0 = lookup8(n0_8, lut.n0_lo[b_med].as_ptr());
+                    let l1 = lookup8(n1_8, lut.n1_lo[b_med].as_ptr());
+                    los[group] = _mm512_ternarylogic_epi64::<0x96>(los[group], l0, l1);
+
+                    let h0 = lookup8(n0_8, lut.n0_hi[b_med].as_ptr());
+                    let h1 = lookup8(n1_8, lut.n1_hi[b_med].as_ptr());
+                    his[group] = _mm512_ternarylogic_epi64::<0x96>(his[group], h0, h1);
                 }
             }
             for group in 0..2 {
