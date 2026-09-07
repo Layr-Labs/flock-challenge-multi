@@ -122,19 +122,45 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
         );
 
     // One transpose back to F128 columns at the very end.
+    // Default: parallelise across independent 64-column blocks (Amal-David
+    // lincheck H4). `FLOCK_NO_LINCHECK_PAR_TRANSPOSE=1` restores the tip
+    // serial loop bit-for-bit aside from the OnceLock check.
     let mut out = vec![F128::ZERO; k];
-    for b in 0..k / 64 {
-        let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+    fn par_transpose_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LINCHECK_PAR_TRANSPOSE").is_none())
+    }
+    if par_transpose_enabled() {
+        out.par_chunks_exact_mut(64)
+            .enumerate()
+            .for_each(|(b, out_chunk)| {
+                let base = b * 1024;
+                for col in 0..64 {
+                    let mut lo = 0u64;
+                    let mut hi = 0u64;
+                    for byte in 0..8 {
+                        lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                    }
+                    for byte in 8..16 {
+                        hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                    }
+                    out_chunk[col] = F128 { lo, hi };
+                }
+            });
+    } else {
+        for b in 0..k / 64 {
+            let base = b * 1024;
+            for col in 0..64 {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                out[b * 64 + col] = F128 { lo, hi };
             }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            out[b * 64 + col] = F128 { lo, hi };
         }
     }
     out
