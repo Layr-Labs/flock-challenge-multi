@@ -121,22 +121,24 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
             },
         );
 
-    // One transpose back to F128 columns at the very end.
+    // One transpose back to F128 columns at the very end (parallelised across 64-column blocks).
     let mut out = vec![F128::ZERO; k];
-    for b in 0..k / 64 {
-        let base = b * 1024;
-        for col in 0..64 {
-            let mut lo = 0u64;
-            let mut hi = 0u64;
-            for byte in 0..8 {
-                lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+    out.par_chunks_exact_mut(64)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let base = b * 1024;
+            for col in 0..64 {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for byte in 0..8 {
+                    lo |= (planes[base + byte * 64 + col] as u64) << (8 * byte);
+                }
+                for byte in 8..16 {
+                    hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
+                }
+                out_chunk[col] = F128 { lo, hi };
             }
-            for byte in 8..16 {
-                hi |= (planes[base + byte * 64 + col] as u64) << (8 * (byte - 8));
-            }
-            out[b * 64 + col] = F128 { lo, hi };
-        }
-    }
+        });
     out
 }
 
@@ -493,24 +495,47 @@ pub(crate) unsafe fn gfni_fold_tile(
 pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) {
     use core::arch::x86_64::*;
     debug_assert_eq!(len % 64, 0);
-    // SAFETY: caller guarantees `len` bytes at both pointers and 64-byte steps.
     unsafe {
         let mut i = 0;
-        // Two-ZMM unroll matches the Linux `xor_avx512_2` RAID xor_gen kernel
-        // (load pair / vpxor pair / store pair). Odd 64-byte tail is one more.
-        while i + 128 <= len {
-            let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
-            let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
-            let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
-            let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
-            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
-            _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
-            i += 128;
-        }
-        if i < len {
-            let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
-            let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
-            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+        let dst_aligned = (dst as usize).is_multiple_of(64);
+        let src_aligned = (src as usize).is_multiple_of(64);
+        if dst_aligned && src_aligned {
+            while i + 256 <= len {
+                let a0 = _mm512_load_si512(dst.add(i) as *const __m512i);
+                let a1 = _mm512_load_si512(dst.add(i + 64) as *const __m512i);
+                let a2 = _mm512_load_si512(dst.add(i + 128) as *const __m512i);
+                let a3 = _mm512_load_si512(dst.add(i + 192) as *const __m512i);
+                let b0 = _mm512_load_si512(src.add(i) as *const __m512i);
+                let b1 = _mm512_load_si512(src.add(i + 64) as *const __m512i);
+                let b2 = _mm512_load_si512(src.add(i + 128) as *const __m512i);
+                let b3 = _mm512_load_si512(src.add(i + 192) as *const __m512i);
+                _mm512_store_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+                _mm512_store_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+                _mm512_store_si512(dst.add(i + 128) as *mut __m512i, _mm512_xor_si512(a2, b2));
+                _mm512_store_si512(dst.add(i + 192) as *mut __m512i, _mm512_xor_si512(a3, b3));
+                i += 256;
+            }
+            while i < len {
+                let a = _mm512_load_si512(dst.add(i) as *const __m512i);
+                let b = _mm512_load_si512(src.add(i) as *const __m512i);
+                _mm512_store_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                i += 64;
+            }
+        } else {
+            while i + 128 <= len {
+                let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+                let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
+                let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
+                let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
+                _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+                _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+                i += 128;
+            }
+            if i < len {
+                let a = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+                let b = _mm512_loadu_si512(src.add(i) as *const __m512i);
+                _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+            }
         }
     }
 }

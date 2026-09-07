@@ -505,14 +505,18 @@ mod tests {
                     horner::<false>(pw, &mut got_w.0, 0, imgs),
                     horner::<true>(pp, &mut got_p.0, 0, imgs)
                 );
-                for keep in [0xfcu8, 0x0f] {
-                    check!(
-                        "residual",
-                        blk,
-                        residual::<false>(pw, &mut got_w.0, imgs, keep),
-                        residual::<true>(pp, &mut got_p.0, imgs, keep)
-                    );
-                }
+                check!(
+                    "residual",
+                    blk,
+                    residual::<false, 0xfc>(pw, &mut got_w.0, imgs),
+                    residual::<true, 0xfc>(pp, &mut got_p.0, imgs)
+                );
+                check!(
+                    "residual",
+                    blk,
+                    residual::<false, 0x0f>(pw, &mut got_w.0, imgs),
+                    residual::<true, 0x0f>(pp, &mut got_p.0, imgs)
+                );
                 check!(
                     "bcomplement runtime",
                     blk,

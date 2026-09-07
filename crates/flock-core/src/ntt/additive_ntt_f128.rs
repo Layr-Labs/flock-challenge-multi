@@ -294,6 +294,28 @@ fn ntt_seed_odd_tail_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_ODD_TAIL").is_some())
 }
 
+/// `FLOCK_NO_NTT_ODD_GATHER=1` restores full-width gather/scatter of odd rows
+/// in the fused top passes. By default, when `odd_tail != 0`, only the active
+/// prefix (`row_lanes`) is copied — the published zero tail need not
+/// round-trip through staging (butterflies already stop at the same bound).
+/// Ranked clears env so default-on ships.
+#[inline]
+fn ntt_odd_gather_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_ODD_GATHER").is_some())
+}
+
+/// Lane count to gather/scatter for row `r`: full width when the kill switch
+/// is set, otherwise the same active bound butterflies already use.
+#[inline]
+fn odd_gather_lanes(r: usize, num_ntts: usize, odd_tail: usize) -> usize {
+    if ntt_odd_gather_disabled() {
+        num_ntts
+    } else {
+        row_lanes(r, num_ntts, odd_tail)
+    }
+}
+
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
 #[cfg(test)]
 static SEED_TOP_FUSION_TEST_OFF: std::sync::atomic::AtomicBool =
@@ -718,8 +740,9 @@ fn staging_init_mode() -> StagingInit {
 ///
 /// - [`AdditiveNttF128::top_fused6_pass`] opens each task with a *gather*:
 ///   `for k in 0..64 { copy_nonoverlapping(row_ptr(k), buf + k·row_len,
-///   row_len) }`. That is 64 rows × `row_len` lanes = the entire block, copied
-///   from `data`, before the first butterfly touches it.
+///   odd_gather_lanes(...)) }`. Even rows copy the full width; odd rows under
+///   a live `odd_tail` omit the published zero suffix (butterflies never read
+///   it). That fills every staging element that can later be read.
 /// - [`AdditiveNttF128::seed_top_fused8_pass`] opens each task with the *seed*:
 ///   for `k ∈ 0..64` it calls `butterfly_fused_2layer_row_from_sparse_geo` with
 ///   `dst = buf + k·row_len, dst_quarter = 64, dst_r = 0`, and
@@ -2185,7 +2208,10 @@ impl AdditiveNttF128 {
     /// stride is a multiple of `S`, so the lane bound is `row_lanes(r, …)`
     /// under the same even-stride guards the incumbent sweeps use
     /// (`4S` even for the fused-four rows, `S` even for the fused-two quads).
-    /// Rows are copied whole, so the (zero) tail lanes round-trip unchanged.
+    /// Odd-row gather/scatter copies only `odd_gather_lanes` when the
+    /// odd-tail bound is live; the (zero) tail stays in place and need
+    /// not round-trip through staging. `FLOCK_NO_NTT_ODD_GATHER=1`
+    /// restores full-width copies.
     fn top_fused6_pass(
         &self,
         data: &mut [F128],
@@ -2250,11 +2276,13 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 let row_ptr = |k: usize| base.add(block_start + (r + k * sub_stride) * row_len);
                 // Gather: 64 rows → contiguous staging rows k·num_ntts.
+                // Odd rows skip the published zero tail (see odd_gather_lanes).
                 for k in 0..64 {
+                    let copy_n = odd_gather_lanes(r + k * sub_stride, row_len, odd_tail);
                     core::ptr::copy_nonoverlapping(
                         row_ptr(k),
                         buf.as_mut_ptr().add(k * row_len),
-                        row_len,
+                        copy_n,
                     );
                 }
                 // Layers layer..layer+4: fused-four on rows {4i + j}, i.e.
@@ -2286,12 +2314,13 @@ impl AdditiveNttF128 {
                     let d = std::slice::from_raw_parts_mut(p.add(3 * row_len), lanes2);
                     kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
                 }
-                // Scatter back.
+                // Scatter back (odd rows omit the zero tail).
                 for k in 0..64 {
+                    let copy_n = odd_gather_lanes(r + k * sub_stride, row_len, odd_tail);
                     core::ptr::copy_nonoverlapping(
                         buf.as_ptr().add(k * row_len),
                         row_ptr(k),
-                        row_len,
+                        copy_n,
                     );
                 }
             }
@@ -2946,10 +2975,12 @@ impl AdditiveNttF128 {
                 if publish_nt {
                     for block in 0..8 {
                         for k in 0..64 {
+                            let r_s = r + k * sub_stride;
+                            let copy_n = odd_gather_lanes(r_s, row_len, odd_tail);
                             Self::publish_row_nt(
                                 bufp.add((block * 64 + perm(k)) * row_len),
-                                base.add(block * block_bytes + (r + k * sub_stride) * row_len),
-                                row_len,
+                                base.add(block * block_bytes + r_s * row_len),
+                                copy_n,
                             );
                         }
                     }
@@ -2960,10 +2991,12 @@ impl AdditiveNttF128 {
                 }
                 for block in 0..8 {
                     for k in 0..64 {
+                        let r_s = r + k * sub_stride;
+                        let copy_n = odd_gather_lanes(r_s, row_len, odd_tail);
                         core::ptr::copy_nonoverlapping(
                             bufp.add((block * 64 + perm(k)) * row_len),
-                            base.add(block * block_bytes + (r + k * sub_stride) * row_len),
-                            row_len,
+                            base.add(block * block_bytes + r_s * row_len),
+                            copy_n,
                         );
                     }
                 }
