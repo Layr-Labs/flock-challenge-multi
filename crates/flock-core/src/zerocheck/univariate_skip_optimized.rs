@@ -1489,19 +1489,18 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
 }
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
-/// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
+/// `KEEP` is the const-generic mask: `0xfc` for block 2 and `0x0f` for block 29.
 #[inline(always)]
 #[allow(unused_variables)]
-pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool, const KEEP: u8>(
     off: &[u16; ROUND1_AB_OFF_WORDS],
     out: &mut [u8; 64],
     plan: Round1AbWindowPlan,
     imgs: Round1AbTableImages,
-    keep: u8,
 ) {
     debug_assert_eq!(plan.nt, 2);
     debug_assert_eq!(out.as_ptr() as usize & 63, 0);
-    debug_assert!(keep == 0xfc || keep == 0x0f);
+    debug_assert!(KEEP == 0xfc || KEEP == 0x0f);
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "gfni",
@@ -1509,11 +1508,10 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P, KEEP>(
             off.as_ptr(),
             out,
             (imgs.0, imgs.1),
-            keep,
         );
     }
     #[cfg(not(all(

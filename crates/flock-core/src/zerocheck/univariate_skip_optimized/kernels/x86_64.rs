@@ -381,18 +381,19 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2<const P: bool
     target_feature = "avx512f",
     target_feature = "avx512bw"
 ))]
-pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<const P: bool>(
+pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual<const P: bool, const KEEP: u8>(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
-    keep: u8,
 ) {
     use core::arch::x86_64::*;
     unsafe {
-        let acc = match keep {
-            0xfc => residual_2img_offw_k2_7::<P>(imgs, op),
-            0x0f => residual_2img_offw_k0_3::<P>(imgs, op),
-            _ => core::hint::unreachable_unchecked(),
+        let acc = if KEEP == 0xfc {
+            residual_2img_offw_k2_7::<P>(imgs, op)
+        } else if KEEP == 0x0f {
+            residual_2img_offw_k0_3::<P>(imgs, op)
+        } else {
+            core::hint::unreachable_unchecked()
         };
         _mm512_stream_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }

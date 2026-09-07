@@ -710,14 +710,13 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     .out
                     .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                round1_ab_inner_window_from_offsets_nt2_residual::<P, 0xfc>(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
                         .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
                     out,
                     plan,
                     imgs,
-                    0xfc,
                 );
                 j += 1;
             }
@@ -731,14 +730,13 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     .out
                     .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                round1_ab_inner_window_from_offsets_nt2_residual::<P, 0x0f>(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
                         .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
                     out,
                     plan,
                     imgs,
-                    0x0f,
                 );
                 j += 1;
             }
@@ -1129,7 +1127,7 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
                 let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                round1_ab_inner_window_from_offsets_nt2_residual::<P, KEEP>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
             }
         }
@@ -1145,7 +1143,7 @@ impl StreamProj<'_> {
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
                 let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
+                round1_ab_inner_window_from_offsets_nt2_residual::<P, KEEP>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
             }
         }
@@ -3190,16 +3188,22 @@ mod tests {
                         nt2::<false>(w, &mut out_w.0, plan, imgs),
                         nt2::<true>(p, &mut out_p.0, plan, imgs)
                     );
-                    for keep in [0xfcu8, 0x0f] {
-                        check!(
-                            "residual",
-                            case,
-                            j,
-                            keep,
-                            residual::<false>(w, &mut out_w.0, plan, imgs, keep),
-                            residual::<true>(p, &mut out_p.0, plan, imgs, keep)
-                        );
-                    }
+                    check!(
+                        "residual",
+                        case,
+                        j,
+                        0xfc,
+                        residual::<false, 0xfc>(w, &mut out_w.0, plan, imgs),
+                        residual::<true, 0xfc>(p, &mut out_p.0, plan, imgs)
+                    );
+                    check!(
+                        "residual",
+                        case,
+                        j,
+                        0x0f,
+                        residual::<false, 0x0f>(w, &mut out_w.0, plan, imgs),
+                        residual::<true, 0x0f>(p, &mut out_p.0, plan, imgs)
+                    );
                     if plan.bcomplement_static_eligible() {
                         for blk in 2..=29usize {
                             check!(
