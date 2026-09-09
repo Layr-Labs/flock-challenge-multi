@@ -1782,6 +1782,18 @@ impl RankedRows {
         }
     }
 
+    /// Static-B ranked windows 0/1, sourced from the live transposed row.
+    /// B's retained all-one line makes z == a; no staging buffer is needed.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_static_values(&self, j: usize, av: __m512i) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            stream_ranked_line(self.z.add(o), av);
+            stream_ranked_line(self.a.add(o), av);
+        }
+    }
+
     /// Sparse ranked window 30: only its first qword is live; publish the
     /// complete line with the other seven qwords zeroed in the load itself.
     #[inline(always)]
@@ -1843,35 +1855,16 @@ impl Drain8<'_> {
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
                 match blk {
-                    0 => {
-                        let (sa, _) = proj.sides();
-                        let a_lo = tr8_chunk(self.ast, rw);
-                        let a_hi = tr8_chunk(self.ast, rw + 8);
-                        for r in 0..8 {
-                            let p = sa.add(r * STEP_WORDS);
-                            store_v8(p, a_lo[r]);
-                            store_v8(p.add(8), a_hi[r]);
-                        }
+                    0 | 1 => {
+                        // B is a provenance-checked all-one line in these
+                        // windows, and their AB projections are elided.
+                        // Keep A's transposed rows live until both identical
+                        // A/Z stores instead of staging and reloading them.
+                        let a_rows = tr8x16_zmm(self.ast, rw);
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let mut j = 0usize;
                         while j != 8 {
-                            rows.publish_static::<0>(j, sa);
-                            j += 1;
-                        }
-                    }
-                    1 => {
-                        let (sa, _) = proj.sides();
-                        let a_lo = tr8_chunk(self.ast, rw);
-                        let a_hi = tr8_chunk(self.ast, rw + 8);
-                        for r in 0..8 {
-                            let p = sa.add(r * STEP_WORDS);
-                            store_v8(p, a_lo[r]);
-                            store_v8(p.add(8), a_hi[r]);
-                        }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                        let mut j = 0usize;
-                        while j != 8 {
-                            rows.publish_static::<1>(j, sa);
+                            rows.publish_static_values(j, a_rows[j]);
                             j += 1;
                         }
                     }
@@ -2912,6 +2905,84 @@ mod tests {
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
                 let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
                 assert_eq!(got, expected, "block {block}");
+            }
+        }
+    }
+
+    /// Static windows retain B and publish the same A/Z bytes as the
+    /// scalar-staged incumbent. Sentinels also check every untouched lane.
+    #[cfg(target_feature = "avx512f")]
+    #[test]
+    fn ranked_static_values_match_staged_path() {
+        #[repr(C, align(64))]
+        struct Input([[u32; 8]; RING_WORDS]);
+        #[repr(C, align(64))]
+        struct Stage([u32; 8 * STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct RankedBuf([u32; 8 * U32_PER_BLOCK]);
+        const SENTINEL: u32 = 0xD39A_7E51;
+
+        unsafe {
+            for case in 0..4usize {
+                let input = Input(core::array::from_fn(|word| {
+                    core::array::from_fn(|block| match case {
+                        0 => 0,
+                        1 => u32::MAX,
+                        2 => ((word as u32) << 16) | block as u32,
+                        _ => (word as u32)
+                            .wrapping_mul(0x9E37_79B9)
+                            .rotate_left(block as u32)
+                            ^ (block as u32).wrapping_mul(0xA5A5_0101),
+                    })
+                }));
+                for blk in 0..2usize {
+                    let word_offset = blk * STEP_WORDS;
+                    let stage = Stage(core::array::from_fn(|i| {
+                        input.0[word_offset + i % STEP_WORDS][i / STEP_WORDS]
+                    }));
+                    let av = tr8x16_zmm(input.0.as_ptr().cast::<V8>(), word_offset);
+                    let mut staged_z = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let mut staged_a = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let mut staged_b = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let mut direct_z = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let mut direct_a = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let mut direct_b = RankedBuf([SENTINEL; 8 * U32_PER_BLOCK]);
+                    let staged_rows = RankedRows::new(
+                        staged_z.0.as_mut_ptr().add(word_offset),
+                        staged_a.0.as_mut_ptr().add(word_offset),
+                        staged_b.0.as_mut_ptr().add(word_offset),
+                    );
+                    let direct_rows = RankedRows::new(
+                        direct_z.0.as_mut_ptr().add(word_offset),
+                        direct_a.0.as_mut_ptr().add(word_offset),
+                        direct_b.0.as_mut_ptr().add(word_offset),
+                    );
+                    for j in 0..8 {
+                        if blk == 0 {
+                            staged_rows.publish_static::<0>(j, stage.0.as_ptr());
+                        } else {
+                            staged_rows.publish_static::<1>(j, stage.0.as_ptr());
+                        }
+                        direct_rows.publish_static_values(j, av[j]);
+                    }
+                    _mm_sfence();
+                    assert_eq!(direct_z.0, staged_z.0, "z case={case} blk={blk}");
+                    assert_eq!(direct_a.0, staged_a.0, "a case={case} blk={blk}");
+                    assert_eq!(direct_b.0, [SENTINEL; 8 * U32_PER_BLOCK]);
+                    assert_eq!(staged_b.0, [SENTINEL; 8 * U32_PER_BLOCK]);
+                    for i in 0..8 * U32_PER_BLOCK {
+                        let row_word = i % U32_PER_BLOCK;
+                        let expected = if (word_offset..word_offset + STEP_WORDS)
+                            .contains(&row_word)
+                        {
+                            input.0[row_word][i / U32_PER_BLOCK]
+                        } else {
+                            SENTINEL
+                        };
+                        assert_eq!(direct_z.0[i], expected, "z i={i} case={case} blk={blk}");
+                        assert_eq!(direct_a.0[i], expected, "a i={i} case={case} blk={blk}");
+                    }
+                }
             }
         }
     }
