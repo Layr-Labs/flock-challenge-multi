@@ -55,16 +55,31 @@ impl F128 {
     }
 
     /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
+    ///
+    /// If b_k = x^{2^k − 1}, then b_{i+j} = b_i^{2^j} · b_j.
+    /// The addition chain 1,2,3,6,7,14,28,56,63,126,127 therefore takes
+    /// 10 products and 127 squarings including the final b_127 square,
+    /// instead of 127 products and 128 squarings. Zero still maps to zero.
     pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
-        let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
-        for _ in 1..128 {
-            r *= cur;
-            cur = cur * cur;
+        #[inline]
+        fn square_n(mut value: F128, n: usize) -> F128 {
+            for _ in 0..n {
+                value = value * value;
+            }
+            value
         }
-        r
+
+        let b2 = square_n(self, 1) * self;
+        let b3 = square_n(b2, 1) * self;
+        let b6 = square_n(b3, 3) * b3;
+        let b7 = square_n(b6, 1) * self;
+        let b14 = square_n(b7, 7) * b7;
+        let b28 = square_n(b14, 14) * b14;
+        let b56 = square_n(b28, 28) * b28;
+        let b63 = square_n(b56, 7) * b7;
+        let b126 = square_n(b63, 63) * b63;
+        let b127 = square_n(b126, 1) * self;
+        square_n(b127, 1)
     }
 }
 
@@ -368,6 +383,45 @@ mod tests {
                 continue;
             }
             assert_eq!(a * a.inv(), F128::ONE);
+        }
+    }
+
+    #[test]
+    fn inverse_addition_chain_matches_portable_fermat() {
+        // Independent left-to-right exponentiation with the portable field
+        // product checks both the exponent chain and hardware multiplication.
+        fn reference(value: F128) -> F128 {
+            let mut out = F128::ONE;
+            for bit in (0..128).rev() {
+                out = software::ghash_mul(out, out);
+                if bit != 0 {
+                    out = software::ghash_mul(out, value);
+                }
+            }
+            out
+        }
+
+        let mut rng = Rng::new(0x1A70_7A5E);
+        let edges = [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(u64::MAX, 0),
+            F128::new(0, u64::MAX),
+            F128::new(u64::MAX, u64::MAX),
+        ];
+        let monomials = (0..128).map(|bit| {
+            if bit < 64 {
+                F128::new(1u64 << bit, 0)
+            } else {
+                F128::new(0, 1u64 << (bit - 64))
+            }
+        });
+        let random = (0..256).map(|_| rng.next_f128());
+        for value in edges.into_iter().chain(monomials).chain(random) {
+            let inverse = value.inv();
+            assert_eq!(inverse, reference(value), "value={value:?}");
+            let expected = if value.is_zero() { F128::ZERO } else { F128::ONE };
+            assert_eq!(software::ghash_mul(value, inverse), expected);
         }
     }
 

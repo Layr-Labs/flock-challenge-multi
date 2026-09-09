@@ -5878,4 +5878,91 @@ mod tests {
             );
         }
     }
+
+    /// The joint A/B path must preserve both independent composed maps,
+    /// including line masks, zero coefficients, and every output boundary.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_joint_composed_prefold_matches_separate_and_scalar() {
+        let mut rng = Rng::new(0xC4AB_5120);
+        for case in 0..4 {
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let coeffs = match case {
+                0 => [F128::ZERO; 4],
+                1 => [F128::ONE, F128::ZERO, F128::ZERO, F128::ZERO],
+                2 => {
+                    let r1 = rng.f128();
+                    let r2 = rng.f128();
+                    [
+                        (F128::ONE + r1) * (F128::ONE + r2),
+                        r1 * (F128::ONE + r2),
+                        (F128::ONE + r1) * r2,
+                        r1 * r2,
+                    ]
+                }
+                _ => [rng.f128(), rng.f128(), rng.f128(), rng.f128()],
+            };
+            let cm = kernels::x86_64::build_cfold_mats(&table.data, coeffs);
+            let mut a = [0u8; 512];
+            let mut b = [0u8; 512];
+            for i in 0..512 {
+                a[i] = rng.next_u64() as u8;
+                b[i] = if case == 2 {
+                    // Distinct sparse B data exercises the two-side mapping.
+                    if i % 8 == 0 { 1 } else { 0 }
+                } else {
+                    rng.next_u64() as u8
+                };
+            }
+            // These nonzero bytes are deliberately retained under dead masks;
+            // the scalar oracle substitutes zero rather than trusting padding.
+            a[448..].fill(0xa5);
+            b[448..].fill(0x5a);
+            let sentinel = rng.f128();
+            for dead in 0u8..=u8::MAX {
+                let mut a_ref = [sentinel; 24];
+                let mut b_ref = [sentinel; 24];
+                let mut a_got = [sentinel; 24];
+                let mut b_got = [sentinel; 24];
+                // SAFETY: inputs each contain 512 bytes; destinations have
+                // sixteen writable values after the three-value guard prefix.
+                // The disjoint arrays also retain five-value guard suffixes.
+                unsafe {
+                    kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                        a.as_ptr(), &cm, a_ref.as_mut_ptr().add(3), dead,
+                    );
+                    kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                        b.as_ptr(), &cm, b_ref.as_mut_ptr().add(3), dead,
+                    );
+                    kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_joint(
+                        a.as_ptr(), b.as_ptr(), &cm,
+                        a_got.as_mut_ptr().add(3), b_got.as_mut_ptr().add(3), dead,
+                    );
+                }
+                assert_eq!(a_got, a_ref, "joint A case={case}, dead={dead:#010b}");
+                assert_eq!(b_got, b_ref, "joint B case={case}, dead={dead:#010b}");
+                for (side, (rows, got)) in [(&a, &a_got), (&b, &b_got)].into_iter().enumerate() {
+                    assert!(got[..3].iter().all(|x| *x == sentinel));
+                    assert!(got[19..].iter().all(|x| *x == sentinel));
+                    for t in 0..16 {
+                        let mut want = F128::ZERO;
+                        for (k, c) in coeffs.iter().enumerate() {
+                            let row = 4 * t + k;
+                            if dead & (1 << (row / 8)) == 0 {
+                                want += *c * table.fold_one_row(&rows[8 * row..8 * (row + 1)]);
+                            }
+                        }
+                        assert_eq!(got[3 + t], want,
+                            "scalar side={side}, case={case}, dead={dead:#010b}, row={t}");
+                    }
+                }
+            }
+        }
+    }
 }
