@@ -479,6 +479,65 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// Two consecutive tile updates with one load/store of each output plane.
+/// Sixteen input ZMMs are shared across all sixteen byte planes; field
+/// addition is XOR, so this is `gfni_fold_tile(tile0)` followed by tile1.
+///
+/// # Safety
+/// Each input pointer exposes `7 * stripe_stride + n_blocks64 * 64` bytes.
+/// `mats[0]` and `mats[1]` contain the corresponding eight-stripe matrices.
+/// Output covers `n_blocks64 * 1024` writable bytes, disjoint from both inputs
+/// and matrices. It is initialized unless `seed_zero` is true; that case
+/// writes every output byte without first reading it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile_pair(
+    tile0: *const u8,
+    tile1: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[[u64; 128]; 2],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller supplies both complete tiles and the exclusive output.
+    unsafe {
+        for block in 0..n_blocks64 {
+            let bs = block * 64;
+            let rows: [__m512i; 16] = core::array::from_fn(|t| {
+                let src = if t < 8 { tile0 } else { tile1 };
+                _mm512_loadu_si512(src.add((t % 8) * stripe_stride + bs).cast::<__m512i>())
+            });
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in 0..16 {
+                let plane_ptr = planes.add(byte_k * 64).cast::<__m512i>();
+                let mut acc = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr)
+                };
+                for t in (0..16).step_by(2) {
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t],
+                        _mm512_set1_epi64(mats[t / 8][(t % 8) * 16 + byte_k] as i64),
+                    );
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t + 1],
+                        _mm512_set1_epi64(mats[(t + 1) / 8][((t + 1) % 8) * 16 + byte_k] as i64),
+                    );
+                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                }
+                _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`
