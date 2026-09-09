@@ -1730,28 +1730,33 @@ unsafe fn butterfly_fused_4layer_row_impl<
             for i in 0..8 {
                 butterfly!(i, i + 8, outer);
             }
-            pf_quad!(1);
-            for s in 0..2 {
-                let twiddle = tw[1 + s];
+            // The remaining three layers never cross the eight-row halves.
+            // Complete and publish one half before evaluating the other, so
+            // the first eight outputs can leave registers sooner. Every row
+            // is still loaded and stored exactly once per lane step.
+            for half in 0..2 {
+                pf_quad!(1 + half);
+                let start = 8 * half;
+                let twiddle = tw[1 + half];
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    butterfly!(start + i, start + i + 4, twiddle);
                 }
-            }
-            pf_quad!(2);
-            for s in 0..4 {
-                let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                for s in 0..2 {
+                    let twiddle = tw[3 + 2 * half + s];
+                    for i in 0..2 {
+                        butterfly!(start + 4 * s + i, start + 4 * s + i + 2, twiddle);
+                    }
                 }
-            }
-            pf_quad!(3);
-            for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
-            }
-
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                if half == 1 {
+                    pf_quad!(3);
+                }
+                for s in 0..4 {
+                    let twiddle = tw[7 + 4 * half + s];
+                    butterfly!(start + 2 * s, start + 2 * s + 1, twiddle);
+                }
+                for i in start..start + 8 {
+                    _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, values[i]);
+                }
             }
             lane += 4;
         }

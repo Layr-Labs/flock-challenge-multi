@@ -1641,6 +1641,14 @@ pub(crate) fn zc_r34_bcast_enabled() -> bool {
     *ON
 }
 
+/// Restore two independent composed prefolds for exact same-binary A/B.
+/// The joint helper shares each affine matrix load between A and B.
+pub(crate) fn zc_r34_joint_gfni_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R34_JOINT_GFNI").is_none());
+    *ON
+}
+
 /// `FLOCK_NO_ZC_PKT_PF=1` disables the next-tile software prefetch of the
 /// packed a/b bursts in the round-2 and rounds-3+4 fold kernels (exact
 /// same-binary A/B; prefetch is architecturally invisible).
@@ -2327,6 +2335,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let c4_bcast = use_c4 && zc_r34_bcast_enabled();
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        let c4_joint = c4_bcast && zc_r34_joint_gfni_enabled();
         // Packed-row prefetch distance and delivery, resolved once per
         // worker chunk (never inside the refill loop).
         let pf_tiles = if zc_pkt_pf_far_enabled() {
@@ -2359,7 +2369,16 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     let _ = (pair_in_block_mask, useful_pairs_inclusive);
                     if use_c4 {
                         let c = cfold.unwrap();
-                        if c4_bcast {
+                        if c4_joint {
+                            gfni_fold64_rows_masked_c4_bcast_joint(
+                                a_pkt.add(4 * xg * 8),
+                                b_pkt.add(4 * xg * 8),
+                                c,
+                                fa.as_mut_ptr(),
+                                fb.as_mut_ptr(),
+                                dead,
+                            );
+                        } else if c4_bcast {
                             gfni_fold64_rows_masked_c4_bcast(
                                 a_pkt.add(4 * xg * 8),
                                 c,
@@ -3838,6 +3857,159 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
                 let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
                 _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(a0, il_lo, a1));
                 _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+            }};
+        }
+        pass!(0);
+        pass!(1);
+    }
+}
+
+/// Apply the composed prefold to A and B together, sharing affine matrices.
+/// The per-side map and emitted order are identical to
+/// [`gfni_fold64_rows_masked_c4_bcast`]. Each matrix is loaded once for the
+/// two sides; the broadcasts still come from the incumbent gathered octets.
+///
+/// # Safety
+/// For each side, every non-dead input line must contain 64 readable bytes,
+/// and its output must contain 16 writable `F128`s. The two output ranges
+/// must not overlap each other or either input. Requires AVX-512 and GFNI.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+// Keep this out of the rounds-3+4 Rayon closure, as for the separate helper.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_joint(
+    a_rows: *const u8,
+    b_rows: *const u8,
+    m: &CFoldMats,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: input and output extents follow the caller contract. Each
+    // scratch half is fully initialized before use. Matrix indices cover
+    // precisely the 64 entries in m.1, and output stores cover 16 F128s.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        #[repr(C, align(64))]
+        struct Octs([u64; 128]);
+        let mut octs = Octs([0u64; 128]);
+        let op = octs.0.as_mut_ptr();
+
+        // Gather one side at a time so its eight input lines die before
+        // loading the next side. No input registers survive into the affines.
+        for (side, rows) in [a_rows, b_rows].into_iter().enumerate() {
+            let mut z = [_mm512_setzero_si512(); 8];
+            if dead_lines == 0 {
+                for (i, slot) in z.iter_mut().enumerate() {
+                    *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                }
+            } else {
+                for (i, slot) in z.iter_mut().enumerate() {
+                    if dead_lines & (1u8 << i) == 0 {
+                        *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                    }
+                }
+            }
+            let gather = |h: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+                let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+                let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+                let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+                let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+                let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+                let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+                let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+                let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+                let base = op.add(64 * side + 32 * h);
+                let oct = |a: usize, v: __m512i| {
+                    _mm512_storeu_si512(
+                        base.add(8 * a) as *mut __m512i,
+                        _mm512_permutexvar_epi8(bt, v),
+                    )
+                };
+                oct(0, _mm512_permutex2var_epi64(p01, s3_lo, p45));
+                oct(1, _mm512_permutex2var_epi64(p01, s3_hi, p45));
+                oct(2, _mm512_permutex2var_epi64(p23, s3_lo, p67));
+                oct(3, _mm512_permutex2var_epi64(p23, s3_hi, p67));
+            };
+            gather(0, z[0], z[1], z[2], z[3]);
+            gather(1, z[4], z[5], z[6], z[7]);
+        }
+
+        // Preserve the incumbent opaque scratch read: otherwise LLVM can
+        // replace load-port broadcasts with register shuffles and spill.
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = m.1.as_ptr() as *const u64;
+        macro_rules! pass {
+            ($h:expr) => {{
+                const H: usize = $h;
+                // Do not retain all 64 matrices across the two input halves.
+                let mp = core::hint::black_box(mp);
+                // Component order: A low bytes, B low bytes, A high, B high.
+                let mut accp = [_mm512_setzero_si512(); 4];
+                let mut accq = [_mm512_setzero_si512(); 4];
+                for a in 0..4usize {
+                    let affine = |j: usize| -> [__m512i; 4] {
+                        let ba = _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64);
+                        let bb = _mm512_set1_epi64(*rp.add(64 + 32 * H + 8 * a + j) as i64);
+                        let ml = _mm512_loadu_si512(mp.add(8 * (8 * a + j)) as *const __m512i);
+                        let al = _mm512_gf2p8affine_epi64_epi8::<0>(ba, ml);
+                        let bl = _mm512_gf2p8affine_epi64_epi8::<0>(bb, ml);
+                        let mh = _mm512_loadu_si512(
+                            mp.add(8 * (32 + 8 * a + j)) as *const __m512i
+                        );
+                        let ah = _mm512_gf2p8affine_epi64_epi8::<0>(ba, mh);
+                        let bh = _mm512_gf2p8affine_epi64_epi8::<0>(bb, mh);
+                        [al, bl, ah, bh]
+                    };
+                    let xor3 = |x: [__m512i; 4], y: [__m512i; 4], z: [__m512i; 4]| {
+                        core::array::from_fn::<__m512i, 4, _>(|i| {
+                            _mm512_ternarylogic_epi64::<0x96>(x[i], y[i], z[i])
+                        })
+                    };
+                    // Reduce three byte contributions at a time, rather than
+                    // keeping all 32 A/B affine results live simultaneously.
+                    // Eight running accumulators plus the partial/three-input
+                    // reductions leave room for broadcasts and matrix operands.
+                    let v1 = xor3(affine(0), affine(1), affine(2));
+                    let v2 = xor3(affine(3), affine(4), affine(5));
+                    let v3 = xor3(affine(6), affine(7), v1);
+                    for i in 0..4usize {
+                        if a == 0 {
+                            accp[i] = v2[i];
+                            accq[i] = v3[i];
+                        } else {
+                            accp[i] = _mm512_ternarylogic_epi64::<0x96>(accp[i], accq[i], v2[i]);
+                            accq[i] = v3[i];
+                        }
+                    }
+                }
+                let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+                let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+                for (side, out) in [a_out, b_out].into_iter().enumerate() {
+                    let lo = _mm512_permutexvar_epi8(
+                        bt, _mm512_xor_si512(accp[side], accq[side])
+                    );
+                    let hi = _mm512_permutexvar_epi8(
+                        bt, _mm512_xor_si512(accp[2 + side], accq[2 + side])
+                    );
+                    let dst = out as *mut __m512i;
+                    _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(lo, il_lo, hi));
+                    _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(lo, il_hi, hi));
+                }
             }};
         }
         pass!(0);
