@@ -955,7 +955,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
                 _ => None,
             };
-            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
+            let mut fold_r34 = || fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 a_packed,
                 b_packed,
                 m,
@@ -969,6 +969,19 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next,
                 eq_override,
             );
+            // Reuse round one's AB pool only for the ranked packed sweep.
+            // zc_r1_pools is a read-only lookup: explicit process-start init
+            // must already have built these topology/affinity-checked pools.
+            // If it did not, keep the calling pool and create no workers here.
+            let half_pool = if m == 32 && k_skip == K_SKIP {
+                crate::smt_split::zc_r1_pools().map(|(ab_pool, _)| ab_pool)
+            } else {
+                None
+            };
+            let (m1, mi, la_next) = match half_pool {
+                Some(ab_pool) => ab_pool.install(fold_r34),
+                None => fold_r34(),
+            };
             a_mlv = a4;
             b_mlv = b4;
             if level + 1 < n_levels {
