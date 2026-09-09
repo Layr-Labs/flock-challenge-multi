@@ -1644,11 +1644,11 @@ fn fold_block_major_gfni(
             } else {
                 (tile_lo, tile_hi)
             };
-            let mut mats = [0u64; 128];
-            debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
-            // Four column-slabs of 8×128 bytes: the grouped gather writes
-            // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            let mut mats = [[0u64; 128]; 4];
+            debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats[0].len());
+            // Up to four independent tiles, each with four 8×128-byte column slabs.
+            // The single-column arms use each tile's slab 0 only.
+            let mut transposed = [[0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]; 4];
             // First tile this worker writes into an uninitialized plane
             // buffer: seed the GFNI acc from a register zero idiom. Later
             // tiles load only blocks that this first tile initialized.
@@ -1693,10 +1693,16 @@ fn fold_block_major_gfni(
                 } else {
                     break;
                 };
+                // Batch only tiles in this worker's already-owned contiguous
+                // claim. Dynamic claims remain four; odd static tails stay local.
+                let batch_len = (claim_hi - tile).min(4);
+                claim_lo = tile + batch_len;
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
-                for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                    let eq8 = eq8_at(8 * (stripe_base + t));
-                    kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                for batch in 0..batch_len {
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let eq8 = eq8_at(8 * (stripe_base + batch * DIRECT_FOLD_TILE_STRIPES + t));
+                        kernels::fold_mats_from_basis(&eq8, &mut mats[batch][t * 16..(t + 1) * 16]);
+                    }
                 }
                 let mut q = 0usize;
                 // Grouped arm: four full 128-bit chunks per gather visit.
@@ -1709,72 +1715,82 @@ fn fold_block_major_gfni(
                 if gather_tr_fused && lc_gather4_enabled() {
                     let full_chunks = useful_bits / 128;
                     while q + 4 <= full_chunks {
-                        if gather_tr_vpermt2b {
-                            gather_transpose_group4_x86::<true>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                full_chunks,
-                                pf_far,
-                                pf_spread,
-                                pf_chunks,
-                                &mut transposed,
-                            );
-                        } else {
-                            gather_transpose_group4_x86::<false>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                full_chunks,
-                                pf_far,
-                                pf_spread,
-                                pf_chunks,
-                                &mut transposed,
-                            );
+                        for batch in 0..batch_len {
+                            if gather_tr_vpermt2b {
+                                gather_transpose_group4_x86::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut transposed[batch],
+                                );
+                            } else {
+                                gather_transpose_group4_x86::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
+                                    q,
+                                    full_chunks,
+                                    pf_far,
+                                    pf_spread,
+                                    pf_chunks,
+                                    &mut transposed[batch],
+                                );
+                            }
                         }
                         for c in 0..4 {
                             // Spread delivery: the same eight-hints-per-stripe
                             // block, issued from the fold that follows the
                             // gather instead of from the gather itself, two
                             // stripes at a time. Same lines, same look-ahead.
-                            if pf_far && pf_spread {
-                                let qn = q + pf_chunks;
-                                if qn <= full_chunks && qn < chunks_per_block {
-                                    // Stripes 2c and 2c+1 are the SIXTEEN
-                                    // consecutive rows 8*stripe_base + 16c ..
-                                    // + 16, so one base pointer and a fixed
-                                    // row stride reach every hint the two
-                                    // eight-row blocks used to address one at
-                                    // a time. Same sixteen lines, same order.
-                                    // SAFETY: those rows are inside this
-                                    // tile's 64 and `qn < chunks_per_block`
-                                    // keeps the column inside the block, so
-                                    // every address the helper forms is in
-                                    // bounds; a prefetch never dereferences.
-                                    unsafe {
-                                        lc_prefetch_rows16(
-                                            z_packed.as_ptr().add(
-                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
-                                            ),
-                                            chunks_per_block,
-                                            cpb_ranked,
-                                        );
+                            for batch in 0..batch_len {
+                                if pf_far && pf_spread {
+                                    let qn = q + pf_chunks;
+                                    if qn <= full_chunks && qn < chunks_per_block {
+                                        // Stripes 2c and 2c+1 are the SIXTEEN
+                                        // consecutive rows 8*stripe_base + 16c ..
+                                        // + 16, so one base pointer and a fixed
+                                        // row stride reach every hint the two
+                                        // eight-row blocks used to address one at
+                                        // a time. Same sixteen lines, same order.
+                                        // SAFETY: those rows are inside this
+                                        // tile's 64 and `qn < chunks_per_block`
+                                        // keeps the column inside the block, so
+                                        // every address the helper forms is in
+                                        // bounds; a prefetch never dereferences.
+                                        unsafe {
+                                            lc_prefetch_rows16(
+                                                z_packed.as_ptr().add(
+                                                    (8 * (stripe_base + batch * DIRECT_FOLD_TILE_STRIPES) + 16 * c) * chunks_per_block + qn,
+                                                ),
+                                                chunks_per_block,
+                                                cpb_ranked,
+                                            );
+                                        }
                                     }
                                 }
                             }
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
-                                    &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
-                                    first_tile,
-                                );
+                                let out = wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024);
+                                if batch_len > 1 {
+                                    let inputs = std::array::from_fn(|batch| {
+                                        transposed[batch].as_ptr().add(c * 1024)
+                                    });
+                                    kernels::gfni_fold_tiles_acc(
+                                        &inputs, batch_len, 128, 2, &mats, out, first_tile,
+                                    );
+                                } else {
+                                    kernels::gfni_fold_tile(
+                                        transposed[0].as_ptr().add(c * 1024),
+                                        128, 2, &mats[0], out, first_tile,
+                                    );
+                                }
                             }
                         }
                         q += 4;
@@ -1783,56 +1799,63 @@ fn fold_block_major_gfni(
                 while q < useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
-                    #[cfg(target_feature = "avx512vbmi")]
-                    if gather_tr_fused {
-                        if gather_tr_vpermt2b {
-                            gather_transpose_tile_x86::<true>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                &mut transposed,
-                            );
+                    for batch in 0..batch_len {
+                        #[cfg(target_feature = "avx512vbmi")]
+                        if gather_tr_fused {
+                            if gather_tr_vpermt2b {
+                                gather_transpose_tile_x86::<true>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
+                                    q,
+                                    &mut transposed[batch],
+                                );
+                            } else {
+                                gather_transpose_tile_x86::<false>(
+                                    z_packed,
+                                    chunks_per_block,
+                                    stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
+                                    q,
+                                    &mut transposed[batch],
+                                );
+                            }
                         } else {
-                            gather_transpose_tile_x86::<false>(
+                            gather_transpose_tile_scalar(
                                 z_packed,
                                 chunks_per_block,
-                                stripe_base,
+                                stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
                                 q,
-                                &mut transposed,
+                                &mut transposed[batch],
                             );
                         }
-                    } else {
+                        #[cfg(not(target_feature = "avx512vbmi"))]
                         gather_transpose_tile_scalar(
                             z_packed,
                             chunks_per_block,
-                            stripe_base,
+                            stripe_base + batch * DIRECT_FOLD_TILE_STRIPES,
                             q,
-                            &mut transposed,
+                            &mut transposed[batch],
                         );
                     }
-                    #[cfg(not(target_feature = "avx512vbmi"))]
-                    gather_transpose_tile_scalar(
-                        z_packed,
-                        chunks_per_block,
-                        stripe_base,
-                        q,
-                        &mut transposed,
-                    );
                     // SAFETY: `transposed` holds 8 stripes x 128 bytes at
                     // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
                     // the worker planes cover (2q + chunk blocks) * 1024
                     // bytes for every q < useful_chunks <= k/128. first_tile
                     // is true iff this worker has not yet stored into wplanes.
                     unsafe {
-                        kernels::gfni_fold_tile(
-                            transposed.as_ptr(),
-                            128,
-                            chunk_bits.div_ceil(64),
-                            &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
-                            first_tile,
-                        );
+                        let out = wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024);
+                        if batch_len > 1 {
+                            let inputs = std::array::from_fn(|batch| transposed[batch].as_ptr());
+                            kernels::gfni_fold_tiles_acc(
+                                &inputs, batch_len, 128, chunk_bits.div_ceil(64),
+                                &mats, out, first_tile,
+                            );
+                        } else {
+                            kernels::gfni_fold_tile(
+                                transposed[0].as_ptr(), 128, chunk_bits.div_ceil(64),
+                                &mats[0], out, first_tile,
+                            );
+                        }
                     }
                     q += 1;
                 }
@@ -3691,6 +3714,240 @@ pub fn verify<Ch: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    /// The register-accumulator batch must agree with successive incumbent
+    /// calls AND an independent F128 basis sum for every batch width1..=4.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+    #[test]
+    fn gfni_fold_tiles_acc_matches_calls_and_scalar_basis() {
+        #[repr(C, align(64))]
+        struct Input([u8; 1152]);
+        #[repr(C, align(64))]
+        struct Output([u8; 2304]);
+        let mut rng = Rng::new(0x1CFA_1A11_0021);
+        let basis: [[[F128; 8]; 8]; 4] =
+            std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| rng.f128())));
+        let mut mats = [[0u64; 128]; 4];
+        for tile in 0..4 {
+            for stripe in 0..8 {
+                kernels::fold_mats_from_basis(
+                    &basis[tile][stripe], &mut mats[tile][stripe * 16..(stripe + 1) * 16],
+                );
+            }
+        }
+        let mats_before = mats;
+        for pattern in 0..3 {
+            for offsets in [[0usize; 4], [3, 17, 29, 43]] {
+                for batch_len in 1..=4 {
+                    // Slots beyond batch_len retain nonzero poison; including
+                    // any of them in the fold must disagree with the oracle.
+                    let mut inputs: [Input; 4] = std::array::from_fn(|tile| {
+                        Input([0xa5u8.wrapping_add(tile as u8); 1152])
+                    });
+                    for tile in 0..batch_len {
+                        for byte in &mut inputs[tile].0[offsets[tile]..offsets[tile] + 1024] {
+                            *byte = match pattern {
+                                0 => 0,
+                                1 => 0xff,
+                                _ => rng.next_u64() as u8,
+                            };
+                        }
+                    }
+                    let before_inputs: [[u8; 1152]; 4] = std::array::from_fn(|tile| inputs[tile].0);
+                    let out_off = if offsets[0] == 0 { 64 } else { 19 };
+                    for n_blocks in 0..=2 {
+                        let len = n_blocks * 1024;
+                        for nonzero_initial in [false, true] {
+                            for seed_zero in [false, true] {
+                                let mut got = Output([0xd3; 2304]);
+                                for byte in &mut got.0[out_off..out_off + len] {
+                                    *byte = if nonzero_initial { rng.next_u64() as u8 } else { 0 };
+                                }
+                                let mut reference = Output(got.0);
+                                let mut scalar = got.0;
+                                if seed_zero { scalar[out_off..out_off + len].fill(0); }
+                                // Independent oracle: a set input bit selects
+                                // its original F128 basis value. This does not
+                                // use GFNI matrices or their encoding.
+                                for block in 0..n_blocks {
+                                    for column in 0..64 {
+                                        let mut value = F128::ZERO;
+                                        for tile in 0..batch_len {
+                                            for stripe in 0..8 {
+                                                let byte = inputs[tile].0[
+                                                    offsets[tile] + stripe * 128 + block * 64 + column
+                                                ];
+                                                for bit in 0..8 {
+                                                    if byte & (1 << bit) != 0 {
+                                                        value += basis[tile][stripe][bit];
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let mut bytes = [0u8; 16];
+                                        bytes[..8].copy_from_slice(&value.lo.to_le_bytes());
+                                        bytes[8..].copy_from_slice(&value.hi.to_le_bytes());
+                                        for byte in 0..16 {
+                                            scalar[out_off + block * 1024 + byte * 64 + column] ^=
+                                                bytes[byte];
+                                        }
+                                    }
+                                }
+                                // SAFETY: every input exposes1024 bytes after
+                                // its offset. Outputs are disjoint and expose
+                                // len writable bytes plus guards on both sides.
+                                unsafe {
+                                    let ptrs = std::array::from_fn(|tile| {
+                                        inputs[tile].0.as_ptr().add(offsets[tile])
+                                    });
+                                    for tile in 0..batch_len {
+                                        kernels::gfni_fold_tile(
+                                            ptrs[tile], 128, n_blocks, &mats[tile],
+                                            reference.0.as_mut_ptr().add(out_off), seed_zero && tile == 0,
+                                        );
+                                    }
+                                    kernels::gfni_fold_tiles_acc(
+                                        &ptrs, batch_len, 128, n_blocks, &mats,
+                                        got.0.as_mut_ptr().add(out_off), seed_zero,
+                                    );
+                                }
+                                assert_eq!(got.0, reference.0,
+                                    "old calls batch={batch_len} pattern={pattern} offsets={offsets:?} blocks={n_blocks} initial={nonzero_initial} seed={seed_zero}");
+                                assert_eq!(got.0, scalar,
+                                    "scalar basis batch={batch_len} pattern={pattern} offsets={offsets:?} blocks={n_blocks} initial={nonzero_initial} seed={seed_zero}");
+                                for tile in 0..4 { assert_eq!(inputs[tile].0, before_inputs[tile]); }
+                                assert_eq!(mats, mats_before);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only each fully written prefix is assumed initialized. The remainder
+        // of the MaybeUninit allocation is never read, including by the oracle.
+        let inputs: [Input; 4] = std::array::from_fn(|tile| Input([0x69 + tile as u8; 1152]));
+        let offsets = [3usize, 17, 29, 43];
+        for batch_len in 1..=4 {
+            for n_blocks in 1..=2 {
+                let len = n_blocks * 1024;
+                let mut output = [core::mem::MaybeUninit::<u8>::uninit(); 2048];
+                let mut reference = [0u8; 2048];
+                unsafe {
+                    let ptrs = std::array::from_fn(|tile| inputs[tile].0.as_ptr().add(offsets[tile]));
+                    kernels::gfni_fold_tiles_acc(
+                        &ptrs, batch_len, 128, n_blocks, &mats,
+                        output.as_mut_ptr().cast::<u8>(), true,
+                    );
+                    for tile in 0..batch_len {
+                        kernels::gfni_fold_tile(
+                            ptrs[tile], 128, n_blocks, &mats[tile], reference.as_mut_ptr(), tile == 0,
+                        );
+                    }
+                    let initialized = core::slice::from_raw_parts(output.as_ptr().cast::<u8>(), len);
+                    assert_eq!(initialized, &reference[..len], "uninit batch={batch_len} blocks={n_blocks}");
+                }
+            }
+        }
+    }
+
+    /// Public power-of-two shapes miss odd private claims. Exercise the actual
+    /// driver with explicit claims, including quad->quad->singleton and
+    /// inactive plane banks, against canonical packed-bit F128 sums.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+    #[test]
+    fn gfni_batched_block_major_claims_match_scalar_bits() {
+        let pools: Vec<_> = (1..=3).map(|threads| {
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+        }).collect();
+        // (tiles, k, useful_bits, worker banks, actual Rayon threads).
+        //513/577 require grouped-four gathers plus one-/two-plane ragged tails.
+        let cases = [
+            (1usize, 1024usize, 0usize, 4usize, 1usize),
+            (1, 1024, 65, 3, 2),
+            (2, 1024, 512, 4, 2),
+            (3, 1024, 513, 2, 2),
+            (4, 1024, 577, 1, 1),
+            (5, 1024, 513, 1, 1),
+            (5, 1024, 577, 1, 1),
+            // A second batch must reload existing planes:2/3-tile tails,
+            // then two complete quads followed by the incumbent singleton.
+            (6, 1024, 513, 1, 1),
+            (7, 1024, 577, 1, 1),
+            (9, 1024, 513, 1, 1),
+            (9, 1024, 577, 1, 1),
+            (7, 1024, 1023, 3, 3),
+            (2, 16384, 15409, 3, 2),
+        ];
+        let mut rng = Rng::new(0x1CFA_C1A1_0005);
+        for (n_tiles, k, useful_bits, n_workers, threads) in cases {
+            let n_outer = n_tiles * 64;
+            let chunks_per_block = k / 128;
+            let eq_outer = rng.f128_vec(n_outer);
+            let mut packed = rng.f128_vec(n_outer * chunks_per_block);
+            // The production contract requires honest zero padding, including
+            // the unused bits within the last live64-column GFNI block.
+            for row in packed.chunks_exact_mut(chunks_per_block) {
+                for (q, value) in row.iter_mut().enumerate() {
+                    let keep = useful_bits.saturating_sub(128 * q).min(128);
+                    let low_mask = match keep.min(64) {
+                        64 => u64::MAX, bits => (1u64 << bits) - 1,
+                    };
+                    let high_mask = match keep.saturating_sub(64) {
+                        64 => u64::MAX, bits => (1u64 << bits) - 1,
+                    };
+                    value.lo &= low_mask;
+                    value.hi &= high_mask;
+                }
+            }
+            let mut scalar = vec![F128::ZERO; k];
+            for outer in 0..n_outer {
+                for (column, out) in scalar.iter_mut().enumerate().take(useful_bits) {
+                    let word = packed[outer * chunks_per_block + column / 128];
+                    let bit = column % 128;
+                    let set = if bit < 64 { word.lo >> bit } else { word.hi >> (bit - 64) } & 1;
+                    if set != 0 { *out += eq_outer[outer]; }
+                }
+            }
+            let input_before = packed.clone();
+            let r = rng.f128();
+            for top_bind in [None, Some(r)] {
+                let mut want = scalar.clone();
+                let want_one = if k == 16384 && top_bind.is_some() {
+                    let mut one = vec![F128::ZERO; k / 2];
+                    for (column, dst) in one.iter_mut().enumerate() {
+                        if column < 18 * 64 {
+                            *dst = (F128::ONE + r) * scalar[column];
+                        } else if (108 * 64..112 * 64).contains(&column) {
+                            *dst = r * scalar[column + k / 2];
+                        }
+                    }
+                    Some(one)
+                } else { None };
+                if top_bind.is_some() {
+                    for column in 0..k / 2 {
+                        want[column] = scalar[column] + r * (scalar[column] + scalar[column + k / 2]);
+                    }
+                    want.truncate(k / 2);
+                }
+                for dynamic in [false, true] {
+                    let eq8_at = |base: usize| std::array::from_fn(|bit| eq_outer[base + bit]);
+                    let (got, got_one) = pools[threads - 1].install(|| {
+                        fold_block_major_gfni(
+                            &packed, k, chunks_per_block, useful_bits, useful_bits.div_ceil(128),
+                            n_workers, n_tiles.div_ceil(n_workers), n_tiles, dynamic, &eq8_at,
+                            top_bind, want_one.is_some(),
+                        )
+                    });
+                    assert_eq!(got, want,
+                        "driver tiles={n_tiles} k={k} useful={useful_bits} workers={n_workers} threads={threads} dynamic={dynamic} top={top_bind:?}");
+                    assert_eq!(got_one, want_one,
+                        "one rows tiles={n_tiles} dynamic={dynamic} top={top_bind:?}");
+                    assert_eq!(packed, input_before);
+                }
+            }
+        }
+    }
 
     /// On the ranked eight-round shape, the first top bind is precisely the
     /// incumbent Fold8 intake's only non-retained-coordinate fold. This is

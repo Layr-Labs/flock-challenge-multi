@@ -479,6 +479,187 @@ pub(crate) unsafe fn gfni_fold_tile(
     }
 }
 
+/// Two consecutive tile updates with one load/store of each output plane.
+/// Sixteen input ZMMs are shared across all sixteen byte planes; field
+/// addition is XOR, so this is `gfni_fold_tile(tile0)` followed by tile1.
+///
+/// # Safety
+/// Each input pointer exposes `7 * stripe_stride + n_blocks64 * 64` bytes.
+/// `mats[0]` and `mats[1]` contain the corresponding eight-stripe matrices.
+/// Output covers `n_blocks64 * 1024` writable bytes, disjoint from both inputs
+/// and matrices. It is initialized unless `seed_zero` is true; that case
+/// writes every output byte without first reading it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tile_pair(
+    tile0: *const u8,
+    tile1: *const u8,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[[u64; 128]; 2],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller supplies both complete tiles and the exclusive output.
+    unsafe {
+        for block in 0..n_blocks64 {
+            let bs = block * 64;
+            let rows: [__m512i; 16] = core::array::from_fn(|t| {
+                let src = if t < 8 { tile0 } else { tile1 };
+                _mm512_loadu_si512(src.add((t % 8) * stripe_stride + bs).cast::<__m512i>())
+            });
+            let planes = out_planes_ptr.add(block * 1024);
+            for byte_k in 0..16 {
+                let plane_ptr = planes.add(byte_k * 64).cast::<__m512i>();
+                let mut acc = if seed_zero {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(plane_ptr)
+                };
+                for t in (0..16).step_by(2) {
+                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t],
+                        _mm512_set1_epi64(mats[t / 8][(t % 8) * 16 + byte_k] as i64),
+                    );
+                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        rows[t + 1],
+                        _mm512_set1_epi64(mats[(t + 1) / 8][((t + 1) % 8) * 16 + byte_k] as i64),
+                    );
+                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                }
+                _mm512_storeu_si512(plane_ptr, acc);
+            }
+        }
+    }
+}
+
+/// Accumulate up to four tiles with sixteen output planes held in registers.
+/// Only the current tile's eight input ZMMs are live. Fixed-index updates
+/// expose all plane accumulators to register allocation without a dynamic
+/// accumulator array; each plane is loaded once and stored once per batch.
+///
+/// # Safety
+/// `batch_len` is in1..=4. Each input0..batch_len exposes at least
+/// `7 * stripe_stride + n_blocks64 * 64` readable bytes, with corresponding
+/// matrices in mats[tile]. Output exposes n_blocks64*1024 writable bytes,
+/// disjoint from all inputs, pointer-array storage and matrices. Output bytes
+/// are initialized unless seed_zero=true, which does not read prior output.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn gfni_fold_tiles_acc(
+    tile_bytes: &[*const u8; 4],
+    batch_len: usize,
+    stripe_stride: usize,
+    n_blocks64: usize,
+    mats: &[[u64; 128]; 4],
+    out_planes_ptr: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!((1..=4).contains(&batch_len));
+    // SAFETY: caller supplies complete tiles, matrices, and exclusive output.
+    unsafe {
+        for block in 0..n_blocks64 {
+            let planes = out_planes_ptr.add(block * 1024);
+            macro_rules! load_plane {
+                ($p:literal) => {
+                    if seed_zero {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_loadu_si512(planes.add($p * 64).cast::<__m512i>())
+                    }
+                };
+            }
+            let mut a0 = load_plane!(0);
+            let mut a1 = load_plane!(1);
+            let mut a2 = load_plane!(2);
+            let mut a3 = load_plane!(3);
+            let mut a4 = load_plane!(4);
+            let mut a5 = load_plane!(5);
+            let mut a6 = load_plane!(6);
+            let mut a7 = load_plane!(7);
+            let mut a8 = load_plane!(8);
+            let mut a9 = load_plane!(9);
+            let mut a10 = load_plane!(10);
+            let mut a11 = load_plane!(11);
+            let mut a12 = load_plane!(12);
+            let mut a13 = load_plane!(13);
+            let mut a14 = load_plane!(14);
+            let mut a15 = load_plane!(15);
+            for tile in 0..batch_len {
+                let src = tile_bytes[tile];
+                let rows: [__m512i; 8] = core::array::from_fn(|stripe| {
+                    _mm512_loadu_si512(
+                        src.add(stripe * stripe_stride + block * 64).cast::<__m512i>(),
+                    )
+                });
+                let mt = mats[tile].as_ptr();
+                macro_rules! update {
+                    ($acc:ident, $p:literal, $s0:literal, $s1:literal) => {{
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[$s0], _mm512_set1_epi64(*mt.add($s0 * 16 + $p) as i64),
+                        );
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                            rows[$s1], _mm512_set1_epi64(*mt.add($s1 * 16 + $p) as i64),
+                        );
+                        $acc = _mm512_ternarylogic_epi64::<0x96>($acc, g0, g1);
+                    }};
+                }
+                macro_rules! stripe_pair {
+                    ($s0:literal, $s1:literal) => {{
+                        update!(a0, 0, $s0, $s1);
+                        update!(a1, 1, $s0, $s1);
+                        update!(a2, 2, $s0, $s1);
+                        update!(a3, 3, $s0, $s1);
+                        update!(a4, 4, $s0, $s1);
+                        update!(a5, 5, $s0, $s1);
+                        update!(a6, 6, $s0, $s1);
+                        update!(a7, 7, $s0, $s1);
+                        update!(a8, 8, $s0, $s1);
+                        update!(a9, 9, $s0, $s1);
+                        update!(a10, 10, $s0, $s1);
+                        update!(a11, 11, $s0, $s1);
+                        update!(a12, 12, $s0, $s1);
+                        update!(a13, 13, $s0, $s1);
+                        update!(a14, 14, $s0, $s1);
+                        update!(a15, 15, $s0, $s1);
+                    }};
+                }
+                stripe_pair!(0, 1);
+                stripe_pair!(2, 3);
+                stripe_pair!(4, 5);
+                stripe_pair!(6, 7);
+            }
+            _mm512_storeu_si512(planes.add(0 * 64).cast::<__m512i>(), a0);
+            _mm512_storeu_si512(planes.add(1 * 64).cast::<__m512i>(), a1);
+            _mm512_storeu_si512(planes.add(2 * 64).cast::<__m512i>(), a2);
+            _mm512_storeu_si512(planes.add(3 * 64).cast::<__m512i>(), a3);
+            _mm512_storeu_si512(planes.add(4 * 64).cast::<__m512i>(), a4);
+            _mm512_storeu_si512(planes.add(5 * 64).cast::<__m512i>(), a5);
+            _mm512_storeu_si512(planes.add(6 * 64).cast::<__m512i>(), a6);
+            _mm512_storeu_si512(planes.add(7 * 64).cast::<__m512i>(), a7);
+            _mm512_storeu_si512(planes.add(8 * 64).cast::<__m512i>(), a8);
+            _mm512_storeu_si512(planes.add(9 * 64).cast::<__m512i>(), a9);
+            _mm512_storeu_si512(planes.add(10 * 64).cast::<__m512i>(), a10);
+            _mm512_storeu_si512(planes.add(11 * 64).cast::<__m512i>(), a11);
+            _mm512_storeu_si512(planes.add(12 * 64).cast::<__m512i>(), a12);
+            _mm512_storeu_si512(planes.add(13 * 64).cast::<__m512i>(), a13);
+            _mm512_storeu_si512(planes.add(14 * 64).cast::<__m512i>(), a14);
+            _mm512_storeu_si512(planes.add(15 * 64).cast::<__m512i>(), a15);
+        }
+    }
+}
+
 /// `dst[i] ^= src[i]` for `len` bytes. `len` must be a multiple of 64.
 ///
 /// Bit-identical to the scalar byte loop: XOR is bitwise and `_mm512_xor_si512`
