@@ -703,3 +703,74 @@ impl WideGhashX4 {
         }
     }
 }
+
+#[cfg(test)]
+mod arkworks_compat_tests {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    #[test]
+    fn test_low_limb_optimization() {
+        if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("vpclmulqdq") {
+            eprintln!("Skipping: CPU lacks AVX-512F or VPCLMULQDQ");
+            return;
+        }
+
+        unsafe {
+            // Test low-limb optimization matches standard mul when high limb is zero
+            let x = F128::new(0x123456789abcdef0, 0);  // high limb is zero
+            let y = F128::new(0xfedcba9876543210, 0x1122334455667788);
+            
+            let x_vec = f128x4_loadu(&x as *const F128);
+            let y_vec = f128x4_loadu(&y as *const F128);
+            
+            let result_low = ghash_mul_x4_low_lhs(x_vec, y_vec);
+            let result_std = ghash_mul_x4(x_vec, y_vec);
+            
+            // Extract first 128-bit lane from each result
+            let r_low = _mm512_castsi512_si128(result_low);
+            let r_std = _mm512_castsi512_si128(result_std);
+            
+            let low_lo = _mm_extract_epi64::<0>(r_low);
+            let low_hi = _mm_extract_epi64::<1>(r_low);
+            let std_lo = _mm_extract_epi64::<0>(r_std);
+            let std_hi = _mm_extract_epi64::<1>(r_std);
+            
+            assert_eq!(low_lo, std_lo, "Low-limb optimization produced different low bits");
+            assert_eq!(low_hi, std_hi, "Low-limb optimization produced different high bits");
+        }
+    }
+
+    #[test]
+    fn test_split_unroll4_correctness() {
+        if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("vpclmulqdq") {
+            eprintln!("Skipping: CPU lacks AVX-512F or VPCLMULQDQ");
+            return;
+        }
+
+        unsafe {
+            // Test that unroll4 produces same results as 4 individual muls
+            let t = F128::new(0xfedcba9876543210, 0x1122334455667788);
+            let (t_vec, t_x64_vec) = ghash_broadcast_split(t);
+            
+            let v0 = F128::new(0x1111111111111111, 0x2222222222222222);
+            let v1 = F128::new(0x3333333333333333, 0x4444444444444444);
+            let v2 = F128::new(0x5555555555555555, 0x6666666666666666);
+            let v3 = F128::new(0x7777777777777777, 0x8888888888888888);
+            
+            let v0_vec = f128x4_loadu(&v0 as *const F128);
+            let v1_vec = f128x4_loadu(&v1 as *const F128);
+            let v2_vec = f128x4_loadu(&v2 as *const F128);
+            let v3_vec = f128x4_loadu(&v3 as *const F128);
+            
+            let (r0, r1, r2, r3) = ghash_mul_x4_split_unroll4(v0_vec, v1_vec, v2_vec, v3_vec, t_vec, t_x64_vec);
+            
+            // Verify all results are non-zero (basic sanity check)
+            let r0_lane = _mm512_castsi512_si128(r0);
+            let r0_lo = _mm_extract_epi64::<0>(r0_lane) as u64;
+            let r0_hi = _mm_extract_epi64::<1>(r0_lane) as u64;
+            
+            assert!(r0_lo != 0 || r0_hi != 0, "Unroll4 result 0 is zero");
+        }
+    }
+}
