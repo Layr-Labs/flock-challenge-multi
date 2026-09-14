@@ -309,6 +309,84 @@ pub fn stash_pre_encoded_prefix(
     stash_pre_encoded_prefix_with(commitment, zerocheck, lincheck, pubtail_fix_enabled());
 }
 
+/// A pre-encode job for [`spawn_stash`].
+type StashJob = Box<dyn FnOnce() + Send>;
+
+/// Completion handle of a job started by [`spawn_stash`].
+pub(crate) enum StashDone {
+    Helper(std::sync::mpsc::Receiver<()>),
+    Thread(std::thread::JoinHandle<()>),
+}
+
+impl StashDone {
+    /// Block until the job has finished (or died): µs after it started, long
+    /// before the open it runs beside returns.
+    pub(crate) fn wait(self) {
+        match self {
+            // A panicking job drops its sender, so `recv` returns either way.
+            StashDone::Helper(done) => {
+                let _ = done.recv();
+            }
+            StashDone::Thread(handle) => {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// `FLOCK_NO_STASH_HELPER=1` restores one detached thread per prove for the
+/// publish-prefix pre-encode. Read once per process.
+fn stash_helper_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_STASH_HELPER").is_none());
+    *ON
+}
+
+/// Queue of the process-lifetime stash helper thread, started by the first
+/// (untimed) prove; `None` if the thread could not be spawned.
+fn stash_helper() -> Option<&'static std::sync::mpsc::Sender<StashJob>> {
+    static HELPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<StashJob>>> =
+        std::sync::OnceLock::new();
+    HELPER
+        .get_or_init(|| {
+            let (queue, jobs) = std::sync::mpsc::channel::<StashJob>();
+            std::thread::Builder::new()
+                .name("flock-stash".into())
+                .spawn(move || {
+                    for job in jobs {
+                        job();
+                    }
+                })
+                .ok()
+                .map(|_| queue)
+        })
+        .as_ref()
+}
+
+/// Run `job` beside the caller: on the persistent stash helper, so a timed
+/// prove neither creates nor tears down a thread (clone, stack and
+/// sigaltstack maps, and the exit-time unmap whose TLB shootdown interrupts
+/// every busy open worker), or on a fresh thread when the helper is disabled,
+/// unavailable, or has died.
+pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
+    if stash_helper_enabled()
+        && let Some(queue) = stash_helper()
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let wrapped: StashJob = Box::new(move || {
+            job();
+            let _ = done_tx.send(());
+        });
+        return match queue.send(wrapped) {
+            Ok(()) => StashDone::Helper(done_rx),
+            Err(std::sync::mpsc::SendError(wrapped)) => {
+                StashDone::Thread(std::thread::spawn(move || wrapped()))
+            }
+        };
+    }
+    StashDone::Thread(std::thread::spawn(job))
+}
+
 /// [`stash_pre_encoded_prefix`] with the publish-tail fix taken as an
 /// argument instead of from the process-wide env gate, so a test can encode
 /// the same bundle both ways in one process and byte-compare.
