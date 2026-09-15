@@ -203,7 +203,72 @@ impl SplitEqGhash {
 /// Ports `ntt_extend_f128_vec_ghash` (scalar form). The NTT is F_2-linear and
 /// φ_8 commutes with that linearity, which is what makes the bit-by-bit
 /// decomposition equal to the direct F_8-valued NTT extension.
+///
+/// The ranked `ell = 64` tables take the unit-image form
+/// ([`ntt_extend_f128_vec_ghash_units`]); `FLOCK_NO_NTT_EXTEND_UNITS=1`
+/// restores the 128 bit-plane passes everywhere.
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
+    if inv_table.ell == 64 && ntt_extend_units_enabled() {
+        ntt_extend_f128_vec_ghash_units(in_s, inv_table)
+    } else {
+        ntt_extend_f128_vec_ghash_bitplanes(in_s, inv_table)
+    }
+}
+
+/// `FLOCK_NO_NTT_EXTEND_UNITS=1` restores the bit-plane form of
+/// [`ntt_extend_f128_vec_ghash`]. Read once per process.
+fn ntt_extend_units_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_EXTEND_UNITS").is_none());
+    *ON
+}
+
+/// Unit-image form of [`ntt_extend_f128_vec_ghash`] for `ell = 64`.
+///
+/// The extension is `F128`-linear: with `N[z]` the bit-input NTT image of the
+/// unit input `e_z`, the bit-plane sum regroups as
+/// `out[λ] = Σ_b γ^b · φ₈(Σ_z bit_b(in[z]) · N[z][λ]) = Σ_z in[z] · φ₈(N[z][λ])`,
+/// because `γ^b = X^b` is exactly bit `b` of an `F128` and `φ₈` is additive.
+/// `φ₈(n)` is the XOR of `φ₈(2^i)` over the set bits of `n`, so each nonzero
+/// input costs one unit apply, eight multiplies and subset XORs instead of
+/// sharing 128 plane passes of 64 multiplies each. Every term is an exact field
+/// sum, so the output is bit-identical to the bit-plane form.
+pub(crate) fn ntt_extend_f128_vec_ghash_units(
+    in_s: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    const ELL: usize = 64;
+    assert_eq!(in_s.len(), ELL);
+    assert_eq!(inv_table.ell, ELL);
+    let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
+    let mut out = vec![F128::ZERO; ELL];
+    let mut unit_bits = [0u8; ELL / 8];
+    let mut image = [F8::ZERO; ELL];
+    for (z, &v) in in_s.iter().enumerate() {
+        if v == F128::ZERO {
+            continue;
+        }
+        unit_bits[z / 8] = 1u8 << (z % 8);
+        inv_table.apply(&unit_bits, &mut image);
+        unit_bits[z / 8] = 0;
+        let prods: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
+        for (dst, n) in out.iter_mut().zip(image.iter()) {
+            let mut bits = n.0;
+            while bits != 0 {
+                *dst += prods[bits.trailing_zeros() as usize];
+                bits &= bits - 1;
+            }
+        }
+    }
+    out
+}
+
+/// Bit-plane form of [`ntt_extend_f128_vec_ghash`] (every `ell`; the
+/// `FLOCK_NO_NTT_EXTEND_UNITS=1` arm and the oracle of the unit-image form).
+pub(crate) fn ntt_extend_f128_vec_ghash_bitplanes(
+    in_s: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
@@ -618,6 +683,39 @@ mod tests {
         for n in 0..=8 {
             let r = rng.f128_vec(n);
             assert_eq!(build_eq(&r), two_mul(&r), "n={n}");
+        }
+    }
+
+    /// The unit-image extension equals the bit-plane extension on the ranked
+    /// `ell = 64` table: random, sparse, single-unit and all-zero inputs.
+    #[test]
+    fn ntt_extend_units_matches_bitplanes() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(64));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut rng = Rng::new(0x0E17_E4D5);
+        let mut cases: Vec<Vec<F128>> = vec![vec![F128::ZERO; 64]];
+        for z in [0usize, 7, 8, 33, 63] {
+            let mut unit = vec![F128::ZERO; 64];
+            unit[z] = rng.f128_vec(1)[0];
+            cases.push(unit);
+        }
+        for _ in 0..24 {
+            let mut v = rng.f128_vec(64);
+            for (i, x) in v.iter_mut().enumerate() {
+                if i % 5 == 3 {
+                    *x = F128::ZERO;
+                }
+            }
+            cases.push(v);
+            cases.push(rng.f128_vec(64));
+        }
+        for (i, input) in cases.iter().enumerate() {
+            assert_eq!(
+                ntt_extend_f128_vec_ghash_units(input, &table),
+                ntt_extend_f128_vec_ghash_bitplanes(input, &table),
+                "case {i}"
+            );
         }
     }
 

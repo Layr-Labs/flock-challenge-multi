@@ -411,6 +411,12 @@ impl Challenger for FsChallenger {
                 }
                 start = start.saturating_add(GRIND_CHUNK);
             }
+        } else if grind_cursor_enabled() {
+            // Ordered cursor scan (see [`grind_cursor_scan`]): every worker
+            // claims chunks in ascending order from one counter, so no thread
+            // idles behind a single-threaded leftmost rayon leaf. Returns the
+            // same globally smallest satisfying nonce.
+            grind_cursor_scan(&state_digest, bits, kind, GRIND_CHUNK)
         } else {
             // Block-parallel search. Blocks are scanned in order and each task
             // returns the smallest match within its chunk, so the result is
@@ -1387,6 +1393,54 @@ fn pow_scan(
     }
 }
 
+/// `FLOCK_NO_GRIND_CURSOR=1` restores the incumbent rayon `find_first` block
+/// search for parallel PoW grinds. Read once per process.
+fn grind_cursor_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_CURSOR").is_none());
+    *ON
+}
+
+/// Ordered parallel PoW scan over consecutive `chunk`-nonce blocks.
+///
+/// `find_first` over an indexed range must finish every chunk left of the
+/// match, and rayon leaves the leftmost leaf range to one thread while
+/// thieves take right halves first, so the grind waits on a single-threaded
+/// leaf even when the match lies inside it. Here every pool thread claims
+/// chunk indices from one ascending counter and stops once its claim passes
+/// the best matching chunk seen so far. Claims are consecutive and every
+/// claimed chunk is scanned to completion, so every chunk below the final
+/// best was scanned: the minimum matching chunk, and `pow_scan`'s smallest
+/// nonce inside it, is exactly the sequential answer.
+fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: u64) -> u64 {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let next = AtomicU64::new(0);
+    let best_chunk = AtomicU64::new(u64::MAX);
+    let best = std::sync::Mutex::new((u64::MAX, 0u64));
+    let workers = rayon::current_num_threads().max(1);
+    (0..workers)
+        .into_par_iter()
+        .with_max_len(1)
+        .for_each(|_| loop {
+            let c = next.fetch_add(1, Ordering::Relaxed);
+            if c > best_chunk.load(Ordering::Acquire) {
+                break;
+            }
+            if let Some(n) = pow_scan(state_digest, c.saturating_mul(chunk), chunk, bits, kind) {
+                let mut guard = best.lock().unwrap_or_else(|poison| poison.into_inner());
+                if c < guard.0 {
+                    *guard = (c, n);
+                    best_chunk.store(c, Ordering::Release);
+                }
+                break;
+            }
+        });
+    let (found_chunk, nonce) = best.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    assert_ne!(found_chunk, u64::MAX, "cursor grind exited without a match");
+    nonce
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,6 +1449,34 @@ mod tests {
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    /// The ordered cursor grind returns exactly the sequential scan's nonce.
+    #[test]
+    fn grind_cursor_scan_matches_sequential_scan() {
+        const CHUNK: u64 = 1 << 10;
+        for kind in KINDS {
+            for seed in 0u8..12 {
+                let mut digest = [0u8; 32];
+                for (i, b) in digest.iter_mut().enumerate() {
+                    *b = seed.wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(7));
+                }
+                for bits in [1u32, 8, 13, 14, 16] {
+                    let mut start = 0u64;
+                    let sequential = loop {
+                        if let Some(n) = pow_scan(&digest, start, CHUNK, bits, kind) {
+                            break n;
+                        }
+                        start += CHUNK;
+                    };
+                    assert_eq!(
+                        grind_cursor_scan(&digest, bits, kind, CHUNK),
+                        sequential,
+                        "seed={seed} bits={bits}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
     /// `verify_pow` accepts at the same transcript position. State binding

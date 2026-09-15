@@ -1938,7 +1938,7 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     prefetch: &super::AbDirectPrefetch,
 ) {
     use core::arch::x86_64::*;
-    debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && N == 15));
+    debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && (N == 15 || N == 14)));
     debug_assert_eq!(live_rows.len(), (N - FIRST) * ELL);
     // SAFETY: the wrapper checks all (N - FIRST) live rows. Input loads use
     // relative offsets, while matrix/row indices retain their absolute bm.
