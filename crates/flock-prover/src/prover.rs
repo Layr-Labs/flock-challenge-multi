@@ -612,14 +612,14 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // allocation) runs on a detached helper thread concurrently with the
     // ~20 ms open instead of inside the measured publish tail. Tens of µs of
     // work; the fingerprint gate in `proof_io` makes a stale or missing
-    // stash fall back to the incumbent full encode, byte-identically.
+    // stash fall back to the incumbent full encode, byte-identically. The job
+    // runs on the process-lifetime stash helper (`proof_io::spawn_stash`).
     let stash = if crate::proof_io::pre_encode_enabled() {
         let commitment_c = commitment.clone();
         let zc_c = zc_proof.clone();
         let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
+        Some(crate::proof_io::spawn_stash(move || {
             crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
         }))
     } else {
         None
@@ -634,10 +634,10 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &lig_config,
         challenger,
     ));
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
+    if let Some(done) = stash {
+        // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
+        // complete before the publish tail looks for it.
+        done.wait();
     }
     flock_core::gaptime::mark("open: returned");
 
