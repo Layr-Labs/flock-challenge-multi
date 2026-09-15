@@ -1062,6 +1062,38 @@ fn tail_split_n_hi(n_vars: usize) -> usize {
     base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
+/// Per-chunk `eq_lo` length of the plain composed tail level whose input has
+/// `n` elements — the split [`fold2_plain_and_round_pair_lookahead_into`] and
+/// [`fold2_plain_and_round4_into`] build over `r_next[1..]` (`log₂(n) − 3`
+/// coordinates).
+pub(crate) fn plain_cascade_lo_size(n: usize) -> usize {
+    assert!(n.is_power_of_two() && n >= 16);
+    let n_vars = n.trailing_zeros() as usize - 3;
+    1usize << (n_vars - tail_split_n_hi(n_vars).min(n_vars))
+}
+
+/// Whether cascade level buffers may be handed over lane-major (see
+/// `kernels::x86_64::zc_lm_handoff_enabled`). The lane-major reader is the
+/// deferred composed fold, so the handoff also needs that route.
+pub(crate) fn zc_lane_major_handoff_on() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        kernels::x86_64::zc_lm_handoff_enabled() && kernels::x86_64::zc_fold_defer_enabled()
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static PACKED_SPLIT_N_HI_OVERRIDE: std::cell::Cell<Option<usize>> =
@@ -1137,9 +1169,9 @@ fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
 /// B-side set per 32-pair batch. `LV` survives as a four-lane vector applied
 /// to the lane-reduced accumulators once per worker chunk.
 ///
-/// Returns `None` unless the factorization is verified against every odd
-/// entry of `eq_lo`: the sweep must never trust a low tensor that is not this
-/// product.
+/// `eq_lo` is the rank-one `eq` of `r_lo` at the only production call site, so
+/// the odd-entry factorization re-check runs only when
+/// `FLOCK_NO_ZC_R2_SETUP_TRIM=1` restores it; see [`build_r2_eq_bake_checked`].
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1151,6 +1183,25 @@ fn build_r2_eq_bake(
     table: &UniSkipFoldTable,
     eq_lo: &[F128],
     r_lo: &[F128],
+) -> Option<kernels::x86_64::R2EqBake> {
+    build_r2_eq_bake_checked(table, eq_lo, r_lo, !zc_r2_setup_trim_enabled())
+}
+
+/// [`build_r2_eq_bake`] with the factorization re-check explicit: when
+/// `verify`, every odd `eq_lo` entry is re-derived as `LV·S·Etop` and any
+/// mismatch returns `None`, so the sweep never trusts a foreign low tensor.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_r2_eq_bake_checked(
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    r_lo: &[F128],
+    verify: bool,
 ) -> Option<kernels::x86_64::R2EqBake> {
     use crate::zerocheck::univariate_skip::build_eq;
     use rayon::prelude::*;
@@ -1170,12 +1221,18 @@ fn build_r2_eq_bake(
     if s.len() != 4 || etop.len() != n_batches {
         return None;
     }
-    for b in 0..n_batches {
-        for g in 0..4 {
-            for lane in 0..4 {
-                let w = lv[lane] * s[g] * etop[b];
-                if w != eq_lo[32 * b + 8 * g + 2 * lane + 1] {
-                    return None;
+    // `eq_lo` is the rank-one tensor of `r_lo`, so its odd entries factor
+    // exactly as `LV·S·Etop` (pinned by `r2_eq_bake_factorization_is_exact`).
+    // The 4,096-multiply re-verification runs only behind
+    // `FLOCK_NO_ZC_R2_SETUP_TRIM=1`.
+    if verify {
+        for b in 0..n_batches {
+            for g in 0..4 {
+                for lane in 0..4 {
+                    let w = lv[lane] * s[g] * etop[b];
+                    if w != eq_lo[32 * b + 8 * g + 2 * lane + 1] {
+                        return None;
+                    }
                 }
             }
         }
@@ -1196,7 +1253,25 @@ fn build_r2_eq_bake(
         b_mats,
         b_scale: etop,
         lane: lv,
+        canonical_elide: false,
     })
+}
+
+/// `FLOCK_NO_ZC_R2_SETUP_TRIM=1` restores two pieces of dead round-two setup:
+/// the eq-bake factorization re-check and, on the baked route (which never
+/// reads it), the `(w, w·x⁶⁴)` pair table. Read once per process.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )),
+    allow(dead_code)
+)]
+fn zc_r2_setup_trim_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_SETUP_TRIM").is_none());
+    *ON
 }
 
 fn packed_split_n_hi(n_vars: usize) -> usize {
@@ -1450,6 +1525,99 @@ fn lookahead_from_odd_weighted(agg: &[F128; 6], r_inv: F128) -> Round3Lookahead 
     }
 }
 
+/// Rows of the unbound identity-C inner fold the round-two canonical-window
+/// elision consumes: rows `0..16`, then row `240`, 64 `F128` each.
+pub(crate) const CANON_ROWS: usize = 17;
+
+/// `FLOCK_NO_ZC_R2_CANON_ELIDE=1` restores the two canonical B windows in the
+/// round-two sweep and skips their round-one capture. Read once per process.
+pub(crate) fn round2_canonical_elide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_CANON_ELIDE").is_none());
+    *ON
+}
+
+/// Exact round-two message and deferred round-three contribution of the two
+/// canonical B windows of every ranked block, from the identity-C inner fold.
+///
+/// Ranked witness brand, per 128-pair block: rows `0..16` have `B = 1` and
+/// `A = z` (static windows 0/1); row 240 has the static `B` word
+/// `0x0001_ffff_ffff_ffff` and `A = z`, and rows `241..256` are zero on both
+/// sides (window 30/31). `rows[slot·64 + s] = Σ_blocks eq(r_blk, blk)·z(blk,
+/// row, s)` with `r_blk = mlv_challenges[8..]` (slot = row, or 16 for row 240).
+/// With `col_s` the fold table's basis column (`L_s(z)`), `F(row) = Σ_s col_s ·
+/// rows[slot·64 + s]` is the eq-weighted fold of the A row over all blocks,
+/// `v0 = Σ_s col_s` the image of the all-ones B row and `v1 = Σ_{s<49} col_s`
+/// the image of row 240's B word. Expanding the sweep's accumulators
+/// (`round2_lookahead_chunk_scalar`) over those pairs, with `eq7 =
+/// eq(mlv[1..8])` over a pair's in-block index and `eq6 = eq(mlv[2..8])` over
+/// a group's (`eq(pair 2y+1) = mlv[1]·eq6(y)` absorbs the odd-lane weighting):
+///
+/// ```text
+/// ones  (pairs 0..8):  ΔG(1)  = v0·Σ_{u<8} eq7(u)·F(2u+1)
+///                      ΔW0 = v0·Σ_{y<4} eq6(y)·F(4y+2)   ΔW1 = v0·Σ_{y<4} eq6(y)·F(4y+3)
+///                      (every other term multiplies a B difference or an even sum of ones)
+/// sparse (pair 120):   ΔG(∞) = v1·eq7(120)·F(240)
+///                      ΔW3 = ΔW5 = v1·eq6(60)·F(240)
+/// ```
+///
+/// Returns `(ΔG(1), ΔG(∞), Δc)` with `Δc` in [`Round3Lookahead`]'s layout
+/// `[W0, W0+W1+W2, W2, W3, W3+W4+W5, W5]`. Every term is an exact field sum,
+/// so adding these to the sweep's sums over the remaining pairs reproduces
+/// the incumbent values bit for bit.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn round2_canonical_window_deltas(
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    rows: &[F128],
+) -> (F128, F128, [F128; 6]) {
+    use crate::zerocheck::univariate_skip::build_eq;
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(rows.len(), CANON_ROWS * 64);
+    assert!(mlv_challenges.len() >= 8);
+    let cols: [F128; 64] =
+        std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
+    let fold = |slot: usize| {
+        let mut acc = F128::ZERO;
+        for (col, value) in cols.iter().zip(&rows[slot * 64..(slot + 1) * 64]) {
+            acc += *col * *value;
+        }
+        acc
+    };
+    let v0 = cols.iter().fold(F128::ZERO, |acc, col| acc + *col);
+    let v1 = cols[..49].iter().fold(F128::ZERO, |acc, col| acc + *col);
+    let eq7 = build_eq(&mlv_challenges[1..8]);
+    let eq6 = build_eq(&mlv_challenges[2..8]);
+    let mut g1 = F128::ZERO;
+    for u in 0..8 {
+        g1 += eq7[u] * fold(2 * u + 1);
+    }
+    let (mut w0, mut w1) = (F128::ZERO, F128::ZERO);
+    for y in 0..4 {
+        w0 += eq6[y] * fold(4 * y + 2);
+        w1 += eq6[y] * fold(4 * y + 3);
+    }
+    let f240 = fold(16);
+    let d_g1 = v0 * g1;
+    let d_ginf = v1 * (eq7[120] * f240);
+    let dw0 = v0 * w0;
+    let dw1 = v0 * w1;
+    let dw3 = v1 * (eq6[60] * f240);
+    let dw5 = dw3;
+    (
+        d_g1,
+        d_ginf,
+        [dw0, dw0 + dw1, F128::ZERO, dw3, dw3 + dw5, dw5],
+    )
+}
+
 /// No-materialize round-two sweep: the round-two message and the deferred
 /// round-three coefficients, computed exactly as
 /// [`uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead`] does,
@@ -1477,6 +1645,7 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         mlv_challenges,
         padding,
         None,
+        None,
     )
 }
 
@@ -1490,6 +1659,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
+    canon: Option<&[F128]>,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1541,26 +1711,6 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let chunk_size = 2 * lo_size;
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
-    // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
-    // functions of the odd eq_lo lanes, hoisted out of the sweep (the
-    // companion CLMUL sat on the head of the chain feeding all eight
-    // accumulates). Interleaved per 8-lo group: [w×4, w·x⁶⁴×4].
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let wtab_vec = if kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8) {
-        Some(build_w_pair_table(eq_lo))
-    } else {
-        None
-    };
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    let wtab_arg = wtab_vec.as_deref();
     // Per-pass eq bake: the odd-lane weight factored into the prefold's
     // matrix sets (A per broadcast octet, B per 32-pair batch) plus a
     // period-two lane vector, so the message block consumes pre-weighted rows
@@ -1571,7 +1721,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let bake_vec = {
+    let mut bake_vec = {
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         {
             if r2_mats_arg.is_some()
@@ -1588,6 +1738,64 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             None::<kernels::x86_64::R2EqBake>
         }
     };
+    // Ranked canonical-window elision: `canon` (rows of the identity-C inner
+    // fold, see `round2_canonical_window_deltas`) arrives only on the ranked
+    // witness brand; the sweep skips the two canonical B windows only on the
+    // bake route, and exactly then the driver adds their contribution back.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let canon_elided = {
+        let rows = canon.filter(|rows| {
+            rows.len() == CANON_ROWS * 64
+                && padding.k_log == 14
+                && padding.useful_bits_per_block == 15_409
+                && m >= k_skip + 8
+                && round2_canonical_elide_enabled()
+        });
+        if rows.is_some()
+            && let Some(bk) = bake_vec.as_mut()
+        {
+            bk.canonical_elide = true;
+        }
+        rows.filter(|_| bake_vec.is_some())
+    };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let canon_elided: Option<&[F128]> = {
+        let _ = canon;
+        None
+    };
+    // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
+    // functions of the odd eq_lo lanes, hoisted out of the sweep (the
+    // companion CLMUL sat on the head of the chain feeding all eight
+    // accumulates). Interleaved per 8-lo group: [w×4, w·x⁶⁴×4].
+    // The baked message block never reads the `(w, w·x⁶⁴)` pair table, so it
+    // is built only for the prescale route (unless the setup trim is off).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_vec = if kernels::x86_64::zc_wtab_enabled()
+        && lo_size.is_multiple_of(8)
+        && !(zc_r2_setup_trim_enabled() && bake_vec.is_some())
+    {
+        Some(build_w_pair_table(eq_lo))
+    } else {
+        None
+    };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_arg = wtab_vec.as_deref();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -1693,7 +1901,16 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             },
         );
 
-    let la = lookahead_from_odd_weighted(&agg, r1_inv);
+    let mut la = lookahead_from_odd_weighted(&agg, r1_inv);
+    let (mut sum1, mut sum_inf) = (sum1, sum_inf);
+    if let Some(rows) = canon_elided {
+        let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(table, mlv_challenges, rows);
+        sum1 += d_g1;
+        sum_inf += d_ginf;
+        for (c, d) in la.c.iter_mut().zip(d_c) {
+            *c += d;
+        }
+    }
     (mlv_challenges[0] * sum1, sum_inf, la)
 }
 
@@ -1726,9 +1943,14 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
+        false,
     )
 }
 
+/// [`fold2_from_packed_and_round_pair_lookahead_into`] with an optional
+/// retained eq split and the output tile layout: `out_lm` stores lane-major
+/// sixteen-element tiles for a lane-major next cascade level (see
+/// [`zc_lane_major_handoff_on`]); it requires eight-group chunks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     a_packed: &[u8],
@@ -1743,6 +1965,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     rho2: F128,
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
+    out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
     #[cfg(all(
         target_arch = "x86_64",
@@ -1837,6 +2060,10 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let hi_size = eq_hi.len();
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
+    assert!(
+        !out_lm || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major composed output needs eight-group AVX-512 chunks"
+    );
     let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_out = 2 * lo_size;
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
@@ -1875,6 +2102,13 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         && quarter >= (1 << 23)
         && (a_out.as_ptr() as usize) % 16 == 0
         && (b_out.as_ptr() as usize) % 16 == 0;
+    // Lane-major composed prefold (see `zc_c4_lm_enabled`), once per pass.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let c4_lm = kernels::x86_64::zc_c4_lm_enabled();
 
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -1909,6 +2143,8 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     nt_out,
                     cfold_arg,
                     wtab_arg,
+                    c4_lm,
+                    out_lm,
                 )
             };
             #[cfg(not(all(
@@ -2749,6 +2985,30 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     rho_b: F128,
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead) {
+    fold2_plain_and_round_pair_lookahead_into_lm(
+        a, b, a_out, b_out, rho_a, rho_b, r_next, false, false,
+    )
+}
+
+/// [`fold2_plain_and_round_pair_lookahead_into`] with explicit tile layouts:
+/// `in_lm` reads `a`/`b` as lane-major sixteen-element tiles and `out_lm`
+/// writes `a_out`/`b_out` that way (ZMM `k` of a tile = element `k` of each of
+/// its four groups; see [`zc_lane_major_handoff_on`]). Values, message and
+/// lookahead are identical for every layout; only the element order inside
+/// each tile of the buffers differs. Either flag requires eight-group chunks
+/// and the AVX-512 kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    r_next: &[F128],
+    in_lm: bool,
+    out_lm: bool,
+) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     let n = a.len();
     assert_eq!(b.len(), n);
@@ -2771,6 +3031,10 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
     assert_eq!(lo_size * hi_size * 2, quarter);
+    assert!(
+        !(in_lm || out_lm) || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major tiles need eight-group AVX-512 chunks"
+    );
     let (kappa, r_inv) = lookahead_inv_factors(r);
 
     let chunk_in = 8 * lo_size;
@@ -2810,6 +3074,13 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
         && quarter >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
         && (a_out.as_ptr() as usize) % 16 == 0
         && (b_out.as_ptr() as usize) % 16 == 0;
+    // Split-companion deferred fold (see `zc_defer_split_enabled`), once per pass.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let split = kernels::x86_64::zc_defer_split_enabled();
 
     let (sum1, sum_inf, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -2828,7 +3099,8 @@ pub fn fold2_plain_and_round_pair_lookahead_into(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm,
+                    out_lm, split,
                 )
             };
             #[cfg(not(all(
@@ -3068,6 +3340,67 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 
 #[cfg(test)]
 mod tests {
+    /// The re-verification `FLOCK_NO_ZC_R2_SETUP_TRIM` keeps is an identity:
+    /// the packed round-two split's low eq tensor factors as
+    /// `LV(lane)·S(g)·Etop(B)` on every odd entry the eq bake reads.
+    #[test]
+    fn r2_eq_bake_factorization_is_exact() {
+        use crate::challenger::Challenger;
+        use crate::zerocheck::univariate_skip::build_eq;
+        let mut rng = crate::challenger::RandomChallenger::new(0x2EB4_0001);
+        let mut checked = 0usize;
+        for n_vars in [10usize, 12, 16, 20, 25] {
+            let challenges = rng.sample_f128_vec(n_vars + 1);
+            let eq = packed_round2_split_eq(&challenges);
+            let lo_size = 1usize << eq.n_lo;
+            if eq.n_lo < 5 || !lo_size.is_multiple_of(32) {
+                continue;
+            }
+            let r_lo = &challenges[1..1 + eq.n_lo];
+            let eq3 = build_eq(&r_lo[..3]);
+            let lv: [F128; 4] = std::array::from_fn(|l| eq3[1 + 2 * l]);
+            let s = build_eq(&r_lo[3..5]);
+            let etop = build_eq(&r_lo[5..]);
+            for b in 0..lo_size / 32 {
+                for g in 0..4 {
+                    for lane in 0..4 {
+                        assert_eq!(
+                            lv[lane] * s[g] * etop[b],
+                            eq.lo[32 * b + 8 * g + 2 * lane + 1],
+                            "n_vars={n_vars} b={b} g={g} lane={lane}"
+                        );
+                    }
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no bake-shaped split exercised");
+    }
+
+    /// The fast composed-fold matrix build is the scalar bit loop's matrices.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn cfold_mats_from_cols_match_scaled_bit_loop() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0xCF01_D4A7);
+        for _ in 0..8 {
+            let data = rng.sample_f128_vec(8 * 256);
+            let c = rng.sample_f128();
+            let cols: [F128; 64] =
+                std::array::from_fn(|i| c * data[(i / 8) * 256 + (1usize << (i % 8))]);
+            assert_eq!(
+                kernels::x86_64::build_row_fold_mats_from_cols(&cols),
+                kernels::x86_64::build_row_fold_mats_scaled(&data, c)
+            );
+        }
+    }
+
     use super::*;
 
     /// Independent restatement of the Lagrange weight formula:
@@ -4378,7 +4711,150 @@ mod tests {
         let r_lo: Vec<F128> = (0..5).map(|_| rng.f128()).collect();
         let mut eq_lo = build_eq(&r_lo);
         eq_lo[7] += F128::ONE;
-        assert!(build_r2_eq_bake(&table, &eq_lo, &r_lo).is_none());
+        assert!(build_r2_eq_bake_checked(&table, &eq_lo, &r_lo, true).is_none());
+    }
+
+    /// Packed a/b with the ranked witness brand on the canonical rows of every
+    /// 256-row block: B rows 0..16 all ones, B row 240 = the static 49-bit
+    /// word, A row 240 a 49-bit word, rows 241..256 zero on both sides.
+    fn ranked_canonical_witness(rng: &mut Rng, n_rows: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut a: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+        let mut b: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+        for blk in 0..n_rows / 256 {
+            let row = |r: usize| (blk * 256 + r) * 8;
+            b[row(0)..row(16)].fill(0xff);
+            b[row(240)..row(256)].fill(0);
+            b[row(240)..row(241)].copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+            let w = u64::from_le_bytes(a[row(240)..row(241)].try_into().unwrap())
+                & 0x0001_ffff_ffff_ffff;
+            a[row(240)..row(241)].copy_from_slice(&w.to_le_bytes());
+            a[row(241)..row(256)].fill(0);
+        }
+        (a, b)
+    }
+
+    /// `Σ_blocks eq(mlv[8..], blk) · bit(A row, s)` for rows 0..16 and 240 —
+    /// the identity-C inner-fold rows the elision consumes (A = z there).
+    fn canonical_rows_direct(a: &[u8], mlv: &[F128], n_blocks: usize) -> Vec<F128> {
+        use crate::zerocheck::univariate_skip::build_eq;
+        let eq_blocks = build_eq(&mlv[8..]);
+        assert_eq!(eq_blocks.len(), n_blocks);
+        let mut rows = vec![F128::ZERO; CANON_ROWS * 64];
+        for (slot, row) in (0..16).chain([240usize]).enumerate() {
+            for (blk, e) in eq_blocks.iter().enumerate() {
+                let off = (blk * 256 + row) * 8;
+                let word = u64::from_le_bytes(a[off..off + 8].try_into().unwrap());
+                for s in 0..64 {
+                    if (word >> s) & 1 == 1 {
+                        rows[slot * 64 + s] += *e;
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The delta formulas are exactly the two canonical windows: the
+    /// incumbent sweep over the full witness equals the sweep over the same
+    /// witness with both windows zeroed, plus the deltas. Runs on every
+    /// target (portable or AVX-512 sweep, no elision).
+    #[test]
+    fn round2_canonical_window_deltas_are_the_windows() {
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        for blocks_log in [3usize, 4] {
+            let m = K_SKIP + 8 + blocks_log;
+            let n_rows = 1usize << (m - K_SKIP);
+            let mut rng = Rng::new(0xCA70 + blocks_log as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            let mut mlv: Vec<F128> = (0..m - K_SKIP).map(|_| rng.f128()).collect();
+            mlv[0] = F128::ONE;
+            let (mut a, mut b) = ranked_canonical_witness(&mut rng, n_rows);
+            let rows = canonical_rows_direct(&a, &mlv, n_rows / 256);
+            let full = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
+            );
+            for blk in 0..n_rows / 256 {
+                let row = |r: usize| (blk * 256 + r) * 8;
+                a[row(0)..row(16)].fill(0);
+                b[row(0)..row(16)].fill(0);
+                a[row(240)..row(256)].fill(0);
+                b[row(240)..row(256)].fill(0);
+            }
+            let rest = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
+            );
+            let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
+            assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
+            assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
+            for i in 0..6 {
+                assert_eq!(full.2.c[i], rest.2.c[i] + d_c[i], "c[{i}] blocks_log={blocks_log}");
+            }
+        }
+    }
+
+    /// AVX-512 sweep with the canonical windows elided (and their deltas added)
+    /// is bit-identical to the incumbent sweep, on both round-two body arms.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn round2_canonical_elide_matches_incumbent() {
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        for &(blocks_log, n_hi) in &[(4usize, 2usize), (5, 1), (5, 4), (6, 5)] {
+            for unroll16 in [true, false] {
+                // The driver sweeps its chunks on rayon workers, so the arm
+                // override must be installed on every worker of a dedicated
+                // pool; a test-thread override alone never reaches the kernel.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(4)
+                    .start_handler(move |_| {
+                        std::mem::forget(kernels::x86_64::R2Unroll16Override::set(unroll16));
+                    })
+                    .build()
+                    .expect("unroll16 override pool");
+                pool.install(|| {
+                    let m = K_SKIP + 8 + blocks_log;
+                    let n_rows = 1usize << (m - K_SKIP);
+                    let mut rng = Rng::new(0xCA71 + (blocks_log * 16 + n_hi) as u64);
+                    let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+                    let mut mlv: Vec<F128> = (0..m - K_SKIP).map(|_| rng.f128()).collect();
+                    mlv[0] = F128::ONE;
+                    let (a, b) = ranked_canonical_witness(&mut rng, n_rows);
+                    let rows = canonical_rows_direct(&a, &mlv, n_rows / 256);
+                    let eq = SplitEqGhash::with_n_hi(&mlv[1..], n_hi);
+                    assert!((1usize << eq.n_lo) >= 32 && eq.n_lo < mlv.len());
+                    let incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None,
+                    );
+                    let hits = kernels::x86_64::R2_CANON_ELIDE_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let elided = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows),
+                    );
+                    assert!(
+                        kernels::x86_64::R2_CANON_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                            > hits,
+                        "elision never engaged"
+                    );
+                    assert_eq!(
+                        incumbent, elided,
+                        "blocks_log={blocks_log} n_hi={n_hi} unroll16={unroll16}"
+                    );
+                });
+            }
+        }
     }
 
     /// AVX-512 lookahead sweep kernel vs the portable reference on one chunk,
@@ -4520,6 +4996,105 @@ mod tests {
         }
     }
 
+    /// Transpose every sixteen-element tile of `v` between the group-major and
+    /// lane-major layouts (ZMM `k` of a tile = element `k` of each of its four
+    /// groups). The permutation is an involution.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    fn lane_major_tiles(v: &[F128]) -> Vec<F128> {
+        assert!(v.len().is_multiple_of(16));
+        let mut out = v.to_vec();
+        for t in (0..v.len()).step_by(16) {
+            for g in 0..4 {
+                for k in 0..4 {
+                    out[t + 4 * k + g] = v[t + 4 * g + k];
+                }
+            }
+        }
+        out
+    }
+
+    /// Lane-major handoff across two plain cascade levels: the writer's
+    /// lane-major tables are the row-major tables with every tile transposed,
+    /// and the lane-major reader reproduces the row-major level's tables,
+    /// message and lookahead from them.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn cascade_lane_major_handoff_matches_row_major() {
+        if !zc_lane_major_handoff_on() {
+            return;
+        }
+        for &log_n in &[16usize, 17, 18] {
+            let mut rng = Rng::new(0x1A00 + log_n as u64);
+            let n = 1usize << log_n;
+            assert!(plain_cascade_lo_size(n).is_multiple_of(8), "log_n={log_n}");
+            assert!(plain_cascade_lo_size(n / 4).is_multiple_of(8), "log_n={log_n}");
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let (rho_a, rho_b, rho_c, rho_d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
+            let mut r1 = vec![F128::ONE; log_n - 2];
+            for v in r1[1..].iter_mut() {
+                *v = rng.f128();
+            }
+            let mut r2 = vec![F128::ONE; log_n - 4];
+            for v in r2[1..].iter_mut() {
+                *v = rng.f128();
+            }
+            let probe = rng.f128();
+
+            let mut a1 = vec![F128::ZERO; n / 4];
+            let mut b1 = vec![F128::ZERO; n / 4];
+            let (m1, mi1, la1) =
+                fold2_plain_and_round_pair_lookahead_into(&a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1);
+            let mut a1l = vec![F128::ZERO; n / 4];
+            let mut b1l = vec![F128::ZERO; n / 4];
+            let (m1l, mi1l, la1l) = fold2_plain_and_round_pair_lookahead_into_lm(
+                &a, &b, &mut a1l, &mut b1l, rho_a, rho_b, &r1, false, true,
+            );
+            assert_eq!((m1, mi1), (m1l, mi1l), "writer msg log_n={log_n}");
+            assert_eq!(lane_major_tiles(&a1), a1l, "writer a log_n={log_n}");
+            assert_eq!(lane_major_tiles(&b1), b1l, "writer b log_n={log_n}");
+            assert_eq!(
+                eval_round3_lookahead(&la1, probe),
+                eval_round3_lookahead(&la1l, probe),
+                "writer lookahead log_n={log_n}"
+            );
+
+            let mut a2 = vec![F128::ZERO; n / 16];
+            let mut b2 = vec![F128::ZERO; n / 16];
+            let (m2, mi2, la2) = fold2_plain_and_round_pair_lookahead_into(
+                &a1, &b1, &mut a2, &mut b2, rho_c, rho_d, &r2,
+            );
+            for out_lm in [false, true] {
+                let mut a2l = vec![F128::ZERO; n / 16];
+                let mut b2l = vec![F128::ZERO; n / 16];
+                let (m2l, mi2l, la2l) = fold2_plain_and_round_pair_lookahead_into_lm(
+                    &a1l, &b1l, &mut a2l, &mut b2l, rho_c, rho_d, &r2, true, out_lm,
+                );
+                let (a_want, b_want) = if out_lm {
+                    (lane_major_tiles(&a2), lane_major_tiles(&b2))
+                } else {
+                    (a2.clone(), b2.clone())
+                };
+                assert_eq!((m2, mi2), (m2l, mi2l), "reader msg log_n={log_n} out_lm={out_lm}");
+                assert_eq!(a_want, a2l, "reader a log_n={log_n} out_lm={out_lm}");
+                assert_eq!(b_want, b2l, "reader b log_n={log_n} out_lm={out_lm}");
+                assert_eq!(
+                    eval_round3_lookahead(&la2, probe),
+                    eval_round3_lookahead(&la2l, probe),
+                    "reader lookahead log_n={log_n} out_lm={out_lm}"
+                );
+            }
+        }
+    }
+
     /// AVX-512 composed-fold kernel vs the portable reference on one chunk.
     #[cfg(all(
         target_arch = "x86_64",
@@ -4628,7 +5203,8 @@ mod tests {
             // SAFETY: lengths satisfy the kernel's contract.
             let out_v = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None, false,
+                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None, false, false,
+                    false, false,
                 )
             };
             assert_eq!(a_s, a_v, "a lo_size={lo_size}");
@@ -4652,11 +5228,64 @@ mod tests {
                         &eq_lo,
                         Some(&wtab),
                         false,
+                        false,
+                        false,
+                        false,
                     )
                 };
                 assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
                 assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
                 assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+
+                // Lane-major input/output tiles and the split-companion
+                // deferred fold, every combination against the same oracle
+                // (layouts converted tile by tile).
+                let a_in_lm = lane_major_tiles(&a_in);
+                let b_in_lm = lane_major_tiles(&b_in);
+                for in_lm in [false, true] {
+                    for out_lm in [false, true] {
+                        for split in [false, true] {
+                            for use_wtab in [false, true] {
+                                let (ai, bi) = if in_lm {
+                                    (&a_in_lm, &b_in_lm)
+                                } else {
+                                    (&a_in, &b_in)
+                                };
+                                let mut a_c = vec![F128::ONE; 2 * lo_size];
+                                let mut b_c = vec![F128::ONE; 2 * lo_size];
+                                // SAFETY: same checked geometry; `lo_size` is
+                                // a multiple of eight, as both layouts need.
+                                let out_c = unsafe {
+                                    kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                                        ai,
+                                        bi,
+                                        &mut a_c,
+                                        &mut b_c,
+                                        rho_a,
+                                        rho_b,
+                                        &eq_lo,
+                                        use_wtab.then_some(&wtab[..]),
+                                        false,
+                                        in_lm,
+                                        out_lm,
+                                        split,
+                                    )
+                                };
+                                let (a_want, b_want) = if out_lm {
+                                    (lane_major_tiles(&a_s), lane_major_tiles(&b_s))
+                                } else {
+                                    (a_s.clone(), b_s.clone())
+                                };
+                                let tag = format!(
+                                    "lo_size={lo_size} in_lm={in_lm} out_lm={out_lm} split={split} wtab={use_wtab}"
+                                );
+                                assert_eq!(a_want, a_c, "a {tag}");
+                                assert_eq!(b_want, b_c, "b {tag}");
+                                assert_eq!(out_s, out_c, "sums {tag}");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5002,8 +5631,17 @@ mod tests {
             };
             #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
             let cfold_built: Option<kernels::x86_64::CFoldMats> = None;
+            let out_lm_arms: &[bool] = if lo_size % 8 == 0 {
+                &[false, true]
+            } else {
+                &[false]
+            };
             for cfold_arg in [None, cfold_built.as_ref()] {
-                for nt_out in [false, true] {
+                for (nt_out, c4_lm, out_lm) in [false, true]
+                    .into_iter()
+                    .flat_map(|nt| [false, true].into_iter().map(move |c4| (nt, c4)))
+                    .flat_map(|(nt, c4)| out_lm_arms.iter().map(move |&lm| (nt, c4, lm)))
+                {
                     let mut a_v = vec![F128::ONE; 2 * lo_size];
                     let mut b_v = vec![F128::ONE; 2 * lo_size];
                     // SAFETY: rows/table/output lengths satisfy the kernel's
@@ -5027,21 +5665,22 @@ mod tests {
                             nt_out,
                             cfold_arg,
                             wtab_test.as_deref(),
+                            c4_lm,
+                            out_lm,
                         )
                     };
                     let baked = cfold_arg.is_some();
-                    assert_eq!(
-                        a_s, a_v,
-                        "a lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}"
+                    let (a_want, b_want) = if out_lm {
+                        (lane_major_tiles(&a_s), lane_major_tiles(&b_s))
+                    } else {
+                        (a_s.clone(), b_s.clone())
+                    };
+                    let tag = format!(
+                        "lo_size={lo_size} mask={mask} nt={nt_out} baked={baked} c4_lm={c4_lm} out_lm={out_lm}"
                     );
-                    assert_eq!(
-                        b_s, b_v,
-                        "b lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}"
-                    );
-                    assert_eq!(
-                        out_s, out_v,
-                        "sums lo_size={lo_size} mask={mask} nt={nt_out} baked={baked}"
-                    );
+                    assert_eq!(a_want, a_v, "a {tag}");
+                    assert_eq!(b_want, b_v, "b {tag}");
+                    assert_eq!(out_s, out_v, "sums {tag}");
                 }
             }
         }
@@ -5847,6 +6486,21 @@ mod tests {
                 );
             }
             assert_eq!(c4b, c4, "c4 broadcast factorisation, dead={dead:#010b}");
+            let mut c4l = [F128::ZERO; 64];
+            // SAFETY: as above; the lane-major twin writes sixteen F128s.
+            unsafe {
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_lm(
+                    poisoned.as_ptr(),
+                    &cm,
+                    c4l.as_mut_ptr(),
+                    dead,
+                );
+            }
+            assert_eq!(
+                c4l[..16],
+                lane_major_tiles(&c4[..16])[..],
+                "c4 lane-major twin, dead={dead:#010b}"
+            );
         }
         // ... and both against the scalar composed fold on live rows.
         let mut c4 = [F128::ZERO; 64];

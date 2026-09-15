@@ -29,11 +29,12 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
-    fold2_plain_and_round_pair_lookahead_into, fold2_plain_and_round4_into,
+    fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
-    packed_round2_split_eq, round_pair_naive, uni_skip_fold_and_round_pair_optimized_packed_padded,
+    packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
-    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq,
+    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq, zc_lane_major_handoff_on,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -450,6 +451,14 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
     )
 }
 
+/// `FLOCK_W30_ELIDE_DEBUG=1` prints when round one adds the elided window 30
+/// from the identity-C fold. Diagnostics only; read once per process.
+fn w30_elide_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_W30_ELIDE_DEBUG").is_some());
+    *ON
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
@@ -514,6 +523,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         inv_table_owned = build_urm_inv_table(k_skip);
         &inv_table_owned
     };
+    // Unbound identity-C inner-fold rows for the round-two canonical-window
+    // elision (ranked one-row brand only; see `multilinear::CANON_ROWS`).
+    let mut r2_canon_rows: Option<Vec<F128>> = None;
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -536,7 +548,18 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::pcs::ranked_direct_fold4_enabled(),
                 "identity-C reuse requires ranked DirectFold4"
             );
+            // Window-30 elision needs row 240 of the identity-C inner fold,
+            // which only the parallel one-row fold captures; the producer
+            // never elides window 30 on the serial route
+            // (`ranked_w30_elide_enabled`), so no restore is needed here.
+            debug_assert!(
+                !ab_inner.ranked_w30_elided() || crate::serial_par_enabled(),
+                "window-30 elision without the parallel identity-C capture"
+            );
             let ranked_one_rows = ab_inner.ranked_one_rows_elided();
+            let w30_elided = ab_inner.ranked_w30_elided();
+            let capture_canon = ranked_one_rows
+                && (multilinear::round2_canonical_elide_enabled() || w30_elided);
             // The two halves are independent (round one has no Fiat-Shamir
             // dependency inside it), so run them concurrently rather than
             // back to back: each alone reaches only ~35 GB/s, while the pair
@@ -552,8 +575,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let c_closure = || {
                 let t = std::time::Instant::now();
-                let (c, s_hat_v_c, quad, fold4, fold8, one_ab) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z(
+                let (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z_with_canon(
                         c_identity_z,
                         m,
                         padding.k_log,
@@ -562,6 +585,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         &r,
                         inv_table,
                         ranked_one_rows,
+                        capture_canon,
                     );
                 (
                     c,
@@ -570,6 +594,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     fold4,
                     fold8,
                     one_ab,
+                    canon,
                     t.elapsed().as_secs_f64() * 1e3,
                 )
             };
@@ -580,13 +605,33 @@ fn prove_packed_padded_inner<C: Challenger>(
             // happened to co-schedule. Schedule only: identical closures over
             // identical inputs, so the proof bytes are unchanged. Falls back to
             // the incumbent `rayon::join` whenever the pools are absent.
-            let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, t_c_ms)) =
+            let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
                     Some((ab_pool, c_pool)) => {
                         rayon::join(|| ab_pool.install(ab_closure), || c_pool.install(c_closure))
                     }
                     None => rayon::join(ab_closure, c_closure),
                 };
+            if w30_elided {
+                let rows = canon
+                    .as_ref()
+                    .expect("window-30 elision requires the row-240 identity-C capture");
+                let delta = crate::zerocheck::univariate_skip_optimized::round1_w30_delta_ab(
+                    &rows[16 * 64..17 * 64],
+                    &r,
+                    k_skip,
+                    padding.k_log,
+                    inv_table,
+                );
+                debug_assert_eq!(ab.len(), delta.len());
+                for (dst, src) in ab.iter_mut().zip(delta) {
+                    *dst += src;
+                }
+                if w30_elide_debug() {
+                    eprintln!("[w30-elide] engaged: window 30 added from identity-C row 240");
+                }
+            }
+            r2_canon_rows = canon;
             if let Some(one_ab) = one_ab {
                 debug_assert_eq!(ab.len(), one_ab.len());
                 for (dst, src) in ab.iter_mut().zip(one_ab) {
@@ -763,6 +808,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
             packed_eq.as_ref(),
+            r2_canon_rows.as_deref(),
         );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
@@ -923,6 +969,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2·levels needs no other change.
     let mut la = lookahead;
+    // Lane-major level handoff (`zc_lane_major_handoff_on`), resolved once;
+    // `lm_in` carries the layout the previous level stored.
+    let lm_handoff = zc_lane_major_handoff_on();
+    let mut lm_in = false;
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
@@ -943,7 +993,12 @@ fn prove_packed_padded_inner<C: Challenger>(
         let quarter = n_cur / 4;
         let mut r_next = vec![F128::ONE; log_n_cur - 2];
         r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 3..]);
-        let (m_even_1, m_even_inf) = if level == 0 && use_nomat {
+        // This level may store lane-major tiles only for another lookahead
+        // level (the last level's pair fold reads row-major) whose chunks are
+        // all eight-group chunks; its own chunk split is checked per branch.
+        let lm_reader_ok =
+            lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter) % 8 == 0;
+        let (m_even_1, m_even_inf, lm_out) = if level == 0 && use_nomat {
             // Rounds 3+4 straight from the packed witness (see above); the
             // outputs land in freshly taken N/4 buffers, and the old (empty)
             // pair is dropped. Also yields the round-five lookahead.
@@ -955,6 +1010,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
                 _ => None,
             };
+            let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
             let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 a_packed,
                 b_packed,
@@ -968,15 +1024,32 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[1],
                 &r_next,
                 eq_override,
+                lm_out,
             );
             a_mlv = a4;
             b_mlv = b4;
             if level + 1 < n_levels {
                 la = Some(la_next);
             }
-            (m1, mi)
+            (m1, mi, lm_out)
         } else if level + 1 < n_levels {
-            let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into(
+            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0;
+            let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into_lm(
+                &a_mlv,
+                &b_mlv,
+                &mut a_nxt[..quarter],
+                &mut b_nxt[..quarter],
+                mlv_rhos[2 * level],
+                mlv_rhos[2 * level + 1],
+                &r_next,
+                lm_in,
+                lm_out,
+            );
+            la = Some(la_next);
+            (m1, mi, lm_out)
+        } else {
+            debug_assert!(!lm_in, "the last composed level reads row-major pairs");
+            let (m1, mi) = fold2_plain_and_round4_into(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..quarter],
@@ -985,19 +1058,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[2 * level + 1],
                 &r_next,
             );
-            la = Some(la_next);
-            (m1, mi)
-        } else {
-            fold2_plain_and_round4_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..quarter],
-                &mut b_nxt[..quarter],
-                mlv_rhos[2 * level],
-                mlv_rhos[2 * level + 1],
-                &r_next,
-            )
+            (m1, mi, false)
         };
+        lm_in = lm_out;
         if !(level == 0 && use_nomat) {
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
