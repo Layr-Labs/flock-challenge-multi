@@ -315,6 +315,56 @@ fn build_ab_eq_fold_mats(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<u64> {
 ))]
 const AB_EQ_FOLD_MATS_PAR_MIN_W: usize = 8;
 
+/// `FLOCK_NO_ZC_AB_MATS_TRANSPOSE=1` restores the scalar 16×16×8×8 bit loop
+/// of the round-one AB eq-fold matrix build. Read once per process.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )),
+    allow(dead_code)
+)]
+fn ab_eq_fold_mats_transpose_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_MATS_TRANSPOSE").is_none());
+    *ON
+}
+
+/// One 256-qword row of the AB eq-fold matrices for `scale`: per input byte
+/// `bm`, the eight scaled basis images go through the shared 8-lane →
+/// 64-column bit transpose into sixteen `VGF2P8AFFINEQB` matrices — the
+/// encoding `build_row_fold_mats_from_cols` already uses (output row `i` at
+/// byte `7 - i`). Same matrices as the scalar bit loop.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    )),
+    allow(dead_code)
+)]
+fn ab_eq_fold_mats_row_transposed(convert: &[F128], scale: F128, row: &mut [u64]) {
+    debug_assert_eq!(row.len(), 256);
+    for bm in 0..16 {
+        let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * scale);
+        let lo_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].lo);
+        let hi_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].hi);
+        let mut lo_bytes = [0u8; 64];
+        let mut hi_bytes = [0u8; 64];
+        crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+        crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+        for c in 0..8 {
+            let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            row[bm * 16 + c] = u64::from_le_bytes(lo).swap_bytes();
+            row[bm * 16 + 8 + c] = u64::from_le_bytes(hi).swap_bytes();
+        }
+    }
+}
+
 /// Body of [`build_ab_eq_fold_mats`]. The per-`w` row — eight basis scales
 /// plus a 128×8 bit transpose into sixteen 8×8 matrices — is a pure function
 /// of `eq_top_scaled[w]` writing its own disjoint 256-qword row, so `par`
@@ -331,7 +381,12 @@ const AB_EQ_FOLD_MATS_PAR_MIN_W: usize = 8;
 ))]
 fn build_ab_eq_fold_mats_gated(eq_top_scaled: &[F128], convert: &[F128], par: bool) -> Vec<u64> {
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    let transposed = ab_eq_fold_mats_transpose_enabled();
     let fill_row = |scale: &F128, row: &mut [u64]| {
+        if transposed {
+            ab_eq_fold_mats_row_transposed(convert, *scale, row);
+            return;
+        }
         for bm in 0..16 {
             let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * *scale);
             for k in 0..16 {
@@ -353,7 +408,10 @@ fn build_ab_eq_fold_mats_gated(eq_top_scaled: &[F128], convert: &[F128], par: bo
             }
         }
     };
-    let mut mats = vec![0u64; eq_top_scaled.len() * 256];
+    // Both `fill_row` arms store all 256 qwords of their row and the loops
+    // below visit every row, so the table skips the zero-fill (a recycled
+    // block would otherwise be memset on every prove).
+    let mut mats = crate::alloc_uninit_vec::<u64>(eq_top_scaled.len() * 256);
     if par && eq_top_scaled.len() >= AB_EQ_FOLD_MATS_PAR_MIN_W {
         use rayon::prelude::*;
         mats.par_chunks_mut(256)
@@ -460,6 +518,11 @@ pub struct Round1AbInner {
     /// Ranked BLAKE3 residual rows 2..=30 are stored contiguously: 29 cache
     /// lines per witness block instead of the dense 32-line address space.
     ranked_compact: bool,
+    /// Ranked BLAKE3 only: round one must not read window 30 (`b_med` 14 of
+    /// every odd outer window). Its K0 row is `z` against the static B30
+    /// constant, so round one adds the exact contribution from the identity-C
+    /// inner fold instead ([`round1_w30_delta_ab`]).
+    ranked_w30_elided: bool,
 }
 
 const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
@@ -485,6 +548,7 @@ impl Round1AbInner {
             invalid_prefix_bytes: 0,
             ranked_one_rows_elided: false,
             ranked_compact: false,
+            ranked_w30_elided: false,
         }
     }
 
@@ -503,6 +567,7 @@ impl Round1AbInner {
             invalid_prefix_bytes: 0,
             ranked_one_rows_elided: false,
             ranked_compact: true,
+            ranked_w30_elided: false,
         }
     }
 
@@ -528,6 +593,19 @@ impl Round1AbInner {
     #[inline]
     pub fn ranked_compact(&self) -> bool {
         self.ranked_compact
+    }
+
+    /// Brand window 30 as elided (see the field). Only the ranked one-row
+    /// representation carries it.
+    pub fn set_ranked_w30_elided(&mut self) {
+        assert!(self.ranked_one_rows_elided);
+        self.ranked_w30_elided = true;
+    }
+
+    /// Whether round one must add window 30 from the identity-C fold.
+    #[inline]
+    pub fn ranked_w30_elided(&self) -> bool {
+        self.ranked_w30_elided
     }
 
     /// Restore dense AB when a consumer cannot add the identity-C one rows.
@@ -556,6 +634,7 @@ impl Round1AbInner {
         self.invalid_prefix_bytes = self.dense_len_bytes;
         self.fill_invalid_prefix(a_packed, b_packed, inv_table);
         self.ranked_one_rows_elided = false;
+        self.ranked_w30_elided = false;
     }
 
     /// Declare the leading `bytes` of the storage unwritten (the producer
@@ -641,6 +720,29 @@ pub fn ranked_ab_compact_enabled() -> bool {
 pub fn ranked_one_rows_reuse_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_ONE_REUSE").is_none());
+    *ON
+}
+
+/// Opt-in `FLOCK_ZC_FOLD8_DIRECT_SHAT=1` collapses fold8 → s_hat_v_c and
+/// skips Fold4/quad. Default OFF: 2d7becf (layout 4232) 1,644,618 and
+/// 54081c0 (layout 3432) 1,644,272, both verified ~0.2% under fire4.
+/// `pre_c_slot` still keys on `fold8.is_some()` if this is turned on.
+pub(crate) fn zc_fold8_direct_shat_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_FOLD8_DIRECT_SHAT").is_some());
+    *ON
+}
+
+/// Ranked window-30 elision (default on): the producer skips window 30's
+/// round-one AB transform and round one adds its exact contribution from the
+/// identity-C inner fold. `FLOCK_NO_ZC_R1_W30_ELIDE=1` restores the transform
+/// and its consumer. Read once per process. Only the parallel identity-C
+/// fold captures row 240, so the elision also requires `FLOCK_NO_SERIAL_PAR`
+/// to be unset: on the serial route window 30 is produced exactly as before.
+pub fn ranked_w30_elide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R1_W30_ELIDE").is_none() && crate::serial_par_enabled()
+    });
     *ON
 }
 
@@ -759,6 +861,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         invalid_prefix_bytes: 0,
         ranked_one_rows_elided: false,
         ranked_compact: false,
+        ranked_w30_elided: false,
     }
 }
 
@@ -1038,6 +1141,30 @@ pub struct Round1AbWindowPlan {
     kernel: kernels::ShiftReducePlan,
     nt: u8,
     bcomplement_static: bool,
+    /// σ-images the ranked AVX-512 K-row applies address: 2, 4 or 8.
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )),
+        allow(dead_code)
+    )]
+    table_images: u8,
+    /// Residual windows 2/29 drop their structural B=1 bytes through the
+    /// checked complement identity (`FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`
+    /// restores the full B applies).
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )),
+        allow(dead_code)
+    )]
+    residual_bcomplement: bool,
 }
 
 impl Round1AbWindowPlan {
@@ -1107,12 +1234,61 @@ pub fn prepare_round1_ab_window_plan(
         0
     };
     let kernel = kernels::prepare_shift_reduce(inv_table);
+    let bcomplement_static = prepare_round1_bcomplement_static(inv_table, kernel);
     Round1AbWindowPlan {
         bstatic: kernels::prepare_bstatic(inv_table),
         kernel,
         nt,
-        bcomplement_static: prepare_round1_bcomplement_static(inv_table, kernel),
+        bcomplement_static,
+        table_images: prepare_round1_table_images(inv_table, kernel),
+        residual_bcomplement: bcomplement_static && round1_residual_bcomplement_enabled(),
     }
+}
+
+/// σ-images the ranked offsets kernels may address: more than the incumbent
+/// two only for the image-reading kernel over the ranked `ell = 64` table,
+/// and never more than the table was built with (see
+/// `InvNttTableByteSingleGf8::table_image_count`; the default table carries
+/// two, the opt-in `FLOCK_INV_TABLE_IMAGES4=1` / `FLOCK_INV_IMAGES8=1` more).
+fn prepare_round1_table_images(
+    inv_table: &InvNttTableByteSingleGf8,
+    kernel: kernels::ShiftReducePlan,
+) -> u8 {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        if kernel.uses_images() && inv_table.ell == 64 && inv_table.n_chunks == 8 {
+            match inv_table.table_image_count() {
+                n if n >= 8 => return 8,
+                n if n >= 4 => return 4,
+                _ => {}
+            }
+        }
+        2
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    {
+        let _ = (inv_table, kernel);
+        2
+    }
+}
+
+/// Disable-only switch for the residual-window B complement
+/// (`FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`). Read once per process.
+fn round1_residual_bcomplement_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT").is_none()
+    });
+    *ON
 }
 
 /// Validate the algebraic table identity used by the ranked-static
@@ -1473,11 +1649,25 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
-            off.as_ptr(),
-            out,
-            (imgs.0, imgs.1),
-        );
+        // `table_images` is fixed for the whole plan; the incumbent two-image
+        // leaf is the default arm.
+        match plan.table_images {
+            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                8,
+            >(off.as_ptr(), out, (imgs.0, imgs.1)),
+            4 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                4,
+            >(off.as_ptr(), out, (imgs.0, imgs.1)),
+            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+                off.as_ptr(),
+                out,
+                (imgs.0, imgs.1),
+            ),
+        }
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -1509,12 +1699,23 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
         target_feature = "avx512bw"
     ))]
     unsafe {
-        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
-            off.as_ptr(),
-            out,
-            (imgs.0, imgs.1),
-            keep,
-        );
+        use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        let op = off.as_ptr();
+        let im = (imgs.0, imgs.1);
+        // Both selectors are fixed for the plan. The incumbent kernel is the
+        // default two-image table with `FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`.
+        match (plan.residual_bcomplement, plan.table_images) {
+            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
+            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
+            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
+            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
+            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
+            (false, _) => {
+                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+                    op, out, im, keep,
+                )
+            }
+        }
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -2523,7 +2724,9 @@ pub(crate) const C_FOLD4_MATS_PER_GROUP: usize = 32;
 fn build_c_fold4_gfni_mats(eq_lo: &[F128]) -> Vec<u64> {
     assert!(eq_lo.len().is_multiple_of(4));
     let d_hi_inv_val = d_hi_inv();
-    let mut mats = vec![0u64; (eq_lo.len() / 4) * C_FOLD4_MATS_PER_GROUP];
+    // `build_one_group_mats` stores all C_FOLD4_MATS_PER_GROUP qwords of every
+    // slot (two halves x sixteen byte columns), so no zero-fill is needed.
+    let mut mats = crate::alloc_uninit_vec::<u64>((eq_lo.len() / 4) * C_FOLD4_MATS_PER_GROUP);
     // Deliberately serial. At the ranked shape this is 1024 groups x ~700 ops
     // = 0.12 ms, which is well under the ~1.2 ms it costs to wake the pool's
     // fifteen sleeping workers at this point in the prove (measured); the
@@ -3360,7 +3563,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             || (eq_fold.is_some()
                 && ranked_one_rows_elided
                 && within_outer_mask == 1
-                && b_med_counts == [16, 15])
+                && (b_med_counts == [16, 15] || b_med_counts == [16, 14]))
     );
     debug_assert!(!ranked_compact || ranked_one_rows_elided);
     if let Some((eq_bot, _, _)) = eq_fold {
@@ -3703,6 +3906,18 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ranked_one_rows_elided = ab_inner.ranked_one_rows_elided();
     let ranked_compact = ab_inner.ranked_compact();
+    // Window 30 elided: the odd outer window stops one row early (`b_med` 14
+    // is never read) and round one adds that row's exact contribution from the
+    // identity-C fold. Every shape gate below still sees the padding counts.
+    let ranked_w30_elided = ab_inner.ranked_w30_elided();
+    let b_med_counts_live: Vec<u8> = if ranked_w30_elided {
+        assert!(ranked_one_rows_elided);
+        assert_eq!(within_outer_mask, 1);
+        assert_eq!(b_med_counts.as_slice(), [16, 15]);
+        vec![16, 14]
+    } else {
+        b_med_counts.clone()
+    };
     if ranked_one_rows_elided {
         assert_eq!(m, 32);
         assert_eq!(padding.k_log, 14);
@@ -3841,7 +4056,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                     big_lo_size,
                     n_lo_and_inner,
                     within_outer_mask,
-                    &b_med_counts,
+                    &b_med_counts_live,
                     ab_inner_bytes,
                     &eq_lo_scaled,
                     eq_hi[x_hi],
@@ -3859,7 +4074,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                     big_lo_size,
                     n_lo_and_inner,
                     within_outer_mask,
-                    &b_med_counts,
+                    &b_med_counts_live,
                     ab_inner_bytes,
                     &eq_lo_scaled,
                     eq_hi[x_hi],
@@ -3943,6 +4158,133 @@ fn round1_lifted_from_fold8(
     assert_eq!(inner_tail.len(), 7);
     assert_eq!(fold8.len(), 64 * n_packed);
 
+    /// `FLOCK_NO_ZC_ONE_FOLD8_DIRECT=1` restores the fold4 → quad → collapse
+    /// chain for the one-row statistic. Read once per process.
+    fn one_fold8_direct_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ZC_ONE_FOLD8_DIRECT").is_none()
+        });
+        *ON
+    }
+
+    let s_hat = if one_fold8_direct_enabled() {
+        one_fold8_s_hat_direct(fold8, inner_tail)
+    } else {
+        one_fold8_s_hat_chain(fold8, inner_tail)
+    };
+    let c_s_inv = c_s_inv_for_identity_c();
+    let mut res_s = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        let naive = (F128::ONE + prefix) * s_hat[lane] + prefix * s_hat[ELL + lane];
+        res_s[lane] = c_s_inv * naive;
+    }
+    ntt_extend_f128_vec_ghash(&res_s, inv_table)
+}
+
+/// B30 row of ranked window 30: bits 0..48 of row 240 are one.
+const RANKED_W30_B_ROW: u64 = 0x0001_ffff_ffff_ffff;
+/// Top-bound one-row slot of row 240 (its high half, bound by `r[k_log - 1]`).
+const RANKED_W30_SLOT: usize = 240 - 128;
+
+/// `FLOCK_NO_ZC_W30_DELTA_DIRECT=1` lifts the window-30 delta through the
+/// incumbent one-slot sixty-four-bank statistic instead of its closed form
+/// (see [`round1_w30_delta_ab`]). Read once per process.
+fn w30_delta_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_W30_DELTA_DIRECT").is_none());
+    *ON
+}
+
+/// Exact round-one AB contribution of ranked window 30 (row 240 = K0 of the
+/// odd half's `b_med` 14) from the unbound identity-C inner fold of row 240.
+///
+/// The ranked producer writes `a = z` on that row against the static B30
+/// constant, so the window's transform is `T(z240)[λ] · T(B30)[λ]` in GF(2^8)
+/// at every Λ-node λ. φ₈ is a field homomorphism, so the AB consumer's image
+/// of that product is `φ₈(T(B30)[λ])` times its image of `T(z240)[λ]`, and the
+/// latter — the contribution of a B = ONE K0 row — is exactly what the
+/// one-row identity-C chain lifts ([`round1_lifted_from_fold8`], the chain the
+/// one-row reuse already uses, fed row 240's top-bound slot alone).
+pub(crate) fn round1_w30_delta_ab(
+    row240: &[F128],
+    r: &[F128],
+    k_skip: usize,
+    k_log: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    assert_eq!(k_skip, K_SKIP);
+    assert_eq!(k_log, 14);
+    assert_eq!(row240.len(), ELL);
+    assert_eq!(inv_table.k, k_skip);
+    let inner_tail = &r[k_skip + 1..k_log];
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    let r_top = inner_tail[6];
+    let lifted = if w30_delta_direct_enabled() {
+        // Closed form of the chain below for its single live slot: the
+        // sixty-four-bank statistic holds `r_top · row240` in the first half of
+        // bank `RANKED_W30_SLOT · ELL / n_packed` and zeros everywhere else, so
+        // its collapse is that half scaled by the bank weight
+        // `low[b & 3] · hi[(b >> 2) & 3] · top[b >> 4]` with a zero second half
+        // ([`one_fold8_s_hat_direct`]), and [`round1_lifted_from_fold8`] then
+        // scales by `c_s⁻¹ · (1 + prefix)` before the extension. The same field
+        // products without the 131 KiB statistic or its 64-bank scan.
+        let bank = RANKED_W30_SLOT * ELL / n_packed;
+        debug_assert_eq!(bank * n_packed, RANKED_W30_SLOT * ELL);
+        let low_eq = build_eq(&inner_tail[..2]);
+        let hi_eq = build_eq(&inner_tail[2..4]);
+        let top_eq = build_eq(&inner_tail[4..6]);
+        let w = low_eq[bank & 3] * hi_eq[(bank >> 2) & 3] * top_eq[bank >> 4];
+        let scale = c_s_inv_for_identity_c() * (F128::ONE + r[k_skip]);
+        let mut res_s = [F128::ZERO; ELL];
+        for (dst, src) in res_s.iter_mut().zip(row240) {
+            *dst = scale * (w * (r_top * *src));
+        }
+        ntt_extend_f128_vec_ghash(&res_s, inv_table)
+    } else {
+        let mut fold8 = vec![F128::ZERO; 64 * n_packed];
+        for (dst, src) in fold8[RANKED_W30_SLOT * ELL..(RANKED_W30_SLOT + 1) * ELL]
+            .iter_mut()
+            .zip(row240)
+        {
+            *dst = r_top * *src;
+        }
+        round1_lifted_from_fold8(&fold8, inner_tail, r[k_skip], inv_table)
+    };
+    let mut beta = [F8::ZERO; ELL];
+    inv_table.apply(&RANKED_W30_B_ROW.to_le_bytes(), &mut beta);
+    lifted
+        .iter()
+        .zip(beta.iter())
+        .map(|(v, b)| phi8(*b) * *v)
+        .collect()
+}
+
+/// Collapse a sixty-four-bank statistic to its 128-vector with one weighted
+/// sum `w_b = low[b & 3] · hi[(b >> 2) & 3] · top[b >> 4]` over the banks
+/// that carry data (the ranked one-row statistic fills 11 of 64), instead of
+/// materializing fold4 and quad. The same products regrouped, and an all-zero
+/// bank adds exact zero, so every entry equals [`one_fold8_s_hat_chain`]'s.
+fn one_fold8_s_hat_direct(fold8: &[F128], inner_tail: &[F128]) -> Vec<F128> {
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    let low_eq = build_eq(&inner_tail[..2]);
+    let hi_eq = build_eq(&inner_tail[2..4]);
+    let top_eq = build_eq(&inner_tail[4..6]);
+    let mut s_hat = vec![F128::ZERO; n_packed];
+    for bank in 0..64 {
+        let src = &fold8[bank * n_packed..(bank + 1) * n_packed];
+        if src.iter().all(|v| *v == F128::ZERO) {
+            continue;
+        }
+        let w = low_eq[bank & 3] * hi_eq[(bank >> 2) & 3] * top_eq[bank >> 4];
+        crate::field::f128_slice::add_scaled(&mut s_hat, src, w);
+    }
+    s_hat
+}
+
+/// The incumbent fold4 → quad → collapse chain for a sixty-four-bank
+/// statistic (kill-switch arm and oracle of [`one_fold8_s_hat_direct`]).
+fn one_fold8_s_hat_chain(fold8: &[F128], inner_tail: &[F128]) -> Vec<F128> {
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let retained_top_eq = build_eq(&inner_tail[4..6]);
     let mut fold4 = vec![F128::ZERO; 16 * n_packed];
     for high in 0..4 {
@@ -3969,14 +4311,7 @@ fn round1_lifted_from_fold8(
             );
         }
     }
-    let s_hat = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
-    let c_s_inv = c_s_inv_for_identity_c();
-    let mut res_s = [F128::ZERO; ELL];
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat[lane] + prefix * s_hat[ELL + lane];
-        res_s[lane] = c_s_inv * naive;
-    }
-    ntt_extend_f128_vec_ghash(&res_s, inv_table)
+    crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2])
 }
 
 pub fn round1_c_fold4_from_block_major_z(
@@ -3996,6 +4331,44 @@ pub fn round1_c_fold4_from_block_major_z(
     Vec<F128>,
     Option<Vec<F128>>,
 ) {
+    let (c, s_hat_v_c, quad, fold4, fold8, one_ab, _) = round1_c_fold4_from_block_major_z_with_canon(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        r,
+        inv_table,
+        ranked_one_rows,
+        false,
+    );
+    (c, s_hat_v_c, quad, fold4, fold8, one_ab)
+}
+
+/// [`round1_c_fold4_from_block_major_z`] that can also return the unbound
+/// identity-C inner fold of rows `0..16` and `240` (`capture_canon`; ranked
+/// one-row route only, `None` everywhere else) for the round-two
+/// canonical-window elision.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    ranked_one_rows: bool,
+    capture_canon: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Option<Vec<F128>>,
+    Option<Vec<F128>>,
+) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -4013,6 +4386,7 @@ pub fn round1_c_fold4_from_block_major_z(
     let inner_tail = &r[k_skip + 1..k_log];
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let par = crate::serial_par_enabled();
+    let mut canon: Option<Vec<F128>> = None;
     let (fold4, fold8, one_fold8) = if crate::pcs::ranked_direct_fold8_enabled() {
         // Ranked shape has one coordinate above the six Fold8 bank
         // selectors. On the parallel/GFNI path, bind it while reducing the
@@ -4020,7 +4394,7 @@ pub fn round1_c_fold4_from_block_major_z(
         // never written and immediately read back by a second Rayon pass.
         let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
             if ranked_one_rows {
-                let (full, one) =
+                let (full, one, rows) =
                     crate::lincheck::fold_block_major_one_shot_bind_top_ranked_one_rows(
                         z_packed,
                         m,
@@ -4028,7 +4402,9 @@ pub fn round1_c_fold4_from_block_major_z(
                         useful_bits,
                         &r[k_log..],
                         inner_tail[6],
+                        capture_canon,
                     );
+                canon = rows;
                 (full, Some(one))
             } else {
                 (
@@ -4057,26 +4433,36 @@ pub fn round1_c_fold4_from_block_major_z(
             )
         };
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
-        let retained_top_eq = build_eq(&inner_tail[4..6]);
-        let mut fold4 = vec![F128::ZERO; 16 * n_packed];
-        let wide = r1_cfold_x4_enabled();
-        for high in 0..4 {
-            for bank in 0..16 {
-                let src = (bank + 16 * high) * n_packed;
-                let dst = bank * n_packed;
-                if wide {
-                    crate::field::f128_slice::add_scaled(
-                        &mut fold4[dst..dst + n_packed],
-                        &fold8[src..src + n_packed],
-                        retained_top_eq[high],
-                    );
-                } else {
-                    for packed in 0..n_packed {
-                        fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+        // Ranked DirectFold8 consumers (`pre_c_slot`) read fold8 only; the
+        // round-1 C message still needs s_hat_v_c. Default: skip the Fold4
+        // tensor and collapse fold8 → s_hat in one step (`collapse_s_hat_v_fold8`).
+        // `FLOCK_NO_ZC_FOLD8_DIRECT_SHAT=1` restores the fold8→fold4→quad→s_hat
+        // chain so fold4 remains in the capture struct.
+        let fold4 = if zc_fold8_direct_shat_enabled() {
+            Vec::new()
+        } else {
+            let retained_top_eq = build_eq(&inner_tail[4..6]);
+            let mut fold4 = vec![F128::ZERO; 16 * n_packed];
+            let wide = r1_cfold_x4_enabled();
+            for high in 0..4 {
+                for bank in 0..16 {
+                    let src = (bank + 16 * high) * n_packed;
+                    let dst = bank * n_packed;
+                    if wide {
+                        crate::field::f128_slice::add_scaled(
+                            &mut fold4[dst..dst + n_packed],
+                            &fold8[src..src + n_packed],
+                            retained_top_eq[high],
+                        );
+                    } else {
+                        for packed in 0..n_packed {
+                            fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                        }
                     }
                 }
             }
-        }
+            fold4
+        };
         (fold4, fold8, one_fold8)
     } else {
         assert!(
@@ -4093,29 +4479,37 @@ pub fn round1_c_fold4_from_block_major_z(
         )
     };
 
-    // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 stay bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    let wide_quad = r1_cfold_x4_enabled();
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            if wide_quad {
-                crate::field::f128_slice::add_scaled(
-                    &mut quad[dst..dst + n_packed],
-                    &fold4[src..src + n_packed],
-                    retained_hi_eq[q],
-                );
-            } else {
-                for packed in 0..n_packed {
-                    quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+    let (quad, s_hat_v_c) = if fold4.is_empty() && !fold8.is_empty() {
+        (
+            Vec::new(),
+            crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]),
+        )
+    } else {
+        // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
+        // tensor (coordinates 0 and 1 stay bank selectors).
+        let retained_hi_eq = build_eq(&inner_tail[2..4]);
+        let mut quad = vec![F128::ZERO; 4 * n_packed];
+        let wide_quad = r1_cfold_x4_enabled();
+        for q in 0..4 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                if wide_quad {
+                    crate::field::f128_slice::add_scaled(
+                        &mut quad[dst..dst + n_packed],
+                        &fold4[src..src + n_packed],
+                        retained_hi_eq[q],
+                    );
+                } else {
+                    for packed in 0..n_packed {
+                        quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                    }
                 }
             }
         }
-    }
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        (quad, s_hat_v_c)
+    };
 
     // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
     // bit at the original C point recovers C's 64 S-domain evaluations.
@@ -4129,7 +4523,7 @@ pub fn round1_c_fold4_from_block_major_z(
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     let one_ab_lifted = one_fold8
         .map(|one_fold8| round1_lifted_from_fold8(&one_fold8, inner_tail, prefix, inv_table));
-    (res_c_lifted, s_hat_v_c, quad, fold4, fold8, one_ab_lifted)
+    (res_c_lifted, s_hat_v_c, quad, fold4, fold8, one_ab_lifted, canon)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -4191,6 +4585,64 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
+    /// The transposed AB eq-fold row equals the scalar bit-loop row.
+    #[test]
+    fn ab_eq_fold_mats_row_transposed_matches_scalar_loop() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0xAB7A_0001);
+        let convert = rng.sample_f128_vec(16 * 256);
+        for _ in 0..4 {
+            let scale = rng.sample_f128();
+            let mut fast = vec![0u64; 256];
+            ab_eq_fold_mats_row_transposed(&convert, scale, &mut fast);
+            let mut slow = vec![0u64; 256];
+            for bm in 0..16 {
+                let basis: [F128; 8] =
+                    std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * scale);
+                for k in 0..16 {
+                    let mut qword = 0u64;
+                    for i in 0..8 {
+                        let bit_index = 8 * k + i;
+                        let mut row_bits = 0u8;
+                        for (j, b) in basis.iter().enumerate() {
+                            let bit = if bit_index < 64 {
+                                (b.lo >> bit_index) & 1
+                            } else {
+                                (b.hi >> (bit_index - 64)) & 1
+                            };
+                            row_bits |= (bit as u8) << j;
+                        }
+                        qword |= (row_bits as u64) << (8 * (7 - i));
+                    }
+                    slow[bm * 16 + k] = qword;
+                }
+            }
+            assert_eq!(fast, slow);
+        }
+    }
+
+    /// The direct one-row collapse equals the fold4 → quad → collapse chain,
+    /// including the ranked shape's eleven live banks.
+    #[test]
+    fn one_fold8_s_hat_direct_matches_chain() {
+        use crate::challenger::Challenger;
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let mut rng = crate::challenger::RandomChallenger::new(0x0F08_D1EC);
+        for live_mask in [u64::MAX, 0x00c0_0000_0000_01ff, 1] {
+            let mut fold8 = rng.sample_f128_vec(64 * n_packed);
+            for bank in 0..64 {
+                if (live_mask >> bank) & 1 == 0 {
+                    fold8[bank * n_packed..(bank + 1) * n_packed].fill(F128::ZERO);
+                }
+            }
+            let inner_tail = rng.sample_f128_vec(7);
+            assert_eq!(
+                one_fold8_s_hat_direct(&fold8, &inner_tail),
+                one_fold8_s_hat_chain(&fold8, &inner_tail)
+            );
+        }
+    }
+
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
@@ -5203,6 +5655,75 @@ mod tests {
         let mut residual = Round1AbInner::take_uninit(1024);
         residual.set_ranked_one_rows_elided();
         residual.restore_full_if_ranked_one_rows_elided(&[], &[], &inv_table);
+    }
+
+    /// The window-30 elision's only new identity: the round-one transform of a
+    /// K0-only window against the static B30 row is φ₈(T(B30)) times the same
+    /// transform against an all-ones B row, node for node (portable kernels).
+    #[test]
+    fn w30_b30_window_factors_through_all_ones_row() {
+        let inv_table = make_inv_table();
+        let plan = prepare_round1_ab_window_plan(&inv_table, &[], false);
+        let mut beta = [F8::ZERO; ELL];
+        inv_table.apply(&RANKED_W30_B_ROW.to_le_bytes(), &mut beta);
+        let mut st = 0x3030_B30Bu64;
+        for _ in 0..64 {
+            let mut a = [0u8; 64];
+            for byte in a[..8].iter_mut() {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                *byte = st as u8;
+            }
+            let mut b30 = [0u8; 64];
+            b30[..8].copy_from_slice(&RANKED_W30_B_ROW.to_le_bytes());
+            let mut ones = [0u8; 64];
+            ones[..8].fill(0xff);
+            let (mut with_b30, mut with_ones) = ([0u8; 64], [0u8; 64]);
+            // A non-static window index: the identity is about the arithmetic,
+            // not the static-B scheduling of window 30.
+            round1_ab_inner_window(&a, &b30, &mut with_b30, 5, &inv_table, plan);
+            round1_ab_inner_window(&a, &ones, &mut with_ones, 5, &inv_table, plan);
+            for node in 0..ELL {
+                assert_eq!(
+                    phi8(F8(with_b30[node])),
+                    phi8(beta[node]) * phi8(F8(with_ones[node])),
+                    "node {node}"
+                );
+            }
+        }
+    }
+
+    /// The closed-form window-30 delta equals the incumbent lift of the
+    /// one-slot sixty-four-bank statistic, for random rows and challenges
+    /// (including a zero row).
+    #[test]
+    fn w30_delta_direct_matches_one_slot_statistic() {
+        let inv_table = make_inv_table();
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let mut rng = Rng::new(0x30_DE17A);
+        for case in 0..12 {
+            let r = rng.f128_vec(20);
+            let row240 = if case == 0 { vec![F128::ZERO; ELL] } else { rng.f128_vec(ELL) };
+            let inner_tail = &r[K_SKIP + 1..14];
+            let mut fold8 = vec![F128::ZERO; 64 * n_packed];
+            for (dst, src) in fold8[RANKED_W30_SLOT * ELL..(RANKED_W30_SLOT + 1) * ELL]
+                .iter_mut()
+                .zip(&row240)
+            {
+                *dst = inner_tail[6] * *src;
+            }
+            let lifted = round1_lifted_from_fold8(&fold8, inner_tail, r[K_SKIP], &inv_table);
+            let mut beta = [F8::ZERO; ELL];
+            inv_table.apply(&RANKED_W30_B_ROW.to_le_bytes(), &mut beta);
+            let expected: Vec<F128> =
+                lifted.iter().zip(beta.iter()).map(|(v, b)| phi8(*b) * *v).collect();
+            assert_eq!(
+                round1_w30_delta_ab(&row240, &r, K_SKIP, 14, &inv_table),
+                expected,
+                "case {case}"
+            );
+        }
     }
 
     /// Round 1 with a producer-skipped (invalid) ab_inner prefix must be

@@ -131,6 +131,8 @@ pub(crate) fn ey_dead_w31_enabled() -> bool {
     *ON
 }
 
+
+
 /// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
 /// handles the low limbs; the two cross-products supply bits 32..63. The
 /// high×high term is above bit 63 and is discarded, exactly like
@@ -895,6 +897,9 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) plan: Round1AbWindowPlan,
     /// Ranked residual representation; dense producers leave this off.
     pub(crate) one_rows_elided: bool,
+    /// Window 30's round-one AB transform is elided: round one adds its exact
+    /// contribution from the identity-C fold (the z/a publish stays).
+    pub(crate) w30_elided: bool,
 }
 
 pub(crate) type RankedClosedWindowPreps = [(Round1AbWindowPlan, Round1AbTableImages); 31];
@@ -1223,9 +1228,11 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_sparse_30(j,q.add(j));
-                let a=&*q.add(j).cast::<[u8;64]>();
-                let out=&mut *self.out.add(j*self.out_stride+30*64-self.out_bias).cast::<[u8;64]>();
-                round1_ab_inner_window30_k0(a,&RANKED_B30.0,out,self.inv_table,plan,imgs,30);
+                if !self.w30_elided {
+                    let a=&*q.add(j).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(j*self.out_stride+30*64-self.out_bias).cast::<[u8;64]>();
+                    round1_ab_inner_window30_k0(a,&RANKED_B30.0,out,self.inv_table,plan,imgs,30);
+                }
                 j+=1;
             }
         }
@@ -1759,6 +1766,19 @@ impl RankedRows {
         }
     }
 
+    /// Static-B ranked windows 0/1 sourced directly from the live transposed
+    /// rows ([`tr8x16_zmm`]) instead of two YMM transposes, sixteen staging
+    /// stores and a reload: the same line, streamed to z and a.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_static_values(&self, j: usize, av: __m512i) {
+        unsafe {
+            let o = j * U32_PER_BLOCK;
+            stream_ranked_line(self.z.add(o), av);
+            stream_ranked_line(self.a.add(o), av);
+        }
+    }
+
     /// Static-B ranked windows 0/1: B=1, so the complete z and a lines match.
     #[inline(always)]
     unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
@@ -1805,6 +1825,19 @@ impl RankedRows {
     }
 }
 
+/// Opt-in `FLOCK_WITGEN_STATIC01_DIRECT=1` publishes the ranked closed drain's
+/// windows 0/1 straight from the transposed ring rows instead of the incumbent
+/// staging (two YMM transposes, sixteen stores and one reload per row).
+/// Default OFF; read once per drain call, never per window.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+fn ranked_static01_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_WITGEN_STATIC01_DIRECT").is_some()
+    });
+    *ON
+}
+
 impl Drain8<'_> {
     #[rustfmt::skip]
     #[inline(never)]
@@ -1838,11 +1871,25 @@ impl Drain8<'_> {
             debug_assert!(self.ranked_static);
             debug_assert!(proj.one_rows_elided);
             let wc = WidenConsts::new();
+            let static01_direct = ranked_static01_direct_enabled();
             for off in (0..words).step_by(STEP_WORDS) {
                 let abs_word = base_word + off;
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
                 match blk {
+                    // Windows 0/1 straight from the transposed ring rows. The
+                    // staging in the arms below exists only to be reloaded by
+                    // `publish_static`: windows 2..29 read the ring directly
+                    // and window 30 re-stages every staging word it reads.
+                    0 | 1 if static01_direct => {
+                        let a_rows = tr8x16_zmm(self.ast, rw);
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let mut j = 0usize;
+                        while j != 8 {
+                            rows.publish_static_values(j, a_rows[j]);
+                            j += 1;
+                        }
+                    }
                     0 => {
                         let (sa, _) = proj.sides();
                         let a_lo = tr8_chunk(self.ast, rw);
@@ -2912,6 +2959,76 @@ mod tests {
                 _mm512_storeu_si512(got.as_mut_ptr().cast::<__m512i>(), row);
                 let expected = core::array::from_fn(|word| (1000 * word + block) as u32);
                 assert_eq!(got, expected, "block {block}");
+            }
+        }
+    }
+
+    /// Ranked windows 0/1 published straight from `tr8x16_zmm` rows must be
+    /// the bytes of the staged `tr8_chunk` + `publish_static` path, for both
+    /// windows and for all-zero, all-one and patterned rings.
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn ranked_static01_direct_publish_matches_staged() {
+        #[repr(C, align(64))]
+        struct Input([[u32; 8]; STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct Stage([u32; 8 * STEP_WORDS]);
+        #[repr(C, align(64))]
+        struct RankedBuf([u32; 8 * U32_PER_BLOCK]);
+
+        unsafe {
+            for case in 0..4u32 {
+                let input = Input(core::array::from_fn(|word| {
+                    core::array::from_fn(|block| match case {
+                        0 => 0,
+                        1 => u32::MAX,
+                        _ => {
+                            0x9E37_79B9u32.wrapping_mul(case)
+                                ^ ((word as u32) << 11)
+                                ^ (block as u32).wrapping_mul(0x0101_0101)
+                        }
+                    })
+                }));
+                let ring = input.0.as_ptr().cast::<V8>();
+                let mut stage = Stage([0u32; 8 * STEP_WORDS]);
+                let a_lo = tr8_chunk(ring, 0);
+                let a_hi = tr8_chunk(ring, 8);
+                for r in 0..8 {
+                    let p = stage.0.as_mut_ptr().add(r * STEP_WORDS);
+                    store_v8(p, a_lo[r]);
+                    store_v8(p.add(8), a_hi[r]);
+                }
+                let a_rows = tr8x16_zmm(ring, 0);
+                for blk in 0..2usize {
+                    let mut staged_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let mut staged_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let mut staged_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let mut direct_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let mut direct_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let mut direct_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
+                    let staged = RankedRows::new(
+                        staged_z.0.as_mut_ptr(),
+                        staged_a.0.as_mut_ptr(),
+                        staged_b.0.as_mut_ptr(),
+                    );
+                    let direct = RankedRows::new(
+                        direct_z.0.as_mut_ptr(),
+                        direct_a.0.as_mut_ptr(),
+                        direct_b.0.as_mut_ptr(),
+                    );
+                    for j in 0..8 {
+                        if blk == 0 {
+                            staged.publish_static::<0>(j, stage.0.as_ptr());
+                        } else {
+                            staged.publish_static::<1>(j, stage.0.as_ptr());
+                        }
+                        direct.publish_static_values(j, a_rows[j]);
+                    }
+                    _mm_sfence();
+                    assert_eq!(staged_z.0, direct_z.0, "z mismatch, case={case} blk={blk}");
+                    assert_eq!(staged_a.0, direct_a.0, "a mismatch, case={case} blk={blk}");
+                    assert_eq!(staged_b.0, direct_b.0, "b mismatch, case={case} blk={blk}");
+                }
             }
         }
     }
