@@ -122,16 +122,22 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
-/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
-/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
+/// Direct-fold8 capture/consumer predicate. Does **not** require the
+/// sixteen-bank fold4 tensor: ranked DirectFold8 consumers read `fold8`,
+/// and the round-1 C message reads `s_hat_v_c` collapsed from it. Requiring
+/// `fold4.is_some()` made `FLOCK_NO_ZC_FOLD8_DIRECT_SHAT`'s default (skip
+/// Fold4) fall through to an empty quad and panic the warmup prove
+/// (`186c138e`, worker exit 101 before readiness).
 #[inline]
 fn ranked_direct_fold8_precompute_enabled(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
 ) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs, captured)
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold4_enabled()
         && pcs::ranked_direct_fold8_enabled()
         && captured.fold8.is_some()
+        && r1cs.k_log >= pcs::LOG_PACKING + 4
         && r1cs.k_log >= r1cs.k_skip + 7
         && r1cs.k_log >= pcs::LOG_PACKING + 6
 }
@@ -612,14 +618,14 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // allocation) runs on a detached helper thread concurrently with the
     // ~20 ms open instead of inside the measured publish tail. Tens of µs of
     // work; the fingerprint gate in `proof_io` makes a stale or missing
-    // stash fall back to the incumbent full encode, byte-identically.
+    // stash fall back to the incumbent full encode, byte-identically. The job
+    // runs on the process-lifetime stash helper (`proof_io::spawn_stash`).
     let stash = if crate::proof_io::pre_encode_enabled() {
         let commitment_c = commitment.clone();
         let zc_c = zc_proof.clone();
         let lc_c = lc_proof.clone();
-        Some(std::thread::spawn(move || {
+        Some(crate::proof_io::spawn_stash(move || {
             crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
-            (commitment_c, zc_c, lc_c)
         }))
     } else {
         None
@@ -634,10 +640,10 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &lig_config,
         challenger,
     ));
-    if let Some(handle) = stash {
-        // Finished long ago (µs vs the ~20 ms open); join keeps the thread
-        // from outliving the prove.
-        let _ = handle.join();
+    if let Some(done) = stash {
+        // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
+        // complete before the publish tail looks for it.
+        done.wait();
     }
     flock_core::gaptime::mark("open: returned");
 

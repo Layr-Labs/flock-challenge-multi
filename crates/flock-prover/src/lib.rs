@@ -39,7 +39,7 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // resample gtr r1 20260819-1220
 
 #[used]
-static LAYOUT_ROLL_132: [u8; 4232] = [0u8; 4232];
+static LAYOUT_ROLL_137: [u8; 3432] = [0u8; 3432];
 
 /// Layout probe. A used static of fixed size; its presence and size move the
 /// placement of the objects laid out after it, without changing any code path.
