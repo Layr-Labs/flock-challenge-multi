@@ -615,6 +615,21 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
 /// dispatch per level costs more than the hashing itself (~3× at the top of a
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
 /// wide lower levels fan out.
+///
+/// Parent-level serial/parallel cutoff. Default 4096 keeps the 2^11 and 2^12
+/// parent levels on the hashing cores (one extra rayon barrier deleted vs 1024).
+/// `FLOCK_NO_MERKLE_SERIAL4K=1` restores 1024.
+fn merkle_serial_level_nodes() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_MERKLE_SERIAL4K").is_some() {
+            1024
+        } else {
+            4096
+        }
+    });
+    *N
+}
+
 pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -622,8 +637,7 @@ pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind
     // initialized bytes with no padding.
     let read_bytes: &[u8] =
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
-    const SERIAL_LEVEL_NODES: usize = 1024;
-    let serial = write.len() <= SERIAL_LEVEL_NODES;
+    let serial = write.len() <= merkle_serial_level_nodes();
 
     match kind {
         HashKind::Blake3 => {
