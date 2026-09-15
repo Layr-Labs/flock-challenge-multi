@@ -2608,6 +2608,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         ab_inner.set_ranked_one_rows_elided();
     }
     assert!(!compact || one_rows_elided);
+    // Window 30's round-one AB transform is dead under the one-row brand:
+    // round one adds its exact contribution from the identity-C fold.
+    let w30_elided = one_rows_elided
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_w30_elide_enabled();
+    if w30_elided {
+        ab_inner.set_ranked_w30_elided();
+    }
 
     // ab_inner's next reader is zerocheck round 1 — after the whole commit
     // phase, DRAM-cold at the ranked shape — so the streamed transform
@@ -2735,6 +2742,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
+                                w30_elided,
                             }
                         }).unwrap_unchecked();
                         if let Some(preps) = ranked_closed_preps.as_ref() {
@@ -5457,6 +5465,25 @@ mod tests {
             ab_e.invalid_prefix_bytes(),
             "invalid-prefix brand mismatch"
         );
+        assert_eq!(
+            ab_g.ranked_w30_elided(),
+            ab_e.ranked_w30_elided(),
+            "window-30 elision brand mismatch"
+        );
+        if ab_g.ranked_w30_elided() {
+            // Neither producer writes the elided window's 64 bytes; round one
+            // adds that window from the identity-C fold, so exclude it here.
+            let (stride, w30) = if ab_g.ranked_compact() {
+                (29 * 64, 28 * 64)
+            } else {
+                (32 * 64, 30 * 64)
+            };
+            for ab in [&mut ab_g, &mut ab_e] {
+                for block in ab.as_bytes_mut().chunks_exact_mut(stride) {
+                    block[w30..w30 + 64].fill(0);
+                }
+            }
+        }
         assert_eq!(ab_g.as_bytes_mut(), ab_e.as_bytes_mut(), "ab_inner mismatch");
     }
 
