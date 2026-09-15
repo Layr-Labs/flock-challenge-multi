@@ -640,6 +640,19 @@ pub(super) fn convert_ab_nomul_gfni_direct<const FIRST_WRITE: bool>(
                 );
             }
         }
+        // Odd window with ranked window 30 elided: round one adds that row's
+        // exact contribution from the identity-C fold instead.
+        (0, 14) => {
+            assert_eq!(live_rows.len(), 14 * 64);
+            unsafe {
+                x86_64::convert_ab_nomul_x86_gfni_direct::<0, 14, FIRST_WRITE>(
+                    live_rows,
+                    mats,
+                    bank_planes,
+                    prefetch,
+                );
+            }
+        }
         _ => unreachable!("direct AB input requires the ranked residual row pair"),
     }
 }
