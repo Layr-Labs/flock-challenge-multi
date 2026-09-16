@@ -2331,9 +2331,27 @@ fn tntt_block_enabled() -> bool {
 ///    cache passes,
 ///  * [`transpose_forward_ntt_dense_layers_per_layer`] (kill switch) — the
 ///    incumbent one parallel sweep per layer.
+#[allow(dead_code)] // Full-transform entry kept beside the `_dead` variant.
 fn transpose_forward_ntt_dense_layers(ntt: &AdditiveNttF128, data: &mut [F128], top: usize) {
+    transpose_forward_ntt_dense_layers_dead(ntt, data, top, 0);
+}
+
+/// [`transpose_forward_ntt_dense_layers`] for a caller that keeps only the
+/// low `2^(log_d - dead_top)` outputs. For a layer `l < dead_top` every kept
+/// position reads only TOP outputs of that layer: a bottom position has bit
+/// `log_d - 1 - l` set, and no later (lower) layer moves data across that
+/// bit, so those layers' bottom products never reach the kept prefix. The
+/// blocked schedule skips them in its cross-chunk pass; the kept prefix is
+/// bit-identical, the discarded suffix is not. `dead_top = 0` is exactly the
+/// incumbent transform.
+fn transpose_forward_ntt_dense_layers_dead(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    top: usize,
+    dead_top: usize,
+) {
     if tntt_block_enabled() {
-        transpose_forward_ntt_dense_layers_blocked(ntt, data, top);
+        transpose_forward_ntt_dense_layers_blocked_dead(ntt, data, top, dead_top);
     } else {
         transpose_forward_ntt_dense_layers_per_layer(ntt, data, top);
     }
@@ -2401,10 +2419,58 @@ fn transpose_forward_ntt_dense_layers_per_layer(
 /// and layer order of the incumbent (layers commute only within a group, and
 /// the groups are applied in the same relative order), so the output is
 /// bit-identical.
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt_dense_layers_blocked(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
     top: usize,
+) {
+    transpose_forward_ntt_dense_layers_blocked_dead(ntt, data, top, 0);
+}
+
+/// `top ^= bot` over two equal-length halves: the transposed butterfly with
+/// its bottom product and store removed (see
+/// [`transpose_forward_ntt_dense_layers_dead`]).
+fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
+    debug_assert_eq!(top.len(), bot.len());
+    #[cfg(target_feature = "avx512f")]
+    {
+        use core::arch::x86_64::*;
+        // SAFETY: avx512f is cfg-guaranteed and both slices have equal
+        // length. F128 addition is bitwise XOR.
+        unsafe {
+            let lanes = top.len() & !3;
+            let mut i = 0;
+            while i < lanes {
+                let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+                let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                _mm512_storeu_si512(
+                    top.as_mut_ptr().add(i).cast::<__m512i>(),
+                    _mm512_xor_si512(a, b),
+                );
+                i += 4;
+            }
+            while i < top.len() {
+                top[i] += bot[i];
+                i += 1;
+            }
+        }
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        for (a, &b) in top.iter_mut().zip(bot.iter()) {
+            *a += b;
+        }
+    }
+}
+
+/// Body of [`transpose_forward_ntt_dense_layers_blocked`]; `dead_top` as in
+/// [`transpose_forward_ntt_dense_layers_dead`].
+fn transpose_forward_ntt_dense_layers_blocked_dead(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    top: usize,
+    dead_top: usize,
 ) {
     use rayon::prelude::*;
     let log_d = data.len().trailing_zeros() as usize;
@@ -2499,6 +2565,19 @@ fn transpose_forward_ntt_dense_layers_blocked(
             for b in 0..split {
                 let layer = split - 1 - b;
                 let stride = 1usize << b;
+                if layer < dead_top {
+                    // Only the kept prefix is read back: `top ^= bot` for
+                    // every column pair of this layer, no bottom product.
+                    let mut j = 0;
+                    while j < nseg {
+                        for u in j..j + stride {
+                            let (lo, hi) = cols.split_at_mut(u + stride);
+                            transpose_top_only(lo[u], hi[0]);
+                        }
+                        j += stride << 1;
+                    }
+                    continue;
+                }
                 block_zero(&mut cols, stride, layer, ntt);
                 let mut j = stride << 1;
                 while j < nseg {
@@ -2518,10 +2597,22 @@ fn transpose_forward_ntt_dense_layers_blocked(
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.)
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+    transpose_forward_ntt_dead(ntt, data, log_d, 0);
+}
+
+/// [`transpose_forward_ntt`] whose caller keeps only the low
+/// `2^(log_d - dead_top)` outputs (see [`transpose_forward_ntt_dense_layers_dead`]).
+fn transpose_forward_ntt_dead(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    dead_top: usize,
+) {
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
-    transpose_forward_ntt_dense_layers(ntt, data, log_d);
+    transpose_forward_ntt_dense_layers_dead(ntt, data, log_d, dead_top.min(log_d));
 }
 
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
@@ -2568,7 +2659,16 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        // Only the low `2^log_msg_cols = 2^(log_block - log_inv_rate)`
+        // outputs are kept, so the top `log_inv_rate` transposed layers skip
+        // their bottom products.
+        transpose_forward_ntt_sparse_dead(
+            &ntt,
+            queries,
+            &alpha_pows,
+            log_block,
+            lig_tntt_dead_top(log_inv_rate),
+        )
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2598,9 +2698,118 @@ struct SparseDualL0 {
     queries: Vec<usize>,
     alpha_pows: Vec<F128>,
     inverse_local_blocks: Vec<[F128; 32]>,
+    /// Per query: the aligned `2^s`-block containing the query after only the
+    /// finest `s` inverse layers (`s = 1..=depth`), stored at `2^s − 2`. This
+    /// is exactly the block [`Self::round_msg_query`] otherwise rebuilds by
+    /// re-applying the coarse forward layers to the fully inverted cache.
+    stage_blocks: Vec<[F128; 30]>,
+    /// Per query: the `depth + 1`-layer singleton expansion over the cache
+    /// block. Every round's (and the materialization's) singleton row is a
+    /// prefix of it: [`expand_singleton_into`] never rewrites its low half.
+    expansion_rows: Vec<[F128; 32]>,
+    /// Whether `stage_blocks` / `expansion_rows` are populated
+    /// (`FLOCK_NO_LIG_SPARSE_DUAL_SNAPSHOT` unset at construction).
+    snapshots: bool,
 }
 
 const SPARSE_DUAL_MAX_DEPTH: usize = 4;
+
+/// `FLOCK_NO_LIG_SPARSE_DUAL_SNAPSHOT=1` restores the per-round forward
+/// re-application and per-round singleton expansion of the sparse-dual
+/// message chain. Read once per process.
+fn lig_sparse_dual_snapshot_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_SNAPSHOT").is_none()
+    });
+    *ON
+}
+
+/// `FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4=1` restores the scalar lane fold of the
+/// sparse-dual cache rows. Read once per process.
+fn lig_sparse_dual_lane_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4").is_none()
+    });
+    *ON
+}
+
+/// `Σ row[i]·weights[i]`. The AVX-512 arm accumulates unreduced 4-lane
+/// products and reduces once; field addition is XOR and reduction is
+/// F2-linear, so it is the same element as the scalar fold.
+#[inline]
+fn sparse_dual_lane_fold(row: &[F128], weights: &[F128], x4: bool) -> F128 {
+    debug_assert_eq!(row.len(), weights.len());
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    if x4 && row.len().is_multiple_of(4) {
+        // SAFETY: cfg supplies the features; both slices hold `row.len()`
+        // F128s, a multiple of four.
+        return unsafe { sparse_dual_lane_fold_avx512(row, weights) };
+    }
+    let _ = x4;
+    row.iter()
+        .zip(weights)
+        .map(|(&v, &w)| v * w)
+        .fold(F128::ZERO, |x, y| x + y)
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn sparse_dual_lane_fold_avx512(row: &[F128], weights: &[F128]) -> F128 {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    // SAFETY: the caller guarantees equal lengths that are a multiple of four.
+    unsafe {
+        let mut acc = WideGhashX4::zero();
+        let mut i = 0usize;
+        while i < row.len() {
+            acc.mul_acc(
+                _mm512_loadu_si512(row.as_ptr().add(i) as *const __m512i),
+                _mm512_loadu_si512(weights.as_ptr().add(i) as *const __m512i),
+            );
+            i += 4;
+        }
+        acc.fold().reduce()
+    }
+}
+
+/// [`inverse_ntt_final_layers_local`] that also records, after each of the
+/// finest `s = 1..=max_stage` inverse layers, the aligned `2^s`-block that
+/// contains `qoff` into `stages[2^s − 2..2^(s+1) − 2]`. Same layers in the
+/// same order with the same products; only the copies are added.
+fn inverse_ntt_final_layers_local_staged(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    global_base: usize,
+    data: &mut [F128],
+    qoff: usize,
+    max_stage: usize,
+    stages: &mut [F128; 30],
+) {
+    let log_s = data.len().trailing_zeros() as usize;
+    debug_assert_eq!(data.len(), 1usize << log_s);
+    debug_assert_eq!(global_base & (data.len() - 1), 0);
+    debug_assert!(max_stage < log_s && max_stage <= SPARSE_DUAL_MAX_DEPTH);
+    debug_assert!(qoff < data.len());
+    for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
+        let block_size = 1usize << (log_d - layer);
+        let half = block_size >> 1;
+        for off in (0..data.len()).step_by(block_size) {
+            let block = (global_base + off) / block_size;
+            let twiddle = ntt.twiddle(layer, block);
+            for j in 0..half {
+                let y0 = data[off + j];
+                let v = y0 + data[off + half + j];
+                data[off + j] = y0 + v * twiddle;
+                data[off + half + j] = v;
+            }
+        }
+        if stage < max_stage {
+            let len = 2usize << stage;
+            let start = qoff & !(len - 1);
+            stages[len - 2..2 * len - 2].copy_from_slice(&data[start..start + len]);
+        }
+    }
+}
 
 /// Apply a prefix of the local transform represented by `data`. The slice is
 /// aligned to its full length; `end_layer` may stop before its final layer.
@@ -2691,7 +2900,10 @@ impl SparseDualL0 {
 
         let cache_len = 1usize << (depth + 1);
         let ntt = AdditiveNttF128::standard(log_d);
-        let cached_queries: Vec<([F128; 32], F128)> = queries
+        let snapshots = lig_sparse_dual_snapshot_enabled();
+        let lane_x4 = lig_sparse_dual_lane_x4_enabled();
+        #[allow(clippy::type_complexity)]
+        let cached_queries: Vec<([F128; 32], F128, [F128; 30], [F128; 32])> = queries
             .par_iter()
             .zip(&alpha_pows)
             .map(|(&query, &alpha)| {
@@ -2700,23 +2912,49 @@ impl SparseDualL0 {
                 for (j, value) in cached[..cache_len].iter_mut().enumerate() {
                     let row = &l0_codeword
                         [(base + j) * num_interleaved..(base + j + 1) * num_interleaved];
-                    *value = row
-                        .iter()
-                        .zip(&lane_weights)
-                        .map(|(&v, &w)| v * w)
-                        .fold(F128::ZERO, |x, y| x + y);
+                    *value = sparse_dual_lane_fold(row, &lane_weights, lane_x4);
                 }
                 // Reuse the queried row already lane-folded for the sparse
                 // cache instead of dotting the opened row a second time.
                 let enforced = alpha * cached[query - base];
-                inverse_ntt_final_layers_local(&ntt, log_d, base, &mut cached[..cache_len]);
-                (cached, enforced)
+                let mut stages = [F128::ZERO; 30];
+                let mut expansion = [F128::ZERO; 32];
+                if snapshots {
+                    inverse_ntt_final_layers_local_staged(
+                        &ntt,
+                        log_d,
+                        base,
+                        &mut cached[..cache_len],
+                        query - base,
+                        depth,
+                        &mut stages,
+                    );
+                    expand_singleton_into(
+                        &ntt,
+                        log_d,
+                        depth + 1,
+                        base >> (depth + 1),
+                        query - base,
+                        F128::ONE,
+                        &mut expansion[..cache_len],
+                    );
+                } else {
+                    inverse_ntt_final_layers_local(&ntt, log_d, base, &mut cached[..cache_len]);
+                }
+                (cached, enforced, stages, expansion)
             })
             .collect();
+        let snapshot_len = if snapshots { cached_queries.len() } else { 0 };
         let mut inverse_local_blocks = Vec::with_capacity(cached_queries.len());
+        let mut stage_blocks = Vec::with_capacity(snapshot_len);
+        let mut expansion_rows = Vec::with_capacity(snapshot_len);
         let mut enforced_sum = F128::ZERO;
-        for (cached, enforced) in cached_queries {
+        for (cached, enforced, stages, expansion) in cached_queries {
             inverse_local_blocks.push(cached);
+            if snapshots {
+                stage_blocks.push(stages);
+                expansion_rows.push(expansion);
+            }
             enforced_sum += enforced;
         }
 
@@ -2730,6 +2968,9 @@ impl SparseDualL0 {
                 queries: queries.to_vec(),
                 alpha_pows,
                 inverse_local_blocks,
+                stage_blocks,
+                expansion_rows,
+                snapshots,
             },
             enforced_sum,
         )
@@ -2746,17 +2987,47 @@ impl SparseDualL0 {
         let query = self.queries[index];
         let alpha = self.alpha_pows[index];
         let cache_base = query & !(self.cache_len - 1);
-        let mut residue = self.inverse_local_blocks[index];
-        forward_ntt_local_until(
-            ntt,
-            self.log_d,
-            cache_base,
-            &mut residue[..self.cache_len],
-            self.log_d - log_s,
-        );
         let global_base = query & !(block_len - 1);
         let cache_off = global_base - cache_base;
-        let local = &residue[cache_off..cache_off + block_len];
+        let mut residue: [F128; 32];
+        let mut row_buf: [F128; 32];
+        let (local, row): (&[F128], &[F128]) = if self.snapshots {
+            // The block after only the finest `log_s` inverse layers was
+            // recorded at construction (the full cache is that state for
+            // `log_s = depth + 1`), and this round's singleton row is a
+            // prefix of the stored `depth + 1` expansion.
+            let local = if log_s <= self.depth {
+                &self.stage_blocks[index][block_len - 2..2 * block_len - 2]
+            } else {
+                &self.inverse_local_blocks[index][cache_off..cache_off + block_len]
+            };
+            (local, &self.expansion_rows[index][..block_len])
+        } else {
+            residue = self.inverse_local_blocks[index];
+            forward_ntt_local_until(
+                ntt,
+                self.log_d,
+                cache_base,
+                &mut residue[..self.cache_len],
+                self.log_d - log_s,
+            );
+            // `row = H_s^T e_q`, where H_s is exactly the final `s`
+            // forward-NTT layers for this aligned block.  Dotting this row
+            // with the coefficient-space u0/u2 vectors is identical to
+            // materializing two local forward transforms and selecting q,
+            // but costs `2^s-1` products instead of `2*s*2^(s-1)`.
+            row_buf = [F128::ZERO; 32];
+            expand_singleton_into(
+                ntt,
+                self.log_d,
+                log_s,
+                global_base >> log_s,
+                query - global_base,
+                F128::ONE,
+                &mut row_buf[..block_len],
+            );
+            (&residue[cache_off..cache_off + block_len], &row_buf[..block_len])
+        };
 
         let half = block_len >> 1;
         let f0 = local[..half]
@@ -2771,22 +3042,6 @@ impl SparseDualL0 {
             .fold(F128::ZERO, |x, y| x + y);
         let pair_sum = f0 + f1;
 
-        // `row = H_s^T e_q`, where H_s is exactly the final `s`
-        // forward-NTT layers for this aligned block.  Dotting this row
-        // with the coefficient-space u0/u2 vectors is identical to
-        // materializing two local forward transforms and selecting q,
-        // but costs `2^s-1` products instead of `2*s*2^(s-1)`.
-        let qoff = query - global_base;
-        let mut row = [F128::ZERO; 32];
-        expand_singleton_into(
-            ntt,
-            self.log_d,
-            log_s,
-            global_base >> log_s,
-            qoff,
-            F128::ONE,
-            &mut row[..block_len],
-        );
         let dot_u0 = row[..half]
             .iter()
             .zip(fold_weights)
@@ -2878,20 +3133,27 @@ impl SparseDualL0 {
         let full_ntt = &self.ntt;
         let mut positions = Vec::with_capacity(self.queries.len());
         let mut values = Vec::with_capacity(self.queries.len());
-        for (&query, &alpha) in self.queries.iter().zip(&self.alpha_pows) {
+        for (index, (&query, &alpha)) in self.queries.iter().zip(&self.alpha_pows).enumerate() {
             let global_base = query & !(block_len - 1);
             let qoff = query & (block_len - 1);
-            let mut row = [F128::ZERO; 32];
-            expand_singleton_into(
-                full_ntt,
-                self.log_d,
-                k,
-                global_base >> k,
-                qoff,
-                F128::ONE,
-                &mut row[..block_len],
-            );
-            let local_value = row[..block_len]
+            let mut row_buf: [F128; 32];
+            let row: &[F128] = if self.snapshots {
+                // `k = depth`: a prefix of the stored `depth + 1` expansion.
+                &self.expansion_rows[index][..block_len]
+            } else {
+                row_buf = [F128::ZERO; 32];
+                expand_singleton_into(
+                    full_ntt,
+                    self.log_d,
+                    k,
+                    global_base >> k,
+                    qoff,
+                    F128::ONE,
+                    &mut row_buf[..block_len],
+                );
+                &row_buf[..block_len]
+            };
+            let local_value = row
                 .iter()
                 .zip(&fold_weights)
                 .map(|(&r, &w)| r * w)
@@ -2900,7 +3162,13 @@ impl SparseDualL0 {
             values.push(alpha * local_value);
         }
         let reduced_log_d = self.log_d - k;
-        let mut folded = transpose_forward_ntt_sparse(full_ntt, &positions, &values, reduced_log_d);
+        let mut folded = transpose_forward_ntt_sparse_dead(
+            full_ntt,
+            &positions,
+            &values,
+            reduced_log_d,
+            lig_tntt_dead_top(self.log_inv_rate),
+        );
         // The induced basis is the message-column prefix of `Fᵀq` (see
         // `induce_sumcheck_poly_via_ntt`, which truncates the full codeword
         // domain to `2^log_msg_cols`). The `k` folded coordinates are the LSBs
@@ -3352,6 +3620,7 @@ struct InduceSingletonStats {
 /// contain a nonzero (a dense `2^k` transpose each), densify, then run the
 /// remaining steps as full dense sweeps. Output is identical to
 /// `transpose_forward_ntt` applied to the scattered input.
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
@@ -3361,6 +3630,28 @@ fn transpose_forward_ntt_sparse(
     transpose_forward_ntt_sparse_inner(ntt, positions, values, log_d, None, None).0
 }
 
+/// `FLOCK_NO_LIG_TNTT_DEAD_BOT=1` keeps the bottom products of the top
+/// `log_inv_rate` transposed layers whose outputs the truncating callers
+/// discard. Read once per process.
+fn lig_tntt_dead_top(log_inv_rate: usize) -> usize {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_TNTT_DEAD_BOT").is_none());
+    if *ON { log_inv_rate } else { 0 }
+}
+
+/// [`transpose_forward_ntt_sparse`] for a caller that keeps only the low
+/// `2^(log_d - dead_top)` outputs; the discarded suffix is not the transform.
+fn transpose_forward_ntt_sparse_dead(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    dead_top: usize,
+) -> Vec<F128> {
+    transpose_forward_ntt_sparse_inner_dead(ntt, positions, values, log_d, None, None, dead_top).0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt_sparse_inner(
     ntt: &AdditiveNttF128,
     positions: &[usize],
@@ -3368,6 +3659,27 @@ fn transpose_forward_ntt_sparse_inner(
     log_d: usize,
     singleton_override: Option<bool>,
     k_override: Option<usize>,
+) -> (Vec<F128>, InduceSingletonStats) {
+    transpose_forward_ntt_sparse_inner_dead(
+        ntt,
+        positions,
+        values,
+        log_d,
+        singleton_override,
+        k_override,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transpose_forward_ntt_sparse_inner_dead(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    singleton_override: Option<bool>,
+    k_override: Option<usize>,
+    dead_top: usize,
 ) -> (Vec<F128>, InduceSingletonStats) {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -3403,7 +3715,7 @@ fn transpose_forward_ntt_sparse_inner(
             data[p] += v;
         }
         if log_d > 0 {
-            transpose_forward_ntt(ntt, &mut data, log_d);
+            transpose_forward_ntt_dead(ntt, &mut data, log_d, dead_top);
         }
         return (data, InduceSingletonStats::default());
     }
@@ -3565,7 +3877,7 @@ fn transpose_forward_ntt_sparse_inner(
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let _ts = std::time::Instant::now();
-    transpose_forward_ntt_dense_layers(ntt, &mut data, log_d - k);
+    transpose_forward_ntt_dense_layers_dead(ntt, &mut data, log_d - k, dead_top.min(log_d - k));
     if ot {
         eprintln!(
             "      [sparse-ntt] log_d={log_d} k={k} wins={nwin} win-phase {win_ms:.2} ms  alloc(zeroed 2^{log_d}) {alloc_ms:.2} ms  densify {dens_ms:.2} ms  dense({dl} layers) {ds:.2} ms  minflt +{mf}",
@@ -4512,8 +4824,15 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         let b_ptr = b.as_ptr();
         let fc_ptr = fc.as_mut_ptr();
         let bc_ptr = bc.as_mut_ptr();
-        let dst_aligned =
+        let dst_aligned16 =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
+        // RecycleAlloc's ranked class is 64-aligned; the NTT publish path
+        // already `_mm512_stream_si512`s that case. Four XMM extracts from a
+        // live ZMM are the same 64 bytes at a quarter of the store uops.
+        let dst_aligned64 =
+            (fc_ptr as usize).is_multiple_of(64) && (bc_ptr as usize).is_multiple_of(64);
+        let stream_zmm = stream && dst_aligned64 && open_nt_zmm_enabled();
+        let dst_aligned = dst_aligned16;
 
         let deferred_vec = if CORR {
             use crate::field::gf2_128::x86_64::ghash_shift64_x4;
@@ -4545,7 +4864,9 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            if stream_zmm {
+                _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+            } else if stream && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
@@ -4567,14 +4888,46 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             }
         };
 
+        // A unit deferred weight (both production callers pass `F128::ONE`)
+        // folds `b ⊕ basis` once: `fold(b) + 1·fold(d) = fold(b + d)` exactly,
+        // deleting the second fold product and the α product per lane group.
+        let defer_one = if CORR {
+            deferred.and_then(|(basis, alpha)| {
+                (alpha == F128::ONE && open_defer_one_xor_enabled()).then_some(basis.as_ptr())
+            })
+        } else {
+            None
+        };
+        let fold4_sum = |p: *const F128, q: *const F128, source: usize| -> __m512i {
+            let lo = _mm512_xor_si512(
+                _mm512_loadu_si512(p.add(source) as *const __m512i),
+                _mm512_loadu_si512(q.add(source) as *const __m512i),
+            );
+            let hi = _mm512_xor_si512(
+                _mm512_loadu_si512(p.add(source + 4) as *const __m512i),
+                _mm512_loadu_si512(q.add(source + 4) as *const __m512i),
+            );
+            let even = _mm512_shuffle_i32x4::<0x88>(lo, hi);
+            let odd = _mm512_shuffle_i32x4::<0xDD>(lo, hi);
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_split(_mm512_xor_si512(even, odd), r_x4, r_x64),
+            )
+        };
+
         let mut t = 0usize;
         while t + 8 <= len {
             let f0 = fold4(f_ptr, 2 * (base + t));
             let f1 = fold4(f_ptr, 2 * (base + t + 4));
-            let mut b0 = fold4(b_ptr, 2 * (base + t));
-            let mut b1 = fold4(b_ptr, 2 * (base + t + 4));
+            let (mut b0, mut b1) = match defer_one {
+                Some(dptr) => (
+                    fold4_sum(b_ptr, dptr, 2 * (base + t)),
+                    fold4_sum(b_ptr, dptr, 2 * (base + t + 4)),
+                ),
+                None => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
+            };
             if CORR {
-                if let Some((dptr, ax, ax64)) = deferred_vec {
+                if let (None, Some((dptr, ax, ax64))) = (defer_one, deferred_vec) {
                     b0 = _mm512_xor_si512(
                         b0,
                         ghash_mul_x4_split(fold4(dptr, 2 * (base + t)), ax, ax64),
@@ -4648,6 +5001,21 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     }
 }
 
+/// `FLOCK_NO_OPEN_NT_ZMM=1` restores four XMM `_mm_stream_si128` extracts
+/// from each folded ZMM. Default on when the destination is 64-aligned:
+/// one `_mm512_stream_si512` publishes the same 64 bytes. Read once per
+/// process; the ranked worker's cleared environment never sets it.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn open_nt_zmm_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_NT_ZMM").is_none());
+    *ON
+}
+
 /// Ranked x86 remaining opening after DirectFold8 starts at `half = 2^17`.
 /// Default enables NT publication in the fused x86 leaf there.
 /// `FLOCK_NO_OPEN_NT_17=1` restores the incumbent 2^21 floor.
@@ -4665,6 +5033,15 @@ fn open_nt_min_half_x86() -> usize {
         }
     });
     *MIN
+}
+
+/// `FLOCK_NO_OPEN_DEFER_ONE_XOR=1` restores the two-fold form of a deferred
+/// basis correction whose weight is `F128::ONE` (fold `b`, fold the basis,
+/// multiply by one, add). Read once per process.
+fn open_defer_one_xor_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFER_ONE_XOR").is_none());
+    *ON
 }
 
 fn fold_and_msg_lsb(
@@ -4709,12 +5086,23 @@ fn fold_and_msg_lsb_inner(
         let mut nf = Vec::with_capacity(half);
         let mut nb = Vec::with_capacity(half);
         // Char-2: even*(1+r)+odd*r = even + r*(even+odd). One mul per pair.
+        // Unit deferred weight: fold `b + basis` once, exactly
+        // `fold(b) + 1·fold(basis)` (see `fold_and_msg_chunk_x86`).
+        let defer_one = deferred_basis
+            .filter(|&(_, alpha)| alpha == F128::ONE && open_defer_one_xor_enabled())
+            .map(|(basis, _)| basis);
         for j in 0..half {
             let f0 = f[2 * j];
             let f1 = f[2 * j + 1];
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
             nf.push(f0 + r * (f0 + f1));
+            if let Some(basis) = defer_one {
+                let s0 = b0 + basis[2 * j];
+                let s1 = b1 + basis[2 * j + 1];
+                nb.push(s0 + r * (s0 + s1));
+                continue;
+            }
             let mut folded_b = b0 + r * (b0 + b1);
             if let Some((basis, alpha)) = deferred_basis {
                 let d0 = basis[2 * j];
@@ -10968,6 +11356,76 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    /// Dropping the bottom products of the top `dead_top` transposed layers
+    /// leaves the kept low `2^(log_d - dead_top)` outputs bit-identical, on
+    /// the scatter + dense route and on every forced window width.
+    #[test]
+    fn sparse_transpose_dead_top_keeps_prefix() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0xDEAD_B077);
+        for &(log_d, n_pos) in &[(6usize, 5usize), (12, 40), (14, 200), (16, 218)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut positions: Vec<usize> = (0..n_pos)
+                .map(|i| (i.wrapping_mul(2_654_435_761) + 7) & ((1usize << log_d) - 1))
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            let values = rng.sample_f128_vec(positions.len());
+            for dead in 0..=3usize {
+                for k_override in [None, Some(4usize), Some(8)] {
+                    let (full, _) = transpose_forward_ntt_sparse_inner(
+                        &ntt, &positions, &values, log_d, None, k_override,
+                    );
+                    let (cut, _) = transpose_forward_ntt_sparse_inner_dead(
+                        &ntt, &positions, &values, log_d, None, k_override, dead,
+                    );
+                    let keep = 1usize << (log_d - dead);
+                    assert_eq!(
+                        &full[..keep],
+                        &cut[..keep],
+                        "log_d={log_d} dead={dead} k={k_override:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A deferred-basis fold with weight ONE (folded as `b + basis`) and with
+    /// a general weight both equal the explicit two-fold oracle, on the serial
+    /// and the chunked paths.
+    #[test]
+    fn fold_with_deferred_basis_matches_two_fold_oracle() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0xDEF0_0E01);
+        for n in [64usize, 1024, 1 << 14] {
+            let f = rng.sample_f128_vec(n);
+            let b = rng.sample_f128_vec(n);
+            let basis = rng.sample_f128_vec(n);
+            let r = rng.sample_f128();
+            for alpha in [F128::ONE, rng.sample_f128()] {
+                let (nf, nb, msg) = fold_and_msg_lsb_inner(&f, &b, r, None, None, Some((&basis, alpha)));
+                let half = n / 2;
+                let mut u_0 = F128::ZERO;
+                let mut u_2 = F128::ZERO;
+                for j in 0..half {
+                    let ef = f[2 * j] + r * (f[2 * j] + f[2 * j + 1]);
+                    let eb = b[2 * j]
+                        + r * (b[2 * j] + b[2 * j + 1])
+                        + alpha * (basis[2 * j] + r * (basis[2 * j] + basis[2 * j + 1]));
+                    assert_eq!(nf[j], ef, "n={n} j={j} f");
+                    assert_eq!(nb[j], eb, "n={n} j={j} b");
+                }
+                let mut k = 0;
+                while k + 1 < half {
+                    u_0 += nf[k] * nb[k];
+                    u_2 += (nf[k] + nf[k + 1]) * (nb[k] + nb[k + 1]);
+                    k += 2;
+                }
+                assert_eq!((msg.u_0, msg.u_2), (u_0, u_2), "n={n} message");
+            }
+        }
+    }
+
     use super::*;
 
     /// The gated parallel query-phase gathers must match the sequential
@@ -13350,6 +13808,9 @@ mod tests {
             queries,
             alpha_pows,
             inverse_local_blocks,
+            stage_blocks: Vec::new(),
+            expansion_rows: Vec::new(),
+            snapshots: false,
         };
         let challenges = rng.sample_f128_vec(depth);
         for k in 0..=depth {
