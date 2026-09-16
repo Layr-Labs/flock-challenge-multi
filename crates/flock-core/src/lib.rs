@@ -508,22 +508,28 @@ pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
 /// the kernel to assemble the range into 2 MiB pages synchronously; where they
 /// won, the calls are no-ops. Setup-phase only. `FLOCK_NO_MADV_COLLAPSE=1`
 /// disables it.
+///
+/// Returns `true` when there is nothing left to collapse for this range —
+/// the kernel reported the whole range assembled, or the range is below one
+/// huge page — and `false` when the call was skipped or refused (typically
+/// `ENOMEM` under fragmentation), so a caller that retries on later parks
+/// can stop as soon as the range is known huge.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
+pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) -> bool {
     const HUGE: usize = 1 << 21;
     if bytes < HUGE {
-        return;
+        return true;
     }
     static DISABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
     if *DISABLED {
-        return;
+        return false;
     }
     const PAGE: usize = 4096;
     let start = (ptr as usize).next_multiple_of(PAGE);
     let end = ptr as usize + bytes;
     if end <= start {
-        return;
+        return true;
     }
     const SYS_MADVISE: usize = 28;
     const MADV_COLLAPSE: usize = 25;
@@ -542,12 +548,14 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
             lateout("r11") _,
             options(nostack),
         );
-        let _ = ret;
+        ret == 0
     }
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
+pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) -> bool {
+    true
+}
 
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.

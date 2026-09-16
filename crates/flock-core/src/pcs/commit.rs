@@ -592,6 +592,72 @@ fn tree_collapse_enabled() -> bool {
     *ON
 }
 
+/// Park-time collapse bookkeeping, per tree buffer base address: attempts so
+/// far and whether the kernel has reported the range assembled.
+///
+/// A tree taken from `TREE_POOL` is the same allocation that was collapsed
+/// when it was first parked, during the untimed warm-up. The incumbent
+/// re-issued `madvise(MADV_COLLAPSE)` on EVERY park — three times inside the
+/// timed prove: the ranked L0 64 MiB tree at `ProverData::drop`, right
+/// before the proof is published, and the 16 / 4 MiB recursive trees inside
+/// the open. On an already-huge range that is still a synchronous kernel
+/// walk of the whole buffer; on a fragmented host every 2 MiB stretch
+/// retries allocation plus direct compaction, and one 64 MiB call was
+/// measured at 0.2–4.3 ms (`ENOMEM`, no free order-9 pages). No outcome of
+/// the call changes a proof byte.
+///
+/// Collapse a buffer on its parks until the kernel reports success or
+/// `TREE_COLLAPSE_MAX_ATTEMPTS` parks, then never again for that address.
+/// The ~20 untimed proves exhaust that budget long before the timed prove
+/// parks anything. `FLOCK_TREE_RECOLLAPSE=1` restores the every-park
+/// behaviour (same-binary A/B).
+const TREE_COLLAPSE_MAX_ATTEMPTS: u8 = 4;
+static TREE_COLLAPSED: Mutex<Vec<(usize, u8, bool)>> = Mutex::new(Vec::new());
+
+fn tree_recollapse_every_park() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_TREE_RECOLLAPSE").is_some());
+    *ON
+}
+
+/// Should this park issue a collapse for the buffer at `base`? Records the
+/// attempt when it says yes.
+fn tree_collapse_due(base: usize) -> bool {
+    if tree_recollapse_every_park() {
+        return true;
+    }
+    let Ok(mut seen) = TREE_COLLAPSED.lock() else {
+        return false;
+    };
+    match seen.iter_mut().find(|(p, _, _)| *p == base) {
+        Some((_, attempts, done)) => {
+            if *done || *attempts >= TREE_COLLAPSE_MAX_ATTEMPTS {
+                false
+            } else {
+                *attempts += 1;
+                true
+            }
+        }
+        None => {
+            // Bounded: the pool parks at most three buffers; anything beyond
+            // a few distinct addresses is stale and safe to shed oldest-first.
+            if seen.len() >= 8 {
+                seen.remove(0);
+            }
+            seen.push((base, 1, false));
+            true
+        }
+    }
+}
+
+fn tree_collapse_done(base: usize) {
+    if let Ok(mut seen) = TREE_COLLAPSED.lock()
+        && let Some(entry) = seen.iter_mut().find(|(p, _, _)| *p == base)
+    {
+        entry.2 = true;
+    }
+}
+
 pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // Only park allocations big enough to matter for wrap-cache stability.
     // Floor at 2^16 nodes (~4 MiB) so the ranked L2 Ligerito tree (2^16
@@ -606,10 +672,15 @@ pub(crate) fn give_tree(mut tree: Vec<Hash>) {
     // kernel may round the final partial page, but the separate 96-page
     // layout tail is otherwise outside the requested range.
     if tree_collapse_enabled() {
-        crate::collapse_hugepages(
-            tree.as_mut_ptr().cast::<u8>(),
-            tree.len() * core::mem::size_of::<Hash>(),
-        );
+        let base = tree.as_ptr() as usize;
+        if tree_collapse_due(base)
+            && crate::collapse_hugepages(
+                tree.as_mut_ptr().cast::<u8>(),
+                tree.len() * core::mem::size_of::<Hash>(),
+            )
+        {
+            tree_collapse_done(base);
+        }
     }
     tree.clear();
     if let Ok(mut pool) = TREE_POOL.lock() {

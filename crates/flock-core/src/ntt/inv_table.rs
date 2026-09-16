@@ -36,6 +36,45 @@ pub struct InvNttTableByteSingleGf8 {
     data_offset: usize,
 }
 
+/// σ-images built for the ranked `ell = 64` table on x86_64. Two by default
+/// (σ₀, σ₈: the incumbent 32 KiB footprint and two-image kernels). Opt-in
+/// `FLOCK_INV_TABLE_IMAGES4=1` builds four (σ₀, σ₈, σ₁₆, σ₂₄), so the AVX-512
+/// K-row apply issues one 128-bit-lane shuffle instead of three, and
+/// `FLOCK_INV_IMAGES8=1` builds all eight σ_{8b} images (no shuffle, 128 KiB
+/// of table). Read once per process.
+fn x86_table_images() -> usize {
+    #[cfg(test)]
+    {
+        let forced = FORCE_TABLE_IMAGES.with(std::cell::Cell::get);
+        if forced != 0 {
+            return forced;
+        }
+    }
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_INV_IMAGES8").is_some() {
+            8
+        } else if std::env::var_os("FLOCK_INV_TABLE_IMAGES4").is_some() {
+            4
+        } else {
+            2
+        }
+    });
+    *N
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_TABLE_IMAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: tables built on this thread carry exactly `images` σ-images
+/// (`0` restores the process default).
+#[cfg(test)]
+pub(crate) fn force_table_images_for_test(images: usize) {
+    assert!(matches!(images, 0 | 2 | 4 | 8));
+    FORCE_TABLE_IMAGES.with(|c| c.set(images));
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Build the table given the two NTT instances: `ntt_S` over the input
     /// domain, `ntt_L` over the output (extension) domain. Both must have the
@@ -63,7 +102,11 @@ impl InvNttTableByteSingleGf8 {
         // vector, and the x86 AVX-512 apply folds its entire first butterfly
         // level into the loads (10 port-5 shuffles → 3 per apply). Other
         // architectures keep the original footprint.
-        let table_images = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        let table_images = if cfg!(target_arch = "x86_64") && ell == 64 {
+            // The ranked AVX-512 K-row applies also address σ₁₆/σ₂₄ (and, on
+            // request, σ₃₂..σ₅₆) images; see `x86_table_images`.
+            x86_table_images()
+        } else if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             2
         } else {
             1
@@ -118,6 +161,25 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
+        // Further σ_{8m} images (m = 2..table_images), built only for the
+        // ranked x86 `ell = 64` table: byte `i` of image `m` is the base row's
+        // byte `i ^ 8m`. The shift is a multiple of eight, so every 8-byte
+        // half maps to one 8-byte half and the image is 8 copies per row.
+        #[cfg(target_arch = "x86_64")]
+        for image in 2..table_images {
+            let shift = 8 * image;
+            let (original_storage, image_storage) =
+                data.split_at_mut(data_offset + image * table_len);
+            let original = &original_storage[data_offset..data_offset + table_len];
+            let target = &mut image_storage[..table_len];
+            for (source, target) in original.chunks_exact(ell).zip(target.chunks_exact_mut(ell)) {
+                for half in (0..ell).step_by(8) {
+                    let from = half ^ shift;
+                    target[half..half + 8].copy_from_slice(&source[from..from + 8]);
+                }
+            }
+        }
+
         Self {
             k,
             ell,
@@ -155,6 +217,22 @@ impl InvNttTableByteSingleGf8 {
     #[inline]
     pub(crate) fn has_second_image(&self) -> bool {
         self.data.len() >= self.data_offset + 2 * 256 * self.ell
+    }
+
+    /// Complete σ-images carried by the allocation: 1, 2, 4 or 8 (see
+    /// `x86_table_images`). Image `m` starts `m · 256 · ell` bytes after
+    /// [`Self::data_ptr`].
+    #[cfg_attr(
+        not(all(
+            target_feature = "gfni",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        )),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) fn table_image_count(&self) -> usize {
+        (self.data.len() - self.data_offset) / (256 * self.ell)
     }
 
     #[inline]
@@ -646,6 +724,186 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
     }
 }
 
+/// Byte distance between consecutive σ-images of the `ell = 64` table: image
+/// `m` starts at `data_ptr() + m · IMAGE_STRIDE_64`.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
+pub(crate) const IMAGE_STRIDE_64: usize = 256 * 64;
+
+/// The eight pre-scaled row offsets of one K-row, in byte order `b0..b7`,
+/// from either arena layout: `P = false` reads bytes 0..4 / 4..8 as the words
+/// at `p` / `p + 4`; `P = true` reads the even bytes at `p` and the odd bytes
+/// at `p + 32` (see [`offw_krow_words`]).
+///
+/// # Safety
+/// `p` and the second word must each be readable as one 64-bit word.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
+#[inline(always)]
+pub(crate) unsafe fn krow_offsets<const P: bool>(p: *const u16) -> [usize; 8] {
+    // SAFETY: two readable 64-bit words per the contract.
+    unsafe {
+        if P {
+            let we = (p as *const u64).read_unaligned();
+            let wo = (p.add(32) as *const u64).read_unaligned();
+            [
+                we as u16 as usize,
+                wo as u16 as usize,
+                (we >> 16) as u16 as usize,
+                (wo >> 16) as u16 as usize,
+                (we >> 32) as u16 as usize,
+                (wo >> 32) as u16 as usize,
+                (we >> 48) as usize,
+                (wo >> 48) as usize,
+            ]
+        } else {
+            let w0 = (p as *const u64).read_unaligned();
+            let w1 = (p.add(4) as *const u64).read_unaligned();
+            [
+                w0 as u16 as usize,
+                (w0 >> 16) as u16 as usize,
+                (w0 >> 32) as u16 as usize,
+                (w0 >> 48) as usize,
+                w1 as u16 as usize,
+                (w1 >> 16) as u16 as usize,
+                (w1 >> 32) as u16 as usize,
+                (w1 >> 48) as usize,
+            ]
+        }
+    }
+}
+
+/// Four-image twin of [`apply_x86_avx512_register_2img_krow_at`]. With
+/// `σ_s(v)[i] = v[i ^ s]`, byte `b` of the K-row contributes
+/// `σ_{8b}(T[byte_b])`. Loading bytes 0..4 from images σ₀/σ₈/σ₁₆/σ₂₄ and bytes
+/// 4..8 from the same four images gives `out = V₀ ⊕ σ₃₂(V₁)`: the same eight
+/// rows and seven XORs as the two-image form, but one 128-bit-lane shuffle
+/// (imm 0x4E) instead of three. Identical value.
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_2img_krow_at`], with `base` the start of
+/// a table carrying at least four images.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool>(
+    base: *const u8,
+    p: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: every offset is `byte * 64` with `byte <= 255`, so each load lands
+    // inside one 256-row image of 64 readable bytes per row.
+    unsafe {
+        let o = krow_offsets::<P>(p);
+        let row = |image: usize, offset: usize| {
+            _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + offset) as *const __m512i)
+        };
+        let v0 = _mm512_xor_si512(
+            _mm512_xor_si512(row(0, o[0]), row(1, o[1])),
+            _mm512_xor_si512(row(2, o[2]), row(3, o[3])),
+        );
+        let v1 = _mm512_xor_si512(
+            _mm512_xor_si512(row(0, o[4]), row(1, o[5])),
+            _mm512_xor_si512(row(2, o[6]), row(3, o[7])),
+        );
+        _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0x4E>(v1, v1))
+    }
+}
+
+/// Eight-image twin of [`apply_x86_avx512_register_2img_krow_at`]: byte `b`
+/// loads image σ_{8b} directly, so the apply is eight loads and seven XORs
+/// with no shuffle. Identical value.
+///
+/// # Safety
+/// As for [`apply_x86_avx512_register_4img_krow_at`], with a table carrying
+/// all eight images.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn apply_x86_avx512_register_8img_krow_at<const P: bool>(
+    base: *const u8,
+    p: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: as for the four-image form; image `b` exists for every `b < 8`.
+    unsafe {
+        let o = krow_offsets::<P>(p);
+        let row = |image: usize| {
+            _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + o[image]) as *const __m512i)
+        };
+        _mm512_xor_si512(
+            _mm512_xor_si512(
+                _mm512_xor_si512(row(0), row(1)),
+                _mm512_xor_si512(row(2), row(3)),
+            ),
+            _mm512_xor_si512(
+                _mm512_xor_si512(row(4), row(5)),
+                _mm512_xor_si512(row(6), row(7)),
+            ),
+        )
+    }
+}
+
+/// K-row apply over `I` σ-images (`2`, `4` or `8`). `I` is a compile-time
+/// selector: each instantiation is exactly one of the three kernels.
+///
+/// # Safety
+/// As for the selected kernel; `base8` is read only when `I == 2`.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
+#[inline(always)]
+pub(crate) unsafe fn apply_x86_avx512_register_img_krow_at<const I: u8, const P: bool>(
+    base: *const u8,
+    base8: *const u8,
+    p: *const u16,
+) -> core::arch::x86_64::__m512i {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        match I {
+            8 => apply_x86_avx512_register_8img_krow_at::<P>(base, p),
+            4 => apply_x86_avx512_register_4img_krow_at::<P>(base, p),
+            _ => apply_x86_avx512_register_2img_krow_at::<P>(base, base8, p),
+        }
+    }
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
@@ -935,6 +1193,95 @@ mod tests {
                         "scalar/avx512-offp apply disagree at k={k}, bytes={:02x?}",
                         bytes
                     );
+                }
+            }
+        }
+    }
+
+    /// The extra ranked x86 images are exact coordinate permutations of the
+    /// base table (image `m`, byte `i` == base byte `i ^ 8m`), and only the
+    /// `ell = 64` table grows them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn extra_sigma_images_are_exact_permutations() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(64));
+        for images in [2usize, 4, 8] {
+            super::force_table_images_for_test(images);
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            super::force_table_images_for_test(0);
+            assert_eq!(table.table_image_count(), images);
+            let len = 256 * table.ell;
+            // SAFETY: the allocation holds `images` complete images starting
+            // at `data_ptr`.
+            let all = unsafe { core::slice::from_raw_parts(table.data_ptr(), images * len) };
+            let (base, rest) = all.split_at(len);
+            for image in 1..images {
+                let img = &rest[(image - 1) * len..image * len];
+                for row in 0..256 {
+                    for i in 0..64 {
+                        assert_eq!(
+                            img[row * 64 + i],
+                            base[row * 64 + (i ^ (8 * image))],
+                            "images={images} image={image} row={row} byte={i}"
+                        );
+                    }
+                }
+            }
+        }
+        super::force_table_images_for_test(8);
+        let ntt_s5 = AdditiveNttGf8::new(5, F8::ZERO);
+        let ntt_l5 = AdditiveNttGf8::new(5, F8(32));
+        let small = InvNttTableByteSingleGf8::new(&ntt_s5, &ntt_l5);
+        super::force_table_images_for_test(0);
+        assert_eq!(small.table_image_count(), 2);
+    }
+
+    /// The four- and eight-image K-row applies equal the two-image apply for
+    /// both arena layouts.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn multi_image_krow_applies_match_two_image() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(64));
+        super::force_table_images_for_test(8);
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        super::force_table_images_for_test(0);
+        assert_eq!(table.table_image_count(), 8);
+        let (base, base8) = table.image_ptrs();
+        let store = |v: core::arch::x86_64::__m512i| {
+            let mut out = [0u8; 64];
+            // SAFETY: 64-byte destination for one ZMM store.
+            unsafe { core::arch::x86_64::_mm512_storeu_si512(out.as_mut_ptr().cast(), v) };
+            out
+        };
+        let mut rng = Rng::new(0x5116_A6E5);
+        for case in 0..768 {
+            let bytes: [u8; 8] = core::array::from_fn(|_| match case {
+                0 => 0,
+                1 => u8::MAX,
+                _ => (rng.next_u64() & 0xff) as u8,
+            });
+            let mut offw = [0u16; 8];
+            let mut offp = [0u16; 64];
+            for (b, &byte) in bytes.iter().enumerate() {
+                offw[b] = u16::from(byte) * 64;
+                offp[(b & 1) * 32 + (b >> 1)] = u16::from(byte) * 64;
+            }
+            // SAFETY: avx512f; eight images present; both offset layouts hold
+            // eight `byte * 64` offsets.
+            unsafe {
+                let expected =
+                    store(apply_x86_avx512_register_2img_krow_at::<false>(base, base8, offw.as_ptr()));
+                let cases = [
+                    ("2img parity", store(apply_x86_avx512_register_2img_krow_at::<true>(base, base8, offp.as_ptr()))),
+                    ("4img", store(apply_x86_avx512_register_4img_krow_at::<false>(base, offw.as_ptr()))),
+                    ("4img parity", store(apply_x86_avx512_register_4img_krow_at::<true>(base, offp.as_ptr()))),
+                    ("8img", store(apply_x86_avx512_register_8img_krow_at::<false>(base, offw.as_ptr()))),
+                    ("8img parity", store(apply_x86_avx512_register_8img_krow_at::<true>(base, offp.as_ptr()))),
+                ];
+                for (name, got) in cases {
+                    assert_eq!(got, expected, "{name}, bytes={bytes:02x?}");
                 }
             }
         }
