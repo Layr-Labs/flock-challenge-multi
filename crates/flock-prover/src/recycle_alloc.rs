@@ -153,6 +153,9 @@ unsafe impl GlobalAlloc for RecycleAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if recyclable(&layout) {
             let p = pop(layout.size());
+            // Provenance for `flock_core::alloc_uninit_vec`, which skips its
+            // `MADV_HUGEPAGE` re-advise on a block that came off a freelist.
+            let _ = flock_core::LAST_ALLOC_RECYCLED.try_with(|c| c.set(!p.is_null()));
             if !p.is_null() {
                 return p;
             }
@@ -167,6 +170,7 @@ unsafe impl GlobalAlloc for RecycleAlloc {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if recyclable(&layout) {
             let p = pop(layout.size());
+            let _ = flock_core::LAST_ALLOC_RECYCLED.try_with(|c| c.set(!p.is_null()));
             if !p.is_null() {
                 unsafe { core::ptr::write_bytes(p, 0, layout.size()) };
                 return p;

@@ -508,22 +508,28 @@ pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
 /// the kernel to assemble the range into 2 MiB pages synchronously; where they
 /// won, the calls are no-ops. Setup-phase only. `FLOCK_NO_MADV_COLLAPSE=1`
 /// disables it.
+///
+/// Returns `true` when there is nothing left to collapse for this range —
+/// the kernel reported the whole range assembled, or the range is below one
+/// huge page — and `false` when the call was skipped or refused (typically
+/// `ENOMEM` under fragmentation), so a caller that retries on later parks
+/// can stop as soon as the range is known huge.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
+pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) -> bool {
     const HUGE: usize = 1 << 21;
     if bytes < HUGE {
-        return;
+        return true;
     }
     static DISABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
     if *DISABLED {
-        return;
+        return false;
     }
     const PAGE: usize = 4096;
     let start = (ptr as usize).next_multiple_of(PAGE);
     let end = ptr as usize + bytes;
     if end <= start {
-        return;
+        return true;
     }
     const SYS_MADVISE: usize = 28;
     const MADV_COLLAPSE: usize = 25;
@@ -542,12 +548,14 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) {
             lateout("r11") _,
             options(nostack),
         );
-        let _ = ret;
+        ret == 0
     }
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) {}
+pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) -> bool {
+    true
+}
 
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
@@ -580,6 +588,7 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     let tail = if bytes >= (2 << 20) {
         core::hint::black_box(EY_TAIL_PAGES) * 4096 / core::mem::size_of::<T>().max(1)
     } else { 0 };
+    LAST_ALLOC_RECYCLED.with(|c| c.set(false));
     let mut v: Vec<T> = Vec::with_capacity(n + tail);
     // SAFETY:
     // - capacity >= n was just allocated, so set_len(n) is in bounds.
@@ -588,7 +597,14 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         v.set_len(n);
     }
-    advise_hugepages(v.as_mut_ptr().cast::<u8>(), n * core::mem::size_of::<T>());
+    // A block handed back by the recycling allocator is the same mapping
+    // that was advised when it was first allocated; `MADV_HUGEPAGE` is a
+    // VMA flag, so re-advising it is a syscall for nothing. The ranked
+    // prove takes three such blocks (8/16/4 MiB) inside the timed window.
+    // `FLOCK_ALWAYS_ADVISE=1` restores the unconditional advise.
+    if !LAST_ALLOC_RECYCLED.with(|c| c.get()) || always_advise() {
+        advise_hugepages(v.as_mut_ptr().cast::<u8>(), n * core::mem::size_of::<T>());
+    }
     // A fresh allocation may land on the address of a buffer that was
     // released by a plain `drop` while a scratch provenance tag was still
     // armed for it. This address now belongs to a new object, so that tag is
@@ -596,6 +612,23 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     // release. Lock-free (a short atomic scan) when nothing is armed.
     crate::scratch::void_pending_tag(v.as_ptr().cast::<crate::field::F128>());
     v
+}
+
+thread_local! {
+    /// Provenance of the most recent recyclable-class allocation on this
+    /// thread, set by the process's global allocator (`flock_prover::
+    /// recycle_alloc`): `true` when the block came off a freelist, `false`
+    /// when the system allocator produced a fresh mapping. Const-initialised
+    /// `Cell<bool>`: no destructor, no lazy registration, safe to touch from
+    /// inside `GlobalAlloc::alloc`. Builds without that allocator never set
+    /// it, so they keep advising every allocation.
+    pub static LAST_ALLOC_RECYCLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+fn always_advise() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ALWAYS_ADVISE").is_some());
+    *ON
 }
 
 /// Compatibility shim — same as `alloc_uninit_vec::<F128>(n)`.
