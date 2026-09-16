@@ -1053,8 +1053,31 @@ pub(crate) fn fold_block_major_one_shot_bind_top(
     }
 }
 
+/// `FLOCK_NO_LC_ONE_ROWS_EQ8_X4=1` restores the ranked one-row identity-C
+/// fold's eight scalar `eq_lo * eq_hi` products per stripe. Read once.
+fn lc_one_rows_eq8_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_ROWS_EQ8_X4").is_none());
+    *ON
+}
+
+/// Ranked default copies the unbound inner fold of rows 0..16 and 240
+/// out of `reduce_block` (low plane of blk 0..16, high plane of blk 112)
+/// instead of a second `reduce_worker_plane_block` pass over those
+/// seventeen columns. Same XOR order. `FLOCK_NO_LC_CANON_FROM_REDUCE=1`
+/// restores the re-reduce. Read once per process; default ON.
+fn lc_canon_from_reduce_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CANON_FROM_REDUCE").is_none());
+    *ON
+}
+
 /// Ranked identity-C fold plus the contribution of complete K-rows whose B
 /// multilinear extension is one.
+///
+/// `capture_canon` additionally returns the unbound inner fold of rows `0..16`
+/// and `240` (64 `F128` each, row 240 last) for the round-two canonical-window
+/// elision (`zerocheck::multilinear::round2_canonical_window_deltas`).
 pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
     z: &[F128],
     m: usize,
@@ -1062,7 +1085,8 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
     useful_bits: usize,
     x_outer: &[F128],
     r_top: F128,
-) -> (Vec<F128>, Vec<F128>) {
+    capture_canon: bool,
+) -> (Vec<F128>, Vec<F128>, Option<Vec<F128>>) {
     assert_eq!(m, 32);
     assert_eq!(k_log, 14);
     assert_eq!(useful_bits, 15409);
@@ -1072,12 +1096,27 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
     let eq_hi = build_eq_table(outer_hi);
     let log_b = eq_lo.len().trailing_zeros() as usize;
     let lo_mask = eq_lo.len() - 1;
+    // Two 4-lane products per stripe instead of eight scalar ones — the same
+    // x4 twin the other factorized sweeps use. Resolved once, outside the
+    // per-stripe closure.
+    #[allow(unused_variables)]
+    let eq8_x4 = lc_one_rows_eq8_x4_enabled() && lc_eq8_x4_enabled();
     let (full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
         z,
         m,
         k_log,
         useful_bits,
         |outer_base| {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if eq8_x4 {
+                // SAFETY: cfg supplies avx512f+vpclmulqdq; the eight indices
+                // are the scalar arm's `lo_mask` / `log_b` formula.
+                return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, outer_base, log_b, lo_mask) };
+            }
             std::array::from_fn(|lane| {
                 let outer = outer_base + lane;
                 eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
@@ -1085,8 +1124,12 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
         },
         Some(r_top),
         true,
+        capture_canon,
     );
-    (full, one.expect("ranked one-row fold requested"))
+    let mut one = one.expect("ranked one-row fold requested");
+    // The capture rides behind the one-row slots (see the plane reduce).
+    let canon = capture_canon.then(|| one.split_off(1usize << (k_log - 1)));
+    (full, one, canon)
 }
 
 /// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
@@ -1205,6 +1248,18 @@ fn lc_zfold_pf_spread_enabled() -> bool {
     *ON
 }
 
+/// Ranked default issues the block-major z-fold prefetch as NTA instead of
+/// T0. The 512 MiB leftover scan is overlapped with `fold_alpha` (L2-resident
+/// CSC gather); T0 pulls that stream into the cache the gather wants.
+/// Prefetch has no architectural effect on the folded values.
+/// `FLOCK_NO_LC_ZFOLD_NTA=1` restores T0. Read once per process; default ON.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_nta_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_NTA").is_none());
+    *ON
+}
+
 /// Block-major row stride, in `F128`, at the ranked shape: `k = 2^14`, so
 /// `chunks_per_block = k / 128 = 128`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
@@ -1230,10 +1285,18 @@ const LC_RANKED_CHUNKS_PER_BLOCK: usize = 128;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
 #[inline(always)]
 unsafe fn lc_prefetch_rows16(base: *const F128, chunks_per_block: usize, ranked: bool) {
-    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-    // SAFETY: bounds per the contract.
+    use core::arch::x86_64::{_MM_HINT_NTA, _MM_HINT_T0, _mm_prefetch};
+    // SAFETY: bounds per the contract. Hint is a const generic of
+    // `_mm_prefetch`; ranked NTA is selected once per process.
     unsafe {
-        if ranked {
+        if ranked && lc_zfold_pf_nta_enabled() {
+            for i in 0..16 {
+                _mm_prefetch(
+                    base.add(i * LC_RANKED_CHUNKS_PER_BLOCK).cast::<i8>(),
+                    _MM_HINT_NTA,
+                );
+            }
+        } else if ranked {
             for i in 0..16 {
                 _mm_prefetch(
                     base.add(i * LC_RANKED_CHUNKS_PER_BLOCK).cast::<i8>(),
@@ -1620,6 +1683,7 @@ fn fold_block_major_gfni(
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     top_bind: Option<F128>,
     ranked_one_rows: bool,
+    capture_canon: bool,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
@@ -1865,8 +1929,19 @@ fn fold_block_major_gfni(
     // buffer carries the dead zero-fill; avoiding this comparatively small
     // clear would require a separate MaybeUninit ownership conversion.
     let mut out = vec![F128::ZERO; out_len];
-    let mut one = ranked_one_rows.then(|| vec![F128::ZERO; out_len]);
+    // Reserve the canonical-row capture appended below up front, so the
+    // append never reallocates and copies the one-row slots.
+    let mut one = ranked_one_rows.then(|| {
+        let mut v = Vec::with_capacity(out_len + if capture_canon { 17 * 64 } else { 0 });
+        v.resize(out_len, F128::ZERO);
+        v
+    });
     debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
+    let from_reduce = capture_canon && lc_canon_from_reduce_enabled();
+    let mut canon_buf = from_reduce.then(|| vec![F128::ZERO; 17 * 64]);
+    // Disjoint slots: blk 0..16 write 64-F128 windows 0..16, blk 112 writes
+    // window 16 (row 240). Not aliased with `one`'s parallel chunks.
+    let canon_addr = canon_buf.as_mut().map(|v| v.as_mut_ptr() as usize);
     let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
         if blk < live_blocks {
             // SAFETY: `active_workers` contains exactly producer chunks that
@@ -1880,6 +1955,19 @@ fn fold_block_major_gfni(
             // Padding has no backing worker-plane writes in the uninitialized
             // allocation, but its canonical folded value is algebraic zero.
             o.fill(F128::ZERO);
+        }
+        if let Some(addr) = canon_addr {
+            if blk < 16 {
+                // SAFETY: slot `blk` is unique to this block; `o` is the
+                // unbound row `blk` (bind happens below).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        o.as_ptr(),
+                        (addr as *mut F128).add(blk * 64),
+                        64,
+                    );
+                }
+            }
         }
         if let Some(r) = top_bind {
             let mut hi = [F128::ZERO; 64];
@@ -1895,6 +1983,19 @@ fn fold_block_major_gfni(
                         hi_blk,
                         &mut hi,
                     );
+                }
+            }
+            if let Some(addr) = canon_addr {
+                if blk == 112 {
+                    // SAFETY: blk 112's high plane is unbound row 240; slot
+                    // 16 is not written by any other block.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            hi.as_ptr(),
+                            (addr as *mut F128).add(16 * 64),
+                            64,
+                        );
+                    }
                 }
             }
             if let Some(one_o) = one_o {
@@ -1924,6 +2025,34 @@ fn fold_block_major_gfni(
             .enumerate()
             .for_each(|(blk, o)| reduce_block(blk, o, None));
     }
+    if capture_canon && let Some(one) = one.as_mut() {
+        if let Some(canon) = canon_buf.take() {
+            one.extend_from_slice(&canon);
+        } else {
+            // Unbound inner fold of rows 0..16 and 240 for the round-two
+            // canonical-window elision, appended behind the one-row slots. The
+            // parallel reduce above wrote only bound values, so re-reduce these
+            // seventeen 64-column blocks from the worker planes (~17k XORs).
+            let mut canon = vec![F128::ZERO; 17 * 64];
+            for (slot, row) in (0..16).chain([240usize]).enumerate() {
+                if row < live_blocks {
+                    // SAFETY: as in `reduce_block`: `row < live_blocks`, every
+                    // active worker's first tile stored this block, and the
+                    // producer iterator joined before the reduction.
+                    unsafe {
+                        reduce_worker_plane_block(
+                            &planes,
+                            worker_stride,
+                            &active_workers,
+                            row,
+                            &mut canon[slot * 64..(slot + 1) * 64],
+                        );
+                    }
+                }
+            }
+            one.extend_from_slice(&canon);
+        }
+    }
     (out, one)
 }
 
@@ -1948,6 +2077,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
         eq8_at,
         top_bind,
         false,
+        false,
     )
     .0
 }
@@ -1960,6 +2090,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
     top_bind: Option<F128>,
     ranked_one_rows: bool,
+    capture_canon: bool,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
 
@@ -2020,6 +2151,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             &eq8_at,
             top_bind,
             ranked_one_rows,
+            capture_canon,
         );
     }
 
@@ -2317,6 +2449,16 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         Some(one)
     } else {
         None
+    };
+    let one = match one {
+        Some(mut one) if capture_canon => {
+            // Unbound rows 0..16 and 240 for the round-two canonical-window
+            // elision, appended behind the one-row slots (GFNI arm twin).
+            one.extend_from_slice(&out[..16 * 64]);
+            one.extend_from_slice(&out[240 * 64..241 * 64]);
+            Some(one)
+        }
+        other => other,
     };
     if let Some(r) = top_bind {
         let half = out.len() / 2;
@@ -5029,5 +5171,82 @@ mod tests {
             ),
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod canon_capture_tests {
+    use super::*;
+
+    /// The ranked one-row fold's appended capture is exactly the unbound
+    /// block-major inner fold of rows 0..16 and 240 (GFNI plane arm on
+    /// AVX-512 GFNI hosts, partials arm elsewhere).
+    #[test]
+    fn ranked_one_row_fold_captures_unbound_canonical_rows() {
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL: usize = 15_409;
+        let n_outer = 1usize << (M - K_LOG);
+        let chunks_per_block = (1usize << K_LOG) / 128;
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut z = vec![F128::ZERO; n_outer * chunks_per_block];
+        for blk in 0..n_outer {
+            for w in 0..chunks_per_block {
+                let bit0 = w * 128;
+                let mut v = F128 { lo: next(), hi: next() };
+                if bit0 >= USEFUL {
+                    v = F128::ZERO;
+                } else if bit0 + 128 > USEFUL {
+                    let keep = USEFUL - bit0;
+                    if keep <= 64 {
+                        v.hi = 0;
+                        if keep < 64 {
+                            v.lo &= (1u64 << keep) - 1;
+                        }
+                    } else if keep - 64 < 64 {
+                        v.hi &= (1u64 << (keep - 64)) - 1;
+                    }
+                }
+                z[blk * chunks_per_block + w] = v;
+            }
+        }
+        let x_outer: Vec<F128> = (0..M - K_LOG).map(|_| F128 { lo: next(), hi: next() }).collect();
+        let r_top = F128 { lo: next(), hi: next() };
+        let eq = build_eq_table(&x_outer);
+        let (_full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
+            &z,
+            M,
+            K_LOG,
+            USEFUL,
+            |base| std::array::from_fn(|lane| eq[base + lane]),
+            Some(r_top),
+            true,
+            true,
+        );
+        let one = one.expect("ranked one-row fold");
+        let half = 1usize << (K_LOG - 1);
+        assert_eq!(one.len(), half + 17 * 64);
+        let canon = &one[half..];
+        for (slot, row) in (0..16).chain([240usize]).enumerate() {
+            for s in 0..64 {
+                let bit = row * 64 + s;
+                let mut want = F128::ZERO;
+                for (blk, e) in eq.iter().enumerate() {
+                    let w = z[blk * chunks_per_block + bit / 128];
+                    let b = bit % 128;
+                    let set = if b < 64 { (w.lo >> b) & 1 } else { (w.hi >> (b - 64)) & 1 };
+                    if set == 1 {
+                        want += *e;
+                    }
+                }
+                assert_eq!(canon[slot * 64 + s], want, "row {row} bit {s}");
+            }
+        }
     }
 }
