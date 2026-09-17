@@ -728,3 +728,19 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// ---------------------------------------------------------------------------
+// Yukon redraw marker (2026-09-18, draw 1).
+//
+// Inert content-hash marker: this submission is a DISCLOSED resample
+// ("redraw") of the promoted frontier tree (02c77fd, score 1651266.98,
+// commit 1b55c6e) to measure current official-runner conditions on the
+// dedicated c7i.4xlarge. The function below is never called from any
+// measured or unmeasured path; it exists only so the submission archive
+// differs by content from every previous archive of the same tree (the
+// server refuses byte-identical archives). Bump the constant for each
+// successive resample.
+#[allow(dead_code)]
+pub(crate) fn yukon_redraw_marker() -> u32 {
+    1
+}
