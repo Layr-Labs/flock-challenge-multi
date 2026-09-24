@@ -1606,7 +1606,7 @@ fn fused_fast_combine_staged_nt(
 /// 4096 XORs per claim, which must amortize over the block's `b` fold
 /// evaluations. Production (m = 32) has b = 4096.
 #[cfg(target_arch = "aarch64")]
-const MERGE_MIN_BLOCK: usize = 2048;
+const MERGE_MIN_BLOCK: usize = 2048usize;
 
 /// OPT-IN (`FLOCK_COMBINE_MERGE=1`) — measured SLOWER than the staged
 /// default at the production shape; kept as the reproducible negative +
