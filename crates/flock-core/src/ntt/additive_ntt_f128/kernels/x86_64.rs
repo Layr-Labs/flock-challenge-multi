@@ -1943,7 +1943,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// row addressing.
 /// `HIGH_ONE_OUTER` requires `twiddles[0].hi == 1`; the shaped dispatcher
 /// verifies it before entering that specialization.
-#[inline]
+// Keep specialization bodies separate. Inlining every DIET/LOW/NNC arm
+// into one dispatcher gives all calls its union-sized stack frame and makes
+// the hot kernel share an instruction footprint with unused alternatives.
+// This preserves every arithmetic operation and all dispatch preconditions.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,
@@ -1965,22 +1969,11 @@ unsafe fn butterfly_fused_3layer_rows_impl<
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
-        // Seven broadcasts (plus their x^64 companions under DIET) hoisted
-        // out of the lane loop: 8 rows stay live in registers across all
-        // three layers, so a row is loaded once and stored once for 12
-        // butterflies instead of the fused-two + single-layer pair's two
-        // loads and two stores for the same 12.
+        // Bulk path deliberately does not keep all seven twiddle pairs live.
+        // Materializing only the active layer's pair leaves enough ZMM space
+        // for three independent four-lane chunks (24 row vectors) without
+        // the 14-register twiddle footprint of the original two-chunk loop.
         let zero = _mm512_setzero_si512();
-        let mut tw = [(zero, zero); 7];
-        // The high-one product needs only the original twiddle broadcast.
-        tw[0] = if HIGH_ONE_OUTER {
-            tw_x4::<false, false>(twiddles[0])
-        } else {
-            tw_x4::<LOW_OUTER, DIET>(twiddles[0])
-        };
-        for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
-            *slot = tw_x4::<LOW_INNER, DIET>(*value);
-        }
         let row = |i: usize| ptr.add(i * num_ntts);
         let mut lane = 0;
 
@@ -2019,6 +2012,77 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                     $values[c][$u] = new_u;
                 }
             }};
+        }
+
+        // Three chunks = twelve scalar F128 lanes per bulk trip.  Each phase
+        // creates only the twiddle pair it consumes, so 24 row registers plus
+        // the current multiplier/product temporaries fit the 32-register ZMM
+        // file.  The arithmetic and row geometry are identical to the proven
+        // two-chunk path; only instruction scheduling / register lifetime changes.
+        macro_rules! butterfly3 {
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
+                butterfly3!($values, $u, $v, $twiddle, $low, false);
+            }};
+            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr) => {{
+                for c in 0..3 {
+                    let product = if $high_one {
+                        mul_x4_high_one($twiddle, $values[c][$v])
+                    } else {
+                        mul_x4::<$low, DIET>($twiddle, $values[c][$v])
+                    };
+                    let new_u = _mm512_xor_si512($values[c][$u], product);
+                    $values[c][$v] = _mm512_xor_si512($values[c][$v], new_u);
+                    $values[c][$u] = new_u;
+                }
+            }};
+        }
+
+        while lane + 12 <= dense_lanes {
+            let mut values = [[zero; 8]; 3];
+            for (c, chunk) in values.iter_mut().enumerate() {
+                for (i, value) in chunk.iter_mut().enumerate() {
+                    *value = _mm512_loadu_si512(row(i).add(lane + 4 * c) as *const __m512i);
+                }
+            }
+
+            let outer = if HIGH_ONE_OUTER {
+                tw_x4::<false, false>(twiddles[0])
+            } else {
+                tw_x4::<LOW_OUTER, DIET>(twiddles[0])
+            };
+            for i in 0..4 {
+                butterfly3!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+            }
+            for s in 0..2 {
+                let twiddle = tw_x4::<LOW_INNER, DIET>(twiddles[1 + s]);
+                for i in 0..2 {
+                    butterfly3!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                }
+            }
+            for s in 0..4 {
+                let twiddle = tw_x4::<LOW_INNER, DIET>(twiddles[3 + s]);
+                butterfly3!(values, 2 * s, 2 * s + 1, twiddle, LOW_INNER);
+            }
+
+            for (c, chunk) in values.iter().enumerate() {
+                for (i, value) in chunk.iter().enumerate() {
+                    _mm512_storeu_si512(row(i).add(lane + 4 * c) as *mut __m512i, *value);
+                }
+            }
+            lane += 12;
+        }
+
+        // Hoist the seven pairs only for the small 8/4-lane remainder and the
+        // published zero-tail path.  At dense_lanes 60 the new bulk loop has
+        // no dense remainder; at 64 only one four-lane remainder remains.
+        let mut tw = [(zero, zero); 7];
+        tw[0] = if HIGH_ONE_OUTER {
+            tw_x4::<false, false>(twiddles[0])
+        } else {
+            tw_x4::<LOW_OUTER, DIET>(twiddles[0])
+        };
+        for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
+            *slot = tw_x4::<LOW_INNER, DIET>(*value);
         }
 
         while lane + 8 <= dense_lanes {
