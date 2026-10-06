@@ -624,6 +624,142 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
     }
 }
 
+/// Four seed-top row groups sharing one immutable twiddle block. Keep the
+/// validated route beside its values, so callers cannot reuse it with a
+/// different basis/coset or staging geometry.
+pub(super) struct PreparedStagedFused4 {
+    twiddles: [F128; 15],
+    num_ntts: usize,
+    stage_permuted: bool,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    shaped_route: Option<(bool, bool)>, // (diet, zero spine)
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    companions: [F128; 15],
+}
+
+impl PreparedStagedFused4 {
+    pub(super) fn new(twiddles: [F128; 15], num_ntts: usize, stage_permuted: bool) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let shaped_route = if num_ntts == 64 && stage_permuted && super::ntt_shaped_enabled() {
+            Some(x86_64::prepare_staged_fused4_route(&twiddles))
+        } else {
+            None
+        };
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let companions = if matches!(shaped_route, Some((true, _))) {
+            twiddles.map(x86_64::shift64_scalar)
+        } else {
+            [F128::ZERO; 15]
+        };
+        Self {
+            twiddles,
+            num_ntts,
+            stage_permuted,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            shaped_route,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            companions,
+        }
+    }
+
+    /// Select a const arithmetic body once around all four row groups.
+    ///
+    /// # Safety
+    /// `ptr` owns 64 complete rows of the prepared width; these rows must be
+    /// disjoint from other concurrent groups, and every lane bound must fit.
+    #[inline]
+    pub(super) unsafe fn apply_four_groups(&self, ptr: *mut F128, lanes: [usize; 4]) {
+        debug_assert!(lanes.iter().all(|&n| n <= self.num_ntts));
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: the private route was checked against the owned twiddles
+        // and exact geometry at construction; values never change afterward.
+        unsafe {
+            match self.shaped_route {
+                Some((true, true)) => {
+                    x86_64::butterfly_staged_fused4_block::<true, true>(
+                        ptr,
+                        lanes,
+                        &self.twiddles,
+                        &self.companions,
+                    );
+                    return;
+                }
+                Some((true, false)) => {
+                    x86_64::butterfly_staged_fused4_block::<true, false>(
+                        ptr,
+                        lanes,
+                        &self.twiddles,
+                        &self.companions,
+                    );
+                    return;
+                }
+                Some((false, true)) => {
+                    x86_64::butterfly_staged_fused4_block::<false, true>(
+                        ptr,
+                        lanes,
+                        &self.twiddles,
+                        &self.companions,
+                    );
+                    return;
+                }
+                Some((false, false)) => {
+                    x86_64::butterfly_staged_fused4_block::<false, false>(
+                        ptr,
+                        lanes,
+                        &self.twiddles,
+                        &self.companions,
+                    );
+                    return;
+                }
+                None => {}
+            }
+        }
+        let (stride, group_base) = if self.stage_permuted { (1, 16) } else { (4, 1) };
+        for (j, active_lanes) in lanes.into_iter().enumerate() {
+            // SAFETY: the prepared permutation partitions all 64 rows into
+            // four disjoint groups, with the original active-lane bounds.
+            unsafe {
+                butterfly_fused_4layer_row(
+                    ptr.add(j * group_base * self.num_ntts),
+                    stride,
+                    self.num_ntts,
+                    active_lanes,
+                    0,
+                    &self.twiddles,
+                );
+            }
+        }
+    }
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety
@@ -872,6 +1008,83 @@ mod low_twiddle_tests {
             };
             F128 { lo: n(), hi: n() }
         }
+    }
+
+    #[test]
+    fn prepared_staged_fused4_matches_portable() {
+        let mut next = rng(0xAFF7_2026_4015_7001);
+        let mut checked = 0;
+        for (num_ntts, stage_permuted) in [(64, true), (64, false), (67, true), (67, false)] {
+            let (stride, group_base) = if stage_permuted { (1, 16) } else { (4, 1) };
+            let lanes = [num_ntts, num_ntts - 4, 3, 5];
+            let base: Vec<F128> = (0..64 * num_ntts).map(|_| next()).collect();
+            let mut zero_spine: [F128; 15] = std::array::from_fn(|_| next());
+            for slot in [0, 1, 3, 7] {
+                zero_spine[slot] = F128::ZERO;
+            }
+            let mut cases = vec![zero_spine];
+            for slot in [0, 1, 3, 7] {
+                for nonzero in [F128::ONE, F128 { lo: 0, hi: 1 }] {
+                    let mut tw = zero_spine;
+                    tw[slot] = nonzero;
+                    cases.push(tw);
+                }
+            }
+            // Equal nonzero slots must not cancel into zero eligibility.
+            let mut cancellation = zero_spine;
+            cancellation[0] = F128::ONE;
+            cancellation[1] = F128::ONE;
+            cases.push(cancellation);
+            // Exercise both routes with overflowing high-limb shifts, and
+            // the degenerate all-zero circuit as well as random twiddles.
+            let mut full = [F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            }; 15];
+            cases.push(full);
+            for slot in [0, 1, 3, 7] {
+                full[slot] = F128::ZERO;
+            }
+            cases.push(full);
+            cases.push([F128::ZERO; 15]);
+            for twiddles in cases {
+                let prepared = PreparedStagedFused4::new(twiddles, num_ntts, stage_permuted);
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if matches!(prepared.shaped_route, Some((true, _))) {
+                    for (twiddle, companion) in twiddles.into_iter().zip(prepared.companions) {
+                        assert_eq!(companion, twiddle * F128 { lo: 0, hi: 1 });
+                    }
+                } else {
+                    assert_eq!(prepared.companions, [F128::ZERO; 15]);
+                }
+                let mut expected = base.clone();
+                for (j, active_lanes) in lanes.into_iter().enumerate() {
+                    for lane in 0..active_lanes {
+                        let mut values = std::array::from_fn(|row| {
+                            expected[(j * group_base + row * stride) * num_ntts + lane]
+                        });
+                        portable::butterfly_fused_4layer(&mut values, &twiddles);
+                        for (row, value) in values.into_iter().enumerate() {
+                            expected[(j * group_base + row * stride) * num_ntts + lane] = value;
+                        }
+                    }
+                }
+                let mut got = base.clone();
+                // SAFETY: complete disjoint staging rows; every lane bound
+                // fits, including scalar remainders and inactive suffixes.
+                unsafe {
+                    prepared.apply_four_groups(got.as_mut_ptr(), lanes);
+                }
+                assert_eq!(got, expected, "width={num_ntts} permuted={stage_permuted}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 52);
+        println!("prepared_staged_cases={checked}");
     }
 
     /// The scalar low-multiplier path must equal the general product for

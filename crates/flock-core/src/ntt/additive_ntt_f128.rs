@@ -1484,27 +1484,16 @@ unsafe fn st_fmp_fold4(
     sub_stride: usize,
     r: usize,
     lanes4_tail: usize,
-    stage_perm: bool,
-    tw4: &[[F128; 15]],
+    tw4: &[kernels::PreparedStagedFused4],
 ) {
-    let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
     unsafe {
         for block in 0..8 {
             let region = bufp.add(block * 64 * row_len);
-            let tw = &tw4[block];
-            for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                kernels::butterfly_fused_4layer_row(
-                    region.add(j * g4_base * row_len),
-                    g4_stride,
-                    row_len,
-                    lanes4,
-                    0,
-                    tw,
-                );
-            }
+            let lanes4 =
+                std::array::from_fn(|j| row_lanes(r + j * sub_stride, row_len, lanes4_tail));
+            tw4[block].apply_four_groups(region, lanes4);
         }
     }
 }
@@ -2427,7 +2416,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         lanes4_tail: usize,
         stage_perm: bool,
-        tw4: &[[F128; 15]],
+        tw4: &[kernels::PreparedStagedFused4],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2436,7 +2425,6 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 64 || lanes4_tail == 4);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
-        let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
 
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
@@ -2444,18 +2432,9 @@ impl AdditiveNttF128 {
         unsafe {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
-                let tw = &tw4[block];
-                for j in 0..4 {
-                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
-                        region.add(j * g4_base * row_len),
-                        g4_stride,
-                        row_len,
-                        lanes4,
-                        0,
-                        tw,
-                    );
-                }
+                let lanes4 =
+                    std::array::from_fn(|j| row_lanes(r + j * sub_stride, row_len, lanes4_tail));
+                tw4[block].apply_four_groups(region, lanes4);
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
                     region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
                 );
@@ -2636,7 +2615,8 @@ impl AdditiveNttF128 {
         let seed_right = seed_tw[0][2];
         let seed_dense = seed_tw[1];
 
-        let tw4: Vec<[F128; 15]> = (0..8)
+        let stage_perm = Self::stage_perm_enabled();
+        let tw4: Vec<kernels::PreparedStagedFused4> = (0..8)
             .map(|block| {
                 let mut tw = [F128 { lo: 0, hi: 0 }; 15];
                 tw[0] = self.twiddle(LAYER, block);
@@ -2649,7 +2629,7 @@ impl AdditiveNttF128 {
                 for s in 0..8 {
                     tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
                 }
-                tw
+                kernels::PreparedStagedFused4::new(tw, num_ntts, stage_perm)
             })
             .collect();
 
@@ -2692,15 +2672,13 @@ impl AdditiveNttF128 {
         // the twelve ways. Row `i` of every kernel group is the same element in
         // the same order as before, so the transform is byte-identical; only
         // the scratch address it lives at changes.
-        let stage_perm = Self::stage_perm_enabled();
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);
-        let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
-            if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
+        let g2_stride = if stage_perm { 16 } else { 1 };
         // The seed half (`M`) of one task: 64 row groups gathered out of
         // `msg` into the 512 staging rows. Split out from `task` so the
         // sibling-paired schedule (see `st_fmp_run`) can run it on a different
@@ -2915,18 +2893,10 @@ impl AdditiveNttF128 {
                 // Layers 3..9 per block, in the staging block.
                 for block in 0..8 {
                     let region = bufp.add(block * 64 * row_len);
-                    let tw = &tw4[block];
-                    for j in 0..4 {
-                        let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                        kernels::butterfly_fused_4layer_row(
-                            region.add(j * g4_base * row_len),
-                            g4_stride,
-                            row_len,
-                            lanes4,
-                            0,
-                            tw,
-                        );
-                    }
+                    let lanes4 = std::array::from_fn(|j| {
+                        row_lanes(r + j * sub_stride, num_ntts, lanes4_tail)
+                    });
+                    tw4[block].apply_four_groups(region, lanes4);
                     for m in 0..16 {
                         let outer_block = block * 16 + m;
                         let t_outer = self.twiddle(LAYER + 4, outer_block);
@@ -2985,7 +2955,7 @@ impl AdditiveNttF128 {
             // SAFETY: `bufp` addresses the 512 seeded staging rows of task
             // `r`; this half writes nothing outside them.
             unsafe {
-                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4);
+                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, &tw4);
             }
         };
         #[cfg(all(

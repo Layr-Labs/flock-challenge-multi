@@ -696,6 +696,14 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
 /// parity-split layout (`P = true`: four even offsets at `4k`, the four odd
 /// ones 32 words later).
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    not(all(
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )),
+    allow(dead_code)
+)]
 #[inline(always)]
 pub(crate) const fn offw_krow_words<const P: bool>(k: usize) -> usize {
     if P { 4 * k } else { 8 * k }
@@ -1271,14 +1279,48 @@ mod tests {
             // SAFETY: avx512f; eight images present; both offset layouts hold
             // eight `byte * 64` offsets.
             unsafe {
-                let expected =
-                    store(apply_x86_avx512_register_2img_krow_at::<false>(base, base8, offw.as_ptr()));
+                let expected = store(apply_x86_avx512_register_2img_krow_at::<false>(
+                    base,
+                    base8,
+                    offw.as_ptr(),
+                ));
                 let cases = [
-                    ("2img parity", store(apply_x86_avx512_register_2img_krow_at::<true>(base, base8, offp.as_ptr()))),
-                    ("4img", store(apply_x86_avx512_register_4img_krow_at::<false>(base, offw.as_ptr()))),
-                    ("4img parity", store(apply_x86_avx512_register_4img_krow_at::<true>(base, offp.as_ptr()))),
-                    ("8img", store(apply_x86_avx512_register_8img_krow_at::<false>(base, offw.as_ptr()))),
-                    ("8img parity", store(apply_x86_avx512_register_8img_krow_at::<true>(base, offp.as_ptr()))),
+                    (
+                        "2img parity",
+                        store(apply_x86_avx512_register_2img_krow_at::<true>(
+                            base,
+                            base8,
+                            offp.as_ptr(),
+                        )),
+                    ),
+                    (
+                        "4img",
+                        store(apply_x86_avx512_register_4img_krow_at::<false>(
+                            base,
+                            offw.as_ptr(),
+                        )),
+                    ),
+                    (
+                        "4img parity",
+                        store(apply_x86_avx512_register_4img_krow_at::<true>(
+                            base,
+                            offp.as_ptr(),
+                        )),
+                    ),
+                    (
+                        "8img",
+                        store(apply_x86_avx512_register_8img_krow_at::<false>(
+                            base,
+                            offw.as_ptr(),
+                        )),
+                    ),
+                    (
+                        "8img parity",
+                        store(apply_x86_avx512_register_8img_krow_at::<true>(
+                            base,
+                            offp.as_ptr(),
+                        )),
+                    ),
                 ];
                 for (name, got) in cases {
                     assert_eq!(got, expected, "{name}, bytes={bytes:02x?}");
