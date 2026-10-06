@@ -1813,9 +1813,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline]
 fn r1_ab_write_fixed_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none());
     *ON
 }
 
