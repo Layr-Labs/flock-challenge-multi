@@ -380,7 +380,7 @@ pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
         return match queue.send(wrapped) {
             Ok(()) => StashDone::Helper(done_rx),
             Err(std::sync::mpsc::SendError(wrapped)) => {
-                StashDone::Thread(std::thread::spawn(move || wrapped()))
+                StashDone::Thread(std::thread::spawn(wrapped))
             }
         };
     }
@@ -889,9 +889,7 @@ mod tests {
                 zerocheck: flock_core::zerocheck::ZerocheckProof {
                     round1_ab: f128_vec(&mut rng, 128),
                     round1_c: f128_vec(&mut rng, 128),
-                    multilinear_rounds: (0..25)
-                        .map(|_| (f128(&mut rng), f128(&mut rng)))
-                        .collect(),
+                    multilinear_rounds: (0..25).map(|_| (f128(&mut rng), f128(&mut rng))).collect(),
                     final_a_eval: f128(&mut rng),
                     final_b_eval: f128(&mut rng),
                     final_c_eval: f128(&mut rng),

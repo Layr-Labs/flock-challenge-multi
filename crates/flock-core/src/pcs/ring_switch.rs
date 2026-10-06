@@ -2134,9 +2134,7 @@ pub(crate) struct GfniDirectFoldMap {
     target_feature = "gfni",
 ))]
 #[inline]
-pub(crate) fn build_gfni_direct_fold_map_from_generators(
-    generators: &[F128],
-) -> GfniDirectFoldMap {
+pub(crate) fn build_gfni_direct_fold_map_from_generators(generators: &[F128]) -> GfniDirectFoldMap {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
     use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
     GfniDirectFoldMap {
@@ -2157,9 +2155,8 @@ pub(crate) fn build_gfni_direct_fold_map_from_generators(
 #[inline]
 pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirectFoldMap {
     debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
-    let generators: [F128; 128] = core::array::from_fn(|i| {
-        table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]
-    });
+    let generators: [F128; 128] =
+        core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
     build_gfni_direct_fold_map_from_generators(&generators)
 }
 
@@ -2957,9 +2954,8 @@ fn direct_fold8_states_seq(
 /// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather state build.
 #[inline]
 fn df8_state_direct_disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
-    });
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some());
     *OFF
 }
 
@@ -2971,11 +2967,7 @@ fn df8_state_direct_disabled() -> bool {
     target_feature = "gfni"
 ))]
 #[inline(never)]
-fn direct_fold8_w_state_gfni(
-    low_eq: &[F128; 64],
-    table: &[F128],
-    w_state: &mut [F128],
-) {
+fn direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
 
     let n_packed = 1usize << LOG_PACKING;

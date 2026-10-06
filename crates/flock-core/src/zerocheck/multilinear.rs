@@ -1240,8 +1240,7 @@ fn build_r2_eq_bake_checked(
     // Scaling a fold table's 64 basis columns scales every XOR-composed image
     // by the same factor, so the matrices of `c · fold` are the matrices of
     // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
-    let cols: [F128; 64] =
-        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
     let scaled = |c: F128| {
         let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
@@ -1582,8 +1581,7 @@ pub(crate) fn round2_canonical_window_deltas(
     assert_eq!(table.n_chunks, 8);
     assert_eq!(rows.len(), CANON_ROWS * 64);
     assert!(mlv_challenges.len() >= 8);
-    let cols: [F128; 64] =
-        std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
     let fold = |slot: usize| {
         let mut acc = F128::ZERO;
         for (col, value) in cols.iter().zip(&rows[slot * 64..(slot + 1) * 64]) {
@@ -3099,8 +3097,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm,
-                    out_lm, split,
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm, out_lm,
+                    split,
                 )
             };
             #[cfg(not(all(
@@ -4637,9 +4635,7 @@ mod tests {
             (64, true),
             (128, true),
         ];
-        for (&(lo_size, canon), unroll16) in
-            shapes.iter().flat_map(|s| [(s, true), (s, false)])
-        {
+        for (&(lo_size, canon), unroll16) in shapes.iter().flat_map(|s| [(s, true), (s, false)]) {
             let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
@@ -4661,8 +4657,7 @@ mod tests {
                         .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
                 }
             }
-            let bake =
-                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let bake = build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
             let mut a_s: [F128; 0] = [];
             let mut b_s: [F128; 0] = [];
             let out_s = round2_lookahead_chunk_scalar::<false>(
@@ -4788,10 +4783,18 @@ mod tests {
                 &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
             );
             let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
-            assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
+            assert_eq!(
+                full.0,
+                rest.0 + mlv[0] * d_g1,
+                "G(1) blocks_log={blocks_log}"
+            );
             assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
             for i in 0..6 {
-                assert_eq!(full.2.c[i], rest.2.c[i] + d_c[i], "c[{i}] blocks_log={blocks_log}");
+                assert_eq!(
+                    full.2.c[i],
+                    rest.2.c[i] + d_c[i],
+                    "c[{i}] blocks_log={blocks_log}"
+                );
             }
         }
     }
@@ -4836,15 +4839,32 @@ mod tests {
                     let eq = SplitEqGhash::with_n_hi(&mlv[1..], n_hi);
                     assert!((1usize << eq.n_lo) >= 32 && eq.n_lo < mlv.len());
                     let incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None,
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        None,
                     );
                     let hits = kernels::x86_64::R2_CANON_ELIDE_HITS
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let elided = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows),
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        Some(&rows),
                     );
                     assert!(
-                        kernels::x86_64::R2_CANON_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                        kernels::x86_64::R2_CANON_ELIDE_HITS
+                            .load(std::sync::atomic::Ordering::Relaxed)
                             > hits,
                         "elision never engaged"
                     );
@@ -5035,7 +5055,10 @@ mod tests {
             let mut rng = Rng::new(0x1A00 + log_n as u64);
             let n = 1usize << log_n;
             assert!(plain_cascade_lo_size(n).is_multiple_of(8), "log_n={log_n}");
-            assert!(plain_cascade_lo_size(n / 4).is_multiple_of(8), "log_n={log_n}");
+            assert!(
+                plain_cascade_lo_size(n / 4).is_multiple_of(8),
+                "log_n={log_n}"
+            );
             let a = rng.f128_vec(n);
             let b = rng.f128_vec(n);
             let (rho_a, rho_b, rho_c, rho_d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
@@ -5051,8 +5074,9 @@ mod tests {
 
             let mut a1 = vec![F128::ZERO; n / 4];
             let mut b1 = vec![F128::ZERO; n / 4];
-            let (m1, mi1, la1) =
-                fold2_plain_and_round_pair_lookahead_into(&a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1);
+            let (m1, mi1, la1) = fold2_plain_and_round_pair_lookahead_into(
+                &a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1,
+            );
             let mut a1l = vec![F128::ZERO; n / 4];
             let mut b1l = vec![F128::ZERO; n / 4];
             let (m1l, mi1l, la1l) = fold2_plain_and_round_pair_lookahead_into_lm(
@@ -5083,7 +5107,11 @@ mod tests {
                 } else {
                     (a2.clone(), b2.clone())
                 };
-                assert_eq!((m2, mi2), (m2l, mi2l), "reader msg log_n={log_n} out_lm={out_lm}");
+                assert_eq!(
+                    (m2, mi2),
+                    (m2l, mi2l),
+                    "reader msg log_n={log_n} out_lm={out_lm}"
+                );
                 assert_eq!(a_want, a2l, "reader a log_n={log_n} out_lm={out_lm}");
                 assert_eq!(b_want, b2l, "reader b log_n={log_n} out_lm={out_lm}");
                 assert_eq!(
@@ -5186,7 +5214,10 @@ mod tests {
     ))]
     #[test]
     fn fold2_and_message_lookahead_x86_matches_scalar() {
-        for &lo_size in &[2usize, 4, 6, 8, 10, 16, 24, 64] {
+        for (lo_size, nt_out) in [2usize, 4, 6, 8, 10, 16, 24, 64]
+            .into_iter()
+            .flat_map(|lo_size| [false, true].map(move |nt| (lo_size, nt)))
+        {
             let mut rng = Rng::new(0x6F00 + lo_size as u64);
             let a_in = rng.f128_vec(8 * lo_size);
             let b_in = rng.f128_vec(8 * lo_size);
@@ -5203,13 +5234,13 @@ mod tests {
             // SAFETY: lengths satisfy the kernel's contract.
             let out_v = unsafe {
                 kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None, false, false,
+                    &a_in, &b_in, &mut a_v, &mut b_v, rho_a, rho_b, &eq_lo, None, nt_out, false,
                     false, false,
                 )
             };
-            assert_eq!(a_s, a_v, "a lo_size={lo_size}");
-            assert_eq!(b_s, b_v, "b lo_size={lo_size}");
-            assert_eq!(out_s, out_v, "sums lo_size={lo_size}");
+            assert_eq!(a_s, a_v, "a lo_size={lo_size} nt={nt_out}");
+            assert_eq!(b_s, b_v, "b lo_size={lo_size} nt={nt_out}");
+            assert_eq!(out_s, out_v, "sums lo_size={lo_size} nt={nt_out}");
 
             if lo_size.is_multiple_of(8) {
                 let wtab = build_w_pair_table(&eq_lo);
@@ -5227,15 +5258,15 @@ mod tests {
                         rho_b,
                         &eq_lo,
                         Some(&wtab),
-                        false,
+                        nt_out,
                         false,
                         false,
                         false,
                     )
                 };
-                assert_eq!(a_s, a_w, "wtab a lo_size={lo_size}");
-                assert_eq!(b_s, b_w, "wtab b lo_size={lo_size}");
-                assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size}");
+                assert_eq!(a_s, a_w, "wtab a lo_size={lo_size} nt={nt_out}");
+                assert_eq!(b_s, b_w, "wtab b lo_size={lo_size} nt={nt_out}");
+                assert_eq!(out_s, out_w, "wtab sums lo_size={lo_size} nt={nt_out}");
 
                 // Lane-major input/output tiles and the split-companion
                 // deferred fold, every combination against the same oracle
@@ -5265,7 +5296,7 @@ mod tests {
                                         rho_b,
                                         &eq_lo,
                                         use_wtab.then_some(&wtab[..]),
-                                        false,
+                                        nt_out,
                                         in_lm,
                                         out_lm,
                                         split,
@@ -5277,7 +5308,7 @@ mod tests {
                                     (a_s.clone(), b_s.clone())
                                 };
                                 let tag = format!(
-                                    "lo_size={lo_size} in_lm={in_lm} out_lm={out_lm} split={split} wtab={use_wtab}"
+                                    "lo_size={lo_size} nt={nt_out} in_lm={in_lm} out_lm={out_lm} split={split} wtab={use_wtab}"
                                 );
                                 assert_eq!(a_want, a_c, "a {tag}");
                                 assert_eq!(b_want, b_c, "b {tag}");

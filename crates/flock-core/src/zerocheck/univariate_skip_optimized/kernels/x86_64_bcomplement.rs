@@ -454,7 +454,10 @@ unsafe fn apply_b_complement_img<
         };
         let base = imgs.0;
         let row = |image: usize, b: usize| {
-            _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + field(b)).cast::<__m512i>())
+            _mm512_loadu_si512(
+                base.add(image * IMAGE_STRIDE_64 + field(b))
+                    .cast::<__m512i>(),
+            )
         };
         macro_rules! live {
             ($b:literal) => {
@@ -873,10 +876,17 @@ mod tests {
         // The residual complement is not vacuous: some live residual K-row
         // carries structural B bytes, and each mode matches the geometry.
         let mut complemented = 0;
-        for (blk, modes, rows) in [(2usize, RESIDUAL_MODES_2, 2..8usize), (29, RESIDUAL_MODES_29, 0..4)] {
+        for (blk, modes, rows) in [
+            (2usize, RESIDUAL_MODES_2, 2..8usize),
+            (29, RESIDUAL_MODES_29, 0..4),
+        ] {
             for k in rows {
                 let mode = (modes >> (8 * (7 - k))) as u8;
-                assert_eq!(fixed_bytes_for_mode(mode), geometry_known_bytes(blk, k), "blk={blk} k={k}");
+                assert_eq!(
+                    fixed_bytes_for_mode(mode),
+                    geometry_known_bytes(blk, k),
+                    "blk={blk} k={k}"
+                );
                 complemented += usize::from(mode != 0);
             }
         }
@@ -911,7 +921,11 @@ mod tests {
                     core::array::from_fn(|i| u16::from(if i < 64 { a[i] } else { b[i - 64] }) << 6);
                 let off_p = parity_layout(&off_w);
                 for layout in [false, true] {
-                    let op = if layout { off_p.as_ptr() } else { off_w.as_ptr() };
+                    let op = if layout {
+                        off_p.as_ptr()
+                    } else {
+                        off_w.as_ptr()
+                    };
                     if blk == 2 || blk == 29 {
                         let keep = if blk == 2 { 0xfcu8 } else { 0x0f };
                         expected.0 = [0xA5; 64];

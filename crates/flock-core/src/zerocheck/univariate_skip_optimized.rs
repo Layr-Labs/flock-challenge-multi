@@ -576,7 +576,10 @@ impl Round1AbInner {
         assert_eq!(self.invalid_prefix_bytes, 0);
         if self.ranked_compact {
             assert_eq!(self.dense_len_bytes, 1usize << 29);
-            assert_eq!(self.as_bytes().len(), (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES);
+            assert_eq!(
+                self.as_bytes().len(),
+                (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES
+            );
         }
         self.ranked_one_rows_elided = true;
     }
@@ -625,9 +628,8 @@ impl Round1AbInner {
         assert_eq!(b_packed.len(), self.dense_len_bytes);
         assert_eq!(inv_table.k, K_SKIP);
         if self.ranked_compact {
-            let dense = crate::scratch::take_f128(
-                self.dense_len_bytes / core::mem::size_of::<F128>(),
-            );
+            let dense =
+                crate::scratch::take_f128(self.dense_len_bytes / core::mem::size_of::<F128>());
             crate::scratch::give_f128(core::mem::replace(&mut self.storage, dense));
             self.ranked_compact = false;
         }
@@ -1275,9 +1277,8 @@ fn prepare_round1_table_images(
 /// Disable-only switch for the residual-window B complement
 /// (`FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`). Read once per process.
 fn round1_residual_bcomplement_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT").is_none());
     *ON
 }
 
@@ -1424,9 +1425,7 @@ pub unsafe fn round1_ab_inner_window30_k0(
         return;
     }
     unsafe {
-        round1_ab_inner_window_with_images(
-            a_window, b_window, out, blk, inv_table, plan, imgs,
-        );
+        round1_ab_inner_window_with_images(a_window, b_window, out, blk, inv_table, plan, imgs);
     }
 }
 
@@ -1617,6 +1616,12 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
 }
 
+/// Const-block specialization of [`round1_ab_inner_window_from_offsets_nt2_bcomplement_static`].
+///
+/// # Safety
+/// As for that wrapper, with `BLK` in `3..=28`: the plan and fixed-one byte
+/// geometry must match this block, and the producer must publish its stores
+/// with [`abinner_publish_fence`].
 #[inline(always)]
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
@@ -1670,6 +1675,10 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
+///
+/// # Safety
+/// As for [`round1_ab_inner_window_from_offsets_nt2`]. The offsets and fixed-one
+/// K-row geometry must match the block selected by `keep` above.
 #[inline(always)]
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
@@ -2806,9 +2815,8 @@ fn transpose_bits_8x8(mut x: u64) -> u64 {
 /// clear-then-accumulate form, which is the byte-identity oracle.
 #[inline]
 fn c_plane_first_write_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C_PLANE_FIRST_WRITE").is_none());
     *ON
 }
 
@@ -3583,8 +3591,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         if compact {
             let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
             debug_assert!((2..31).contains(&row_in_block));
-            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES
-                + (row_in_block - 2) * ELL
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
         } else {
             x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
         }
@@ -3628,13 +3635,12 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             let x_next = x_outer_lo + pf_windows;
             let x_next_outer = x_next | (x_hi << n_lo);
             let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_first = if ranked_one_rows_elided
-                && ((x_outer + pf_windows) & within_outer_mask) == 0
-            {
-                2
-            } else {
-                0
-            };
+            let next_first =
+                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                };
             (
                 n_next,
                 live_row_base(x_next_outer, next_first, ranked_compact),
@@ -3704,8 +3710,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
                 // Borrow only initialized, consumed rows. In particular, do
                 // not form a full-window array reference over the two omitted
                 // prefix rows or the odd window's unused final row.
-                let live_rows = &ab_inner
-                    [live_base..live_base + (n_b_med - first_b_med) * ELL];
+                let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
                 let prefetch = kernels::AbDirectPrefetch {
                     next_window: if pf_windows == 0 {
                         core::ptr::null()
@@ -4151,9 +4156,8 @@ fn round1_lifted_from_fold8(
     /// `FLOCK_NO_ZC_ONE_FOLD8_DIRECT=1` restores the fold4 → quad → collapse
     /// chain for the one-row statistic. Read once per process.
     fn one_fold8_direct_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_ZC_ONE_FOLD8_DIRECT").is_none()
-        });
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_ONE_FOLD8_DIRECT").is_none());
         *ON
     }
 
@@ -4321,17 +4325,18 @@ pub fn round1_c_fold4_from_block_major_z(
     Vec<F128>,
     Option<Vec<F128>>,
 ) {
-    let (c, s_hat_v_c, quad, fold4, fold8, one_ab, _) = round1_c_fold4_from_block_major_z_with_canon(
-        z_packed,
-        m,
-        k_log,
-        k_skip,
-        useful_bits,
-        r,
-        inv_table,
-        ranked_one_rows,
-        false,
-    );
+    let (c, s_hat_v_c, quad, fold4, fold8, one_ab, _) =
+        round1_c_fold4_from_block_major_z_with_canon(
+            z_packed,
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            r,
+            inv_table,
+            ranked_one_rows,
+            false,
+        );
     (c, s_hat_v_c, quad, fold4, fold8, one_ab)
 }
 
@@ -4495,7 +4500,15 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     let one_ab_lifted = one_fold8
         .map(|one_fold8| round1_lifted_from_fold8(&one_fold8, inner_tail, prefix, inv_table));
-    (res_c_lifted, s_hat_v_c, quad, fold4, fold8, one_ab_lifted, canon)
+    (
+        res_c_lifted,
+        s_hat_v_c,
+        quad,
+        fold4,
+        fold8,
+        one_ab_lifted,
+        canon,
+    )
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -5676,7 +5689,11 @@ mod tests {
         let mut rng = Rng::new(0x30_DE17A);
         for case in 0..12 {
             let r = rng.f128_vec(20);
-            let row240 = if case == 0 { vec![F128::ZERO; ELL] } else { rng.f128_vec(ELL) };
+            let row240 = if case == 0 {
+                vec![F128::ZERO; ELL]
+            } else {
+                rng.f128_vec(ELL)
+            };
             let inner_tail = &r[K_SKIP + 1..14];
             let mut fold8 = vec![F128::ZERO; 64 * n_packed];
             for (dst, src) in fold8[RANKED_W30_SLOT * ELL..(RANKED_W30_SLOT + 1) * ELL]
@@ -5688,8 +5705,11 @@ mod tests {
             let lifted = round1_lifted_from_fold8(&fold8, inner_tail, r[K_SKIP], &inv_table);
             let mut beta = [F8::ZERO; ELL];
             inv_table.apply(&RANKED_W30_B_ROW.to_le_bytes(), &mut beta);
-            let expected: Vec<F128> =
-                lifted.iter().zip(beta.iter()).map(|(v, b)| phi8(*b) * *v).collect();
+            let expected: Vec<F128> = lifted
+                .iter()
+                .zip(beta.iter())
+                .map(|(v, b)| phi8(*b) * *v)
+                .collect();
             assert_eq!(
                 round1_w30_delta_ab(&row240, &r, K_SKIP, 14, &inv_table),
                 expected,
