@@ -191,6 +191,132 @@ pub trait LincheckCircuit: Sync {
     fn const_pin_col(&self) -> Option<usize> {
         None
     }
+
+    /// Optional exact reconstruction of linear witness wires. Only valid
+    /// witnesses for this circuit may use this plan; commitments keep full z.
+    fn root_fold_plan(&self) -> Option<&'static LinearFoldPlan> {
+        None
+    }
+}
+
+/// XOR circuit over original witness columns: leaves 0..k, zero k, then
+/// child-before-parent internal nodes k+1+i. Outputs replace dependent wires.
+/// Roots must be sorted and unique; internal nodes may reference only roots,
+/// zero, or earlier internal nodes. The defining identities require valid z.
+pub struct LinearFoldPlan {
+    pub roots: Box<[usize]>,
+    pub children: Box<[[u32; 2]]>,
+    pub outputs: Box<[(usize, u32)]>,
+}
+
+impl LinearFoldPlan {
+    fn reconstruct(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        let mut nodes = vec![F128::ZERO; k + 1 + self.children.len()];
+        for (&col, &value) in self.roots.iter().zip(folded) {
+            nodes[col] = value;
+        }
+        for (i, &[a, b]) in self.children.iter().enumerate() {
+            nodes[k + 1 + i] = nodes[a as usize] + nodes[b as usize];
+        }
+        for &(col, node) in self.outputs.iter() {
+            nodes[col] = nodes[node as usize];
+        }
+        nodes.truncate(k);
+        nodes
+    }
+}
+
+/// Auxiliary compact roots, shared by the C and AB folds at their distinct
+/// Fiat-Shamir points. The canonical witness remains untouched for PCS.
+pub struct RootFoldSource {
+    plan: &'static LinearFoldPlan,
+    packed: crate::scratch::LocalBuf,
+    k_log: usize,
+}
+
+impl RootFoldSource {
+    pub fn new(z: &[F128], k_log: usize, plan: &'static LinearFoldPlan) -> Self {
+        use rayon::prelude::*;
+        let k = 1usize << k_log;
+        let stride = k / 128;
+        assert_eq!(z.len() % stride, 0);
+        assert!(!plan.roots.is_empty());
+        assert!(plan.roots.windows(2).all(|w| w[0] < w[1]));
+        let root_stride = plan.roots.len().div_ceil(128);
+        let mut masks = vec![0u64; k / 64];
+        for &col in plan.roots.iter() {
+            assert!(col < k);
+            masks[col / 64] |= 1u64 << (col % 64);
+        }
+        // Keep auxiliary storage out of the tagged canonical-witness pool.
+        let mut packed = crate::scratch::LocalBuf::new(z.len() / stride * root_stride, true);
+        crate::in_pool(|| packed.par_chunks_mut(root_stride).zip(z.par_chunks(stride))
+            .for_each(|(out, block)| {
+                // Every scratch slot is overwritten, including the last
+                // chunk's unused bits, before either fold can read it.
+                out.fill(F128::ZERO);
+                let mut pos = 0;
+                for (q, &mask) in masks.iter().enumerate() {
+                    if mask == 0 { continue; }
+                    let word = if q % 2 == 0 { block[q / 2].lo } else { block[q / 2].hi };
+                    let bits = extract_root_bits(word, mask) as u128;
+                    let count = mask.count_ones() as usize;
+                    let slot = pos / 128;
+                    let shift = pos % 128;
+                    let value = bits << shift;
+                    out[slot].lo |= value as u64;
+                    out[slot].hi |= (value >> 64) as u64;
+                    if shift + count > 128 {
+                        out[slot + 1].lo |= (bits >> (128 - shift)) as u64;
+                    }
+                    pos += count;
+                }
+                debug_assert_eq!(pos, plan.roots.len());
+            }));
+        Self { plan, packed, k_log }
+    }
+
+    pub fn fold(&self, m: usize, x_outer: &[F128]) -> Vec<F128> {
+        let k_log = self.k_log;
+        assert_eq!(x_outer.len(), m - k_log);
+        let run = |eq8_at: &(dyn Fn(usize) -> [F128; 8] + Sync)| {
+            partial_fold_packed_z_block_major_padded_with_tables_result(
+                &self.packed, m, k_log, self.plan.roots.len(),
+                |i| eq8_at(i), None, false, false,
+                Some(self.plan.roots.len().div_ceil(128)),
+            ).0
+        };
+        let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+            let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+            let eq_lo = build_eq_table(lo);
+            let eq_hi = build_eq_table(hi);
+            let log_b = eq_lo.len().trailing_zeros() as usize;
+            let mask = eq_lo.len() - 1;
+            run(&|i| eq8_from_factors(&eq_lo, &eq_hi, i, log_b, mask))
+        } else {
+            let eq = build_eq_table(x_outer);
+            run(&|i| std::array::from_fn(|j| eq[i + j]))
+        };
+        self.plan.reconstruct(&folded, 1usize << k_log)
+    }
+}
+
+#[inline]
+fn extract_root_bits(word: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    { unsafe { std::arch::x86_64::_pext_u64(word, mask) } }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut mask = mask;
+        let mut out = 0;
+        let mut bit = 1;
+        while mask != 0 {
+            if word & (mask & mask.wrapping_neg()) != 0 { out |= bit; }
+            mask &= mask - 1;
+            bit <<= 1;
+        }
+        out
+    }
 }
 
 /// Default `LincheckCircuit` over a pair of sparse binary matrices. Delegates
@@ -1114,6 +1240,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
         Some(r_top),
         true,
         capture_canon,
+        None,
     );
     let mut one = one.expect("ranked one-row fold requested");
     // The capture rides behind the one-row slots (see the plane reduce).
@@ -2012,6 +2139,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
         top_bind,
         false,
         false,
+        None,
     )
     .0
 }
@@ -2025,6 +2153,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     top_bind: Option<F128>,
     ranked_one_rows: bool,
     capture_canon: bool,
+    source_stride: Option<usize>,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
 
@@ -2033,7 +2162,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
-    let chunks_per_block = k / 128;
+    let chunks_per_block = source_stride.unwrap_or(k / 128);
     assert_eq!(z_packed.len(), n_outer * chunks_per_block);
     assert!(n_log >= 3, "need n_outer >= 8 for byte groups");
     assert!(useful_bits <= k);
@@ -2356,6 +2485,13 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             probe_t2.elapsed().as_secs_f64() * 1e3
         );
     }
+    finish_block_major_fold(out, top_bind, ranked_one_rows, capture_canon)
+}
+
+pub(crate) fn finish_block_major_fold(
+    mut out: Vec<F128>, top_bind: Option<F128>, ranked_one_rows: bool, capture_canon: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
+    let k = out.len();
     let one = if ranked_one_rows {
         let r = top_bind.expect("ranked one-row contribution needs top bind");
         assert_eq!(k, 1 << 14);
@@ -2975,7 +3111,7 @@ fn sumcheck_bind_both_and_eval_next(
 
 enum PackedZ<'a> {
     LincheckStripe(&'a [u8]),
-    BlockMajor(&'a [F128]),
+    BlockMajor(&'a [F128], Option<&'a RootFoldSource>),
 }
 
 // ---------------------------------------------------------------------------
@@ -3000,6 +3136,7 @@ enum PackedZ<'a> {
 // `z` is read-only (`C` aliases it).
 
 struct LastRhoPrepared {
+    roots: Option<std::sync::Arc<RootFoldSource>>,
     z_ptr: *const F128,
     z_len: usize,
     m: usize,
@@ -3045,11 +3182,19 @@ pub fn prepare_last_rho_z_fold(
     useful_bits: usize,
     inner_rest_len: usize,
 ) -> LastRhoZFoldGuard {
+    prepare_last_rho_z_fold_with_roots(z, m, k_log, useful_bits, inner_rest_len, None)
+}
+
+pub fn prepare_last_rho_z_fold_with_roots(
+    z: &[F128], m: usize, k_log: usize, useful_bits: usize, inner_rest_len: usize,
+    roots: Option<std::sync::Arc<RootFoldSource>>,
+) -> LastRhoZFoldGuard {
     // A previous prepare on this thread that was never waited would leave a
     // live handle holding a pointer into a now-dead buffer. Join it first.
     let _ = wait_last_rho_z_fold();
     LAST_RHO.with(|slot| {
         *slot.borrow_mut() = LastRhoSlot::Prepared(LastRhoPrepared {
+            roots,
             z_ptr: z.as_ptr(),
             z_len: z.len(),
             m,
@@ -3094,6 +3239,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let m = p.m;
     let k_log = p.k_log;
     let useful_bits = p.useful_bits;
+    let roots = p.roots;
     let handle = std::thread::Builder::new()
         .name("flock-last-rho-z-fold".into())
         .spawn(move || {
@@ -3104,7 +3250,10 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
             let trace = std::env::var_os("LINCHECK_TRACE").is_some();
             let t0 = std::time::Instant::now();
-            let out = fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer);
+            let out = match roots {
+                Some(roots) => roots.fold(m, &x_outer),
+                None => fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer),
+            };
             if trace {
                 eprintln!(
                     "[lc] {:<26} {:>7.2} ms",
@@ -3257,12 +3406,23 @@ pub fn prove_padded_capture_z_vec_block_major_mode<Ch: Challenger>(
     capture: ZCaptureMode,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    prove_padded_capture_z_vec_block_major_mode_with_roots(
+        z_packed, None, m, k_log, k_skip, useful_bits, circuit, x_ab, capture, challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode_with_roots<Ch: Challenger>(
+    z_packed: &[F128], roots: Option<&RootFoldSource>, m: usize, k_log: usize,
+    k_skip: usize, useful_bits: usize, circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint, capture: ZCaptureMode, challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
     assert!(
         capture != ZCaptureMode::None,
         "capture mode must not be None"
     );
     let (proof, claim, captured, actual) = prove_padded_inner(
-        PackedZ::BlockMajor(z_packed),
+        PackedZ::BlockMajor(z_packed, roots),
         m,
         k_log,
         k_skip,
@@ -3328,7 +3488,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured, _actual) = prove_padded_inner(
-        PackedZ::BlockMajor(z_packed),
+        PackedZ::BlockMajor(z_packed, None),
         m,
         k_log,
         k_skip,
@@ -3467,7 +3627,7 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let mut z_vec = match (kicked_z_vec, z_packed) {
-        (Some(z), PackedZ::BlockMajor(_)) => z,
+        (Some(z), PackedZ::BlockMajor(_, _)) => z,
         (kicked, z_packed) => {
             debug_assert!(
                 kicked.is_none(),
@@ -3478,8 +3638,14 @@ fn prove_padded_inner<Ch: Challenger>(
                     let eq_x_outer = build_eq_table(&x_ab.x_outer);
                     partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
                 }
-                PackedZ::BlockMajor(z) => {
-                    fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                PackedZ::BlockMajor(z, roots) => {
+                    if let Some(roots) = roots {
+                        roots.fold(m, &x_ab.x_outer)
+                    } else if let Some(plan) = circuit.root_fold_plan() {
+                        RootFoldSource::new(z, k_log, plan).fold(m, &x_ab.x_outer)
+                    } else {
+                        fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                    }
                 }
             }
         }
@@ -5162,6 +5328,7 @@ mod canon_capture_tests {
             Some(r_top),
             true,
             true,
+            None,
         );
         let one = one.expect("ranked one-row fold");
         let half = 1usize << (K_LOG - 1);
