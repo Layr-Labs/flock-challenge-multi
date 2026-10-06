@@ -1124,12 +1124,16 @@ unsafe fn inject_alpha_e_x4(
                 n_rows, USEFUL_BITS,
                 "cz aggregation requires the pinned BLAKE3 row prefix"
             );
-            debug_assert!(b_roots[..GS_BASE]
-                .iter()
-                .all(|&root| root == Z_CONST_POS as u32));
-            debug_assert!(b_roots[OUT_HI_BASE..USEFUL_BITS]
-                .iter()
-                .all(|&root| root == Z_CONST_POS as u32));
+            debug_assert!(
+                b_roots[..GS_BASE]
+                    .iter()
+                    .all(|&root| root == Z_CONST_POS as u32)
+            );
+            debug_assert!(
+                b_roots[OUT_HI_BASE..USEFUL_BITS]
+                    .iter()
+                    .all(|&root| root == Z_CONST_POS as u32)
+            );
             debug_assert!((0..N_G).all(|g| {
                 let const_begin = GS_BASE + g * G_STRIDE + CARRY_ROWS_PER_G;
                 b_roots[const_begin..GS_BASE + (g + 1) * G_STRIDE]
@@ -2324,7 +2328,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut a,
             &mut b,
             &mut ab_inner,
-            &inv_table,
+            inv_table,
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
@@ -2405,7 +2409,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
                             a_bytes,
                             b_bytes,
                             ab_stage_bytes,
-                            &inv_table,
+                            inv_table,
                             // Staging vec, re-read L1-hot by nt_copy_u64s
                             // below: temporal.
                             false,
@@ -2463,7 +2467,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
                         std::slice::from_raw_parts(b_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK)
                     };
                     flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                        a_bytes, b_bytes, ab_out, &inv_table, false,
+                        a_bytes, b_bytes, ab_out, inv_table, false,
                     );
                 }
               });
@@ -2501,7 +2505,9 @@ struct AbWinLine([u64; 8]);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RankedClosedDispatch {
     Auto,
+    #[cfg_attr(not(test), allow(dead_code))]
     ForceGeneric,
+    #[cfg_attr(not(test), allow(dead_code))]
     ForceExact,
 }
 
@@ -5427,12 +5433,8 @@ mod tests {
             (z, a, b, ab_inner)
         };
 
-        let (seed_z, seed_a, seed_b, _) = run(
-            RankedClosedDispatch::ForceGeneric,
-            [false; 3],
-            false,
-            None,
-        );
+        let (seed_z, seed_a, seed_b, _) =
+            run(RankedClosedDispatch::ForceGeneric, [false; 3], false, None);
         let seed_bufs = (seed_z, seed_a, seed_b);
         let (z_g, a_g, b_g, mut ab_g) = run(
             RankedClosedDispatch::ForceGeneric,
@@ -5484,7 +5486,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ab_g.as_bytes_mut(), ab_e.as_bytes_mut(), "ab_inner mismatch");
+        assert_eq!(
+            ab_g.as_bytes_mut(),
+            ab_e.as_bytes_mut(),
+            "ab_inner mismatch"
+        );
     }
 
     /// The closed form must also survive the padding regime: when the block

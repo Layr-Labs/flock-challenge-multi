@@ -1419,10 +1419,8 @@ fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: 
     let best_chunk = AtomicU64::new(u64::MAX);
     let best = std::sync::Mutex::new((u64::MAX, 0u64));
     let workers = rayon::current_num_threads().max(1);
-    (0..workers)
-        .into_par_iter()
-        .with_max_len(1)
-        .for_each(|_| loop {
+    (0..workers).into_par_iter().with_max_len(1).for_each(|_| {
+        loop {
             let c = next.fetch_add(1, Ordering::Relaxed);
             if c > best_chunk.load(Ordering::Acquire) {
                 break;
@@ -1435,8 +1433,11 @@ fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: 
                 }
                 break;
             }
-        });
-    let (found_chunk, nonce) = best.into_inner().unwrap_or_else(|poison| poison.into_inner());
+        }
+    });
+    let (found_chunk, nonce) = best
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
     assert_ne!(found_chunk, u64::MAX, "cursor grind exited without a match");
     nonce
 }
@@ -1458,7 +1459,9 @@ mod tests {
             for seed in 0u8..12 {
                 let mut digest = [0u8; 32];
                 for (i, b) in digest.iter_mut().enumerate() {
-                    *b = seed.wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(7));
+                    *b = seed
+                        .wrapping_mul(31)
+                        .wrapping_add((i as u8).wrapping_mul(7));
                 }
                 for bits in [1u32, 8, 13, 14, 16] {
                     let mut start = 0u64;
