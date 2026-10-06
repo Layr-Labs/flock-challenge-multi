@@ -1354,6 +1354,15 @@ fn fold_untimed_enabled() -> bool {
 /// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
 /// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
 /// restores the incumbent GPR transpose. Same bytes either way.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )),
+    allow(dead_code)
+)]
 fn lc_plane_f128_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
@@ -5133,7 +5142,10 @@ mod canon_capture_tests {
         for blk in 0..n_outer {
             for w in 0..chunks_per_block {
                 let bit0 = w * 128;
-                let mut v = F128 { lo: next(), hi: next() };
+                let mut v = F128 {
+                    lo: next(),
+                    hi: next(),
+                };
                 if bit0 >= USEFUL {
                     v = F128::ZERO;
                 } else if bit0 + 128 > USEFUL {
@@ -5150,8 +5162,16 @@ mod canon_capture_tests {
                 z[blk * chunks_per_block + w] = v;
             }
         }
-        let x_outer: Vec<F128> = (0..M - K_LOG).map(|_| F128 { lo: next(), hi: next() }).collect();
-        let r_top = F128 { lo: next(), hi: next() };
+        let x_outer: Vec<F128> = (0..M - K_LOG)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r_top = F128 {
+            lo: next(),
+            hi: next(),
+        };
         let eq = build_eq_table(&x_outer);
         let (_full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
             &z,
@@ -5174,7 +5194,11 @@ mod canon_capture_tests {
                 for (blk, e) in eq.iter().enumerate() {
                     let w = z[blk * chunks_per_block + bit / 128];
                     let b = bit % 128;
-                    let set = if b < 64 { (w.lo >> b) & 1 } else { (w.hi >> (b - 64)) & 1 };
+                    let set = if b < 64 {
+                        (w.lo >> b) & 1
+                    } else {
+                        (w.hi >> (b - 64)) & 1
+                    };
                     if set == 1 {
                         want += *e;
                     }

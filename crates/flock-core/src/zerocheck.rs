@@ -558,8 +558,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
             let ranked_one_rows = ab_inner.ranked_one_rows_elided();
             let w30_elided = ab_inner.ranked_w30_elided();
-            let capture_canon = ranked_one_rows
-                && (multilinear::round2_canonical_elide_enabled() || w30_elided);
+            let capture_canon =
+                ranked_one_rows && (multilinear::round2_canonical_elide_enabled() || w30_elided);
             // The two halves are independent (round one has no Fiat-Shamir
             // dependency inside it), so run them concurrently rather than
             // back to back: each alone reaches only ~35 GB/s, while the pair
@@ -997,7 +997,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // level (the last level's pair fold reads row-major) whose chunks are
         // all eight-group chunks; its own chunk split is checked per branch.
         let lm_reader_ok =
-            lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter) % 8 == 0;
+            lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter).is_multiple_of(8);
         let (m_even_1, m_even_inf, lm_out) = if level == 0 && use_nomat {
             // Rounds 3+4 straight from the packed witness (see above); the
             // outputs land in freshly taken N/4 buffers, and the old (empty)
@@ -1033,7 +1033,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             (m1, mi, lm_out)
         } else if level + 1 < n_levels {
-            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0;
+            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur).is_multiple_of(8);
             let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into_lm(
                 &a_mlv,
                 &b_mlv,
