@@ -1422,9 +1422,9 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
     let wtab_arg = wtab_vec.as_deref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    // Per-chunk: (round-2 partial pair, six lookahead partials), both already
+    // Per-chunk: (even-parity pair, six lookahead partials), all already
     // scaled by eq_hi[x_hi]. Reduced by F128 XOR (commutative, associative).
-    let (sum1, sum_inf, agg) = a_folded
+    let (sum1_even, sum_inf_even, agg) = a_folded
         .par_chunks_mut(chunk_size)
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
@@ -1477,12 +1477,10 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
 
             let eq_h = eq_hi[x_hi];
             // `out[0..2]` carry the even lane on the odd lane's weight; κ
-            // restores `eq₂(2y)` exactly (field arithmetic, no rounding).
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
+            // restores `eq₂(2y)` after the chunk reduction below.
             (
-                eq_h * p1,
-                eq_h * pinf,
+                eq_h * out[0],
+                eq_h * out[1],
                 [
                     eq_h * out[2],
                     eq_h * out[3],
@@ -1504,6 +1502,10 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             },
         );
 
+    // The odd sums already ride in agg[0..2]. Apply the shared parity
+    // factor twice for the whole pass rather than twice per chunk.
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r1_inv);
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf, la)
 }
@@ -1804,7 +1806,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let bake_arg = bake_vec.as_ref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    let (sum1, sum_inf, agg) = (0..hi_size)
+    let (sum1_even, sum_inf_even, agg) = (0..hi_size)
         .into_par_iter()
         .map(|x_hi| {
             let row_base = x_hi * chunk_size;
@@ -1875,11 +1877,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             );
 
             let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
             (
-                eq_h * p1,
-                eq_h * pinf,
+                eq_h * out[0],
+                eq_h * out[1],
                 [
                     eq_h * out[2],
                     eq_h * out[3],
@@ -1901,6 +1901,8 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             },
         );
 
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
     let mut la = lookahead_from_odd_weighted(&agg, r1_inv);
     let (mut sum1, mut sum_inf) = (sum1, sum_inf);
     if let Some(rows) = canon_elided {
@@ -2110,7 +2112,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     ))]
     let c4_lm = kernels::x86_64::zc_c4_lm_enabled();
 
-    let (sum1, sum_inf, agg) = a_out
+    let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
         .enumerate()
@@ -2167,11 +2169,9 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             );
 
             let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
             (
-                eq_h * p1,
-                eq_h * pinf,
+                eq_h * out[0],
+                eq_h * out[1],
                 [
                     eq_h * out[2],
                     eq_h * out[3],
@@ -2193,6 +2193,8 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             },
         );
 
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next4[0] * sum1, sum_inf, la)
 }
@@ -3082,7 +3084,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
     ))]
     let split = kernels::x86_64::zc_defer_split_enabled();
 
-    let (sum1, sum_inf, agg) = a_out
+    let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
         .enumerate()
@@ -3112,11 +3114,9 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
                 fold2_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo);
 
             let eq_h = eq_hi[x_hi];
-            let p1 = kappa * out[0] + out[2];
-            let pinf = kappa * out[1] + out[3];
             (
-                eq_h * p1,
-                eq_h * pinf,
+                eq_h * out[0],
+                eq_h * out[1],
                 [
                     eq_h * out[2],
                     eq_h * out[3],
@@ -3138,6 +3138,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
             },
         );
 
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next[0] * sum1, sum_inf, la)
 }
@@ -5144,6 +5146,11 @@ mod tests {
             let mut r_next = vec![F128::ONE; log_n - 2];
             for v in r_next[1..].iter_mut() {
                 *v = rng.f128();
+            }
+            // Exercise kappa=0 across multiple chunks as well as the
+            // generic parity weights used by the other sizes.
+            if log_n == 5 {
+                r_next[1] = F128::ONE;
             }
             assert_ne!(r_next[1], F128::ZERO);
             let mut a_ref = vec![F128::ZERO; n / 4];
