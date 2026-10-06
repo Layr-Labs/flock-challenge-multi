@@ -775,6 +775,7 @@ pub struct Blake3AdjointPlan {
     /// Total node count = `K + 1 + children.len()`.
     n_nodes: usize,
     const_pin: Option<usize>,
+    linear_fold: std::sync::OnceLock<flock_core::lincheck::LinearFoldPlan>,
 }
 
 impl Blake3AdjointPlan {
@@ -967,6 +968,87 @@ impl Blake3AdjointPlan {
             n_rows,
             n_nodes,
             const_pin: Some(Z_CONST_POS),
+            linear_fold: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Reconstruct the linear witness wires from folded input/carry wires.
+    /// For a valid witness, a row with B = {const} gives z[i] = A[i] z.
+    /// Field-weighted outer folds preserve these XOR identities. Substitute
+    /// those wire leaves in the existing DAG, retaining only the nodes needed
+    /// by the dependent outputs; the original adjoint remains unchanged.
+    pub fn linear_fold_plan(&self) -> flock_core::lincheck::LinearFoldPlan {
+        let constant = self.const_pin.expect("linear fold requires the constant pin") as u32;
+        let dependent: Vec<bool> = (0..self.n_rows)
+            .map(|i| self.b_roots[i] == constant && self.a_roots[i] != i as u32)
+            .collect();
+        let roots = (0..self.n_rows)
+            .filter(|&i| !dependent[i])
+            .collect::<Vec<_>>();
+        let mut builder = AdjBuilder::new();
+        let mut memo = vec![None; self.n_nodes];
+        let mut visiting = vec![false; self.n_nodes];
+
+        fn rewrite(
+            node: u32,
+            plan: &Blake3AdjointPlan,
+            dependent: &[bool],
+            memo: &mut [Option<u32>],
+            visiting: &mut [bool],
+            builder: &mut AdjBuilder,
+        ) -> u32 {
+            let index = node as usize;
+            assert!(index < plan.n_nodes, "invalid adjoint node");
+            if let Some(mapped) = memo[index] {
+                return mapped;
+            }
+            assert!(!visiting[index], "cyclic linear witness dependency");
+            visiting[index] = true;
+            let mapped = if node < ADJ_ZERO {
+                assert!(index < plan.n_rows, "linear output references padding");
+                if dependent[index] {
+                    rewrite(
+                        plan.a_roots[index],
+                        plan,
+                        dependent,
+                        memo,
+                        visiting,
+                        builder,
+                    )
+                } else {
+                    node
+                }
+            } else if node == ADJ_ZERO {
+                ADJ_ZERO
+            } else {
+                let [p, q] = plan.children[index - ADJ_BASE as usize];
+                let p = rewrite(p, plan, dependent, memo, visiting, builder);
+                let q = rewrite(q, plan, dependent, memo, visiting, builder);
+                builder.xor(p, q)
+            };
+            visiting[index] = false;
+            memo[index] = Some(mapped);
+            mapped
+        }
+
+        let outputs = (0..self.n_rows)
+            .filter(|&i| dependent[i])
+            .map(|i| {
+                let node = rewrite(
+                    i as u32,
+                    self,
+                    &dependent,
+                    &mut memo,
+                    &mut visiting,
+                    &mut builder,
+                );
+                (i, node)
+            })
+            .collect::<Vec<_>>();
+        flock_core::lincheck::LinearFoldPlan {
+            roots: roots.into_boxed_slice(),
+            children: builder.children.into_boxed_slice(),
+            outputs: outputs.into_boxed_slice(),
         }
     }
 
@@ -985,6 +1067,11 @@ impl Blake3AdjointPlan {
 /// to be warmed.
 static BLAKE3_ADJOINT_PLAN: std::sync::LazyLock<Blake3AdjointPlan> =
     std::sync::LazyLock::new(Blake3AdjointPlan::build);
+
+fn linear_fold_enabled() -> bool {
+    cfg!(all(target_arch = "x86_64", target_feature = "bmi2"))
+        && std::env::var_os("FLOCK_NO_LINEAR_FOLD").is_none()
+}
 
 /// `FLOCK_NO_LC_ADJOINT=1` restores the materialized CSC gather (exact A/B
 /// control: same `comb_vec`, ~21 M gathers instead of ~55 K adds). Default ON —
@@ -1322,6 +1409,11 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
 
     fn const_pin_col(&self) -> Option<usize> {
         self.const_pin
+    }
+
+    fn root_fold_plan(&self) -> Option<&'static flock_core::lincheck::LinearFoldPlan> {
+        linear_fold_enabled().then(|| BLAKE3_ADJOINT_PLAN.linear_fold
+            .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan()))
     }
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
@@ -2597,11 +2689,21 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         BYTES_PER_BLOCK
     };
     let group_bytes = GROUP * ab_block_bytes;
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
     let one_rows_elided = ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
+        // Only the ranked static offset drain removes the partial one rows
+        // in windows 2 and 29. The generic drain must keep dense AB.
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
         && flock_core::pcs::ranked_direct_fold8_enabled();
     if one_rows_elided {
@@ -2624,14 +2726,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
-    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-        inv_table,
-        ab_inner_bytes,
-        abinner_nt,
-    );
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
     // direct-dense inline + maddubs chain the helper reuses.
@@ -4033,6 +4129,10 @@ impl Blake3Setup {
         // Off-shape we fall back to the CSC gather, so warm that instead.
         if adjoint_plan_arms(&r1cs) {
             std::sync::LazyLock::force(&BLAKE3_ADJOINT_PLAN);
+            if linear_fold_enabled() {
+                BLAKE3_ADJOINT_PLAN.linear_fold
+                    .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+            }
         } else {
             r1cs.csc_lincheck_circuit();
         }
@@ -5664,6 +5764,117 @@ mod tests {
                 assert_eq!(want[c], got[c], "trial {trial}, column {c}");
             }
         }
+    }
+
+    /// Linear outputs reconstructed after an arbitrary field-weighted outer
+    /// fold must match folding every bit of valid BLAKE3 witnesses directly.
+    #[test]
+    fn linear_fold_plan_reconstructs_full_outer_fold() {
+        let adjoint = Blake3AdjointPlan::build();
+        let plan = adjoint.linear_fold_plan();
+        assert_eq!(plan.roots.len(), 11_313);
+        assert_eq!(plan.outputs.len(), 4_096);
+        assert!(plan.roots.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut is_root = vec![false; K];
+        for &root in &plan.roots {
+            is_root[root] = true;
+        }
+        for (i, &[p, q]) in plan.children.iter().enumerate() {
+            let node = ADJ_BASE + i as u32;
+            for child in [p, q] {
+                assert!(child < node, "reconstruction DAG is not topological");
+                if child < ADJ_ZERO {
+                    assert!(is_root[child as usize], "dependent wire remains a leaf");
+                }
+            }
+        }
+        for &(wire, node) in &plan.outputs {
+            assert!(!is_root[wire]);
+            assert!((node as usize) < K + 1 + plan.children.len());
+            if node < ADJ_ZERO {
+                assert!(is_root[node as usize], "dependent output remains a leaf");
+            }
+        }
+
+        let mut rng = Rng::new(0xF01D_1DEA);
+        let mut full = vec![F128::ZERO; K];
+        let mut packed = Vec::new();
+        for _ in 0..64 {
+            let cv = std::array::from_fn(|_| rng.next_u32());
+            let message = std::array::from_fn(|_| rng.next_u32());
+            let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+            let witness = build_block_witness(
+                &cv,
+                &message,
+                counter,
+                rng.next_u32(),
+                rng.next_u32(),
+            );
+            let weight = F128::new(
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            );
+            for chunk in witness.chunks(128) {
+                let mut word = F128::ZERO;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    if bit {
+                        if i < 64 { word.lo |= 1u64 << i; }
+                        else { word.hi |= 1u64 << (i - 64); }
+                    }
+                }
+                packed.push(word);
+            }
+            for (value, bit) in full.iter_mut().zip(witness) {
+                if bit {
+                    *value += weight;
+                }
+            }
+        }
+        let mut nodes = vec![F128::ZERO; K + 1 + plan.children.len()];
+        let mut reconstructed = vec![F128::ZERO; K];
+        for &root in &plan.roots {
+            nodes[root] = full[root];
+            reconstructed[root] = full[root];
+        }
+        for (i, &[p, q]) in plan.children.iter().enumerate() {
+            nodes[ADJ_BASE as usize + i] = nodes[p as usize] + nodes[q as usize];
+        }
+        for &(wire, node) in &plan.outputs {
+            reconstructed[wire] = nodes[node as usize];
+        }
+        assert_eq!(reconstructed, full);
+        let plan = Box::leak(Box::new(plan));
+        let source = flock_core::lincheck::RootFoldSource::new(&packed, K_LOG, plan);
+        for _ in 0..2 {
+            let point: Vec<F128> = (0..6).map(|_| F128::new(
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            )).collect();
+            let eq = flock_core::lincheck::build_eq_table(&point);
+            let dense = flock_core::lincheck::partial_fold_packed_z_block_major_padded(
+                &packed, K_LOG + 6, K_LOG, USEFUL_BITS, &eq,
+            );
+            assert_eq!(source.fold(&packed, K_LOG + 6, &point), dense);
+        }
+
+        // The auxiliary roots intentionally omit dependent bits. A changed
+        // dependent bit in committed z must still fail the full verifier.
+        use flock_core::challenger::FsChallenger;
+        // m=32 exercises identity-C reconstruction as well as the AB fold;
+        // a smaller malformed fixture could fail in dense C before PCS.
+        let setup = Blake3Setup::new(1 << 18);
+        let blocks = crate::seed_pipe::generate_compressions_par(18, 0xF01D_1DEA);
+        let (mut z, a, b) = generate_witness_with_ab_packed(&blocks, 18);
+        z[OUT_LO_BASE / 128].lo ^= 1u64 << (OUT_LO_BASE % 128);
+        let mut ch = FsChallenger::new(b"linear-fold-malformed");
+        let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_block_major_witness(
+            &setup.r1cs, &setup.pcs_params, z, a, b, setup.lincheck_circuit(), None, &mut ch,
+        );
+        let mut ch = FsChallenger::new(b"linear-fold-malformed");
+        let result = setup.verify(&commitment, &proof, &mut ch);
+        assert!(result.is_err(), "changed dependent witness bit accepted");
+        eprintln!("root fold: {} XOR nodes; full-size malformed witness: {result:?}", plan.children.len());
+
     }
 
     /// The fused generator produces (z, a, b) byte-identical to
