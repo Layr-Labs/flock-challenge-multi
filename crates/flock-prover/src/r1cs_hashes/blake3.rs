@@ -2599,7 +2599,19 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
+    // The consumer may repair omitted rows only when the producer actually
+    // selects its ranked-static drain. AVX2 without the offsets kernel (and
+    // cold/provenance-miss buffers) still writes those rows in full.
     let one_rows_elided = ab_stream
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
@@ -2624,14 +2636,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
-    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
-    let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-        inv_table,
-        ab_inner_bytes,
-        abinner_nt,
-    );
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
     // direct-dense inline + maddubs chain the helper reuses.
@@ -2678,28 +2683,25 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         .for_each_init(
             || {
                 // Rayon splits this down to one bout per GROUP under stealing
-                // pressure, so the init runs about as often as the dump does —
-                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
-                // allocation (64-aligned via `AbWinLine`) and skips the fill;
-                // the dump writes every window byte before the projection
-                // reads any.
-                let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
-                    WIN_LINES
-                } else {
-                    0
-                };
+                // pressure. Streaming uses a callback-local stack stage so
+                // Rayon only moves this Vec header, not the 1 KiB stage. The
+                // non-streaming fallback retains its aligned allocation and
+                // write-before-read lifetime.
+                let mut fallback = Vec::<core::mem::MaybeUninit<AbWinLine>>::new();
+                let want = if !ab_stream && ab_nt { WIN_LINES } else { 0 };
                 if want != 0 {
-                    v.reserve_exact(want);
+                    fallback.reserve_exact(want);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
                     // `reserve_exact` guaranteed the capacity.
-                    unsafe { v.set_len(want) };
+                    unsafe { fallback.set_len(want) };
                 }
-                v
+                fallback
             },
             |win, (g, (((z_out, a_out), b_out), ab_out))| {
+                // Every live stage word is written synchronously before the
+                // projection reads it; static regions bypass this stage.
+                let mut inline_stage =
+                    core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 // The two window sides live back-to-back in one 64-aligned
                 // allocation: `[a windows | b windows]`, each 8 blocks of
@@ -2713,8 +2715,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                     None
                 };
                 let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
+                    debug_assert!(win.is_empty());
+                    Some(
+                        inline_stage
+                            .as_mut_ptr()
+                            .cast::<AbWinLine>()
+                            .cast::<u32>(),
+                    )
                 } else {
                     None
                 };
