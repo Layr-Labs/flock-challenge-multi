@@ -63,7 +63,14 @@ fn find_class(size: usize, insert: bool) -> Option<usize> {
 
 #[inline]
 fn recyclable(layout: &Layout) -> bool {
-    layout.size() >= RECYCLE_MIN && layout.align() <= MAX_ALIGN
+    // With the alignment shim enabled every cached block is 64-aligned,
+    // irrespective of its original requested alignment. All such layouts
+    // share the same size+slack System layout, so the size-only freelist can
+    // safely serve SIMD allocations too. Without the shim, retain the old
+    // System alignment contract and bypass over-aligned allocations.
+    layout.size() >= RECYCLE_MIN
+        && layout.size() <= isize::MAX as usize - ALIGN_SLACK - (MAX_ALIGN - 1)
+        && (layout.align() <= MAX_ALIGN || (layout.align() <= ALIGN_SLACK && align64_enabled()))
 }
 
 /// `FLOCK_NO_ALIGN64=1` restores raw System pointers for the recyclable
@@ -90,8 +97,8 @@ const ALIGN_SLACK: usize = 64;
 
 #[inline]
 fn adjusted(layout: &Layout) -> Layout {
-    // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
-    // caller could have constructed, and 16 is a power of two.
+    // recyclable() bounds size so size+slack, rounded to MAX_ALIGN, fits in
+    // isize. MAX_ALIGN is a power of two.
     Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
 }
 
@@ -147,8 +154,9 @@ pub struct RecycleAlloc;
 // size class. With align64 on, every recyclable-class block System sees uses
 // the `adjusted` layout on both alloc and dealloc, and the user pointer is
 // recovered to its System base via the offset word `align_up` stored.
-// glibc/mimalloc and the macOS allocator provide at least 16-byte alignment
-// at these sizes; layouts requiring larger alignment bypass the recycler.
+// With the shim disabled, only requests up to 16-byte alignment recycle.
+// With the shim enabled, all cached blocks are 64-aligned and may serve any
+// request up to that alignment; larger alignments still bypass the recycler.
 unsafe impl GlobalAlloc for RecycleAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if recyclable(&layout) {
@@ -205,6 +213,59 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_alignment_class_reuses_and_zeroes() {
+        let allocator = RecycleAlloc;
+        let size = RECYCLE_MIN + 1232;
+        let narrow = Layout::from_size_align(size, 16).unwrap();
+        let wide = Layout::from_size_align(size, 64).unwrap();
+        assert!(recyclable(&wide));
+        // SAFETY: each allocation is used within its exact requested size;
+        // the original layout is retained for every deallocation/reallocation.
+        unsafe {
+            let first = allocator.alloc(narrow);
+            assert!(!first.is_null());
+            assert_eq!(first as usize % 64, 0);
+            core::ptr::write_bytes(first, 0xA5, size);
+            allocator.dealloc(first, narrow);
+            let second = allocator.alloc(wide);
+            assert_eq!(second, first, "same-size align16 -> align64 reuse");
+            assert!(flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get()));
+            core::ptr::write_bytes(second, 0x5A, size);
+            allocator.dealloc(second, wide);
+            let zeroed = allocator.alloc_zeroed(narrow);
+            assert_eq!(zeroed, second, "same-size align64 -> align16 reuse");
+            assert!(
+                core::slice::from_raw_parts(zeroed, size)
+                    .iter()
+                    .all(|&x| x == 0)
+            );
+            allocator.dealloc(zeroed, narrow);
+            let original = allocator.alloc(wide);
+            core::ptr::write_bytes(original, 0x3C, size);
+            let larger = allocator.realloc(original, wide, size * 2);
+            assert!(!larger.is_null());
+            assert_eq!(larger as usize % 64, 0);
+            assert!(
+                core::slice::from_raw_parts(larger, size)
+                    .iter()
+                    .all(|&x| x == 0x3C)
+            );
+            allocator.dealloc(larger, Layout::from_size_align(size * 2, 64).unwrap());
+        }
+        assert!(!recyclable(&Layout::from_size_align(size, 128).unwrap()));
+        assert!(!recyclable(
+            &Layout::from_size_align(RECYCLE_MIN - 1, 64).unwrap()
+        ));
+        let largest_wide = Layout::from_size_align(isize::MAX as usize - 63, 64).unwrap();
+        assert!(
+            !recyclable(&largest_wide),
+            "slack must fit the System layout"
+        );
+    }
+
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
     /// freelist, and grown through realloc — returns a 64-aligned pointer
