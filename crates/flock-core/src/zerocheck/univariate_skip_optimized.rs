@@ -515,7 +515,7 @@ pub struct Round1AbInner {
     /// B is identically one. Round one adds their identity-C contribution
     /// before the AB message is emitted.
     ranked_one_rows_elided: bool,
-    /// Ranked BLAKE3 residual rows 2..=30 are stored contiguously: 29 cache
+    /// Ranked BLAKE3 residual rows 2..=29 are stored contiguously: 28 cache
     /// lines per witness block instead of the dense 32-line address space.
     ranked_compact: bool,
     /// Ranked BLAKE3 only: round one must not read window 30 (`b_med` 14 of
@@ -526,7 +526,7 @@ pub struct Round1AbInner {
 }
 
 const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
-const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
+pub const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 28 * ELL;
 
 impl Round1AbInner {
     #[inline]
@@ -587,7 +587,7 @@ impl Round1AbInner {
         self.ranked_one_rows_elided
     }
 
-    /// Whether the ranked residual rows use the physical 29-line block
+    /// Whether the ranked residual rows use the physical 28-line block
     /// layout. This is an internal producer/consumer address contract only;
     /// the proof and the round-one algebra are unchanged.
     #[inline]
@@ -709,7 +709,7 @@ impl Round1AbInner {
     }
 }
 
-/// Exact same-binary rollback for the ranked 29-row physical layout.
+/// Exact same-binary rollback for the ranked 28-row physical layout.
 pub fn ranked_ab_compact_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_AB_COMPACT").is_none());
@@ -3582,7 +3582,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
         if compact {
             let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
-            debug_assert!((2..31).contains(&row_in_block));
+            debug_assert!((2..30).contains(&row_in_block));
             (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES
                 + (row_in_block - 2) * ELL
         } else {
@@ -3916,6 +3916,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     }
     if ranked_compact {
         assert!(ranked_one_rows_elided);
+        assert!(ranked_w30_elided);
         assert_eq!(within_outer_mask, 1);
         assert_eq!(b_med_counts.as_slice(), [16, 15]);
         assert_eq!(

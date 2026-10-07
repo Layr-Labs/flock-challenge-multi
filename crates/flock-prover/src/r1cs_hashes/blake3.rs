@@ -2277,6 +2277,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             && ranked_plan.offsets_eligible(2)
             && blake3_witgen8::ey_dead_w31_enabled()
             && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_w30_elide_enabled()
             && flock_core::pcs::ranked_direct_fold8_enabled()
             && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled()
     };
@@ -2584,7 +2585,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     const U32_PER_BLOCK: usize = K / 32;
     const SIMD: usize = 8;
     const GROUP: usize = 16;
-    const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
+    const COMPACT_BYTES_PER_BLOCK: usize =
+        flock_core::zerocheck::univariate_skip_optimized::RANKED_AB_COMPACT_BLOCK_BYTES;
     // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
     const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
     // 64-byte lines backing one task's streaming projection staging pair.
@@ -2599,7 +2601,19 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
+    // The consumer may repair omitted rows only when the producer actually
+    // selects its ranked-static drain. AVX2 without the offsets kernel (and
+    // cold/provenance-miss buffers) still writes those rows in full.
     let one_rows_elided = ab_stream
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
@@ -2612,6 +2626,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // round one adds its exact contribution from the identity-C fold.
     let w30_elided = one_rows_elided
         && flock_core::zerocheck::univariate_skip_optimized::ranked_w30_elide_enabled();
+    assert!(!compact || w30_elided);
     if w30_elided {
         ab_inner.set_ranked_w30_elided();
     }
@@ -2624,14 +2639,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
-    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
-    let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-        inv_table,
-        ab_inner_bytes,
-        abinner_nt,
-    );
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
     // direct-dense inline + maddubs chain the helper reuses.
@@ -5470,14 +5478,10 @@ mod tests {
             ab_e.ranked_w30_elided(),
             "window-30 elision brand mismatch"
         );
-        if ab_g.ranked_w30_elided() {
+        if ab_g.ranked_w30_elided() && !ab_g.ranked_compact() {
             // Neither producer writes the elided window's 64 bytes; round one
             // adds that window from the identity-C fold, so exclude it here.
-            let (stride, w30) = if ab_g.ranked_compact() {
-                (29 * 64, 28 * 64)
-            } else {
-                (32 * 64, 30 * 64)
-            };
+            let (stride, w30) = (32 * 64, 30 * 64);
             for ab in [&mut ab_g, &mut ab_e] {
                 for block in ab.as_bytes_mut().chunks_exact_mut(stride) {
                     block[w30..w30 + 64].fill(0);
