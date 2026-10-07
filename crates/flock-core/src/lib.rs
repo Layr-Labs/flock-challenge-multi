@@ -99,7 +99,7 @@ fn init_global_pool() -> Option<usize> {
 /// no arithmetic changes, proof bytes identical.
 pub(crate) mod topology_pool {
     /// "pin16" | "phys8"
-    pub(crate) const POOL_MODE: &str = "pin16";
+    pub(crate) const POOL_MODE: &str = "phys8";
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
