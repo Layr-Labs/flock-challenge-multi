@@ -550,7 +550,19 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         //   out[i]       = v + v*r_j      ← new bit_j = 0
         //   out[i + len] = v * r_j        ← new bit_j = 1
         // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let i = unsafe { build_eq_table_x86_x4(&mut out, len, r_j) };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let i = 0;
+        for i in i..len {
             let v = out[i];
             let hi = v * r_j;
             out[i + len] = hi;
@@ -558,6 +570,45 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         }
     }
     out
+}
+
+/// Expand four adjacent entries of an eq table with one four-lane GHASH
+/// multiply. The caller handles any short prefix/tail scalarly.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; `out[0..2*len]` is initialized and
+/// `out.len() >= 2*len`. Only complete groups of four are processed.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn build_eq_table_x86_x4(out: &mut [F128], len: usize, r: F128) -> usize {
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+
+    let vector_end = len & !3;
+    if vector_end == 0 {
+        return 0;
+    }
+    // SAFETY: this function is target-feature gated and `r` is the shared
+    // multiplier for every lane in this expansion step.
+    let (multiplier, multiplier_x64) = unsafe { ghash_broadcast_split(r) };
+    let mut i = 0;
+    while i < vector_end {
+        // SAFETY: four initialized F128 values fit in one ZMM; the matching
+        // high-half range is within the resized output slice.
+        unsafe {
+            let old = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+            let high = ghash_mul_x4_split(old, multiplier, multiplier_x64);
+            let low = _mm512_xor_si512(old, high);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + len) as *mut __m512i, high);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, low);
+        }
+        i += 4;
+    }
+    vector_end
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row
@@ -4013,24 +4064,30 @@ mod tests {
     /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]
     fn eq_table_matches_direct_formula() {
-        for &d in &[1usize, 2, 3, 5, 8] {
+        for d in 0usize..=18 {
             let mut rng = Rng::new(11 + d as u64);
-            let point = rng.f128_vec(d);
-            let table = build_eq_table(&point);
-            assert_eq!(table.len(), 1 << d);
-            for i in 0..(1 << d) {
-                let mut expected = F128::ONE;
-                for j in 0..d {
-                    let bit = ((i >> j) & 1) as u64;
-                    // eq(r, bit) = (1 + r) if bit = 0 else r
-                    let factor = if bit == 0 {
-                        F128::ONE + point[j]
-                    } else {
-                        point[j]
-                    };
-                    expected *= factor;
+            let cases = [
+                vec![F128::ZERO; d],
+                vec![F128::ONE; d],
+                rng.f128_vec(d),
+            ];
+            for point in cases {
+                let table = build_eq_table(&point);
+                assert_eq!(table.len(), 1 << d);
+                for i in 0..(1 << d) {
+                    let mut expected = F128::ONE;
+                    for j in 0..d {
+                        let bit = ((i >> j) & 1) as u64;
+                        // eq(r, bit) = (1 + r) if bit = 0 else r
+                        let factor = if bit == 0 {
+                            F128::ONE + point[j]
+                        } else {
+                            point[j]
+                        };
+                        expected *= factor;
+                    }
+                    assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
                 }
-                assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
             }
         }
     }
