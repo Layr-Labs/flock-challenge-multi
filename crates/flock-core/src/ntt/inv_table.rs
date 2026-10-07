@@ -36,10 +36,11 @@ pub struct InvNttTableByteSingleGf8 {
     data_offset: usize,
 }
 
-/// σ-images built for the ranked `ell = 64` table on x86_64. Two by default
-/// (σ₀, σ₈: the incumbent 32 KiB footprint and two-image kernels). Opt-in
-/// `FLOCK_INV_TABLE_IMAGES4=1` builds four (σ₀, σ₈, σ₁₆, σ₂₄), so the AVX-512
-/// K-row apply issues one 128-bit-lane shuffle instead of three, and
+/// σ-images built for the ranked `ell = 64` table on x86_64. Four by default
+/// (σ₀, σ₈, σ₁₆, σ₂₄: 64 KiB), so the AVX-512 K-row apply issues one
+/// 128-bit-lane shuffle instead of three. `FLOCK_INV_TABLE_IMAGES2=1`
+/// restores the two-image 32 KiB table; an explicit four-image request wins.
+///
 /// `FLOCK_INV_IMAGES8=1` builds all eight σ_{8b} images (no shuffle, 128 KiB
 /// of table). Read once per process.
 fn x86_table_images() -> usize {
@@ -55,8 +56,10 @@ fn x86_table_images() -> usize {
             8
         } else if std::env::var_os("FLOCK_INV_TABLE_IMAGES4").is_some() {
             4
-        } else {
+        } else if std::env::var_os("FLOCK_INV_TABLE_IMAGES2").is_some() {
             2
+        } else {
+            4
         }
     });
     *N

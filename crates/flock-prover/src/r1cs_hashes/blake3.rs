@@ -2599,7 +2599,19 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     let group_bytes = GROUP * ab_block_bytes;
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
+    // The consumer may repair omitted rows only when the producer actually
+    // selects its ranked-static drain. AVX2 without the offsets kernel (and
+    // cold/provenance-miss buffers) still writes those rows in full.
     let one_rows_elided = ab_stream
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
@@ -2624,14 +2636,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // stream as well: their only in-task reader, the window projection, now
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
-    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
-    let z_nt = witgen_simd::witgen_z_nt_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
-    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-        inv_table,
-        ab_inner_bytes,
-        abinner_nt,
-    );
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
     // direct-dense inline + maddubs chain the helper reuses.
