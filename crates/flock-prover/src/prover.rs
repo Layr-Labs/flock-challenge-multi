@@ -912,13 +912,19 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // Last-ρ leftover z-fold: arm before zerocheck so the last ML ρ can
     // start today's one-shot fold. Guard keeps `z_packed` live until
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
+    let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        lincheck_circuit.root_fold_plan().map(|plan| std::sync::Arc::new(
+            lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan)
+        ))
+    } else { None };
     let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
-        Some(lincheck::prepare_last_rho_z_fold(
+        Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
             r1cs.m,
             r1cs.k_log,
             r1cs.useful_bits,
             r1cs.k_log - r1cs.k_skip,
+            roots.clone(),
         ))
     } else {
         None
@@ -953,8 +959,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             flock_core::gaptime::mark("zerocheck: views built");
             let r = match c_identity_z {
             Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
-                    a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
+                    a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
                     challenger,
                 )
             }
@@ -1002,8 +1008,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode(
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
             &z_packed,
+            roots.as_deref(),
             r1cs.m,
             r1cs.k_log,
             r1cs.k_skip,
@@ -1014,6 +1021,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             challenger,
         ),
     });
+    drop(roots);
     flock_core::gaptime::mark("lincheck: done");
 
     let ab = ZClaim {
@@ -1171,13 +1179,19 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
 
+    let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        lincheck_circuit.root_fold_plan().map(|plan| std::sync::Arc::new(
+            lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan)
+        ))
+    } else { None };
     let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
-        Some(lincheck::prepare_last_rho_z_fold(
+        Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
             r1cs.m,
             r1cs.k_log,
             r1cs.useful_bits,
             r1cs.k_log - r1cs.k_skip,
+            roots.clone(),
         ))
     } else {
         None
@@ -1211,8 +1225,8 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             };
             match c_identity_z {
             Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c(
-                    a_packed, b_packed, c_packed, c_identity_z, r1cs.m, &padding, ab_inner,
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
+                    a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
                     challenger,
                 )
             }
@@ -1245,8 +1259,9 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode(
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
             &z_packed,
+            roots.as_deref(),
             r1cs.m,
             r1cs.k_log,
             r1cs.k_skip,
@@ -1257,6 +1272,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             challenger,
         ),
     };
+    drop(roots);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
