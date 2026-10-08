@@ -1583,14 +1583,8 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                 let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
                 let [b0, b1, b2, b3] = transpose4(ob0, ob1, ob2, ob3);
                 if nt_out {
-                    stream_zmm_as_xmm4(ap, a0);
-                    stream_zmm_as_xmm4(ap.add(4), a1);
-                    stream_zmm_as_xmm4(ap.add(8), a2);
-                    stream_zmm_as_xmm4(ap.add(12), a3);
-                    stream_zmm_as_xmm4(bp, b0);
-                    stream_zmm_as_xmm4(bp.add(4), b1);
-                    stream_zmm_as_xmm4(bp.add(8), b2);
-                    stream_zmm_as_xmm4(bp.add(12), b3);
+                    stream_tile_as_xmm16(ap, a0, a1, a2, a3);
+                    stream_tile_as_xmm16(bp, b0, b1, b2, b3);
                 } else {
                     _mm512_storeu_si512(ap.cast::<__m512i>(), a0);
                     _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), a1);
@@ -1610,14 +1604,8 @@ pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
                 (a0, a1, a2, a3, b0, b1, b2, b3)
             } else {
                 if nt_out {
-                    stream_zmm_as_xmm4(ap, oa0);
-                    stream_zmm_as_xmm4(ap.add(4), oa1);
-                    stream_zmm_as_xmm4(ap.add(8), oa2);
-                    stream_zmm_as_xmm4(ap.add(12), oa3);
-                    stream_zmm_as_xmm4(bp, ob0);
-                    stream_zmm_as_xmm4(bp.add(4), ob1);
-                    stream_zmm_as_xmm4(bp.add(8), ob2);
-                    stream_zmm_as_xmm4(bp.add(12), ob3);
+                    stream_tile_as_xmm16(ap, oa0, oa1, oa2, oa3);
+                    stream_tile_as_xmm16(bp, ob0, ob1, ob2, ob3);
                 } else {
                     _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
                     _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
@@ -2324,32 +2312,91 @@ unsafe fn fold16_to_4_deferred_gen<const LM_IN: bool, const SPLIT: bool>(
     }
 }
 
-/// Store one ZMM as four XMM non-temporal quarters. Large pool allocations
-/// land 16 mod 64, so a 64-byte-aligned ZMM stream is unreachable; `F128`
-/// is `repr(C, align(16))`, so every `Vec<F128>` base — and every F128
-/// element offset from it — is 16-byte aligned by the allocation layout
-/// (a language guarantee, not malloc folklore).
+/// Publish sixteen F128s non-temporally. The four register destinations
+/// differ by 64 bytes, so they share one alignment decision. `F128` has
+/// alignment 16; all other legal base residues retain the XMM store path.
 ///
 /// # Safety
-/// `p` must be 16-byte aligned and cover 4 F128s; avx512f is required (the
+/// `p` must be 16-byte aligned and cover 16 F128s; avx512f is required (the
 /// module gate supplies it, and the explicit cfg keeps that visible here).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
-unsafe fn stream_zmm_as_xmm4(p: *mut F128, v: core::arch::x86_64::__m512i) {
+unsafe fn stream_tile_as_xmm16(
+    p: *mut F128,
+    v0: core::arch::x86_64::__m512i,
+    v1: core::arch::x86_64::__m512i,
+    v2: core::arch::x86_64::__m512i,
+    v3: core::arch::x86_64::__m512i,
+) {
     use core::arch::x86_64::*;
-    // SAFETY: alignment per the contract; features per the cfg above. At
-    // 64-alignment (the allocator's recyclable class on this lineage) one
-    // single-uop ZMM stream publishes the whole line.
+
+    #[inline(always)]
+    unsafe fn stream_xmm4(p: *mut F128, v: __m512i) {
+        // SAFETY: the tile's base and all quarter offsets are 16-aligned.
+        unsafe {
+            let d = p.cast::<__m128i>();
+            _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
+            _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
+            _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
+            _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+        }
+    }
+
+    // SAFETY: every register covers four of the sixteen writable F128s.
+    // Offsets 4, 8, and 12 preserve the base's residue modulo 64.
     unsafe {
         if p as usize % 64 == 0 {
-            _mm512_stream_si512(p as *mut __m512i, v);
-            return;
+            _mm512_stream_si512(p.cast::<__m512i>(), v0);
+            _mm512_stream_si512(p.add(4).cast::<__m512i>(), v1);
+            _mm512_stream_si512(p.add(8).cast::<__m512i>(), v2);
+            _mm512_stream_si512(p.add(12).cast::<__m512i>(), v3);
+        } else {
+            stream_xmm4(p, v0);
+            stream_xmm4(p.add(4), v1);
+            stream_xmm4(p.add(8), v2);
+            stream_xmm4(p.add(12), v3);
         }
-        let d = p as *mut __m128i;
-        _mm_stream_si128(d, _mm512_extracti32x4_epi32::<0>(v));
-        _mm_stream_si128(d.add(1), _mm512_extracti32x4_epi32::<1>(v));
-        _mm_stream_si128(d.add(2), _mm512_extracti32x4_epi32::<2>(v));
-        _mm_stream_si128(d.add(3), _mm512_extracti32x4_epi32::<3>(v));
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
+#[test]
+fn nt_tile_store_matches_all_alignment_classes() {
+    use core::arch::x86_64::*;
+
+    #[repr(align(64))]
+    struct Aligned([F128; 24]);
+
+    let guard = F128 {
+        lo: 0x1234_5678_9ABC_DEF0,
+        hi: 0xFEDC_BA98_7654_3210,
+    };
+    let values: [F128; 16] = std::array::from_fn(|i| F128 {
+        lo: (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        hi: (i as u64 + 17).wrapping_mul(0xD6E8_FEB8_6659_FD93),
+    });
+    for offset in 0..4 {
+        let mut dst = Aligned([guard; 24]);
+        let start = 4 + offset;
+        let ptr = dst.0.as_mut_ptr();
+        assert_eq!(ptr as usize % 64, 0);
+        // SAFETY: all sixteen loads are in `values`; the four legal
+        // 16-byte-aligned destinations each leave guard elements outside
+        // the sixteen-value range. Drain the NT stores before reading.
+        unsafe {
+            let p = values.as_ptr().cast::<__m512i>();
+            stream_tile_as_xmm16(
+                ptr.add(start),
+                _mm512_loadu_si512(p),
+                _mm512_loadu_si512(p.add(1)),
+                _mm512_loadu_si512(p.add(2)),
+                _mm512_loadu_si512(p.add(3)),
+            );
+            _mm_sfence();
+        }
+        assert_eq!(&dst.0[start..start + 16], &values);
+        assert!(dst.0[..start].iter().all(|&v| v == guard));
+        assert!(dst.0[start + 16..].iter().all(|&v| v == guard));
     }
 }
 
@@ -2894,14 +2941,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                     (s0, s1, s2, s3, t0, t1, t2, t3)
                 };
                 if nt_out {
-                    stream_zmm_as_xmm4(ap, s0);
-                    stream_zmm_as_xmm4(ap.add(4), s1);
-                    stream_zmm_as_xmm4(ap.add(8), s2);
-                    stream_zmm_as_xmm4(ap.add(12), s3);
-                    stream_zmm_as_xmm4(bp, t0);
-                    stream_zmm_as_xmm4(bp.add(4), t1);
-                    stream_zmm_as_xmm4(bp.add(8), t2);
-                    stream_zmm_as_xmm4(bp.add(12), t3);
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
                 } else {
                     _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
                     _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
@@ -2928,14 +2969,8 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 (a0, a1, a2, a3, b0, b1, b2, b3)
             } else {
                 if nt_out {
-                    stream_zmm_as_xmm4(ap, oa0);
-                    stream_zmm_as_xmm4(ap.add(4), oa1);
-                    stream_zmm_as_xmm4(ap.add(8), oa2);
-                    stream_zmm_as_xmm4(ap.add(12), oa3);
-                    stream_zmm_as_xmm4(bp, ob0);
-                    stream_zmm_as_xmm4(bp.add(4), ob1);
-                    stream_zmm_as_xmm4(bp.add(8), ob2);
-                    stream_zmm_as_xmm4(bp.add(12), ob3);
+                    stream_tile_as_xmm16(ap, oa0, oa1, oa2, oa3);
+                    stream_tile_as_xmm16(bp, ob0, ob1, ob2, ob3);
                 } else {
                     _mm512_storeu_si512(ap.cast::<__m512i>(), oa0);
                     _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), oa1);
