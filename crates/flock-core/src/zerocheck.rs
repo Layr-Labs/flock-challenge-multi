@@ -433,6 +433,17 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
     ab_inner: univariate_skip_optimized::Round1AbInner,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
+        a_packed, b_packed, c_packed, c_identity_z, None, m, padding, ab_inner, challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots<C: Challenger>(
+    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], c_identity_z: &[F128],
+    roots: Option<&crate::lincheck::RootFoldSource>, m: usize, padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner, challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
         b_packed,
@@ -441,7 +452,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
         padding,
         true,
         Some(ab_inner),
-        Some(c_identity_z),
+        Some((c_identity_z, roots)),
         challenger,
     );
     (
@@ -468,7 +479,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_identity_z: Option<&[F128]>,
+    c_identity_z: Option<(&[F128], Option<&crate::lincheck::RootFoldSource>)>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -537,7 +548,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // one-row windows as though they had been initialized.
             ab_inner.restore_full_if_ranked_one_rows_elided(a_packed, b_packed, inv_table);
         }
-        if let Some(c_identity_z) = c_identity_z {
+        if let Some((c_identity_z, roots)) = c_identity_z {
             // Ranked identity-C: AB completes without touching `c_packed`, and
             // C's message plus all three capture tensors come from one
             // block-major outer fold of the witness. Both halves are
@@ -586,6 +597,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         inv_table,
                         ranked_one_rows,
                         capture_canon,
+                        roots,
                     );
                 (
                     c,
