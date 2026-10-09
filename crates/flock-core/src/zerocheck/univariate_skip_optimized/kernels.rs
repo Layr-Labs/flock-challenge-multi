@@ -690,6 +690,34 @@ pub(super) fn c_plane_bank_to_f128(bank_planes: &[u8; 16 * 64], out: &mut [super
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn reduce_worker_plane_block_to_f128(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base: usize,
+    out: &mut [super::F128; 64],
+) {
+    unsafe {
+        x86_64::reduce_worker_plane_block_x86_avx512(
+            planes_ptr,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base,
+            out,
+        );
+    }
+}
+
 /// Ascending bulk fetch of one four-window C group into the worker staging
 /// buffer; see the kernel.
 #[cfg(all(

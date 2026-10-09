@@ -1943,7 +1943,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// row addressing.
 /// `HIGH_ONE_OUTER` requires `twiddles[0].hi == 1`; the shaped dispatcher
 /// verifies it before entering that specialization.
-#[inline]
+// Keep specialization bodies separate. Inlining every DIET/LOW/NNC arm
+// into one dispatcher gives all calls its union-sized stack frame and makes
+// the hot kernel share an instruction footprint with unused alternatives.
+// This preserves every arithmetic operation and all dispatch preconditions.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,
