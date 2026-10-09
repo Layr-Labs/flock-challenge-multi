@@ -3529,6 +3529,7 @@ impl Drop for WorkerStateAbOnly {
 /// Every C statement (and every `c_packed` byte) is gone.
 /// `DIRECT` only changes the GFNI input loads: the caller selects it once
 /// per band for the ranked residual `(first, end) = (2, 16), (0, 15)` pair.
+#[inline(never)]
 fn process_one_x_hi_ab_only<const DIRECT: bool>(
     x_hi: usize,
     big_lo_size: usize,
@@ -3546,7 +3547,24 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )))]
     state.partial_ab.fill(F128::ZERO);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if eq_fold.is_none() || !r1_eqfold_x4_enabled() {
+        state.partial_ab.fill(F128::ZERO);
+    }
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
     debug_assert!(
         !DIRECT
@@ -3803,12 +3821,30 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
+        let wide = r1_eqfold_x4_enabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        ))]
+        if wide {
+            unsafe {
+                kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    eq_hi_val,
+                    &mut state.local_res_ab,
+                );
+            }
+            return;
+        }
         // Plane-major → F128 through the same vectorized kernel the C drain
         // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
         // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
         // shared `add_scaled` leaf, which selects the architecture kernel.
         let mut bank_f128 = [F128::ZERO; ELL];
-        let wide = r1_eqfold_x4_enabled();
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
             let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
                 .try_into()
@@ -4331,6 +4367,7 @@ pub fn round1_c_fold4_from_block_major_z(
         inv_table,
         ranked_one_rows,
         false,
+        None,
     );
     (c, s_hat_v_c, quad, fold4, fold8, one_ab)
 }
@@ -4350,6 +4387,7 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     inv_table: &InvNttTableByteSingleGf8,
     ranked_one_rows: bool,
     capture_canon: bool,
+    roots: Option<&crate::lincheck::RootFoldSource>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -4383,7 +4421,16 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         // worker byte planes so the full length-2^k_log C inner table is
         // never written and immediately read back by a second Rayon pass.
         let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
-            if ranked_one_rows {
+            if let Some(roots) = roots {
+                let full = roots.fold(z_packed, m, &r[k_log..]);
+                let (full, mut one) = crate::lincheck::finish_block_major_fold(
+                    full, Some(inner_tail[6]), ranked_one_rows, capture_canon,
+                );
+                if capture_canon {
+                    canon = one.as_mut().map(|v| v.split_off(1usize << (k_log - 1)));
+                }
+                (full, one)
+            } else if ranked_one_rows {
                 let (full, one, rows) =
                     crate::lincheck::fold_block_major_one_shot_bind_top_ranked_one_rows(
                         z_packed,
