@@ -1553,12 +1553,19 @@ impl AdditiveNttF128 {
     ///
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
         debug_assert!(layer < self.log_domain_size());
         debug_assert!(block < 1usize << layer);
         if let Some(twiddles) = &self.precomputed_twiddles {
             return twiddles[(1usize << layer) - 1 + block];
         }
+        self.twiddle_unprecomputed(layer, block)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn twiddle_unprecomputed(&self, layer: usize, block: usize) -> F128 {
         let v = &self.evals[self.log_domain_size() - layer - 1];
         span_get(&v[1..], block)
     }
@@ -2233,6 +2240,18 @@ impl AdditiveNttF128 {
                 tw
             })
             .collect();
+        let tw2: Vec<[[F128; 3]; 16]> = (0..num_blocks)
+            .map(|block| {
+                core::array::from_fn(|m| {
+                    let outer_block = block * 16 + m;
+                    [
+                        self.twiddle(layer + 4, outer_block),
+                        self.twiddle(layer + 5, 2 * outer_block),
+                        self.twiddle(layer + 5, 2 * outer_block + 1),
+                    ]
+                })
+            })
+            .collect();
 
         let base_addr = data.as_mut_ptr() as usize;
         let n_tasks = num_blocks * sub_stride;
@@ -2274,11 +2293,7 @@ impl AdditiveNttF128 {
                 }
                 // Layers layer+4, layer+5: fused-two on quads {4m..4m+4};
                 // block index at layer+4 is block·16 + m.
-                for m in 0..16 {
-                    let outer_block = block * 16 + m;
-                    let t_outer = self.twiddle(layer + 4, outer_block);
-                    let t_inner_a = self.twiddle(layer + 5, 2 * outer_block);
-                    let t_inner_b = self.twiddle(layer + 5, 2 * outer_block + 1);
+                for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2[block].iter().enumerate() {
                     let p = buf.as_mut_ptr().add(4 * m * row_len);
                     let a = std::slice::from_raw_parts_mut(p, lanes2);
                     let b = std::slice::from_raw_parts_mut(p.add(row_len), lanes2);
@@ -2417,7 +2432,6 @@ impl AdditiveNttF128 {
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_fused2_publish<const ALIGNED_ZMM: bool>(
-        &self,
         bufp: *mut F128,
         base: *mut F128,
         row_len: usize,
@@ -2428,6 +2442,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        tw2: &[[[F128; 3]; 16]; 8],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2456,8 +2471,17 @@ impl AdditiveNttF128 {
                         tw,
                     );
                 }
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                Self::seed_top_publish2_block::<ALIGNED_ZMM>(
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2489,7 +2513,6 @@ impl AdditiveNttF128 {
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_publish2<const ALIGNED_ZMM: bool>(
-        &self,
         bufp: *mut F128,
         base: *mut F128,
         row_len: usize,
@@ -2498,6 +2521,7 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2: &[[[F128; 3]; 16]; 8],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2511,8 +2535,17 @@ impl AdditiveNttF128 {
         unsafe {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
-                self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                Self::seed_top_publish2_block::<ALIGNED_ZMM>(
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2545,7 +2578,6 @@ impl AdditiveNttF128 {
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     unsafe fn seed_top_publish2_block<const ALIGNED_ZMM: bool>(
-        &self,
         region: *mut F128,
         base: *mut F128,
         block: usize,
@@ -2555,17 +2587,14 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
         // this block's 64 logical rows.
         unsafe {
-            for m in 0..16 {
-                let outer_block = block * 16 + m;
-                let t_outer = self.twiddle(3 + 4, outer_block);
-                let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
                 let k = 4 * m;
                 let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                 let step = g2_stride * row_len;
@@ -2652,6 +2681,18 @@ impl AdditiveNttF128 {
                 tw
             })
             .collect();
+
+        let mut tw2 = [[[F128::ZERO; 3]; 16]; 8];
+        for (block, tw2_blk) in tw2.iter_mut().enumerate() {
+            for (m, triple) in tw2_blk.iter_mut().enumerate() {
+                let outer_block = block * 16 + m;
+                *triple = [
+                    self.twiddle(LAYER + 4, outer_block),
+                    self.twiddle(LAYER + 5, 2 * outer_block),
+                    self.twiddle(LAYER + 5, 2 * outer_block + 1),
+                ];
+            }
+        }
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
@@ -2881,7 +2922,7 @@ impl AdditiveNttF128 {
                     // 8×16-quad loop. Every 64-element destination row has a
                     // 1024-byte stride, so it preserves the base residue.
                     if direct_publish_zmm {
-                        self.seed_top_direct_fused2_publish::<true>(
+                        Self::seed_top_direct_fused2_publish::<true>(
                             bufp,
                             base,
                             row_len,
@@ -2892,9 +2933,10 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     } else {
-                        self.seed_top_direct_fused2_publish::<false>(
+                        Self::seed_top_direct_fused2_publish::<false>(
                             bufp,
                             base,
                             row_len,
@@ -2905,6 +2947,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2927,11 +2970,7 @@ impl AdditiveNttF128 {
                             tw,
                         );
                     }
-                    for m in 0..16 {
-                        let outer_block = block * 16 + m;
-                        let t_outer = self.twiddle(LAYER + 4, outer_block);
-                        let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
-                        let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                    for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2[block].iter().enumerate() {
                         let p = region.add(perm(4 * m) * row_len);
                         let step = g2_stride * row_len;
                         let a = std::slice::from_raw_parts_mut(p, lanes2);
@@ -3003,12 +3042,12 @@ impl AdditiveNttF128 {
             unsafe {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
-                    self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    Self::seed_top_direct_publish2::<true>(
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 } else {
-                    self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    Self::seed_top_direct_publish2::<false>(
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
@@ -3447,11 +3486,23 @@ impl AdditiveNttF128 {
         // per-row order — only the interleaving of DISJOINT blocks changes,
         // so the output bytes are identical. `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1`
         // restores the sweep schedule (exact same-binary A/B).
+        let tw_table = self.precomputed_twiddles.as_deref();
+        let tw_addr: usize = tw_table
+            .filter(|t| log_d <= 30 && t.len() >= (1usize << log_d) - 1)
+            .map_or(0, |t| t.as_ptr() as usize);
         let fuse_blocks = deep_fused4_ok
             && log_d == n_top + 11
             && start_layer <= n_top
+            && tw_addr != 0
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
+
+        let tw_at = |layer: usize, block: usize| -> F128 {
+            if tw_addr != 0 {
+                return unsafe { *(tw_addr as *const F128).add((1usize << layer) - 1 + block) };
+            }
+            self.twiddle_unprecomputed(layer, block)
+        };
 
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
@@ -3460,6 +3511,13 @@ impl AdditiveNttF128 {
          -> bool {
             if fuse_blocks && block_cb.is_some() {
                 let cb = block_cb.unwrap();
+                // SAFETY: `fuse_blocks` checked `tw_addr != 0`, which
+                // guarantees `tw_addr` covers `(1 << log_d) - 1` elements, and
+                // every `(layer, block)` below satisfies `layer < log_d` and
+                // `block < (1 << layer)`.
+                let tw_fast = |layer: usize, block: usize| -> F128 {
+                    unsafe { *(tw_addr as *const F128).add((1usize << layer) - 1 + block) }
+                };
                 // Sweep 1: fused-four over the whole sub-group (layers
                 // n_top..n_top+4) — verbatim the incumbent's first pass.
                 {
@@ -3468,15 +3526,15 @@ impl AdditiveNttF128 {
                     let sixteenth = block_size >> 4;
                     let global_block = sub_idx;
                     let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer, global_block);
+                    tw[0] = tw_fast(layer, global_block);
                     for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                        tw[1 + s] = tw_fast(layer + 1, 2 * global_block + s);
                     }
                     for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                        tw[3 + s] = tw_fast(layer + 2, 4 * global_block + s);
                     }
                     for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                        tw[7 + s] = tw_fast(layer + 3, 8 * global_block + s);
                     }
                     butterfly_interleaved_fused_4layer_rows(
                         sub_data,
@@ -3505,15 +3563,15 @@ impl AdditiveNttF128 {
                 for b in 0..16usize {
                     let g4 = sub_idx * 16 + b;
                     let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer4, g4);
+                    tw[0] = tw_fast(layer4, g4);
                     for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+                        tw[1 + s] = tw_fast(layer4 + 1, 2 * g4 + s);
                     }
                     for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+                        tw[3 + s] = tw_fast(layer4 + 2, 4 * g4 + s);
                     }
                     for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+                        tw[7 + s] = tw_fast(layer4 + 3, 8 * g4 + s);
                     }
                     let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
                     butterfly_interleaved_fused_4layer_rows(
@@ -3531,12 +3589,12 @@ impl AdditiveNttF128 {
                     for j in 0..16usize {
                         let g8 = g4 * 16 + j;
                         let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
-                        tw3[0] = self.twiddle(layer3, g8);
+                        tw3[0] = tw_fast(layer3, g8);
                         for s in 0..2 {
-                            tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+                            tw3[1 + s] = tw_fast(layer3 + 1, 2 * g8 + s);
                         }
                         for s in 0..4 {
-                            tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+                            tw3[3 + s] = tw_fast(layer3 + 2, 4 * g8 + s);
                         }
                         let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
                         // SAFETY: eight consecutive rows of `num_ntts` lanes,
@@ -3584,15 +3642,15 @@ impl AdditiveNttF128 {
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                             let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
+                            tw[0] = tw_at(layer, global_block);
                             for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                tw[1 + s] = tw_at(layer + 1, 2 * global_block + s);
                             }
                             for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                tw[3 + s] = tw_at(layer + 2, 4 * global_block + s);
                             }
                             for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                                tw[7 + s] = tw_at(layer + 3, 8 * global_block + s);
                             }
                             let block_start = block_in_sub * block_bytes;
                             butterfly_interleaved_fused_4layer_rows(
@@ -3636,12 +3694,12 @@ impl AdditiveNttF128 {
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                             let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                            tw[0] = self.twiddle(layer, global_block);
+                            tw[0] = tw_at(layer, global_block);
                             for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                tw[1 + s] = tw_at(layer + 1, 2 * global_block + s);
                             }
                             for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                tw[3 + s] = tw_at(layer + 2, 4 * global_block + s);
                             }
                             let block_start = block_in_sub * block_bytes;
                             let block = &mut sub_data[block_start..block_start + block_bytes];
@@ -3666,9 +3724,9 @@ impl AdditiveNttF128 {
                         let quarter = block_size >> 2;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let t_outer = self.twiddle(layer, global_block);
-                            let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
-                            let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                            let t_outer = tw_at(layer, global_block);
+                            let t_inner_a = tw_at(layer + 1, 2 * global_block);
+                            let t_inner_b = tw_at(layer + 1, 2 * global_block + 1);
                             let block_start = block_in_sub * block_bytes;
                             butterfly_interleaved_fused_2layer_par_rows(
                                 &mut sub_data[block_start..block_start + block_bytes],
@@ -3689,7 +3747,7 @@ impl AdditiveNttF128 {
                         let block_size_half = block_size >> 1;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let twiddle = self.twiddle(layer, global_block);
+                            let twiddle = tw_at(layer, global_block);
                             let block_start = block_in_sub * block_bytes;
                             let block = &mut sub_data[block_start..block_start + block_bytes];
                             butterfly_interleaved_block(
@@ -3719,7 +3777,7 @@ impl AdditiveNttF128 {
 
                 for block_in_sub in 0..num_blocks_in_sub {
                     let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                    let twiddle = self.twiddle(layer, global_block);
+                    let twiddle = tw_at(layer, global_block);
                     let block_start = block_in_sub * block_bytes;
                     let block = &mut sub_data[block_start..block_start + block_bytes];
                     butterfly_interleaved_block(

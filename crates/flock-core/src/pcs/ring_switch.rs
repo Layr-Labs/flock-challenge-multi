@@ -3126,14 +3126,14 @@ fn direct_fold8_states_par(
         return (a_state, w_state, round0);
     }
 
-    let mut a_state = vec![F128::ZERO; state_len];
+    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
     let mut w_state;
     if rs_reuse_fold8_a_state_enabled() {
         direct_fold8_a_state_into(&fold8, &mut a_state);
         w_state = fold8;
         direct_fold8_w_state_into(low_eq, table, &mut w_state);
     } else {
-        w_state = vec![F128::ZERO; state_len];
+        w_state = crate::alloc_uninit_vec::<F128>(state_len);
         rayon::join(
             || direct_fold8_w_state_into(low_eq, table, &mut w_state),
             || direct_fold8_a_state_into(&fold8, &mut a_state),
