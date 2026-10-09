@@ -391,6 +391,17 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
 
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    {
+        // SAFETY: len==8 and mats.len()==16 asserted; cfg supplies avx512f/bw/vbmi/gfni.
+        unsafe {
+            crate::bits::transpose_8_f128_to_16_mats_swapped_gfni(eq8, mats);
+        }
+        return;
+    }
+    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vbmi")))]
+    {
+
     let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
         // SAFETY: len==8 asserted; cfg supplies avx512f.
         unsafe { aos8_lohi(eq8) }
@@ -414,6 +425,7 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
         let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
         mats[c] = u64::from_le_bytes(lo).swap_bytes();
         mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+    }
     }
 }
 

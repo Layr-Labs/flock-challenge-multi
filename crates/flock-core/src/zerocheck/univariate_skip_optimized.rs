@@ -54,6 +54,34 @@ pub(crate) fn c_plane_bank_to_f128(bank_planes: &[u8; 1024], out: &mut [F128; 64
     kernels::c_plane_bank_to_f128(bank_planes, out)
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) unsafe fn reduce_worker_plane_block_to_f128(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base: usize,
+    out: &mut [F128; 64],
+) {
+    unsafe {
+        kernels::reduce_worker_plane_block_to_f128(
+            planes_ptr,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base,
+            out,
+        )
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
@@ -350,17 +378,43 @@ fn ab_eq_fold_mats_row_transposed(convert: &[F128], scale: F128, row: &mut [u64]
     debug_assert_eq!(row.len(), 256);
     for bm in 0..16 {
         let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * scale);
-        let lo_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].lo);
-        let hi_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].hi);
-        let mut lo_bytes = [0u8; 64];
-        let mut hi_bytes = [0u8; 64];
-        crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-        crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
-        for c in 0..8 {
-            let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-            let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-            row[bm * 16 + c] = u64::from_le_bytes(lo).swap_bytes();
-            row[bm * 16 + 8 + c] = u64::from_le_bytes(hi).swap_bytes();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        {
+            // SAFETY: basis has len 8, row slice has len 16; cfg supplies features.
+            unsafe {
+                crate::bits::transpose_8_f128_to_16_mats_swapped_gfni(
+                    &basis,
+                    &mut row[bm * 16..bm * 16 + 16],
+                );
+            }
+            continue;
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        {
+            let lo_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].lo);
+            let hi_lanes: [u64; 8] = std::array::from_fn(|j| basis[j].hi);
+            let mut lo_bytes = [0u8; 64];
+            let mut hi_bytes = [0u8; 64];
+            crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+            crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
+            for c in 0..8 {
+                let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+                let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+                row[bm * 16 + c] = u64::from_le_bytes(lo).swap_bytes();
+                row[bm * 16 + 8 + c] = u64::from_le_bytes(hi).swap_bytes();
+            }
         }
     }
 }
@@ -3495,20 +3549,16 @@ fn give_ranked_ab_plane(v: Vec<u8>) {
 
 /// AB-only worker state: [`WorkerStateFold4`] without any of the C banks.
 pub(crate) struct WorkerStateAbOnly {
-    partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
     cached_plane_banks: bool,
-    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
 
 impl WorkerStateAbOnly {
     pub(crate) fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
             cached_plane_banks: false,
-            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
         }
     }
@@ -3529,6 +3579,7 @@ impl Drop for WorkerStateAbOnly {
 /// Every C statement (and every `c_packed` byte) is gone.
 /// `DIRECT` only changes the GFNI input loads: the caller selects it once
 /// per band for the ranked residual `(first, end) = (2, 16), (0, 15)` pair.
+#[inline(never)]
 fn process_one_x_hi_ab_only<const DIRECT: bool>(
     x_hi: usize,
     big_lo_size: usize,
@@ -3546,7 +3597,33 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
-    state.partial_ab.fill(F128::ZERO);
+    // SAFETY: `partial_ab` is filled with `F128::ZERO` before any read on
+    // every path that reads it (when `eq_fold.is_none() || !r1_eqfold_x4_enabled()`
+    // or non-AVX-512); `chunk_ab_bytes` is only read on `!DIRECT` paths after
+    // `first_b_med..n_b_med` (and `0..2` on scalar fallback) are written.
+    let mut partial_ab_uninit = core::mem::MaybeUninit::<[F128; ELL]>::uninit();
+    let mut chunk_ab_bytes_uninit =
+        core::mem::MaybeUninit::<[[u8; 64]; 1 << N_MEDIUM]>::uninit();
+    let partial_ab = unsafe { &mut *partial_ab_uninit.as_mut_ptr() };
+    let chunk_ab_bytes = unsafe { &mut *chunk_ab_bytes_uninit.as_mut_ptr() };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )))]
+    partial_ab.fill(F128::ZERO);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if eq_fold.is_none() || !r1_eqfold_x4_enabled() {
+        partial_ab.fill(F128::ZERO);
+    }
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
     debug_assert!(
         !DIRECT
@@ -3674,7 +3751,7 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
                     pf_one(b_med);
                 }
                 let byte_base_b = live_base + (b_med - first_b_med) * ELL;
-                state.chunk_ab_bytes[b_med]
+                chunk_ab_bytes[b_med]
                     .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + ELL]);
             }
             #[cfg(target_arch = "x86_64")]
@@ -3738,14 +3815,14 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             } else if plane_first_write && w_idx == 0 {
                 if first_b_med == 2 {
                     kernels::write_convert_ab_nomul_gfni_range2(
-                        &state.chunk_ab_bytes,
+                        chunk_ab_bytes,
                         n_b_med,
                         mats_w,
                         bank,
                     );
                 } else {
                     kernels::write_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
+                        chunk_ab_bytes,
                         n_b_med,
                         mats_w,
                         bank,
@@ -3754,14 +3831,14 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             } else {
                 if first_b_med == 2 {
                     kernels::accumulate_convert_ab_nomul_gfni_range2(
-                        &state.chunk_ab_bytes,
+                        chunk_ab_bytes,
                         n_b_med,
                         mats_w,
                         bank,
                     );
                 } else {
                     kernels::accumulate_convert_ab_nomul_gfni(
-                        &state.chunk_ab_bytes,
+                        chunk_ab_bytes,
                         n_b_med,
                         mats_w,
                         bank,
@@ -3770,15 +3847,15 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             }
         } else {
             if first_b_med == 2 {
-                state.chunk_ab_bytes[0].fill(0);
-                state.chunk_ab_bytes[1].fill(0);
+                chunk_ab_bytes[0].fill(0);
+                chunk_ab_bytes[1].fill(0);
             }
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab_bytes,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
+                partial_ab,
             );
         }
         #[cfg(not(all(
@@ -3790,25 +3867,43 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         {
             debug_assert!(eq_fold.is_none());
             if first_b_med == 2 {
-                state.chunk_ab_bytes[0].fill(0);
-                state.chunk_ab_bytes[1].fill(0);
+                chunk_ab_bytes[0].fill(0);
+                chunk_ab_bytes[1].fill(0);
             }
             kernels::accumulate_convert_ab(
-                &state.chunk_ab_bytes,
+                chunk_ab_bytes,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
+                partial_ab,
             );
         }
     }
     if let Some((eq_bot, _, _)) = eq_fold {
+        let wide = r1_eqfold_x4_enabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        ))]
+        if wide {
+            unsafe {
+                kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    eq_hi_val,
+                    &mut state.local_res_ab,
+                );
+            }
+            return;
+        }
         // Plane-major → F128 through the same vectorized kernel the C drain
         // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
         // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
         // shared `add_scaled` leaf, which selects the architecture kernel.
         let mut bank_f128 = [F128::ZERO; ELL];
-        let wide = r1_eqfold_x4_enabled();
         for (u, eq_bot_val) in eq_bot.iter().enumerate() {
             let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
                 .try_into()
@@ -3816,23 +3911,23 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
             if wide {
                 crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
+                    partial_ab,
                     &bank_f128,
                     *eq_bot_val,
                 );
             } else {
                 for lane in 0..ELL {
-                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+                    partial_ab[lane] += *eq_bot_val * bank_f128[lane];
                 }
             }
         }
     }
     if r1_eqfold_x4_enabled() {
-        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        let (dst, src) = (&mut state.local_res_ab, &*partial_ab);
         crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
     } else {
         for lane in 0..ELL {
-            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+            state.local_res_ab[lane] += eq_hi_val * partial_ab[lane];
         }
     }
 }
@@ -4331,6 +4426,7 @@ pub fn round1_c_fold4_from_block_major_z(
         inv_table,
         ranked_one_rows,
         false,
+        None,
     );
     (c, s_hat_v_c, quad, fold4, fold8, one_ab)
 }
@@ -4350,6 +4446,7 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     inv_table: &InvNttTableByteSingleGf8,
     ranked_one_rows: bool,
     capture_canon: bool,
+    roots: Option<&crate::lincheck::RootFoldSource>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -4383,7 +4480,16 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         // worker byte planes so the full length-2^k_log C inner table is
         // never written and immediately read back by a second Rayon pass.
         let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
-            if ranked_one_rows {
+            if let Some(roots) = roots {
+                let full = roots.fold(z_packed, m, &r[k_log..]);
+                let (full, mut one) = crate::lincheck::finish_block_major_fold(
+                    full, Some(inner_tail[6]), ranked_one_rows, capture_canon,
+                );
+                if capture_canon {
+                    canon = one.as_mut().map(|v| v.split_off(1usize << (k_log - 1)));
+                }
+                (full, one)
+            } else if ranked_one_rows {
                 let (full, one, rows) =
                     crate::lincheck::fold_block_major_one_shot_bind_top_ranked_one_rows(
                         z_packed,
