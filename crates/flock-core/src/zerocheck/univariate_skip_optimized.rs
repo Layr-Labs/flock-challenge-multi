@@ -4331,6 +4331,7 @@ pub fn round1_c_fold4_from_block_major_z(
         inv_table,
         ranked_one_rows,
         false,
+        None,
     );
     (c, s_hat_v_c, quad, fold4, fold8, one_ab)
 }
@@ -4350,6 +4351,7 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     inv_table: &InvNttTableByteSingleGf8,
     ranked_one_rows: bool,
     capture_canon: bool,
+    roots: Option<&crate::lincheck::RootFoldSource>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -4383,7 +4385,16 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         // worker byte planes so the full length-2^k_log C inner table is
         // never written and immediately read back by a second Rayon pass.
         let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
-            if ranked_one_rows {
+            if let Some(roots) = roots {
+                let full = roots.fold(z_packed, m, &r[k_log..]);
+                let (full, mut one) = crate::lincheck::finish_block_major_fold(
+                    full, Some(inner_tail[6]), ranked_one_rows, capture_canon,
+                );
+                if capture_canon {
+                    canon = one.as_mut().map(|v| v.split_off(1usize << (k_log - 1)));
+                }
+                (full, one)
+            } else if ranked_one_rows {
                 let (full, one, rows) =
                     crate::lincheck::fold_block_major_one_shot_bind_top_ranked_one_rows(
                         z_packed,
@@ -4426,19 +4437,21 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         let retained_top_eq = build_eq(&inner_tail[4..6]);
         let mut fold4 = vec![F128::ZERO; 16 * n_packed];
         let wide = r1_cfold_x4_enabled();
+        let top_span = 16 * n_packed;
         for high in 0..4 {
-            for bank in 0..16 {
-                let src = (bank + 16 * high) * n_packed;
-                let dst = bank * n_packed;
-                if wide {
-                    crate::field::f128_slice::add_scaled(
-                        &mut fold4[dst..dst + n_packed],
-                        &fold8[src..src + n_packed],
-                        retained_top_eq[high],
-                    );
-                } else {
+            let src = high * top_span;
+            if wide {
+                crate::field::f128_slice::add_scaled(
+                    &mut fold4[..top_span],
+                    &fold8[src..src + top_span],
+                    retained_top_eq[high],
+                );
+            } else {
+                for bank in 0..16 {
+                    let b_src = (bank + 16 * high) * n_packed;
+                    let dst = bank * n_packed;
                     for packed in 0..n_packed {
-                        fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
+                        fold4[dst + packed] += retained_top_eq[high] * fold8[b_src + packed];
                     }
                 }
             }
@@ -4464,19 +4477,21 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     let retained_hi_eq = build_eq(&inner_tail[2..4]);
     let mut quad = vec![F128::ZERO; 4 * n_packed];
     let wide_quad = r1_cfold_x4_enabled();
+    let quad_span = 4 * n_packed;
     for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            if wide_quad {
-                crate::field::f128_slice::add_scaled(
-                    &mut quad[dst..dst + n_packed],
-                    &fold4[src..src + n_packed],
-                    retained_hi_eq[q],
-                );
-            } else {
+        let src = q * quad_span;
+        if wide_quad {
+            crate::field::f128_slice::add_scaled(
+                &mut quad[..quad_span],
+                &fold4[src..src + quad_span],
+                retained_hi_eq[q],
+            );
+        } else {
+            for e in 0..4 {
+                let e_src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
                 for packed in 0..n_packed {
-                    quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                    quad[dst + packed] += retained_hi_eq[q] * fold4[e_src + packed];
                 }
             }
         }

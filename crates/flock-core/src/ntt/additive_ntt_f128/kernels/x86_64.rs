@@ -5,7 +5,7 @@ use crate::field::F128;
 /// The independent fused-three high-one specialization has its own rollback
 /// switches. Read once, outside every lane loop.
 #[inline]
-fn mul_diet_disabled() -> bool {
+pub(super) fn mul_diet_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
@@ -1640,6 +1640,151 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     }
 }
 
+#[inline]
+fn zero_spine_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_ZERO_SPINE").is_some())
+}
+
+/// Scalar `t · x^64 mod (x^128 + x^7 + x^2 + x + 1)` companion for a twiddle
+/// `t = lo + hi·x^64`.
+#[inline]
+pub(super) const fn shift64_scalar(t: F128) -> F128 {
+    let h = t.hi;
+    let lo = h ^ (h << 1) ^ (h << 2) ^ (h << 7);
+    let hi = t.lo ^ (h >> 63) ^ (h >> 62) ^ (h >> 57);
+    F128 { lo, hi }
+}
+
+/// Build the fifteen `t · x^64 mod p` companions for a fused-four twiddle set.
+#[inline]
+pub(super) fn build_companions_15(twiddles: &[F128; 15]) -> [F128; 15] {
+    let mut out = [F128::ZERO; 15];
+    let mut i = 0;
+    while i < 15 {
+        out[i] = shift64_scalar(twiddles[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Check whether a fused-four twiddle set has all four spine slots
+/// (`tw[0], tw[1], tw[3], tw[7]`) equal to zero.
+#[inline]
+pub(super) fn has_zero_spine(tw: &[F128; 15]) -> bool {
+    !zero_spine_disabled()
+        && tw[0].is_zero()
+        && tw[1].is_zero()
+        && tw[3].is_zero()
+        && tw[7].is_zero()
+}
+
+/// Outlined prepared row kernel for the staged seed+top fused-four pass
+/// (`S16 = 1, NN = 64, H = 0, r = 0`).
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq`, that `ptr` covers 16
+/// consecutive rows of 64 `F128` lanes, `active_lanes <= 64`, `companions`
+/// holds `shift64_scalar(twiddles[i])` for all 15 slots, and when `ZERO_SPINE`
+/// is true, `twiddles[0]`, `twiddles[1]`, `twiddles[3]`, and `twiddles[7]` are
+/// all `F128::ZERO`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared_staged<
+    const DIET: bool,
+    const ZERO_SPINE: bool,
+>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    twiddles: &[F128; 15],
+    companions: &[F128; 15],
+) {
+    // SAFETY: forwarded caller contract; PREPARED = DIET uses the precomputed
+    // scalar companions when DIET is active.
+    unsafe {
+        butterfly_fused_4layer_row_impl_ext::<DIET, 0, 1, 64, ZERO_SPINE, DIET>(
+            ptr,
+            1,
+            64,
+            active_lanes,
+            0,
+            twiddles,
+            companions,
+            0,
+        )
+    }
+}
+
+/// Outlined prepared row kernel for the first deep 4-layer sweep
+/// (`S16 = 128, NN = 64, DIET = true, ZERO_SPINE = false, PREPARED = true`).
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq`, that `ptr` covers a valid
+/// `16 × 128 × 64` block, `r < 128`, `pf_r < 128` (when `H != 0`),
+/// `active_lanes <= 64`, and `companions` holds `shift64_scalar(twiddles[i])`
+/// for all 15 slots.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared_deep128<const H: u8>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    companions: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        butterfly_fused_4layer_row_impl_ext::<true, H, 128, 64, false, true>(
+            ptr,
+            128,
+            64,
+            active_lanes,
+            r,
+            twiddles,
+            companions,
+            pf_r,
+        )
+    }
+}
+
+/// Outlined prepared row kernel for the second deep 4-layer sweep
+/// (`S16 = 8, NN = 64, DIET = true, PREPARED = true`).
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq`, that `ptr` covers a valid
+/// `16 × 8 × 64` block, `r < 8`, `pf_r < 8` (when `H != 0`),
+/// `active_lanes <= 64`, `companions` holds `shift64_scalar(twiddles[i])`
+/// for all 15 slots, and when `ZERO_SPINE` is true, `twiddles[0]`,
+/// `twiddles[1]`, `twiddles[3]`, and `twiddles[7]` are all `F128::ZERO`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared_deep8<
+    const H: u8,
+    const ZERO_SPINE: bool,
+>(
+    ptr: *mut F128,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    companions: &[F128; 15],
+    pf_r: usize,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        butterfly_fused_4layer_row_impl_ext::<true, H, 8, 64, ZERO_SPINE, true>(
+            ptr,
+            8,
+            64,
+            active_lanes,
+            r,
+            twiddles,
+            companions,
+            pf_r,
+        )
+    }
+}
+
 /// # Safety
 /// Same contract as [`butterfly_fused_4layer_row`]. `S16`/`NN` are either 0
 /// (use the runtime `sixteenth`/`num_ntts`) or the exact runtime values (the
@@ -1662,6 +1807,42 @@ unsafe fn butterfly_fused_4layer_row_impl<
     twiddles: &[F128; 15],
     pf_r: usize,
 ) {
+    // SAFETY: `PREPARED = false` ignores `companions` and derives companions
+    // via `tw_x4::<false, DIET>` exactly as before.
+    unsafe {
+        butterfly_fused_4layer_row_impl_ext::<DIET, H, S16, NN, false, false>(
+            ptr,
+            sixteenth,
+            num_ntts,
+            active_lanes,
+            r,
+            twiddles,
+            twiddles,
+            pf_r,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_impl_ext<
+    const DIET: bool,
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+    const ZERO_SPINE: bool,
+    const PREPARED: bool,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    companions: &[F128; 15],
+    pf_r: usize,
+) {
     use core::arch::x86_64::*;
 
     // Shape substitution: a compile-time constant when the wrapper pins one
@@ -1669,33 +1850,41 @@ unsafe fn butterfly_fused_4layer_row_impl<
     // pin values equal to the runtime shape, so this is the identity.
     let sixteenth = if S16 != 0 { S16 } else { sixteenth };
     let num_ntts = if NN != 0 { NN } else { num_ntts };
+    debug_assert!(
+        !ZERO_SPINE
+            || (twiddles[0].is_zero()
+                && twiddles[1].is_zero()
+                && twiddles[3].is_zero()
+                && twiddles[7].is_zero())
+    );
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
+        // steps of savings, or 0 setup CLMULs when PREPARED supplies prebuilt
+        // scalar companions.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
+        for i in 0..15 {
+            if ZERO_SPINE && (i == 0 || i == 1 || i == 3 || i == 7) {
+                continue;
+            }
+            if PREPARED && DIET {
+                let v = twiddles[i];
+                let c = companions[i];
+                let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(v.hi as i64, v.lo as i64));
+                let cv = _mm512_broadcast_i32x4(_mm_set_epi64x(c.hi as i64, c.lo as i64));
+                tw[i] = (tv, cv);
+            } else {
+                tw[i] = tw_x4::<false, DIET>(twiddles[i]);
+            }
         }
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
         let mut lane = 0;
         while lane < lanes {
-            // Hint DELIVERY, not hint content: the same sixteen lines of the
-            // next row group are still requested exactly once per lane step,
-            // four at a time at four points spaced through the body instead
-            // of all sixteen back to back at its head. The incumbent burst
-            // put sixteen prefetch uops on the load ports immediately in
-            // front of the sixteen DEMAND loads of this lane step, which are
-            // on the critical path; the three other hot prefetch sites in
-            // this prover (`seed_pf_spread`, `zc_r1ab_pf_spread`,
-            // `zc_tail_pf_spread`) already ship exactly this delivery and
-            // each is worth several percent of its window. Architecturally
-            // invisible: a prefetch moves no value.
             macro_rules! pf_quad {
                 ($g:expr) => {{
                     if H != 0 {
@@ -1724,30 +1913,57 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     values[$u] = new_u;
                 }};
             }
+            macro_rules! butterfly_zero {
+                ($u:expr, $v:expr) => {{
+                    values[$v] = _mm512_xor_si512(values[$v], values[$u]);
+                }};
+            }
 
             pf_quad!(0);
-            let outer = tw[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+            if ZERO_SPINE {
+                for i in 0..8 {
+                    butterfly_zero!(i, i + 8);
+                }
+            } else {
+                let outer = tw[0];
+                for i in 0..8 {
+                    butterfly!(i, i + 8, outer);
+                }
             }
             pf_quad!(1);
             for s in 0..2 {
-                let twiddle = tw[1 + s];
-                for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                if ZERO_SPINE && s == 0 {
+                    for i in 0..4 {
+                        butterfly_zero!(i, i + 4);
+                    }
+                } else {
+                    let twiddle = tw[1 + s];
+                    for i in 0..4 {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    }
                 }
             }
             pf_quad!(2);
             for s in 0..4 {
-                let twiddle = tw[3 + s];
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                if ZERO_SPINE && s == 0 {
+                    for i in 0..2 {
+                        butterfly_zero!(i, i + 2);
+                    }
+                } else {
+                    let twiddle = tw[3 + s];
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
                 }
             }
             pf_quad!(3);
             for s in 0..8 {
-                let twiddle = tw[7 + s];
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+                if ZERO_SPINE && s == 0 {
+                    butterfly_zero!(0, 1);
+                } else {
+                    let twiddle = tw[7 + s];
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -1943,7 +2159,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// row addressing.
 /// `HIGH_ONE_OUTER` requires `twiddles[0].hi == 1`; the shaped dispatcher
 /// verifies it before entering that specialization.
-#[inline]
+// Keep specialization bodies separate. Inlining every DIET/LOW/NNC arm
+// into one dispatcher gives all calls its union-sized stack frame and makes
+// the hot kernel share an instruction footprint with unused alternatives.
+// This preserves every arithmetic operation and all dispatch preconditions.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,

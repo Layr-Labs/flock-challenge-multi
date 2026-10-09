@@ -741,6 +741,285 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     }
 }
 
+/// Prepared per-block fused-four twiddle pack for [`super::AdditiveNttF128::seed_top_fused8_pass`].
+///
+/// Precomputes the fifteen `t · x^64 mod p` twiddle companions and resolves
+/// `(DIET, ZERO_SPINE)` once per block before the `r ∈ 0..2048` task loop, so
+/// each of the 65,536 row-group calls dispatches directly to the specialized
+/// `#[inline(never)]` leaf with zero setup CLMULs and (on block 0, where the
+/// four spine twiddles are zero) 17 butterfly multiplies instead of 32.
+#[derive(Clone, Copy)]
+pub(super) struct PreparedStagedFused4 {
+    twiddles: [F128; 15],
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    companions: [F128; 15],
+    row_len: usize,
+    stage_perm: bool,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    shaped_diet_zero_spine: Option<(bool, bool)>,
+}
+
+impl PreparedStagedFused4 {
+    #[inline]
+    pub(super) fn new(twiddles: [F128; 15], row_len: usize, stage_perm: bool) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            let shaped_diet_zero_spine =
+                if stage_perm && row_len == 64 && super::ntt_shaped_enabled() {
+                    let diet = !x86_64::mul_diet_disabled();
+                    let zero_spine = x86_64::has_zero_spine(&twiddles);
+                    Some((diet, zero_spine))
+                } else {
+                    None
+                };
+            let companions = if matches!(shaped_diet_zero_spine, Some((true, _))) {
+                x86_64::build_companions_15(&twiddles)
+            } else {
+                [F128::ZERO; 15]
+            };
+            Self {
+                twiddles,
+                companions,
+                row_len,
+                stage_perm,
+                shaped_diet_zero_spine,
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            Self {
+                twiddles,
+                row_len,
+                stage_perm,
+            }
+        }
+    }
+
+    /// Apply fused-four group `j ∈ 0..4` inside a 64-row block starting at `region`.
+    ///
+    /// # Safety
+    /// `region` must own 64 staging rows of `self.row_len` `F128` elements,
+    /// `j < 4`, and `lanes <= self.row_len`.
+    #[inline]
+    pub(super) unsafe fn apply_group(&self, region: *mut F128, j: usize, lanes: usize) {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        if let Some((diet, zero_spine)) = self.shaped_diet_zero_spine {
+            // SAFETY: `shaped_diet_zero_spine` is `Some` iff `stage_perm && row_len == 64`.
+            unsafe {
+                let ptr = region.add(j * 16 * 64);
+                match (diet, zero_spine) {
+                    (true, true) => {
+                        x86_64::butterfly_fused_4layer_row_prepared_staged::<true, true>(
+                            ptr,
+                            lanes,
+                            &self.twiddles,
+                            &self.companions,
+                        )
+                    }
+                    (true, false) => {
+                        x86_64::butterfly_fused_4layer_row_prepared_staged::<true, false>(
+                            ptr,
+                            lanes,
+                            &self.twiddles,
+                            &self.companions,
+                        )
+                    }
+                    (false, true) => {
+                        x86_64::butterfly_fused_4layer_row_prepared_staged::<false, true>(
+                            ptr,
+                            lanes,
+                            &self.twiddles,
+                            &self.companions,
+                        )
+                    }
+                    (false, false) => {
+                        x86_64::butterfly_fused_4layer_row_prepared_staged::<false, false>(
+                            ptr,
+                            lanes,
+                            &self.twiddles,
+                            &self.companions,
+                        )
+                    }
+                }
+            }
+            return;
+        }
+        let (g4_stride, g4_base): (usize, usize) = if self.stage_perm { (1, 16) } else { (4, 1) };
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            butterfly_fused_4layer_row(
+                region.add(j * g4_base * self.row_len),
+                g4_stride,
+                self.row_len,
+                lanes,
+                0,
+                &self.twiddles,
+            );
+        }
+    }
+}
+
+/// Prepared block-level driver for [`super::butterfly_interleaved_fused_4layer_rows`]:
+/// precomputes the 15 `t · x^64` twiddle companions once per block (`16 · sixteenth`
+/// rows) and calls the dedicated outlined leaf for each row group `r ∈ 0..sixteenth`.
+/// Returns `true` when the fast path handled the block.
+#[inline]
+pub(super) fn butterfly_interleaved_fused_4layer_rows_prepared(
+    block: &mut [F128],
+    t: &[F128; 15],
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    hint: u8,
+) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if num_ntts == 64 && super::ntt_shaped_enabled() && !x86_64::mul_diet_disabled() {
+        let base = block.as_mut_ptr();
+        match sixteenth {
+            128 => {
+                let companions = x86_64::build_companions_15(t);
+                // SAFETY: `block.len() == 16 * 128 * 64`; `r` and `r + 1` lie
+                // inside `0..128`; `odd_tail == 0 || 128 % 2 == 0`.
+                unsafe {
+                    for r in 0..128 {
+                        let lanes = if (r & 1) != 0 { 64 - odd_tail } else { 64 };
+                        if hint == 0 || r + 1 >= 128 {
+                            x86_64::butterfly_fused_4layer_row_prepared_deep128::<0>(
+                                base,
+                                lanes,
+                                r,
+                                t,
+                                &companions,
+                                0,
+                            );
+                        } else if hint == 1 {
+                            x86_64::butterfly_fused_4layer_row_prepared_deep128::<1>(
+                                base,
+                                lanes,
+                                r,
+                                t,
+                                &companions,
+                                r + 1,
+                            );
+                        } else {
+                            x86_64::butterfly_fused_4layer_row_prepared_deep128::<2>(
+                                base,
+                                lanes,
+                                r,
+                                t,
+                                &companions,
+                                r + 1,
+                            );
+                        }
+                    }
+                }
+                return true;
+            }
+            8 => {
+                let companions = x86_64::build_companions_15(t);
+                let zero_spine = x86_64::has_zero_spine(t);
+                // SAFETY: `block.len() == 16 * 8 * 64`; `r` and `r + 1` lie
+                // inside `0..8`; `odd_tail == 0 || 8 % 2 == 0`.
+                unsafe {
+                    if zero_spine {
+                        for r in 0..8 {
+                            let lanes = if (r & 1) != 0 { 64 - odd_tail } else { 64 };
+                            if hint == 0 || r + 1 >= 8 {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<0, true>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    0,
+                                );
+                            } else if hint == 1 {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<1, true>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    r + 1,
+                                );
+                            } else {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<2, true>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    r + 1,
+                                );
+                            }
+                        }
+                    } else {
+                        for r in 0..8 {
+                            let lanes = if (r & 1) != 0 { 64 - odd_tail } else { 64 };
+                            if hint == 0 || r + 1 >= 8 {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<0, false>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    0,
+                                );
+                            } else if hint == 1 {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<1, false>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    r + 1,
+                                );
+                            } else {
+                                x86_64::butterfly_fused_4layer_row_prepared_deep8::<2, false>(
+                                    base,
+                                    lanes,
+                                    r,
+                                    t,
+                                    &companions,
+                                    r + 1,
+                                );
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    let _ = (block, t, sixteenth, num_ntts, odd_tail, hint);
+    false
+}
+
 /// Process one fused-three-layer group of eight consecutive rows.
 ///
 /// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
