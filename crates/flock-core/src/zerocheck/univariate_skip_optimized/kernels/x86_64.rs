@@ -2015,14 +2015,13 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
 /// sub-qword byte transpose. `REV` reverses the row order, which is what
 /// cancels the `A.byte[7-i]` indexing of `VGF2P8AFFINEQB` when the result is
 /// fed back in as a bit-transpose matrix.
-#[inline]
+#[inline(always)]
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512bw",
     target_feature = "avx512vbmi"
 ))]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn byte_transpose_8x64<const REV: bool>(
     rows: [core::arch::x86_64::__m512i; 8],
 ) -> [core::arch::x86_64::__m512i; 8] {
@@ -2049,38 +2048,56 @@ unsafe fn byte_transpose_8x64<const REV: bool>(
         62, 54, 46, 38, 30, 22, 14,  6,
         63, 55, 47, 39, 31, 23, 15,  7,
     ];
-    const T4A: [i64; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
-    const T4B: [i64; 8] = [4, 5, 6, 7, 12, 13, 14, 15];
-    const T2A: [i64; 8] = [0, 1, 8, 9, 4, 5, 12, 13];
-    const T2B: [i64; 8] = [2, 3, 10, 11, 6, 7, 14, 15];
-    const T1A: [i64; 8] = [0, 8, 2, 10, 4, 12, 6, 14];
-    const T1B: [i64; 8] = [1, 9, 3, 11, 5, 13, 7, 15];
 
     // SAFETY: only register-to-register shuffles plus loads of the fixed
     // 64-byte index constants; the cfg gate supplies the target features.
     unsafe {
-        let mut cur = rows;
-        for (a, b, d) in [(T4A, T4B, 4usize), (T2A, T2B, 2), (T1A, T1B, 1)] {
-            let ia = _mm512_loadu_si512(a.as_ptr() as *const __m512i);
-            let ib = _mm512_loadu_si512(b.as_ptr() as *const __m512i);
-            let mut next = [_mm512_setzero_si512(); 8];
-            for r in 0..8usize {
-                if r & d == 0 {
-                    let x = cur[r];
-                    let y = cur[r | d];
-                    next[r] = _mm512_permutex2var_epi64(x, ia, y);
-                    next[r | d] = _mm512_permutex2var_epi64(x, ib, y);
-                }
-            }
-            cur = next;
-        }
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+        let e01 = _mm512_unpacklo_epi64(rows[0], rows[1]);
+        let o01 = _mm512_unpackhi_epi64(rows[0], rows[1]);
+        let e23 = _mm512_unpacklo_epi64(rows[2], rows[3]);
+        let o23 = _mm512_unpackhi_epi64(rows[2], rows[3]);
+        let e45 = _mm512_unpacklo_epi64(rows[4], rows[5]);
+        let o45 = _mm512_unpackhi_epi64(rows[4], rows[5]);
+        let e67 = _mm512_unpacklo_epi64(rows[6], rows[7]);
+        let o67 = _mm512_unpackhi_epi64(rows[6], rows[7]);
+
+        let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+        let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+        let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+        let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+        let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+        let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+        let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+        let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+
+        let cur = [
+            _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+            _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+            _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+            _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+            _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+            _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+            _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+            _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+        ];
+
         let table = if REV { IDX_REV.as_ptr() } else { IDX.as_ptr() };
         let idx = _mm512_loadu_si512(table as *const __m512i);
-        let mut out = [_mm512_setzero_si512(); 8];
-        for k in 0..8usize {
-            out[k] = _mm512_permutexvar_epi8(idx, cur[k]);
-        }
-        out
+        [
+            _mm512_permutexvar_epi8(idx, cur[0]),
+            _mm512_permutexvar_epi8(idx, cur[1]),
+            _mm512_permutexvar_epi8(idx, cur[2]),
+            _mm512_permutexvar_epi8(idx, cur[3]),
+            _mm512_permutexvar_epi8(idx, cur[4]),
+            _mm512_permutexvar_epi8(idx, cur[5]),
+            _mm512_permutexvar_epi8(idx, cur[6]),
+            _mm512_permutexvar_epi8(idx, cur[7]),
+        ]
     }
 }
 
