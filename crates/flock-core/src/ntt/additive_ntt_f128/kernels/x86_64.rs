@@ -1913,7 +1913,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 
 /// Restore the general product for outer twiddles whose high limb is zero.
 /// Read once per process, outside every butterfly lane loop.
-#[inline]
+#[inline(never)]
 fn low_outer_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
@@ -1921,7 +1921,7 @@ fn low_outer_fused3_disabled() -> bool {
 
 /// Restore the general product for outer twiddles whose high limb is one.
 /// Read once per process, outside every butterfly lane loop.
-#[inline]
+#[inline(never)]
 fn high_one_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some())
@@ -1930,7 +1930,7 @@ fn high_one_fused3_disabled() -> bool {
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores general products in all three
 /// layers. The LOW_OUTER and HIGH_ONE switches disable just their respective
 /// outer forms.
-#[inline]
+#[inline(never)]
 fn low_twiddle_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
@@ -1943,7 +1943,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// row addressing.
 /// `HIGH_ONE_OUTER` requires `twiddles[0].hi == 1`; the shaped dispatcher
 /// verifies it before entering that specialization.
-#[inline]
+// Keep specialization bodies separate. Inlining every DIET/LOW/NNC arm
+// into one dispatcher gives all calls its union-sized stack frame and makes
+// the hot kernel share an instruction footprint with unused alternatives.
+// This preserves every arithmetic operation and all dispatch preconditions.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,

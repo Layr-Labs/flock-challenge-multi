@@ -4824,6 +4824,8 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         let b_ptr = b.as_ptr();
         let fc_ptr = fc.as_mut_ptr();
         let bc_ptr = bc.as_mut_ptr();
+        let dst_aligned64 =
+            (fc_ptr as usize).is_multiple_of(64) && (bc_ptr as usize).is_multiple_of(64);
         let dst_aligned =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
 
@@ -4857,7 +4859,9 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            if stream && dst_aligned64 {
+                _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+            } else if stream && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
@@ -5710,19 +5714,29 @@ fn materialize_direct_fold4(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-                    use core::arch::x86_64::_mm512_setzero_si512;
 
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let (mats0_lo, mats0_hi) = super::ring_switch::compose_block_mats_gfni(
-                        &direct_gfni_mats[0],
-                        claim0.eq_hi[block],
-                    );
-                    let (mats1_lo, mats1_hi) = super::ring_switch::compose_block_mats_gfni(
-                        &direct_gfni_mats[1],
-                        claim1.eq_hi[block],
-                    );
+                    let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    unsafe {
+                        super::ring_switch::compose_block_mats_gfni_into(
+                            &direct_gfni_mats[0],
+                            claim0.eq_hi[block],
+                            &mut *mats0_lo.as_mut_ptr(),
+                            &mut *mats0_hi.as_mut_ptr(),
+                        );
+                        super::ring_switch::compose_block_mats_gfni_into(
+                            &direct_gfni_mats[1],
+                            claim1.eq_hi[block],
+                            &mut *mats1_lo.as_mut_ptr(),
+                            &mut *mats1_hi.as_mut_ptr(),
+                        );
+                    }
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                    let mut planes =
+                        core::mem::MaybeUninit::<[core::arch::x86_64::__m512i; 16]>::uninit();
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate
@@ -5730,13 +5744,13 @@ fn materialize_direct_fold4(
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
+                                &*mats0_lo.as_ptr(),
                                 rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
+                                &*mats0_hi.as_ptr(),
                                 rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
+                                &*mats1_lo.as_ptr(),
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
+                                &*mats1_hi.as_ptr(),
                                 b_out.as_mut_ptr().add(slot),
                                 planes.as_mut_ptr().cast::<core::arch::x86_64::__m512i>(),
                             );
@@ -7318,7 +7332,7 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-    use crate::pcs::ring_switch::compose_block_mats_gfni;
+    use crate::pcs::ring_switch::compose_block_mats_gfni_into;
     use rayon::prelude::*;
 
     assert_eq!(claims.len(), 2);
@@ -7359,14 +7373,24 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             },
             |gfni_tmp, (block, (b_out, f_out))| {
                 let (claim0, claim1) = (&claims[0], &claims[1]);
-                let (mats0_lo, mats0_hi) = compose_block_mats_gfni(
-                    &direct_gfni_mats[0],
-                    claim0.eq_hi[block],
-                );
-                let (mats1_lo, mats1_hi) = compose_block_mats_gfni(
-                    &direct_gfni_mats[1],
-                    claim1.eq_hi[block],
-                );
+                let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                unsafe {
+                    compose_block_mats_gfni_into(
+                        &direct_gfni_mats[0],
+                        claim0.eq_hi[block],
+                        &mut *mats0_lo.as_mut_ptr(),
+                        &mut *mats0_hi.as_mut_ptr(),
+                    );
+                    compose_block_mats_gfni_into(
+                        &direct_gfni_mats[1],
+                        claim1.eq_hi[block],
+                        &mut *mats1_lo.as_mut_ptr(),
+                        &mut *mats1_hi.as_mut_ptr(),
+                    );
+                }
                 let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                 for slot in (0..block_len).step_by(64) {
                     // SAFETY: both packed row halves supply 512 bytes, both
@@ -7375,13 +7399,13 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                     unsafe {
                         gfni_fold64_four_maps_staged(
                             rows0.0.as_ptr().add(slot).cast::<u8>(),
-                            &mats0_lo,
+                            &*mats0_lo.as_ptr(),
                             rows0.1.as_ptr().add(slot).cast::<u8>(),
-                            &mats0_hi,
+                            &*mats0_hi.as_ptr(),
                             rows1.0.as_ptr().add(slot).cast::<u8>(),
-                            &mats1_lo,
+                            &*mats1_lo.as_ptr(),
                             rows1.1.as_ptr().add(slot).cast::<u8>(),
-                            &mats1_hi,
+                            &*mats1_hi.as_ptr(),
                             b_out.as_mut_ptr().add(slot),
                             gfni_tmp.as_mut_ptr().cast(),
                         );
@@ -7706,16 +7730,26 @@ fn materialize_direct_fold8(
                 ))]
                 if b_gfni_on {
                     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
-                    use crate::pcs::ring_switch::compose_block_mats_gfni;
+                    use crate::pcs::ring_switch::compose_block_mats_gfni_into;
                     let (claim0, claim1) = (&claims[0], &claims[1]);
-                    let (mats0_lo, mats0_hi) = compose_block_mats_gfni(
-                        &direct_gfni_mats[0],
-                        claim0.eq_hi[block],
-                    );
-                    let (mats1_lo, mats1_hi) = compose_block_mats_gfni(
-                        &direct_gfni_mats[1],
-                        claim1.eq_hi[block],
-                    );
+                    let mut mats0_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats0_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats1_lo = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    let mut mats1_hi = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+                    unsafe {
+                        compose_block_mats_gfni_into(
+                            &direct_gfni_mats[0],
+                            claim0.eq_hi[block],
+                            &mut *mats0_lo.as_mut_ptr(),
+                            &mut *mats0_hi.as_mut_ptr(),
+                        );
+                        compose_block_mats_gfni_into(
+                            &direct_gfni_mats[1],
+                            claim1.eq_hi[block],
+                            &mut *mats1_lo.as_mut_ptr(),
+                            &mut *mats1_hi.as_mut_ptr(),
+                        );
+                    }
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each packed-u64 row half supplies 512 bytes;
@@ -7723,13 +7757,13 @@ fn materialize_direct_fold8(
                         unsafe {
                             gfni_fold64_four_maps_staged(
                                 rows0.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_lo,
+                                &*mats0_lo.as_ptr(),
                                 rows0.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats0_hi,
+                                &*mats0_hi.as_ptr(),
                                 rows1.0.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_lo,
+                                &*mats1_lo.as_ptr(),
                                 rows1.1.as_ptr().add(slot).cast::<u8>(),
-                                &mats1_hi,
+                                &*mats1_hi.as_ptr(),
                                 b_out.as_mut_ptr().add(slot),
                                 gfni_tmp.as_mut_ptr().cast(),
                             );
