@@ -1693,24 +1693,40 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     ))]
     unsafe {
-        // `table_images` is fixed for the whole plan; the incumbent two-image
-        // leaf is the default arm.
-        match plan.table_images {
-            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                8,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            4 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                4,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+        #[cold]
+        #[inline(never)]
+        unsafe fn slow_multi_img<const BLK: usize, const P: bool>(
+            op: *const u16,
+            out: &mut [u8; 64],
+            imgs: (*const u8, *const u8),
+            table_images: u8,
+        ) {
+            unsafe {
+                match table_images {
+                    8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                        BLK,
+                        P,
+                        8,
+                    >(op, out, imgs),
+                    _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                        BLK,
+                        P,
+                        4,
+                    >(op, out, imgs),
+                }
+            }
+        }
+        // `table_images` is fixed for the whole plan (2 by default); keep the
+        // opt-in 4/8-image arms outlined so `drain_range_spread_ranked_closed_exact`
+        // does not inline 52 dead block bodies into the L1I footprint.
+        if plan.table_images <= 2 {
+            kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
                 off.as_ptr(),
                 out,
                 (imgs.0, imgs.1),
-            ),
+            );
+        } else {
+            slow_multi_img::<BLK, P>(off.as_ptr(), out, (imgs.0, imgs.1), plan.table_images);
         }
     }
     #[cfg(not(all(
@@ -1744,21 +1760,47 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
     ))]
     unsafe {
         use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        #[cold]
+        #[inline(never)]
+        unsafe fn slow_residual<const P: bool>(
+            op: *const u16,
+            out: &mut [u8; 64],
+            im: (*const u8, *const u8),
+            keep: u8,
+            residual_bcomplement: bool,
+            table_images: u8,
+        ) {
+            unsafe {
+                match (residual_bcomplement, table_images) {
+                    (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
+                    (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
+                    (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
+                    (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
+                    (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
+                    (false, _) => {
+                        kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+                            op, out, im, keep,
+                        )
+                    }
+                }
+            }
+        }
         let op = off.as_ptr();
         let im = (imgs.0, imgs.1);
-        // Both selectors are fixed for the plan. The incumbent kernel is the
-        // default two-image table with `FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`.
-        match (plan.residual_bcomplement, plan.table_images) {
-            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
-            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
-            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
-            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
-            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
-            (false, _) => {
-                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
-                    op, out, im, keep,
-                )
-            }
+        // Both selectors are fixed for the plan. The ranked default is
+        // `residual_bcomplement == true && table_images <= 2`; keep the
+        // opt-in/rollback arms outlined out of the hot witness drain loop.
+        if plan.residual_bcomplement && plan.table_images <= 2 {
+            residual_img::<P, 2, true>(op, out, im, keep);
+        } else {
+            slow_residual::<P>(
+                op,
+                out,
+                im,
+                keep,
+                plan.residual_bcomplement,
+                plan.table_images,
+            );
         }
     }
     #[cfg(not(all(
