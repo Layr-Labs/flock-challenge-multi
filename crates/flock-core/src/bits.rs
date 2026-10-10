@@ -87,6 +87,80 @@ unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     }
 }
 
+/// Bit-transpose 8 little-endian `u64` lanes directly into 8 `VGF2P8AFFINEQB`
+/// `u64` matrices (where output row `i` sits at byte `7 - i`, matching
+/// `u64::from_le_bytes(group).swap_bytes()`).
+///
+/// Using `0x0102040810204080` (`0x8040201008040201u64.swap_bytes()`) as the
+/// `VGF2P8AFFINEQB` selector extracts bit `7 - i` into output byte `i` of each
+/// qword, fusing the 8-byte reversal into the affine instruction and writing
+/// the 8 `u64` matrices in a single ZMM store with zero stack staging.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[rustfmt::skip]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+pub(crate) unsafe fn transpose_8_u64s_to_8_mats_swapped_gfni(lanes: &[u64; 8], out_mats: &mut [u64]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(out_mats.len(), 8);
+    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
+    const BSWAP:[u8;64]=[7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8,23,22,21,20,19,18,17,16,31,30,29,28,27,26,25,24,39,38,37,36,35,34,33,32,47,46,45,44,43,42,41,40,55,54,53,52,51,50,49,48,63,62,61,60,59,58,57,56];
+    unsafe {
+        let x=_mm512_loadu_si512(lanes.as_ptr() as *const __m512i);
+        let i=_mm512_loadu_si512(I.as_ptr() as *const __m512i);
+        let bswap=_mm512_loadu_si512(BSWAP.as_ptr() as *const __m512i);
+        let id=_mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let t=_mm512_gf2p8affine_epi64_epi8::<0>(id,_mm512_permutexvar_epi8(i,x));
+        _mm512_storeu_si512(out_mats.as_mut_ptr() as *mut __m512i,_mm512_shuffle_epi8(t,bswap));
+    }
+}
+
+/// Deinterleave 8 `F128` basis elements into `lo` and `hi` `u64` lanes in ZMM
+/// registers and bit-transpose both directly into 16 `VGF2P8AFFINEQB` `u64`
+/// matrices (`out_mats[0..8]` for `lo`, `out_mats[8..16]` for `hi`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[rustfmt::skip]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+pub(crate) unsafe fn transpose_8_f128_to_16_mats_swapped_gfni(
+    basis: &[crate::field::F128],
+    out_mats: &mut [u64],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(basis.len(), 8);
+    debug_assert_eq!(out_mats.len(), 16);
+    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
+    const BSWAP:[u8;64]=[7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8,23,22,21,20,19,18,17,16,31,30,29,28,27,26,25,24,39,38,37,36,35,34,33,32,47,46,45,44,43,42,41,40,55,54,53,52,51,50,49,48,63,62,61,60,59,58,57,56];
+    unsafe {
+        let p = basis.as_ptr() as *const __m512i;
+        let v0 = _mm512_loadu_si512(p);
+        let v1 = _mm512_loadu_si512(p.add(1));
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        let lo = _mm512_permutex2var_epi64(v0, lo_idx, v1);
+        let hi = _mm512_permutex2var_epi64(v0, hi_idx, v1);
+        let i = _mm512_loadu_si512(I.as_ptr() as *const __m512i);
+        let bswap = _mm512_loadu_si512(BSWAP.as_ptr() as *const __m512i);
+        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let dst = out_mats.as_mut_ptr() as *mut __m512i;
+        let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, lo));
+        let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, hi));
+        _mm512_storeu_si512(dst, _mm512_shuffle_epi8(t_lo, bswap));
+        _mm512_storeu_si512(dst.add(1), _mm512_shuffle_epi8(t_hi, bswap));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

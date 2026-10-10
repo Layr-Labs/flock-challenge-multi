@@ -2176,27 +2176,28 @@ pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirec
     target_feature = "gfni",
 ))]
 #[inline(always)]
-pub(crate) fn compose_block_mats_gfni(
+pub(crate) fn compose_block_mats_gfni_into(
     map: &GfniDirectFoldMap,
     e_hi: F128,
-) -> ([u64; 128], [u64; 128]) {
+    low_mats: &mut [u64; 128],
+    high_mats: &mut [u64; 128],
+) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
+    use core::mem::MaybeUninit;
 
-    let mut low_mats = [0u64; 128];
-    let mut high_mats = [0u64; 128];
-    let mut low_rows = [0u64; 64];
-    let mut high_rows = [0u64; 64];
+    let mut low_rows = [MaybeUninit::<u64>::uninit(); 64];
+    let mut high_rows = [MaybeUninit::<u64>::uninit(); 64];
     let mut w = e_hi;
     for chunk in 0..2 {
         for lane in 0..64 {
-            low_rows[lane] = w.lo;
-            high_rows[lane] = w.hi;
+            low_rows[lane].write(w.lo);
+            high_rows[lane].write(w.hi);
             w = crate::field::mul_by_x(w);
         }
         let mats = if chunk == 0 {
-            &mut low_mats
+            &mut *low_mats
         } else {
-            &mut high_mats
+            &mut *high_mats
         };
         // SAFETY: both row arrays hold 64 initialized u64 values, the output
         // matrix block is fully overwritten, and this function's cfg supplies
@@ -2211,7 +2212,33 @@ pub(crate) fn compose_block_mats_gfni(
             );
         }
     }
-    (low_mats, high_mats)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni",
+))]
+#[inline(always)]
+pub(crate) fn compose_block_mats_gfni(
+    map: &GfniDirectFoldMap,
+    e_hi: F128,
+) -> ([u64; 128], [u64; 128]) {
+    use core::mem::MaybeUninit;
+    let mut low_mats = MaybeUninit::<[u64; 128]>::uninit();
+    let mut high_mats = MaybeUninit::<[u64; 128]>::uninit();
+    // SAFETY: compose_block_mats_gfni_into overwrites all 128 u64s of both outputs.
+    unsafe {
+        compose_block_mats_gfni_into(
+            map,
+            e_hi,
+            &mut *low_mats.as_mut_ptr(),
+            &mut *high_mats.as_mut_ptr(),
+        );
+        (low_mats.assume_init(), high_mats.assume_init())
+    }
 }
 
 #[inline(always)]
@@ -2971,39 +2998,55 @@ fn df8_state_direct_disabled() -> bool {
     target_feature = "gfni"
 ))]
 #[inline(never)]
-fn direct_fold8_w_state_gfni(
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
+unsafe fn direct_fold8_w_state_gfni(
     low_eq: &[F128; 64],
     table: &[F128],
     w_state: &mut [F128],
 ) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
+    use core::arch::x86_64::*;
 
     let n_packed = 1usize << LOG_PACKING;
     assert_eq!(w_state.len(), 64 * n_packed);
     let map = build_gfni_direct_fold_map_from_table(table);
-    let mut values = *low_eq;
-    let mut low_rows = [0u64; 64];
-    let mut high_rows = [0u64; 64];
-    for bit in 0..n_packed {
-        for lane in 0..64 {
-            low_rows[lane] = values[lane].lo;
-            high_rows[lane] = values[lane].hi;
+    let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
+    let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
+    let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
+    let high_ptr = high_rows.as_mut_ptr().cast::<u64>();
+    for lane in 0..64 {
+        unsafe {
+            low_ptr.add(lane).write(low_eq[lane].lo);
+            high_ptr.add(lane).write(low_eq[lane].hi);
         }
+    }
+    let poly = _mm512_set1_epi64(0x87);
+    let zero = _mm512_setzero_si512();
+    for bit in 0..n_packed {
         // SAFETY: both input rows hold 64 initialized words, the destination
         // row covers 64 F128s, and the enclosing cfg supplies every feature.
         unsafe {
             gfni_fold64_two_maps::<false>(
-                low_rows.as_ptr().cast::<u8>(),
+                low_ptr.cast::<u8>(),
                 &map.low,
-                high_rows.as_ptr().cast::<u8>(),
+                high_ptr.cast::<u8>(),
                 &map.high,
                 w_state.as_mut_ptr().add(bit * 64),
                 core::ptr::null(),
             );
-        }
-        if bit + 1 < n_packed {
-            for value in &mut values {
-                *value = crate::field::mul_by_x(*value);
+            if bit + 1 < n_packed {
+                let lo_ptr = low_ptr.cast::<__m512i>();
+                let hi_ptr = high_ptr.cast::<__m512i>();
+                for g in 0..8 {
+                    let lo = _mm512_loadu_si512(lo_ptr.add(g));
+                    let hi = _mm512_loadu_si512(hi_ptr.add(g));
+                    let new_hi = _mm512_shldi_epi64::<1>(hi, lo);
+                    let lo_shl = _mm512_add_epi64(lo, lo);
+                    let mask = _mm512_cmpgt_epi64_mask(zero, hi);
+                    let new_lo = _mm512_mask_xor_epi64(lo_shl, mask, lo_shl, poly);
+                    _mm512_storeu_si512(lo_ptr.add(g), new_lo);
+                    _mm512_storeu_si512(hi_ptr.add(g), new_hi);
+                }
             }
         }
     }
@@ -3020,7 +3063,7 @@ fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut 
         target_feature = "gfni"
     ))]
     {
-        direct_fold8_w_state_gfni(low_eq, table, w_state);
+        unsafe { direct_fold8_w_state_gfni(low_eq, table, w_state); }
         return;
     }
     #[cfg(not(all(
@@ -3126,14 +3169,14 @@ fn direct_fold8_states_par(
         return (a_state, w_state, round0);
     }
 
-    let mut a_state = vec![F128::ZERO; state_len];
+    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
     let mut w_state;
     if rs_reuse_fold8_a_state_enabled() {
         direct_fold8_a_state_into(&fold8, &mut a_state);
         w_state = fold8;
         direct_fold8_w_state_into(low_eq, table, &mut w_state);
     } else {
-        w_state = vec![F128::ZERO; state_len];
+        w_state = crate::alloc_uninit_vec::<F128>(state_len);
         rayon::join(
             || direct_fold8_w_state_into(low_eq, table, &mut w_state),
             || direct_fold8_a_state_into(&fold8, &mut a_state),

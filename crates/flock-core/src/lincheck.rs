@@ -191,6 +191,521 @@ pub trait LincheckCircuit: Sync {
     fn const_pin_col(&self) -> Option<usize> {
         None
     }
+
+    /// Optional exact reconstruction of linear witness wires. Only valid
+    /// witnesses for this circuit may use this plan; commitments keep full z.
+    fn root_fold_plan(&self) -> Option<&'static LinearFoldPlan> {
+        None
+    }
+}
+
+/// XOR circuit over original witness columns: leaves 0..k, zero k, then
+/// child-before-parent internal nodes k+1+i. Outputs replace dependent wires.
+/// Roots must be sorted and unique; internal nodes may reference only roots,
+/// zero, or earlier internal nodes. The defining identities require valid z.
+pub struct LinearFoldPlan {
+    pub roots: Box<[usize]>,
+    pub children: Box<[[u32; 2]]>,
+    pub outputs: Box<[(usize, u32)]>,
+}
+
+impl LinearFoldPlan {
+    fn reconstruct(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        let total = k + 1 + self.children.len();
+        let live_cols = self.roots.len() + self.outputs.len();
+        let mut nodes = if live_cols <= k {
+            let mut v = crate::alloc_uninit_vec::<F128>(total);
+            v[live_cols..=k].fill(F128::ZERO);
+            v
+        } else {
+            vec![F128::ZERO; total]
+        };
+        debug_assert!(folded.len() >= self.roots.len());
+        for (&col, &value) in self.roots.iter().zip(folded) {
+            debug_assert!(col < k);
+            unsafe {
+                *nodes.get_unchecked_mut(col) = value;
+            }
+        }
+        let base = k + 1;
+        for (i, &[a, b]) in self.children.iter().enumerate() {
+            let a = a as usize;
+            let b = b as usize;
+            debug_assert!(a < base + i && b < base + i);
+            unsafe {
+                let sum = *nodes.get_unchecked(a) + *nodes.get_unchecked(b);
+                *nodes.get_unchecked_mut(base + i) = sum;
+            }
+        }
+        for &(col, node) in self.outputs.iter() {
+            let node = node as usize;
+            debug_assert!(col < k && node < total);
+            unsafe {
+                *nodes.get_unchecked_mut(col) = *nodes.get_unchecked(node);
+            }
+        }
+        nodes.truncate(k);
+        nodes
+    }
+}
+
+/// Root fold preparation, shared by C and AB at their distinct Fiat-Shamir
+/// points. GFNI selects roots from canonical tiles; other targets compact them.
+pub struct RootFoldSource {
+    plan: &'static LinearFoldPlan,
+    source: RootFoldStorage,
+    k_log: usize,
+}
+
+enum RootFoldStorage {
+    Packed(crate::scratch::LocalBuf),
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    Splice(RootSplicePlan),
+}
+
+impl RootFoldSource {
+    pub fn new(z: &[F128], k_log: usize, plan: &'static LinearFoldPlan) -> Self {
+        use rayon::prelude::*;
+        let k = 1usize << k_log;
+        let stride = k / 128;
+        assert_eq!(z.len() % stride, 0);
+        assert!(!plan.roots.is_empty());
+        assert!(plan.roots.windows(2).all(|w| w[0] < w[1]));
+        // Derive and check the small selector plan on portable hosts too, so
+        // the witness reconstruction oracle also exercises its column map.
+        let splice = RootSplicePlan::new(plan, k);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        if k_log == 14
+            && z.len() / stride >= 64
+            && z.len() / stride % 64 == 0
+            && block_major_gfni_enabled()
+        {
+            if let Some(splice) = splice {
+                return Self {
+                    plan,
+                    source: RootFoldStorage::Splice(splice),
+                    k_log,
+                };
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        drop(splice);
+        let root_stride = plan.roots.len().div_ceil(128);
+        let mut masks = vec![0u64; k / 64];
+        for &col in plan.roots.iter() {
+            assert!(col < k);
+            masks[col / 64] |= 1u64 << (col % 64);
+        }
+        // Keep auxiliary storage out of the tagged canonical-witness pool.
+        let mut packed = crate::scratch::LocalBuf::new(z.len() / stride * root_stride, true);
+        crate::in_pool(|| {
+            packed
+                .par_chunks_mut(root_stride)
+                .zip(z.par_chunks(stride))
+                .for_each(|(out, block)| {
+                    // Every scratch slot is overwritten, including the last
+                    // chunk's unused bits, before either fold can read it.
+                    out.fill(F128::ZERO);
+                    let mut pos = 0;
+                    for (q, &mask) in masks.iter().enumerate() {
+                        if mask == 0 {
+                            continue;
+                        }
+                        let word = if q % 2 == 0 {
+                            block[q / 2].lo
+                        } else {
+                            block[q / 2].hi
+                        };
+                        let bits = extract_root_bits(word, mask) as u128;
+                        let count = mask.count_ones() as usize;
+                        let slot = pos / 128;
+                        let shift = pos % 128;
+                        let value = bits << shift;
+                        out[slot].lo |= value as u64;
+                        out[slot].hi |= (value >> 64) as u64;
+                        if shift + count > 128 {
+                            out[slot + 1].lo |= (bits >> (128 - shift)) as u64;
+                        }
+                        pos += count;
+                    }
+                    debug_assert_eq!(pos, plan.roots.len());
+                })
+        });
+        Self {
+            plan,
+            source: RootFoldStorage::Packed(packed),
+            k_log,
+        }
+    }
+
+    fn run_fold(
+        &self,
+        z_canonical: &[F128],
+        m: usize,
+        k: usize,
+        eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
+    ) -> Vec<F128> {
+        #[allow(unused_variables)]
+        match &self.source {
+            RootFoldStorage::Packed(packed) => {
+                partial_fold_packed_z_block_major_padded_with_tables_result(
+                    packed,
+                    m,
+                    self.k_log,
+                    self.plan.roots.len(),
+                    eq8_at,
+                    None,
+                    false,
+                    false,
+                    Some(self.plan.roots.len().div_ceil(128)),
+                )
+                .0
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni"
+            ))]
+            RootFoldStorage::Splice(splice) => splice.fold(z_canonical, k, &eq8_at),
+        }
+    }
+
+    pub fn fold(&self, z_canonical: &[F128], m: usize, x_outer: &[F128]) -> Vec<F128> {
+        let k_log = self.k_log;
+        assert_eq!(x_outer.len(), m - k_log);
+        let k = 1usize << k_log;
+        assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
+        let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+            let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+            let eq_lo = build_eq_table(lo);
+            let eq_hi = build_eq_table(hi);
+            let log_b = eq_lo.len().trailing_zeros() as usize;
+            let mask = eq_lo.len() - 1;
+            #[allow(unused_variables)]
+            let eq8_x4 = lc_eq8_x4_enabled();
+            self.run_fold(z_canonical, m, k, |i| {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if eq8_x4 {
+                    return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, i, log_b, mask) };
+                }
+                std::array::from_fn(|r| {
+                    let outer = i + r;
+                    eq_lo[outer & mask] * eq_hi[outer >> log_b]
+                })
+            })
+        } else {
+            let eq = build_eq_table(x_outer);
+            self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]))
+        };
+        self.plan.reconstruct(&folded, k)
+    }
+}
+
+#[derive(Clone)]
+enum RootSpliceAction {
+    Skip,
+    Full(usize),
+    Start,
+    End { out: usize, select: [u8; 64] },
+    Tail { out: usize, mask: u64 },
+}
+
+struct RootSplicePlan {
+    actions: Box<[RootSpliceAction]>,
+    source_bits: usize,
+    root_bits: usize,
+}
+
+impl RootSplicePlan {
+    fn new(plan: &LinearFoldPlan, k: usize) -> Option<Self> {
+        // Accept only the BLAKE3 geometry: each complete root group is either
+        // one aligned source block, or two adjacent blocks with exactly one
+        // contiguous 64-wire dependent interval between their root portions.
+        if k != 16384 || plan.roots.len() != 11313 || plan.outputs.len() != 4096 {
+            return None;
+        }
+        let mut actions = vec![RootSpliceAction::Skip; k / 64];
+        let mut pairs = 0;
+        for (out, roots) in plan.roots.chunks(64).enumerate() {
+            let first = *roots.first()?;
+            let last = *roots.last()?;
+            let block = first / 64;
+            if block >= actions.len() || last >= k || first % 64 != 0 {
+                return None;
+            }
+            if !matches!(actions[block], RootSpliceAction::Skip) {
+                return None;
+            }
+            if roots.len() != 64 {
+                if roots.len() != 49 || roots.iter().enumerate().any(|(i, &col)| col != first + i) {
+                    return None;
+                }
+                actions[block] = RootSpliceAction::Tail {
+                    out,
+                    mask: (1u64 << roots.len()) - 1,
+                };
+            } else if last / 64 == block {
+                if roots.iter().enumerate().any(|(i, &col)| col != first + i) {
+                    return None;
+                }
+                actions[block] = RootSpliceAction::Full(out);
+            } else {
+                if last / 64 != block + 1 || !matches!(actions[block + 1], RootSpliceAction::Skip) {
+                    return None;
+                }
+                let split = roots.iter().position(|&col| col >= first + 64)?;
+                if split == 0
+                    || roots
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &col)| col != first + i + if i >= split { 64 } else { 0 })
+                {
+                    return None;
+                }
+                let select = std::array::from_fn(|i| (roots[i] - first) as u8);
+                actions[block] = RootSpliceAction::Start;
+                actions[block + 1] = RootSpliceAction::End { out, select };
+                pairs += 1;
+            }
+        }
+        if pairs != 55 {
+            return None;
+        }
+        let source_bits = plan.roots.last()? + 1;
+        if source_bits != 15089 {
+            return None;
+        }
+        assert_eq!(plan.roots.len().div_ceil(64), 177);
+        let splice = Self {
+            actions: actions.into_boxed_slice(),
+            source_bits,
+            root_bits: plan.roots.len(),
+        };
+        splice.check_columns(&plan.roots);
+        Some(splice)
+    }
+
+    fn check_columns(&self, roots: &[usize]) {
+        let mut next = 0;
+        let mut first = None;
+        for (block, action) in self.actions.iter().enumerate() {
+            match action {
+                RootSpliceAction::Skip => {}
+                RootSpliceAction::Start => {
+                    assert!(first.replace(block).is_none());
+                }
+                RootSpliceAction::Full(out) => {
+                    assert!(first.is_none());
+                    assert_eq!(out * 64, next);
+                    for bit in 0..64 {
+                        assert_eq!(roots[next], block * 64 + bit);
+                        next += 1;
+                    }
+                }
+                RootSpliceAction::End { out, select } => {
+                    assert_eq!(first.take(), Some(block - 1));
+                    assert_eq!(out * 64, next);
+                    for &bit in select {
+                        assert!(bit < 128);
+                        assert_eq!(roots[next], (block - 1) * 64 + bit as usize);
+                        next += 1;
+                    }
+                }
+                RootSpliceAction::Tail { out, mask } => {
+                    assert!(first.is_none());
+                    assert_eq!(out * 64, next);
+                    assert_eq!(*mask, (1u64 << 49) - 1);
+                    for bit in 0..64 {
+                        if mask & (1u64 << bit) != 0 {
+                            assert_eq!(roots[next], block * 64 + bit);
+                            next += 1;
+                        } else {
+                            // These final15 lanes have no root and the GFNI
+                            // producer masks their input bytes to exact zero.
+                            assert_eq!(next, roots.len());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(first.is_none());
+        assert_eq!(next, self.root_bits);
+        assert_eq!(self.source_bits, roots.last().unwrap() + 1);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    fn fold(
+        &self,
+        z: &[F128],
+        k: usize,
+        eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    ) -> Vec<F128> {
+        let n_stripes = z.len() / (k / 128) / 8;
+        assert_eq!(n_stripes % DIRECT_FOLD_TILE_STRIPES, 0);
+        let n_tiles = n_stripes / DIRECT_FOLD_TILE_STRIPES;
+        let tiles_per_worker = n_tiles.div_ceil(rayon::current_num_threads().max(1));
+        let n_workers = n_tiles.div_ceil(tiles_per_worker);
+        fold_block_major_gfni(
+            z,
+            k,
+            k / 128,
+            self.source_bits,
+            self.source_bits.div_ceil(128),
+            n_workers,
+            tiles_per_worker,
+            n_tiles,
+            dynamic_tiles_enabled(),
+            eq8_at,
+            None,
+            false,
+            false,
+            Some(self),
+        )
+        .0
+    }
+
+    /// Drain one canonical 128-column chunk in source order. A pair's first
+    /// half survives in 512 bytes of per-tile carry even across gather4 batches.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    unsafe fn fold_chunk(
+        &self,
+        q: usize,
+        tile: *const u8,
+        mats: &[u64; 128],
+        planes: *mut u8,
+        seed_zero: bool,
+        carry: &mut [u8; 512],
+        pending: &mut bool,
+    ) {
+        use core::arch::x86_64::*;
+        unsafe {
+            for half in 0..2 {
+                let input = tile.add(half * 64);
+                match &self.actions[2 * q + half] {
+                    RootSpliceAction::Skip => {}
+                    RootSpliceAction::Full(out) => kernels::gfni_fold_tile(
+                        input,
+                        128,
+                        1,
+                        mats,
+                        planes.add(out * 1024),
+                        seed_zero,
+                    ),
+                    RootSpliceAction::Start => {
+                        debug_assert!(!*pending);
+                        for t in 0..8 {
+                            let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                            _mm512_storeu_si512(
+                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                row,
+                            );
+                        }
+                        *pending = true;
+                    }
+                    RootSpliceAction::End { out, select } => {
+                        debug_assert!(*pending);
+                        let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
+                        for t in 0..8 {
+                            let lo =
+                                _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
+                            let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                            let roots = _mm512_permutex2var_epi8(lo, indices, hi);
+                            _mm512_storeu_si512(
+                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                roots,
+                            );
+                        }
+                        kernels::gfni_fold_tile(
+                            carry.as_ptr(),
+                            64,
+                            1,
+                            mats,
+                            planes.add(out * 1024),
+                            seed_zero,
+                        );
+                        *pending = false;
+                    }
+                    RootSpliceAction::Tail { out, mask } => {
+                        debug_assert!(!*pending);
+                        for t in 0..8 {
+                            let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                            let roots = _mm512_maskz_mov_epi8(*mask, row);
+                            _mm512_storeu_si512(
+                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                roots,
+                            );
+                        }
+                        kernels::gfni_fold_tile(
+                            carry.as_ptr(),
+                            64,
+                            1,
+                            mats,
+                            planes.add(out * 1024),
+                            seed_zero,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn extract_root_bits(word: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        unsafe { std::arch::x86_64::_pext_u64(word, mask) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut mask = mask;
+        let mut out = 0;
+        let mut bit = 1;
+        while mask != 0 {
+            if word & (mask & mask.wrapping_neg()) != 0 {
+                out |= bit;
+            }
+            mask &= mask - 1;
+            bit <<= 1;
+        }
+        out
+    }
 }
 
 /// Default `LincheckCircuit` over a pair of sparse binary matrices. Delegates
@@ -550,7 +1065,19 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         //   out[i]       = v + v*r_j      ← new bit_j = 0
         //   out[i + len] = v * r_j        ← new bit_j = 1
         // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let i = unsafe { build_eq_table_x86_x4(&mut out, len, r_j) };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let i = 0;
+        for i in i..len {
             let v = out[i];
             let hi = v * r_j;
             out[i + len] = hi;
@@ -558,6 +1085,45 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         }
     }
     out
+}
+
+/// Expand four adjacent entries of an eq table with one four-lane GHASH
+/// multiply. The caller handles any short prefix/tail scalarly.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; `out[0..2*len]` is initialized and
+/// `out.len() >= 2*len`. Only complete groups of four are processed.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn build_eq_table_x86_x4(out: &mut [F128], len: usize, r: F128) -> usize {
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+
+    let vector_end = len & !3;
+    if vector_end == 0 {
+        return 0;
+    }
+    // SAFETY: this function is target-feature gated and `r` is the shared
+    // multiplier for every lane in this expansion step.
+    let (multiplier, multiplier_x64) = unsafe { ghash_broadcast_split(r) };
+    let mut i = 0;
+    while i < vector_end {
+        // SAFETY: four initialized F128 values fit in one ZMM; the matching
+        // high-half range is within the resized output slice.
+        unsafe {
+            let old = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+            let high = ghash_mul_x4_split(old, multiplier, multiplier_x64);
+            let low = _mm512_xor_si512(old, high);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + len) as *mut __m512i, high);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, low);
+        }
+        i += 4;
+    }
+    vector_end
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row
@@ -895,12 +1461,27 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
     let log_b = eq_lo.len().trailing_zeros() as usize;
     let lo_mask = eq_lo.len() - 1;
 
+    #[allow(unused_variables)]
+    let eq8_x4 = lc_eq8_x4_enabled();
     partial_fold_packed_z_block_major_padded_with_tables(
         z_packed,
         m,
         k_log,
         useful_bits,
-        |outer_base| eq8_from_factors(eq_lo, eq_hi, outer_base, log_b, lo_mask),
+        |outer_base| {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if eq8_x4 {
+                return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
+            }
+            std::array::from_fn(|lane| {
+                let outer = outer_base + lane;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            })
+        },
         top_bind,
     )
 }
@@ -915,6 +1496,7 @@ fn lc_eq8_x4_enabled() -> bool {
 }
 
 /// Eight consecutive factorized outer weights starting at `outer_base`.
+#[inline]
 fn eq8_from_factors(
     eq_lo: &[F128],
     eq_hi: &[F128],
@@ -951,6 +1533,7 @@ fn eq8_from_factors(
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline]
 unsafe fn eq8_from_factors_x4(
     eq_lo: &[F128],
     eq_hi: &[F128],
@@ -960,26 +1543,31 @@ unsafe fn eq8_from_factors_x4(
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
-    let mut out = [F128::ZERO; 8];
-    // SAFETY: eight consecutive factorized indices; each load is an F128
-    // the scalar loop would read, packed into one ZMM of four lanes.
+    debug_assert_eq!(lo_mask + 1, eq_lo.len());
+    debug_assert!((outer_base + 7) >> log_b < eq_hi.len());
+    let mut out = core::mem::MaybeUninit::<[F128; 8]>::uninit();
+    // SAFETY: eight consecutive factorized indices; `outer & lo_mask < eq_lo.len()`
+    // and `(outer_base + 7) >> log_b < eq_hi.len()` by the function safety contract.
     unsafe {
+        let out_ptr = out.as_mut_ptr().cast::<F128>();
         for g in 0..2 {
-            let mut lo = [F128::ZERO; 4];
-            let mut hi = [F128::ZERO; 4];
+            let mut lo = core::mem::MaybeUninit::<[F128; 4]>::uninit();
+            let mut hi = core::mem::MaybeUninit::<[F128; 4]>::uninit();
+            let lo_ptr = lo.as_mut_ptr().cast::<F128>();
+            let hi_ptr = hi.as_mut_ptr().cast::<F128>();
             for r in 0..4 {
                 let outer = outer_base + 4 * g + r;
-                lo[r] = eq_lo[outer & lo_mask];
-                hi[r] = eq_hi[outer >> log_b];
+                lo_ptr.add(r).write(*eq_lo.get_unchecked(outer & lo_mask));
+                hi_ptr.add(r).write(*eq_hi.get_unchecked(outer >> log_b));
             }
             let prod = ghash_mul_x4(
-                _mm512_loadu_si512(lo.as_ptr() as *const __m512i),
-                _mm512_loadu_si512(hi.as_ptr() as *const __m512i),
+                _mm512_loadu_si512(lo_ptr as *const __m512i),
+                _mm512_loadu_si512(hi_ptr as *const __m512i),
             );
-            _mm512_storeu_si512(out.as_mut_ptr().add(4 * g) as *mut __m512i, prod);
+            _mm512_storeu_si512(out_ptr.add(4 * g) as *mut __m512i, prod);
         }
+        out.assume_init()
     }
-    out
 }
 
 /// Today's one-shot block-major fold at `x_outer`. Same dispatch as
@@ -1114,6 +1702,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
         Some(r_top),
         true,
         capture_canon,
+        None,
     );
     let mut one = one.expect("ranked one-row fold requested");
     // The capture rides behind the one-row slots (see the plane reduce).
@@ -1574,6 +2163,28 @@ unsafe fn reduce_worker_plane_block(
         return;
     };
     let base = blk * 1024;
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    if lc_plane_f128_enabled() {
+        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
+        // SAFETY: for every active worker `w`, `w * worker_stride + base .. + 1024`
+        // is in bounds of `planes` and was fully initialized by `gfni_fold_tile(seed_zero=true)`
+        // before the Rayon producer join.
+        unsafe {
+            crate::zerocheck::univariate_skip_optimized::reduce_worker_plane_block_to_f128(
+                planes.as_ptr().cast::<u8>(),
+                worker_stride,
+                first_worker,
+                rest_workers,
+                base,
+                out64,
+            );
+        }
+        return;
+    }
     let mut acc = [0u8; 1024];
     let first = first_worker * worker_stride + base;
     let first_block = &planes[first..first + 1024];
@@ -1595,20 +2206,6 @@ unsafe fn reduce_worker_plane_block(
         unsafe {
             kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
         }
-    }
-    // Same 16×64 plane layout as the fused C-drain bank. That leaf already
-    // bit-transposes eight plane-ZMMs and interleaves lo/hi into AoS F128;
-    // the GPR 8×8 path below is the same map on 8-byte groups.
-    #[cfg(all(
-        target_feature = "avx512bw",
-        target_feature = "avx512vbmi",
-        target_feature = "vpclmulqdq"
-    ))]
-    if lc_plane_f128_enabled() {
-        let bank: &[u8; 1024] = &acc;
-        let out64: &mut [F128; 64] = out.try_into().expect("64-column plane block");
-        crate::zerocheck::univariate_skip_optimized::c_plane_bank_to_f128(bank, out64);
-        return;
     }
     // The plane rows are contiguous, while the old per-column loop made 16
     // strided byte loads for every F128. Transpose eight 8-byte groups with
@@ -1653,20 +2250,34 @@ fn fold_block_major_gfni(
     top_bind: Option<F128>,
     ranked_one_rows: bool,
     capture_canon: bool,
+    root_splice: Option<&RootSplicePlan>,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
     const TILE_GRAB: usize = 4;
+    debug_assert!(
+        root_splice.is_none() || (top_bind.is_none() && !ranked_one_rows && !capture_canon)
+    );
     let next_tile = std::sync::atomic::AtomicUsize::new(0);
-    // Same total footprint as the F128 partials (k*16 bytes per worker). The
+    let live_blocks = root_splice
+        .map_or(useful_bits, |splice| splice.root_bits)
+        .div_ceil(64);
+    let plane_cols = if root_splice.is_some() {
+        live_blocks * 64
+    } else {
+        k
+    };
+    let worker_stride = plane_cols * 16;
+    // Same total footprint as the F128 partials (plane_cols*16 bytes per worker). The
     // first claimed tile seeds every live plane block from register zero, so
     // eager zeroing is dead work. Dynamic claiming can leave a Rayon chunk
     // with no tile, however; `active` keeps those stale chunks out of reduce.
     // MaybeUninit keeps the whole Rayon slice valid while only active/live
     // subranges are initialized; it is never reinterpreted wholesale as u8.
-    let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * k * 16);
+    let mut planes =
+        crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * worker_stride);
     let mut active = vec![0u8; n_workers];
     planes
-        .par_chunks_mut(k * 16)
+        .par_chunks_mut(worker_stride)
         .zip(active.par_iter_mut())
         .enumerate()
         .for_each(|(worker, (wplanes, worker_active))| {
@@ -1677,11 +2288,21 @@ fn fold_block_major_gfni(
             } else {
                 (tile_lo, tile_hi)
             };
-            let mut mats = [0u64; 128];
+            // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
+            // u64s of `mats` at the start of every tile, and `gather_transpose_*`
+            // / `splice.fold_chunk` unconditionally overwrite `transposed` and
+            // `splice_carry` before reading them.
+            let mut mats = unsafe { core::mem::MaybeUninit::<[u64; 128]>::uninit().assume_init() };
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            let mut transposed = unsafe {
+                core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit()
+                    .assume_init()
+            };
+            #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            let mut splice_carry =
+                unsafe { core::mem::MaybeUninit::<[u8; 512]>::uninit().assume_init() };
             // First tile this worker writes into an uninitialized plane
             // buffer: seed the GFNI acc from a register zero idiom. Later
             // tiles load only blocks that this first tile initialized.
@@ -1727,6 +2348,8 @@ fn fold_block_major_gfni(
                     break;
                 };
                 let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+                let mut splice_pending = false;
                 for t in 0..DIRECT_FOLD_TILE_STRIPES {
                     let eq8 = eq8_at(8 * (stripe_base + t));
                     kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
@@ -1800,6 +2423,19 @@ fn fold_block_major_gfni(
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
+                                #[cfg(target_feature = "avx512bw")]
+                                if let Some(splice) = root_splice {
+                                    splice.fold_chunk(
+                                        q + c,
+                                        transposed.as_ptr().add(c * 1024),
+                                        &mats,
+                                        wplanes.as_mut_ptr().cast::<u8>(),
+                                        first_tile,
+                                        &mut splice_carry,
+                                        &mut splice_pending,
+                                    );
+                                    continue;
+                                }
                                 kernels::gfni_fold_tile(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
@@ -1858,6 +2494,20 @@ fn fold_block_major_gfni(
                     // bytes for every q < useful_chunks <= k/128. first_tile
                     // is true iff this worker has not yet stored into wplanes.
                     unsafe {
+                        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+                        if let Some(splice) = root_splice {
+                            splice.fold_chunk(
+                                q,
+                                transposed.as_ptr(),
+                                &mats,
+                                wplanes.as_mut_ptr().cast::<u8>(),
+                                first_tile,
+                                &mut splice_carry,
+                                &mut splice_pending,
+                            );
+                            q += 1;
+                            continue;
+                        }
                         kernels::gfni_fold_tile(
                             transposed.as_ptr(),
                             128,
@@ -1869,6 +2519,8 @@ fn fold_block_major_gfni(
                     }
                     q += 1;
                 }
+                #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+                debug_assert!(!splice_pending, "root pair must finish within its tile");
                 first_tile = false;
             }
             // This byte is exclusively owned by the zipped Rayon chunk. A
@@ -1884,7 +2536,6 @@ fn fold_block_major_gfni(
     // here and write only the already-bound low half. This preserves the
     // incumbent reduction and transpose leaves while avoiding a length-k
     // intermediate allocation plus its complete readback.
-    let worker_stride = k * 16;
     // Iteration over the marker vector preserves the incumbent ascending
     // worker reduction order while deleting inactive zero contributions.
     let active_workers: Vec<usize> = active
@@ -1892,12 +2543,13 @@ fn fold_block_major_gfni(
         .enumerate()
         .filter_map(|(worker, active)| (active != 0).then_some(worker))
         .collect();
-    let live_blocks = useful_bits.div_ceil(64);
-    let out_len = if top_bind.is_some() { k / 2 } else { k };
-    // Keep output initialized as F128 throughout. The much larger plane
-    // buffer carries the dead zero-fill; avoiding this comparatively small
-    // clear would require a separate MaybeUninit ownership conversion.
-    let mut out = vec![F128::ZERO; out_len];
+    let out_len = if top_bind.is_some() {
+        k / 2
+    } else {
+        plane_cols
+    };
+    // Every 64-column chunk of `out` is overwritten by `reduce_block` below.
+    let mut out = crate::alloc_uninit_vec::<F128>(out_len);
     // Reserve the canonical-row capture appended below up front, so the
     // append never reallocates and copies the one-row slots.
     let mut one = ranked_one_rows.then(|| {
@@ -1939,12 +2591,22 @@ fn fold_block_major_gfni(
             if let Some(one_o) = one_o {
                 if blk < 18 {
                     let scale = F128::ONE + r;
-                    for (dst, src) in one_o.iter_mut().zip(o.iter()) {
-                        *dst = scale * *src;
+                    if lc_one_scale_vec_disabled() {
+                        for (dst, src) in one_o.iter_mut().zip(o.iter()) {
+                            *dst = scale * *src;
+                        }
+                    } else {
+                        one_o.fill(F128::ZERO);
+                        crate::field::f128_slice::add_scaled(one_o, o, scale);
                     }
                 } else if (108..112).contains(&blk) {
-                    for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
-                        *dst = r * *src;
+                    if lc_one_scale_vec_disabled() {
+                        for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
+                            *dst = r * *src;
+                        }
+                    } else {
+                        one_o.fill(F128::ZERO);
+                        crate::field::f128_slice::add_scaled(one_o, &hi, r);
                     }
                 } else {
                     one_o.fill(F128::ZERO);
@@ -2012,6 +2674,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables(
         top_bind,
         false,
         false,
+        None,
     )
     .0
 }
@@ -2025,6 +2688,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     top_bind: Option<F128>,
     ranked_one_rows: bool,
     capture_canon: bool,
+    source_stride: Option<usize>,
 ) -> (Vec<F128>, Option<Vec<F128>>) {
     use rayon::prelude::*;
 
@@ -2033,7 +2697,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
-    let chunks_per_block = k / 128;
+    let chunks_per_block = source_stride.unwrap_or(k / 128);
     assert_eq!(z_packed.len(), n_outer * chunks_per_block);
     assert!(n_log >= 3, "need n_outer >= 8 for byte groups");
     assert!(useful_bits <= k);
@@ -2086,6 +2750,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             top_bind,
             ranked_one_rows,
             capture_canon,
+            None,
         );
     }
 
@@ -2356,6 +3021,16 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             probe_t2.elapsed().as_secs_f64() * 1e3
         );
     }
+    finish_block_major_fold(out, top_bind, ranked_one_rows, capture_canon)
+}
+
+pub(crate) fn finish_block_major_fold(
+    mut out: Vec<F128>,
+    top_bind: Option<F128>,
+    ranked_one_rows: bool,
+    capture_canon: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
+    let k = out.len();
     let one = if ranked_one_rows {
         let r = top_bind.expect("ranked one-row contribution needs top bind");
         assert_eq!(k, 1 << 14);
@@ -2647,6 +3322,12 @@ fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// Length above which the inner product / element-wise kernels split via
 /// rayon. Below it, sequential beats dispatch overhead.
 const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
+/// Length above which the four-lane SIMD (`sumcheck_x4`) sumcheck kernels
+/// split via rayon. At `k = 2^14` (`half = 8192`), `comb_vec` is hot in L2 on
+/// the calling worker and 4-lane SIMD finishes in ~1 µs, so keeping `half <= 8192`
+/// sequential avoids three 16-thread fork-join barriers and cross-core cache
+/// invalidations across rounds 0..2.
+const SUMCHECK_X4_PAR_THRESHOLD: usize = 1usize << 14;
 
 /// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
 /// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
@@ -2757,7 +3438,7 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
             })
             .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
     }
-    if half < SUMCHECK_PAR_THRESHOLD {
+    if half < SUMCHECK_X4_PAR_THRESHOLD {
         return crate::field::f128_slice::msg_split_half(chi, clo, zhi, zlo, half);
     }
     // Chunked: the per-chunk sums are XORed, and XOR is associative and
@@ -2833,7 +3514,7 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     }
     let (lo, hi) = v.split_at_mut(half);
     let hi = &hi[..half];
-    if half < SUMCHECK_PAR_THRESHOLD {
+    if half < SUMCHECK_X4_PAR_THRESHOLD {
         crate::field::f128_slice::bind_split_half(lo, hi, r);
     } else {
         let chunk = sumcheck_chunk(half);
@@ -2901,7 +3582,7 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if sumcheck_x4_enabled() {
-        if par_gate < SUMCHECK_PAR_THRESHOLD {
+        if par_gate < SUMCHECK_X4_PAR_THRESHOLD {
             crate::field::f128_slice::bind_both_and_msg_split(
                 cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r, half2,
             )
@@ -2975,7 +3656,7 @@ fn sumcheck_bind_both_and_eval_next(
 
 enum PackedZ<'a> {
     LincheckStripe(&'a [u8]),
-    BlockMajor(&'a [F128]),
+    BlockMajor(&'a [F128], Option<&'a RootFoldSource>),
 }
 
 // ---------------------------------------------------------------------------
@@ -3000,6 +3681,7 @@ enum PackedZ<'a> {
 // `z` is read-only (`C` aliases it).
 
 struct LastRhoPrepared {
+    roots: Option<std::sync::Arc<RootFoldSource>>,
     z_ptr: *const F128,
     z_len: usize,
     m: usize,
@@ -3045,11 +3727,23 @@ pub fn prepare_last_rho_z_fold(
     useful_bits: usize,
     inner_rest_len: usize,
 ) -> LastRhoZFoldGuard {
+    prepare_last_rho_z_fold_with_roots(z, m, k_log, useful_bits, inner_rest_len, None)
+}
+
+pub fn prepare_last_rho_z_fold_with_roots(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    inner_rest_len: usize,
+    roots: Option<std::sync::Arc<RootFoldSource>>,
+) -> LastRhoZFoldGuard {
     // A previous prepare on this thread that was never waited would leave a
     // live handle holding a pointer into a now-dead buffer. Join it first.
     let _ = wait_last_rho_z_fold();
     LAST_RHO.with(|slot| {
         *slot.borrow_mut() = LastRhoSlot::Prepared(LastRhoPrepared {
+            roots,
             z_ptr: z.as_ptr(),
             z_len: z.len(),
             m,
@@ -3094,6 +3788,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
     let m = p.m;
     let k_log = p.k_log;
     let useful_bits = p.useful_bits;
+    let roots = p.roots;
     let handle = std::thread::Builder::new()
         .name("flock-last-rho-z-fold".into())
         .spawn(move || {
@@ -3104,7 +3799,10 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
             let trace = std::env::var_os("LINCHECK_TRACE").is_some();
             let t0 = std::time::Instant::now();
-            let out = fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer);
+            let out = match roots {
+                Some(roots) => roots.fold(z, m, &x_outer),
+                None => fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer),
+            };
             if trace {
                 eprintln!(
                     "[lc] {:<26} {:>7.2} ms",
@@ -3257,12 +3955,39 @@ pub fn prove_padded_capture_z_vec_block_major_mode<Ch: Challenger>(
     capture: ZCaptureMode,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    prove_padded_capture_z_vec_block_major_mode_with_roots(
+        z_packed,
+        None,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode_with_roots<Ch: Challenger>(
+    z_packed: &[F128],
+    roots: Option<&RootFoldSource>,
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
     assert!(
         capture != ZCaptureMode::None,
         "capture mode must not be None"
     );
     let (proof, claim, captured, actual) = prove_padded_inner(
-        PackedZ::BlockMajor(z_packed),
+        PackedZ::BlockMajor(z_packed, roots),
         m,
         k_log,
         k_skip,
@@ -3328,7 +4053,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured, _actual) = prove_padded_inner(
-        PackedZ::BlockMajor(z_packed),
+        PackedZ::BlockMajor(z_packed, None),
         m,
         k_log,
         k_skip,
@@ -3467,7 +4192,7 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let mut z_vec = match (kicked_z_vec, z_packed) {
-        (Some(z), PackedZ::BlockMajor(_)) => z,
+        (Some(z), PackedZ::BlockMajor(_, _)) => z,
         (kicked, z_packed) => {
             debug_assert!(
                 kicked.is_none(),
@@ -3478,8 +4203,14 @@ fn prove_padded_inner<Ch: Challenger>(
                     let eq_x_outer = build_eq_table(&x_ab.x_outer);
                     partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
                 }
-                PackedZ::BlockMajor(z) => {
-                    fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                PackedZ::BlockMajor(z, roots) => {
+                    if let Some(roots) = roots {
+                        roots.fold(z, m, &x_ab.x_outer)
+                    } else if let Some(plan) = circuit.root_fold_plan() {
+                        RootFoldSource::new(z, k_log, plan).fold(z, m, &x_ab.x_outer)
+                    } else {
+                        fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                    }
                 }
             }
         }
@@ -5133,7 +5864,10 @@ mod canon_capture_tests {
         for blk in 0..n_outer {
             for w in 0..chunks_per_block {
                 let bit0 = w * 128;
-                let mut v = F128 { lo: next(), hi: next() };
+                let mut v = F128 {
+                    lo: next(),
+                    hi: next(),
+                };
                 if bit0 >= USEFUL {
                     v = F128::ZERO;
                 } else if bit0 + 128 > USEFUL {
@@ -5150,8 +5884,16 @@ mod canon_capture_tests {
                 z[blk * chunks_per_block + w] = v;
             }
         }
-        let x_outer: Vec<F128> = (0..M - K_LOG).map(|_| F128 { lo: next(), hi: next() }).collect();
-        let r_top = F128 { lo: next(), hi: next() };
+        let x_outer: Vec<F128> = (0..M - K_LOG)
+            .map(|_| F128 {
+                lo: next(),
+                hi: next(),
+            })
+            .collect();
+        let r_top = F128 {
+            lo: next(),
+            hi: next(),
+        };
         let eq = build_eq_table(&x_outer);
         let (_full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
             &z,
@@ -5162,6 +5904,7 @@ mod canon_capture_tests {
             Some(r_top),
             true,
             true,
+            None,
         );
         let one = one.expect("ranked one-row fold");
         let half = 1usize << (K_LOG - 1);
@@ -5174,7 +5917,11 @@ mod canon_capture_tests {
                 for (blk, e) in eq.iter().enumerate() {
                     let w = z[blk * chunks_per_block + bit / 128];
                     let b = bit % 128;
-                    let set = if b < 64 { (w.lo >> b) & 1 } else { (w.hi >> (b - 64)) & 1 };
+                    let set = if b < 64 {
+                        (w.lo >> b) & 1
+                    } else {
+                        (w.hi >> (b - 64)) & 1
+                    };
                     if set == 1 {
                         want += *e;
                     }

@@ -243,6 +243,9 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     debug_assert_eq!(src.len(), 16 * dst.len());
     // SAFETY: caller guarantees the target features and source bounds.
     unsafe {
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(64);
+        let quads = dst.len() & !3;
         let wb: [__m512i; 16] = core::array::from_fn(|b| {
             _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
         });
@@ -253,9 +256,6 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
         let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
         let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-        let quads = dst.len() & !3;
-        let pf_ahead = fold16_pf_ahead();
-        let pf_limit = src.len().saturating_sub(64);
         let mut t = 0usize;
         while t < quads {
             if pf_ahead != 0 {

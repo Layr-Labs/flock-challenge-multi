@@ -1674,12 +1674,35 @@ unsafe fn butterfly_fused_4layer_row_impl<
     unsafe {
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
-        // steps of savings.
+        // steps of savings. Under DIET, keeping all 15 `(t, t·x^64)` pairs as
+        // 30 live `__m512i` variables across the 16-ZMM `values` array exceeds
+        // the 32-ZMM register file and forces LLVM to spill 28 ZMMs (1,792 B)
+        // to the stack and reload 28 ZMMs (1,792 B) on every lane step.
+        // Instead, keep the 3 top twiddle pairs (`tw[0..3]`, reused 8 and 4
+        // times per lane step = 6 ZMMs) in ZMM registers and store the
+        // remaining 12 `(t, t·x^64)` pairs in compact 32-byte `[__m128i; 2]`
+        // slots (`384` bytes total vs `1,792` bytes), so LLVM folds each load
+        // into a single 16-byte `vbroadcasti32x4` with zero ZMM stack spills!
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 15];
-        for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
-            *slot = tw_x4::<false, DIET>(*value);
+        let mut tw_compact = [(_mm_setzero_si128(), _mm_setzero_si128()); 12];
+        if DIET {
+            for i in 0..3 {
+                tw[i] = tw_x4::<false, true>(twiddles[i]);
+            }
+            for i in 0..12 {
+                let pair = tw_x4::<false, true>(twiddles[3 + i]);
+                tw_compact[i] = (
+                    _mm512_castsi512_si128(pair.0),
+                    _mm512_castsi512_si128(pair.1),
+                );
+            }
+        } else {
+            for (slot, value) in tw.iter_mut().zip(twiddles.iter()) {
+                *slot = tw_x4::<false, false>(*value);
+            }
         }
+        let tw_c_ptr = core::hint::black_box(tw_compact.as_ptr());
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -1739,14 +1762,30 @@ unsafe fn butterfly_fused_4layer_row_impl<
             }
             pf_quad!(2);
             for s in 0..4 {
-                let twiddle = tw[3 + s];
+                let twiddle = if DIET {
+                    let p = tw_c_ptr.add(s) as *const __m128i;
+                    (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    )
+                } else {
+                    tw[3 + s]
+                };
                 for i in 0..2 {
                     butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
                 }
             }
             pf_quad!(3);
             for s in 0..8 {
-                let twiddle = tw[7 + s];
+                let twiddle = if DIET {
+                    let p = tw_c_ptr.add(4 + s) as *const __m128i;
+                    (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    )
+                } else {
+                    tw[7 + s]
+                };
                 butterfly!(2 * s, 2 * s + 1, twiddle);
             }
 
@@ -1913,7 +1952,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 
 /// Restore the general product for outer twiddles whose high limb is zero.
 /// Read once per process, outside every butterfly lane loop.
-#[inline]
+#[inline(never)]
 fn low_outer_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
@@ -1921,7 +1960,7 @@ fn low_outer_fused3_disabled() -> bool {
 
 /// Restore the general product for outer twiddles whose high limb is one.
 /// Read once per process, outside every butterfly lane loop.
-#[inline]
+#[inline(never)]
 fn high_one_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some())
@@ -1930,7 +1969,7 @@ fn high_one_fused3_disabled() -> bool {
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores general products in all three
 /// layers. The LOW_OUTER and HIGH_ONE switches disable just their respective
 /// outer forms.
-#[inline]
+#[inline(never)]
 fn low_twiddle_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
@@ -1943,7 +1982,11 @@ fn low_twiddle_fused3_disabled() -> bool {
 /// row addressing.
 /// `HIGH_ONE_OUTER` requires `twiddles[0].hi == 1`; the shaped dispatcher
 /// verifies it before entering that specialization.
-#[inline]
+// Keep specialization bodies separate. Inlining every DIET/LOW/NNC arm
+// into one dispatcher gives all calls its union-sized stack frame and makes
+// the hot kernel share an instruction footprint with unused alternatives.
+// This preserves every arithmetic operation and all dispatch preconditions.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_3layer_rows_impl<
     const DIET: bool,

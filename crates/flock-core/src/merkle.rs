@@ -385,24 +385,27 @@ pub(crate) fn hash_indexed_blake3_1k(data: &[u8], indices: &[usize], out: &mut [
         .for_each(|(outs, positions)| {
             let n = outs.len();
             let base_ptr = data.as_ptr();
-            // SAFETY: chunks are non-empty and the entry assertions prove each
-            // indexed 1 KiB message lies in `data`. Shared inputs may alias.
-            let first: &[u8; LEAF_SIZE] = unsafe {
-                &*(base_ptr.add(positions[0] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-            };
-            let mut inputs: [&[u8; LEAF_SIZE]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-            for i in 0..n {
-                inputs[i] = unsafe {
-                    &*(base_ptr.add(positions[i] * LEAF_SIZE) as *const [u8; LEAF_SIZE])
-                };
+            // SAFETY: every element 0..n is written directly into the MaybeUninit
+            // buffer and the entry assertions prove each indexed 1 KiB message
+            // lies in `data`. Shared inputs may alias.
+            let mut inputs = core::mem::MaybeUninit::<[&[u8; LEAF_SIZE]; BLAKE3_BATCH]>::uninit();
+            let inputs_ptr = inputs.as_mut_ptr() as *mut &[u8; LEAF_SIZE];
+            for (i, &pos) in positions.iter().enumerate() {
+                unsafe {
+                    inputs_ptr
+                        .add(i)
+                        .write(&*(base_ptr.add(pos * LEAF_SIZE) as *const [u8; LEAF_SIZE]));
+                }
             }
+            let inputs_slice: &[&[u8; LEAF_SIZE]] =
+                unsafe { core::slice::from_raw_parts(inputs_ptr, n) };
             // SAFETY: Hash is exactly 32 initialized bytes; `hash_many`
             // overwrites every byte in this output chunk.
             let out_bytes = unsafe {
                 core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32)
             };
             blake3_platform().hash_many(
-                &inputs[..n],
+                inputs_slice,
                 &BLAKE3_IV,
                 0,
                 blake3::IncrementCounter::No,
@@ -970,7 +973,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        let mut written = 0;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -984,12 +987,16 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
                 proof.push(tree[level_start + (p ^ 1)]);
                 i += 1;
             }
-            next.push(p >> 1);
+            // Each parent consumes at least one child. The write index is
+            // therefore strictly behind the next unread child, so one buffer
+            // can hold both the current frontier and its compacted parents.
+            active[written] = p >> 1;
+            written += 1;
         }
-        // `next` is sorted-unique by construction: the input was sorted-unique;
+        // The compacted prefix is sorted-unique: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        active = next;
+        active.truncate(written);
         level_start += level_len;
         level_len >>= 1;
     }
@@ -1019,7 +1026,7 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        let mut written = 0;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -1030,9 +1037,13 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
                 indices.push(level_start + (p ^ 1));
                 i += 1;
             }
-            next.push(p >> 1);
+            // Each parent consumes at least one child. The write index is
+            // therefore strictly behind the next unread child, so one buffer
+            // can hold both the current frontier and its compacted parents.
+            active[written] = p >> 1;
+            written += 1;
         }
-        active = next;
+        active.truncate(written);
         level_start += level_len;
         level_len >>= 1;
     }
