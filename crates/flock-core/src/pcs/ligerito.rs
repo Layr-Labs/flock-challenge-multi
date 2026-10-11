@@ -2710,6 +2710,9 @@ struct SparseDualL0 {
     /// Whether `stage_blocks` / `expansion_rows` are populated
     /// (`FLOCK_NO_LIG_SPARSE_DUAL_SNAPSHOT` unset at construction).
     snapshots: bool,
+    /// Whether 4-lane AVX-512 dot products are enabled
+    /// (`FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4` unset at construction).
+    lane_x4: bool,
 }
 
 const SPARSE_DUAL_MAX_DEPTH: usize = 4;
@@ -2769,6 +2772,49 @@ unsafe fn sparse_dual_lane_fold_avx512(row: &[F128], weights: &[F128]) -> F128 {
             i += 4;
         }
         acc.fold().reduce()
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn sparse_dual_round_dots_avx512(
+    local: &[F128],
+    row: &[F128],
+    weights: &[F128],
+    half: usize,
+) -> (F128, F128, F128, F128) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees `local.len() >= 2*half`, `row.len() >= 2*half`,
+    // `weights.len() == half`, and `half` is a non-zero multiple of 4.
+    unsafe {
+        let mut acc_f0 = WideGhashX4::zero();
+        let mut acc_f1 = WideGhashX4::zero();
+        let mut acc_u0 = WideGhashX4::zero();
+        let mut acc_u2 = WideGhashX4::zero();
+        let local0_ptr = local.as_ptr();
+        let local1_ptr = local0_ptr.add(half);
+        let row0_ptr = row.as_ptr();
+        let row1_ptr = row0_ptr.add(half);
+        let w_ptr = weights.as_ptr();
+        let mut i = 0usize;
+        while i < half {
+            let vw = _mm512_loadu_si512(w_ptr.add(i) as *const __m512i);
+            let vl0 = _mm512_loadu_si512(local0_ptr.add(i) as *const __m512i);
+            let vl1 = _mm512_loadu_si512(local1_ptr.add(i) as *const __m512i);
+            let vr0 = _mm512_loadu_si512(row0_ptr.add(i) as *const __m512i);
+            let vr1 = _mm512_loadu_si512(row1_ptr.add(i) as *const __m512i);
+            acc_f0.mul_acc(vl0, vw);
+            acc_f1.mul_acc(vl1, vw);
+            acc_u0.mul_acc(vr0, vw);
+            acc_u2.mul_acc(_mm512_xor_si512(vr0, vr1), vw);
+            i += 4;
+        }
+        let f0 = acc_f0.fold().reduce();
+        let f1 = acc_f1.fold().reduce();
+        let dot_u0 = acc_u0.fold().reduce();
+        let dot_u2 = acc_u2.fold().reduce();
+        (f0, f0 + f1, dot_u0, dot_u2)
     }
 }
 
@@ -2971,6 +3017,7 @@ impl SparseDualL0 {
                 stage_blocks,
                 expansion_rows,
                 snapshots,
+                lane_x4,
             },
             enforced_sum,
         )
@@ -3030,6 +3077,28 @@ impl SparseDualL0 {
         };
 
         let half = block_len >> 1;
+        if self.lane_x4 && half == 1 {
+            // Introduction round (`fold_challenges.is_empty()`):
+            // `fold_weights[0] == F128::ONE` and `row[0] == F128::ONE`.
+            let f0 = local[0];
+            let pair_sum = f0 + local[1];
+            let dot_u2 = row[0] + row[1];
+            return SumcheckMessage {
+                u_0: alpha * f0,
+                u_2: alpha * pair_sum * dot_u2,
+            };
+        }
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        if self.lane_x4 && half.is_multiple_of(4) {
+            // SAFETY: cfg supplies the features; `local` and `row` have length
+            // `block_len = 2 * half` and `fold_weights` has length `half`.
+            let (f0, pair_sum, dot_u0, dot_u2) =
+                unsafe { sparse_dual_round_dots_avx512(local, row, fold_weights, half) };
+            return SumcheckMessage {
+                u_0: alpha * f0 * dot_u0,
+                u_2: alpha * pair_sum * dot_u2,
+            };
+        }
         let f0 = local[..half]
             .iter()
             .zip(fold_weights)
@@ -3127,9 +3196,21 @@ impl SparseDualL0 {
     /// the reduced `2^(log_d-k)` transform.
     fn materialize_after_folds(&self, fold_challenges: &[F128]) -> Vec<F128> {
         let k = fold_challenges.len();
-        assert!(k > 0 && k == self.depth);
+        assert!(k > 0 && k == self.depth && k <= SPARSE_DUAL_MAX_DEPTH);
         let block_len = 1usize << k;
-        let fold_weights = build_eq_table(fold_challenges);
+        let mut weights = [F128::ZERO; 1 << SPARSE_DUAL_MAX_DEPTH];
+        weights[0] = F128::ONE;
+        let mut weights_len = 1usize;
+        for &challenge in fold_challenges {
+            for i in 0..weights_len {
+                let value = weights[i];
+                let hi = value * challenge;
+                weights[weights_len + i] = hi;
+                weights[i] = value + hi;
+            }
+            weights_len <<= 1;
+        }
+        let fold_weights = &weights[..block_len];
         let full_ntt = &self.ntt;
         let mut positions = Vec::with_capacity(self.queries.len());
         let mut values = Vec::with_capacity(self.queries.len());
@@ -3153,11 +3234,7 @@ impl SparseDualL0 {
                 );
                 &row_buf[..block_len]
             };
-            let local_value = row
-                .iter()
-                .zip(&fold_weights)
-                .map(|(&r, &w)| r * w)
-                .fold(F128::ZERO, |x, y| x + y);
+            let local_value = sparse_dual_lane_fold(row, fold_weights, self.lane_x4);
             positions.push(query >> k);
             values.push(alpha * local_value);
         }
@@ -3826,9 +3903,7 @@ fn transpose_forward_ntt_sparse_inner_dead(
                                 values[i],
                                 scratch,
                             );
-                            for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
-                                *d += s;
-                            }
+                            transpose_top_only(&mut buf, scratch);
                         }
                     }
                     return (w, buf);
@@ -4598,51 +4673,55 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
     debug_assert_eq!(bc.len(), len);
     // Process 8 F128 (4 message pairs) per iteration.
     let lanes = len & !7;
-    let mut u0_acc = WideGhashX4::zero();
-    let mut u2_acc = WideGhashX4::zero();
+    // SAFETY: caller carries the target features; every load below is inside
+    // the equal-length slices.
+    unsafe {
+        let mut u0_acc = WideGhashX4::zero();
+        let mut u2_acc = WideGhashX4::zero();
 
-    let mut k = 0;
-    while k < lanes {
-        // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
-        let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
-        let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
-        let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
-        let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
+        let mut k = 0;
+        while k < lanes {
+            // Load 4 F128 from fc and 4 from bc (positions k..k+4 and k+4..k+8).
+            let f0 = _mm512_loadu_si512(fc.as_ptr().add(k) as *const __m512i);
+            let f1 = _mm512_loadu_si512(fc.as_ptr().add(k + 4) as *const __m512i);
+            let b0 = _mm512_loadu_si512(bc.as_ptr().add(k) as *const __m512i);
+            let b1 = _mm512_loadu_si512(bc.as_ptr().add(k + 4) as *const __m512i);
 
-        // u0: products at even pair-positions k, k+2, k+4, k+6.
-        let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
-        let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
-        u0_acc.mul_acc(f_even, b_even);
+            // u0: products at even pair-positions k, k+2, k+4, k+6.
+            let f_even = _mm512_shuffle_i32x4::<0x88>(f0, f1);
+            let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
+            u0_acc.mul_acc(f_even, b_even);
 
-        // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
-        //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
-        let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-        let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-        let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-        let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-        let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-        let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
-        u2_acc.mul_acc(f_sum, b_sum);
+            // u2: pair sums (fc[k]+fc[k+1]), (fc[k+2]+fc[k+3]),
+            //               (fc[k+4]+fc[k+5]), (fc[k+6]+fc[k+7]).
+            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
+            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
+            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
+            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
+            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
+            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            u2_acc.mul_acc(f_sum, b_sum);
 
-        k += 8;
+            k += 8;
+        }
+
+        // Fold the 4-lane unreduced accumulators to scalar F128.
+        let mut u0 = u0_acc.fold().reduce();
+        let mut u2 = u2_acc.fold().reduce();
+
+        // Scalar tail for remaining pairs.
+        while k + 1 < len {
+            let f0 = fc[k];
+            let f1 = fc[k + 1];
+            let b0 = bc[k];
+            let b1 = bc[k + 1];
+            u0 += f0 * b0;
+            u2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+
+        (u0, u2)
     }
-
-    // Fold the 4-lane unreduced accumulators to scalar F128.
-    let mut u0 = u0_acc.fold().reduce();
-    let mut u2 = u2_acc.fold().reduce();
-
-    // Scalar tail for remaining pairs.
-    while k + 1 < len {
-        let f0 = fc[k];
-        let f1 = fc[k + 1];
-        let b0 = bc[k];
-        let b1 = bc[k + 1];
-        u0 += f0 * b0;
-        u2 += (f0 + f1) * (b0 + b1);
-        k += 2;
-    }
-
-    (u0, u2)
 }
 
 /// [`msg_reduce_avx512`] with the full inner product `Σ_i fc[i]·bc[i]`
@@ -8093,10 +8172,14 @@ impl SumcheckProver {
         assert!(self.pending_ood_eq.is_none());
         assert!(self.pending_fold_basis.is_none());
         assert_eq!(basis.len(), self.combined_basis.len());
-        self.combined_basis
-            .par_iter_mut()
-            .zip(basis.par_iter())
-            .for_each(|(dst, &src)| *dst += src);
+        if self.combined_basis.len() < 4096 {
+            transpose_top_only(&mut self.combined_basis, &basis);
+        } else {
+            self.combined_basis
+                .par_iter_mut()
+                .zip(basis.par_iter())
+                .for_each(|(dst, &src)| *dst += src);
+        }
     }
 
     /// Like [`Self::introduce_new`] but also returns the claimed sum
@@ -13817,6 +13900,7 @@ mod tests {
             stage_blocks: Vec::new(),
             expansion_rows: Vec::new(),
             snapshots: false,
+            lane_x4: true,
         };
         let challenges = rng.sample_f128_vec(depth);
         for k in 0..=depth {
