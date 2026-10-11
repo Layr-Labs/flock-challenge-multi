@@ -1487,24 +1487,21 @@ unsafe fn st_fmp_fold4(
     stage_perm: bool,
     tw4: &[[F128; 15]],
 ) {
-    let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
     unsafe {
         for block in 0..8 {
             let region = bufp.add(block * 64 * row_len);
             let tw = &tw4[block];
-            for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                kernels::butterfly_fused_4layer_row(
-                    region.add(j * g4_base * row_len),
-                    g4_stride,
-                    row_len,
-                    lanes4,
-                    0,
-                    tw,
-                );
-            }
+            kernels::butterfly_fused_4layer_top_block(
+                region,
+                row_len,
+                sub_stride,
+                r,
+                lanes4_tail,
+                stage_perm,
+                tw,
+            );
         }
     }
 }
@@ -2436,7 +2433,6 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 64 || lanes4_tail == 4);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
-        let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
 
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
@@ -2445,17 +2441,15 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 let tw = &tw4[block];
-                for j in 0..4 {
-                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
-                        region.add(j * g4_base * row_len),
-                        g4_stride,
-                        row_len,
-                        lanes4,
-                        0,
-                        tw,
-                    );
-                }
+                kernels::butterfly_fused_4layer_top_block(
+                    region,
+                    row_len,
+                    sub_stride,
+                    r,
+                    lanes4_tail,
+                    stage_perm,
+                    tw,
+                );
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
                     region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
                 );

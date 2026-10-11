@@ -682,6 +682,36 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// Process all four 16-row groups (`j in 0..4`) of one 64-row staging block in
+/// the seed+top pass (`st_fmp_fold4` / `seed_top_direct_fused2_publish`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_top_block(
+    region: *mut F128,
+    row_len: usize,
+    sub_stride: usize,
+    r: usize,
+    lanes4_tail: usize,
+    stage_perm: bool,
+    twiddles: &[F128; 15],
+) {
+    unsafe {
+        x86_64::butterfly_fused_4layer_top_block(
+            region,
+            row_len,
+            sub_stride,
+            r,
+            lanes4_tail,
+            stage_perm,
+            twiddles,
+        );
+    }
+}
+
 /// [`butterfly_fused_4layer_row`] with one line hint per row of row group
 /// `pf_r` issued at every lane step. `H` selects the hint level (1 = L1,
 /// 2 = L2). Portable builds ignore the hint.
