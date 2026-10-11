@@ -233,6 +233,16 @@ fn ntt_extend_units_enabled() -> bool {
 /// input costs one unit apply, eight multiplies and subset XORs instead of
 /// sharing 128 plane passes of 64 multiplies each. Every term is an exact field
 /// sum, so the output is bit-identical to the bit-plane form.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")
+)]
 pub(crate) fn ntt_extend_f128_vec_ghash_units(
     in_s: &[F128],
     inv_table: &InvNttTableByteSingleGf8,

@@ -4,6 +4,7 @@ use crate::field::F128;
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -34,6 +35,7 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -61,12 +63,43 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
     }
 }
 
+/// Four-lane `dst = scale * src` without reading `dst`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[inline(always)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(dst.len(), src.len());
+    // SAFETY: caller supplies target features and equal slice lengths.
+    unsafe {
+        let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let scale_x64 = ghash_shift64_x4(scale_x4);
+        let lanes = dst.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let extra = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let scaled = ghash_mul_x4_split(extra, scale_x4, scale_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, scaled);
+            i += 4;
+        }
+        while i < dst.len() {
+            dst[i] = scale * src[i];
+            i += 1;
+        }
+    }
+}
+
 /// Four-lane `dst = fold_r(src) + scale * fold_r(addend)` with all
 /// intermediates kept in zmm and one final store.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; the caller guarantees that both input
 /// slices contain every pair selected by `base` and `dst.len()`.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs_with_scaled_addend(
     src: &[F128],
@@ -148,6 +181,7 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -236,6 +270,7 @@ fn fold16_pf_ahead() -> usize {
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
@@ -313,6 +348,7 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `f.len() == b.len()`, multiple of 4.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_two_and_msg_in_place(
     f: &mut Vec<F128>,
@@ -402,6 +438,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; `hi.len() >= lo.len()`.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -440,6 +477,7 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all four slices at least `n` long.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn msg_split_half(
     chi: &[F128],
@@ -490,6 +528,7 @@ pub(super) unsafe fn msg_split_half(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all eight slices at least `n` long.
+#[inline(always)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bind_both_and_msg_split(

@@ -3601,6 +3601,38 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    if DIRECT {
+        let (eq_bot, mats, bank_bits) = eq_fold.expect("DIRECT requires eq_fold");
+        unsafe {
+            process_one_x_hi_ab_only_direct_x86(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                eq_hi_val,
+                eq_bot,
+                mats,
+                bank_bits,
+                plane_first_write,
+                plane_cache,
+                ranked_one_rows_elided,
+                ranked_compact,
+                state,
+            );
+        }
+        return;
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -3894,28 +3926,8 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             }
             return;
         }
-        // Plane-major → F128 through the same vectorized kernel the C drain
-        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
-        // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
-        // shared `add_scaled` leaf, which selects the architecture kernel.
-        let mut bank_f128 = [F128::ZERO; ELL];
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
-            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            if wide {
-                crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
-                    &bank_f128,
-                    *eq_bot_val,
-                );
-            } else {
-                for lane in 0..ELL {
-                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
-                }
-            }
-        }
+        fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
+        return;
     }
     if r1_eqfold_x4_enabled() {
         let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
@@ -3925,6 +3937,202 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn fold_ab_plane_banks_fallback_cold(
+    state: &mut WorkerStateAbOnly,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    wide: bool,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    // Plane-major → F128 through the same vectorized kernel the C drain
+    // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
+    // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
+    // shared `add_scaled` leaf, which selects the architecture kernel.
+    let mut bank_f128 = [F128::ZERO; ELL];
+    for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+        let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+            .try_into()
+            .expect("one 16-plane bank");
+        kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
+        if wide {
+            crate::field::f128_slice::add_scaled(
+                &mut state.partial_ab,
+                &bank_f128,
+                *eq_bot_val,
+            );
+        } else {
+            for lane in 0..ELL {
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+            }
+        }
+    }
+    if wide {
+        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn process_one_x_hi_ab_only_direct_x86(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_hi_val: F128,
+    eq_bot: &[F128],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+    ranked_one_rows_elided: bool,
+    ranked_compact: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+    debug_assert!(
+        ranked_one_rows_elided
+            && within_outer_mask == 1
+            && (b_med_counts == [16, 15] || b_med_counts == [16, 14])
+    );
+    debug_assert!(!ranked_compact || ranked_one_rows_elided);
+    let plane_len = eq_bot.len() * 16 * ELL;
+    if state.plane_banks.len() != plane_len {
+        if state.cached_plane_banks {
+            state.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+        }
+        state.plane_banks = if plane_cache {
+            state.cached_plane_banks = true;
+            take_ranked_ab_plane()
+        } else if plane_first_write {
+            crate::alloc_uninit_vec(plane_len)
+        } else {
+            vec![0u8; plane_len]
+        };
+    } else if !plane_first_write {
+        state.plane_banks.fill(0);
+    }
+    let n_lo = n_lo_and_inner - N_INNER;
+    #[inline(always)]
+    fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
+        if compact {
+            let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
+            debug_assert!((2..31).contains(&row_in_block));
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
+        } else {
+            x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
+        }
+    }
+    let pf_windows = if zc_r1ab_pf_enabled() {
+        ZC_R1AB_PF_WINDOWS
+    } else {
+        0
+    };
+    let ab_inner_ptr = ab_inner.as_ptr();
+    let pf_spread = zc_r1ab_pf_spread_enabled();
+    let bank_mask = (1usize << bank_bits) - 1;
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+            2
+        } else {
+            0
+        };
+        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+            let x_next = x_outer_lo + pf_windows;
+            let x_next_outer = x_next | (x_hi << n_lo);
+            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided
+                && ((x_outer + pf_windows) & within_outer_mask) == 0
+            {
+                2
+            } else {
+                0
+            };
+            (
+                n_next,
+                live_row_base(x_next_outer, next_first, ranked_compact),
+                next_first,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let w_idx = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & bank_mask;
+        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+            .try_into()
+            .expect("one 16x16 qword matrix block per w");
+        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
+            .try_into()
+            .expect("one plane bank per low index");
+        let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+        let prefetch = kernels::AbDirectPrefetch {
+            next_window: if pf_windows == 0 {
+                core::ptr::null()
+            } else {
+                ab_inner_ptr.wrapping_add(next_live_base)
+            },
+            first: next_first_b_med,
+            end: n_next,
+            spread: pf_spread,
+        };
+        if plane_first_write && w_idx == 0 {
+            kernels::convert_ab_nomul_gfni_direct::<true>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        } else {
+            kernels::convert_ab_nomul_gfni_direct::<false>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        }
+    }
+    let wide = r1_eqfold_x4_enabled();
+    if wide {
+        unsafe {
+            kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                &mut state.plane_banks,
+                eq_bot,
+                eq_hi_val,
+                &mut state.local_res_ab,
+            );
+        }
+        return;
+    }
+    fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
 /// Ranked default routes the round-one AB band folds — the plane-bank
@@ -4228,6 +4436,16 @@ pub(crate) fn identity_c_inner_fold(
 /// has reduced identity C to its 16,384-element inner table; unlike the old
 /// raw-row DirectFold8 experiment, this does not widen round one's GFNI plane
 /// state or revisit the 512 MiB witness.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")
+)]
 fn round1_lifted_from_fold8(
     fold8: &[F128],
     inner_tail: &[F128],
@@ -4285,6 +4503,16 @@ fn w30_delta_direct_enabled() -> bool {
 /// latter — the contribution of a B = ONE K0 row — is exactly what the
 /// one-row identity-C chain lifts ([`round1_lifted_from_fold8`], the chain the
 /// one-row reuse already uses, fed row 240's top-bound slot alone).
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")
+)]
 pub(crate) fn round1_w30_delta_ab(
     row240: &[F128],
     r: &[F128],
@@ -4344,6 +4572,16 @@ pub(crate) fn round1_w30_delta_ab(
 /// that carry data (the ranked one-row statistic fills 11 of 64), instead of
 /// materializing fold4 and quad. The same products regrouped, and an all-zero
 /// bank adds exact zero, so every entry equals [`one_fold8_s_hat_chain`]'s.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")
+)]
 fn one_fold8_s_hat_direct(fold8: &[F128], inner_tail: &[F128]) -> Vec<F128> {
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let low_eq = build_eq(&inner_tail[..2]);
@@ -4430,6 +4668,16 @@ pub fn round1_c_fold4_from_block_major_z(
 /// identity-C inner fold of rows `0..16` and `240` (`capture_canon`; ranked
 /// one-row route only, `None` everywhere else) for the round-two
 /// canonical-window elision.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")
+)]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     z_packed: &[F128],
