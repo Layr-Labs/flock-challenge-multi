@@ -2187,22 +2187,62 @@ pub(crate) fn compose_block_mats_gfni_into(
 
     let mut low_rows = [MaybeUninit::<u64>::uninit(); 64];
     let mut high_rows = [MaybeUninit::<u64>::uninit(); 64];
-    let mut w = e_hi;
-    for chunk in 0..2 {
-        for lane in 0..64 {
-            low_rows[lane].write(w.lo);
-            high_rows[lane].write(w.hi);
-            w = crate::field::mul_by_x(w);
-        }
-        let mats = if chunk == 0 {
-            &mut *low_mats
-        } else {
-            &mut *high_mats
-        };
-        // SAFETY: both row arrays hold 64 initialized u64 values, the output
-        // matrix block is fully overwritten, and this function's cfg supplies
-        // every target feature required by the leaf.
-        unsafe {
+    // Construct consecutive powers in eight independent lanes. For a
+    // shift s <= 8, the bits crossing x^128 fold at offsets 0, 1, 2, 7;
+    // their largest reduced degree is 14, so there is no second reduction.
+    // SAFETY: the cfg provides AVX-512F. Each unaligned store writes eight
+    // words at 8*g, g < 8, initializing both complete 64-word arrays before
+    // the unchanged map leaf reads them. The vector state continues across
+    // the two chunks, so lane k at group g is e_hi * x^(64*chunk + 8*g + k).
+    unsafe {
+        use core::arch::x86_64::*;
+        let shifts = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+        let back = _mm512_setr_epi64(64, 63, 62, 61, 60, 59, 58, 57);
+        let lo = _mm512_set1_epi64(e_hi.lo as i64);
+        let hi = _mm512_set1_epi64(e_hi.hi as i64);
+        // Variable qword shifts by 64 produce zero, including lane s=0.
+        let carry = _mm512_srlv_epi64(hi, back);
+        let folded = _mm512_xor_si512(
+            _mm512_xor_si512(carry, _mm512_slli_epi64::<1>(carry)),
+            _mm512_xor_si512(
+                _mm512_slli_epi64::<2>(carry),
+                _mm512_slli_epi64::<7>(carry),
+            ),
+        );
+        let mut powers_lo = _mm512_xor_si512(_mm512_sllv_epi64(lo, shifts), folded);
+        let mut powers_hi =
+            _mm512_or_si512(_mm512_sllv_epi64(hi, shifts), _mm512_srlv_epi64(lo, back));
+        for chunk in 0..2 {
+            for group in 0..8 {
+                _mm512_storeu_si512(
+                    low_rows.as_mut_ptr().add(8 * group).cast::<__m512i>(),
+                    powers_lo,
+                );
+                _mm512_storeu_si512(
+                    high_rows.as_mut_ptr().add(8 * group).cast::<__m512i>(),
+                    powers_hi,
+                );
+                let carry = _mm512_srli_epi64::<56>(powers_hi);
+                let folded = _mm512_xor_si512(
+                    _mm512_xor_si512(carry, _mm512_slli_epi64::<1>(carry)),
+                    _mm512_xor_si512(
+                        _mm512_slli_epi64::<2>(carry),
+                        _mm512_slli_epi64::<7>(carry),
+                    ),
+                );
+                powers_hi = _mm512_or_si512(
+                    _mm512_slli_epi64::<8>(powers_hi),
+                    _mm512_srli_epi64::<56>(powers_lo),
+                );
+                powers_lo = _mm512_xor_si512(_mm512_slli_epi64::<8>(powers_lo), folded);
+            }
+            let mats = if chunk == 0 {
+                &mut *low_mats
+            } else {
+                &mut *high_mats
+            };
+            // Both arrays are fully initialized; all map pointers, matrix
+            // destinations, byte ordering and leaf behavior are unchanged.
             gfni_fold64_two_maps_to_mats(
                 low_rows.as_ptr().cast::<u8>(),
                 &map.low,
