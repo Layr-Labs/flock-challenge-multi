@@ -2830,7 +2830,32 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 // token-verified constant chunks of a/b/z; the windows are
                 // always written in full.
                 unsafe {
-                    for half in 0..(n_here / SIMD) {
+                    // Only complete closed groups use the sixteen-lane schedule.
+                    // Slice inputs, padding and sub-GROUP tails retain the octa.
+                    let full16_init = match blocks {
+                        crate::seed_pipe::BlockSource::Closed { init, len }
+                            if n_here == GROUP && GROUP * g + GROUP <= len
+                                && stage.is_some() && blake3_witgen8::witness16_enabled() => Some(init),
+                        _ => None,
+                    };
+                    if let Some(init) = full16_init {
+                        let projs = std::array::from_fn(|half| blake3_witgen8::StreamProj {
+                            stage: stage.unwrap_unchecked(),
+                            out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                            out_stride: ab_block_bytes,
+                            out_bias: if compact { 2 * 64 } else { 0 },
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided,
+                            w30_elided,
+                        });
+                        blake3_witgen8::build_16_witness_ab_stream_closed(
+                            init, GROUP * g,
+                            z_out.as_mut_ptr().cast(), a_out.as_mut_ptr().cast(), b_out.as_mut_ptr().cast(),
+                            projs, ranked_closed_preps.as_ref().map(|p| &p.0), elide,
+                        );
+                    }
+                    for half in 0..(if full16_init.is_some() { 0 } else { n_here / SIMD }) {
                         let base = GROUP * g + half * SIMD;
                         let off = half * SIMD * F128_PER_BLOCK;
                         // Streaming arm: the drain transforms each 64-byte

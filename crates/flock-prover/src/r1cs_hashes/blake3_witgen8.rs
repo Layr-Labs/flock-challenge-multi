@@ -2790,6 +2790,505 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     }
 }
 
+
+// Sixteen compression lanes share one round schedule. On AVX-512 targets this
+// is one ZMM per word; AVX2 hosts retain the same schedule as two YMM halves.
+// Only publication splits into octas, preserving the proven eight-row drains.
+#[cfg(target_feature = "avx512f")]
+type V16 = __m512i;
+#[cfg(not(target_feature = "avx512f"))]
+#[derive(Clone, Copy)]
+struct V16 { lo: V8, hi: V8 }
+
+#[inline(always)]
+fn join_v16(lo: V8, hi: V8) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { V16 { lo, hi } }
+}
+
+#[inline(always)]
+fn split_v16(v: V16) -> [V8; 2] {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { [_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64::<1>(v)] }
+    #[cfg(not(target_feature = "avx512f"))]
+    { [v.lo, v.hi] }
+}
+
+#[inline(always)]
+fn dup_u32_16(x: u32) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_set1_epi32(x as i32) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(dup_u32(x), dup_u32(x)) }
+}
+
+#[inline(always)]
+fn xor_v16(a: V16, b: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_xor_si512(a, b) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(xor_v8(a.lo, b.lo), xor_v8(a.hi, b.hi)) }
+}
+
+#[inline(always)]
+fn or_v16(a: V16, b: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_or_si512(a, b) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(or_v8(a.lo, b.lo), or_v8(a.hi, b.hi)) }
+}
+
+#[inline(always)]
+fn add_v16(a: V16, b: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_add_epi32(a, b) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(add_v8(a.lo, b.lo), add_v8(a.hi, b.hi)) }
+}
+
+#[cfg(target_feature = "avx512f")]
+macro_rules! shift512_imm {
+    ($op:ident, $v:expr, $n:expr) => {
+        match $n {
+            0 => $op::<0>($v),
+            1 => $op::<1>($v),
+            2 => $op::<2>($v),
+            3 => $op::<3>($v),
+            4 => $op::<4>($v),
+            5 => $op::<5>($v),
+            6 => $op::<6>($v),
+            7 => $op::<7>($v),
+            8 => $op::<8>($v),
+            9 => $op::<9>($v),
+            10 => $op::<10>($v),
+            11 => $op::<11>($v),
+            12 => $op::<12>($v),
+            13 => $op::<13>($v),
+            14 => $op::<14>($v),
+            15 => $op::<15>($v),
+            16 => $op::<16>($v),
+            17 => $op::<17>($v),
+            18 => $op::<18>($v),
+            19 => $op::<19>($v),
+            20 => $op::<20>($v),
+            21 => $op::<21>($v),
+            22 => $op::<22>($v),
+            23 => $op::<23>($v),
+            24 => $op::<24>($v),
+            25 => $op::<25>($v),
+            26 => $op::<26>($v),
+            27 => $op::<27>($v),
+            28 => $op::<28>($v),
+            29 => $op::<29>($v),
+            30 => $op::<30>($v),
+            31 => $op::<31>($v),
+            _ => unreachable!("witness shift must be in 0..32"),
+        }
+    };
+}
+
+#[inline(always)]
+fn shr_v16<const N: i32>(v: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { shift512_imm!(_mm512_srli_epi32, v, N) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(shr_v8::<N>(v.lo), shr_v8::<N>(v.hi)) }
+}
+
+#[inline(always)]
+fn shl_v16<const N: i32>(v: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { shift512_imm!(_mm512_slli_epi32, v, N) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(shl_v8::<N>(v.lo), shl_v8::<N>(v.hi)) }
+}
+
+#[inline(always)]
+fn vsli_v16<const N: i32>(a: V16, b: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        let mask = _mm512_set1_epi32(((1u64 << N) - 1) as u32 as i32);
+        _mm512_ternarylogic_epi32::<0xF8>(shl_v16::<N>(b), a, mask)
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(vsli_v8::<N>(a.lo, b.lo), vsli_v8::<N>(a.hi, b.hi)) }
+}
+
+#[inline(always)]
+fn ror_v16<const N: i32>(v: V16) -> V16 {
+    #[cfg(target_feature = "avx512f")]
+    unsafe { _mm512_ror_epi32::<N>(v) }
+    #[cfg(not(target_feature = "avx512f"))]
+    { join_v16(ror_v8::<N>(v.lo), ror_v8::<N>(v.hi)) }
+}
+
+#[inline(always)]
+fn add_carry_parts_v16(x: V16, y: V16) -> (V16, V16, V16) {
+    let sum = add_v16(x, y);
+    (sum, xor_v16(sum, y), xor_v16(sum, x))
+}
+
+#[inline(always)]
+fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
+    debug_assert_eq!(N + M, 32);
+    ror_v16::<N>(xor_v16(x, y))
+}
+
+#[inline(always)]
+fn packer_initial_bit16(bit: V16) -> V16 {
+    #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
+    { shl_v16::<31>(bit) }
+    #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
+    { bit }
+}
+
+/// Store one packed word into two separate octa rings, not a new row layout.
+#[inline(always)]
+unsafe fn store_word16(stage: [*mut V8; 2], word: usize, v: V16) {
+    let halves = split_v16(v);
+    unsafe {
+        store_v8(stage[0].add(word & (RING_WORDS - 1)).cast(), halves[0]);
+        store_v8(stage[1].add(word & (RING_WORDS - 1)).cast(), halves[1]);
+    }
+}
+
+struct W16<'t, const FLUSH: bool> {
+    pending: V16,
+    stage: [*mut V8; 2],
+    drain: [*mut Drain8<'t>; 2],
+    ranked_static: bool,
+}
+
+impl<'t, const FLUSH: bool> W16<'t, FLUSH> {
+    #[inline(always)]
+    fn at(stage: [*mut V8; 2], pending: V16, drain: [*mut Drain8<'t>; 2], ranked_static: bool) -> Self {
+        Self { pending, stage, drain, ranked_static }
+    }
+
+    #[inline(always)]
+    unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
+        unsafe {
+            let static_b = FLUSH
+                && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
+                && self.ranked_static;
+            if !static_b {
+                store_word16(self.stage, WORD, v);
+            }
+            // Both A halves have already been written. Drain each octa fully
+            // before reusing the shared projection staging/offset workspace.
+            if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
+                for drain in self.drain {
+                    if WORD + 1 == RING_WORDS {
+                        (*drain).drain_range(16, 16, RING_WORDS - 16);
+                    } else {
+                        (*drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(&mut self, v: V16) {
+        const {
+            assert!(USED >= 0 && USED < 32);
+            assert!(WIDTH == 31 || WIDTH == 32);
+            assert!(BACK >= 1 && BACK < 32);
+            assert!(WORD < U32_PER_BLOCK);
+        }
+        debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
+        unsafe {
+            #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
+            {
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        self.write_word::<WORD>(v);
+                        self.pending = dup_u32_16(0);
+                    } else {
+                        self.pending = shl_v16::<1>(v);
+                    }
+                } else {
+                    let out = _mm512_shldi_epi32::<USED>(v, self.pending);
+                    self.write_word::<WORD>(out);
+                    self.pending = if WIDTH == 31 { shl_v16::<1>(v) } else { v };
+                }
+            }
+            #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
+            {
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        self.write_word::<WORD>(v);
+                        self.pending = dup_u32_16(0);
+                    } else {
+                        self.pending = v;
+                    }
+                } else if USED + WIDTH < 32 {
+                    self.pending = vsli_v16::<USED>(self.pending, v);
+                } else {
+                    let out = vsli_v16::<USED>(self.pending, v);
+                    self.write_word::<WORD>(out);
+                    self.pending = if USED + WIDTH == 32 { dup_u32_16(0) } else { shr_v16::<BACK>(v) };
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(&mut self) {
+        const { assert!(USEFUL_BITS % 32 == 17); }
+        #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
+        let pending = shr_v16::<15>(self.pending);
+        #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
+        let pending = self.pending;
+        unsafe { self.write_word::<LAST_WORD>(pending); }
+    }
+}
+
+macro_rules! pushf16 {
+    ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
+        $w.push::<{ ($pos % 32) as i32 }, $width, {
+            let u = ($pos % 32) as i32;
+            if u == 0 { 1 } else { 32 - u }
+        }, { $pos / 32 }>($v);
+    }};
+}
+
+/// Keep the incumbent octa as a diagnostic control (read once per process).
+#[inline(always)]
+pub(crate) fn witness16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN16").is_none());
+    *ON
+}
+
+/// Build a full, unpadded closed-form sixteen-compression group in one
+/// arithmetic schedule, publishing through two unchanged eight-row drains.
+///
+/// # Safety
+/// AVX2 is compiled in. z/a/b own sixteen contiguous blocks with the alignment
+/// required by Drain8. Each projection owns its corresponding eight outputs;
+/// their staging may alias because drains complete synchronously. The caller
+/// fences non-temporal stores on this thread before releasing these buffers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_16_witness_ab_stream_closed(
+    init: u64,
+    base: usize,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    projs: [StreamProj<'_>; 2],
+    preps: Option<&RankedClosedWindowPreps>,
+    elide: [bool; 3],
+) {
+    unsafe {
+        let lo = prepare_closed_inputs(init, base);
+        let hi = prepare_closed_inputs(init, base + 8);
+        let cv_v: [V16; 8] = std::array::from_fn(|i| join_v16(lo.cv[i], hi.cv[i]));
+        let m: [V16; 16] = std::array::from_fn(|i| join_v16(lo.message[i], hi.message[i]));
+        let tlo = join_v16(lo.counter_lo, hi.counter_lo);
+        let thi = join_v16(lo.counter_hi, hi.counter_hi);
+        let blen = join_v16(lo.block_len, hi.block_len);
+        let flags = join_v16(lo.flags, hi.flags);
+        let ranked_static = elide == [true; 3] && projs[0].plan.offsets_eligible(2);
+        debug_assert_eq!(projs[0].plan.offsets_eligible(2), projs[1].plan.offsets_eligible(2));
+        if preps.is_some() {
+            debug_assert!(ranked_static);
+            debug_assert!(projs.iter().all(|p| p.one_rows_elided && p.out_bias == 2 * 64));
+        }
+        let mut state: [V16; 16] = [
+            cv_v[0],
+            cv_v[1],
+            cv_v[2],
+            cv_v[3],
+            cv_v[4],
+            cv_v[5],
+            cv_v[6],
+            cv_v[7],
+            dup_u32_16(BLAKE3_IV[0]),
+            dup_u32_16(BLAKE3_IV[1]),
+            dup_u32_16(BLAKE3_IV[2]),
+            dup_u32_16(BLAKE3_IV[3]),
+            tlo,
+            thi,
+            blen,
+            flags,
+        ];
+
+        let zero = dup_u32_16(0);
+        let mut ar = core::mem::MaybeUninit::<[[V8; RING_WORDS]; 2]>::uninit();
+        let mut br = core::mem::MaybeUninit::<[[V8; RING_WORDS]; 2]>::uninit();
+        let ar_ptr = ar.as_mut_ptr().cast::<V8>();
+        let br_ptr = br.as_mut_ptr().cast::<V8>();
+        let ast = [ar_ptr, ar_ptr.add(RING_WORDS)];
+        let bs = [br_ptr, br_ptr.add(RING_WORDS)];
+        let [proj_lo, proj_hi] = projs;
+        let mut drains = [
+            Drain8 { ast: ast[0], bs: bs[0], z, a, b, proj: proj_lo,
+                elide, ranked_static, ranked_preps: preps },
+            Drain8 { ast: ast[1], bs: bs[1], z: z.add(8 * U32_PER_BLOCK),
+                a: a.add(8 * U32_PER_BLOCK), b: b.add(8 * U32_PER_BLOCK), proj: proj_hi,
+                elide, ranked_static, ranked_preps: preps },
+        ];
+        let maxv = dup_u32_16(u32::MAX);
+        let one = dup_u32_16(1);
+        let chain: [V16; 20] = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
+        ];
+        // Words 16..35 are available before the rounds. Retain them in the
+        // rolling epochs; the writer publishes each epoch when it completes
+        // that epoch's last word.
+        for k in 0..20usize {
+            let v = if k == 0 {
+                or_v16(one, shl_v16::<1>(chain[0]))
+            } else {
+                or_v16(shr_v16::<31>(chain[k - 1]), shl_v16::<1>(chain[k]))
+            };
+            let w = 16 + k;
+            store_word16(ast, w, v);
+        }
+        // Unswitch the static-prefix decision once per octa. Ranked blocks
+        // 0/1 source B from RANKED_B_MAX; block 2 still needs words 32..35.
+        if !ranked_static {
+            for w in 16..RANKED_STATIC_B_PREFIX_END {
+                store_word16(bs, w, maxv);
+            }
+        }
+        for w in RANKED_STATIC_B_PREFIX_END..16 + PROLOGUE_WORDS {
+            store_word16(bs, w, maxv);
+        }
+
+        // The round stream starts at word `PROLOGUE_WORDS + 16`, so a first
+        // epoch that ends inside the prologue never reaches the writers'
+        // epoch boundary — publish it here instead. Constant-folded away for
+        // every ring long enough to reach the round stream.
+        if RING_WORDS <= PROLOGUE_WORDS + 16 {
+            for drain in &mut drains { drain.drain_range(16, 16, RING_WORDS - 16); }
+        }
+
+        let pending_bit = packer_initial_bit16(shr_v16::<31>(flags));
+        let drain_ptr = [core::ptr::addr_of_mut!(drains[0]), core::ptr::addr_of_mut!(drains[1])];
+        let mut wa = W16::<false>::at(ast, pending_bit, drain_ptr, false);
+        // B is pushed after A at every site; it alone triggers a band drain
+        // once both rings contain the completed word. Z is derived there.
+        let mut wb = W16::<true>::at(bs, packer_initial_bit16(one), drain_ptr, ranked_static);
+
+        macro_rules! g {
+            ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+             $mx:literal, $my:literal) => {{
+                let (t0, l0, r0) = add_carry_parts_v16(state[$la], state[$lb]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                let (a1, l1, r1) = add_carry_parts_v16(t0, m[$mx]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                let d1 = xor_rotr16::<16, 16>(state[$ld], a1);
+                let (c1s, l2, r2) = add_carry_parts_v16(state[$lc], d1);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                let b1 = xor_rotr16::<12, 20>(state[$lb], c1s);
+                let (t1, l3, r3) = add_carry_parts_v16(a1, b1);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                let (a2, l4, r4) = add_carry_parts_v16(t1, m[$my]);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                let d2 = xor_rotr16::<8, 24>(d1, a2);
+                let (c2s, l5, r5) = add_carry_parts_v16(c1s, d2);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                let bn = xor_rotr16::<7, 25>(b1, c2s);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
+                pushf16!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                pushf16!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                state[$la] = a2;
+                state[$lb] = bn;
+                state[$lc] = c2s;
+                state[$ld] = d2;
+            }};
+        }
+        macro_rules! round {
+            ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+             $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+             $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+             $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                g!($gb, 0, 4, 8, 12, $m0, $m1);
+                g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+        round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+        const {
+            assert!(OUT_HI_BASE % 32 == 17);
+        }
+        macro_rules! oh {
+            ($w:literal) => {{
+                let hv = xor_v16(state[$w + 8], cv_v[$w]);
+                pushf16!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
+                pushf16!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+            }};
+        }
+        oh!(0);
+        oh!(1);
+        oh!(2);
+        oh!(3);
+        oh!(4);
+        oh!(5);
+        oh!(6);
+        oh!(7);
+        wa.finish();
+        wb.finish();
+
+        const ZF: usize = USEFUL_BITS.div_ceil(32);
+        const {
+            assert!(U32_PER_BLOCK - ZF == 30);
+        }
+        // finish() completed word 481. The ranked blk30 path reads only ring
+        // words 480/481 and constructs its zero tail directly; blk31 is a
+        // direct zero output. Cold/rollback paths retain the complete tail.
+        if !ranked_static {
+            for w in ZF..U32_PER_BLOCK {
+                let i = w & (RING_WORDS - 1);
+                store_word16(ast, i, zero);
+                store_word16(bs, i, zero);
+            }
+        }
+        for drain in &mut drains { drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS); }
+
+        // Band 0 is the one intentional deferral: words 0..7 are the input
+        // CV, while words 8..15 depend on the final compression state. Build
+        // the complete cache line now, then publish it through the exact same
+        // elide/NT/window policy as every rolling band.
+        for w in 0..8usize {
+            let lo = xor_v16(state[w], state[w + 8]);
+            store_word16(ast, w, cv_v[w]);
+            store_word16(ast, 8 + w, lo);
+        }
+        if !ranked_static {
+            for w in 0..8usize {
+                store_word16(bs, w, maxv);
+                store_word16(bs, 8 + w, maxv);
+            }
+        }
+        for drain in &mut drains { drain.drain_range(0, 0, 16); }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
