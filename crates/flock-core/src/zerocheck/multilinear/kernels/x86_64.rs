@@ -3609,15 +3609,20 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
             qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
         };
-        let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
-            let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
-            };
-            let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
-            let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
-            let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
-            _mm512_xor_si512(v2, v3)
-        };
+        // Keep the arithmetic in the caller: an outlined closure would
+        // force live input and output planes through the SIMD call ABI.
+        #[inline(always)]
+        unsafe fn map_plane(p: &[__m512i; 8], mats: &[u64; 128], k: usize) -> __m512i {
+            unsafe {
+                let g = |j: usize| {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
+                };
+                let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
+                let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
+                let v3 = _mm512_ternarylogic_epi64::<0x96>(g(6), g(7), v1);
+                _mm512_xor_si512(v2, v3)
+            }
+        }
 
         {
             let p0 = input_planes(rows0);
@@ -3627,19 +3632,38 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
                 _mm512_storeu_si512(planes.add(k), value);
             }
         }
-        {
+        // Finish the low planes in the existing private scratch, but keep
+        // the eight finalized high planes in registers. Scratch is workspace,
+        // not an output: its high half still contains the first claim below.
+        let hi_acc = {
             let p2 = input_planes(rows2);
             let p3 = input_planes(rows3);
-            for k in 0..16 {
-                let value = _mm512_xor_si512(map_plane(&p2, mats2, k), map_plane(&p3, mats3, k));
-                let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
+            #[inline(always)]
+            unsafe fn finish_plane(
+                p2: &[__m512i; 8], mats2: &[u64; 128],
+                p3: &[__m512i; 8], mats3: &[u64; 128],
+                planes: *const __m512i, k: usize,
+            ) -> __m512i {
+                unsafe {
+                    let value = _mm512_xor_si512(map_plane(p2, mats2, k), map_plane(p3, mats3, k));
+                    _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)))
+                }
+            }
+            for k in 0..8 {
+                // Read the first-claim contribution before reusing its slot.
+                let value = finish_plane(&p2, mats2, &p3, mats3, planes, k);
                 _mm512_storeu_si512(planes.add(k), value);
             }
-        }
-
-        let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
-        let lo_half = qword_transpose(acc[..8].try_into().unwrap());
-        let hi_half = qword_transpose(acc[8..].try_into().unwrap());
+            [
+                finish_plane(&p2, mats2, &p3, mats3, planes, 8), finish_plane(&p2, mats2, &p3, mats3, planes, 9), finish_plane(&p2, mats2, &p3, mats3, planes, 10), finish_plane(&p2, mats2, &p3, mats3, planes, 11),
+                finish_plane(&p2, mats2, &p3, mats3, planes, 12), finish_plane(&p2, mats2, &p3, mats3, planes, 13), finish_plane(&p2, mats2, &p3, mats3, planes, 14), finish_plane(&p2, mats2, &p3, mats3, planes, 15),
+            ]
+        };
+        // The second claim's inputs are dead before either output transpose.
+        // Publication below remains two full, contiguous stores per group.
+        let hi_half = qword_transpose(hi_acc);
+        let lo_acc: [__m512i; 8] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
+        let lo_half = qword_transpose(lo_acc);
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
         let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
         for i in 0..8 {
