@@ -2047,8 +2047,34 @@ impl Drain8<'_> {
                         let x1 = load_v8(self.ast.add(rw + 1).cast::<u32>());
                         let l = _mm256_unpacklo_epi32(x0, x1);
                         let h = _mm256_unpackhi_epi32(x0, x1);
-                        store_v8(sa, _mm256_permute2x128_si256::<0x20>(l, h));
-                        store_v8(sa.add(8), _mm256_permute2x128_si256::<0x31>(l, h));
+                        let q_lo = _mm256_permute2x128_si256::<0x20>(l, h);
+                        let q_hi = _mm256_permute2x128_si256::<0x31>(l, h);
+                        if proj.w30_elided {
+                            // Only the first qword of each sparse row is live.
+                            // The elided AB transform never reads its sliding
+                            // staging window: publish the exact same two full
+                            // lines per block directly from the eight qwords.
+                            // AVX-512 PALIGNRQ's immediate is in qwords, across
+                            // the full concatenated pair (unlike byte PALIGNR).
+                            let q = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q_lo), q_hi);
+                            let zero = _mm512_setzero_si512();
+                            let rows = RankedRows::new(self.z.add(abs_word), self.a.add(abs_word), self.b.add(abs_word));
+                            macro_rules! publish {
+                                ($j:literal) => {{
+                                    let av = _mm512_maskz_alignr_epi64::<$j>(1, zero, q);
+                                    let o = $j * U32_PER_BLOCK;
+                                    stream_ranked_line(rows.z.add(o), av);
+                                    stream_ranked_line(rows.a.add(o), av);
+                                }};
+                            }
+                            publish!(0); publish!(1); publish!(2); publish!(3);
+                            publish!(4); publish!(5); publish!(6); publish!(7);
+                            continue;
+                        }
+                        // Non-elided and diagnostic routes retain the complete
+                        // sliding-window staging plus initialized zero guard.
+                        store_v8(sa, q_lo);
+                        store_v8(sa.add(8), q_hi);
                         let z = _mm256_setzero_si256();
                         store_v8(sa.add(16), z);
                         store_v8(sa.add(24), z);
