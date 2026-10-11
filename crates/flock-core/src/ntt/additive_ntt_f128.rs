@@ -4462,6 +4462,13 @@ fn butterfly_interleaved_fused_4layer_rows(
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     debug_assert!(odd_tail == 0 || sixteenth.is_multiple_of(2));
     let base = block.as_mut_ptr();
+    unsafe {
+        if kernels::butterfly_fused_4layer_rows_shaped_try(
+            base, sixteenth, num_ntts, odd_tail, t, hint,
+        ) {
+            return;
+        }
+    }
     for r in 0..sixteenth {
         let lanes = row_lanes(r, num_ntts, odd_tail);
         // The sixteen rows the NEXT row group reads are asked for one line

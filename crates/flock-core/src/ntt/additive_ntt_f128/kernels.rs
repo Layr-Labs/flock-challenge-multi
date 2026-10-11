@@ -661,8 +661,8 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                     );
                 }
                 1 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
+                    return x86_64::butterfly_fused_4layer_row_shaped_1::<64>(
+                        ptr, lanes, r, twiddles,
                     );
                 }
                 _ => {}
@@ -680,6 +680,71 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     unsafe {
         portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
+}
+
+/// Try to run an entire fused-four block (`r in 0..sixteenth`) using a
+/// block-level shaped kernel that broadcasts and x^64-companions the 15
+/// twiddles ONCE per block instead of `sixteenth` times per block.
+/// Returns `true` if handled.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_rows_shaped_try(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 15],
+    hint: u8,
+) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match (sixteenth, hint) {
+                (128, 0) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<128, 64, 0>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                (128, 1) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<128, 64, 1>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                (128, _) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<128, 64, 2>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                (8, 0) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<8, 64, 0>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                (8, 1) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<8, 64, 1>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                (8, _) => {
+                    x86_64::butterfly_fused_4layer_rows_shaped::<8, 64, 2>(
+                        ptr, odd_tail, twiddles,
+                    );
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = (ptr, sixteenth, num_ntts, odd_tail, twiddles, hint);
+    false
 }
 
 /// [`butterfly_fused_4layer_row`] with one line hint per row of row group
