@@ -3601,6 +3601,38 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    if DIRECT {
+        let (eq_bot, mats, bank_bits) = eq_fold.expect("DIRECT requires eq_fold");
+        unsafe {
+            process_one_x_hi_ab_only_direct_x86(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                eq_hi_val,
+                eq_bot,
+                mats,
+                bank_bits,
+                plane_first_write,
+                plane_cache,
+                ranked_one_rows_elided,
+                ranked_compact,
+                state,
+            );
+        }
+        return;
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -3894,28 +3926,8 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             }
             return;
         }
-        // Plane-major → F128 through the same vectorized kernel the C drain
-        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
-        // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
-        // shared `add_scaled` leaf, which selects the architecture kernel.
-        let mut bank_f128 = [F128::ZERO; ELL];
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
-            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            if wide {
-                crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
-                    &bank_f128,
-                    *eq_bot_val,
-                );
-            } else {
-                for lane in 0..ELL {
-                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
-                }
-            }
-        }
+        fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
+        return;
     }
     if r1_eqfold_x4_enabled() {
         let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
@@ -3925,6 +3937,317 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn fold_ab_plane_banks_fallback_cold(
+    state: &mut WorkerStateAbOnly,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    wide: bool,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    // Plane-major → F128 through the same vectorized kernel the C drain
+    // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
+    // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
+    // shared `add_scaled` leaf, which selects the architecture kernel.
+    let mut bank_f128 = [F128::ZERO; ELL];
+    for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+        let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+            .try_into()
+            .expect("one 16-plane bank");
+        kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
+        if wide {
+            crate::field::f128_slice::add_scaled(
+                &mut state.partial_ab,
+                &bank_f128,
+                *eq_bot_val,
+            );
+        } else {
+            for lane in 0..ELL {
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+            }
+        }
+    }
+    if wide {
+        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn process_one_x_hi_ab_only_direct_x86(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_hi_val: F128,
+    eq_bot: &[F128],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+    ranked_one_rows_elided: bool,
+    ranked_compact: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+    debug_assert!(
+        ranked_one_rows_elided
+            && within_outer_mask == 1
+            && (b_med_counts == [16, 15] || b_med_counts == [16, 14])
+    );
+    debug_assert!(!ranked_compact || ranked_one_rows_elided);
+    let plane_len = eq_bot.len() * 16 * ELL;
+    if state.plane_banks.len() != plane_len {
+        if state.cached_plane_banks {
+            state.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+        }
+        state.plane_banks = if plane_cache {
+            state.cached_plane_banks = true;
+            take_ranked_ab_plane()
+        } else if plane_first_write {
+            crate::alloc_uninit_vec(plane_len)
+        } else {
+            vec![0u8; plane_len]
+        };
+    } else if !plane_first_write {
+        state.plane_banks.fill(0);
+    }
+    let n_lo = n_lo_and_inner - N_INNER;
+    #[inline(always)]
+    fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
+        if compact {
+            let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
+            debug_assert!((2..31).contains(&row_in_block));
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
+        } else {
+            x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
+        }
+    }
+    let pf_windows = if zc_r1ab_pf_enabled() {
+        ZC_R1AB_PF_WINDOWS
+    } else {
+        0
+    };
+    let ab_inner_ptr = ab_inner.as_ptr();
+    let pf_spread = zc_r1ab_pf_spread_enabled();
+    let bank_mask = (1usize << bank_bits) - 1;
+    if big_lo_size == 4096
+        && n_lo == 12
+        && bank_bits == 7
+        && eq_bot.len() == 128
+        && mats.len() == 32 * 256
+        && state.plane_banks.len() == 128 * 16 * ELL
+        && plane_first_write
+        && ranked_one_rows_elided
+        && within_outer_mask == 1
+        && (b_med_counts == [16, 15] || b_med_counts == [16, 14])
+        && pf_windows == 2
+        && pf_spread
+        && r1_eqfold_x4_enabled()
+    {
+        let w30_elided = b_med_counts[1] == 14;
+        let expected_ab_len = if ranked_compact {
+            (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES
+        } else {
+            (1usize << 19) * 16 * ELL
+        };
+        if ab_inner.len() >= expected_ab_len {
+            let banks_ptr = state.plane_banks.as_mut_ptr();
+            let mats_ptr = mats.as_ptr();
+            #[inline(never)]
+            #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+            unsafe fn run_ranked_band<const COMPACT: bool, const ODD_N: usize>(
+                x_hi: usize,
+                ab_inner_ptr: *const u8,
+                mats_ptr: *const u64,
+                banks_ptr: *mut u8,
+            ) {
+                let block_base_hi = (x_hi << 11)
+                    * if COMPACT {
+                        RANKED_AB_COMPACT_BLOCK_BYTES
+                    } else {
+                        32 * ELL
+                    };
+                let stride = if COMPACT {
+                    RANKED_AB_COMPACT_BLOCK_BYTES
+                } else {
+                    32 * ELL
+                };
+                let even_off = if COMPACT { 0 } else { 2 * ELL };
+                let odd_off = if COMPACT { 14 * ELL } else { 16 * ELL };
+                unsafe {
+                    {
+                        let mats_w = mats_ptr;
+                        for pair in 0..64usize {
+                            let base = block_base_hi + pair * stride;
+                            let next_base = base + stride;
+                            let bank_even = banks_ptr.add((pair * 2) * 16 * ELL);
+                            let bank_odd = bank_even.add(16 * ELL);
+                            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_ranked::<2, 16, true>(
+                                ab_inner_ptr.add(base + even_off),
+                                mats_w,
+                                bank_even,
+                                ab_inner_ptr.wrapping_add(next_base + even_off),
+                            );
+                            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_ranked::<0, ODD_N, true>(
+                                ab_inner_ptr.add(base + odd_off),
+                                mats_w,
+                                bank_odd,
+                                ab_inner_ptr.wrapping_add(next_base + odd_off),
+                            );
+                        }
+                    }
+                    for w_idx in 1..32usize {
+                        let mats_w = mats_ptr.add(w_idx * 256);
+                        let w_base = block_base_hi + (w_idx * 64) * stride;
+                        for pair in 0..64usize {
+                            let base = w_base + pair * stride;
+                            let next_base = base + stride;
+                            let bank_even = banks_ptr.add((pair * 2) * 16 * ELL);
+                            let bank_odd = bank_even.add(16 * ELL);
+                            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_ranked::<2, 16, false>(
+                                ab_inner_ptr.add(base + even_off),
+                                mats_w,
+                                bank_even,
+                                ab_inner_ptr.wrapping_add(next_base + even_off),
+                            );
+                            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_ranked::<0, ODD_N, false>(
+                                ab_inner_ptr.add(base + odd_off),
+                                mats_w,
+                                bank_odd,
+                                ab_inner_ptr.wrapping_add(next_base + odd_off),
+                            );
+                        }
+                    }
+                }
+            }
+            unsafe {
+                match (ranked_compact, w30_elided) {
+                    (true, true) => {
+                        run_ranked_band::<true, 14>(x_hi, ab_inner_ptr, mats_ptr, banks_ptr)
+                    }
+                    (true, false) => {
+                        run_ranked_band::<true, 15>(x_hi, ab_inner_ptr, mats_ptr, banks_ptr)
+                    }
+                    (false, true) => {
+                        run_ranked_band::<false, 14>(x_hi, ab_inner_ptr, mats_ptr, banks_ptr)
+                    }
+                    (false, false) => {
+                        run_ranked_band::<false, 15>(x_hi, ab_inner_ptr, mats_ptr, banks_ptr)
+                    }
+                }
+                kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    eq_hi_val,
+                    &mut state.local_res_ab,
+                );
+            }
+            return;
+        }
+    }
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+            2
+        } else {
+            0
+        };
+        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+            let x_next = x_outer_lo + pf_windows;
+            let x_next_outer = x_next | (x_hi << n_lo);
+            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided
+                && ((x_outer + pf_windows) & within_outer_mask) == 0
+            {
+                2
+            } else {
+                0
+            };
+            (
+                n_next,
+                live_row_base(x_next_outer, next_first, ranked_compact),
+                next_first,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let w_idx = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & bank_mask;
+        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+            .try_into()
+            .expect("one 16x16 qword matrix block per w");
+        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
+            .try_into()
+            .expect("one plane bank per low index");
+        let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+        let prefetch = kernels::AbDirectPrefetch {
+            next_window: if pf_windows == 0 {
+                core::ptr::null()
+            } else {
+                ab_inner_ptr.wrapping_add(next_live_base)
+            },
+            first: next_first_b_med,
+            end: n_next,
+            spread: pf_spread,
+        };
+        if plane_first_write && w_idx == 0 {
+            kernels::convert_ab_nomul_gfni_direct::<true>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        } else {
+            kernels::convert_ab_nomul_gfni_direct::<false>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        }
+    }
+    let wide = r1_eqfold_x4_enabled();
+    if wide {
+        unsafe {
+            kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                &mut state.plane_banks,
+                eq_bot,
+                eq_hi_val,
+                &mut state.local_res_ab,
+            );
+        }
+        return;
+    }
+    fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
 /// Ranked default routes the round-one AB band folds — the plane-bank

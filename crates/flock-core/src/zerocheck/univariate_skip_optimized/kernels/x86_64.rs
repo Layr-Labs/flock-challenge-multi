@@ -1925,9 +1925,16 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_gfni(
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[inline(never)]
-#[target_feature(enable = "avx512f,gfni")]
-pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
+#[inline]
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "avx512vbmi"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "avx512vbmi")),
+    target_feature(enable = "avx512f,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn convert_ab_nomul_x86_gfni_direct<
     const FIRST: usize,
     const N: usize,
     const FIRST_WRITE: bool,
@@ -2000,6 +2007,94 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
                     _mm512_set1_epi64(mats[bm * 16 + k] as i64),
                 );
                 acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+pub(crate) unsafe fn convert_ab_nomul_x86_gfni_direct_ranked<
+    const FIRST: usize,
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    live_rows: *const u8,
+    mats: *const u64,
+    bank_planes: *mut u8,
+    next_window: *const u8,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && (N == 15 || N == 14)));
+    unsafe {
+        macro_rules! load_pf {
+            ($idx:expr) => {{
+                let off = ($idx) * ELL;
+                _mm_prefetch(next_window.wrapping_add(off).cast::<i8>(), _MM_HINT_T0);
+                _mm512_loadu_si512(live_rows.add(off) as *const __m512i)
+            }};
+        }
+        let r0 = load_pf!(0);
+        let r1 = load_pf!(1);
+        let r2 = load_pf!(2);
+        let r3 = load_pf!(3);
+        let r4 = load_pf!(4);
+        let r5 = load_pf!(5);
+        let r6 = load_pf!(6);
+        let r7 = load_pf!(7);
+        let r8 = load_pf!(8);
+        let r9 = load_pf!(9);
+        let r10 = load_pf!(10);
+        let r11 = load_pf!(11);
+        let r12 = load_pf!(12);
+        let r13 = load_pf!(13);
+        let r14 = if N - FIRST == 15 {
+            load_pf!(14)
+        } else {
+            _mm512_setzero_si512()
+        };
+        for k in 0..16 {
+            let plane_ptr = bank_planes.add(k * ELL) as *mut __m512i;
+            let m = mats.add(FIRST * 16 + k);
+            let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(r0, _mm512_set1_epi64(*m as i64));
+            let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(r1, _mm512_set1_epi64(*m.add(16) as i64));
+            let mut acc = if FIRST_WRITE {
+                _mm512_xor_si512(g0, g1)
+            } else {
+                let prev = _mm512_loadu_si512(plane_ptr as *const __m512i);
+                _mm512_ternarylogic_epi64::<0x96>(prev, g0, g1)
+            };
+            macro_rules! pair_step {
+                ($ra:ident, $rb:ident, $off_a:expr, $off_b:expr) => {{
+                    let ga = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        $ra,
+                        _mm512_set1_epi64(*m.add($off_a) as i64),
+                    );
+                    let gb = _mm512_gf2p8affine_epi64_epi8::<0>(
+                        $rb,
+                        _mm512_set1_epi64(*m.add($off_b) as i64),
+                    );
+                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, ga, gb);
+                }};
+            }
+            pair_step!(r2, r3, 2 * 16, 3 * 16);
+            pair_step!(r4, r5, 4 * 16, 5 * 16);
+            pair_step!(r6, r7, 6 * 16, 7 * 16);
+            pair_step!(r8, r9, 8 * 16, 9 * 16);
+            pair_step!(r10, r11, 10 * 16, 11 * 16);
+            pair_step!(r12, r13, 12 * 16, 13 * 16);
+            if N - FIRST == 15 {
+                let g14 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    r14,
+                    _mm512_set1_epi64(*m.add(14 * 16) as i64),
+                );
+                acc = _mm512_xor_si512(acc, g14);
             }
             _mm512_storeu_si512(plane_ptr, acc);
         }
@@ -2373,7 +2468,14 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[cfg_attr(
+    target_feature = "gfni",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")
+)]
 pub(crate) unsafe fn reduce_worker_plane_block_x86_avx512(
     planes_ptr: *const u8,
     worker_stride: usize,
@@ -2421,14 +2523,21 @@ pub(crate) unsafe fn reduce_worker_plane_block_x86_avx512(
     }
 }
 
-#[inline(never)]
+#[inline]
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "avx512bw",
     target_feature = "avx512vbmi"
 ))]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[cfg_attr(
+    all(target_feature = "gfni", target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "gfni", target_feature = "vpclmulqdq")),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi")
+)]
 unsafe fn transpose_plane_banks_in_place_x86_avx512(plane_banks: &mut [u8], n_banks: usize) {
     use core::arch::x86_64::*;
     debug_assert_eq!(plane_banks.len(), n_banks * 16 * ELL);
@@ -2460,13 +2569,20 @@ unsafe fn transpose_plane_banks_in_place_x86_avx512(plane_banks: &mut [u8], n_ba
     }
 }
 
-#[inline(never)]
+#[inline]
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni")),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 unsafe fn accumulate_transposed_banks_half_x86_avx512(
     plane_banks: &[u8],
     eq_bot: &[F128],
@@ -2540,7 +2656,7 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
 /// Fused byte-plane transpose and unreduced `WideGhashX4` accumulation across
 /// all `eq_bot` plane banks for one `x_hi` band, followed by one per-lane
 /// reduction and `eq_hi` fold into `local_res_ab`.
-#[inline(never)]
+#[inline]
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -2548,7 +2664,14 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")]
+#[cfg_attr(
+    target_feature = "gfni",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")
+)]
 pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
     plane_banks: &mut [u8],
     eq_bot: &[F128],
