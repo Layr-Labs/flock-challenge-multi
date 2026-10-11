@@ -210,23 +210,20 @@ pub struct LinearFoldPlan {
 }
 
 impl LinearFoldPlan {
-    fn reconstruct(&self, folded: &[F128], k: usize) -> Vec<F128> {
+    fn alloc_nodes(&self, k: usize) -> Vec<F128> {
         let total = k + 1 + self.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
-        let mut nodes = if live_cols <= k {
+        if live_cols <= k {
             let mut v = crate::alloc_uninit_vec::<F128>(total);
             v[live_cols..=k].fill(F128::ZERO);
             v
         } else {
             vec![F128::ZERO; total]
-        };
-        debug_assert!(folded.len() >= self.roots.len());
-        for (&col, &value) in self.roots.iter().zip(folded) {
-            debug_assert!(col < k);
-            unsafe {
-                *nodes.get_unchecked_mut(col) = value;
-            }
         }
+    }
+
+    fn finish_reconstruct(&self, mut nodes: Vec<F128>, k: usize) -> Vec<F128> {
+        let total = k + 1 + self.children.len();
         let base = k + 1;
         for (i, &[a, b]) in self.children.iter().enumerate() {
             let a = a as usize;
@@ -246,6 +243,18 @@ impl LinearFoldPlan {
         }
         nodes.truncate(k);
         nodes
+    }
+
+    fn reconstruct(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        let mut nodes = self.alloc_nodes(k);
+        debug_assert!(folded.len() >= self.roots.len());
+        for (&col, &value) in self.roots.iter().zip(folded) {
+            debug_assert!(col < k);
+            unsafe {
+                *nodes.get_unchecked_mut(col) = value;
+            }
+        }
+        self.finish_reconstruct(nodes, k)
     }
 }
 
@@ -366,7 +375,7 @@ impl RootFoldSource {
         #[allow(unused_variables)]
         match &self.source {
             RootFoldStorage::Packed(packed) => {
-                partial_fold_packed_z_block_major_padded_with_tables_result(
+                let folded = partial_fold_packed_z_block_major_padded_with_tables_result(
                     packed,
                     m,
                     self.k_log,
@@ -377,7 +386,8 @@ impl RootFoldSource {
                     false,
                     Some(self.plan.roots.len().div_ceil(128)),
                 )
-                .0
+                .0;
+                self.plan.reconstruct(&folded, k)
             }
             #[cfg(all(
                 target_arch = "x86_64",
@@ -386,7 +396,10 @@ impl RootFoldSource {
                 target_feature = "avx512vbmi",
                 target_feature = "gfni"
             ))]
-            RootFoldStorage::Splice(splice) => splice.fold(z_canonical, k, &eq8_at),
+            RootFoldStorage::Splice(splice) => {
+                let folded = splice.fold(z_canonical, k, &eq8_at);
+                self.plan.reconstruct(&folded, k)
+            }
         }
     }
 
@@ -395,7 +408,7 @@ impl RootFoldSource {
         assert_eq!(x_outer.len(), m - k_log);
         let k = 1usize << k_log;
         assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
-        let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+        if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
             let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
             let eq_lo = build_eq_table(lo);
             let eq_hi = build_eq_table(hi);
@@ -420,8 +433,7 @@ impl RootFoldSource {
         } else {
             let eq = build_eq_table(x_outer);
             self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]))
-        };
-        self.plan.reconstruct(&folded, k)
+        }
     }
 }
 
@@ -564,12 +576,7 @@ impl RootSplicePlan {
         target_feature = "avx512vbmi",
         target_feature = "gfni"
     ))]
-    fn fold(
-        &self,
-        z: &[F128],
-        k: usize,
-        eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
-    ) -> Vec<F128> {
+    fn fold(&self, z: &[F128], k: usize, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
         let n_stripes = z.len() / (k / 128) / 8;
         assert_eq!(n_stripes % DIRECT_FOLD_TILE_STRIPES, 0);
         let n_tiles = n_stripes / DIRECT_FOLD_TILE_STRIPES;
@@ -603,6 +610,7 @@ impl RootSplicePlan {
         target_feature = "avx512vbmi",
         target_feature = "gfni"
     ))]
+    #[inline(always)]
     unsafe fn fold_chunk(
         &self,
         q: usize,
@@ -619,14 +627,12 @@ impl RootSplicePlan {
                 let input = tile.add(half * 64);
                 match &self.actions[2 * q + half] {
                     RootSpliceAction::Skip => {}
-                    RootSpliceAction::Full(out) => kernels::gfni_fold_tile(
-                        input,
-                        128,
-                        1,
-                        mats,
-                        planes.add(out * 1024),
-                        seed_zero,
-                    ),
+                    RootSpliceAction::Full(out) => {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                            _mm512_loadu_si512(input.add(t * 128) as *const __m512i)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
+                    }
                     RootSpliceAction::Start => {
                         debug_assert!(!*pending);
                         for t in 0..8 {
@@ -641,46 +647,69 @@ impl RootSplicePlan {
                     RootSpliceAction::End { out, select } => {
                         debug_assert!(*pending);
                         let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
-                        for t in 0..8 {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let lo =
                                 _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
                             let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_permutex2var_epi8(lo, indices, hi);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_permutex2var_epi8(lo, indices, hi)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                         *pending = false;
                     }
                     RootSpliceAction::Tail { out, mask } => {
                         debug_assert!(!*pending);
-                        for t in 0..8 {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_maskz_mov_epi8(*mask, row);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_maskz_mov_epi8(*mask, row)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                     }
                 }
+            }
+        }
+    }
+
+    /// Drain all four 128-column chunks of a grouped gather batch in one call.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fold_group4(
+        &self,
+        q: usize,
+        transposed: *const u8,
+        mats: &[u64; 128],
+        planes: *mut u8,
+        seed_zero: bool,
+        carry: &mut [u8; 512],
+        pending: &mut bool,
+        pf_base: *const F128,
+        chunks_per_block: usize,
+        cpb_ranked: bool,
+    ) {
+        unsafe {
+            for c in 0..4 {
+                if !pf_base.is_null() {
+                    lc_prefetch_rows16(
+                        pf_base.add(16 * c * chunks_per_block),
+                        chunks_per_block,
+                        cpb_ranked,
+                    );
+                }
+                self.fold_chunk(
+                    q + c,
+                    transposed.add(c * 1024),
+                    mats,
+                    planes,
+                    seed_zero,
+                    carry,
+                    pending,
+                );
             }
         }
     }
@@ -1939,6 +1968,12 @@ fn fold_untimed_enabled() -> bool {
     *ON
 }
 
+fn lincheck_trace_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LINCHECK_TRACE").is_some());
+    *ON
+}
+
 /// Ranked default: identity-C worker-reduce reconstructs each 64-column
 /// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
 /// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
@@ -2390,6 +2425,39 @@ fn fold_block_major_gfni(
                                 &mut transposed,
                             );
                         }
+                        #[cfg(target_feature = "avx512bw")]
+                        if let Some(splice) = root_splice {
+                            let pf_base = if pf_far && pf_spread {
+                                let qn = q + pf_chunks;
+                                if qn <= full_chunks && qn < chunks_per_block {
+                                    unsafe {
+                                        z_packed
+                                            .as_ptr()
+                                            .add((8 * stripe_base) * chunks_per_block + qn)
+                                    }
+                                } else {
+                                    core::ptr::null()
+                                }
+                            } else {
+                                core::ptr::null()
+                            };
+                            unsafe {
+                                splice.fold_group4(
+                                    q,
+                                    transposed.as_ptr(),
+                                    &mats,
+                                    wplanes.as_mut_ptr().cast::<u8>(),
+                                    first_tile,
+                                    &mut splice_carry,
+                                    &mut splice_pending,
+                                    pf_base,
+                                    chunks_per_block,
+                                    cpb_ranked,
+                                );
+                            }
+                            q += 4;
+                            continue;
+                        }
                         for c in 0..4 {
                             // Spread delivery: the same eight-hints-per-stripe
                             // block, issued from the fold that follows the
@@ -2423,19 +2491,6 @@ fn fold_block_major_gfni(
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                #[cfg(target_feature = "avx512bw")]
-                                if let Some(splice) = root_splice {
-                                    splice.fold_chunk(
-                                        q + c,
-                                        transposed.as_ptr().add(c * 1024),
-                                        &mats,
-                                        wplanes.as_mut_ptr().cast::<u8>(),
-                                        first_tile,
-                                        &mut splice_carry,
-                                        &mut splice_pending,
-                                    );
-                                    continue;
-                                }
                                 kernels::gfni_fold_tile(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
@@ -2719,7 +2774,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
     // kill switch, which restores the always-on probes). Resolved once here
     // so the worker loop reads a register, not the environment.
-    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    let trace_fold = lincheck_trace_enabled();
     // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
     // so `LINCHECK_TRACE=1` measures the production sweep. Set
     // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
@@ -3013,7 +3068,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
                 .for_each(|(o, p)| *o += *p);
         }
     }
-    if std::env::var_os("LINCHECK_TRACE").is_some() {
+    if lincheck_trace_enabled() {
         eprintln!(
             "[lc] fold alloc {:.2} ms par {:.2} ms reduce {:.2} ms",
             (probe_t1 - probe_t0).as_secs_f64() * 1e3,
@@ -3797,7 +3852,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             // the leftover fold starts after the last ρ, when C is no
             // longer written).
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
-            let trace = std::env::var_os("LINCHECK_TRACE").is_some();
+            let trace = lincheck_trace_enabled();
             let t0 = std::time::Instant::now();
             let out = match roots {
                 Some(roots) => roots.fold(z, m, &x_outer),
@@ -4094,7 +4149,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = lincheck_trace_enabled();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.

@@ -23,12 +23,15 @@ use super::{
 };
 use core::arch::x86_64::*;
 use flock_core::ntt::InvNttTableByteSingleGf8;
+#[allow(unused_imports)]
 use flock_core::zerocheck::univariate_skip_optimized::{
     ROUND1_AB_OFF_WORDS, Round1AbTableImages, Round1AbWindowPlan,
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const,
-    round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_two_image,
+    round1_ab_inner_window_from_offsets_nt2_residual,
+    round1_ab_inner_window_from_offsets_nt2_residual_two_image, round1_ab_inner_window_with_images,
     round1_ab_inner_window30_k0, round1_ab_table_images,
 };
 
@@ -701,7 +704,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
         let b_rows = tr8x16_zmm(b_ring, rw);
         widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
 
-        if proj.one_rows_elided && blk == 2 {
+        if proj.one_rows_elided && plan.is_ranked_default_two_image() && blk == 2 {
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
@@ -709,7 +712,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     .out
                     .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                round1_ab_inner_window_from_offsets_nt2_residual_two_image::<P>(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
                         .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
@@ -722,7 +725,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
             }
             return;
         }
-        if proj.one_rows_elided && blk == 29 {
+        if proj.one_rows_elided && plan.is_ranked_default_two_image() && blk == 29 {
             let mut j = 0usize;
             while j != 8 {
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
@@ -730,7 +733,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     .out
                     .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                round1_ab_inner_window_from_offsets_nt2_residual_two_image::<P>(
                     &*off
                         .add(j * ROUND1_AB_OFF_WORDS)
                         .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
@@ -744,7 +747,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
             return;
         }
 
-        if plan.bcomplement_static_eligible() && ranked_b_constwin_enabled() {
+        if plan.bcomplement_static_eligible()
+            && plan.is_ranked_default_two_image()
+            && ranked_b_constwin_enabled()
+        {
             match blk {
                 3 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(
@@ -899,6 +905,49 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
             }
         }
 
+        project_blocks_ranked_hot_offsets_direct_inline_fallback::<P>(
+            proj, plan, imgs, blk, rows, &a_rows, &b_rows, off,
+        );
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fallback<const P: bool>(
+    proj: &StreamProj<'_>,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+    rows: RankedRows,
+    a_rows: &[__m512i; 8],
+    b_rows: &[__m512i; 8],
+    off: *const u16,
+) {
+    unsafe {
+        if proj.one_rows_elided && (blk == 2 || blk == 29) {
+            let keep = if blk == 2 { 0xfc } else { 0x0f };
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    keep,
+                );
+                j += 1;
+            }
+            return;
+        }
         let mut j = 0usize;
         while j != 8 {
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
@@ -958,7 +1007,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
                 .out
                 .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
-            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_two_image::<BLK, P>(
                 &*off
                     .add(j * ROUND1_AB_OFF_WORDS)
                     .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
@@ -1976,6 +2025,56 @@ impl Drain8<'_> {
     }
 
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn drain_range_spread_ranked_closed_exact_cold_static(
+        &self,
+        proj: &StreamProj<'_>,
+        preps: &RankedClosedWindowPreps,
+        blk: usize,
+        abs_word: usize,
+        rw: usize,
+    ) {
+        unsafe {
+            let (sa, _) = proj.sides();
+            let rows = RankedRows::new(self.z.add(abs_word), self.a.add(abs_word), self.b.add(abs_word));
+            if blk == 30 {
+                let x0 = load_v8(self.ast.add(rw).cast::<u32>());
+                let x1 = load_v8(self.ast.add(rw + 1).cast::<u32>());
+                let l = _mm256_unpacklo_epi32(x0, x1);
+                let h = _mm256_unpackhi_epi32(x0, x1);
+                store_v8(sa, _mm256_permute2x128_si256::<0x20>(l, h));
+                store_v8(sa.add(8), _mm256_permute2x128_si256::<0x31>(l, h));
+                let z = _mm256_setzero_si256();
+                store_v8(sa.add(16), z);
+                store_v8(sa.add(24), z);
+                let (plan, imgs) = preps[30];
+                proj.project_blocks_ranked_30(plan, imgs, rows);
+                return;
+            }
+            let a_lo = tr8_chunk(self.ast, rw);
+            let a_hi = tr8_chunk(self.ast, rw + 8);
+            for r in 0..8 {
+                let p = sa.add(r * STEP_WORDS);
+                store_v8(p, a_lo[r]);
+                store_v8(p.add(8), a_hi[r]);
+            }
+            let mut j = 0usize;
+            if blk == 0 {
+                while j != 8 {
+                    rows.publish_static::<0>(j, sa);
+                    j += 1;
+                }
+            } else {
+                while j != 8 {
+                    rows.publish_static::<1>(j, sa);
+                    j += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range_spread_ranked_closed_exact(
@@ -2009,52 +2108,23 @@ impl Drain8<'_> {
                             j += 1;
                         }
                     }
-                    0 => {
-                        let (sa, _) = proj.sides();
-                        let a_lo = tr8_chunk(self.ast, rw);
-                        let a_hi = tr8_chunk(self.ast, rw + 8);
-                        for r in 0..8 {
-                            let p = sa.add(r * STEP_WORDS);
-                            store_v8(p, a_lo[r]);
-                            store_v8(p.add(8), a_hi[r]);
-                        }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                        let mut j = 0usize;
-                        while j != 8 {
-                            rows.publish_static::<0>(j, sa);
-                            j += 1;
-                        }
-                    }
-                    1 => {
-                        let (sa, _) = proj.sides();
-                        let a_lo = tr8_chunk(self.ast, rw);
-                        let a_hi = tr8_chunk(self.ast, rw + 8);
-                        for r in 0..8 {
-                            let p = sa.add(r * STEP_WORDS);
-                            store_v8(p, a_lo[r]);
-                            store_v8(p.add(8), a_hi[r]);
-                        }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                        let mut j = 0usize;
-                        while j != 8 {
-                            rows.publish_static::<1>(j, sa);
-                            j += 1;
-                        }
-                    }
-                    30 => {
-                        let (sa, _) = proj.sides();
+                    30 if proj.w30_elided => {
                         let x0 = load_v8(self.ast.add(rw).cast::<u32>());
                         let x1 = load_v8(self.ast.add(rw + 1).cast::<u32>());
                         let l = _mm256_unpacklo_epi32(x0, x1);
                         let h = _mm256_unpackhi_epi32(x0, x1);
-                        store_v8(sa, _mm256_permute2x128_si256::<0x20>(l, h));
-                        store_v8(sa.add(8), _mm256_permute2x128_si256::<0x31>(l, h));
-                        let z = _mm256_setzero_si256();
-                        store_v8(sa.add(16), z);
-                        store_v8(sa.add(24), z);
+                        let mut q = [0u64; 8];
+                        store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
+                        store_v8(q.as_mut_ptr().add(4).cast::<u32>(), _mm256_permute2x128_si256::<0x31>(l, h));
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
-                        let (plan, imgs) = preps[30];
-                        proj.project_blocks_ranked_30(plan, imgs, rows);
+                        let mut j = 0usize;
+                        while j != 8 {
+                            rows.publish_sparse_30(j, q.as_ptr().add(j));
+                            j += 1;
+                        }
+                    }
+                    0 | 1 | 30 => {
+                        self.drain_range_spread_ranked_closed_exact_cold_static(proj, preps, blk, abs_word, rw);
                     }
                     31 => continue,
                     2..=29 => {
