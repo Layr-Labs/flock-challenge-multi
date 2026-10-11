@@ -3010,8 +3010,10 @@ unsafe fn direct_fold8_w_state_gfni(
     let n_packed = 1usize << LOG_PACKING;
     assert_eq!(w_state.len(), 64 * n_packed);
     let map = build_gfni_direct_fold_map_from_table(table);
-    let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-    let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
+    #[repr(C, align(64))]
+    struct AlignedRows([u64; 64]);
+    let mut low_rows = core::mem::MaybeUninit::<AlignedRows>::uninit();
+    let mut high_rows = core::mem::MaybeUninit::<AlignedRows>::uninit();
     let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
     let high_ptr = high_rows.as_mut_ptr().cast::<u64>();
     for lane in 0..64 {
@@ -3035,8 +3037,8 @@ unsafe fn direct_fold8_w_state_gfni(
                 core::ptr::null(),
             );
             if bit + 1 < n_packed {
-                let lo_ptr = low_ptr.cast::<__m512i>();
-                let hi_ptr = high_ptr.cast::<__m512i>();
+                let lo_ptr = core::hint::black_box(low_ptr).cast::<__m512i>();
+                let hi_ptr = core::hint::black_box(high_ptr).cast::<__m512i>();
                 for g in 0..8 {
                     let lo = _mm512_loadu_si512(lo_ptr.add(g));
                     let hi = _mm512_loadu_si512(hi_ptr.add(g));

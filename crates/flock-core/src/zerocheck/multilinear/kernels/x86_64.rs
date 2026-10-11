@@ -358,7 +358,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         // Select the odd F128 lanes of eight consecutive eq_lo values.
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
-        let wsplit = zc_wsplit_enabled();
+        let wsplit = !BAKE && zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         const B_ONES_BLOCK_PAIRS: usize = 128;
@@ -370,8 +370,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         // windows are then scheduled regardless of the per-window switches,
         // and every scheduled visit skips its window instead of consuming it.
         let canon_elide = BAKE && bake.is_some_and(|bk| bk.canonical_elide);
-        let b_ones_on = zc_b_ones_enabled() || canon_elide;
-        let b_sparse_on = zc_b_sparse_enabled() || canon_elide;
+        let b_ones_on = canon_elide || zc_b_ones_enabled();
+        let b_sparse_on = canon_elide || zc_b_sparse_enabled();
         let pair_in_b_block = pair_idx_base & (B_ONES_BLOCK_PAIRS - 1);
         let (mut b_special_head, mut b_special_kind) = match (b_ones_on, b_sparse_on) {
             (true, true) if pair_in_b_block == 0 => (0, B_SPECIAL_ONES),
@@ -393,14 +393,17 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         // GFNI batch fold: 32 consecutive pairs = 64 consecutive rows per
         // side prefolded in one bit-matrix batch (padded pairs fold zero
         // rows; the consume path below skips them exactly as before).
+        // When `BAKE` is true, `zc_r2_bake_route_ok` already established
+        // `!WRITE && use_batch && regfold_on && tr_emit && tr_bcast`.
         let use_batch = cfg!(all(target_feature = "avx512vbmi", target_feature = "gfni"))
-            && mats.is_some()
-            && lo_size >= 32
-            && lo_size.is_multiple_of(32);
+            && (BAKE
+                || (mats.is_some()
+                    && lo_size >= 32
+                    && lo_size.is_multiple_of(32)));
         // Resolved once per worker chunk: the window loop below calls
         // out-of-line leaves, so a latch read inside `load_window!` would be
         // re-evaluated on every window.
-        let regfold_on = zc_regfold_enabled();
+        let regfold_on = BAKE || zc_regfold_enabled();
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let fa = &mut (*fa_store.as_mut_ptr()).0;
@@ -422,14 +425,15 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         // scalar tail (and the regfold-off arm) index the cache BY ROW and
         // must never see the residue-major layout.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        let tr_emit = !WRITE
-            && use_batch
-            && lo_size.is_multiple_of(8)
-            && zc_regfold_enabled()
-            && zc_r2_tr_enabled();
+        let tr_emit = BAKE
+            || (!WRITE
+                && use_batch
+                && lo_size.is_multiple_of(8)
+                && regfold_on
+                && zc_r2_tr_enabled());
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-        let tr_bcast = tr_emit && zc_r2_bcast_enabled();
+        let tr_bcast = BAKE || (tr_emit && zc_r2_bcast_enabled());
         // Use the same basis columns as build_row_fold_mats, not a
         // hard-coded ONE: arbitrary linear-map tests need not map ff to 1.
         // These two tiny values are derived once per worker chunk and never
@@ -682,7 +686,6 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
                 // Refill both caches for pairs x_lo..x_lo+32 (rows
                 // row_base+2*x_lo .. +64 per side) — the same bytes the
                 // gather path reads.
-                let m = mats.unwrap();
                 let g0 = row_base + 2 * x_lo;
                 // `g0 = 2 · (pair_idx_base + x_lo)` is the tile's global row
                 // start, so its block position decides the dead lines.
@@ -729,6 +732,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
                             &bk.b_mats[x_lo >> 5].0
                         }
                         _ => {
+                            let m = mats.unwrap();
                             gfni_fold64_rows_masked_tr_bcast(
                                 a_pkt.add(g0 * 8),
                                 m,
@@ -823,9 +827,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
                         ),
                     }
                 } else if tr_emit {
+                    let m = mats.unwrap();
                     gfni_fold64_rows_masked_tr(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked_tr(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 } else {
+                    let m = mats.unwrap();
                     gfni_fold64_rows_masked(a_pkt.add(g0 * 8), m, fa.as_mut_ptr(), dead);
                     gfni_fold64_rows_masked(b_pkt.add(g0 * 8), m, fb.as_mut_ptr(), dead);
                 }
@@ -1085,8 +1091,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         }
 
         // Small instances (lo_size ∈ {2, 4}) leave whole groups for the
-        // scalar path; identical arithmetic, one group at a time.
-        while x_lo + 2 <= lo_size {
+        // scalar path; identical arithmetic, one group at a time. `BAKE`
+        // requires `lo_size` to be a multiple of 32 and steps by 8 or 16,
+        // so `x_lo == lo_size` on loop exit and the scalar tail is dead.
+        while !BAKE && x_lo + 2 <= lo_size {
             let mut rows = [[F128::ZERO; 4]; 2];
             let mut any = false;
             for half in 0..2 {
@@ -1150,7 +1158,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
             for i in 0..8 {
                 let scaled = ghash_mul_x4(lane_w, acc[i].reduce_lanes());
                 let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
-                out[i] = tail[i].reduce() + (l[0] + l[1] + l[2] + l[3]);
+                out[i] = l[0] + l[1] + l[2] + l[3];
             }
         } else {
             for i in 0..8 {
@@ -3763,6 +3771,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 /// # Safety
 /// As [`gfni_fold64_rows_masked_tr`].
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     rows: *const u8,
@@ -3799,6 +3808,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
 /// As [`gfni_fold64_rows_masked_tr_bcast`], with `mats4` exposing `4 · 128`
 /// readable `u64`.
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4(
     rows: *const u8,
