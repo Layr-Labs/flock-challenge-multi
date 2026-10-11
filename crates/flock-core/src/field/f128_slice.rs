@@ -267,6 +267,28 @@ pub(crate) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     }
 }
 
+/// Fold 64 adjacent banks using the existing 16-bank weights followed by
+/// the exact r4/r5 nested fold, retaining the four-slot mid values in registers.
+/// Only the ranked AVX-512 producer uses this helper; every output is overwritten.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(crate) fn fold64_banked_nested(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    assert_eq!(src.len(), 64 * dst.len(), "fold64 source geometry");
+    // SAFETY: the cfg guarantees both target features and the assertion
+    // covers all 64 source fields for each destination. The slices do not alias.
+    unsafe { x86_64::fold64_banked_nested(src, dst, w, r4, r5) }
+}
+
 #[cfg(test)]
 mod tests {
     /// `fold16_banked` (deferred-reduction AVX-512 kernel on x86; scalar

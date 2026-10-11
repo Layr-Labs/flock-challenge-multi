@@ -7279,34 +7279,25 @@ fn materialize_direct_fold8_f_for_precommit(
     use rayon::prelude::*;
 
     const SUB: usize = 256;
-    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     folded_f
         .par_chunks_mut(block_len)
         .enumerate()
-        .for_each_init(
-            || {
-                crate::scratch::LocalBuf::new(
-                    (4 * SUB).max(ALIGN64_MIN_F128),
-                    crate::scratch::fold_buf_pool_enabled(),
-                )
-            },
-            |mid4, (block, f_out)| {
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let mut slot = 0usize;
-                while slot < block_len {
-                    let n = SUB.min(block_len - slot);
-                    let m4 = &mut mid4[..4 * n];
-                    crate::field::f128_slice::fold16_banked(
-                        &f_in[64 * slot..64 * (slot + n)],
-                        m4,
-                        fold16_weight,
-                    );
-                    crate::field::f128_slice::fold4_nested(m4, &mut f_out[slot..slot + n], r4, r5);
-                    slot += n;
-                }
-            },
-        );
+        .for_each(|(block, f_out)| {
+            let start = 64 * block * block_len;
+            let f_in = &packed_witness[start..start + 64 * block_len];
+            let mut slot = 0usize;
+            while slot < block_len {
+                let n = SUB.min(block_len - slot);
+                crate::field::f128_slice::fold64_banked_nested(
+                    &f_in[64 * slot..64 * (slot + n)],
+                    &mut f_out[slot..slot + n],
+                    fold16_weight,
+                    r4,
+                    r5,
+                );
+                slot += n;
+            }
+        });
 }
 
 /// Materialize the exact ranked two-claim GFNI basis and M6 after folded_f is
