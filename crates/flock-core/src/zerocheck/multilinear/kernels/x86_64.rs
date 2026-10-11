@@ -3487,13 +3487,6 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         };
 
         #[rustfmt::skip]
-        const I: [u8; 64] = [
-            56, 48, 40, 32, 24, 16, 8, 0, 57, 49, 41, 33, 25, 17, 9, 1,
-            58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3,
-            60, 52, 44, 36, 28, 20, 12, 4, 61, 53, 45, 37, 29, 21, 13, 5,
-            62, 54, 46, 38, 30, 22, 14, 6, 63, 55, 47, 39, 31, 23, 15, 7,
-        ];
-        #[rustfmt::skip]
         const BSWAP: [u8; 64] = [
             7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
             23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24,
@@ -3503,9 +3496,12 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
 
         let p0 = input_planes(rows0);
         let p1 = input_planes(rows1);
-        let perm_i = _mm512_loadu_si512(I.as_ptr().cast::<__m512i>());
         let bswap = _mm512_loadu_si512(BSWAP.as_ptr().cast::<__m512i>());
-        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        // BT[I[i]] == BSWAP[i]: the two full-register byte permutations
+        // compose to a qword-local byte reverse. GFNI uses one matrix per
+        // qword, so the final byte reverse commutes into its constant data
+        // operand. Reversing 0x8040201008040201 gives this data constant.
+        let reversed_id = _mm512_set1_epi64(0x0102040810204080u64 as i64);
         let dst = out.as_mut_ptr().cast::<__m512i>();
 
         let acc_lo: [__m512i; 8] =
@@ -3513,10 +3509,10 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         let lo_half = qword_transpose(acc_lo);
         for group in 0..8 {
             let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
-                id,
-                _mm512_permutexvar_epi8(perm_i, _mm512_permutexvar_epi8(bt, lo_half[group])),
+                reversed_id,
+                _mm512_shuffle_epi8(lo_half[group], bswap),
             );
-            _mm512_storeu_si512(dst.add(2 * group), _mm512_shuffle_epi8(t_lo, bswap));
+            _mm512_storeu_si512(dst.add(2 * group), t_lo);
         }
 
         let acc_hi: [__m512i; 8] =
@@ -3524,10 +3520,10 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         let hi_half = qword_transpose(acc_hi);
         for group in 0..8 {
             let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
-                id,
-                _mm512_permutexvar_epi8(perm_i, _mm512_permutexvar_epi8(bt, hi_half[group])),
+                reversed_id,
+                _mm512_shuffle_epi8(hi_half[group], bswap),
             );
-            _mm512_storeu_si512(dst.add(2 * group + 1), _mm512_shuffle_epi8(t_hi, bswap));
+            _mm512_storeu_si512(dst.add(2 * group + 1), t_hi);
         }
     }
 }
