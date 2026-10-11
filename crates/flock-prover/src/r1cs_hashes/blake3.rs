@@ -1426,6 +1426,43 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
     }
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            return self.fold_alpha_batched_x86(alpha, eq_inner);
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        )))]
+        self.fold_alpha_batched_fallback(alpha, eq_inner)
+    }
+}
+
+impl Blake3AdjointPlan {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq,sse4.1")]
+    #[inline(never)]
+    unsafe fn fold_alpha_batched_x86(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        self.fold_alpha_batched_fallback(alpha, eq_inner)
+    }
+
+    #[inline(always)]
+    fn fold_alpha_batched_fallback(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut acc = vec![F128::ZERO; self.n_nodes];
 
@@ -2775,6 +2812,48 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
         _ => None,
     };
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    if let (Some(preps), Some(init)) = (ranked_closed_preps.as_ref(), ranked_closed_init)
+        && w30_elided
+        && blake3_witgen8::ranked_static01_direct_enabled()
+    {
+        z.par_chunks_mut(group_f128)
+            .zip(a.par_chunks_mut(group_f128))
+            .zip(b.par_chunks_mut(group_f128))
+            .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+            .enumerate()
+            .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        let proj = blake3_witgen8::StreamProj {
+                            stage: core::ptr::null_mut(),
+                            out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                            out_stride: ab_block_bytes,
+                            out_bias: 2 * 64,
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided: true,
+                            w30_elided: true,
+                        };
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                            init,
+                            base,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            proj,
+                            &preps.0,
+                            [true; 3],
+                        );
+                    }
+                }
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            });
+        return;
+    }
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
