@@ -1219,6 +1219,13 @@ impl Round1AbWindowPlan {
         self.bcomplement_static
     }
 
+    /// True when both the two-image inverse-NTT table and residual B-complement
+    /// defaults are active (`table_images == 2 && residual_bcomplement`).
+    #[inline(always)]
+    pub fn is_ranked_default_two_image(&self) -> bool {
+        self.table_images == 2 && self.residual_bcomplement
+    }
+
     /// This plan specialised to one medium-window index: the static-B partials
     /// are dropped for every window whose plan is not live, so a producer that
     /// transforms several blocks at the same window index resolves the
@@ -1671,6 +1678,39 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[cold]
+#[inline(never)]
+unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_cold_img<
+    const BLK: usize,
+    const P: bool,
+>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: Round1AbTableImages,
+    table_images: u8,
+) {
+    unsafe {
+        match table_images {
+            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                8,
+            >(op, out, (imgs.0, imgs.1)),
+            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                4,
+            >(op, out, (imgs.0, imgs.1)),
+        }
+    }
+}
+
 #[inline(always)]
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
@@ -1695,22 +1735,19 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
     unsafe {
         // `table_images` is fixed for the whole plan; the incumbent two-image
         // leaf is the default arm.
-        match plan.table_images {
-            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                8,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            4 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                4,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+        if plan.table_images == 2 {
+            kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
                 off.as_ptr(),
                 out,
                 (imgs.0, imgs.1),
-            ),
+            );
+        } else {
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_cold_img::<BLK, P>(
+                off.as_ptr(),
+                out,
+                imgs,
+                plan.table_images,
+            );
         }
     }
     #[cfg(not(all(
@@ -1720,6 +1757,110 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     )))]
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_two_image<
+    const BLK: usize,
+    const P: bool,
+>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(plan.table_images, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[cold]
+#[inline(never)]
+unsafe fn round1_ab_inner_window_from_offsets_nt2_residual_cold<const P: bool>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    keep: u8,
+) {
+    unsafe {
+        use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        let im = (imgs.0, imgs.1);
+        match (plan.residual_bcomplement, plan.table_images) {
+            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
+            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
+            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
+            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
+            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
+            (false, _) => {
+                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+                    op, out, im, keep,
+                )
+            }
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual_two_image<const P: bool>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    keep: u8,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert!(plan.residual_bcomplement);
+    debug_assert_eq!(plan.table_images, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!(keep == 0xfc || keep == 0x0f);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        residual_img::<P, 2, true>(off.as_ptr(), out, (imgs.0, imgs.1), keep);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("residual nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
@@ -1745,20 +1886,10 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
     unsafe {
         use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
         let op = off.as_ptr();
-        let im = (imgs.0, imgs.1);
-        // Both selectors are fixed for the plan. The incumbent kernel is the
-        // default two-image table with `FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`.
-        match (plan.residual_bcomplement, plan.table_images) {
-            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
-            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
-            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
-            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
-            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
-            (false, _) => {
-                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
-                    op, out, im, keep,
-                )
-            }
+        if plan.residual_bcomplement && plan.table_images == 2 {
+            residual_img::<P, 2, true>(op, out, (imgs.0, imgs.1), keep);
+        } else {
+            round1_ab_inner_window_from_offsets_nt2_residual_cold::<P>(op, out, plan, imgs, keep);
         }
     }
     #[cfg(not(all(
@@ -3581,6 +3712,114 @@ impl Drop for WorkerStateAbOnly {
 /// AB half of [`process_one_x_hi_with_precomputed_ab_fold4`], instruction for
 /// instruction: same window order, same kernels, same band-end plane fold.
 /// Every C statement (and every `c_packed` byte) is gone.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn process_one_x_hi_ab_only_ranked_direct<const COMPACT: bool, const ODD_N: usize>(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo: usize,
+    ab_inner_ptr: *const u8,
+    eq_hi_val: F128,
+    eq_bot: &[F128],
+    mats_ptr: *const [u64; 256],
+    bank_bits: usize,
+    plane_cache: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    let plane_len = eq_bot.len() * 16 * ELL;
+    if state.plane_banks.len() != plane_len {
+        if state.cached_plane_banks {
+            state.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+        }
+        state.plane_banks = if plane_cache {
+            state.cached_plane_banks = true;
+            take_ranked_ab_plane()
+        } else {
+            crate::alloc_uninit_vec(plane_len)
+        };
+    }
+
+    let bank_mask = (1usize << bank_bits) - 1;
+    let first_write_limit = 1usize << bank_bits;
+    let planes_base = state.plane_banks.as_mut_ptr().cast::<[u8; 16 * ELL]>();
+    let block_stride = if COMPACT {
+        RANKED_AB_COMPACT_BLOCK_BYTES
+    } else {
+        32 * ELL
+    };
+    let odd_off = if COMPACT { 14 * ELL } else { 16 * ELL };
+
+    unsafe {
+        let mut x_outer_lo = 0usize;
+        while x_outer_lo < first_write_limit {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let block_base = (x_outer >> 1) * block_stride + if COMPACT { 0 } else { 2 * ELL };
+            let next_base =
+                ((x_outer + ZC_R1AB_PF_WINDOWS) >> 1) * block_stride + if COMPACT { 0 } else { 2 * ELL };
+            let mats_even = &*mats_ptr.add(x_outer_lo >> bank_bits);
+            let bank_even = &mut *planes_base.add(x_outer_lo & bank_mask);
+            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_spread_exact::<2, 16, true>(
+                ab_inner_ptr.add(block_base),
+                mats_even,
+                bank_even,
+                ab_inner_ptr.wrapping_add(next_base),
+            );
+
+            let x_odd = x_outer_lo + 1;
+            let mats_odd = &*mats_ptr.add(x_odd >> bank_bits);
+            let bank_odd = &mut *planes_base.add(x_odd & bank_mask);
+            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_spread_exact::<0, ODD_N, true>(
+                ab_inner_ptr.add(block_base + odd_off),
+                mats_odd,
+                bank_odd,
+                ab_inner_ptr.wrapping_add(next_base + odd_off),
+            );
+            x_outer_lo += 2;
+        }
+
+        while x_outer_lo < big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let block_base = (x_outer >> 1) * block_stride + if COMPACT { 0 } else { 2 * ELL };
+            let next_base =
+                ((x_outer + ZC_R1AB_PF_WINDOWS) >> 1) * block_stride + if COMPACT { 0 } else { 2 * ELL };
+            let mats_even = &*mats_ptr.add(x_outer_lo >> bank_bits);
+            let bank_even = &mut *planes_base.add(x_outer_lo & bank_mask);
+            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_spread_exact::<2, 16, false>(
+                ab_inner_ptr.add(block_base),
+                mats_even,
+                bank_even,
+                ab_inner_ptr.wrapping_add(next_base),
+            );
+
+            let x_odd = x_outer_lo + 1;
+            let mats_odd = &*mats_ptr.add(x_odd >> bank_bits);
+            let bank_odd = &mut *planes_base.add(x_odd & bank_mask);
+            kernels::x86_64::convert_ab_nomul_x86_gfni_direct_spread_exact::<0, ODD_N, false>(
+                ab_inner_ptr.add(block_base + odd_off),
+                mats_odd,
+                bank_odd,
+                ab_inner_ptr.wrapping_add(next_base + odd_off),
+            );
+            x_outer_lo += 2;
+        }
+
+        kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+            &mut state.plane_banks,
+            eq_bot,
+            eq_hi_val,
+            &mut state.local_res_ab,
+        );
+    }
+}
+
 /// `DIRECT` only changes the GFNI input loads: the caller selects it once
 /// per band for the ranked residual `(first, end) = (2, 16), (0, 15)` pair.
 #[inline(never)]
@@ -3601,6 +3840,99 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    if DIRECT
+        && plane_first_write
+        && ranked_one_rows_elided
+        && within_outer_mask == 1
+        && big_lo_size.is_multiple_of(2)
+        && zc_r1ab_pf_enabled()
+        && zc_r1ab_pf_spread_enabled()
+        && r1_eqfold_x4_enabled()
+    {
+        if let Some((eq_bot, mats, bank_bits)) = eq_fold {
+            let n_lo = n_lo_and_inner - N_INNER;
+            let first_write_limit = 1usize << bank_bits;
+            if bank_bits >= 1
+                && first_write_limit <= big_lo_size
+                && mats.len() == (big_lo_size >> bank_bits) * 256
+            {
+                let mats_ptr = mats.as_ptr().cast::<[u64; 256]>();
+                let ab_ptr = ab_inner.as_ptr();
+                if b_med_counts == [16, 14] {
+                    unsafe {
+                        if ranked_compact {
+                            process_one_x_hi_ab_only_ranked_direct::<true, 14>(
+                                x_hi,
+                                big_lo_size,
+                                n_lo,
+                                ab_ptr,
+                                eq_hi_val,
+                                eq_bot,
+                                mats_ptr,
+                                bank_bits,
+                                plane_cache,
+                                state,
+                            );
+                        } else {
+                            process_one_x_hi_ab_only_ranked_direct::<false, 14>(
+                                x_hi,
+                                big_lo_size,
+                                n_lo,
+                                ab_ptr,
+                                eq_hi_val,
+                                eq_bot,
+                                mats_ptr,
+                                bank_bits,
+                                plane_cache,
+                                state,
+                            );
+                        }
+                    }
+                    return;
+                } else if b_med_counts == [16, 15] {
+                    unsafe {
+                        if ranked_compact {
+                            process_one_x_hi_ab_only_ranked_direct::<true, 15>(
+                                x_hi,
+                                big_lo_size,
+                                n_lo,
+                                ab_ptr,
+                                eq_hi_val,
+                                eq_bot,
+                                mats_ptr,
+                                bank_bits,
+                                plane_cache,
+                                state,
+                            );
+                        } else {
+                            process_one_x_hi_ab_only_ranked_direct::<false, 15>(
+                                x_hi,
+                                big_lo_size,
+                                n_lo,
+                                ab_ptr,
+                                eq_hi_val,
+                                eq_bot,
+                                mats_ptr,
+                                bank_bits,
+                                plane_cache,
+                                state,
+                            );
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",

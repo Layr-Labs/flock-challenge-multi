@@ -2006,6 +2006,68 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     }
 }
 
+/// Ranked exact-spread twin of [`convert_ab_nomul_x86_gfni_direct`] when the
+/// window `2` steps ahead has identical `(FIRST, N)` geometry (`ZC_R1AB_PF_WINDOWS == 2`
+/// and `within_outer_mask == 1`). Interleaves each `prefetcht0` directly with
+/// the corresponding `_mm512_loadu_si512` with zero dynamic branches.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+pub(crate) unsafe fn convert_ab_nomul_x86_gfni_direct_spread_exact<
+    const FIRST: usize,
+    const N: usize,
+    const FIRST_WRITE: bool,
+>(
+    live_rows: *const u8,
+    mats: &[u64; 256],
+    bank_planes: &mut [u8; 16 * ELL],
+    next_window: *const u8,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!((FIRST == 2 && N == 16) || (FIRST == 0 && (N == 15 || N == 14)));
+    unsafe {
+        let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
+        for bm in FIRST..N {
+            let off = (bm - FIRST) * ELL;
+            _mm_prefetch(next_window.wrapping_add(off).cast::<i8>(), _MM_HINT_T0);
+            rows[bm] = _mm512_loadu_si512(live_rows.add(off).cast::<__m512i>());
+        }
+        for k in 0..16 {
+            let plane_ptr = bank_planes.as_mut_ptr().add(k * ELL).cast::<__m512i>();
+            let mut acc = if FIRST_WRITE {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr.cast_const())
+            };
+            let mut bm = FIRST;
+            while bm + 1 < N {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm + 1],
+                    _mm512_set1_epi64(mats[(bm + 1) * 16 + k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                bm += 2;
+            }
+            if bm < N {
+                let g = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[bm],
+                    _mm512_set1_epi64(mats[bm * 16 + k] as i64),
+                );
+                acc = _mm512_xor_si512(acc, g);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
 /// 8x64 byte transpose: eight 64-byte rows in, eight registers out with
 /// `out[k].byte[8L + b] = rows[REV ? 7 - b : b][8k + L]` — i.e. output
 /// register `k` holds, in qword `L`, the eight rows' byte `8k + L`.
