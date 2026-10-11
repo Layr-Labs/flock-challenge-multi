@@ -660,6 +660,11 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                         ptr, lanes, r, twiddles, 0,
                     );
                 }
+                4 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
                 1 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
                         ptr, lanes, r, twiddles, 0,
