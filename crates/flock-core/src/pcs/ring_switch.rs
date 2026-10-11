@@ -2990,6 +2990,44 @@ fn df8_state_direct_disabled() -> bool {
     *OFF
 }
 
+/// Advance the two initialized 64-word row planes by the field generator.
+/// Keep the recurrence out of the mapping caller: no row-vector SSA value
+/// then needs to survive the read-only GFNI leaf's call-clobbered registers.
+///
+/// # Safety
+/// Both pointers cover 64 initialized u64s in disjoint writable regions.
+/// The caller provides the same target features as the W-state builder.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
+unsafe fn direct_fold8_w_advance_gfni(low_ptr: *mut u64, high_ptr: *mut u64) {
+    use core::arch::x86_64::*;
+    // SAFETY: eight unaligned vector loads/stores cover exactly 64 words
+    // per plane; both old halves are loaded before either half is written.
+    unsafe {
+        let poly = _mm512_set1_epi64(0x87);
+        let zero = _mm512_setzero_si512();
+        let lo_ptr = low_ptr.cast::<__m512i>();
+        let hi_ptr = high_ptr.cast::<__m512i>();
+        for g in 0..8 {
+            let lo = _mm512_loadu_si512(lo_ptr.add(g));
+            let hi = _mm512_loadu_si512(hi_ptr.add(g));
+            let new_hi = _mm512_shldi_epi64::<1>(hi, lo);
+            let lo_shl = _mm512_add_epi64(lo, lo);
+            let mask = _mm512_cmpgt_epi64_mask(zero, hi);
+            let new_lo = _mm512_mask_xor_epi64(lo_shl, mask, lo_shl, poly);
+            _mm512_storeu_si512(lo_ptr.add(g), new_lo);
+            _mm512_storeu_si512(hi_ptr.add(g), new_hi);
+        }
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -3020,8 +3058,6 @@ unsafe fn direct_fold8_w_state_gfni(
             high_ptr.add(lane).write(low_eq[lane].hi);
         }
     }
-    let poly = _mm512_set1_epi64(0x87);
-    let zero = _mm512_setzero_si512();
     for bit in 0..n_packed {
         // SAFETY: both input rows hold 64 initialized words, the destination
         // row covers 64 F128s, and the enclosing cfg supplies every feature.
@@ -3035,18 +3071,7 @@ unsafe fn direct_fold8_w_state_gfni(
                 core::ptr::null(),
             );
             if bit + 1 < n_packed {
-                let lo_ptr = low_ptr.cast::<__m512i>();
-                let hi_ptr = high_ptr.cast::<__m512i>();
-                for g in 0..8 {
-                    let lo = _mm512_loadu_si512(lo_ptr.add(g));
-                    let hi = _mm512_loadu_si512(hi_ptr.add(g));
-                    let new_hi = _mm512_shldi_epi64::<1>(hi, lo);
-                    let lo_shl = _mm512_add_epi64(lo, lo);
-                    let mask = _mm512_cmpgt_epi64_mask(zero, hi);
-                    let new_lo = _mm512_mask_xor_epi64(lo_shl, mask, lo_shl, poly);
-                    _mm512_storeu_si512(lo_ptr.add(g), new_lo);
-                    _mm512_storeu_si512(hi_ptr.add(g), new_hi);
-                }
+                direct_fold8_w_advance_gfni(low_ptr, high_ptr);
             }
         }
     }
