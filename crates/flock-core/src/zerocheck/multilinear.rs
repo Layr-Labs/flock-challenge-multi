@@ -1946,6 +1946,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
         false,
+        false,
     )
 }
 
@@ -1953,6 +1954,8 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
 /// retained eq split and the output tile layout: `out_lm` stores lane-major
 /// sixteen-element tiles for a lane-major next cascade level (see
 /// [`zc_lane_major_handoff_on`]); it requires eight-group chunks.
+/// `ranked_b_canonical` is supplied only by the identity-C ranked witness
+/// capture, never inferred from dimensions or the equality tensor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     a_packed: &[u8],
@@ -1968,7 +1971,15 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
+    ranked_b_canonical: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    // The brand and the exact circuit shape are both required. Generic callers
+    // use false even when they happen to have the same dimensions.
+    let ranked_b_canonical = ranked_b_canonical
+        && m == 32
+        && k_skip == 6
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409;
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -2147,6 +2158,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     wtab_arg,
                     c4_lm,
                     out_lm,
+                    ranked_b_canonical,
                 )
             };
             #[cfg(not(all(
@@ -5669,6 +5681,7 @@ mod tests {
                             wtab_test.as_deref(),
                             c4_lm,
                             out_lm,
+                            false,
                         )
                     };
                     let baked = cfold_arg.is_some();
@@ -6491,7 +6504,7 @@ mod tests {
             let mut c4l = [F128::ZERO; 64];
             // SAFETY: as above; the lane-major twin writes sixteen F128s.
             unsafe {
-                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_lm(
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_lm::<0>(
                     poisoned.as_ptr(),
                     &cm,
                     c4l.as_mut_ptr(),

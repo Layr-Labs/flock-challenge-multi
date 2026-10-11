@@ -1037,6 +1037,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next,
                 eq_override,
                 lm_out,
+                r2_canon_rows.is_some(),
             );
             a_mlv = a4;
             b_mlv = b4;

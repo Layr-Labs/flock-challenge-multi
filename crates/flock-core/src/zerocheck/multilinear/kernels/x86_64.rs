@@ -2504,6 +2504,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     wtab: Option<&[F128]>,
     c4_lm: bool,
     out_lm: bool,
+    ranked_b_canonical: bool,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -2770,6 +2771,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         };
         let pf_on = zc_pkt_pf_enabled();
         let pf_spread = zc_pkt_pf_spread_enabled();
+        // Only the selected composed lane-major leaf substitutes inputs.
+        // Every other route retains its demand loads and prefetches.
+        let b_const_active = ranked_b_canonical && c4_lm_on;
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let fa = &mut (*fa_store.as_mut_ptr()).0;
@@ -2780,6 +2784,28 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 let x = $x_expr;
                 let ol = 2 * x; // local output index of group 0
                 let xg = out_base + ol;
+                // A tile is 64 packed rows / 16 composed outputs. A ranked
+                // block has 256 packed rows / 64 composed outputs.
+                let b_mode = if b_const_active {
+                    match xg & 63 {
+                        0 => 1u8,
+                        48 => 2u8,
+                        _ => 0u8,
+                    }
+                } else {
+                    0u8
+                };
+                // Hints target a future tile, not the current tile. Suppress
+                // the same known lines there, including every split phase.
+                let b_pf_keep = if b_const_active {
+                    match (xg + 16 * pf_tiles) & 63 {
+                        0 => 0xfcu8,
+                        48 => 0x3fu8,
+                        _ => 0xffu8,
+                    }
+                } else {
+                    0xffu8
+                };
                 let cache = if use_batch {
                     #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
                     {
@@ -2788,18 +2814,23 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         if use_c4 {
                             let c = cfold.unwrap();
                             if c4_lm_on {
-                                gfni_fold64_rows_masked_c4_bcast_lm(
+                                gfni_fold64_rows_masked_c4_bcast_lm::<0>(
                                     a_pkt.add(4 * xg * 8),
                                     c,
                                     fa.as_mut_ptr(),
                                     dead,
                                 );
-                                gfni_fold64_rows_masked_c4_bcast_lm(
-                                    b_pkt.add(4 * xg * 8),
-                                    c,
-                                    fb.as_mut_ptr(),
-                                    dead,
-                                );
+                                match b_mode {
+                                    1 => gfni_fold64_rows_masked_c4_bcast_lm::<1>(
+                                        b_pkt.add(4 * xg * 8), c, fb.as_mut_ptr(), dead,
+                                    ),
+                                    2 => gfni_fold64_rows_masked_c4_bcast_lm::<2>(
+                                        b_pkt.add(4 * xg * 8), c, fb.as_mut_ptr(), dead,
+                                    ),
+                                    _ => gfni_fold64_rows_masked_c4_bcast_lm::<0>(
+                                        b_pkt.add(4 * xg * 8), c, fb.as_mut_ptr(), dead,
+                                    ),
+                                }
                             } else if c4_bcast {
                                 gfni_fold64_rows_masked_c4_bcast(
                                     a_pkt.add(4 * xg * 8),
@@ -2850,10 +2881,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                     a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                     core::arch::x86_64::_MM_HINT_T0,
                                 );
-                                _mm_prefetch(
-                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T0,
-                                );
+                                if b_pf_keep & (1u8 << l) != 0 {
+                                    _mm_prefetch(
+                                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                        core::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2926,10 +2959,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_pf_keep & (1u8 << l) != 0 {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
                 let ap = a_out.as_mut_ptr().add(ol);
@@ -2969,10 +3004,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_pf_keep & (1u8 << l) != 0 {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                     (a0, a1, a2, a3, b0, b1, b2, b3)
@@ -2997,10 +3034,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_pf_keep & (1u8 << l) != 0 {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                     let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
@@ -3014,10 +3053,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_pf_keep & (1u8 << l) != 0 {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
                 let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -4481,7 +4522,10 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 /// every output field element is the incumbent's.
 ///
 /// # Safety
-/// As [`gfni_fold64_rows_masked_c4`].
+/// As [`gfni_fold64_rows_masked_c4`]. `B_MODE = 0` preserves all parent
+/// dead-line semantics. `B_MODE = 1` or `2` requires the circuit brand and
+/// first or last tile respectively: skipped lines equal the exact constants
+/// substituted below. Those modes are never selected for generic witnesses.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4493,7 +4537,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 // rayon closure's inlining shape unchanged.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
-pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm<const B_MODE: u8>(
     rows: *const u8,
     m: &CFoldMats,
     out: *mut F128,
@@ -4507,7 +4551,22 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
     // supplies each intrinsic.
     unsafe {
         let mut z = [_mm512_setzero_si512(); 8];
-        if dead_lines == 0 {
+        if B_MODE == 1 {
+            // Circuit-branded first tile: rows 0..16 are all ones.
+            z[0] = _mm512_set1_epi64(-1);
+            z[1] = _mm512_set1_epi64(-1);
+            for i in 2..8 {
+                z[i] = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+        } else if B_MODE == 2 {
+            // Circuit-branded last tile: row 240 has 49 live bits; all
+            // remaining rows are padding. Other six lines stay fully live.
+            for i in 0..6 {
+                z[i] = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            }
+            z[6] = _mm512_setr_epi64(0x0001_ffff_ffff_ffff, 0, 0, 0, 0, 0, 0, 0);
+            // z[7] retains zero; neither known input line is demand-loaded.
+        } else if dead_lines == 0 {
             for (i, slot) in z.iter_mut().enumerate() {
                 *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
             }
