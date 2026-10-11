@@ -1476,6 +1476,7 @@ fn st_fmp_run(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 unsafe fn st_fmp_fold4(
@@ -1542,6 +1543,7 @@ impl AdditiveNttF128 {
         }
     }
 
+    #[inline]
     pub fn log_domain_size(&self) -> usize {
         self.evals.len()
     }
@@ -1553,6 +1555,7 @@ impl AdditiveNttF128 {
     ///
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
         debug_assert!(layer < self.log_domain_size());
         debug_assert!(block < 1usize << layer);
@@ -2414,6 +2417,7 @@ impl AdditiveNttF128 {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_fused2_publish<const ALIGNED_ZMM: bool>(
@@ -2428,6 +2432,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        tw2: &[[[F128; 3]; 16]],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2457,7 +2462,16 @@ impl AdditiveNttF128 {
                     );
                 }
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2486,6 +2500,7 @@ impl AdditiveNttF128 {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_publish2<const ALIGNED_ZMM: bool>(
@@ -2498,6 +2513,7 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2: &[[[F128; 3]; 16]],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2512,7 +2528,16 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2555,17 +2580,14 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
         // this block's 64 logical rows.
         unsafe {
-            for m in 0..16 {
-                let outer_block = block * 16 + m;
-                let t_outer = self.twiddle(3 + 4, outer_block);
-                let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
                 let k = 4 * m;
                 let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                 let step = g2_stride * row_len;
@@ -2650,6 +2672,19 @@ impl AdditiveNttF128 {
                     tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
                 }
                 tw
+            })
+            .collect();
+
+        let tw2: Vec<[[F128; 3]; 16]> = (0..8)
+            .map(|block| {
+                core::array::from_fn(|m| {
+                    let outer_block = block * 16 + m;
+                    [
+                        self.twiddle(LAYER + 4, outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block + 1),
+                    ]
+                })
             })
             .collect();
 
@@ -2892,6 +2927,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2905,6 +2941,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2927,11 +2964,7 @@ impl AdditiveNttF128 {
                             tw,
                         );
                     }
-                    for m in 0..16 {
-                        let outer_block = block * 16 + m;
-                        let t_outer = self.twiddle(LAYER + 4, outer_block);
-                        let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
-                        let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                    for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2[block].iter().enumerate() {
                         let p = region.add(perm(4 * m) * row_len);
                         let step = g2_stride * row_len;
                         let a = std::slice::from_raw_parts_mut(p, lanes2);
@@ -3004,11 +3037,11 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC

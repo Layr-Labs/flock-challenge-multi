@@ -1372,6 +1372,7 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    #[allow(dead_code)]
     ranked_preps: Option<&'t RankedClosedWindowPreps>,
 }
 
@@ -1409,14 +1410,14 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t, const FLUSH: bool> {
+struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
 }
 
-impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
+impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOSED> {
     #[inline(always)]
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
@@ -1436,7 +1437,7 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
             // must still publish the completed A/B epoch.
             let static_b = FLUSH
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
-                && self.ranked_static;
+                && (RANKED_CLOSED || self.ranked_static);
             if !static_b {
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
@@ -1445,9 +1446,13 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
                 if WORD + 1 == RING_WORDS {
-                    (*self.drain).drain_range(16, 16, RING_WORDS - 16);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
                 } else {
-                    (*self.drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(
+                        WORD + 1 - RING_WORDS,
+                        0,
+                        RING_WORDS,
+                    );
                 }
             }
         }
@@ -1958,6 +1963,30 @@ fn ranked_static01_direct_enabled() -> bool {
 }
 
 impl Drain8<'_> {
+    #[inline(always)]
+    unsafe fn drain_range_gen<const RANKED_CLOSED: bool>(
+        &mut self,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+            if RANKED_CLOSED {
+                let preps = self.ranked_preps.unwrap_unchecked();
+                self.drain_range_spread_ranked_closed_exact(
+                    &self.proj,
+                    preps,
+                    base_word,
+                    ring_word,
+                    words,
+                );
+                return;
+            }
+            self.drain_range(base_word, ring_word, words);
+        }
+    }
+
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
@@ -2438,8 +2467,9 @@ unsafe fn dump_elide_win(
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide(
-    prepared: PreparedInputs,
+#[inline(always)]
+unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>(
+    prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
@@ -2449,6 +2479,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
     ranked_preps: Option<&RankedClosedWindowPreps>,
 ) {
     unsafe {
+        let ranked_static = RANKED_CLOSED || ranked_static;
         let cv_v = prepared.cv;
         let m = prepared.message;
         let tlo = prepared.counter_lo;
@@ -2526,15 +2557,16 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
         // epoch boundary — publish it here instead. Constant-folded away for
         // every ring long enough to reach the round stream.
         if RING_WORDS <= PROLOGUE_WORDS + 16 {
-            drain.drain_range(16, 16, RING_WORDS - 16);
+            drain.drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
         }
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false, RANKED_CLOSED>::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
+        let mut wb =
+            W8::<true, RANKED_CLOSED>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -2629,7 +2661,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
                 store_v8(bs.add(i) as *mut u32, zero);
             }
         }
-        drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain.drain_range_gen::<RANKED_CLOSED>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
@@ -2646,7 +2678,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
                 store_v8(bs.add(8 + w) as *mut u32, maxv);
             }
         }
-        drain.drain_range(0, 0, 16);
+        drain.drain_range_gen::<RANKED_CLOSED>(0, 0, 16);
     }
 }
 
@@ -2745,8 +2777,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
-        build_octa_witness_ab_stream_prepared_elide(
-            prepared,
+        build_octa_witness_ab_stream_prepared_elide::<false>(
+            &prepared,
             z,
             a,
             b,
@@ -2777,8 +2809,9 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(ranked_direct_dense_publish_enabled());
         debug_assert!(ranked_direct_dense_inline_enabled());
         debug_assert!(widen_maddubs_enabled());
-        build_octa_witness_ab_stream_prepared_elide(
-            prepare_closed_inputs(init, base),
+        let prepared = prepare_closed_inputs(init, base);
+        build_octa_witness_ab_stream_prepared_elide::<true>(
+            &prepared,
             z,
             a,
             b,

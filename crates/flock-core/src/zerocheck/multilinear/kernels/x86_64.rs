@@ -63,6 +63,7 @@ pub(crate) unsafe fn fold_round2_pair_x86_unchecked_8(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn fold_and_message_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -324,6 +325,14 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const BAKE: bool>(
     table_data: *const F128,
@@ -1175,6 +1184,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn fold2_and_message_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -1341,6 +1351,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn fold2_and_message_lookahead_x86_avx512(
     a_in: &[F128],
     b_in: &[F128],
@@ -2485,6 +2496,14 @@ unsafe fn transpose4_lanes(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     table_data: *const F128,
