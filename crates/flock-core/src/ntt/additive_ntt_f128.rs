@@ -1487,24 +1487,21 @@ unsafe fn st_fmp_fold4(
     stage_perm: bool,
     tw4: &[[F128; 15]],
 ) {
-    let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
     unsafe {
         for block in 0..8 {
             let region = bufp.add(block * 64 * row_len);
             let tw = &tw4[block];
-            for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                kernels::butterfly_fused_4layer_row(
-                    region.add(j * g4_base * row_len),
-                    g4_stride,
-                    row_len,
-                    lanes4,
-                    0,
-                    tw,
-                );
-            }
+            kernels::butterfly_fused_4layer_top_block(
+                region,
+                row_len,
+                sub_stride,
+                r,
+                lanes4_tail,
+                stage_perm,
+                tw,
+            );
         }
     }
 }
@@ -2428,6 +2425,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        tw2: &[[[F128; 3]; 16]; 8],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2436,7 +2434,6 @@ impl AdditiveNttF128 {
         debug_assert!(lanes2 == 64 || lanes4_tail == 4);
         debug_assert_eq!(base as usize % 16, 0);
         debug_assert!(!ALIGNED_ZMM || base as usize % 64 == 0);
-        let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
 
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows; the 16 quads partition the
@@ -2445,19 +2442,26 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 let tw = &tw4[block];
-                for j in 0..4 {
-                    let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
-                        region.add(j * g4_base * row_len),
-                        g4_stride,
-                        row_len,
-                        lanes4,
-                        0,
-                        tw,
-                    );
-                }
+                kernels::butterfly_fused_4layer_top_block(
+                    region,
+                    row_len,
+                    sub_stride,
+                    r,
+                    lanes4_tail,
+                    stage_perm,
+                    tw,
+                );
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2498,6 +2502,7 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2: &[[[F128; 3]; 16]; 8],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2512,7 +2517,16 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2555,17 +2569,14 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
         // this block's 64 logical rows.
         unsafe {
-            for m in 0..16 {
-                let outer_block = block * 16 + m;
-                let t_outer = self.twiddle(3 + 4, outer_block);
-                let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
                 let k = 4 * m;
                 let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                 let step = g2_stride * row_len;
@@ -2652,6 +2663,16 @@ impl AdditiveNttF128 {
                 tw
             })
             .collect();
+
+        let mut tw2 = [[[F128::ZERO; 3]; 16]; 8];
+        for (block, block_tw2) in tw2.iter_mut().enumerate() {
+            for (m, quad_tw) in block_tw2.iter_mut().enumerate() {
+                let outer_block = block * 16 + m;
+                quad_tw[0] = self.twiddle(LAYER + 4, outer_block);
+                quad_tw[1] = self.twiddle(LAYER + 5, 2 * outer_block);
+                quad_tw[2] = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+            }
+        }
 
         let src_addr = msg.as_ptr() as usize;
         let base_addr = data.as_mut_ptr() as usize;
@@ -2892,6 +2913,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2905,6 +2927,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2927,11 +2950,7 @@ impl AdditiveNttF128 {
                             tw,
                         );
                     }
-                    for m in 0..16 {
-                        let outer_block = block * 16 + m;
-                        let t_outer = self.twiddle(LAYER + 4, outer_block);
-                        let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
-                        let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                    for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2[block].iter().enumerate() {
                         let p = region.add(perm(4 * m) * row_len);
                         let step = g2_stride * row_len;
                         let a = std::slice::from_raw_parts_mut(p, lanes2);
@@ -3004,11 +3023,11 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
