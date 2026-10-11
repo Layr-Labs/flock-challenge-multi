@@ -2508,6 +2508,98 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
 
+    // Compact the deferred polynomial product triple into its actual two
+    // 128-bit limbs. Both shuffles are per 128-bit lane and require only
+    // AVX-512F: no stronger feature predicate than this kernel's existing gate.
+    #[derive(Clone, Copy)]
+    struct CompactProductX4 {
+        lo: __m512i,
+        hi: __m512i,
+    }
+
+    impl CompactProductX4 {
+        #[inline(always)]
+        unsafe fn zero() -> Self {
+            unsafe {
+                let z = _mm512_setzero_si512();
+                Self { lo: z, hi: z }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn add_parts(&mut self, lo: __m512i, hi: __m512i, mid: __m512i) {
+            unsafe {
+                // Per lane: [0, 0, mid.d0, mid.d1] and
+                // [mid.d2, mid.d3, 0, 0], respectively.
+                let mid_lo = _mm512_maskz_shuffle_epi32::<0x44>(0xCCCC, mid);
+                let mid_hi = _mm512_maskz_shuffle_epi32::<0xEE>(0x3333, mid);
+                self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, lo, mid_lo);
+                self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, hi, mid_hi);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
+            unsafe {
+                let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+                let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+                let mid = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x01>(x, y),
+                    _mm512_clmulepi64_epi128::<0x10>(x, y),
+                );
+                self.add_parts(lo, hi, mid);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn mul_acc2(&mut self, x0: __m512i, y0: __m512i, x1: __m512i, y1: __m512i) {
+            unsafe {
+                let lo = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x00>(x0, y0),
+                    _mm512_clmulepi64_epi128::<0x00>(x1, y1),
+                );
+                let hi = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x11>(x0, y0),
+                    _mm512_clmulepi64_epi128::<0x11>(x1, y1),
+                );
+                let mid0 = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x01>(x0, y0),
+                    _mm512_clmulepi64_epi128::<0x10>(x0, y0),
+                );
+                let mid1 = _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x01>(x1, y1),
+                    _mm512_clmulepi64_epi128::<0x10>(x1, y1),
+                );
+                self.add_parts(lo, hi, _mm512_xor_si512(mid0, mid1));
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn fold(self) -> F256Unreduced {
+            #[inline(always)]
+            unsafe fn xor_lanes(v: __m512i) -> __m128i {
+                unsafe {
+                    let l0 = _mm512_extracti32x4_epi32::<0>(v);
+                    let l1 = _mm512_extracti32x4_epi32::<1>(v);
+                    let l2 = _mm512_extracti32x4_epi32::<2>(v);
+                    let l3 = _mm512_extracti32x4_epi32::<3>(v);
+                    _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+                }
+            }
+            unsafe {
+                let lo = xor_lanes(self.lo);
+                let hi = xor_lanes(self.hi);
+                // SSE2 word extraction; avoids adding an SSE4.1 helper ABI.
+                F256Unreduced {
+                    r0: _mm_cvtsi128_si64(lo) as u64,
+                    r1: _mm_cvtsi128_si64(_mm_unpackhi_epi64(lo, lo)) as u64,
+                    r2: _mm_cvtsi128_si64(hi) as u64,
+                    r3: _mm_cvtsi128_si64(_mm_unpackhi_epi64(hi, hi)) as u64,
+                }
+            }
+        }
+    }
+
     let lo_size = eq_lo.len();
     // Lane-major output tiles exist only where the eight-group loop covers
     // the chunk (`out_lm` is also the `eq_lo` stride the caller checked).
@@ -2732,7 +2824,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let defer = zc_fold_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
-        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc = [CompactProductX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
