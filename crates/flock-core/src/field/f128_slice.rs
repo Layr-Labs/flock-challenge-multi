@@ -171,6 +171,35 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Write one scaled field slice directly into another: `dst[i] = scale * src[i]`.
+///
+/// Avoids zero-filling `dst` and reading those zeros back before XORing.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
+    assert_eq!(dst.len(), src.len(), "scaled slice length changed");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees one readable source per destination slot.
+    unsafe {
+        x86_64::scale_slice(dst, src, scale);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (value, &extra) in dst.iter_mut().zip(src) {
+        *value = scale * extra;
+    }
+}
+
 /// Fold adjacent pairs from `src` and `addend` at `r`, add the scaled folded
 /// addend, and write the result without materializing either intermediate:
 /// `dst[t] = fold_r(src)[j] + scale * fold_r(addend)[j]`, where
