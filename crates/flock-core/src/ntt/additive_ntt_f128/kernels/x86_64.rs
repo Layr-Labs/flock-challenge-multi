@@ -1510,6 +1510,7 @@ fn sparse_dense_geo_scalar_tail(
 
 /// # Safety
 /// The caller guarantees target features, pointer validity, and disjoint rows.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
@@ -1522,7 +1523,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl_nodiet::<0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1552,6 +1553,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 /// # Safety
 /// Same contract as [`butterfly_fused_4layer_row`]; in addition, row group
 /// `pf_r` must lie inside the same block.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     ptr: *mut F128,
@@ -1565,7 +1567,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
+            butterfly_fused_4layer_row_impl_nodiet::<H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1601,6 +1603,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// # Safety
 /// Same contract as [`butterfly_fused_4layer_row_pf`], with
 /// `sixteenth == S16` and `num_ntts == NN`.
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     const S16: usize,
@@ -1617,7 +1620,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     // values in the same impl body (a distinct monomorphization).
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+            butterfly_fused_4layer_row_impl_nodiet::<H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1636,6 +1639,62 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 twiddles,
                 pf_r,
             )
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_impl_nodiet<
+    const H: u8,
+    const S16: usize,
+    const NN: usize,
+>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    unsafe {
+        butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+            ptr,
+            sixteenth,
+            num_ntts,
+            active_lanes,
+            r,
+            twiddles,
+            pf_r,
+        );
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn butterfly_fused_4layer_row_scalar_tail(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    mut lane: usize,
+    active_lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    unsafe {
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
+        while lane < active_lanes {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
         }
     }
 }
@@ -1795,16 +1854,16 @@ unsafe fn butterfly_fused_4layer_row_impl<
             lane += 4;
         }
 
-        while lane < active_lanes {
-            let mut values = [F128::ZERO; 16];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *row(i).add(lane);
-            }
-            super::portable::butterfly_fused_4layer(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *row(i).add(lane) = *value;
-            }
-            lane += 1;
+        if lane < active_lanes {
+            butterfly_fused_4layer_row_scalar_tail(
+                ptr,
+                sixteenth,
+                num_ntts,
+                lane,
+                active_lanes,
+                r,
+                twiddles,
+            );
         }
     }
 }
@@ -1975,6 +2034,55 @@ fn low_twiddle_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn butterfly_fused_3layer_rows_scalar_dense_tail(
+    ptr: *mut F128,
+    num_ntts: usize,
+    mut lane: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    unsafe {
+        let row = |i: usize| ptr.add(i * num_ntts);
+        while lane < dense_lanes {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn butterfly_fused_3layer_rows_scalar_zero_odd_tail(
+    ptr: *mut F128,
+    num_ntts: usize,
+    mut lane: usize,
+    twiddles: &[F128; 7],
+) {
+    unsafe {
+        let row = |i: usize| ptr.add(i * num_ntts);
+        while lane < num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *row(i).add(lane);
+            }
+            super::portable::butterfly_fused_3layer_zero_odd(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *row(i).add(lane) = *value;
+            }
+            lane += 1;
+        }
+    }
+}
+
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
 /// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
@@ -2013,17 +2121,37 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // three layers, so a row is loaded once and stored once for 12
         // butterflies instead of the fused-two + single-layer pair's two
         // loads and two stores for the same 12.
+        // When `DIET && !LOW_INNER`, keeping all 7 `(t, t·x^64)` pairs as 14
+        // live ZMMs alongside 16 row ZMMs (`values: [[__m512i; 8]; 2]`) plus
+        // `MOD_POLY` and temporaries exceeds 32 ZMMs and spills 5–7 ZMMs.
+        // Storing `tw[3..7]` in compact `[__m128i; 2]` slots (`tw_compact`)
+        // keeps live ZMMs <= 26 and eliminates all ZMM stack spills/reloads.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 7];
+        let mut tw_compact = [(_mm_setzero_si128(), _mm_setzero_si128()); 4];
         // The high-one product needs only the original twiddle broadcast.
         tw[0] = if HIGH_ONE_OUTER {
             tw_x4::<false, false>(twiddles[0])
         } else {
             tw_x4::<LOW_OUTER, DIET>(twiddles[0])
         };
-        for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
-            *slot = tw_x4::<LOW_INNER, DIET>(*value);
+        if DIET && !LOW_INNER {
+            for i in 1..3 {
+                tw[i] = tw_x4::<false, true>(twiddles[i]);
+            }
+            for i in 0..4 {
+                let pair = tw_x4::<false, true>(twiddles[3 + i]);
+                tw_compact[i] = (
+                    _mm512_castsi512_si128(pair.0),
+                    _mm512_castsi512_si128(pair.1),
+                );
+            }
+        } else {
+            for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
+                *slot = tw_x4::<LOW_INNER, DIET>(*value);
+            }
         }
+        let tw_c_ptr = core::hint::black_box(tw_compact.as_ptr());
         let row = |i: usize| ptr.add(i * num_ntts);
         let mut lane = 0;
 
@@ -2083,7 +2211,16 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 }
             }
             for s in 0..4 {
-                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                let twiddle = if DIET && !LOW_INNER {
+                    let p = tw_c_ptr.add(s) as *const __m128i;
+                    (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    )
+                } else {
+                    tw[3 + s]
+                };
+                butterfly2!(values, 2 * s, 2 * s + 1, twiddle, LOW_INNER);
             }
 
             for (c, chunk) in values.iter().enumerate() {
@@ -2110,7 +2247,16 @@ unsafe fn butterfly_fused_3layer_rows_impl<
                 }
             }
             for s in 0..4 {
-                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                let twiddle = if DIET && !LOW_INNER {
+                    let p = tw_c_ptr.add(s) as *const __m128i;
+                    (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    )
+                } else {
+                    tw[3 + s]
+                };
+                butterfly!(values, 2 * s, 2 * s + 1, twiddle, LOW_INNER);
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -2118,16 +2264,15 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
             lane += 4;
         }
-        while lane < dense_lanes {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *row(i).add(lane);
-            }
-            super::portable::butterfly_fused_3layer(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *row(i).add(lane) = *value;
-            }
-            lane += 1;
+        if lane < dense_lanes {
+            butterfly_fused_3layer_rows_scalar_dense_tail(
+                ptr,
+                num_ntts,
+                lane,
+                dense_lanes,
+                twiddles,
+            );
+            lane = dense_lanes;
         }
 
         // Published zero tail: rows 1, 3, 5, 7 are zero here, so only the
@@ -2149,16 +2294,8 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
             lane += 4;
         }
-        while lane < num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *row(i).add(lane);
-            }
-            super::portable::butterfly_fused_3layer_zero_odd(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *row(i).add(lane) = *value;
-            }
-            lane += 1;
+        if lane < num_ntts {
+            butterfly_fused_3layer_rows_scalar_zero_odd_tail(ptr, num_ntts, lane, twiddles);
         }
     }
 }
