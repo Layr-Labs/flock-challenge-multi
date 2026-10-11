@@ -2805,168 +2805,211 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 v
             },
             |win, (g, (((z_out, a_out), b_out), ab_out))| {
-                let n_here = z_out.len() / F128_PER_BLOCK;
-                // The two window sides live back-to-back in one 64-aligned
-                // allocation: `[a windows | b windows]`, each 8 blocks of
-                // U32_PER_BLOCK words in the same row-major geometry as a/b.
-                let win_ab = if ab_nt && !ab_stream {
-                    debug_assert_eq!(win.len(), WIN_LINES);
-                    let wa = win.as_mut_ptr().cast::<u32>();
-                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
-                    Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
-                } else {
-                    None
-                };
-                let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
-                } else {
-                    None
-                };
-                // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
-                // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
-                // contiguous 512-word blocks disjoint from every witness buffer.
-                // Last rayon chunk may be 8-wide. `elide` skips only
-                // token-verified constant chunks of a/b/z; the windows are
-                // always written in full.
-                unsafe {
-                    for half in 0..(n_here / SIMD) {
-                        let base = GROUP * g + half * SIMD;
-                        let off = half * SIMD * F128_PER_BLOCK;
-                        // Streaming arm: the drain transforms each 64-byte
-                        // round-1 window as it is produced, straight into
-                        // this octa's ab_inner blocks.
-                        let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
-                                stage: st,
-                                out: ab_out
-                                    .as_mut_ptr()
-                                    .add(half * SIMD * ab_block_bytes),
-                                out_stride: ab_block_bytes,
-                                out_bias: if compact { 2 * 64 } else { 0 },
+                if let Some(preps) = ranked_closed_preps.as_ref() {
+                    let n_here = z_out.len() / F128_PER_BLOCK;
+                    let stage_ptr = win.as_mut_ptr().cast::<u32>();
+                    let init = unsafe { ranked_closed_init.unwrap_unchecked() };
+                    unsafe {
+                        for half in 0..(n_here / SIMD) {
+                            let base = GROUP * g + half * SIMD;
+                            let off = half * SIMD * F128_PER_BLOCK;
+                            let proj = blake3_witgen8::StreamProj {
+                                stage: stage_ptr,
+                                out: ab_out.as_mut_ptr().add(half * SIMD * COMPACT_BYTES_PER_BLOCK),
+                                out_stride: COMPACT_BYTES_PER_BLOCK,
+                                out_bias: 2 * 64,
                                 inv_table,
                                 plan: win_plan,
-                                one_rows_elided,
+                                one_rows_elided: true,
                                 w30_elided,
-                            }
-                        }).unwrap_unchecked();
-                        if let Some(preps) = ranked_closed_preps.as_ref() {
+                            };
                             blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
-                                ranked_closed_init.unwrap_unchecked(),
+                                init,
                                 base,
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
                                 proj,
                                 &preps.0,
-                                elide,
-                            );
-                        } else {
-                            // Lead 2: a full closed-form octa carries only
-                            // init/base into the witness kernel, which
-                            // generates all 25 draws directly in word-major
-                            // SIMD lanes. Slice input still borrows in place;
-                            // only a ragged closed octa uses the scalar
-                            // staging needed to preserve padding semantics.
-                            let staged: [Compression; SIMD];
-                            let octa = match blocks {
-                                crate::seed_pipe::BlockSource::Slice(s) => {
-                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                        s.get(base + j).unwrap_or(padding)
-                                    }))
-                                }
-                                crate::seed_pipe::BlockSource::Closed { init, len }
-                                    if base + SIMD <= len =>
-                                {
-                                    blake3_witgen8::OctaInputs::Closed { init, base }
-                                }
-                                crate::seed_pipe::BlockSource::Closed { init, len } => {
-                                    staged = std::array::from_fn(|j| {
-                                        let idx = base + j;
-                                        if idx < len {
-                                            crate::seed_pipe::gen_block(init, idx)
-                                        } else {
-                                            *padding
-                                        }
-                                    });
-                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
-                                        &staged[j]
-                                    }))
-                                }
-                            };
-                            blake3_witgen8::build_octa_witness_ab_stream_elide(
-                                octa,
-                                z_out.as_mut_ptr().add(off).cast::<u32>(),
-                                a_out.as_mut_ptr().add(off).cast::<u32>(),
-                                b_out.as_mut_ptr().add(off).cast::<u32>(),
-                                proj,
-                                elide,
+                                [true; 3],
                             );
                         }
-                        // Fused arm: project THIS octa's eight blocks now, off
-                        // the just-written windows, while they are L1-hot. Same
-                        // ascending block order as the incumbent loop below, so
-                        // ab_inner's NT stream stays sequential per thread.
-                        if let Some((win_a, win_b)) = win_ab {
-                            for j in 0..SIMD {
-                                if base + j < skip_blocks {
-                                    continue;
-                                }
-                                let a_bytes = std::slice::from_raw_parts(
-                                    win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let b_bytes = std::slice::from_raw_parts(
-                                    win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
-                                    BYTES_PER_BLOCK,
-                                );
-                                let blk = half * SIMD + j;
-                                let ab_blk =
-                                    &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
-                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                                );
-                            }
-                        }
                     }
-                }
-                // Incumbent arm — and, under `ab_nt`, only a ragged sub-octa tail
-                // the dump loop above could not cover (unreachable at every
-                // power-of-two shape ≥ 8; kept so the two arms stay observably
-                // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
-                    (n_here / SIMD) * SIMD
-                } else {
-                    0
-                };
-                assert!(!compact || j0 == n_here);
-                for j in j0..n_here {
-                    let block_idx = GROUP * g + j;
-                    if block_idx >= skip_blocks {
-                        let a_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let b_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
-                                BYTES_PER_BLOCK,
-                            )
-                        };
-                        let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
-                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                            a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
-                        );
-                    }
-                }
-                // Last NT store of the task in every arm — a/b's streams included.
-                if abinner_nt || z_nt || ab_nt {
                     flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                    return;
                 }
+                generate_round1_inner_octa_chunk_generic(
+                    win,
+                    g,
+                    z_out,
+                    a_out,
+                    b_out,
+                    ab_out,
+                    blocks,
+                    skip_blocks,
+                    inv_table,
+                    padding,
+                    elide,
+                    ab_nt,
+                    ab_stream,
+                    compact,
+                    ab_block_bytes,
+                    win_plan,
+                    one_rows_elided,
+                    w30_elided,
+                    abinner_nt,
+                    z_nt,
+                );
             },
         );
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_chunk_generic(
+    win: &mut [core::mem::MaybeUninit<AbWinLine>],
+    g: usize,
+    z_out: &mut [F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    ab_out: &mut [u8],
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    ab_stream: bool,
+    compact: bool,
+    ab_block_bytes: usize,
+    win_plan: flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan,
+    one_rows_elided: bool,
+    w30_elided: bool,
+    abinner_nt: bool,
+    z_nt: bool,
+) {
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
+    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+
+    let n_here = z_out.len() / F128_PER_BLOCK;
+    let win_ab = if ab_nt && !ab_stream {
+        debug_assert_eq!(win.len(), WIN_LINES);
+        let wa = win.as_mut_ptr().cast::<u32>();
+        Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+    } else {
+        None
+    };
+    let stage = if ab_stream {
+        debug_assert_eq!(win.len(), STAGE_LINES);
+        Some(win.as_mut_ptr().cast::<u32>())
+    } else {
+        None
+    };
+    unsafe {
+        for half in 0..(n_here / SIMD) {
+            let base = GROUP * g + half * SIMD;
+            let off = half * SIMD * F128_PER_BLOCK;
+            let proj = stage
+                .map(|st| blake3_witgen8::StreamProj {
+                    stage: st,
+                    out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                    out_stride: ab_block_bytes,
+                    out_bias: if compact { 2 * 64 } else { 0 },
+                    inv_table,
+                    plan: win_plan,
+                    one_rows_elided,
+                    w30_elided,
+                })
+                .unwrap_unchecked();
+            let staged: [Compression; SIMD];
+            let octa = match blocks {
+                crate::seed_pipe::BlockSource::Slice(s) => {
+                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                        s.get(base + j).unwrap_or(padding)
+                    }))
+                }
+                crate::seed_pipe::BlockSource::Closed { init, len } if base + SIMD <= len => {
+                    blake3_witgen8::OctaInputs::Closed { init, base }
+                }
+                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                    staged = std::array::from_fn(|j| {
+                        let idx = base + j;
+                        if idx < len {
+                            crate::seed_pipe::gen_block(init, idx)
+                        } else {
+                            *padding
+                        }
+                    });
+                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| &staged[j]))
+                }
+            };
+            blake3_witgen8::build_octa_witness_ab_stream_elide(
+                octa,
+                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                b_out.as_mut_ptr().add(off).cast::<u32>(),
+                proj,
+                elide,
+            );
+            if let Some((win_a, win_b)) = win_ab {
+                for j in 0..SIMD {
+                    if base + j < skip_blocks {
+                        continue;
+                    }
+                    let a_bytes = std::slice::from_raw_parts(
+                        win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
+                        BYTES_PER_BLOCK,
+                    );
+                    let b_bytes = std::slice::from_raw_parts(
+                        win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
+                        BYTES_PER_BLOCK,
+                    );
+                    let blk = half * SIMD + j;
+                    let ab_blk = &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
+                    flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                        a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                    );
+                }
+            }
+        }
+    }
+    let j0 = if win_ab.is_some() || stage.is_some() {
+        (n_here / SIMD) * SIMD
+    } else {
+        0
+    };
+    assert!(!compact || j0 == n_here);
+    for j in j0..n_here {
+        let block_idx = GROUP * g + j;
+        if block_idx >= skip_blocks {
+            let a_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    a_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                    BYTES_PER_BLOCK,
+                )
+            };
+            let b_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    b_out.as_ptr().add(j * F128_PER_BLOCK).cast::<u8>(),
+                    BYTES_PER_BLOCK,
+                )
+            };
+            let ab_blk = &mut ab_out[j * BYTES_PER_BLOCK..(j + 1) * BYTES_PER_BLOCK];
+            flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+            );
+        }
+    }
+    if abinner_nt || z_nt || ab_nt {
+        flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+    }
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck

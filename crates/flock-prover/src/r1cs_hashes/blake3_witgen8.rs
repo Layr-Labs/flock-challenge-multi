@@ -2758,6 +2758,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     }
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     init: u64,
