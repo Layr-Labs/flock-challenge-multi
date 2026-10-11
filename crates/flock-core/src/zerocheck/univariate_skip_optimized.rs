@@ -1219,6 +1219,13 @@ impl Round1AbWindowPlan {
         self.bcomplement_static
     }
 
+    /// True when both the two-image inverse-NTT table and residual B-complement
+    /// defaults are active (`table_images == 2 && residual_bcomplement`).
+    #[inline(always)]
+    pub fn is_ranked_default_two_image(&self) -> bool {
+        self.table_images == 2 && self.residual_bcomplement
+    }
+
     /// This plan specialised to one medium-window index: the static-B partials
     /// are dropped for every window whose plan is not live, so a producer that
     /// transforms several blocks at the same window index resolves the
@@ -1671,6 +1678,39 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static<const P
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[cold]
+#[inline(never)]
+unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_cold_img<
+    const BLK: usize,
+    const P: bool,
+>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: Round1AbTableImages,
+    table_images: u8,
+) {
+    unsafe {
+        match table_images {
+            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                8,
+            >(op, out, (imgs.0, imgs.1)),
+            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
+                BLK,
+                P,
+                4,
+            >(op, out, (imgs.0, imgs.1)),
+        }
+    }
+}
+
 #[inline(always)]
 #[allow(unused_variables)]
 pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
@@ -1695,22 +1735,19 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
     unsafe {
         // `table_images` is fixed for the whole plan; the incumbent two-image
         // leaf is the default arm.
-        match plan.table_images {
-            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                8,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            4 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<
-                BLK,
-                P,
-                4,
-            >(off.as_ptr(), out, (imgs.0, imgs.1)),
-            _ => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+        if plan.table_images == 2 {
+            kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
                 off.as_ptr(),
                 out,
                 (imgs.0, imgs.1),
-            ),
+            );
+        } else {
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_cold_img::<BLK, P>(
+                off.as_ptr(),
+                out,
+                imgs,
+                plan.table_images,
+            );
         }
     }
     #[cfg(not(all(
@@ -1720,6 +1757,110 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
         target_feature = "avx512bw"
     )))]
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_two_image<
+    const BLK: usize,
+    const P: bool,
+>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(plan.table_images, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "gfni",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[cold]
+#[inline(never)]
+unsafe fn round1_ab_inner_window_from_offsets_nt2_residual_cold<const P: bool>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    keep: u8,
+) {
+    unsafe {
+        use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        let im = (imgs.0, imgs.1);
+        match (plan.residual_bcomplement, plan.table_images) {
+            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
+            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
+            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
+            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
+            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
+            (false, _) => {
+                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
+                    op, out, im, keep,
+                )
+            }
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual_two_image<const P: bool>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    keep: u8,
+) {
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert!(plan.residual_bcomplement);
+    debug_assert_eq!(plan.table_images, 2);
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!(keep == 0xfc || keep == 0x0f);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
+        residual_img::<P, 2, true>(off.as_ptr(), out, (imgs.0, imgs.1), keep);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("residual nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
@@ -1745,20 +1886,10 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
     unsafe {
         use kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img as residual_img;
         let op = off.as_ptr();
-        let im = (imgs.0, imgs.1);
-        // Both selectors are fixed for the plan. The incumbent kernel is the
-        // default two-image table with `FLOCK_NO_R1_RESIDUAL_BCOMPLEMENT=1`.
-        match (plan.residual_bcomplement, plan.table_images) {
-            (true, 8) => residual_img::<P, 8, true>(op, out, im, keep),
-            (true, 4) => residual_img::<P, 4, true>(op, out, im, keep),
-            (true, _) => residual_img::<P, 2, true>(op, out, im, keep),
-            (false, 8) => residual_img::<P, 8, false>(op, out, im, keep),
-            (false, 4) => residual_img::<P, 4, false>(op, out, im, keep),
-            (false, _) => {
-                kernels::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual::<P>(
-                    op, out, im, keep,
-                )
-            }
+        if plan.residual_bcomplement && plan.table_images == 2 {
+            residual_img::<P, 2, true>(op, out, (imgs.0, imgs.1), keep);
+        } else {
+            round1_ab_inner_window_from_offsets_nt2_residual_cold::<P>(op, out, plan, imgs, keep);
         }
     }
     #[cfg(not(all(
