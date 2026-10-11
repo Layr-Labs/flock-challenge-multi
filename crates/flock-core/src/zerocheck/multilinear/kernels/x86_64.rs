@@ -322,10 +322,436 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_tr_bcast_zero_dead_inline<const MULTI: bool>(
+    rows: *const u8,
+    mats: *const u64,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = octs.as_mut_ptr().cast::<u64>();
+        for i in 0..8 {
+            let z = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+            _mm512_storeu_si512(
+                op.add(8 * i) as *mut __m512i,
+                _mm512_permutexvar_epi8(bt, z),
+            );
+        }
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = mats;
+        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
+        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
+        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        for g in 0..4 {
+            let mut a01 = [_mm512_setzero_si512(); 2];
+            let mut a23 = [_mm512_setzero_si512(); 2];
+            let mi = if MULTI { mp.add(128 * g) } else { mp };
+            for half in 0..2 {
+                let i = 2 * g + half;
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(8 * i + j) as i64));
+                let plane = |h: usize| {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(mi.add(16 * j + 8 * h) as *const __m512i),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    _mm512_xor_si512(v2, v3)
+                };
+                let l = _mm512_permutexvar_epi8(bt, plane(0));
+                let hh = _mm512_permutexvar_epi8(bt, plane(1));
+                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+            }
+            let dst = (out as *mut __m512i).add(g);
+            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_tr_bcast_skip_group_inline<const MULTI: bool, const GROUP: usize>(
+    rows: *const u8,
+    mats: *const u64,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr() as *const __m512i);
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = octs.as_mut_ptr().cast::<u64>();
+        let first_g = if GROUP == 0 { 1 } else { 0 };
+        for relative in 0..6 {
+            let i = 2 * first_g + relative;
+            let z = _mm512_loadu_si512(rows.add(64 * i).cast::<__m512i>());
+            _mm512_storeu_si512(
+                op.add(8 * i).cast::<__m512i>(),
+                _mm512_permutexvar_epi8(bt, z),
+            );
+        }
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = mats;
+        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
+        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
+        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        for relative in 0..3 {
+            let g = first_g + relative;
+            let mi = if MULTI { mp.add(128 * g) } else { mp };
+            let mut a01 = [_mm512_setzero_si512(); 2];
+            let mut a23 = [_mm512_setzero_si512(); 2];
+            for half in 0..2 {
+                let i = 2 * g + half;
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*rp.add(8 * i + j) as i64));
+                let plane = |h: usize| {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(mi.add(16 * j + 8 * h).cast::<__m512i>()),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    _mm512_xor_si512(v2, v3)
+                };
+                let l = _mm512_permutexvar_epi8(bt, plane(0));
+                let hh = _mm512_permutexvar_epi8(bt, plane(1));
+                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+            }
+            let dst = out.cast::<__m512i>().add(g);
+            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn round2_lookahead_chunk_baked_canon_elide_fast(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    pair_idx_base: usize,
+    bk: &R2EqBake,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut x_lo = 0usize;
+        const B_ONES_BLOCK_PAIRS: usize = 128;
+        const B_SPARSE_PAIR: usize = 120;
+        const B_SPECIAL_ONES: u8 = 0;
+        const B_SPECIAL_SPARSE: u8 = 1;
+        let pair_in_b_block = pair_idx_base & (B_ONES_BLOCK_PAIRS - 1);
+        let (mut b_special_head, mut b_special_kind) = if pair_in_b_block == 0 {
+            (0, B_SPECIAL_ONES)
+        } else if pair_in_b_block <= B_SPARSE_PAIR {
+            (B_SPARSE_PAIR - pair_in_b_block, B_SPECIAL_SPARSE)
+        } else {
+            (B_ONES_BLOCK_PAIRS - pair_in_b_block, B_SPECIAL_ONES)
+        };
+
+        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa = &mut (*fa_store.as_mut_ptr()).0;
+        let fb = &mut (*fb_store.as_mut_ptr()).0;
+        let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
+        let b_mats_slice = bk.b_mats.as_ptr();
+
+        macro_rules! spread_pf_fast {
+            ($x:expr) => {{
+                let tile_base = row_base + 2 * ($x & !31);
+                let next = (tile_base + 64 * ZC_PKT_PF_TILES) * 8;
+                let l0 = ($x & 31) >> 2;
+                _mm_prefetch(a_pkt.wrapping_add(next + 64 * l0).cast::<i8>(), _MM_HINT_T0);
+                _mm_prefetch(b_pkt.wrapping_add(next + 64 * l0).cast::<i8>(), _MM_HINT_T0);
+                _mm_prefetch(
+                    a_pkt.wrapping_add(next + 64 * (l0 + 1)).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    b_pkt.wrapping_add(next + 64 * (l0 + 1)).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }};
+        }
+
+        macro_rules! load_window_fast {
+            ($x:expr) => {{
+                let g = ($x & 31) >> 1;
+                let fap = fa.as_ptr();
+                let fbp = fb.as_ptr();
+                (
+                    _mm512_load_si512(fap.add(g).cast::<__m512i>()),
+                    _mm512_load_si512(fap.add(16 + g).cast::<__m512i>()),
+                    _mm512_load_si512(fap.add(32 + g).cast::<__m512i>()),
+                    _mm512_load_si512(fap.add(48 + g).cast::<__m512i>()),
+                    _mm512_load_si512(fbp.add(g).cast::<__m512i>()),
+                    _mm512_load_si512(fbp.add(16 + g).cast::<__m512i>()),
+                    _mm512_load_si512(fbp.add(32 + g).cast::<__m512i>()),
+                    _mm512_load_si512(fbp.add(48 + g).cast::<__m512i>()),
+                )
+            }};
+        }
+
+        while x_lo + 8 <= lo_size {
+            if (x_lo & 31) == 0 {
+                let g0 = row_base + 2 * x_lo;
+                let bm_ptr = (*b_mats_slice.add(x_lo >> 5)).0.as_ptr();
+                match g0 & 255 {
+                    0 => {
+                        gfni_fold64_rows_tr_bcast_skip_group_inline::<true, 0>(
+                            a_pkt.add(g0 * 8),
+                            a_mats_ptr,
+                            fa.as_mut_ptr(),
+                        );
+                        gfni_fold64_rows_tr_bcast_skip_group_inline::<false, 0>(
+                            b_pkt.add(g0 * 8),
+                            bm_ptr,
+                            fb.as_mut_ptr(),
+                        );
+                    }
+                    192 => {
+                        gfni_fold64_rows_tr_bcast_skip_group_inline::<true, 3>(
+                            a_pkt.add(g0 * 8),
+                            a_mats_ptr,
+                            fa.as_mut_ptr(),
+                        );
+                        gfni_fold64_rows_tr_bcast_skip_group_inline::<false, 3>(
+                            b_pkt.add(g0 * 8),
+                            bm_ptr,
+                            fb.as_mut_ptr(),
+                        );
+                    }
+                    _ => {
+                        gfni_fold64_rows_tr_bcast_zero_dead_inline::<true>(
+                            a_pkt.add(g0 * 8),
+                            a_mats_ptr,
+                            fa.as_mut_ptr(),
+                        );
+                        gfni_fold64_rows_tr_bcast_zero_dead_inline::<false>(
+                            b_pkt.add(g0 * 8),
+                            bm_ptr,
+                            fb.as_mut_ptr(),
+                        );
+                    }
+                }
+            }
+            spread_pf_fast!(x_lo);
+            if x_lo == b_special_head {
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if b_special_kind == B_SPECIAL_ONES {
+                    b_special_head = b_special_head.wrapping_add(B_SPARSE_PAIR);
+                    b_special_kind = B_SPECIAL_SPARSE;
+                } else {
+                    b_special_head =
+                        b_special_head.wrapping_add(B_ONES_BLOCK_PAIRS - B_SPARSE_PAIR);
+                    b_special_kind = B_SPECIAL_ONES;
+                }
+                x_lo += 8;
+                continue;
+            }
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = load_window_fast!(x_lo);
+            if x_lo + 16 <= lo_size && (x_lo & 31) != 24 && b_special_head != x_lo + 8 {
+                let x_hi = x_lo + 8;
+                spread_pf_fast!(x_hi);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = load_window_fast!(x_hi);
+                acc[0].mul_acc2(a1w, b1, c1w, d1);
+                acc[1].mul_acc2(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(c0w, c1w),
+                    _mm512_xor_si512(d0, d1),
+                );
+                acc[2].mul_acc2(a3w, b3, c3w, d3);
+                acc[3].mul_acc2(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(c2w, c3w),
+                    _mm512_xor_si512(d2, d3),
+                );
+                acc[4].mul_acc2(a2w, b2, c2w, d2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                let e_cw = _mm512_xor_si512(c0w, c2w);
+                let e_d = _mm512_xor_si512(d0, d2);
+                let o_cw = _mm512_xor_si512(c1w, c3w);
+                let o_d = _mm512_xor_si512(d1, d3);
+                acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                acc[7].mul_acc2(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(e_cw, o_cw),
+                    _mm512_xor_si512(e_d, o_d),
+                );
+                x_lo += 16;
+                continue;
+            }
+            acc[0].mul_acc(a1w, b1);
+            acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+            acc[2].mul_acc(a3w, b3);
+            acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+            acc[4].mul_acc(a2w, b2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            acc[5].mul_acc(e_aw, e_b);
+            acc[6].mul_acc(o_aw, o_b);
+            acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            x_lo += 8;
+        }
+
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let mut out = [F128::ZERO; 8];
+        for i in 0..8 {
+            let scaled = ghash_mul_x4(lane_w, acc[i].reduce_lanes());
+            let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
+            out[i] = l[0] + l[1] + l[2] + l[3];
+        }
+        out
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const BAKE: bool>(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    a_chunk: &mut [F128],
+    b_chunk: &mut [F128],
+    eq_lo: &[F128],
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    wtab: Option<&[F128]>,
+    bake: Option<&R2EqBake>,
+) -> [F128; 8] {
+    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+    if !WRITE && BAKE {
+        let lo_size = eq_lo.len();
+        if let Some(bk) = bake {
+            if bk.canonical_elide
+                && mats.is_some()
+                && lo_size >= 32
+                && lo_size.is_multiple_of(32)
+                && zc_regfold_enabled()
+                && zc_r2_tr_enabled()
+                && zc_r2_bcast_enabled()
+                && zc_pkt_pf_enabled()
+                && zc_pkt_pf_far_enabled()
+                && zc_pkt_pf_spread_enabled()
+                && zc_r2_unroll16_enabled()
+            {
+                // SAFETY: caller contract guarantees bounds and AVX-512F/VBMI/GFNI/VPCLMULQDQ.
+                return unsafe {
+                    round2_lookahead_chunk_baked_canon_elide_fast(
+                        a_pkt,
+                        b_pkt,
+                        row_base,
+                        lo_size,
+                        pair_idx_base,
+                        bk,
+                    )
+                };
+            }
+        }
+    }
+    // SAFETY: forwarded from caller.
+    unsafe {
+        round2_lookahead_chunk_x86_avx512_fallback::<WRITE, BAKE>(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            row_base,
+            a_chunk,
+            b_chunk,
+            eq_lo,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            wtab,
+            bake,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn round2_lookahead_chunk_x86_avx512_fallback<const WRITE: bool, const BAKE: bool>(
     table_data: *const F128,
     mats: Option<&[u64; 128]>,
     a_pkt: *const u8,
@@ -2483,10 +2909,377 @@ unsafe fn transpose4_lanes(
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_zero_dead_inline(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut z = [_mm512_setzero_si512(); 8];
+        for (i, slot) in z.iter_mut().enumerate() {
+            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+        }
+
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = (*octs.as_mut_ptr()).0.as_mut_ptr();
+        let oct_even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr() as *const __m512i);
+        let oct_odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr() as *const __m512i);
+
+        let gather = |p: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+            let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+            let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+            let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+            let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+            let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+            let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+            let base = op.add(32 * p);
+            let oct = |a: usize, v: __m512i| {
+                _mm512_store_si512(base.add(8 * a) as *mut __m512i, v)
+            };
+            oct(0, _mm512_permutex2var_epi8(p01, oct_even, p45));
+            oct(1, _mm512_permutex2var_epi8(p01, oct_odd, p45));
+            oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
+            oct(3, _mm512_permutex2var_epi8(p23, oct_odd, p67));
+        };
+        gather(0, z[0], z[2], z[4], z[6]);
+        gather(1, z[1], z[3], z[5], z[7]);
+
+        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        let mp = m.1.as_ptr() as *const u64;
+        let dst = out as *mut __m512i;
+        let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
+        let out_odd = _mm512_loadu_si512(C4_LM_OUT_ODD.as_ptr() as *const __m512i);
+
+        macro_rules! pass {
+            ($p:expr) => {{
+                const P: usize = $p;
+                let mp = core::hint::black_box(mp);
+                let mut accp = [_mm512_setzero_si512(); 2];
+                let mut accq = [_mm512_setzero_si512(); 2];
+                for a in 0..4usize {
+                    let b: [__m512i; 8] = core::array::from_fn(|j| {
+                        _mm512_set1_epi64(*rp.add(32 * P + 8 * a + j) as i64)
+                    });
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                b[j],
+                                _mm512_loadu_si512(
+                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
+                                ),
+                            )
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
+                        if a == 0 {
+                            accp[hh] = v2;
+                            accq[hh] = v3;
+                        } else {
+                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
+                            accq[hh] = v3;
+                        }
+                    }
+                }
+                let r0 = _mm512_xor_si512(accp[0], accq[0]);
+                let r1 = _mm512_xor_si512(accp[1], accq[1]);
+                _mm512_store_si512(dst.add(2 * P), _mm512_permutex2var_epi8(r0, out_even, r1));
+                _mm512_store_si512(dst.add(2 * P + 1), _mm512_permutex2var_epi8(r0, out_odd, r1));
+            }};
+        }
+        pass!(0);
+        pass!(1);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_c4_lm_fast(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    wtab: &[F128],
+) -> [F128; 8] {
+    use core::arch::x86_64::*;
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
+        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wtab.as_ptr();
+        let mut x_lo = 0usize;
+
+        while x_lo + 16 <= lo_size {
+            let ol0 = 2 * x_lo;
+            let xg0 = out_base + ol0;
+            let next0 = (4 * xg0 + 64 * ZC_PKT_PF_TILES) * 8;
+            gfni_fold64_rows_masked_c4_bcast_lm_zero_dead_inline(a_pkt.add(4 * xg0 * 8), cfold, fa);
+            gfni_fold64_rows_masked_c4_bcast_lm_zero_dead_inline(b_pkt.add(4 * xg0 * 8), cfold, fb);
+            for l in 0..4 {
+                _mm_prefetch(
+                    a_pkt.wrapping_add(next0 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    b_pkt.wrapping_add(next0 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+
+            let x1 = x_lo + 8;
+            let ol1 = 2 * x1;
+            let xg1 = out_base + ol1;
+            let next1 = (4 * xg1 + 64 * ZC_PKT_PF_TILES) * 8;
+            gfni_fold64_rows_masked_c4_bcast_lm_zero_dead_inline(
+                a_pkt.add(4 * xg1 * 8),
+                cfold,
+                fa.add(16),
+            );
+            gfni_fold64_rows_masked_c4_bcast_lm_zero_dead_inline(
+                b_pkt.add(4 * xg1 * 8),
+                cfold,
+                fb.add(16),
+            );
+            for l in 4..8 {
+                _mm_prefetch(
+                    a_pkt.wrapping_add(next0 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    b_pkt.wrapping_add(next0 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+
+            let a0 = _mm512_load_si512(fa.cast::<__m512i>());
+            let a1 = _mm512_load_si512(fa.add(4).cast::<__m512i>());
+            let a2 = _mm512_load_si512(fa.add(8).cast::<__m512i>());
+            let a3 = _mm512_load_si512(fa.add(12).cast::<__m512i>());
+            let b0 = _mm512_load_si512(fb.cast::<__m512i>());
+            let b1 = _mm512_load_si512(fb.add(4).cast::<__m512i>());
+            let b2 = _mm512_load_si512(fb.add(8).cast::<__m512i>());
+            let b3 = _mm512_load_si512(fb.add(12).cast::<__m512i>());
+
+            let ap0 = a_out_ptr.add(ol0).cast::<__m512i>();
+            let bp0 = b_out_ptr.add(ol0).cast::<__m512i>();
+            _mm512_stream_si512(ap0, a0);
+            _mm512_stream_si512(ap0.add(1), a1);
+            _mm512_stream_si512(ap0.add(2), a2);
+            _mm512_stream_si512(ap0.add(3), a3);
+            _mm512_stream_si512(bp0, b0);
+            _mm512_stream_si512(bp0.add(1), b1);
+            _mm512_stream_si512(bp0.add(2), b2);
+            _mm512_stream_si512(bp0.add(3), b3);
+
+            for l in 0..4 {
+                _mm_prefetch(
+                    a_pkt.wrapping_add(next1 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    b_pkt.wrapping_add(next1 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+
+            let wp0 = wt_ptr.add(x_lo).cast::<__m512i>();
+            let w0 = _mm512_loadu_si512(wp0);
+            let w0_64 = _mm512_loadu_si512(wp0.add(1));
+            let a0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w0, w0_64);
+            let a1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w0, w0_64);
+            let a2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w0, w0_64);
+            let a3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w0, w0_64);
+
+            let c0 = _mm512_load_si512(fa.add(16).cast::<__m512i>());
+            let c1 = _mm512_load_si512(fa.add(20).cast::<__m512i>());
+            let c2 = _mm512_load_si512(fa.add(24).cast::<__m512i>());
+            let c3 = _mm512_load_si512(fa.add(28).cast::<__m512i>());
+            let d0 = _mm512_load_si512(fb.add(16).cast::<__m512i>());
+            let d1 = _mm512_load_si512(fb.add(20).cast::<__m512i>());
+            let d2 = _mm512_load_si512(fb.add(24).cast::<__m512i>());
+            let d3 = _mm512_load_si512(fb.add(28).cast::<__m512i>());
+
+            let ap1 = a_out_ptr.add(ol1).cast::<__m512i>();
+            let bp1 = b_out_ptr.add(ol1).cast::<__m512i>();
+            _mm512_stream_si512(ap1, c0);
+            _mm512_stream_si512(ap1.add(1), c1);
+            _mm512_stream_si512(ap1.add(2), c2);
+            _mm512_stream_si512(ap1.add(3), c3);
+            _mm512_stream_si512(bp1, d0);
+            _mm512_stream_si512(bp1.add(1), d1);
+            _mm512_stream_si512(bp1.add(2), d2);
+            _mm512_stream_si512(bp1.add(3), d3);
+
+            for l in 4..8 {
+                _mm_prefetch(
+                    a_pkt.wrapping_add(next1 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                _mm_prefetch(
+                    b_pkt.wrapping_add(next1 + 64 * l).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+
+            let wp1 = wt_ptr.add(x1).cast::<__m512i>();
+            let w1 = _mm512_loadu_si512(wp1);
+            let w1_64 = _mm512_loadu_si512(wp1.add(1));
+            let c0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(c0, w1, w1_64);
+            let c1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(c1, w1, w1_64);
+            let c2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(c2, w1, w1_64);
+            let c3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(c3, w1, w1_64);
+
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        _mm_sfence();
+        let mut out = [F128::ZERO; 8];
+        for i in 0..8 {
+            out[i] = acc[i].fold().reduce();
+        }
+        out
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
+    table_data: *const F128,
+    mats: Option<&[u64; 128]>,
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    eq_lo: &[F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    nt_out: bool,
+    cfold: Option<&CFoldMats>,
+    wtab: Option<&[F128]>,
+    c4_lm: bool,
+    out_lm: bool,
+) -> [F128; 8] {
+    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+    {
+        let lo_size = eq_lo.len();
+        if c4_lm
+            && out_lm
+            && nt_out
+            && mats.is_some()
+            && lo_size.is_multiple_of(16)
+            && ((a_out.as_ptr() as usize) | (b_out.as_ptr() as usize)).is_multiple_of(64)
+            && zc_regfold_enabled()
+            && zc_r34_bcast_enabled()
+            && zc_pkt_pf_enabled()
+            && zc_pkt_pf_spread_enabled()
+            && zc_pkt_pf_far_enabled()
+        {
+            if let (Some(c), Some(wt)) = (cfold, wtab) {
+                return unsafe {
+                    fold2_from_packed_lookahead_c4_lm_fast(
+                        a_pkt, b_pkt, out_base, a_out, b_out, lo_size, c, wt,
+                    )
+                };
+            }
+        }
+    }
+    unsafe {
+        fold2_from_packed_lookahead_x86_avx512_fallback(
+            table_data,
+            mats,
+            a_pkt,
+            b_pkt,
+            out_base,
+            a_out,
+            b_out,
+            rho1,
+            rho2,
+            eq_lo,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            nt_out,
+            cfold,
+            wtab,
+            c4_lm,
+            out_lm,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_x86_avx512_fallback(
     table_data: *const F128,
     mats: Option<&[u64; 128]>,
     a_pkt: *const u8,

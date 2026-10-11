@@ -4826,6 +4826,8 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         let bc_ptr = bc.as_mut_ptr();
         let dst_aligned =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
+        let dst_aligned64 =
+            (fc_ptr as usize).is_multiple_of(64) && (bc_ptr as usize).is_multiple_of(64);
 
         let deferred_vec = if CORR {
             use crate::field::gf2_128::x86_64::ghash_shift64_x4;
@@ -4857,7 +4859,9 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            if stream && dst_aligned64 {
+                _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+            } else if stream && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
@@ -5732,7 +5736,8 @@ fn materialize_direct_fold4(
                         );
                     }
                     let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
-                    let mut planes = unsafe { [_mm512_setzero_si512(); 16] };
+                    let mut planes =
+                        core::mem::MaybeUninit::<[core::arch::x86_64::__m512i; 16]>::uninit();
                     for slot in (0..block_len).step_by(64) {
                         // SAFETY: each row half supplies 512 bytes, the four
                         // maps cover 64 output slots, and the cfg gate

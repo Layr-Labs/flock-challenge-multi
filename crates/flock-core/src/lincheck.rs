@@ -603,6 +603,7 @@ impl RootSplicePlan {
         target_feature = "avx512vbmi",
         target_feature = "gfni"
     ))]
+    #[inline(always)]
     unsafe fn fold_chunk(
         &self,
         q: usize,
@@ -619,14 +620,12 @@ impl RootSplicePlan {
                 let input = tile.add(half * 64);
                 match &self.actions[2 * q + half] {
                     RootSpliceAction::Skip => {}
-                    RootSpliceAction::Full(out) => kernels::gfni_fold_tile(
-                        input,
-                        128,
-                        1,
-                        mats,
-                        planes.add(out * 1024),
-                        seed_zero,
-                    ),
+                    RootSpliceAction::Full(out) => {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                            _mm512_loadu_si512(input.add(t * 128) as *const __m512i)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
+                    }
                     RootSpliceAction::Start => {
                         debug_assert!(!*pending);
                         for t in 0..8 {
@@ -641,46 +640,72 @@ impl RootSplicePlan {
                     RootSpliceAction::End { out, select } => {
                         debug_assert!(*pending);
                         let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
-                        for t in 0..8 {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let lo =
                                 _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
                             let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_permutex2var_epi8(lo, indices, hi);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_permutex2var_epi8(lo, indices, hi)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                         *pending = false;
                     }
                     RootSpliceAction::Tail { out, mask } => {
                         debug_assert!(!*pending);
-                        for t in 0..8 {
+                        let m = *mask;
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_maskz_mov_epi8(*mask, row);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_maskz_mov_epi8(m, row)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                     }
                 }
+            }
+        }
+    }
+
+    /// Drain a four-column `gather4` batch in a single AVX-512/GFNI leaf call,
+    /// amortizing the call overhead across all four columns and keeping the
+    /// interleaved 16-row lookahead prefetches inside the same register window.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fold_group4(
+        &self,
+        q: usize,
+        transposed: *const u8,
+        mats: &[u64; 128],
+        planes: *mut u8,
+        seed_zero: bool,
+        carry: &mut [u8; 512],
+        pending: &mut bool,
+        pf_base: *const F128,
+        chunks_per_block: usize,
+        cpb_ranked: bool,
+    ) {
+        unsafe {
+            for c in 0..4 {
+                if !pf_base.is_null() {
+                    lc_prefetch_rows16(
+                        pf_base.add(16 * c * chunks_per_block),
+                        chunks_per_block,
+                        cpb_ranked,
+                    );
+                }
+                self.fold_chunk(
+                    q + c,
+                    transposed.add(c * 1024),
+                    mats,
+                    planes,
+                    seed_zero,
+                    carry,
+                    pending,
+                );
             }
         }
     }
@@ -2292,17 +2317,18 @@ fn fold_block_major_gfni(
             // u64s of `mats` at the start of every tile, and `gather_transpose_*`
             // / `splice.fold_chunk` unconditionally overwrite `transposed` and
             // `splice_carry` before reading them.
-            let mut mats = unsafe { core::mem::MaybeUninit::<[u64; 128]>::uninit().assume_init() };
+            let mut mats_uninit = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+            let mats = unsafe { &mut *mats_uninit.as_mut_ptr() };
             debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
             // Four column-slabs of 8×128 bytes: the grouped gather writes
             // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = unsafe {
-                core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit()
-                    .assume_init()
-            };
+            let mut transposed_uninit =
+                core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
+            let mut transposed = unsafe { &mut *transposed_uninit.as_mut_ptr() };
             #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-            let mut splice_carry =
-                unsafe { core::mem::MaybeUninit::<[u8; 512]>::uninit().assume_init() };
+            let mut splice_carry_uninit = core::mem::MaybeUninit::<[u8; 512]>::uninit();
+            #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+            let mut splice_carry = unsafe { &mut *splice_carry_uninit.as_mut_ptr() };
             // First tile this worker writes into an uninitialized plane
             // buffer: seed the GFNI acc from a register zero idiom. Later
             // tiles load only blocks that this first tile initialized.
@@ -2390,6 +2416,39 @@ fn fold_block_major_gfni(
                                 &mut transposed,
                             );
                         }
+                        #[cfg(target_feature = "avx512bw")]
+                        if let Some(splice) = root_splice {
+                            let pf_base = if pf_far && pf_spread {
+                                let qn = q + pf_chunks;
+                                if qn <= full_chunks && qn < chunks_per_block {
+                                    unsafe {
+                                        z_packed
+                                            .as_ptr()
+                                            .add((8 * stripe_base) * chunks_per_block + qn)
+                                    }
+                                } else {
+                                    core::ptr::null()
+                                }
+                            } else {
+                                core::ptr::null()
+                            };
+                            unsafe {
+                                splice.fold_group4(
+                                    q,
+                                    transposed.as_ptr(),
+                                    &mats,
+                                    wplanes.as_mut_ptr().cast::<u8>(),
+                                    first_tile,
+                                    &mut splice_carry,
+                                    &mut splice_pending,
+                                    pf_base,
+                                    chunks_per_block,
+                                    cpb_ranked,
+                                );
+                            }
+                            q += 4;
+                            continue;
+                        }
                         for c in 0..4 {
                             // Spread delivery: the same eight-hints-per-stripe
                             // block, issued from the fold that follows the
@@ -2423,19 +2482,6 @@ fn fold_block_major_gfni(
                             // SAFETY: as for the single-column call below;
                             // every grouped chunk is full (2 blocks of 64).
                             unsafe {
-                                #[cfg(target_feature = "avx512bw")]
-                                if let Some(splice) = root_splice {
-                                    splice.fold_chunk(
-                                        q + c,
-                                        transposed.as_ptr().add(c * 1024),
-                                        &mats,
-                                        wplanes.as_mut_ptr().cast::<u8>(),
-                                        first_tile,
-                                        &mut splice_carry,
-                                        &mut splice_pending,
-                                    );
-                                    continue;
-                                }
                                 kernels::gfni_fold_tile(
                                     transposed.as_ptr().add(c * 1024),
                                     128,
