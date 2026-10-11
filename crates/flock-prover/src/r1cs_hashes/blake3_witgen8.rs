@@ -899,6 +899,27 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
             }
         }
 
+        project_blocks_ranked_hot_offsets_direct_inline_fallback::<P>(
+            proj, plan, imgs, blk, rows, &a_rows, &b_rows, off,
+        );
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fallback<const P: bool>(
+    proj: &StreamProj<'_>,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    blk: usize,
+    rows: RankedRows,
+    a_rows: &[__m512i; 8],
+    b_rows: &[__m512i; 8],
+    off: *const u16,
+) {
+    unsafe {
         let mut j = 0usize;
         while j != 8 {
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
