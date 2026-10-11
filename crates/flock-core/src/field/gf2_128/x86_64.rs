@@ -38,6 +38,7 @@ unsafe fn lane1(v: __m128i) -> u64 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute. `b_lo` is the multiplier's low limb; its high limb must be 0.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     // SAFETY: function carries the required target features.
@@ -53,6 +54,7 @@ pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -83,6 +85,7 @@ pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -119,6 +122,7 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 /// # Safety
 /// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
 /// features required by this function.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -155,6 +159,7 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -183,6 +188,7 @@ pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -229,6 +235,7 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     // SAFETY: function carries the required target features.
