@@ -1945,33 +1945,38 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     // The fixed output array covers all sixteen 64-byte plane stores. The
     // prefetch pointer is only used by nonfaulting hints via wrapping_add.
     unsafe {
-        let pf_one = |bm: usize| {
-            _mm_prefetch(
-                prefetch
-                    .next_window
-                    .wrapping_add((bm - prefetch.first) * ELL)
-                    .cast::<i8>(),
-                _MM_HINT_T0,
-            );
-        };
-        if !prefetch.spread {
+        #[cold]
+        #[inline(never)]
+        #[target_feature(enable = "avx512f,gfni")]
+        unsafe fn prefetch_fallback<const FIRST: usize, const N: usize>(
+            prefetch: &super::AbDirectPrefetch,
+        ) {
             for bm in prefetch.first..prefetch.end {
-                pf_one(bm);
+                _mm_prefetch(
+                    prefetch
+                        .next_window
+                        .wrapping_add((bm - prefetch.first) * ELL)
+                        .cast::<i8>(),
+                    _MM_HINT_T0,
+                );
             }
         }
         let mut rows = [_mm512_setzero_si512(); 1 << N_MEDIUM];
-        for bm in FIRST..N {
-            // Preserve the old copy-loop hint/load interleave, now beside
-            // the first and only demand load of the original input line.
-            if prefetch.spread && bm >= prefetch.first && bm < prefetch.end {
-                pf_one(bm);
+        if prefetch.spread && prefetch.first == FIRST && prefetch.end == N {
+            for bm in FIRST..N {
+                let rel = (bm - FIRST) * ELL;
+                _mm_prefetch(
+                    prefetch.next_window.wrapping_add(rel).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+                rows[bm] = _mm512_loadu_si512(live_rows.as_ptr().add(rel) as *const __m512i);
             }
-            rows[bm] =
-                _mm512_loadu_si512(live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i);
-        }
-        if prefetch.spread {
-            for bm in N.max(prefetch.first)..prefetch.end {
-                pf_one(bm);
+        } else {
+            prefetch_fallback::<FIRST, N>(prefetch);
+            for bm in FIRST..N {
+                rows[bm] = _mm512_loadu_si512(
+                    live_rows.as_ptr().add((bm - FIRST) * ELL) as *const __m512i,
+                );
             }
         }
         for k in 0..16 {
