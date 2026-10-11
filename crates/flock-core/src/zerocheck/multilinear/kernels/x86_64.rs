@@ -3533,6 +3533,94 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
 }
 
 
+/// A 64-entry equality tile in the byte-plane layout used by the GFNI leaf.
+/// Low planes 0..7 precede high planes 8..15; no SIMD value crosses an ABI.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[repr(align(64))]
+pub(crate) struct GfniEqPlanes64 {
+    low: [u64; 64],
+    high: [u64; 64],
+}
+
+/// Build precisely the incumbent `input_planes` result once for one eq tile.
+/// The compile-time cfg supplies every SIMD feature used by this producer.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub(crate) fn build_gfni_eq_planes64(values: &[F128]) -> GfniEqPlanes64 {
+    use core::arch::x86_64::*;
+    assert_eq!(values.len(), 64);
+    let low: [u64; 64] = core::array::from_fn(|i| values[i].lo);
+    let high: [u64; 64] = core::array::from_fn(|i| values[i].hi);
+    let mut result = GfniEqPlanes64 { low: [0; 64], high: [0; 64] };
+    // SAFETY: the two input arrays have 64 initialized qwords; each result
+    // half holds eight complete ZMM planes. No consumer sees it before return.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast());
+        let s2_lo = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let s2_hi = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        let s3_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let s3_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        let qword_transpose = |t: [__m512i; 8]| -> [__m512i; 8] {
+            let e01 = _mm512_unpacklo_epi64(t[0], t[1]);
+            let o01 = _mm512_unpackhi_epi64(t[0], t[1]);
+            let e23 = _mm512_unpacklo_epi64(t[2], t[3]);
+            let o23 = _mm512_unpackhi_epi64(t[2], t[3]);
+            let e45 = _mm512_unpacklo_epi64(t[4], t[5]);
+            let o45 = _mm512_unpackhi_epi64(t[4], t[5]);
+            let e67 = _mm512_unpacklo_epi64(t[6], t[7]);
+            let o67 = _mm512_unpackhi_epi64(t[6], t[7]);
+            let h02_a = _mm512_permutex2var_epi64(e01, s2_lo, e23);
+            let h46_a = _mm512_permutex2var_epi64(e01, s2_hi, e23);
+            let h13_a = _mm512_permutex2var_epi64(o01, s2_lo, o23);
+            let h57_a = _mm512_permutex2var_epi64(o01, s2_hi, o23);
+            let h02_b = _mm512_permutex2var_epi64(e45, s2_lo, e67);
+            let h46_b = _mm512_permutex2var_epi64(e45, s2_hi, e67);
+            let h13_b = _mm512_permutex2var_epi64(o45, s2_lo, o67);
+            let h57_b = _mm512_permutex2var_epi64(o45, s2_hi, o67);
+            [
+                _mm512_permutex2var_epi64(h02_a, s3_lo, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_lo, h13_b),
+                _mm512_permutex2var_epi64(h02_a, s3_hi, h02_b),
+                _mm512_permutex2var_epi64(h13_a, s3_hi, h13_b),
+                _mm512_permutex2var_epi64(h46_a, s3_lo, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_lo, h57_b),
+                _mm512_permutex2var_epi64(h46_a, s3_hi, h46_b),
+                _mm512_permutex2var_epi64(h57_a, s3_hi, h57_b),
+            ]
+        };
+        let input_planes = |rows: *const u8| -> [__m512i; 8] {
+            let z: [__m512i; 8] =
+                core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
+            qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
+        };
+        let lp = input_planes(low.as_ptr().cast());
+        let hp = input_planes(high.as_ptr().cast());
+        for i in 0..8 {
+            _mm512_storeu_si512(result.low.as_mut_ptr().add(8 * i).cast(), lp[i]);
+            _mm512_storeu_si512(result.high.as_mut_ptr().add(8 * i).cast(), hp[i]);
+        }
+    }
+    result
+}
+
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
 /// each completed output-byte plane. This replaces LLVM's accidental
@@ -3549,8 +3637,74 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
+#[inline]
 #[target_feature(enable = "avx512f,avx512vbmi,gfni")]
 pub(crate) unsafe fn gfni_fold64_four_maps_staged(
+    rows0: *const u8,
+    mats0: &[u64; 128],
+    rows1: *const u8,
+    mats1: &[u64; 128],
+    rows2: *const u8,
+    mats2: &[u64; 128],
+    rows3: *const u8,
+    mats3: &[u64; 128],
+    out: *mut F128,
+    planes: *mut core::arch::x86_64::__m512i,
+) {
+    // SAFETY: forwarded row extents, maps, output and scratch contract.
+    unsafe {
+        gfni_fold64_four_maps_staged_impl::<false>(
+            rows0, mats0, rows1, mats1, rows2, mats2, rows3, mats3, out, planes,
+        );
+    }
+}
+
+/// Apply the same staged four-map fold to immutable pretransposed eq tiles.
+///
+/// # Safety
+/// `out` covers 64 writable F128s, `scratch` covers sixteen ZMMs, neither
+/// overlaps input tiles/maps, and the target features in the cfg are available.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+pub(crate) unsafe fn gfni_fold64_four_planes_staged(
+    tile0: &GfniEqPlanes64,
+    mats0: &[u64; 128],
+    mats1: &[u64; 128],
+    tile1: &GfniEqPlanes64,
+    mats2: &[u64; 128],
+    mats3: &[u64; 128],
+    out: *mut F128,
+    scratch: *mut core::arch::x86_64::__m512i,
+) {
+    // SAFETY: tile halves each supply eight complete initialized planes;
+    // all remaining contracts are forwarded unchanged to the shared leaf.
+    unsafe {
+        gfni_fold64_four_maps_staged_impl::<true>(
+            tile0.low.as_ptr().cast(), mats0, tile0.high.as_ptr().cast(), mats1,
+            tile1.low.as_ptr().cast(), mats2, tile1.high.as_ptr().cast(), mats3,
+            out, scratch,
+        );
+    }
+}
+
+// The only specialized operation is input loading. Both formats share the
+// exact same map, staging, output transposes and publication implementation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_four_maps_staged_impl<const PRETRANSPOSED: bool>(
     rows0: *const u8,
     mats0: &[u64; 128],
     rows1: *const u8,
@@ -3607,7 +3761,11 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
         let input_planes = |rows: *const u8| -> [__m512i; 8] {
             let z: [__m512i; 8] =
                 core::array::from_fn(|i| _mm512_loadu_si512(rows.add(64 * i).cast()));
-            qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
+            if PRETRANSPOSED {
+                z
+            } else {
+                qword_transpose(z.map(|v| _mm512_permutexvar_epi8(bt, v)))
+            }
         };
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {

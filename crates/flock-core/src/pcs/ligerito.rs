@@ -7327,7 +7327,9 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     challenges: [F128; 6],
     block_len: usize,
 ) -> (Vec<F128>, SumcheckMessage) {
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_four_maps_staged;
+    use crate::zerocheck::multilinear::kernels::x86_64::{
+        GfniEqPlanes64, build_gfni_eq_planes64, gfni_fold64_four_planes_staged,
+    };
     use crate::pcs::ring_switch::compose_block_mats_gfni_into;
     use rayon::prelude::*;
 
@@ -7345,14 +7347,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
             super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators)
         })
         .collect();
-    let direct_gfni_rows: Vec<(Vec<u64>, Vec<u64>)> = claims
+    // eq_lo is identical across every high-factor block. Store its exact
+    // GFNI byte-plane layout once, instead of retransposing it in every leaf.
+    let direct_gfni_planes: Vec<Vec<GfniEqPlanes64>> = claims
         .par_iter()
-        .map(|claim| {
-            (
-                claim.eq_lo.iter().map(|x| x.lo).collect(),
-                claim.eq_lo.iter().map(|x| x.hi).collect(),
-            )
-        })
+        .map(|claim| claim.eq_lo.chunks_exact(64).map(build_gfni_eq_planes64).collect())
         .collect();
 
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
@@ -7387,21 +7386,15 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                         &mut *mats1_hi.as_mut_ptr(),
                     );
                 }
-                let (rows0, rows1) = (&direct_gfni_rows[0], &direct_gfni_rows[1]);
+                let (tiles0, tiles1) = (&direct_gfni_planes[0], &direct_gfni_planes[1]);
                 for slot in (0..block_len).step_by(64) {
-                    // SAFETY: both packed row halves supply 512 bytes, both
-                    // outputs cover 64 F128s, and this helper's cfg fixes all
-                    // target features required by the kernel.
+                    // SAFETY: slot/64 selects the exact 64-entry tile, output
+                    // and scratch retain the incumbent extents, and this
+                    // helper's cfg supplies all target features.
                     unsafe {
-                        gfni_fold64_four_maps_staged(
-                            rows0.0.as_ptr().add(slot).cast::<u8>(),
-                            &*mats0_lo.as_ptr(),
-                            rows0.1.as_ptr().add(slot).cast::<u8>(),
-                            &*mats0_hi.as_ptr(),
-                            rows1.0.as_ptr().add(slot).cast::<u8>(),
-                            &*mats1_lo.as_ptr(),
-                            rows1.1.as_ptr().add(slot).cast::<u8>(),
-                            &*mats1_hi.as_ptr(),
+                        gfni_fold64_four_planes_staged(
+                            &tiles0[slot / 64], &*mats0_lo.as_ptr(), &*mats0_hi.as_ptr(),
+                            &tiles1[slot / 64], &*mats1_lo.as_ptr(), &*mats1_hi.as_ptr(),
                             b_out.as_mut_ptr().add(slot),
                             gfni_tmp.as_mut_ptr().cast(),
                         );
