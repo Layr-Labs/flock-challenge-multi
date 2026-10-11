@@ -2788,15 +2788,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                         if use_c4 {
                             let c = cfold.unwrap();
                             if c4_lm_on {
-                                gfni_fold64_rows_masked_c4_bcast_lm(
+                                // Local FoldCache destinations are disjoint from
+                                // one another, packed witnesses, and cfold matrices.
+                                gfni_fold64_rows_masked_c4_bcast_lm_pair(
                                     a_pkt.add(4 * xg * 8),
-                                    c,
-                                    fa.as_mut_ptr(),
-                                    dead,
-                                );
-                                gfni_fold64_rows_masked_c4_bcast_lm(
                                     b_pkt.add(4 * xg * 8),
                                     c,
+                                    fa.as_mut_ptr(),
                                     fb.as_mut_ptr(),
                                     dead,
                                 );
@@ -4603,6 +4601,171 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
                 let r1 = _mm512_xor_si512(accp[1], accq[1]);
                 _mm512_storeu_si512(dst.add(2 * P), _mm512_permutex2var_epi8(r0, out_even, r1));
                 _mm512_storeu_si512(dst.add(2 * P + 1), _mm512_permutex2var_epi8(r0, out_odd, r1));
+            }};
+        }
+        pass!(0);
+        pass!(1);
+    }
+}
+
+/// Paired version of the lane-major composed prefold, private to the packed
+/// rounds-3+4 caller. Each matrix vector is reused across the two row sides.
+///
+/// # Safety
+/// Same readable-row / dead-line / ISA contract as the single-side leaf.
+/// Both outputs hold sixteen writable F128s, are mutually disjoint, and
+/// neither output aliases either row input or the borrowed matrices.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_pair(
+    rows_a: *const u8,
+    rows_b: *const u8,
+    m: &CFoldMats,
+    out_a: *mut F128,
+    out_b: *mut F128,
+    dead_lines: u8,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: both stage expansions use the incumbent's masked loads and
+    // full gather. All octets are initialized before the affine reads;
+    // matrix vectors are read-only and outputs are distinct caller scratch.
+    unsafe {
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs_a = Octs([0u64; 64]);
+        let mut octs_b = Octs([0u64; 64]);
+        let oct_even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr() as *const __m512i);
+        let oct_odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr() as *const __m512i);
+        macro_rules! stage {
+            ($rows:expr, $octs:expr) => {{
+                let rows = $rows;
+                let op = $octs.0.as_mut_ptr();
+                let mut z = [_mm512_setzero_si512(); 8];
+                if dead_lines == 0 {
+                    for (i, slot) in z.iter_mut().enumerate() {
+                        *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                    }
+                } else {
+                    for (i, slot) in z.iter_mut().enumerate() {
+                        if dead_lines & (1u8 << i) == 0 {
+                            *slot = _mm512_loadu_si512(rows.add(64 * i) as *const __m512i);
+                        }
+                    }
+                }
+
+                let gather = |p: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+                    // Stage 1: qwords `{a, a + 4}` of two lines, as the incumbent.
+                    let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+                    let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+                    let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+                    let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+                    let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+                    let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+                    let base = op.add(32 * p);
+                    // `oct[a].qword[j]` = chunk `j` of the eight residue-`a` rows.
+                    let oct = |a: usize, v: __m512i| {
+                        _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v)
+                    };
+                    oct(0, _mm512_permutex2var_epi8(p01, oct_even, p45));
+                    oct(1, _mm512_permutex2var_epi8(p01, oct_odd, p45));
+                    oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
+                    oct(3, _mm512_permutex2var_epi8(p23, oct_odd, p67));
+                };
+                gather(0, z[0], z[2], z[4], z[6]);
+                gather(1, z[1], z[3], z[5], z[7]);
+            }};
+        }
+        stage!(rows_a, octs_a);
+        stage!(rows_b, octs_b);
+        // Opaque pointers preserve load-port octet broadcasts, as in parent.
+        let rp_a = core::hint::black_box(octs_a.0.as_ptr());
+        let rp_b = core::hint::black_box(octs_b.0.as_ptr());
+        let mp = m.1.as_ptr() as *const u64;
+        let dst_a = out_a as *mut __m512i;
+        let dst_b = out_b as *mut __m512i;
+        let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
+        let out_odd = _mm512_loadu_si512(C4_LM_OUT_ODD.as_ptr() as *const __m512i);
+
+        // Groups are reduced promptly rather than retaining sixteen affine
+        // products plus sixteen row broadcasts. Each matrix is still the
+        // full incumbent vector of eight independent qword matrices.
+        macro_rules! affine {
+            ($mp:expr, $p:expr, $a:expr, $hh:expr, $j:expr) => {{
+                let matrix = _mm512_loadu_si512(
+                    $mp.add(8 * (32 * $hh + 8 * $a + $j)) as *const __m512i,
+                );
+                let ba = _mm512_set1_epi64(*rp_a.add(32 * $p + 8 * $a + $j) as i64);
+                let bb = _mm512_set1_epi64(*rp_b.add(32 * $p + 8 * $a + $j) as i64);
+                (
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ba, matrix),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(bb, matrix),
+                )
+            }};
+        }
+        macro_rules! affine3 {
+            ($mp:expr, $p:expr, $a:expr, $hh:expr, $j:expr) => {{
+                let (a0, b0) = affine!($mp, $p, $a, $hh, $j);
+                let (a1, b1) = affine!($mp, $p, $a, $hh, $j + 1);
+                let (a2, b2) = affine!($mp, $p, $a, $hh, $j + 2);
+                (
+                    _mm512_ternarylogic_epi64::<0x96>(a0, a1, a2),
+                    _mm512_ternarylogic_epi64::<0x96>(b0, b1, b2),
+                )
+            }};
+        }
+        macro_rules! pass {
+            ($p:expr) => {{
+                const P: usize = $p;
+                let mut accp_a = [_mm512_setzero_si512(); 2];
+                let mut accq_a = [_mm512_setzero_si512(); 2];
+                let mut accp_b = [_mm512_setzero_si512(); 2];
+                let mut accq_b = [_mm512_setzero_si512(); 2];
+                // Keep each constant-a group's matrix loads in this group.
+                // The opaque pointer blocks eager matrix staging across groups.
+                macro_rules! group {
+                    ($a:expr) => {{
+                        const A: usize = $a;
+                        let matrix_base = core::hint::black_box(mp);
+                        for hh in 0..2usize {
+                            let (v1_a, v1_b) = affine3!(matrix_base, P, A, hh, 0);
+                            let (v2_a, v2_b) = affine3!(matrix_base, P, A, hh, 3);
+                            let (g6_a, g6_b) = affine!(matrix_base, P, A, hh, 6);
+                            let (g7_a, g7_b) = affine!(matrix_base, P, A, hh, 7);
+                            let v3_a = _mm512_ternarylogic_epi64::<0x96>(g6_a, g7_a, v1_a);
+                            let v3_b = _mm512_ternarylogic_epi64::<0x96>(g6_b, g7_b, v1_b);
+                            if A == 0 {
+                                accp_a[hh] = v2_a;
+                                accq_a[hh] = v3_a;
+                                accp_b[hh] = v2_b;
+                                accq_b[hh] = v3_b;
+                            } else {
+                                accp_a[hh] = _mm512_ternarylogic_epi64::<0x96>(accp_a[hh], accq_a[hh], v2_a);
+                                accq_a[hh] = v3_a;
+                                accp_b[hh] = _mm512_ternarylogic_epi64::<0x96>(accp_b[hh], accq_b[hh], v2_b);
+                                accq_b[hh] = v3_b;
+                            }
+                        }
+                    }};
+                }
+                group!(0);
+                group!(1);
+                group!(2);
+                group!(3);
+                let r0_a = _mm512_xor_si512(accp_a[0], accq_a[0]);
+                let r1_a = _mm512_xor_si512(accp_a[1], accq_a[1]);
+                let r0_b = _mm512_xor_si512(accp_b[0], accq_b[0]);
+                let r1_b = _mm512_xor_si512(accp_b[1], accq_b[1]);
+                _mm512_storeu_si512(dst_a.add(2 * P), _mm512_permutex2var_epi8(r0_a, out_even, r1_a));
+                _mm512_storeu_si512(dst_a.add(2 * P + 1), _mm512_permutex2var_epi8(r0_a, out_odd, r1_a));
+                _mm512_storeu_si512(dst_b.add(2 * P), _mm512_permutex2var_epi8(r0_b, out_even, r1_b));
+                _mm512_storeu_si512(dst_b.add(2 * P + 1), _mm512_permutex2var_epi8(r0_b, out_odd, r1_b));
             }};
         }
         pass!(0);
