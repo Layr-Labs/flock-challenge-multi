@@ -1804,6 +1804,15 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let bake_arg = bake_vec.as_ref();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fast_r2 =
+        kernels::x86_64::round2_baked_elide_route_ok(r2_mats_arg.is_some(), lo_size, bake_arg);
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     let (sum1_even, sum_inf_even, agg) = (0..hi_size)
@@ -1824,6 +1833,53 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             // shape, WRITE=false touches no chunk, and the cfg gate supplies
             // every intrinsic feature.
             let out = unsafe {
+                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                if fast_r2
+                    && (pair_idx_base & 127) == 0
+                    && (row_base & 255) == 0
+                    && let Some(bk) = bake_arg
+                {
+                    kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        lo_size,
+                        bk,
+                    )
+                } else if let Some(bk) = bake_arg {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                        Some(bk),
+                    )
+                } else {
+                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        row_base,
+                        &mut none_a,
+                        &mut none_b,
+                        eq_lo,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        wtab_arg,
+                        None,
+                    )
+                }
+                #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
                 if let Some(bk) = bake_arg {
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
                         table.data.as_ptr(),
@@ -2111,6 +2167,20 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let c4_lm = kernels::x86_64::zc_c4_lm_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fast_r34 = kernels::x86_64::fold2_packed_c4_lm_wtab_route_ok(
+        r2_mats_arg.is_some(),
+        c4_lm,
+        lo_size,
+        cfold_arg.is_some(),
+        wtab_arg.is_some(),
+    );
 
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -2129,6 +2199,56 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             // 4·out_base .. 4·(out_base + chunk_out); the table has the
             // protocol-fixed shape; the cfg gate supplies every feature.
             let out = unsafe {
+                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                if fast_r34
+                    && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg)
+                {
+                    let ap = a_packed.as_ptr();
+                    let bp = b_packed.as_ptr();
+                    match (nt_out, out_lm) {
+                        (true, true) => {
+                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                            )
+                        }
+                        (true, false) => {
+                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                            )
+                        }
+                        (false, true) => {
+                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                            )
+                        }
+                        (false, false) => {
+                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                            )
+                        }
+                    }
+                } else {
+                    kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                        table.data.as_ptr(),
+                        r2_mats_arg,
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        out_base,
+                        a_out,
+                        b_out,
+                        rho1,
+                        rho2,
+                        eq_lo,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        nt_out,
+                        cfold_arg,
+                        wtab_arg,
+                        c4_lm,
+                        out_lm,
+                    )
+                }
+                #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
                 kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                     table.data.as_ptr(),
                     r2_mats_arg,
@@ -3083,6 +3203,16 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         target_feature = "vpclmulqdq"
     ))]
     let split = kernels::x86_64::zc_defer_split_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fast_plain = kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+        split,
+        lo_size,
+        wtab_arg.is_some(),
+    );
 
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -3100,10 +3230,75 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
             // SAFETY: chunk geometry supplies four inputs per output and two
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
-                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm,
-                    out_lm, split,
-                )
+                if fast_plain && let Some(wt) = wtab_arg {
+                    let ap = a_in.as_ptr();
+                    let bp = b_in.as_ptr();
+                    let aop = a_out.as_mut_ptr();
+                    let bop = b_out.as_mut_ptr();
+                    match (nt_out, in_lm, out_lm) {
+                        (false, true, true) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                false,
+                                true,
+                                true,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (false, false, true) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                false,
+                                false,
+                                true,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (false, true, false) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                false,
+                                true,
+                                false,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (false, false, false) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                false,
+                                false,
+                                false,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (true, true, true) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                true,
+                                true,
+                                true,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (true, false, true) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                true,
+                                false,
+                                true,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (true, true, false) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                true,
+                                true,
+                                false,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                        (true, false, false) => {
+                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                                true,
+                                false,
+                                false,
+                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                        }
+                    }
+                } else {
+                    kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                        a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm,
+                        out_lm, split,
+                    )
+                }
             };
             #[cfg(not(all(
                 target_arch = "x86_64",

@@ -84,7 +84,8 @@ fn generate_evals_from_subspace(basis: &[F128]) -> Vec<Vec<F128>> {
 
 /// Compute `Σ_j bit_j(idx) · basis[j]` — the `idx`-th element of the F_2-span
 /// of `basis`.
-#[inline]
+#[cold]
+#[inline(never)]
 fn span_get(basis: &[F128], idx: usize) -> F128 {
     let mut acc = F128::ZERO;
     for (j, &b) in basis.iter().enumerate() {
@@ -1476,6 +1477,7 @@ fn st_fmp_run(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 unsafe fn st_fmp_fold4(
@@ -1542,6 +1544,7 @@ impl AdditiveNttF128 {
         }
     }
 
+    #[inline]
     pub fn log_domain_size(&self) -> usize {
         self.evals.len()
     }
@@ -1553,6 +1556,7 @@ impl AdditiveNttF128 {
     ///
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
+    #[inline]
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
         debug_assert!(layer < self.log_domain_size());
         debug_assert!(block < 1usize << layer);
@@ -2414,6 +2418,7 @@ impl AdditiveNttF128 {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_fused2_publish<const ALIGNED_ZMM: bool>(
@@ -2428,6 +2433,7 @@ impl AdditiveNttF128 {
         lanes4_tail: usize,
         stage_perm: bool,
         tw4: &[[F128; 15]],
+        tw2: &[[[F128; 3]; 16]],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2457,7 +2463,16 @@ impl AdditiveNttF128 {
                     );
                 }
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2486,6 +2501,7 @@ impl AdditiveNttF128 {
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     #[allow(clippy::too_many_arguments)]
     #[inline]
     unsafe fn seed_top_direct_publish2<const ALIGNED_ZMM: bool>(
@@ -2498,6 +2514,7 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2: &[[[F128; 3]; 16]],
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2512,7 +2529,16 @@ impl AdditiveNttF128 {
             for block in 0..8 {
                 let region = bufp.add(block * 64 * row_len);
                 self.seed_top_publish2_block::<ALIGNED_ZMM>(
-                    region, base, block, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                    region,
+                    base,
+                    block,
+                    row_len,
+                    block_size,
+                    sub_stride,
+                    r,
+                    lanes2,
+                    stage_perm,
+                    &tw2[block],
                 );
             }
         }
@@ -2555,17 +2581,14 @@ impl AdditiveNttF128 {
         r: usize,
         lanes2: usize,
         stage_perm: bool,
+        tw2_block: &[[F128; 3]; 16],
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
         // this block's 64 logical rows.
         unsafe {
-            for m in 0..16 {
-                let outer_block = block * 16 + m;
-                let t_outer = self.twiddle(3 + 4, outer_block);
-                let t_inner_a = self.twiddle(3 + 5, 2 * outer_block);
-                let t_inner_b = self.twiddle(3 + 5, 2 * outer_block + 1);
+            for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
                 let k = 4 * m;
                 let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                 let step = g2_stride * row_len;
@@ -2650,6 +2673,19 @@ impl AdditiveNttF128 {
                     tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
                 }
                 tw
+            })
+            .collect();
+
+        let tw2: Vec<[[F128; 3]; 16]> = (0..8)
+            .map(|block| {
+                core::array::from_fn(|m| {
+                    let outer_block = block * 16 + m;
+                    [
+                        self.twiddle(LAYER + 4, outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block + 1),
+                    ]
+                })
             })
             .collect();
 
@@ -2892,6 +2928,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2905,6 +2942,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
+                            &tw2,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -2927,11 +2965,7 @@ impl AdditiveNttF128 {
                             tw,
                         );
                     }
-                    for m in 0..16 {
-                        let outer_block = block * 16 + m;
-                        let t_outer = self.twiddle(LAYER + 4, outer_block);
-                        let t_inner_a = self.twiddle(LAYER + 5, 2 * outer_block);
-                        let t_inner_b = self.twiddle(LAYER + 5, 2 * outer_block + 1);
+                    for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2[block].iter().enumerate() {
                         let p = region.add(perm(4 * m) * row_len);
                         let step = g2_stride * row_len;
                         let a = std::slice::from_raw_parts_mut(p, lanes2);
@@ -3004,11 +3038,11 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
@@ -3458,107 +3492,42 @@ impl AdditiveNttF128 {
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
                         hint: u8|
          -> bool {
-            if fuse_blocks && block_cb.is_some() {
-                let cb = block_cb.unwrap();
-                // Sweep 1: fused-four over the whole sub-group (layers
-                // n_top..n_top+4) — verbatim the incumbent's first pass.
-                {
-                    let layer = n_top;
-                    let block_size = 1usize << (log_d - layer);
-                    let sixteenth = block_size >> 4;
-                    let global_block = sub_idx;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer, global_block);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                    }
-                    for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                    }
-                    butterfly_interleaved_fused_4layer_rows(
+            if fuse_blocks && let Some(cb) = block_cb {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                // SAFETY: cfg guarantees AVX-512F + VPCLMULQDQ.
+                return unsafe {
+                    self.deep_sub_fused_blocks_x86(
+                        sub_idx,
                         sub_data,
-                        &tw,
-                        sixteenth,
+                        cb,
+                        n_top,
+                        log_d,
                         num_ntts,
-                        if sixteenth.is_multiple_of(2) {
-                            odd_tail
-                        } else {
-                            0
-                        },
+                        odd_tail,
+                        sub_size_positions,
                         hint,
-                    );
-                }
-                // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
-                // (n_top+8..n_top+11), then the leaf callback, all while the
-                // 128-position block is cache-hot.
-                let layer4 = n_top + 4;
-                let block_size4 = 1usize << (log_d - layer4);
-                let block_bytes4 = block_size4 * num_ntts;
-                let sixteenth4 = block_size4 >> 4;
-                let layer3 = n_top + 8;
-                let dense_lanes = num_ntts - odd_tail;
-                #[cfg(test)]
-                FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                for b in 0..16usize {
-                    let g4 = sub_idx * 16 + b;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                    tw[0] = self.twiddle(layer4, g4);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-                    }
-                    for s in 0..8 {
-                        tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-                    }
-                    let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-                    butterfly_interleaved_fused_4layer_rows(
-                        blk,
-                        &tw,
-                        sixteenth4,
-                        num_ntts,
-                        if sixteenth4.is_multiple_of(2) {
-                            odd_tail
-                        } else {
-                            0
-                        },
-                        hint,
-                    );
-                    for j in 0..16usize {
-                        let g8 = g4 * 16 + j;
-                        let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
-                        tw3[0] = self.twiddle(layer3, g8);
-                        for s in 0..2 {
-                            tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
-                        }
-                        for s in 0..4 {
-                            tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
-                        }
-                        let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
-                        // SAFETY: eight consecutive rows of `num_ntts` lanes,
-                        // owned exclusively by this sub-group task; the zero
-                        // tail lives on odd rows exactly as in the sweep
-                        // schedule (blocks start at even global rows).
-                        unsafe {
-                            kernels::butterfly_fused_3layer_rows(
-                                eight.as_mut_ptr(),
-                                num_ntts,
-                                dense_lanes,
-                                &tw3,
-                            );
-                        }
-                    }
-                    let lo = sub_idx * sub_size_positions + b * block_size4;
-                    cb(
-                        lo..lo + block_size4,
-                        &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
-                    );
-                }
-                return true;
+                    )
+                };
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )))]
+                return self.deep_sub_fused_blocks_fallback(
+                    sub_idx,
+                    sub_data,
+                    cb,
+                    n_top,
+                    log_d,
+                    num_ntts,
+                    odd_tail,
+                    sub_size_positions,
+                    hint,
+                );
             }
             // The cache-blocked tail normally sweeps each subgroup once per
             // remaining layer. On AVX-512, reuse the fused-four kernel from
@@ -4263,6 +4232,154 @@ impl AdditiveNttF128 {
             }
         }
     }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn deep_sub_fused_blocks_x86(
+        &self,
+        sub_idx: usize,
+        sub_data: &mut [F128],
+        cb: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        sub_size_positions: usize,
+        hint: u8,
+    ) -> bool {
+        self.deep_sub_fused_blocks_fallback(
+            sub_idx,
+            sub_data,
+            cb,
+            n_top,
+            log_d,
+            num_ntts,
+            odd_tail,
+            sub_size_positions,
+            hint,
+        )
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn deep_sub_fused_blocks_fallback(
+        &self,
+        sub_idx: usize,
+        sub_data: &mut [F128],
+        cb: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        sub_size_positions: usize,
+        hint: u8,
+    ) -> bool {
+        // Sweep 1: fused-four over the whole sub-group (layers
+        // n_top..n_top+4) — verbatim the incumbent's first pass.
+        {
+            let layer = n_top;
+            let block_size = 1usize << (log_d - layer);
+            let sixteenth = block_size >> 4;
+            let global_block = sub_idx;
+            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+            tw[0] = self.twiddle(layer, global_block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+            }
+            butterfly_interleaved_fused_4layer_rows(
+                sub_data,
+                &tw,
+                sixteenth,
+                num_ntts,
+                if sixteenth.is_multiple_of(2) {
+                    odd_tail
+                } else {
+                    0
+                },
+                hint,
+            );
+        }
+        // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
+        // (n_top+8..n_top+11), then the leaf callback, all while the
+        // 128-position block is cache-hot.
+        let layer4 = n_top + 4;
+        let block_size4 = 1usize << (log_d - layer4);
+        let block_bytes4 = block_size4 * num_ntts;
+        let sixteenth4 = block_size4 >> 4;
+        let layer3 = n_top + 8;
+        let dense_lanes = num_ntts - odd_tail;
+        #[cfg(test)]
+        FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for b in 0..16usize {
+            let g4 = sub_idx * 16 + b;
+            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+            tw[0] = self.twiddle(layer4, g4);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+            }
+            let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
+            butterfly_interleaved_fused_4layer_rows(
+                blk,
+                &tw,
+                sixteenth4,
+                num_ntts,
+                if sixteenth4.is_multiple_of(2) {
+                    odd_tail
+                } else {
+                    0
+                },
+                hint,
+            );
+            for j in 0..16usize {
+                let g8 = g4 * 16 + j;
+                let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+                tw3[0] = self.twiddle(layer3, g8);
+                for s in 0..2 {
+                    tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+                }
+                for s in 0..4 {
+                    tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+                }
+                let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+                // SAFETY: eight consecutive rows of `num_ntts` lanes,
+                // owned exclusively by this sub-group task; the zero
+                // tail lives on odd rows exactly as in the sweep
+                // schedule (blocks start at even global rows).
+                unsafe {
+                    kernels::butterfly_fused_3layer_rows(
+                        eight.as_mut_ptr(),
+                        num_ntts,
+                        dense_lanes,
+                        &tw3,
+                    );
+                }
+            }
+            let lo = sub_idx * sub_size_positions + b * block_size4;
+            cb(
+                lo..lo + block_size4,
+                &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
+            );
+        }
+        true
+    }
 }
 
 /// Like [`butterfly_interleaved_block`] but parallelizes across rows via
@@ -4452,6 +4569,50 @@ fn butterfly_interleaved_fused_4layer_par_rows(
 /// here would add dispatch overhead and disrupt subgroup cache locality.
 #[inline]
 fn butterfly_interleaved_fused_4layer_rows(
+    block: &mut [F128],
+    t: &[F128; 15],
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    hint: u8,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg guarantees AVX-512F + VPCLMULQDQ.
+    return unsafe {
+        butterfly_interleaved_fused_4layer_rows_x86(block, t, sixteenth, num_ntts, odd_tail, hint)
+    };
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    butterfly_interleaved_fused_4layer_rows_fallback(block, t, sixteenth, num_ntts, odd_tail, hint)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[inline]
+unsafe fn butterfly_interleaved_fused_4layer_rows_x86(
+    block: &mut [F128],
+    t: &[F128; 15],
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    hint: u8,
+) {
+    butterfly_interleaved_fused_4layer_rows_fallback(block, t, sixteenth, num_ntts, odd_tail, hint)
+}
+
+#[inline(always)]
+fn butterfly_interleaved_fused_4layer_rows_fallback(
     block: &mut [F128],
     t: &[F128; 15],
     sixteenth: usize,
