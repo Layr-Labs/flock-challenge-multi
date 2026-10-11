@@ -509,30 +509,28 @@ pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
 #[target_feature(enable = "avx512f,sse4.1")]
 pub unsafe fn f128x4_extract(v: __m512i) -> [F128; 4] {
     // SAFETY: register-only lane extraction under the declared features.
-    unsafe {
-        let l0 = _mm512_extracti32x4_epi32::<0>(v);
-        let l1 = _mm512_extracti32x4_epi32::<1>(v);
-        let l2 = _mm512_extracti32x4_epi32::<2>(v);
-        let l3 = _mm512_extracti32x4_epi32::<3>(v);
-        [
-            F128 {
-                lo: _mm_extract_epi64::<0>(l0) as u64,
-                hi: _mm_extract_epi64::<1>(l0) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l1) as u64,
-                hi: _mm_extract_epi64::<1>(l1) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l2) as u64,
-                hi: _mm_extract_epi64::<1>(l2) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l3) as u64,
-                hi: _mm_extract_epi64::<1>(l3) as u64,
-            },
-        ]
-    }
+    let l0 = _mm512_extracti32x4_epi32::<0>(v);
+    let l1 = _mm512_extracti32x4_epi32::<1>(v);
+    let l2 = _mm512_extracti32x4_epi32::<2>(v);
+    let l3 = _mm512_extracti32x4_epi32::<3>(v);
+    [
+        F128 {
+            lo: _mm_extract_epi64::<0>(l0) as u64,
+            hi: _mm_extract_epi64::<1>(l0) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l1) as u64,
+            hi: _mm_extract_epi64::<1>(l1) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l2) as u64,
+            hi: _mm_extract_epi64::<1>(l2) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l3) as u64,
+            hi: _mm_extract_epi64::<1>(l3) as u64,
+        },
+    ]
 }
 
 /// Pack 4 `F128` scalars into a `__m512i` (lane 0 = `a`, …, lane 3 = `d`).
@@ -588,6 +586,20 @@ impl WideGhashX4 {
     #[target_feature(enable = "avx512f")]
     pub unsafe fn zero() -> Self {
         let z = _mm512_setzero_si512();
+        Self {
+            lo: z,
+            hi: z,
+            mid: z,
+        }
+    }
+
+    /// Empty accumulator opaque to `LoopIdiomRecognize` so `[WideGhashX4; 8]`
+    /// is initialized with ZMM stores or kept in registers rather than
+    /// `vzeroupper` + `callq memset`.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn zero_no_memset() -> Self {
+        let z = core::hint::black_box(_mm512_setzero_si512());
         Self {
             lo: z,
             hi: z,
