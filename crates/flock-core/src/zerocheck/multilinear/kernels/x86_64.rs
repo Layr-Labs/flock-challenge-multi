@@ -2457,6 +2457,104 @@ unsafe fn transpose4_lanes(
     }
 }
 
+/// Private representation for the packed rounds-3+4 message sums.
+/// `mix` retains the Karatsuba mixed product: `mid = mix ^ lo ^ hi`.
+/// Convert only after horizontal XOR at chunk finish, not per product.
+/// All three vectors have the same four independent 128-bit lane layout.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[derive(Clone, Copy)]
+struct PackedKaratsubaX4 {
+    lo: core::arch::x86_64::__m512i,
+    hi: core::arch::x86_64::__m512i,
+    mix: core::arch::x86_64::__m512i,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl PackedKaratsubaX4 {
+    // SAFETY for these private methods: the cfg gate and sole caller provide
+    // AVX-512F, VPCLMULQDQ and the SSE4.1 lane extracts used by fold().
+    #[inline(always)]
+    unsafe fn zero() -> Self {
+        unsafe {
+            let z = core::arch::x86_64::_mm512_setzero_si512();
+            Self { lo: z, hi: z, mix: z }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn mul_acc(&mut self, x: core::arch::x86_64::__m512i, y: core::arch::x86_64::__m512i) {
+        use core::arch::x86_64::*;
+        unsafe {
+            let xs = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4e>(x));
+            let ys = _mm512_xor_si512(y, _mm512_shuffle_epi32::<0x4e>(y));
+            self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+            self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+            self.mix = _mm512_xor_si512(self.mix, _mm512_clmulepi64_epi128::<0x00>(xs, ys));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn mul_acc2(
+        &mut self,
+        x0: core::arch::x86_64::__m512i,
+        y0: core::arch::x86_64::__m512i,
+        x1: core::arch::x86_64::__m512i,
+        y1: core::arch::x86_64::__m512i,
+    ) {
+        use core::arch::x86_64::*;
+        unsafe {
+            let xs0 = _mm512_xor_si512(x0, _mm512_shuffle_epi32::<0x4e>(x0));
+            let ys0 = _mm512_xor_si512(y0, _mm512_shuffle_epi32::<0x4e>(y0));
+            let xs1 = _mm512_xor_si512(x1, _mm512_shuffle_epi32::<0x4e>(x1));
+            let ys1 = _mm512_xor_si512(y1, _mm512_shuffle_epi32::<0x4e>(y1));
+            let lo0 = _mm512_clmulepi64_epi128::<0x00>(x0, y0);
+            let lo1 = _mm512_clmulepi64_epi128::<0x00>(x1, y1);
+            let hi0 = _mm512_clmulepi64_epi128::<0x11>(x0, y0);
+            let hi1 = _mm512_clmulepi64_epi128::<0x11>(x1, y1);
+            let mix0 = _mm512_clmulepi64_epi128::<0x00>(xs0, ys0);
+            let mix1 = _mm512_clmulepi64_epi128::<0x00>(xs1, ys1);
+            self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, lo0, lo1);
+            self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, hi0, hi1);
+            self.mix = _mm512_ternarylogic_epi64::<0x96>(self.mix, mix0, mix1);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fold(self) -> F256Unreduced {
+        use core::arch::x86_64::*;
+        #[inline(always)]
+        unsafe fn xor4(v: __m512i) -> __m128i {
+            unsafe {
+                let l0 = _mm512_extracti32x4_epi32::<0>(v);
+                let l1 = _mm512_extracti32x4_epi32::<1>(v);
+                let l2 = _mm512_extracti32x4_epi32::<2>(v);
+                let l3 = _mm512_extracti32x4_epi32::<3>(v);
+                _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
+            }
+        }
+        unsafe {
+            let lo = xor4(self.lo);
+            let hi = xor4(self.hi);
+            let mid = _mm_xor_si128(xor4(self.mix), _mm_xor_si128(lo, hi));
+            F256Unreduced {
+                r0: _mm_extract_epi64::<0>(lo) as u64,
+                r1: (_mm_extract_epi64::<1>(lo) ^ _mm_extract_epi64::<0>(mid)) as u64,
+                r2: (_mm_extract_epi64::<0>(hi) ^ _mm_extract_epi64::<1>(mid)) as u64,
+                r3: _mm_extract_epi64::<1>(hi) as u64,
+            }
+        }
+    }
+}
+
+
 /// x86 no-materialize composed pass for one worker chunk: re-derives the
 /// round-two folded rows from the packed witness through the same byte-table
 /// gathers as the sweep (`fold_round2_pair_x86_unchecked_8`), folds them at
@@ -2732,7 +2830,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         let defer = zc_fold_defer_enabled();
         let even_idx = _mm512_set_epi64(13, 12, 9, 8, 5, 4, 1, 0);
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
-        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc = [PackedKaratsubaX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
