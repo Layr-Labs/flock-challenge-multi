@@ -2373,7 +2373,14 @@ pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
     target_feature = "avx512vbmi",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+#[cfg_attr(
+    target_feature = "gfni",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")
+)]
 pub(crate) unsafe fn reduce_worker_plane_block_x86_avx512(
     planes_ptr: *const u8,
     worker_stride: usize,
