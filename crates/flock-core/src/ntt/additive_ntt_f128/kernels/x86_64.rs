@@ -1646,7 +1646,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 /// shaped wrappers): distinct constants force a distinct monomorphization, so
 /// the shaped forms get compile-time address arithmetic even though the
 /// ninety-line body is never inlined into its wrapper.
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
     const DIET: bool,
