@@ -742,15 +742,6 @@ pub(super) fn stage_c_group(src: &[u8], dst: &mut [u8; 4 * 16 * 64]) {
 /// the group's four contiguous 1 KiB windows, `n_b_med` their live medium-row
 /// counts, `mats` the group's 32 matrix qwords, `plane_banks` the byte-plane
 /// C bank store. Bit-identical banks; see the kernel.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
-))]
-#[inline]
 /// First-write form of [`accumulate_c_banks_fold4_fused_gfni`], for the first
 /// live group of a band.
 #[cfg(all(

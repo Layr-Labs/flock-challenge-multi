@@ -1438,14 +1438,18 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf as [`collapse_s_hat_v_fold8`] — identical per-element
-        // operation in identical order, so the result is bit-identical to
-        // the scalar loop below. (This ranked-live call sat scalar when the
-        // fold8 twin was converted.)
-        for q in 0..4 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves as [`collapse_s_hat_v_fold8`] — identical
+        // per-element operation in identical order, so the result is
+        // bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_quad[..n_packed],
+            low_eq[0],
+        );
+        for q in 1..4 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_quad[q * n_packed..(q + 1) * n_packed],
@@ -1454,6 +1458,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for q in 0..4 {
         for b in 0..n_packed {
             out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
@@ -1541,12 +1546,17 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf — identical per-element operation in identical order, so the
-        // result is bit-identical to the scalar loop below.
-        for bank in 0..64 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves — identical per-element operation in identical
+        // order, so the result is bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_fold8[..n_packed],
+            low_eq[0],
+        );
+        for bank in 1..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed],
@@ -1555,6 +1565,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for bank in 0..64 {
         for packed in 0..n_packed {
             out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];

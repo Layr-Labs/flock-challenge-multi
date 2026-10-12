@@ -289,6 +289,55 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_nt(
     }
 }
 
+/// Precomputed x86_64 seed twiddles for [`seed_layers_pair_row_group_8`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) type SeedBlockTwiddles8 = x86_64::SeedBlockTwiddles8;
+
+/// Precompute [`SeedBlockTwiddles8`] once per `seed_layers_pair_from_msg` call.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn precompute_seed_twiddles_8(twiddles: &[[F128; 3]]) -> SeedBlockTwiddles8 {
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe { x86_64::precompute_seed_twiddles_8(twiddles) }
+}
+
+/// Fuse all `blocks` of one `r` row-group in `seed_layers_pair_from_msg` when
+/// `num_ntts == 8`: loads the 4 source rows (`8` ZMMs) once, produces sparse
+/// block 0 and dense blocks `1..blocks` directly from those registers, and
+/// publishes with 64B ZMM streams, 16B XMM streams, or temporal stores.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`] across all `blocks`
+/// output blocks of length `msg_len`, with `num_ntts == 8`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn seed_layers_pair_row_group_8(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    msg_len: usize,
+    r: usize,
+    pre: &SeedBlockTwiddles8,
+    use_nt: bool,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        x86_64::seed_layers_pair_row_group_8(src, dst, quarter, msg_len, r, pre, use_nt);
+    }
+}
+
 /// [`butterfly_fused_2layer_row_from`] with independent source/destination
 /// row geometry (source rows `i·src_quarter + src_r`, destination rows
 /// `i·dst_quarter + dst_r`).
@@ -630,6 +679,14 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
 /// The caller must ensure the 16 row slices selected by `r` are valid and
 /// disjoint from any row group being processed concurrently.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
@@ -648,24 +705,75 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // geometry and disjointness contract. The shaped arms only fire when the
     // constants equal the runtime shape, so they are value-identical.
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
+        if super::ntt_shaped_enabled() {
+            if num_ntts == 64 {
+                match sixteenth {
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    8 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    4 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    1 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    _ => {}
                 }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
+            } else if num_ntts == 8 {
+                match sixteenth {
+                    1024 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1024, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    64 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<64, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    16 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<16, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    8 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    4 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<4, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    2 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<2, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    1 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    _ => {}
                 }
-                1 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                _ => {}
             }
         }
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
@@ -690,6 +798,14 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 /// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
 /// also lie inside the block.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     ptr: *mut F128,
     sixteenth: usize,
@@ -752,6 +868,14 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// group being processed concurrently, that `dense_lanes <= num_ntts`, and
 /// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
     num_ntts: usize,
@@ -768,9 +892,14 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // geometry, disjointness and zero-tail contract. The shaped arm only
     // fires when the constant equals the runtime shape (value-identical).
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
-            return;
+        if super::ntt_shaped_enabled() {
+            if num_ntts == 64 {
+                x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
+                return;
+            } else if num_ntts == 8 {
+                x86_64::butterfly_fused_3layer_rows_shaped::<8>(ptr, dense_lanes, twiddles);
+                return;
+            }
         }
         x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
     }
