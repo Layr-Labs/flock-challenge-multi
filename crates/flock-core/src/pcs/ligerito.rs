@@ -4824,8 +4824,10 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         let b_ptr = b.as_ptr();
         let fc_ptr = fc.as_mut_ptr();
         let bc_ptr = bc.as_mut_ptr();
-        let dst_aligned =
-            (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
+        let dst_alignment = (fc_ptr as usize) | (bc_ptr as usize);
+        let dst_aligned = dst_alignment.is_multiple_of(16);
+        let dst_aligned64 = dst_alignment.is_multiple_of(64);
+        let dst_aligned32 = dst_alignment.is_multiple_of(32);
 
         let deferred_vec = if CORR {
             use crate::field::gf2_128::x86_64::ghash_shift64_x4;
@@ -4857,7 +4859,22 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            // Bulk t advances by eight F128s; each vector starts at t or
+            // t+4. Those 64-byte offsets preserve the checked base alignment.
+            // Publish the same 64 bytes without extracting individual lanes
+            // when both destinations permit a wider non-temporal store.
+            if stream && dst_aligned64 {
+                _mm512_stream_si512(ptr.cast::<__m512i>(), value);
+            } else if stream && dst_aligned32 {
+                _mm256_stream_si256(
+                    ptr.cast::<__m256i>(),
+                    _mm512_castsi512_si256(value),
+                );
+                _mm256_stream_si256(
+                    ptr.add(2).cast::<__m256i>(),
+                    _mm512_extracti64x4_epi64::<1>(value),
+                );
+            } else if stream && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
