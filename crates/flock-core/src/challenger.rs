@@ -665,17 +665,15 @@ fn blake3_pow_scan_many(state_digest: &[u8; 32], start: u64, len: u64, bits: u32
 }
 
 // ---------------------------------------------------------------------------
-// blake3_pow_avx512 — 32-lane (2 × 16-wide) AVX-512 kernel for the BLAKE3
-// PoW grind: the x86 twin of `blake3_pow_neon` below (same structure, same
-// determinism contract — read that module's header for the why).
+// blake3_pow_avx512 — 16-lane AVX-512 kernel for the BLAKE3 PoW grind:
+// the x86 twin of `blake3_pow_neon` below (same determinism contract).
 //
-// What AVX-512 changes versus the NEON port: every lane rotation is a single
-// `vprord` (`_mm512_ror_epi32`), the accept test is one `vpshufb` byte
-// reverse plus one `vpcmpud` into a 16-bit mask, and a 16-wide state already
-// exposes 4 × 16 independent G lanes per half-round, so two interleaved
-// groups (32 nonces per iteration, dividing `GRIND_CHUNK` exactly) are enough
-// to keep the two 512-bit ALU ports busy without spilling the 2 × 16 + 16
-// live ZMM registers.
+// Every lane rotation is one `vprord` (`_mm512_ror_epi32`); the accept test
+// is one `vpshufb` byte reverse plus one `vpcmpud` into a 16-bit mask. One
+// 16-wide state exposes four independent G operations per half-round while
+// reducing register pressure versus two interleaved states. The scan retains
+// nonce-independent prefix/digest operands, so this is not a promise of zero
+// stack traffic. It gives up cross-state ILP for fewer compression spills.
 //
 // Like the NEON kernel it computes only digest word 0 (`v0 ^ v8`), which is
 // all the `bits ≤ 32` predicate reads, and hoists the nonce-independent
@@ -793,8 +791,9 @@ mod blake3_pow_avx512 {
         v[a] = add(add(v[a], b1), my);
     }
 
-    /// Independent 16-wide states interleaved per compression call.
-    const GROUPS: usize = 2;
+    /// One 16-wide state reduces live compression-state register pressure;
+    /// nonce-independent prefix and message operands can still use the stack.
+    const GROUPS: usize = 1;
     /// Nonce lanes per scan iteration.
     const LANES: usize = 16 * GROUPS;
 
@@ -969,7 +968,7 @@ mod blake3_pow_avx512 {
                 let m: __mmask16 = _mm512_cmplt_epu32_mask(rev, thresh);
                 mask |= (m as u32) << (16 * k);
             }
-            if n < 32 {
+            if n < LANES as u32 {
                 mask &= (1u32 << n) - 1;
             }
             if mask != 0 {
