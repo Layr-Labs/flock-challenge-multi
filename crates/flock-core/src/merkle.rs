@@ -585,6 +585,64 @@ pub(crate) fn hash_leaf_pairs_serial(
     }
 }
 
+/// Retire four original leaves into one retained level-two node. Leaves and
+/// first-level parents are temporary, while output keeps canonical quad order.
+/// This separate frame avoids adding the temporary CV arrays to every caller.
+#[inline(never)]
+pub(crate) fn hash_leaf_quads_serial(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+    kind: HashKind,
+) {
+    const CHUNK_LEAVES: usize = 128;
+    assert!(leaf_size > 0);
+    assert_eq!(data.len(), 4 * out.len() * leaf_size);
+    let mut leaves = core::mem::MaybeUninit::<[Hash; CHUNK_LEAVES]>::uninit();
+    let mut pairs = core::mem::MaybeUninit::<[Hash; CHUNK_LEAVES / 2]>::uninit();
+    for (quads, bytes) in out
+        .chunks_mut(CHUNK_LEAVES / 4)
+        .zip(data.chunks(CHUNK_LEAVES * leaf_size))
+    {
+        let leaf_count = 4 * quads.len();
+        let pair_count = 2 * quads.len();
+        // SAFETY: the arrays are aligned for Hash and the initialized prefixes
+        // have at most CHUNK_LEAVES and CHUNK_LEAVES/2 entries, respectively.
+        // Each producer writes its entire prefix before the next hash reads it.
+        let (leaf_hashes, pair_hashes) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(leaves.as_mut_ptr().cast::<Hash>(), leaf_count),
+                core::slice::from_raw_parts_mut(pairs.as_mut_ptr().cast::<Hash>(), pair_count),
+            )
+        };
+        hash_leaves_serial(bytes, leaf_size, leaf_hashes, kind);
+        hash_pairs_level_serial(leaf_hashes, pair_hashes, kind);
+        hash_pairs_level_serial(pair_hashes, quads, kind);
+    }
+}
+
+/// Reconstruct omitted first-level BLAKE3 nodes from indexed pairs of original
+/// 1 KiB leaves, preserving parent order without copying codeword bytes.
+pub(crate) fn hash_indexed_blake3_pairs_1k(
+    data: &[u8],
+    positions: &[usize],
+    out: &mut [Hash],
+) {
+    assert_eq!(positions.len(), out.len());
+    assert_eq!(data.len() % 2048, 0);
+    let pair_count = data.len() / 2048;
+    assert!(positions.iter().all(|&p| p < pair_count));
+    let mut leaf_positions = Vec::with_capacity(2 * positions.len());
+    for &p in positions {
+        leaf_positions.push(2 * p);
+        leaf_positions.push(2 * p + 1);
+    }
+    // The existing sparse primitive initializes every CV before parent hashing.
+    let mut leaf_hashes: Vec<Hash> = crate::alloc_uninit_vec(leaf_positions.len());
+    hash_indexed_blake3_1k(data, &leaf_positions, &mut leaf_hashes);
+    hash_pairs_level_serial(&leaf_hashes, out, HashKind::Blake3);
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;

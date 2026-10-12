@@ -8356,14 +8356,97 @@ fn ranked_l0_auth_batch_enabled(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_L0_AUTH_BATCH").is_none());
     cfg!(all(target_arch = "x86_64", target_feature = "avx512f"))
         && *ON
-        && tree_len == block_len - 1
+        && (tree_len == block_len - 1
+            || (block_len >= 4 && tree_len == block_len / 2 - 1))
         && block_len == (1 << 20)
         && num_interleaved == 64
         && n_queries == 218
         && kind == HashKind::Blake3
 }
 
-/// L0 counterpart that also accepts the ranked depth-one compact tree. The
+/// Open a depth-two compact L0 tree in the original full-tree proof order.
+/// Only its two omitted levels are reconstructed; higher nodes map by the
+/// geometric sum n+n/2 of omitted widths, never by a compact level number.
+fn merkle_multi_proof_for_l0_cut2(
+    tree: &[Hash],
+    codeword: &[F128],
+    block_len: usize,
+    num_interleaved: usize,
+    queries: &[usize],
+    kind: HashKind,
+) -> Vec<Hash> {
+    assert!(block_len.is_power_of_two() && block_len >= 4);
+    assert_eq!(tree.len(), block_len / 2 - 1);
+    assert_eq!(codeword.len(), block_len * num_interleaved);
+    let retained_start = block_len + block_len / 2;
+    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+    let leaf_size = num_interleaved * core::mem::size_of::<F128>();
+    // SAFETY: F128 has no padding and codeword stays alive throughout the gather.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr().cast::<u8>(),
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
+    use rayon::prelude::*;
+    if ranked_l0_auth_batch_enabled(
+        tree.len(), block_len, num_interleaved, queries.len(), kind,
+    ) {
+        debug_assert_eq!(leaf_size, 1024);
+        // The established canonical index walk emits complete levels in order.
+        let leaf_end = indices.partition_point(|&i| i < block_len);
+        let pair_end = indices.partition_point(|&i| i < retained_start);
+        debug_assert!(indices[pair_end..].iter().all(|&i| i >= retained_start));
+        let mut proof: Vec<Hash> = crate::alloc_uninit_vec(indices.len());
+        let (leaf_out, higher_out) = proof.split_at_mut(leaf_end);
+        let (pair_out, stored_out) = higher_out.split_at_mut(pair_end - leaf_end);
+        let pair_positions: Vec<usize> = indices[leaf_end..pair_end]
+            .iter().map(|&i| i - block_len).collect();
+        rayon::join(
+            || {
+                rayon::join(
+                    || merkle::hash_indexed_blake3_1k(bytes, &indices[..leaf_end], leaf_out),
+                    || merkle::hash_indexed_blake3_pairs_1k(bytes, &pair_positions, pair_out),
+                );
+            },
+            || {
+                let stored_indices = &indices[pair_end..];
+                if serial_par_enabled() && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
+                    stored_out.par_iter_mut().zip(stored_indices.par_iter())
+                        .with_min_len(MULTIPROOF_PAR_CHUNK)
+                        .for_each(|(out, &i)| *out = tree[i - retained_start]);
+                } else {
+                    for (out, &i) in stored_out.iter_mut().zip(stored_indices) {
+                        *out = tree[i - retained_start];
+                    }
+                }
+            },
+        );
+        return proof;
+    }
+    let gather = |&i: &usize| {
+        if i < block_len {
+            let start = i * leaf_size;
+            merkle::hash_leaf(&bytes[start..start + leaf_size], kind)
+        } else if i < retained_start {
+            let start = 2 * (i - block_len) * leaf_size;
+            let left = merkle::hash_leaf(&bytes[start..start + leaf_size], kind);
+            let right = merkle::hash_leaf(&bytes[start + leaf_size..start + 2 * leaf_size], kind);
+            merkle::hash_pair(&left, &right, kind)
+        } else {
+            tree[i - retained_start]
+        }
+    };
+    if serial_par_enabled() && indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
+        indices.par_iter().with_min_len(MULTIPROOF_PAR_CHUNK).map(gather).collect()
+    } else {
+        indices.iter().map(gather).collect()
+    }
+}
+
+/// L0 counterpart accepting the full tree and ranked cut1/cut2 compact trees.
+/// The cut2 branch reconstructs two omitted levels; this cut1 fallback keeps
+/// the accepted single-level mapping below unchanged. The
 /// canonical proof walk still uses the original `block_len`: omitted level-0
 /// siblings are rehashed from their codeword rows, while every level at or
 /// above one has the same relative order in the compact tree at index
@@ -8378,6 +8461,11 @@ fn merkle_multi_proof_for_l0(
 ) -> Vec<Hash> {
     if tree.len() == 2 * block_len - 1 {
         return merkle_multi_proof_for(tree, block_len, queries);
+    }
+    if block_len >= 4 && tree.len() == block_len / 2 - 1 {
+        return merkle_multi_proof_for_l0_cut2(
+            tree, codeword, block_len, num_interleaved, queries, kind,
+        );
     }
     assert_eq!(tree.len(), block_len - 1, "unsupported compact L0 tree");
     assert_eq!(codeword.len(), block_len * num_interleaved);
@@ -8899,7 +8987,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_interleaved_0 = 1usize << initial_k;
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert!(
-        l0_tree.len() == 2 * block_len_0 - 1 || l0_tree.len() == block_len_0 - 1,
+        l0_tree.len() == 2 * block_len_0 - 1
+            || l0_tree.len() == block_len_0 - 1
+            || (block_len_0 >= 4 && l0_tree.len() == block_len_0 / 2 - 1),
         "external L0 tree has unsupported layout"
     );
 

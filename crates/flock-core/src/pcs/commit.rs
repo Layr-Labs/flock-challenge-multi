@@ -342,17 +342,14 @@ fn finalize_commit(
                     sub_data.len() * core::mem::size_of::<F128>(),
                 )
             };
-            // At cut depth one, every two ordinary leaves are hashed directly
-            // to their parent and only that parent level is retained. Ranked
-            // deep-pass ranges are even-sized and pair-aligned, so workers
-            // still own disjoint output ranges.
-            let stored_range = if merkle_cut_depth == 1 {
-                assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
-                assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
-                (range.start >> 1)..(range.end >> 1)
-            } else {
-                range.clone()
-            };
+            // Retain level cut_depth as the compact tree's level zero. Ranked
+            // blocks align to four original leaves, so cut1 and cut2 outputs
+            // remain disjoint across workers just like the full leaf ranges.
+            let group = 1usize << merkle_cut_depth;
+            assert_eq!(range.start % group, 0, "Merkle-cut range start is unaligned");
+            assert_eq!(range.len() % group, 0, "Merkle-cut range length is unaligned");
+            let stored_range =
+                (range.start >> merkle_cut_depth)..(range.end >> merkle_cut_depth);
             // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
             // range; only this worker writes it, and all corresponding NTT
             // rows have retired on this thread.
@@ -362,10 +359,11 @@ fn finalize_commit(
                     stored_range.len(),
                 )
             };
-            if merkle_cut_depth == 1 {
-                merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
-            } else {
-                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            match merkle_cut_depth {
+                2 => merkle::hash_leaf_quads_serial(bytes, leaf_size, out, kind),
+                1 => merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind),
+                0 => merkle::hash_leaves_serial(bytes, leaf_size, out, kind),
+                _ => unreachable!("unsupported Merkle cut depth"),
             }
 
             if !subtree_parents {
@@ -381,11 +379,8 @@ fn finalize_commit(
             else {
                 return;
             };
-            let parent_range = if merkle_cut_depth == 1 {
-                (parent_range.start >> 1)..(parent_range.end >> 1)
-            } else {
-                parent_range
-            };
+            let parent_range = (parent_range.start >> merkle_cut_depth)
+                ..(parent_range.end >> merkle_cut_depth);
             let len = parent_range.len();
             let depth = if len.is_power_of_two()
                 && len >= 2
@@ -412,8 +407,8 @@ fn finalize_commit(
             if depth == 0 || seen == 0 {
                 return;
             }
-            // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
-            // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
+            // Compact level j (j ≥ 1) has stored_leaves >> j nodes and starts
+            // at offset 2·stored_leaves − 2·(stored_leaves >> j); the group owns
             // nodes [start >> j, (start + len) >> j) of it.
             let mut lvl_read_off = parent_range.start; // level 0 = leaves
             let mut lvl_read_len = len;
@@ -482,9 +477,9 @@ fn finalize_commit(
     )
 }
 
-/// The ranked x86 BLAKE3 L0 tree retains level 1 and above. Its omitted leaf
-/// CVs are reconstructed from the retained codeword only when queried during
-/// opening. `FLOCK_NO_MERKLE_CUT` restores the ordinary full tree.
+/// The ranked x86 BLAKE3 L0 tree retains level 2 and above by default. The
+/// omitted levels are reconstructed from the retained codeword during opening.
+/// `FLOCK_NO_MERKLE_CUT2` restores cut1; `FLOCK_NO_MERKLE_CUT` restores cut0.
 fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
     if cfg!(target_arch = "x86_64")
         && std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none()
@@ -496,7 +491,11 @@ fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
         && params.n_leaves() == (1 << 20)
         && params.leaf_size_bytes() == 1024
     {
-        1
+        if std::env::var_os("FLOCK_NO_MERKLE_CUT2").is_none() {
+            2
+        } else {
+            1
+        }
     } else {
         0
     }
