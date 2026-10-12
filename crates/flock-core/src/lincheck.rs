@@ -615,6 +615,22 @@ impl RootSplicePlan {
     ) {
         use core::arch::x86_64::*;
         unsafe {
+            // A pair fully contained in this chunk never needs carry storage.
+            // Cross-chunk pairs retain the existing pending/carry protocol.
+            if !*pending {
+                if let (RootSpliceAction::Start, RootSpliceAction::End { out, select }) =
+                    (&self.actions[2 * q], &self.actions[2 * q + 1])
+                {
+                    let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
+                    let rows = std::array::from_fn(|t| {
+                        let lo = _mm512_loadu_si512(tile.add(t * 128) as *const __m512i);
+                        let hi = _mm512_loadu_si512(tile.add(t * 128 + 64) as *const __m512i);
+                        _mm512_permutex2var_epi8(lo, indices, hi)
+                    });
+                    kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
+                    return;
+                }
+            }
             for half in 0..2 {
                 let input = tile.add(half * 64);
                 match &self.actions[2 * q + half] {
@@ -641,44 +657,22 @@ impl RootSplicePlan {
                     RootSpliceAction::End { out, select } => {
                         debug_assert!(*pending);
                         let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
-                        for t in 0..8 {
+                        let rows = std::array::from_fn(|t| {
                             let lo =
                                 _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
                             let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_permutex2var_epi8(lo, indices, hi);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_permutex2var_epi8(lo, indices, hi)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                         *pending = false;
                     }
                     RootSpliceAction::Tail { out, mask } => {
                         debug_assert!(!*pending);
-                        for t in 0..8 {
+                        let rows = std::array::from_fn(|t| {
                             let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_maskz_mov_epi8(*mask, row);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
+                            _mm512_maskz_mov_epi8(*mask, row)
+                        });
+                        kernels::gfni_fold_rows(rows, mats, planes.add(out * 1024), seed_zero);
                     }
                 }
             }
