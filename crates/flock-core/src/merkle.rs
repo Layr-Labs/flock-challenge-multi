@@ -565,6 +565,11 @@ pub(crate) fn hash_leaf_pairs_serial(
     out: &mut [Hash],
     kind: HashKind,
 ) {
+    // Ranked x86 callbacks retire 128 leaves. Two hash_many batches need only
+    // 4 KiB of CV scratch, not the 32 KiB rayon task grouping buffer.
+    #[cfg(target_arch = "x86_64")]
+    const SCRATCH_LEAVES: usize = 2 * BLAKE3_BATCH;
+    #[cfg(not(target_arch = "x86_64"))]
     const SCRATCH_LEAVES: usize = BLAKE3_GROUP;
     assert_eq!(data.len(), 2 * out.len() * leaf_size);
 
