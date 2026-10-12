@@ -1438,14 +1438,18 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf as [`collapse_s_hat_v_fold8`] — identical per-element
-        // operation in identical order, so the result is bit-identical to
-        // the scalar loop below. (This ranked-live call sat scalar when the
-        // fold8 twin was converted.)
-        for q in 0..4 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves as [`collapse_s_hat_v_fold8`] — identical
+        // per-element operation in identical order, so the result is
+        // bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_quad[..n_packed],
+            low_eq[0],
+        );
+        for q in 1..4 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_quad[q * n_packed..(q + 1) * n_packed],
@@ -1454,6 +1458,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for q in 0..4 {
         for b in 0..n_packed {
             out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
@@ -1541,12 +1546,17 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf — identical per-element operation in identical order, so the
-        // result is bit-identical to the scalar loop below.
-        for bank in 0..64 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves — identical per-element operation in identical
+        // order, so the result is bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_fold8[..n_packed],
+            low_eq[0],
+        );
+        for bank in 1..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed],
@@ -1555,6 +1565,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for bank in 0..64 {
         for packed in 0..n_packed {
             out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
@@ -2183,26 +2194,70 @@ pub(crate) fn compose_block_mats_gfni_into(
     high_mats: &mut [u64; 128],
 ) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
+    use core::arch::x86_64::*;
     use core::mem::MaybeUninit;
 
-    let mut low_rows = [MaybeUninit::<u64>::uninit(); 64];
-    let mut high_rows = [MaybeUninit::<u64>::uninit(); 64];
-    let mut w = e_hi;
-    for chunk in 0..2 {
-        for lane in 0..64 {
-            low_rows[lane].write(w.lo);
-            high_rows[lane].write(w.hi);
-            w = crate::field::mul_by_x(w);
-        }
-        let mats = if chunk == 0 {
-            &mut *low_mats
-        } else {
-            &mut *high_mats
-        };
-        // SAFETY: both row arrays hold 64 initialized u64 values, the output
-        // matrix block is fully overwritten, and this function's cfg supplies
-        // every target feature required by the leaf.
-        unsafe {
+    let mut low_rows = MaybeUninit::<[u64; 64]>::uninit();
+    let mut high_rows = MaybeUninit::<[u64; 64]>::uninit();
+    let low_ptr = low_rows.as_mut_ptr().cast::<__m512i>();
+    let high_ptr = high_rows.as_mut_ptr().cast::<__m512i>();
+
+    let s0 = e_hi;
+    let s1 = crate::field::mul_by_x(s0);
+    let s2 = crate::field::mul_by_x(s1);
+    let s3 = crate::field::mul_by_x(s2);
+    let s4 = crate::field::mul_by_x(s3);
+    let s5 = crate::field::mul_by_x(s4);
+    let s6 = crate::field::mul_by_x(s5);
+    let s7 = crate::field::mul_by_x(s6);
+
+    unsafe {
+        let mut lo = _mm512_set_epi64(
+            s7.lo as i64,
+            s6.lo as i64,
+            s5.lo as i64,
+            s4.lo as i64,
+            s3.lo as i64,
+            s2.lo as i64,
+            s1.lo as i64,
+            s0.lo as i64,
+        );
+        let mut hi = _mm512_set_epi64(
+            s7.hi as i64,
+            s6.hi as i64,
+            s5.hi as i64,
+            s4.hi as i64,
+            s3.hi as i64,
+            s2.hi as i64,
+            s1.hi as i64,
+            s0.hi as i64,
+        );
+        for chunk in 0..2 {
+            for g in 0..8 {
+                _mm512_storeu_si512(low_ptr.add(g), lo);
+                _mm512_storeu_si512(high_ptr.add(g), hi);
+                if chunk == 0 || g < 7 {
+                    let top = _mm512_srli_epi64::<56>(hi);
+                    let red_721 = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_slli_epi64::<7>(top),
+                        _mm512_slli_epi64::<2>(top),
+                        _mm512_add_epi64(top, top),
+                    );
+                    let next_hi = _mm512_shldi_epi64::<8>(hi, lo);
+                    let next_lo = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_slli_epi64::<8>(lo),
+                        red_721,
+                        top,
+                    );
+                    lo = next_lo;
+                    hi = next_hi;
+                }
+            }
+            let mats = if chunk == 0 {
+                &mut *low_mats
+            } else {
+                &mut *high_mats
+            };
             gfni_fold64_two_maps_to_mats(
                 low_rows.as_ptr().cast::<u8>(),
                 &map.low,
