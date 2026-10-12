@@ -3454,6 +3454,20 @@ fn transpose_forward_ntt_window_dense(
     w: usize,
     mut buf: Vec<F128>,
 ) -> (usize, Vec<F128>) {
+    transpose_forward_ntt_window_dense_into(ntt, log_d, k, w, &mut buf);
+    (w, buf)
+}
+
+/// The incumbent collision fallback over its final, disjoint window slice.
+#[inline]
+fn transpose_forward_ntt_window_dense_into(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    k: usize,
+    w: usize,
+    buf: &mut [F128],
+) {
+    debug_assert_eq!(buf.len(), 1usize << k);
     for s in 0..k {
         let layer = log_d - 1 - s;
         let bsh = 1usize << s;
@@ -3466,7 +3480,6 @@ fn transpose_forward_ntt_window_dense(
             transpose_butterfly(top_h, bot, t);
         }
     }
-    (w, buf)
 }
 
 /// Ranked default skips the singleton window buffers' zero-fill (every slot
@@ -3786,21 +3799,42 @@ fn transpose_forward_ntt_sparse_inner_dead(
 
     // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
     let nwins = if fill { runs.len() } else { win_vec.len() };
-    let _tw = std::time::Instant::now();
-    let processed: Vec<(usize, Vec<F128>)> = if fill {
-        runs.par_iter()
-            .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
+    let ot = open_timing();
+    let mf0 = if ot { minor_faults() } else { 0 };
+    let (mut data, win_ms, alloc_ms, dens_ms) = if cfg!(target_arch = "x86_64")
+        && fill
+        && induce_fused_densify_enabled()
+    {
+        // Construct each active prefix directly in its final window. The
+        // grouping gives at most one run per window; Rayon gives each task
+        // a disjoint mutable slice. No active-window Vec or later copy.
+        let _ta = std::time::Instant::now();
+        let mut slots = vec![None; n >> k];
+        for &(rs, re) in &runs {
+            let w = positions[order[rs] as usize] >> k;
+            debug_assert!(slots[w].is_none(), "window {w} constructed twice");
+            slots[w] = Some((rs, re));
+        }
+        let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+        let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
+        let _tw = std::time::Instant::now();
+        data.par_chunks_mut(1usize << k)
+            .zip(slots.into_par_iter())
+            .enumerate()
+            .for_each_init(Vec::<F128>::new, |scratch, (w, (dst, run))| {
+                let Some((rs, re)) = run else {
+                    dst.fill(F128::ZERO);
+                    return;
+                };
                 let first = order[rs] as usize;
-                let w = positions[first] >> k;
                 let nnz = re - rs;
                 if singleton_on && nnz <= multi_max {
-                    // Every nonzero expands separately; the sums XOR
-                    // together. F2-linearity: the transpose layers are
-                    // linear over F2, so T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ),
-                    // and F128 addition is XOR (order irrelevant).
-                    // Separate buffers are required — step s of an
-                    // expansion reads its own prefix.
-                    let mut buf = take_singleton_buf(k);
+                    // The first expansion initializes the whole destination
+                    // before any read. Later expansions MUST use their own
+                    // prefix scratch: expanding over the sum is not valid.
+                    if !singleton_uninit_enabled() {
+                        dst.fill(F128::ZERO);
+                    }
                     expand_singleton_into(
                         ntt,
                         log_d,
@@ -3808,7 +3842,7 @@ fn transpose_forward_ntt_sparse_inner_dead(
                         w,
                         positions[first] & wmask,
                         values[first],
-                        &mut buf,
+                        dst,
                     );
                     if nnz > 1 {
                         if scratch.len() < 1usize << k {
@@ -3826,53 +3860,111 @@ fn transpose_forward_ntt_sparse_inner_dead(
                                 values[i],
                                 scratch,
                             );
-                            for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
+                            for (d, &s) in dst.iter_mut().zip(scratch.iter()) {
                                 *d += s;
                             }
                         }
                     }
-                    return (w, buf);
+                } else {
+                    // Dense collision windows read scatter destinations,
+                    // so zero-initialize ALL slots before adding any query.
+                    dst.fill(F128::ZERO);
+                    for &i in &order[rs..re] {
+                        let i = i as usize;
+                        dst[positions[i] & wmask] += values[i];
+                    }
+                    transpose_forward_ntt_window_dense_into(ntt, log_d, k, w, dst);
                 }
-                // Past the cost boundary: incumbent dense window
-                // (needs the zeroed allocation — only the nonzero slots
-                // are scattered).
-                let mut buf = vec![F128::ZERO; 1 << k];
-                for &i in &order[rs..re] {
-                    let i = i as usize;
-                    buf[positions[i] & wmask] += values[i];
-                }
-                transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
-            })
-            .collect()
+            });
+        (data, _tw.elapsed().as_secs_f64() * 1e3, alloc_ms, 0.0)
     } else {
-        win_vec
-            .into_par_iter()
-            .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
-            .collect()
-    };
-    let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
+        let _tw = std::time::Instant::now();
+        let processed: Vec<(usize, Vec<F128>)> = if fill {
+            runs.par_iter()
+                .map_init(Vec::<F128>::new, |scratch, &(rs, re)| {
+                    let first = order[rs] as usize;
+                    let w = positions[first] >> k;
+                    let nnz = re - rs;
+                    if singleton_on && nnz <= multi_max {
+                        // Every nonzero expands separately; the sums XOR
+                        // together. F2-linearity: the transpose layers are
+                        // linear over F2, so T(Σ vᵢ·δ_pᵢ) = Σ T(vᵢ·δ_pᵢ),
+                        // and F128 addition is XOR (order irrelevant).
+                        // Separate buffers are required — step s of an
+                        // expansion reads its own prefix.
+                        let mut buf = take_singleton_buf(k);
+                        expand_singleton_into(
+                            ntt,
+                            log_d,
+                            k,
+                            w,
+                            positions[first] & wmask,
+                            values[first],
+                            &mut buf,
+                        );
+                        if nnz > 1 {
+                            if scratch.len() < 1usize << k {
+                                *scratch = take_singleton_buf(k);
+                            }
+                            let scratch = &mut scratch[..1usize << k];
+                            for &i in &order[rs + 1..re] {
+                                let i = i as usize;
+                                expand_singleton_into(
+                                    ntt,
+                                    log_d,
+                                    k,
+                                    w,
+                                    positions[i] & wmask,
+                                    values[i],
+                                    scratch,
+                                );
+                                for (d, &s) in buf.iter_mut().zip(scratch.iter()) {
+                                    *d += s;
+                                }
+                            }
+                        }
+                        return (w, buf);
+                    }
+                    // Past the cost boundary: incumbent dense window
+                    // (needs the zeroed allocation — only the nonzero slots
+                    // are scattered).
+                    let mut buf = vec![F128::ZERO; 1 << k];
+                    for &i in &order[rs..re] {
+                        let i = i as usize;
+                        buf[positions[i] & wmask] += values[i];
+                    }
+                    transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf)
+                })
+                .collect()
+        } else {
+            win_vec
+                .into_par_iter()
+                .map(|(w, buf)| transpose_forward_ntt_window_dense(ntt, log_d, k, w, buf))
+                .collect()
+        };
+        let win_ms = _tw.elapsed().as_secs_f64() * 1e3;
 
-    // Densify (active windows only; the rest stay zero, which is the correct
-    // post-step-(k-1) state for an all-zero window).
-    let ot = open_timing();
-    let _ta = std::time::Instant::now();
-    let mf0 = if ot { minor_faults() } else { 0 };
-    let (mut data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
-        // FUSED: one parallel pass writes every window exactly once, from an
-        // UNINITIALIZED buffer. See `densify_windows_fused`.
-        let slots = window_slots(n >> k, processed);
-        let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-        let _td = std::time::Instant::now();
-        let data = densify_windows_fused(n, k, slots);
-        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
-    } else {
-        let mut data = vec![F128::ZERO; n];
-        let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
-        let _td = std::time::Instant::now();
-        for (w, buf) in processed {
-            data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
-        }
-        (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+        // Densify (active windows only; the rest stay zero, which is the correct
+        // post-step-(k-1) state for an all-zero window).
+        let _ta = std::time::Instant::now();
+        let (data, alloc_ms, dens_ms) = if induce_fused_densify_enabled() {
+            // FUSED: one parallel pass writes every window exactly once, from an
+            // UNINITIALIZED buffer. See `densify_windows_fused`.
+            let slots = window_slots(n >> k, processed);
+            let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
+            let _td = std::time::Instant::now();
+            let data = densify_windows_fused(n, k, slots);
+            (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+        } else {
+            let mut data = vec![F128::ZERO; n];
+            let alloc_ms = _ta.elapsed().as_secs_f64() * 1e3;
+            let _td = std::time::Instant::now();
+            for (w, buf) in processed {
+                data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
+            }
+            (data, alloc_ms, _td.elapsed().as_secs_f64() * 1e3)
+        };
+        (data, win_ms, alloc_ms, dens_ms)
     };
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
