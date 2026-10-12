@@ -2504,6 +2504,7 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
     wtab: Option<&[F128]>,
     c4_lm: bool,
     out_lm: bool,
+    b_boundary: Option<&[F128; 2]>,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -2770,6 +2771,11 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
         };
         let pf_on = zc_pkt_pf_enabled();
         let pf_spread = zc_pkt_pf_spread_enabled();
+        // Full 64-output blocks only: a cached tail is always produced by its
+        // own preceding head within this chunk, even for nondefault splits.
+        let b_quartet_active = b_boundary.is_some() && c4_lm_on
+            && lo_size.is_multiple_of(32) && out_base.is_multiple_of(64);
+        let mut b_tail = [F128::ZERO; 16];
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let fa = &mut (*fa_store.as_mut_ptr()).0;
@@ -2780,6 +2786,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                 let x = $x_expr;
                 let ol = 2 * x; // local output index of group 0
                 let xg = out_base + ol;
+                // Hint residues belong to the future tile, not the current one.
+                let b_pf_keep = if b_quartet_active {
+                    match (xg + 16 * pf_tiles) & 63 {
+                        0 => 0xfcu8,
+                        48 => 0x3fu8,
+                        _ => 0xffu8,
+                    }
+                } else { 0xffu8 };
                 let cache = if use_batch {
                     #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
                     {
@@ -2794,12 +2808,20 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                     fa.as_mut_ptr(),
                                     dead,
                                 );
-                                gfni_fold64_rows_masked_c4_bcast_lm(
-                                    b_pkt.add(4 * xg * 8),
-                                    c,
-                                    fb.as_mut_ptr(),
-                                    dead,
-                                );
+                                if b_quartet_active && (xg & 63) == 0 {
+                                    gfni_b_boundary_quartet_lm(
+                                        b_pkt.add(4 * xg * 8), c,
+                                        b_boundary.unwrap(), fb.as_mut_ptr(),
+                                        b_tail.as_mut_ptr(),
+                                    );
+                                } else if b_quartet_active && (xg & 63) == 48 {
+                                    fb[..16].copy_from_slice(&b_tail);
+                                } else {
+                                    gfni_fold64_rows_masked_c4_bcast_lm(
+                                        b_pkt.add(4 * xg * 8), c,
+                                        fb.as_mut_ptr(), dead,
+                                    );
+                                }
                             } else if c4_bcast {
                                 gfni_fold64_rows_masked_c4_bcast(
                                     a_pkt.add(4 * xg * 8),
@@ -2850,10 +2872,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                     a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                     core::arch::x86_64::_MM_HINT_T0,
                                 );
-                                _mm_prefetch(
-                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                    core::arch::x86_64::_MM_HINT_T0,
-                                );
+                                if b_pf_keep & (1u8 << l) != 0 {
+                                    _mm_prefetch(
+                                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                        core::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2926,10 +2950,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_pf_keep & (1u8 << l) != 0 {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
                 let ap = a_out.as_mut_ptr().add(ol);
@@ -2969,10 +2995,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_pf_keep & (1u8 << l) != 0 {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                     (a0, a1, a2, a3, b0, b1, b2, b3)
@@ -2997,10 +3025,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                                 a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                                 core::arch::x86_64::_MM_HINT_T0,
                             );
-                            _mm_prefetch(
-                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
+                            if b_pf_keep & (1u8 << l) != 0 {
+                                _mm_prefetch(
+                                    b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
                         }
                     }
                     let [a0, a1, a2, a3] = transpose4(oa0, oa1, oa2, oa3);
@@ -3014,10 +3044,12 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_x86_avx512(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
                             core::arch::x86_64::_MM_HINT_T0,
                         );
-                        _mm_prefetch(
-                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
-                        );
+                        if b_pf_keep & (1u8 << l) != 0 {
+                            _mm_prefetch(
+                                b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
                     }
                 }
                 let (a0w, a1w, a2w, a3w) = if let Some(wt) = wtab {
@@ -4608,6 +4640,139 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         pass!(0);
         pass!(1);
     }
+}
+
+/// Same composed map as the generic broadcast leaf, but fuse the two ranked B
+/// boundary tiles. Twelve nonconstant outputs from each tile fit exactly three
+/// eight-output affine passes. The constant head and sparse/zero tail use the
+/// actual per-pass map images supplied by the private circuit-branded caller.
+///
+/// # Safety
+/// A complete 256-u64 block is within the caller's readable extent. This leaf
+/// reads only rows 16..64 and 192..240; head/tail each cover 16 writable F128.
+/// The caller certifies rows 0..16 are ff, row 240 is low49 ones and 241..256
+/// zero. `known` equals [L(ff), c0*L(low49)]. All target features are cfg-gated.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+unsafe fn gfni_b_boundary_quartet_lm(
+    rows: *const u8, m: &CFoldMats, known: &[F128; 2],
+    head: *mut F128, tail: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: all sources and destinations satisfy the caller's contract.
+    unsafe {
+        #[inline(always)]
+        unsafe fn pass8(z: [__m512i; 4], m: &CFoldMats) -> [__m512i; 2] {
+            use core::arch::x86_64::*;
+            unsafe {
+                #[repr(C, align(64))]
+                struct Octs([u64; 32]);
+                let mut octs = Octs([0; 32]);
+                let op = octs.0.as_mut_ptr();
+                let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+                let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+                let p01 = _mm512_permutex2var_epi64(z[0], g1_lo, z[1]);
+                let p23 = _mm512_permutex2var_epi64(z[0], g1_hi, z[1]);
+                let p45 = _mm512_permutex2var_epi64(z[2], g1_lo, z[3]);
+                let p67 = _mm512_permutex2var_epi64(z[2], g1_hi, z[3]);
+                let even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr().cast());
+                let odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr().cast());
+                _mm512_storeu_si512(op.cast(), _mm512_permutex2var_epi8(p01, even, p45));
+                _mm512_storeu_si512(op.add(8).cast(), _mm512_permutex2var_epi8(p01, odd, p45));
+                _mm512_storeu_si512(op.add(16).cast(), _mm512_permutex2var_epi8(p23, even, p67));
+                _mm512_storeu_si512(op.add(24).cast(), _mm512_permutex2var_epi8(p23, odd, p67));
+                // Preserve the parent's load-port broadcast, not register vpermq.
+                let rp: *const u64 = core::hint::black_box(op as *const u64);
+                let mp = core::hint::black_box(m.1.as_ptr() as *const u64);
+                let mut accp = [_mm512_setzero_si512(); 2];
+                let mut accq = [_mm512_setzero_si512(); 2];
+                for a in 0..4usize {
+                    let b: [__m512i; 8] = core::array::from_fn(|j| {
+                        _mm512_set1_epi64(*rp.add(8 * a + j) as i64)
+                    });
+                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
+                        core::array::from_fn(|j| {
+                            _mm512_gf2p8affine_epi64_epi8::<0>(b[j],
+                                _mm512_loadu_si512(mp.add(8 * (32 * hh + 8 * a + j)).cast()))
+                        })
+                    });
+                    for hh in 0..2usize {
+                        let g = f[hh];
+                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
+                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
+                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
+                        if a == 0 { accp[hh] = v2; accq[hh] = v3; }
+                        else {
+                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
+                            accq[hh] = v3;
+                        }
+                    }
+                    // V1 scheduled many affine products across reductions
+                    // and spilled them. This no-instruction memory-clobber
+                    // fence ties only the four already-reduced live values.
+                    // It is a compiler fence, not a hardware memory fence.
+                    core::arch::asm!(
+                        "/* {p0} {q0} {p1} {q1} */",
+                        p0 = inout(zmm_reg) accp[0],
+                        q0 = inout(zmm_reg) accq[0],
+                        p1 = inout(zmm_reg) accp[1],
+                        q1 = inout(zmm_reg) accq[1],
+                        options(nostack, preserves_flags),
+                    );
+                }
+                let mut r0 = _mm512_xor_si512(accp[0], accq[0]);
+                let mut r1 = _mm512_xor_si512(accp[1], accq[1]);
+                core::arch::asm!(
+                    "/* {lo} {hi} */",
+                    lo = inout(zmm_reg) r0,
+                    hi = inout(zmm_reg) r1,
+                    options(nostack, preserves_flags),
+                );
+                // Plane byte 8*k+s -> byte k in row-major output slot s.
+                const fn output_index(half: usize) -> [i8; 64] {
+                    let mut idx = [0i8; 64];
+                    let mut u = 0;
+                    while u < 4 {
+                        let s = 4 * half + u;
+                        let mut k = 0;
+                        while k < 8 {
+                            idx[16 * u + k] = (8 * k + s) as i8;
+                            idx[16 * u + 8 + k] = (64 + 8 * k + s) as i8;
+                            k += 1;
+                        }
+                        u += 1;
+                    }
+                    idx
+                }
+                const LO: [i8; 64] = output_index(0);
+                const HI: [i8; 64] = output_index(1);
+                [_mm512_permutex2var_epi8(r0, _mm512_loadu_si512(LO.as_ptr().cast()), r1),
+                 _mm512_permutex2var_epi8(r0, _mm512_loadu_si512(HI.as_ptr().cast()), r1)]
+            }
+        }
+        let load = |row: usize| _mm512_loadu_si512(rows.add(row * 8).cast::<__m512i>());
+        let ones = _mm512_broadcast_i32x4(_mm_set_epi64x(known[0].hi as i64, known[0].lo as i64));
+        let sparse = _mm512_maskz_broadcast_i32x4(0x000f,
+            _mm_set_epi64x(known[1].hi as i64, known[1].lo as i64));
+        let a = pass8([load(16), load(24), load(32), load(40)], m);
+        let b = pass8([load(48), load(56), load(192), load(200)], m);
+        let h = transpose4_lanes(ones, a[0], a[1], b[0]);
+        for i in 0..4 { _mm512_storeu_si512(head.add(4 * i).cast(), h[i]); }
+        let c = pass8([load(208), load(216), load(224), load(232)], m);
+        let t = transpose4_lanes(b[1], c[0], c[1], sparse);
+        for i in 0..4 { _mm512_storeu_si512(tail.add(4 * i).cast(), t[i]); }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+pub(crate) fn zc_b_quartet_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_B_QUARTET").is_none()
+    });
+    *ON
 }
 
 /// [`gfni_fold64_rows`] with the 64 rows already in registers (qword q of

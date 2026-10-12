@@ -1946,6 +1946,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
         false,
+        false,
     )
 }
 
@@ -1968,7 +1969,14 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
+    ranked_b_canonical: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    // A private producer brand is necessary: dimensions/equality tensors alone
+    // say nothing about B's circuit rows. The generic wrapper passes false.
+    let ranked_b_canonical = ranked_b_canonical
+        && m == 32 && k_skip == 6 && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409;
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -2030,6 +2038,30 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     ))]
     #[allow(unused_variables)]
     let cfold_arg = cfold_mats.as_ref();
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    let b_boundary = {
+        #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+        {
+            (ranked_b_canonical && cfold_arg.is_some()
+                && kernels::x86_64::zc_b_quartet_enabled()).then(|| {
+                // Compute images of this proof's actual linear map, not ONE.
+                // Basis columns are exactly those build_cfold_mats consumes.
+                let mut all = F128::ZERO;
+                let mut sparse = F128::ZERO;
+                for bit in 0..64 {
+                    let v = table.data[(bit / 8) * 256 + (1usize << (bit % 8))];
+                    all += v;
+                    if bit < 49 { sparse += v; }
+                }
+                [all, (F128::ONE + rho1) * (F128::ONE + rho2) * sparse]
+            })
+        }
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        { let _ = ranked_b_canonical; None::<[F128; 2]> }
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    let _ = ranked_b_canonical;
 
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
@@ -2147,6 +2179,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     wtab_arg,
                     c4_lm,
                     out_lm,
+                    b_boundary.as_ref(),
                 )
             };
             #[cfg(not(all(
@@ -5669,6 +5702,7 @@ mod tests {
                             wtab_test.as_deref(),
                             c4_lm,
                             out_lm,
+                            None,
                         )
                     };
                     let baked = cfold_arg.is_some();
