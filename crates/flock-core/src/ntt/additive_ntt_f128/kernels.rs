@@ -166,7 +166,7 @@ pub(super) fn butterfly_fused_2layer(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     src: *const F128,
@@ -221,6 +221,95 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
                     src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
                 )
             }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) use x86_64::PreparedPublish2Quad;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn prepare_publish2_block(
+    tw2_block: &[[F128; 3]; 16],
+) -> [PreparedPublish2Quad; 16] {
+    unsafe { x86_64::prepare_publish2_block(tw2_block, low_twiddle_disabled()) }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn mul_diet_disabled() -> bool {
+    x86_64::mul_diet_disabled()
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_prepared<
+    const DIET: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    quad: &PreparedPublish2Quad,
+) {
+    debug_assert!(lanes == 60 || lanes == 64);
+    debug_assert_eq!(dst_a as usize % 16, 0);
+    debug_assert_eq!(dst_b as usize % 16, 0);
+    debug_assert_eq!(dst_c as usize % 16, 0);
+    debug_assert_eq!(dst_d as usize % 16, 0);
+    debug_assert!(!ALIGNED_ZMM || dst_a as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_b as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_c as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_d as usize % 64 == 0);
+
+    unsafe {
+        match quad.kind {
+            0 => x86_64::butterfly_fused_2layer_publish_nt_prepared_impl::<
+                false,
+                false,
+                DIET,
+                ALIGNED_ZMM,
+            >(src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, quad),
+            1 => x86_64::butterfly_fused_2layer_publish_nt_prepared_impl::<
+                false,
+                true,
+                DIET,
+                ALIGNED_ZMM,
+            >(src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, quad),
+            2 => x86_64::butterfly_fused_2layer_publish_nt_prepared_impl::<
+                true,
+                false,
+                DIET,
+                ALIGNED_ZMM,
+            >(src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, quad),
+            _ => x86_64::butterfly_fused_2layer_publish_nt_prepared_impl::<
+                true,
+                true,
+                DIET,
+                ALIGNED_ZMM,
+            >(src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, quad),
         }
     }
 }
@@ -624,19 +713,59 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
     }
 }
 
-/// Process one fused-four-layer row group across every interleaved NTT lane.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) use x86_64::PreparedTwiddles4;
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+#[derive(Clone, Copy)]
+pub(super) struct PreparedTwiddles4(pub(super) [F128; 15]);
+
+#[inline]
+pub(super) fn prepare_twiddles4(twiddles: &[F128; 15]) -> PreparedTwiddles4 {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::prepare_twiddles4(twiddles)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    PreparedTwiddles4(*twiddles)
+}
+
+/// Process one fused-four-layer row group using precomputed [`PreparedTwiddles4`].
 ///
 /// # Safety
-/// The caller must ensure the 16 row slices selected by `r` are valid and
-/// disjoint from any row group being processed concurrently.
+/// Same contract as [`butterfly_fused_4layer_row`].
 #[inline]
-pub(super) unsafe fn butterfly_fused_4layer_row(
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+pub(super) unsafe fn butterfly_fused_4layer_row_prepared(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
     lanes: usize,
     r: usize,
-    twiddles: &[F128; 15],
+    twiddles: &PreparedTwiddles4,
 ) {
     debug_assert!(lanes <= num_ntts);
     #[cfg(all(
@@ -644,28 +773,76 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry and disjointness contract. The shaped arms only fire when the
-    // constants equal the runtime shape, so they are value-identical.
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            match sixteenth {
-                128 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
+        if super::ntt_shaped_enabled() {
+            if num_ntts == 64 {
+                match sixteenth {
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    8 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    4 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    1 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    _ => {}
                 }
-                8 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
+            } else if num_ntts == 8 {
+                match sixteenth {
+                    1024 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1024, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    128 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<128, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    64 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<64, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    16 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<16, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    8 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<8, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    4 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<4, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    2 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<2, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    1 => {
+                        return x86_64::butterfly_fused_4layer_row_shaped::<1, 8, 0>(
+                            ptr, lanes, r, twiddles, 0,
+                        );
+                    }
+                    _ => {}
                 }
-                1 => {
-                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
-                        ptr, lanes, r, twiddles, 0,
-                    );
-                }
-                _ => {}
             }
         }
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
@@ -676,27 +853,31 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
-    // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &twiddles.0);
     }
 }
 
-/// [`butterfly_fused_4layer_row`] with one line hint per row of row group
-/// `pf_r` issued at every lane step. `H` selects the hint level (1 = L1,
-/// 2 = L2). Portable builds ignore the hint.
+/// [`butterfly_fused_4layer_row_pf`] using precomputed [`PreparedTwiddles4`].
 ///
 /// # Safety
-/// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
-/// also lie inside the block.
+/// Same contract as [`butterfly_fused_4layer_row_pf`].
 #[inline]
-pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+pub(super) unsafe fn butterfly_fused_4layer_row_pf_prepared<const H: u8>(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
     lanes: usize,
     r: usize,
-    twiddles: &[F128; 15],
+    twiddles: &PreparedTwiddles4,
     pf_r: usize,
 ) {
     debug_assert!(lanes <= num_ntts);
@@ -705,9 +886,6 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry and disjointness contract. The shaped arms only fire when the
-    // constants equal the runtime shape, so they are value-identical.
     unsafe {
         if super::ntt_shaped_enabled() && num_ntts == 64 {
             match sixteenth {
@@ -734,10 +912,70 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
-    // SAFETY: forwarded caller contract.
     unsafe {
         let _ = pf_r;
-        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &twiddles.0);
+    }
+}
+
+/// Process one fused-four-layer row group across every interleaved NTT lane.
+///
+/// # Safety
+/// The caller must ensure the 16 row slices selected by `r` are valid and
+/// disjoint from any row group being processed concurrently.
+#[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+pub(super) unsafe fn butterfly_fused_4layer_row(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    let prep = prepare_twiddles4(twiddles);
+    unsafe {
+        butterfly_fused_4layer_row_prepared(ptr, sixteenth, num_ntts, lanes, r, &prep);
+    }
+}
+
+/// [`butterfly_fused_4layer_row`] with one line hint per row of row group
+/// `pf_r` issued at every lane step. `H` selects the hint level (1 = L1,
+/// 2 = L2). Portable builds ignore the hint.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
+/// also lie inside the block.
+#[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+    pf_r: usize,
+) {
+    let prep = prepare_twiddles4(twiddles);
+    unsafe {
+        butterfly_fused_4layer_row_pf_prepared::<H>(
+            ptr, sixteenth, num_ntts, lanes, r, &prep, pf_r,
+        );
     }
 }
 
@@ -752,6 +990,14 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// group being processed concurrently, that `dense_lanes <= num_ntts`, and
 /// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
     num_ntts: usize,
@@ -768,9 +1014,14 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     // geometry, disjointness and zero-tail contract. The shaped arm only
     // fires when the constant equals the runtime shape (value-identical).
     unsafe {
-        if super::ntt_shaped_enabled() && num_ntts == 64 {
-            x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
-            return;
+        if super::ntt_shaped_enabled() {
+            if num_ntts == 64 {
+                x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
+                return;
+            } else if num_ntts == 8 {
+                x86_64::butterfly_fused_3layer_rows_shaped::<8>(ptr, dense_lanes, twiddles);
+                return;
+            }
         }
         x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
     }
