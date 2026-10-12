@@ -971,6 +971,11 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
     }
 }
 
+// On x86, batch four 16-word drains per rolling epoch instead of two.
+// This changes only call cadence: the drain still visits every window in order.
+#[cfg(target_arch = "x86_64")]
+const RING_WORDS: usize = 64;
+#[cfg(not(target_arch = "x86_64"))]
 const RING_WORDS: usize = 32;
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
@@ -1443,7 +1448,7 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
                 // Words 0..15 cannot be published until the final chaining
                 // value is known.  The first rolling epoch therefore starts
-                // at word 16; later epochs cover their complete 128 words.
+                // at word 16; later epochs cover their complete RING_WORDS.
                 if WORD + 1 == RING_WORDS {
                     (*self.drain).drain_range(16, 16, RING_WORDS - 16);
                 } else {
