@@ -211,6 +211,41 @@ pub struct LinearFoldPlan {
 
 impl LinearFoldPlan {
     fn reconstruct(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            return self.reconstruct_x86(folded, k);
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        )))]
+        self.reconstruct_fallback(folded, k)
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vl",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq")]
+    #[inline(never)]
+    unsafe fn reconstruct_x86(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        self.reconstruct_fallback(folded, k)
+    }
+
+    #[inline(always)]
+    fn reconstruct_fallback(&self, folded: &[F128], k: usize) -> Vec<F128> {
         let total = k + 1 + self.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
         let mut nodes = if live_cols <= k {
@@ -412,10 +447,7 @@ impl RootFoldSource {
                 if eq8_x4 {
                     return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, i, log_b, mask) };
                 }
-                std::array::from_fn(|r| {
-                    let outer = i + r;
-                    eq_lo[outer & mask] * eq_hi[outer >> log_b]
-                })
+                eq8_from_factors_scalar_cold(&eq_lo, &eq_hi, i, log_b, mask)
             })
         } else {
             let eq = build_eq_table(x_outer);
@@ -603,6 +635,15 @@ impl RootSplicePlan {
         target_feature = "avx512vbmi",
         target_feature = "gfni"
     ))]
+    #[cfg_attr(
+        target_feature = "vpclmulqdq",
+        target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+    )]
+    #[cfg_attr(
+        not(target_feature = "vpclmulqdq"),
+        target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
+    )]
+    #[inline]
     unsafe fn fold_chunk(
         &self,
         q: usize,
@@ -641,20 +682,14 @@ impl RootSplicePlan {
                     RootSpliceAction::End { out, select } => {
                         debug_assert!(*pending);
                         let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
-                        for t in 0..8 {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let lo =
                                 _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
                             let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_permutex2var_epi8(lo, indices, hi);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
+                            _mm512_permutex2var_epi8(lo, indices, hi)
+                        });
+                        kernels::gfni_fold_rows(
+                            &rows,
                             mats,
                             planes.add(out * 1024),
                             seed_zero,
@@ -663,18 +698,12 @@ impl RootSplicePlan {
                     }
                     RootSpliceAction::Tail { out, mask } => {
                         debug_assert!(!*pending);
-                        for t in 0..8 {
+                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
                             let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            let roots = _mm512_maskz_mov_epi8(*mask, row);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                roots,
-                            );
-                        }
-                        kernels::gfni_fold_tile(
-                            carry.as_ptr(),
-                            64,
-                            1,
+                            _mm512_maskz_mov_epi8(*mask, row)
+                        });
+                        kernels::gfni_fold_rows(
+                            &rows,
                             mats,
                             planes.add(out * 1024),
                             seed_zero,
@@ -903,6 +932,202 @@ impl CscCircuit {
             .for_each(|(c, slot)| *slot = one_col(c));
         out
     }
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        ),
+        target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq")
+    )]
+    #[inline(never)]
+    fn fold_cols_narrow_chunk(
+        &self,
+        c_base: usize,
+        out_chunk: &mut [F128],
+        alpha: F128,
+        eq_inner: &[F128],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+        let eq_ptr = eq_inner.as_ptr();
+        #[cfg(target_arch = "x86_64")]
+        #[inline(always)]
+        unsafe fn gather_col_128(rows16: &[u16], eq_ptr: *const F128) -> __m128i {
+            use core::arch::x86_64::*;
+            unsafe {
+                let mut acc0 = _mm_setzero_si128();
+                let mut acc1 = _mm_setzero_si128();
+                let mut acc2 = _mm_setzero_si128();
+                let mut acc3 = _mm_setzero_si128();
+                let mut chunks = rows16.chunks_exact(4);
+                for ch in &mut chunks {
+                    acc0 = _mm_xor_si128(
+                        acc0,
+                        _mm_loadu_si128(eq_ptr.add(ch[0] as usize) as *const __m128i),
+                    );
+                    acc1 = _mm_xor_si128(
+                        acc1,
+                        _mm_loadu_si128(eq_ptr.add(ch[1] as usize) as *const __m128i),
+                    );
+                    acc2 = _mm_xor_si128(
+                        acc2,
+                        _mm_loadu_si128(eq_ptr.add(ch[2] as usize) as *const __m128i),
+                    );
+                    acc3 = _mm_xor_si128(
+                        acc3,
+                        _mm_loadu_si128(eq_ptr.add(ch[3] as usize) as *const __m128i),
+                    );
+                }
+                let mut acc = _mm_xor_si128(_mm_xor_si128(acc0, acc1), _mm_xor_si128(acc2, acc3));
+                for &r in chunks.remainder() {
+                    acc = _mm_xor_si128(
+                        acc,
+                        _mm_loadu_si128(eq_ptr.add(r as usize) as *const __m128i),
+                    );
+                }
+                acc
+            }
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+            let (alpha_vec, alpha_x64) = ghash_broadcast_split(alpha);
+            let n4 = out_chunk.len() & !3;
+            let mut i = 0;
+            while i < n4 {
+                let c0 = c_base + i;
+                let a0_s = *self.a_col_ptr.get_unchecked(c0) as usize;
+                let a0_e = *self.a_col_ptr.get_unchecked(c0 + 1) as usize;
+                let a1_e = *self.a_col_ptr.get_unchecked(c0 + 2) as usize;
+                let a2_e = *self.a_col_ptr.get_unchecked(c0 + 3) as usize;
+                let a3_e = *self.a_col_ptr.get_unchecked(c0 + 4) as usize;
+
+                let sa0 = gather_col_128(self.a_rows16.get_unchecked(a0_s..a0_e), eq_ptr);
+                let sa1 = gather_col_128(self.a_rows16.get_unchecked(a0_e..a1_e), eq_ptr);
+                let sa2 = gather_col_128(self.a_rows16.get_unchecked(a1_e..a2_e), eq_ptr);
+                let sa3 = gather_col_128(self.a_rows16.get_unchecked(a2_e..a3_e), eq_ptr);
+
+                let b0_s = *self.b_col_ptr.get_unchecked(c0) as usize;
+                let b0_e = *self.b_col_ptr.get_unchecked(c0 + 1) as usize;
+                let b1_e = *self.b_col_ptr.get_unchecked(c0 + 2) as usize;
+                let b2_e = *self.b_col_ptr.get_unchecked(c0 + 3) as usize;
+                let b3_e = *self.b_col_ptr.get_unchecked(c0 + 4) as usize;
+
+                let sb0 = gather_col_128(self.b_rows16.get_unchecked(b0_s..b0_e), eq_ptr);
+                let sb1 = gather_col_128(self.b_rows16.get_unchecked(b0_e..b1_e), eq_ptr);
+                let sb2 = gather_col_128(self.b_rows16.get_unchecked(b1_e..b2_e), eq_ptr);
+                let sb3 = gather_col_128(self.b_rows16.get_unchecked(b2_e..b3_e), eq_ptr);
+
+                let sa_zmm = _mm512_inserti32x4::<3>(
+                    _mm512_inserti32x4::<2>(
+                        _mm512_inserti32x4::<1>(_mm512_castsi128_si512(sa0), sa1),
+                        sa2,
+                    ),
+                    sa3,
+                );
+                let sb_zmm = _mm512_inserti32x4::<3>(
+                    _mm512_inserti32x4::<2>(
+                        _mm512_inserti32x4::<1>(_mm512_castsi128_si512(sb0), sb1),
+                        sb2,
+                    ),
+                    sb3,
+                );
+                let prod = ghash_mul_x4_split(sa_zmm, alpha_vec, alpha_x64);
+                let res = _mm512_xor_si512(prod, sb_zmm);
+                _mm512_storeu_si512(out_chunk.as_mut_ptr().add(i) as *mut __m512i, res);
+                i += 4;
+            }
+            for (rem_i, slot) in out_chunk[n4..].iter_mut().enumerate() {
+                let c = c_base + n4 + rem_i;
+                let a_start = *self.a_col_ptr.get_unchecked(c) as usize;
+                let a_end = *self.a_col_ptr.get_unchecked(c + 1) as usize;
+                let b_start = *self.b_col_ptr.get_unchecked(c) as usize;
+                let b_end = *self.b_col_ptr.get_unchecked(c + 1) as usize;
+                let acc_a = gather_col_128(self.a_rows16.get_unchecked(a_start..a_end), eq_ptr);
+                let acc_b = gather_col_128(self.b_rows16.get_unchecked(b_start..b_end), eq_ptr);
+                let mut sa = F128::ZERO;
+                let mut sb = F128::ZERO;
+                _mm_storeu_si128(&mut sa as *mut F128 as *mut __m128i, acc_a);
+                _mm_storeu_si128(&mut sb as *mut F128 as *mut __m128i, acc_b);
+                *slot = alpha * sa + sb;
+            }
+            return;
+        }
+
+        for (i, slot) in out_chunk.iter_mut().enumerate() {
+            let c = c_base + i;
+            let a_start = unsafe { *self.a_col_ptr.get_unchecked(c) as usize };
+            let a_end = unsafe { *self.a_col_ptr.get_unchecked(c + 1) as usize };
+            let a_slice = unsafe { self.a_rows16.get_unchecked(a_start..a_end) };
+            let b_start = unsafe { *self.b_col_ptr.get_unchecked(c) as usize };
+            let b_end = unsafe { *self.b_col_ptr.get_unchecked(c + 1) as usize };
+            let b_slice = unsafe { self.b_rows16.get_unchecked(b_start..b_end) };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let acc_a = gather_col_128(a_slice, eq_ptr);
+                let acc_b = gather_col_128(b_slice, eq_ptr);
+                let mut sa = F128::ZERO;
+                let mut sb = F128::ZERO;
+                _mm_storeu_si128(&mut sa as *mut F128 as *mut __m128i, acc_a);
+                _mm_storeu_si128(&mut sb as *mut F128 as *mut __m128i, acc_b);
+                *slot = alpha * sa + sb;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let mut sa = F128::ZERO;
+                for &r in a_slice {
+                    sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                let mut sb = F128::ZERO;
+                for &r in b_slice {
+                    sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                *slot = alpha * sa + sb;
+            }
+        }
+    }
+
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vl",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        ),
+        target_feature(enable = "avx512f,avx512vl,avx512bw,vpclmulqdq")
+    )]
+    #[inline(never)]
+    fn fold_cols_wide_chunk(
+        &self,
+        c_base: usize,
+        out_chunk: &mut [F128],
+        alpha: F128,
+        eq_inner: &[F128],
+    ) {
+        for (i, slot) in out_chunk.iter_mut().enumerate() {
+            let c = c_base + i;
+            let mut sa = F128::ZERO;
+            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted by caller.
+                sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+            }
+            let mut sb = F128::ZERO;
+            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                // SAFETY: as above.
+                sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+            }
+            *slot = alpha * sa + sb;
+        }
+    }
 }
 
 impl LincheckCircuit for CscCircuit {
@@ -918,38 +1143,112 @@ impl LincheckCircuit for CscCircuit {
         // checking here (once) instead of per nonzero drops the two-branch
         // bounds check from the ~7-instruction gather loop body.
         assert!(self.n_rows <= eq_inner.len());
+        use rayon::prelude::*;
+        let mut out = crate::alloc_uninit_vec::<F128>(self.n_cols);
         if self.narrow {
             // u16 index stream: identical row order, identical XOR order,
             // half the bytes read per nonzero.
-            return self.map_cols(|c| {
-                let mut sa = F128::ZERO;
-                for &r in &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
-                {
-                    // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
-                    sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+            if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512bw",
+                    target_feature = "vpclmulqdq"
+                ))]
+                unsafe {
+                    self.fold_cols_narrow_chunk(0, &mut out, alpha, eq_inner);
+                    return out;
                 }
-                let mut sb = F128::ZERO;
-                for &r in &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512bw",
+                    target_feature = "vpclmulqdq"
+                )))]
                 {
-                    // SAFETY: as above.
-                    sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+                    self.fold_cols_narrow_chunk(0, &mut out, alpha, eq_inner);
+                    return out;
                 }
-                alpha * sa + sb
-            });
+            }
+            const COL_CHUNK: usize = 256;
+            out.par_chunks_mut(COL_CHUNK)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let c_base = ci * COL_CHUNK;
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512bw",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    unsafe {
+                        self.fold_cols_narrow_chunk(c_base, chunk, alpha, eq_inner);
+                        return;
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512bw",
+                        target_feature = "vpclmulqdq"
+                    )))]
+                    self.fold_cols_narrow_chunk(c_base, chunk, alpha, eq_inner);
+                });
+            return out;
         }
-        self.map_cols(|c| {
-            let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
-                sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vl",
+                target_feature = "avx512bw",
+                target_feature = "vpclmulqdq"
+            ))]
+            unsafe {
+                self.fold_cols_wide_chunk(0, &mut out, alpha, eq_inner);
+                return out;
             }
-            let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                // SAFETY: as above.
-                sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vl",
+                target_feature = "avx512bw",
+                target_feature = "vpclmulqdq"
+            )))]
+            {
+                self.fold_cols_wide_chunk(0, &mut out, alpha, eq_inner);
+                return out;
             }
-            alpha * sa + sb
-        })
+        }
+        const COL_CHUNK: usize = 256;
+        out.par_chunks_mut(COL_CHUNK)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                let c_base = ci * COL_CHUNK;
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512bw",
+                    target_feature = "vpclmulqdq"
+                ))]
+                unsafe {
+                    self.fold_cols_wide_chunk(c_base, chunk, alpha, eq_inner);
+                    return;
+                }
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512bw",
+                    target_feature = "vpclmulqdq"
+                )))]
+                self.fold_cols_wide_chunk(c_base, chunk, alpha, eq_inner);
+            });
+        out
     }
 }
 
@@ -1477,10 +1776,7 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
             if eq8_x4 {
                 return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
             }
-            std::array::from_fn(|lane| {
-                let outer = outer_base + lane;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
+            eq8_from_factors_scalar_cold(eq_lo, eq_hi, outer_base, log_b, lo_mask)
         },
         top_bind,
     )
@@ -1493,6 +1789,21 @@ fn lc_eq8_x4_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EQ8_X4").is_none());
     *ON
+}
+
+#[cold]
+#[inline(never)]
+fn eq8_from_factors_scalar_cold(
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    outer_base: usize,
+    log_b: usize,
+    lo_mask: usize,
+) -> [F128; 8] {
+    std::array::from_fn(|r| {
+        let outer = outer_base + r;
+        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+    })
 }
 
 /// Eight consecutive factorized outer weights starting at `outer_base`.
@@ -1514,10 +1825,7 @@ fn eq8_from_factors(
         // same formula as the scalar loop (lo_mask / log_b).
         return unsafe { eq8_from_factors_x4(eq_lo, eq_hi, outer_base, log_b, lo_mask) };
     }
-    std::array::from_fn(|r| {
-        let outer = outer_base + r;
-        eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-    })
+    eq8_from_factors_scalar_cold(eq_lo, eq_hi, outer_base, log_b, lo_mask)
 }
 
 /// Four-then-four 4-lane products of the factorized eq tensor. Bit-identical
@@ -1532,8 +1840,7 @@ fn eq8_from_factors(
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-#[inline]
+#[inline(always)]
 unsafe fn eq8_from_factors_x4(
     eq_lo: &[F128],
     eq_hi: &[F128],
@@ -1694,10 +2001,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
                 // are the scalar arm's `lo_mask` / `log_b` formula.
                 return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, outer_base, log_b, lo_mask) };
             }
-            std::array::from_fn(|lane| {
-                let outer = outer_base + lane;
-                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
-            })
+            eq8_from_factors_scalar_cold(&eq_lo, &eq_hi, outer_base, log_b, lo_mask)
         },
         Some(r_top),
         true,
@@ -1943,6 +2247,7 @@ fn fold_untimed_enabled() -> bool {
 /// plane block with the C-drain AVX-512 leaf (`c_plane_bank_to_f128`)
 /// instead of eight GPR 8×8 delta-swaps. `FLOCK_NO_LC_PLANE_F128=1`
 /// restores the incumbent GPR transpose. Same bytes either way.
+#[allow(dead_code)]
 fn lc_plane_f128_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_PLANE_F128").is_none());
@@ -1988,9 +2293,17 @@ fn gather_transpose_tile_scalar(
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[inline(always)]
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "vpclmulqdq")),
+    target_feature(enable = "avx512f,avx512vbmi,gfni")
+)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
-fn gather_transpose_group4_x86<const FUSE: bool>(
+unsafe fn gather_transpose_group4_x86<const FUSE: bool>(
     z_packed: &[F128],
     chunks_per_block: usize,
     stripe_base: usize,
@@ -2058,8 +2371,16 @@ fn gather_transpose_group4_x86<const FUSE: bool>(
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[inline(always)]
-fn gather_transpose_tile_x86<const FUSE: bool>(
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "vpclmulqdq")),
+    target_feature(enable = "avx512f,avx512vbmi,gfni")
+)]
+#[inline]
+unsafe fn gather_transpose_tile_x86<const FUSE: bool>(
     z_packed: &[F128],
     chunks_per_block: usize,
     stripe_base: usize,
@@ -2185,6 +2506,33 @@ unsafe fn reduce_worker_plane_block(
         }
         return;
     }
+    unsafe {
+        reduce_worker_plane_block_gpr_cold(
+            planes,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base,
+            out,
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[cold]
+#[inline(never)]
+unsafe fn reduce_worker_plane_block_gpr_cold(
+    planes: &[core::mem::MaybeUninit<u8>],
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base: usize,
+    out: &mut [F128],
+) {
     let mut acc = [0u8; 1024];
     let first = first_worker * worker_stride + base;
     let first_block = &planes[first..first + 1024];
@@ -2281,252 +2629,85 @@ fn fold_block_major_gfni(
         .zip(active.par_iter_mut())
         .enumerate()
         .for_each(|(worker, (wplanes, worker_active))| {
-            let tile_lo = worker * tiles_per_worker;
-            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
-            let (mut claim_lo, mut claim_hi) = if dynamic {
-                (0usize, 0usize)
-            } else {
-                (tile_lo, tile_hi)
-            };
-            // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
-            // u64s of `mats` at the start of every tile, and `gather_transpose_*`
-            // / `splice.fold_chunk` unconditionally overwrite `transposed` and
-            // `splice_carry` before reading them.
-            let mut mats = unsafe { core::mem::MaybeUninit::<[u64; 128]>::uninit().assume_init() };
-            debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
-            // Four column-slabs of 8×128 bytes: the grouped gather writes
-            // column c at slab c; the single-column arms use slab 0 only.
-            let mut transposed = unsafe {
-                core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit()
-                    .assume_init()
-            };
-            #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-            let mut splice_carry =
-                unsafe { core::mem::MaybeUninit::<[u8; 512]>::uninit().assume_init() };
-            // First tile this worker writes into an uninitialized plane
-            // buffer: seed the GFNI acc from a register zero idiom. Later
-            // tiles load only blocks that this first tile initialized.
-            let mut first_tile = true;
-            // Fused register gather+transpose (no staging arrays); the
-            // scalar path stays as the kill-switch arm.
-            #[cfg(target_feature = "avx512vbmi")]
-            let gather_tr_fused = lc_gather_tr_enabled();
-            // Resolve the corrected VPERMT2B-vs-incumbent gate once per
-            // worker. The hot q loops branch once per eight-stripe batch;
-            // their const-generic leaf has no per-gather gate branch.
-            #[cfg(target_feature = "avx512vbmi")]
-            let gather_tr_vpermt2b = lincheck_gt_fuse_enabled();
-            // Grouped-gather prefetch distance, resolved once per worker
-            // (never inside the tile / chunk / stripe loops).
-            #[cfg(target_feature = "avx512vbmi")]
-            let pf_far = lc_zfold_pf_enabled();
-            #[cfg(target_feature = "avx512vbmi")]
-            let pf_chunks = if lc_zfold_pf_near_enabled() {
-                LC_ZFOLD_PF_CHUNKS
-            } else {
-                2 * LC_ZFOLD_PF_CHUNKS
-            };
-            #[cfg(target_feature = "avx512vbmi")]
-            let pf_spread = lc_zfold_pf_spread_enabled();
-            // Ranked-stride addressing, resolved once per worker (never
-            // inside the tile / chunk / stripe loops).
-            #[cfg(target_feature = "avx512vbmi")]
-            let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
-            loop {
-                let tile = if claim_lo < claim_hi {
-                    claim_lo += 1;
-                    claim_lo - 1
-                } else if dynamic {
-                    let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
-                    if lo >= n_tiles {
-                        break;
-                    }
-                    claim_lo = lo + 1;
-                    claim_hi = (lo + TILE_GRAB).min(n_tiles);
-                    lo
-                } else {
-                    break;
-                };
-                let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
-                #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-                let mut splice_pending = false;
-                for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                    let eq8 = eq8_at(8 * (stripe_base + t));
-                    kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
-                }
-                let mut q = 0usize;
-                // Grouped arm: four full 128-bit chunks per gather visit.
-                // The row stride is 2048 bytes, so a tile's 64 live rows
-                // land in two L1 sets; one wide load per row per FOUR
-                // columns quarters the residency each row line needs there.
-                // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
-                // the ragged final chunk takes the single-column arm below.
-                #[cfg(target_feature = "avx512vbmi")]
-                if gather_tr_fused && lc_gather4_enabled() {
-                    let full_chunks = useful_bits / 128;
-                    while q + 4 <= full_chunks {
-                        if gather_tr_vpermt2b {
-                            gather_transpose_group4_x86::<true>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                full_chunks,
-                                pf_far,
-                                pf_spread,
-                                pf_chunks,
-                                &mut transposed,
-                            );
-                        } else {
-                            gather_transpose_group4_x86::<false>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                full_chunks,
-                                pf_far,
-                                pf_spread,
-                                pf_chunks,
-                                &mut transposed,
-                            );
-                        }
-                        for c in 0..4 {
-                            // Spread delivery: the same eight-hints-per-stripe
-                            // block, issued from the fold that follows the
-                            // gather instead of from the gather itself, two
-                            // stripes at a time. Same lines, same look-ahead.
-                            if pf_far && pf_spread {
-                                let qn = q + pf_chunks;
-                                if qn <= full_chunks && qn < chunks_per_block {
-                                    // Stripes 2c and 2c+1 are the SIXTEEN
-                                    // consecutive rows 8*stripe_base + 16c ..
-                                    // + 16, so one base pointer and a fixed
-                                    // row stride reach every hint the two
-                                    // eight-row blocks used to address one at
-                                    // a time. Same sixteen lines, same order.
-                                    // SAFETY: those rows are inside this
-                                    // tile's 64 and `qn < chunks_per_block`
-                                    // keeps the column inside the block, so
-                                    // every address the helper forms is in
-                                    // bounds; a prefetch never dereferences.
-                                    unsafe {
-                                        lc_prefetch_rows16(
-                                            z_packed.as_ptr().add(
-                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
-                                            ),
-                                            chunks_per_block,
-                                            cpb_ranked,
-                                        );
-                                    }
-                                }
-                            }
-                            // SAFETY: as for the single-column call below;
-                            // every grouped chunk is full (2 blocks of 64).
-                            unsafe {
-                                #[cfg(target_feature = "avx512bw")]
-                                if let Some(splice) = root_splice {
-                                    splice.fold_chunk(
-                                        q + c,
-                                        transposed.as_ptr().add(c * 1024),
-                                        &mats,
-                                        wplanes.as_mut_ptr().cast::<u8>(),
-                                        first_tile,
-                                        &mut splice_carry,
-                                        &mut splice_pending,
-                                    );
-                                    continue;
-                                }
-                                kernels::gfni_fold_tile(
-                                    transposed.as_ptr().add(c * 1024),
-                                    128,
-                                    2,
-                                    &mats,
-                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
-                                    first_tile,
-                                );
-                            }
-                        }
-                        q += 4;
-                    }
-                }
-                while q < useful_chunks {
-                    let inner_base = q * 128;
-                    let chunk_bits = (useful_bits - inner_base).min(128);
-                    #[cfg(target_feature = "avx512vbmi")]
-                    if gather_tr_fused {
-                        if gather_tr_vpermt2b {
-                            gather_transpose_tile_x86::<true>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                &mut transposed,
-                            );
-                        } else {
-                            gather_transpose_tile_x86::<false>(
-                                z_packed,
-                                chunks_per_block,
-                                stripe_base,
-                                q,
-                                &mut transposed,
-                            );
-                        }
-                    } else {
-                        gather_transpose_tile_scalar(
-                            z_packed,
-                            chunks_per_block,
-                            stripe_base,
-                            q,
-                            &mut transposed,
-                        );
-                    }
-                    #[cfg(not(target_feature = "avx512vbmi"))]
-                    gather_transpose_tile_scalar(
+            #[cfg(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq"
+            ))]
+            unsafe {
+                if root_splice.is_some() {
+                    fold_block_major_gfni_worker::<TILE_GRAB, true>(
                         z_packed,
                         chunks_per_block,
-                        stripe_base,
-                        q,
-                        &mut transposed,
+                        useful_bits,
+                        useful_chunks,
+                        tiles_per_worker,
+                        n_tiles,
+                        dynamic,
+                        &next_tile,
+                        eq8_at,
+                        root_splice,
+                        worker,
+                        wplanes,
+                        worker_active,
                     );
-                    // SAFETY: `transposed` holds 8 stripes x 128 bytes at
-                    // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
-                    // the worker planes cover (2q + chunk blocks) * 1024
-                    // bytes for every q < useful_chunks <= k/128. first_tile
-                    // is true iff this worker has not yet stored into wplanes.
-                    unsafe {
-                        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-                        if let Some(splice) = root_splice {
-                            splice.fold_chunk(
-                                q,
-                                transposed.as_ptr(),
-                                &mats,
-                                wplanes.as_mut_ptr().cast::<u8>(),
-                                first_tile,
-                                &mut splice_carry,
-                                &mut splice_pending,
-                            );
-                            q += 1;
-                            continue;
-                        }
-                        kernels::gfni_fold_tile(
-                            transposed.as_ptr(),
-                            128,
-                            chunk_bits.div_ceil(64),
-                            &mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
-                            first_tile,
-                        );
-                    }
-                    q += 1;
+                } else {
+                    fold_block_major_gfni_worker::<TILE_GRAB, false>(
+                        z_packed,
+                        chunks_per_block,
+                        useful_bits,
+                        useful_chunks,
+                        tiles_per_worker,
+                        n_tiles,
+                        dynamic,
+                        &next_tile,
+                        eq8_at,
+                        None,
+                        worker,
+                        wplanes,
+                        worker_active,
+                    );
                 }
-                #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-                debug_assert!(!splice_pending, "root pair must finish within its tile");
-                first_tile = false;
+                return;
             }
-            // This byte is exclusively owned by the zipped Rayon chunk. A
-            // true `first_tile` means dynamic claiming assigned it no work,
-            // so none of its uninitialized plane bytes may enter reduction.
-            *worker_active = u8::from(!first_tile);
+            #[cfg(not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq"
+            )))]
+            if root_splice.is_some() {
+                fold_block_major_gfni_worker_fallback::<TILE_GRAB, true>(
+                    z_packed,
+                    chunks_per_block,
+                    useful_bits,
+                    useful_chunks,
+                    tiles_per_worker,
+                    n_tiles,
+                    dynamic,
+                    &next_tile,
+                    eq8_at,
+                    root_splice,
+                    worker,
+                    wplanes,
+                    worker_active,
+                );
+            } else {
+                fold_block_major_gfni_worker_fallback::<TILE_GRAB, false>(
+                    z_packed,
+                    chunks_per_block,
+                    useful_bits,
+                    useful_chunks,
+                    tiles_per_worker,
+                    n_tiles,
+                    dynamic,
+                    &next_tile,
+                    eq8_at,
+                    None,
+                    worker,
+                    wplanes,
+                    worker_active,
+                );
+            }
         });
 
     // Cross-worker reduce + transpose-back in ONE parallel pass over
@@ -2559,61 +2740,41 @@ fn fold_block_major_gfni(
     });
     debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
     let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
-        if blk < live_blocks {
-            // SAFETY: `active_workers` contains exactly producer chunks that
-            // claimed a tile. Their first tile used `seed_zero=true` and
-            // stored every byte of each `blk < live_blocks`; the producer
-            // parallel iterator joined before this reduction starts.
-            unsafe {
-                reduce_worker_plane_block(&planes, worker_stride, &active_workers, blk, o);
-            }
-        } else {
-            // Padding has no backing worker-plane writes in the uninitialized
-            // allocation, but its canonical folded value is algebraic zero.
-            o.fill(F128::ZERO);
+        #[cfg(all(
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            fold_block_major_gfni_reduce_block(
+                &planes,
+                worker_stride,
+                &active_workers,
+                live_blocks,
+                k,
+                top_bind,
+                blk,
+                o,
+                one_o,
+            );
+            return;
         }
-        if let Some(r) = top_bind {
-            let mut hi = [F128::ZERO; 64];
-            let hi_blk = blk + k / 128;
-            if hi_blk < live_blocks {
-                // SAFETY: identical to the low-block call above; `hi_blk` is
-                // explicitly constrained to the fully stored live range.
-                unsafe {
-                    reduce_worker_plane_block(
-                        &planes,
-                        worker_stride,
-                        &active_workers,
-                        hi_blk,
-                        &mut hi,
-                    );
-                }
-            }
-            if let Some(one_o) = one_o {
-                if blk < 18 {
-                    let scale = F128::ONE + r;
-                    if lc_one_scale_vec_disabled() {
-                        for (dst, src) in one_o.iter_mut().zip(o.iter()) {
-                            *dst = scale * *src;
-                        }
-                    } else {
-                        one_o.fill(F128::ZERO);
-                        crate::field::f128_slice::add_scaled(one_o, o, scale);
-                    }
-                } else if (108..112).contains(&blk) {
-                    if lc_one_scale_vec_disabled() {
-                        for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
-                            *dst = r * *src;
-                        }
-                    } else {
-                        one_o.fill(F128::ZERO);
-                        crate::field::f128_slice::add_scaled(one_o, &hi, r);
-                    }
-                } else {
-                    one_o.fill(F128::ZERO);
-                }
-            }
-            crate::field::f128_slice::bind_split_half(o, &hi, r);
-        }
+        #[cfg(not(all(
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq"
+        )))]
+        fold_block_major_gfni_reduce_block_fallback(
+            &planes,
+            worker_stride,
+            &active_workers,
+            live_blocks,
+            k,
+            top_bind,
+            blk,
+            o,
+            one_o,
+        );
     };
     if let Some(one) = one.as_mut() {
         out.par_chunks_mut(64)
@@ -2650,6 +2811,410 @@ fn fold_block_major_gfni(
         one.extend_from_slice(&canon);
     }
     (out, one)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_block_major_gfni_worker<const TILE_GRAB: usize, const HAS_SPLICE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    useful_bits: usize,
+    useful_chunks: usize,
+    tiles_per_worker: usize,
+    n_tiles: usize,
+    dynamic: bool,
+    next_tile: &std::sync::atomic::AtomicUsize,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    root_splice: Option<&RootSplicePlan>,
+    worker: usize,
+    wplanes: &mut [core::mem::MaybeUninit<u8>],
+    worker_active: &mut u8,
+) {
+    fold_block_major_gfni_worker_fallback::<TILE_GRAB, HAS_SPLICE>(
+        z_packed,
+        chunks_per_block,
+        useful_bits,
+        useful_chunks,
+        tiles_per_worker,
+        n_tiles,
+        dynamic,
+        next_tile,
+        eq8_at,
+        root_splice,
+        worker,
+        wplanes,
+        worker_active,
+    )
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLICE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    useful_bits: usize,
+    useful_chunks: usize,
+    tiles_per_worker: usize,
+    n_tiles: usize,
+    dynamic: bool,
+    next_tile: &std::sync::atomic::AtomicUsize,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    root_splice: Option<&RootSplicePlan>,
+    worker: usize,
+    wplanes: &mut [core::mem::MaybeUninit<u8>],
+    worker_active: &mut u8,
+) {
+    let tile_lo = worker * tiles_per_worker;
+    let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+    let (mut claim_lo, mut claim_hi) = if dynamic {
+        (0usize, 0usize)
+    } else {
+        (tile_lo, tile_hi)
+    };
+    let mut mats_store = core::mem::MaybeUninit::<[u64; 128]>::uninit();
+    // Four column-slabs of 8×128 bytes: the grouped gather writes
+    // column c at slab c; the single-column arms use slab 0 only.
+    let mut transposed_store =
+        core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    let mut splice_carry_store = core::mem::MaybeUninit::<[u8; 512]>::uninit();
+    // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
+    // u64s of `mats` at the start of every tile, and `gather_transpose_*`
+    // / `splice.fold_chunk` unconditionally overwrite `transposed` and
+    // `splice_carry` before reading them. Borrowing from the `MaybeUninit`
+    // backing avoids a 4 KiB uninit by-value move and the `invalid_value` lint.
+    let mats = unsafe { &mut *mats_store.as_mut_ptr() };
+    let transposed = unsafe { &mut *transposed_store.as_mut_ptr() };
+    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+    let splice_carry = unsafe { &mut *splice_carry_store.as_mut_ptr() };
+    debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
+    // First tile this worker writes into an uninitialized plane
+    // buffer: seed the GFNI acc from a register zero idiom. Later
+    // tiles load only blocks that this first tile initialized.
+    let mut first_tile = true;
+    // Fused register gather+transpose (no staging arrays); the
+    // scalar path stays as the kill-switch arm.
+    #[cfg(target_feature = "avx512vbmi")]
+    let gather_tr_fused = lc_gather_tr_enabled();
+    // Resolve the corrected VPERMT2B-vs-incumbent gate once per
+    // worker. The hot q loops branch once per eight-stripe batch;
+    // their const-generic leaf has no per-gather gate branch.
+    #[cfg(target_feature = "avx512vbmi")]
+    let gather_tr_vpermt2b = lincheck_gt_fuse_enabled();
+    // Grouped-gather prefetch distance, resolved once per worker
+    // (never inside the tile / chunk / stripe loops).
+    #[cfg(target_feature = "avx512vbmi")]
+    let pf_far = lc_zfold_pf_enabled();
+    #[cfg(target_feature = "avx512vbmi")]
+    let pf_chunks = if lc_zfold_pf_near_enabled() {
+        LC_ZFOLD_PF_CHUNKS
+    } else {
+        2 * LC_ZFOLD_PF_CHUNKS
+    };
+    #[cfg(target_feature = "avx512vbmi")]
+    let pf_spread = lc_zfold_pf_spread_enabled();
+    // Ranked-stride addressing, resolved once per worker (never
+    // inside the tile / chunk / stripe loops).
+    #[cfg(target_feature = "avx512vbmi")]
+    let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+    loop {
+        let tile = if claim_lo < claim_hi {
+            claim_lo += 1;
+            claim_lo - 1
+        } else if dynamic {
+            let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
+            if lo >= n_tiles {
+                break;
+            }
+            claim_lo = lo + 1;
+            claim_hi = (lo + TILE_GRAB).min(n_tiles);
+            lo
+        } else {
+            break;
+        };
+        let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        let mut splice_pending = false;
+        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+            let eq8 = eq8_at(8 * (stripe_base + t));
+            kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+        }
+        let mut q = 0usize;
+        #[cfg(target_feature = "avx512vbmi")]
+        if gather_tr_fused && lc_gather4_enabled() {
+            let full_chunks = useful_bits / 128;
+            while q + 4 <= full_chunks {
+                unsafe {
+                    if gather_tr_vpermt2b {
+                        gather_transpose_group4_x86::<true>(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            full_chunks,
+                            pf_far,
+                            pf_spread,
+                            pf_chunks,
+                            transposed,
+                        );
+                    } else {
+                        gather_transpose_group4_x86::<false>(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            full_chunks,
+                            pf_far,
+                            pf_spread,
+                            pf_chunks,
+                            transposed,
+                        );
+                    }
+                }
+                for c in 0..4 {
+                    if pf_far && pf_spread {
+                        let qn = q + pf_chunks;
+                        if qn <= full_chunks && qn < chunks_per_block {
+                            unsafe {
+                                lc_prefetch_rows16(
+                                    z_packed.as_ptr().add(
+                                        (8 * stripe_base + 16 * c) * chunks_per_block + qn,
+                                    ),
+                                    chunks_per_block,
+                                    cpb_ranked,
+                                );
+                            }
+                        }
+                    }
+                    unsafe {
+                        #[cfg(target_feature = "avx512bw")]
+                        if HAS_SPLICE
+                            && let Some(splice) = root_splice
+                        {
+                            splice.fold_chunk(
+                                q + c,
+                                transposed.as_ptr().add(c * 1024),
+                                mats,
+                                wplanes.as_mut_ptr().cast::<u8>(),
+                                first_tile,
+                                splice_carry,
+                                &mut splice_pending,
+                            );
+                            continue;
+                        }
+                        kernels::gfni_fold_tile(
+                            transposed.as_ptr().add(c * 1024),
+                            128,
+                            2,
+                            mats,
+                            wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                            first_tile,
+                        );
+                    }
+                }
+                q += 4;
+            }
+        }
+        while q < useful_chunks {
+            let inner_base = q * 128;
+            let chunk_bits = (useful_bits - inner_base).min(128);
+            #[cfg(target_feature = "avx512vbmi")]
+            if gather_tr_fused {
+                unsafe {
+                    if gather_tr_vpermt2b {
+                        gather_transpose_tile_x86::<true>(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            transposed,
+                        );
+                    } else {
+                        gather_transpose_tile_x86::<false>(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            transposed,
+                        );
+                    }
+                }
+            } else {
+                gather_transpose_tile_scalar(
+                    z_packed,
+                    chunks_per_block,
+                    stripe_base,
+                    q,
+                    transposed,
+                );
+            }
+            #[cfg(not(target_feature = "avx512vbmi"))]
+            gather_transpose_tile_scalar(
+                z_packed,
+                chunks_per_block,
+                stripe_base,
+                q,
+                transposed,
+            );
+            unsafe {
+                #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+                if HAS_SPLICE
+                    && let Some(splice) = root_splice
+                {
+                    splice.fold_chunk(
+                        q,
+                        transposed.as_ptr(),
+                        mats,
+                        wplanes.as_mut_ptr().cast::<u8>(),
+                        first_tile,
+                        splice_carry,
+                        &mut splice_pending,
+                    );
+                    q += 1;
+                    continue;
+                }
+                kernels::gfni_fold_tile(
+                    transposed.as_ptr(),
+                    128,
+                    chunk_bits.div_ceil(64),
+                    mats,
+                    wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                    first_tile,
+                );
+            }
+            q += 1;
+        }
+        #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
+        debug_assert!(!splice_pending, "root pair must finish within its tile");
+        first_tile = false;
+    }
+    *worker_active = u8::from(!first_tile);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_block_major_gfni_reduce_block(
+    planes: &[core::mem::MaybeUninit<u8>],
+    worker_stride: usize,
+    active_workers: &[usize],
+    live_blocks: usize,
+    k: usize,
+    top_bind: Option<F128>,
+    blk: usize,
+    o: &mut [F128],
+    one_o: Option<&mut [F128]>,
+) {
+    fold_block_major_gfni_reduce_block_fallback(
+        planes,
+        worker_stride,
+        active_workers,
+        live_blocks,
+        k,
+        top_bind,
+        blk,
+        o,
+        one_o,
+    )
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_gfni_reduce_block_fallback(
+    planes: &[core::mem::MaybeUninit<u8>],
+    worker_stride: usize,
+    active_workers: &[usize],
+    live_blocks: usize,
+    k: usize,
+    top_bind: Option<F128>,
+    blk: usize,
+    o: &mut [F128],
+    one_o: Option<&mut [F128]>,
+) {
+    if blk < live_blocks {
+        // SAFETY: `active_workers` contains exactly producer chunks that
+        // claimed a tile. Their first tile used `seed_zero=true` and
+        // stored every byte of each `blk < live_blocks`; the producer
+        // parallel iterator joined before this reduction starts.
+        unsafe {
+            reduce_worker_plane_block(planes, worker_stride, active_workers, blk, o);
+        }
+    } else {
+        // Padding has no backing worker-plane writes in the uninitialized
+        // allocation, but its canonical folded value is algebraic zero.
+        o.fill(F128::ZERO);
+    }
+    if let Some(r) = top_bind {
+        let hi_blk = blk + k / 128;
+        let mut hi_store = core::mem::MaybeUninit::<[F128; 64]>::uninit();
+        // SAFETY: when `hi_blk < live_blocks`, `reduce_worker_plane_block`
+        // unconditionally writes all 64 `F128` elements of `hi` before reading;
+        // when `hi_blk >= live_blocks`, `hi` is explicitly zero-filled below.
+        let hi = unsafe { &mut *hi_store.as_mut_ptr() };
+        if hi_blk < live_blocks {
+            unsafe {
+                reduce_worker_plane_block(
+                    planes,
+                    worker_stride,
+                    active_workers,
+                    hi_blk,
+                    hi,
+                );
+            }
+        } else {
+            hi.fill(F128::ZERO);
+        }
+        if let Some(one_o) = one_o {
+            if blk < 18 {
+                let scale = F128::ONE + r;
+                if lc_one_scale_vec_disabled() {
+                    for (dst, src) in one_o.iter_mut().zip(o.iter()) {
+                        *dst = scale * *src;
+                    }
+                } else {
+                    crate::field::f128_slice::scale_slice(one_o, o, scale);
+                }
+            } else if (108..112).contains(&blk) {
+                if lc_one_scale_vec_disabled() {
+                    for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
+                        *dst = r * *src;
+                    }
+                } else {
+                    crate::field::f128_slice::scale_slice(one_o, hi, r);
+                }
+            } else {
+                one_o.fill(F128::ZERO);
+            }
+        }
+        crate::field::f128_slice::bind_split_half(o, hi, r);
+    }
 }
 
 /// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
@@ -3035,11 +3600,11 @@ pub(crate) fn finish_block_major_fold(
         let r = top_bind.expect("ranked one-row contribution needs top bind");
         assert_eq!(k, 1 << 14);
         let half = k / 2;
-        let mut one = vec![F128::ZERO; half];
+        let mut one = Vec::with_capacity(half + if capture_canon { 17 * 64 } else { 0 });
+        one.resize(half, F128::ZERO);
         let scale_lo = F128::ONE + r;
         // Ranked one-rows: 1152 live low slots and 256 live high slots.
-        // `add_scaled` on a zero dest is `scale * src` (XOR-identity). Kill
-        // `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
+        // Kill `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
         if lc_one_scale_vec_disabled() {
             for i in 0..1152 {
                 one[i] = scale_lo * out[i];
@@ -3048,8 +3613,8 @@ pub(crate) fn finish_block_major_fold(
                 one[i - half] = r * out[i];
             }
         } else {
-            crate::field::f128_slice::add_scaled(&mut one[..1152], &out[..1152], scale_lo);
-            crate::field::f128_slice::add_scaled(
+            crate::field::f128_slice::scale_slice(&mut one[..1152], &out[..1152], scale_lo);
+            crate::field::f128_slice::scale_slice(
                 &mut one[15104 - half..15360 - half],
                 &out[15104..15360],
                 r,
@@ -3298,25 +3863,18 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = Vec::with_capacity(total);
+    let mut out = crate::alloc_uninit_vec::<F128>(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for &er in &eq_rest {
-        for &ls in &lambda_skip {
-            out.push(ls * er);
-        }
+    for (chunk, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
+        crate::field::f128_slice::scale_slice(chunk, &lambda_skip, er);
     }
-    debug_assert_eq!(out.len(), total);
     out
 }
 
 /// Dot product of two equal-length F128 slices.
+#[inline]
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
-    assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
-    }
-    acc
+    crate::pcs::ring_switch::inner_product(a, b)
 }
 
 /// Length above which the inner product / element-wise kernels split via
