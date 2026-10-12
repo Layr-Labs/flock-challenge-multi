@@ -2591,9 +2591,10 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
 /// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
 /// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
-/// total — allocated once per `for_each_init` bout and rewritten by every octa
-/// in the task, so it stays L1-resident. The `align(64)` is what the whole
-/// allocation inherits; nothing ever reads the field.
+/// total for the non-streaming fallback, allocated once per `for_each_init`
+/// bout and rewritten by every octa. Streaming projection instead uses a
+/// callback-local 1 KiB array of these lines. Both owners inherit `align(64)`;
+/// the field is addressed only through raw pointers.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[repr(C, align(64))]
 struct AbWinLine([u64; 8]);
@@ -2706,6 +2707,60 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     );
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    if !ab_stream {
+        // The rolling octa kernel requires a projection staging allocation.
+        // Cold/reference callers have no stage: do not unwrap that absence.
+        // Full scalar writes also remain valid for recycled constant regions.
+        assert!(!compact);
+        z.par_chunks_mut(F128_PER_BLOCK)
+            .zip(a.par_chunks_mut(F128_PER_BLOCK))
+            .zip(b.par_chunks_mut(F128_PER_BLOCK))
+            .zip(ab_inner.as_bytes_mut().par_chunks_mut(BYTES_PER_BLOCK))
+            .enumerate()
+            .for_each(|(block_idx, (((z_out, a_out), b_out), ab_out))| {
+                blocks.with_block(block_idx, padding, |block| {
+                    let (cv, msg, counter, block_len, flags) = block;
+                    // SAFETY: each disjoint F128 block owns K/64 u64 words
+                    // with sufficient alignment; the builder writes them all.
+                    unsafe {
+                        let z_words = std::slice::from_raw_parts_mut(
+                            z_out.as_mut_ptr().cast::<u64>(), K / 64,
+                        );
+                        let a_words = std::slice::from_raw_parts_mut(
+                            a_out.as_mut_ptr().cast::<u64>(), K / 64,
+                        );
+                        let b_words = std::slice::from_raw_parts_mut(
+                            b_out.as_mut_ptr().cast::<u64>(), K / 64,
+                        );
+                        build_block_witness_ab_packed_into(
+                            cv, msg, *counter, *block_len, *flags,
+                            z_words, a_words, b_words,
+                        );
+                    }
+                    if block_idx >= skip_blocks {
+                        // SAFETY: the initialized a/b blocks each contain
+                        // BYTES_PER_BLOCK bytes and do not alias ab_out.
+                        let (a_bytes, b_bytes) = unsafe {
+                            (
+                                std::slice::from_raw_parts(
+                                    a_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK,
+                                ),
+                                std::slice::from_raw_parts(
+                                    b_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK,
+                                ),
+                            )
+                        };
+                        flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                            a_bytes, b_bytes, ab_out, inv_table, abinner_nt,
+                        );
+                    }
+                    if abinner_nt {
+                        flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                    }
+                });
+            });
+        return;
+    }
     let one_rows_elided = ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
@@ -2789,13 +2844,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 // the dump writes every window byte before the projection
                 // reads any.
                 let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
-                let want = if ab_stream {
-                    STAGE_LINES
-                } else if ab_nt {
-                    WIN_LINES
-                } else {
-                    0
-                };
+                let want = if ab_nt && !ab_stream { WIN_LINES } else { 0 };
                 if want != 0 {
                     v.reserve_exact(want);
                     // SAFETY: `MaybeUninit<T>` needs no initialization, and
@@ -2817,9 +2866,15 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 } else {
                     None
                 };
+                // The streaming drain needs only one 1 KiB staging pair.
+                // Keep it 64-aligned and callback-local: the two octas use it
+                // sequentially, and each drain writes before projection reads.
+                // No heap allocation or initialization is needed in this arm.
+                let mut stream_stage =
+                    core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
                 let stage = if ab_stream {
-                    debug_assert_eq!(win.len(), STAGE_LINES);
-                    Some(win.as_mut_ptr().cast::<u32>())
+                    debug_assert!(win.is_empty());
+                    Some(stream_stage.as_mut_ptr().cast::<u32>())
                 } else {
                     None
                 };
