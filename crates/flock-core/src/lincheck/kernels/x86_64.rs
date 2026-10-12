@@ -158,7 +158,15 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "vpclmulqdq")),
+    target_feature(enable = "avx512f,avx512vbmi,gfni")
+)]
+#[inline]
 pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
     z_ptr: *const F128,
     stride: usize,
@@ -241,7 +249,15 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-#[target_feature(enable = "avx512f,avx512vbmi,gfni")]
+#[cfg_attr(
+    all(target_feature = "avx512bw", target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(target_feature = "avx512bw", target_feature = "vpclmulqdq")),
+    target_feature(enable = "avx512f,avx512vbmi,gfni")
+)]
+#[inline]
 pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
     z_ptr: *const F128,
     stride: usize,
@@ -387,6 +403,7 @@ unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
+#[inline]
 pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(mats.len(), 16);
@@ -429,6 +446,65 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
 }
 
+/// Register-resident single-block GFNI fold: given the eight stripe rows of one
+/// 64-column block already in ZMM registers, folds them through `mats` into the
+/// sixteen 64-byte planes at `planes` without a store-to-load round trip.
+///
+/// # Safety
+/// - `planes` must point to at least `1024` writable bytes (and initialized if `!seed_zero`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )),
+    target_feature(enable = "avx512f,gfni")
+)]
+#[inline]
+pub(crate) unsafe fn gfni_fold_rows(
+    rows: &[core::arch::x86_64::__m512i; 8],
+    mats: &[u64; 128],
+    planes: *mut u8,
+    seed_zero: bool,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        for byte_k in 0..16 {
+            let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
+            let mut acc = if seed_zero {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane_ptr as *const __m512i)
+            };
+            for t in (0..8).step_by(2) {
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[t],
+                    _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+                );
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[t + 1],
+                    _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                );
+                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+            }
+            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+}
+
 /// One tile's GFNI sweep: for every 64-column block, sixteen byte-plane
 /// accumulators fold the eight stripes' GFNI products (two per `vpternlogq`).
 ///
@@ -449,7 +525,23 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     target_feature = "avx512f",
     target_feature = "gfni"
 ))]
-#[target_feature(enable = "avx512f,gfni")]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )),
+    target_feature(enable = "avx512f,gfni")
+)]
+#[inline]
 pub(crate) unsafe fn gfni_fold_tile(
     tile_bytes_ptr: *const u8,
     stripe_stride: usize,
@@ -466,27 +558,7 @@ pub(crate) unsafe fn gfni_fold_tile(
             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                 _mm512_loadu_si512(tile_bytes_ptr.add(t * stripe_stride + bs) as *const __m512i)
             });
-            let planes = out_planes_ptr.add(block * 1024);
-            for byte_k in 0..16 {
-                let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-                let mut acc = if seed_zero {
-                    _mm512_setzero_si512()
-                } else {
-                    _mm512_loadu_si512(plane_ptr as *const __m512i)
-                };
-                for t in (0..8).step_by(2) {
-                    let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t],
-                        _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                    );
-                    let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                        rows[t + 1],
-                        _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                    );
-                    acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
-                }
-                _mm512_storeu_si512(plane_ptr, acc);
-            }
+            gfni_fold_rows(&rows, mats, out_planes_ptr.add(block * 1024), seed_zero);
         }
     }
 }
