@@ -630,6 +630,14 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
 /// The caller must ensure the 16 row slices selected by `r` are valid and
 /// disjoint from any row group being processed concurrently.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
@@ -657,6 +665,11 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 }
                 8 => {
                     return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                4 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<4, 64, 0>(
                         ptr, lanes, r, twiddles, 0,
                     );
                 }
@@ -690,6 +703,14 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
 /// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
 /// also lie inside the block.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     ptr: *mut F128,
     sixteenth: usize,
@@ -752,6 +773,14 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
 /// group being processed concurrently, that `dense_lanes <= num_ntts`, and
 /// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
 #[inline]
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
     num_ntts: usize,
