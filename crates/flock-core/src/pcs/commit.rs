@@ -251,7 +251,9 @@ fn finalize_commit(
     z_packed: &[F128],
     params: &PcsParams,
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    static COMMIT_TIMING_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+    let timing = *COMMIT_TIMING_ON;
     let ntt = AdditiveNttF128::standard(params.k_code());
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
 
@@ -486,8 +488,10 @@ fn finalize_commit(
 /// CVs are reconstructed from the retained codeword only when queried during
 /// opening. `FLOCK_NO_MERKLE_CUT` restores the ordinary full tree.
 fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
+    static MERKLE_CUT_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none());
     if cfg!(target_arch = "x86_64")
-        && std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none()
+        && *MERKLE_CUT_ON
         && params.m == 32
         && params.log_inv_rate == 1
         && params.log_batch_size == 6
@@ -1327,7 +1331,9 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    static NO_PREFAULT_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PREFAULT").is_some());
+    if rayon::current_num_threads() <= 1 || *NO_PREFAULT_ON {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.

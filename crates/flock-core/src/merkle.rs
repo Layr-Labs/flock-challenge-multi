@@ -964,8 +964,10 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     }
 
     let mut active: Vec<usize> = positions.to_vec();
-    active.sort_unstable();
-    active.dedup();
+    if !active.windows(2).all(|w| w[0] < w[1]) {
+        active.sort_unstable();
+        active.dedup();
+    }
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
     let mut proof = Vec::new();
@@ -1017,8 +1019,10 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     }
 
     let mut active: Vec<usize> = positions.to_vec();
-    active.sort_unstable();
-    active.dedup();
+    if !active.windows(2).all(|w| w[0] < w[1]) {
+        active.sort_unstable();
+        active.dedup();
+    }
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
     let mut indices = Vec::new();

@@ -1055,7 +1055,9 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     };
 
     // The head start is exactly what this mechanism buys; make it printable.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+    static SEED_PIPE_DEBUG_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some());
+    if *SEED_PIPE_DEBUG_ON
         && let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at)
     {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -1075,7 +1077,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     let result = state.result.take();
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+    if *SEED_PIPE_DEBUG_ON
         && let Some(seed_at) = seed_at
     {
         eprintln!(
