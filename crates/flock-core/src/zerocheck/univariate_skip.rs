@@ -240,24 +240,107 @@ pub(crate) fn ntt_extend_f128_vec_ghash_units(
     const ELL: usize = 64;
     assert_eq!(in_s.len(), ELL);
     assert_eq!(inv_table.ell, ELL);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        return unsafe { ntt_extend_f128_vec_ghash_units_avx512(in_s, inv_table) };
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
+        let mut out = vec![F128::ZERO; ELL];
+        let mut unit_bits = [0u8; ELL / 8];
+        let mut image = [F8::ZERO; ELL];
+        for (z, &v) in in_s.iter().enumerate() {
+            if v == F128::ZERO {
+                continue;
+            }
+            unit_bits[z / 8] = 1u8 << (z % 8);
+            inv_table.apply(&unit_bits, &mut image);
+            unit_bits[z / 8] = 0;
+            let prods: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
+            for (dst, n) in out.iter_mut().zip(image.iter()) {
+                let mut bits = n.0;
+                while bits != 0 {
+                    *dst += prods[bits.trailing_zeros() as usize];
+                    bits &= bits - 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
+    in_s: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    use core::arch::x86_64::*;
+    const ELL: usize = 64;
     let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
     let mut out = vec![F128::ZERO; ELL];
-    let mut unit_bits = [0u8; ELL / 8];
-    let mut image = [F8::ZERO; ELL];
-    for (z, &v) in in_s.iter().enumerate() {
-        if v == F128::ZERO {
-            continue;
-        }
-        unit_bits[z / 8] = 1u8 << (z % 8);
-        inv_table.apply(&unit_bits, &mut image);
-        unit_bits[z / 8] = 0;
-        let prods: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
-        for (dst, n) in out.iter_mut().zip(image.iter()) {
-            let mut bits = n.0;
-            while bits != 0 {
-                *dst += prods[bits.trailing_zeros() as usize];
-                bits &= bits - 1;
+    let base = inv_table.data_ptr();
+    let base8 = if inv_table.has_second_image() {
+        inv_table.half_swapped_data_ptr()
+    } else {
+        core::ptr::null()
+    };
+    unsafe {
+        let out_ptr = out.as_mut_ptr().cast::<__m512i>();
+        let mut acc: [__m512i; 16] = [_mm512_setzero_si512(); 16];
+        for (z, &v) in in_s.iter().enumerate() {
+            if v == F128::ZERO {
+                continue;
             }
+            let b = z / 8;
+            let row_off = (1usize << (z % 8)) * ELL;
+            let raw = if b & 1 != 0 && !base8.is_null() {
+                _mm512_loadu_si512(base8.add(row_off).cast::<__m512i>())
+            } else {
+                let r = _mm512_loadu_si512(base.add(row_off).cast::<__m512i>());
+                if b & 1 != 0 {
+                    _mm512_shuffle_epi32::<0x4E>(r)
+                } else {
+                    r
+                }
+            };
+            let img = match b >> 1 {
+                0 => raw,
+                1 => _mm512_shuffle_i64x2::<0xB1>(raw, raw),
+                2 => _mm512_shuffle_i64x2::<0x4E>(raw, raw),
+                _ => _mm512_shuffle_i64x2::<0x1B>(raw, raw),
+            };
+            for i in 0..8 {
+                let p = v * basis[i];
+                let pv = _mm512_broadcast_i32x4(_mm_set_epi64x(p.hi as i64, p.lo as i64));
+                let m64: u64 =
+                    _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
+                for g in 0..16 {
+                    let nibble = ((m64 >> (4 * g)) & 0xF) as u8;
+                    let mask8 =
+                        ((nibble & 1) * 3) | (((nibble >> 1) & 1) * 12) | (((nibble >> 2) & 1) * 48) | (((nibble >> 3) & 1) * 192);
+                    acc[g] = _mm512_mask_xor_epi64(acc[g], mask8, acc[g], pv);
+                }
+            }
+        }
+        for g in 0..16 {
+            _mm512_storeu_si512(out_ptr.add(g), acc[g]);
         }
     }
     out
