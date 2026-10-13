@@ -1438,14 +1438,18 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf as [`collapse_s_hat_v_fold8`] — identical per-element
-        // operation in identical order, so the result is bit-identical to
-        // the scalar loop below. (This ranked-live call sat scalar when the
-        // fold8 twin was converted.)
-        for q in 0..4 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves as [`collapse_s_hat_v_fold8`] — identical
+        // per-element operation in identical order, so the result is
+        // bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_quad[..n_packed],
+            low_eq[0],
+        );
+        for q in 1..4 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_quad[q * n_packed..(q + 1) * n_packed],
@@ -1454,6 +1458,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for q in 0..4 {
         for b in 0..n_packed {
             out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
@@ -1541,12 +1546,17 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `add_scaled`
-        // leaf — identical per-element operation in identical order, so the
-        // result is bit-identical to the scalar loop below.
-        for bank in 0..64 {
+        // Same bank-major accumulation through the vectorized `scale_slice` /
+        // `add_scaled` leaves — identical per-element operation in identical
+        // order, so the result is bit-identical to the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::scale_slice(
+            &mut out,
+            &s_hat_v_fold8[..n_packed],
+            low_eq[0],
+        );
+        for bank in 1..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
                 &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed],
@@ -1555,6 +1565,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         }
         return out;
     }
+    let mut out = vec![F128::ZERO; n_packed];
     for bank in 0..64 {
         for packed in 0..n_packed {
             out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
@@ -1771,6 +1782,37 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
         target_feature = "gfni"
     )))]
     {
+        let mut out = [F128::ZERO; 128];
+        tensor_algebra_transpose_into(s_hat_v, &mut out);
+        out.to_vec()
+    }
+}
+
+#[inline]
+fn tensor_algebra_transpose_into(s_hat_v: &[F128], out: &mut [F128; 128]) {
+    debug_assert_eq!(s_hat_v.len(), 128);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        // SAFETY: the `cfg` supplies the required features and `out` has 128 slots.
+        unsafe {
+            transpose128_gfni(s_hat_v.as_ptr(), out.as_mut_ptr());
+        }
+        return;
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
         assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
         let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
         for row_group in 0..16 {
@@ -1786,13 +1828,12 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
                 out_bytes[bit + 64][row_group] = hi_columns[bit];
             }
         }
-        out_bytes
-            .iter()
-            .map(|b| F128 {
+        for (slot, b) in out.iter_mut().zip(out_bytes.iter()) {
+            *slot = F128 {
                 lo: u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
                 hi: u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
-            })
-            .collect()
+            };
+        }
     }
 }
 
@@ -2183,26 +2224,70 @@ pub(crate) fn compose_block_mats_gfni_into(
     high_mats: &mut [u64; 128],
 ) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps_to_mats;
+    use core::arch::x86_64::*;
     use core::mem::MaybeUninit;
 
-    let mut low_rows = [MaybeUninit::<u64>::uninit(); 64];
-    let mut high_rows = [MaybeUninit::<u64>::uninit(); 64];
-    let mut w = e_hi;
-    for chunk in 0..2 {
-        for lane in 0..64 {
-            low_rows[lane].write(w.lo);
-            high_rows[lane].write(w.hi);
-            w = crate::field::mul_by_x(w);
-        }
-        let mats = if chunk == 0 {
-            &mut *low_mats
-        } else {
-            &mut *high_mats
-        };
-        // SAFETY: both row arrays hold 64 initialized u64 values, the output
-        // matrix block is fully overwritten, and this function's cfg supplies
-        // every target feature required by the leaf.
-        unsafe {
+    let mut low_rows = MaybeUninit::<[u64; 64]>::uninit();
+    let mut high_rows = MaybeUninit::<[u64; 64]>::uninit();
+    let low_ptr = low_rows.as_mut_ptr().cast::<__m512i>();
+    let high_ptr = high_rows.as_mut_ptr().cast::<__m512i>();
+
+    let s0 = e_hi;
+    let s1 = crate::field::mul_by_x(s0);
+    let s2 = crate::field::mul_by_x(s1);
+    let s3 = crate::field::mul_by_x(s2);
+    let s4 = crate::field::mul_by_x(s3);
+    let s5 = crate::field::mul_by_x(s4);
+    let s6 = crate::field::mul_by_x(s5);
+    let s7 = crate::field::mul_by_x(s6);
+
+    unsafe {
+        let mut lo = _mm512_set_epi64(
+            s7.lo as i64,
+            s6.lo as i64,
+            s5.lo as i64,
+            s4.lo as i64,
+            s3.lo as i64,
+            s2.lo as i64,
+            s1.lo as i64,
+            s0.lo as i64,
+        );
+        let mut hi = _mm512_set_epi64(
+            s7.hi as i64,
+            s6.hi as i64,
+            s5.hi as i64,
+            s4.hi as i64,
+            s3.hi as i64,
+            s2.hi as i64,
+            s1.hi as i64,
+            s0.hi as i64,
+        );
+        for chunk in 0..2 {
+            for g in 0..8 {
+                _mm512_storeu_si512(low_ptr.add(g), lo);
+                _mm512_storeu_si512(high_ptr.add(g), hi);
+                if chunk == 0 || g < 7 {
+                    let top = _mm512_srli_epi64::<56>(hi);
+                    let red_721 = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_slli_epi64::<7>(top),
+                        _mm512_slli_epi64::<2>(top),
+                        _mm512_add_epi64(top, top),
+                    );
+                    let next_hi = _mm512_shldi_epi64::<8>(hi, lo);
+                    let next_lo = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_slli_epi64::<8>(lo),
+                        red_721,
+                        top,
+                    );
+                    lo = next_lo;
+                    hi = next_hi;
+                }
+            }
+            let mats = if chunk == 0 {
+                &mut *low_mats
+            } else {
+                &mut *high_mats
+            };
             gfni_fold64_two_maps_to_mats(
                 low_rows.as_ptr().cast::<u8>(),
                 &map.low,
@@ -2955,6 +3040,51 @@ fn build_direct_fold8_factors_reusing_a_state(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_direct_fold8_factors_reusing_a_state_from_generators(
+    fold8: Vec<F128>,
+    suffix: &[F128],
+    generators: &[F128],
+) -> DirectFold8Factors {
+    let low_eq: [F128; 64] = build_eq(&suffix[..6])
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
+    let n_packed = 1usize << LOG_PACKING;
+    let state_len = 64 * n_packed;
+    assert_eq!(fold8.len(), state_len);
+    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
+    let mut w_state;
+    if rs_reuse_fold8_a_state_enabled() {
+        direct_fold8_a_state_into(&fold8, &mut a_state);
+        w_state = fold8;
+        unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
+    } else {
+        w_state = crate::alloc_uninit_vec::<F128>(state_len);
+        rayon::join(
+            || unsafe {
+                direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state)
+            },
+            || direct_fold8_a_state_into(&fold8, &mut a_state),
+        );
+    }
+    let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+    let tail = &suffix[6..];
+    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+    DirectFold8Factors {
+        eq_lo,
+        eq_hi,
+        a_state,
+        w_state,
+        round0,
+    }
+}
+
 fn direct_fold8_states_seq(
     fold8: &[F128],
     low_eq: &[F128; 64],
@@ -2999,9 +3129,9 @@ fn df8_state_direct_disabled() -> bool {
 ))]
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
-unsafe fn direct_fold8_w_state_gfni(
+unsafe fn direct_fold8_w_state_gfni_from_generators(
     low_eq: &[F128; 64],
-    table: &[F128],
+    generators: &[F128],
     w_state: &mut [F128],
 ) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
@@ -3009,7 +3139,7 @@ unsafe fn direct_fold8_w_state_gfni(
 
     let n_packed = 1usize << LOG_PACKING;
     assert_eq!(w_state.len(), 64 * n_packed);
-    let map = build_gfni_direct_fold_map_from_table(table);
+    let map = build_gfni_direct_fold_map_from_generators(generators);
     let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
@@ -3035,8 +3165,8 @@ unsafe fn direct_fold8_w_state_gfni(
                 core::ptr::null(),
             );
             if bit + 1 < n_packed {
-                let lo_ptr = low_ptr.cast::<__m512i>();
-                let hi_ptr = high_ptr.cast::<__m512i>();
+                let lo_ptr = core::hint::black_box(low_ptr.cast::<__m512i>());
+                let hi_ptr = core::hint::black_box(high_ptr.cast::<__m512i>());
                 for g in 0..8 {
                     let lo = _mm512_loadu_si512(lo_ptr.add(g));
                     let hi = _mm512_loadu_si512(hi_ptr.add(g));
@@ -3050,6 +3180,25 @@ unsafe fn direct_fold8_w_state_gfni(
             }
         }
     }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn direct_fold8_w_state_gfni(
+    low_eq: &[F128; 64],
+    table: &[F128],
+    w_state: &mut [F128],
+) {
+    debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
+    let generators: [F128; 128] =
+        core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
+    unsafe { direct_fold8_w_state_gfni_from_generators(low_eq, &generators, w_state) }
 }
 
 fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
@@ -3097,13 +3246,42 @@ fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
     assert_eq!(fold8.len(), 64 * n_packed);
     assert_eq!(a_state.len(), 64 * n_packed);
     let a_addr = a_state.as_mut_ptr() as usize;
-    (0..64usize).into_par_iter().for_each(|e| {
-        let transposed = tensor_algebra_transpose(&fold8[e * n_packed..(e + 1) * n_packed]);
+    // Process 4 consecutive banks per task (16 tasks total, 1 per worker).
+    // Four adjacent `e` lanes form a contiguous 64-byte cache line in every
+    // output row `a_state[bit * 64 + e_base .. bit * 64 + e_base + 4]`,
+    // eliminating 64 heap allocations and all cross-core false sharing.
+    (0..16usize).into_par_iter().for_each(|e_group| {
+        let e_base = e_group * 4;
+        let mut t0 = [F128::ZERO; 128];
+        let mut t1 = [F128::ZERO; 128];
+        let mut t2 = [F128::ZERO; 128];
+        let mut t3 = [F128::ZERO; 128];
+        tensor_algebra_transpose_into(
+            &fold8[e_base * n_packed..(e_base + 1) * n_packed],
+            &mut t0,
+        );
+        tensor_algebra_transpose_into(
+            &fold8[(e_base + 1) * n_packed..(e_base + 2) * n_packed],
+            &mut t1,
+        );
+        tensor_algebra_transpose_into(
+            &fold8[(e_base + 2) * n_packed..(e_base + 3) * n_packed],
+            &mut t2,
+        );
+        tensor_algebra_transpose_into(
+            &fold8[(e_base + 3) * n_packed..(e_base + 4) * n_packed],
+            &mut t3,
+        );
         let a = a_addr as *mut F128;
-        // SAFETY: each e owns one disjoint lane in every output row.
+        // SAFETY: each `e_group` owns the disjoint 4-lane slice `[e_base..e_base+4]`
+        // (one full 64-byte cache line) in every output row `bit in 0..128`.
         unsafe {
-            for (bit, value) in transposed.into_iter().enumerate() {
-                *a.add(bit * 64 + e) = value;
+            for bit in 0..n_packed {
+                let dst = a.add(bit * 64 + e_base);
+                *dst = t0[bit];
+                *dst.add(1) = t1[bit];
+                *dst.add(2) = t2[bit];
+                *dst.add(3) = t3[bit];
             }
         }
     });
@@ -3852,8 +4030,30 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
-            let table = build_fold_byte_table(&scaled_eq_r_dprime);
-            let wants_direct = w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1);
+            let wants_direct = !elide_basis
+                && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let skip_table =
+                elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let skip_table = false;
+            let table = if skip_table {
+                Vec::new()
+            } else {
+                build_fold_byte_table(&scaled_eq_r_dprime)
+            };
             let direct_fold2 = match kinds[i] {
                 Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
                     let suffix = dense_suffixes[d];
@@ -3909,12 +4109,41 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             };
             let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
                 (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                    Some(build_direct_fold8_factors_reusing_a_state(
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vbmi",
+                        target_feature = "vpclmulqdq",
+                        target_feature = "gfni"
+                    ))]
+                    let factors = if skip_table {
+                        build_direct_fold8_factors_reusing_a_state_from_generators(
+                            fold8,
+                            dense_suffixes[d],
+                            &scaled_eq_r_dprime,
+                        )
+                    } else {
+                        build_direct_fold8_factors_reusing_a_state(
+                            fold8,
+                            dense_suffixes[d],
+                            &table,
+                            tail_par,
+                        )
+                    };
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512vbmi",
+                        target_feature = "vpclmulqdq",
+                        target_feature = "gfni"
+                    )))]
+                    let factors = build_direct_fold8_factors_reusing_a_state(
                         fold8,
                         dense_suffixes[d],
                         &table,
                         tail_par,
-                    ))
+                    );
+                    Some(factors)
                 }
                 _ => None,
             };
