@@ -568,7 +568,7 @@ fn close_fd(fd: i32) {
 /// never be observed by the harness.
 fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     use std::io::Write;
-    let (proof, commitment, _) = out;
+    let (proof, commitment, _claim) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
@@ -582,7 +582,9 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     file.write_all(&bytes)?;
     file.set_len(bytes.len() as u64)?;
     drop(file);
-    std::fs::rename(temporary, path)
+    let res = std::fs::rename(temporary, path);
+    drop(_claim);
+    res
 }
 
 /// Rehearse the publication tail during the UNTIMED window.
