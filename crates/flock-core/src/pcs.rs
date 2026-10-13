@@ -137,7 +137,9 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    static PCS_TRACE_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("PCS_TRACE").is_ok());
+    let trace = *PCS_TRACE_ON;
     let t_total = std::time::Instant::now();
 
     assert_eq!(
@@ -791,11 +793,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // `direct_c_stats` is None and `b_combined` stays empty -- so no
     // `rs_eq_ind` basis factor is read anywhere. ring_switch decides the
     // second half of that antecedent itself and skips building them.
+    static OPEN_DIRECT_AB_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
     let basis_elidable = cfg!(target_arch = "x86_64")
         && n_rs == 2
         && n_pd == 0
         && packed_witness.len() == (1usize << 25)
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && *OPEN_DIRECT_AB_ON;
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
@@ -856,7 +860,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && *OPEN_DIRECT_AB_ON;
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);

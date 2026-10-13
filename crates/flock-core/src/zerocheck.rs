@@ -27,7 +27,7 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
     fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
@@ -65,7 +65,9 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
+    *OFF
 }
 
 /// Test-only: number of lookahead/cascade levels the last prove ran with, so
@@ -92,7 +94,9 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some());
+    *OFF
 }
 
 /// Test-only forced-off latch for the no-materialize sweep.
@@ -116,7 +120,9 @@ fn nomat_off() -> bool {
     if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some());
+    *OFF
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
@@ -126,7 +132,9 @@ fn cascade3_off() -> bool {
     if ZC_CASCADE3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some());
+    *OFF
 }
 
 /// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Both
@@ -150,7 +158,9 @@ fn cascade4_off() -> bool {
     if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some());
+    *OFF
 }
 
 /// Cascade level 4 (rounds 11+12) ships on: `FLOCK_NO_ZC_CASCADE5=1` restores
@@ -167,7 +177,9 @@ fn cascade5_off() -> bool {
     if ZC_CASCADE5_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some());
+    *OFF
 }
 
 /// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted five-level cap. The
@@ -175,7 +187,9 @@ fn cascade5_off() -> bool {
 /// the ranked 26-variable tail.
 #[inline]
 fn deep_cascade_off() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some());
+    *OFF
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -525,7 +539,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    static ZC_TIMING_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+    let zc_timing = *ZC_TIMING_ON;
     let t_round1 = std::time::Instant::now();
     let inv_table_owned;
     let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
@@ -747,15 +763,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `ĉ(z, r_rest)` directly (the eq-weighted sum collapses to the MLE
     // evaluation because ĉ is linear). This is **the c-claim** — at point
     // `(z, r_rest)`, *not* `(z, ρ-values)`. ~64 F128 muls + Lagrange weights.
-    let final_c_eval = interpolate_at_z_on_lambda(&round1_c, k_skip, z);
-
-    // ---- 6. Round 2: fused fold + first multilinear message ----
-    //
-    // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
-    // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
-    // verifier samples ρ_1 after observing this message.
     let t_round2 = std::time::Instant::now();
-    let fold_table = UniSkipFoldTable::new(k_skip, z);
+    let (final_c_eval, fold_table) =
+        crate::zerocheck::multilinear::interpolate_lambda_and_fold_table(&round1_c, k_skip, z);
     crate::gaptime::mark("zc: fold_table built");
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
@@ -765,7 +775,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // and, being the "no fusion at all" oracle, also disables the lookahead.
     // Transcript bytes are identical either way; the ranked worker's cleared
     // environment never sets it.
-    let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
+    static NO_TAIL_FUSION_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some());
+    let no_tail_fusion = *NO_TAIL_FUSION_ON;
 
     // Two-challenge symbolic lookahead: round three's message is a quadratic
     // in ρ₁, so its six coefficients ride along inside round two's sweep and

@@ -35,10 +35,12 @@ use flock_core::zerocheck;
 
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    static OPEN_DIRECT_AB_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
     cfg!(target_arch = "x86_64")
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && *OPEN_DIRECT_AB_ON
 }
 
 #[inline]
@@ -110,6 +112,8 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
 #[inline]
 fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
+    static ZC_IDENTITY_C_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none());
     ranked_direct_ab_precompute_enabled(r1cs)
         && pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
@@ -119,17 +123,18 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && c0_is_identity_cached(r1cs)
-        && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
+        && *ZC_IDENTITY_C_ON
 }
 
-/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
+/// Direct-fold8 capture/consumer predicate: the fold4 shape plus the shared
 /// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
 #[inline]
 fn ranked_direct_fold8_precompute_enabled(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
 ) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs, captured)
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold4_enabled()
         && pcs::ranked_direct_fold8_enabled()
         && captured.fold8.is_some()
         && r1cs.k_log >= r1cs.k_skip + 7
@@ -614,26 +619,49 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // work; the fingerprint gate in `proof_io` makes a stale or missing
     // stash fall back to the incumbent full encode, byte-identically. The job
     // runs on the process-lifetime stash helper (`proof_io::spawn_stash`).
+    struct ScopedPrefixPtrs {
+        commitment: *const Commitment,
+        zc: *const zerocheck::ZerocheckProof,
+        lc: *const lincheck::LincheckProof,
+    }
+    // SAFETY: `LigeritoCommitment`, `ZerocheckProof`, and `LincheckProof` are
+    // `Sync`, and `done.wait()` joins the stash job before any of the three
+    // bindings is moved or mutated.
+    unsafe impl Send for ScopedPrefixPtrs {}
+
     let stash = if crate::proof_io::pre_encode_enabled() {
-        let commitment_c = commitment.clone();
-        let zc_c = zc_proof.clone();
-        let lc_c = lc_proof.clone();
+        let ptrs = ScopedPrefixPtrs {
+            commitment: &commitment,
+            zc: &zc_proof,
+            lc: &lc_proof,
+        };
         Some(crate::proof_io::spawn_stash(move || {
-            crate::proof_io::stash_pre_encoded_prefix(&commitment_c, &zc_c, &lc_c);
+            let ptrs = ptrs;
+            // SAFETY: valid shared references for the lifetime of this closure,
+            // bounded by `done.wait()` below.
+            unsafe {
+                crate::proof_io::stash_pre_encoded_prefix(
+                    &*ptrs.commitment,
+                    &*ptrs.zc,
+                    &*ptrs.lc,
+                );
+            }
         }))
     } else {
         None
     };
+    let claims_arr = [ab, c];
     let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
-        &[ab.clone(), c.clone()],
+        &claims_arr,
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
         challenger,
     ));
+    let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
         // complete before the publish tail looks for it.
