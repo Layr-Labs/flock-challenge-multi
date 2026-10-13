@@ -3601,6 +3601,38 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     ranked_compact: bool,
     state: &mut WorkerStateAbOnly,
 ) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    if DIRECT {
+        let (eq_bot, mats, bank_bits) = eq_fold.expect("DIRECT requires eq_fold");
+        unsafe {
+            process_one_x_hi_ab_only_direct_x86(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                eq_hi_val,
+                eq_bot,
+                mats,
+                bank_bits,
+                plane_first_write,
+                plane_cache,
+                ranked_one_rows_elided,
+                ranked_compact,
+                state,
+            );
+        }
+        return;
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -3894,28 +3926,8 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             }
             return;
         }
-        // Plane-major → F128 through the same vectorized kernel the C drain
-        // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
-        // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
-        // shared `add_scaled` leaf, which selects the architecture kernel.
-        let mut bank_f128 = [F128::ZERO; ELL];
-        for (u, eq_bot_val) in eq_bot.iter().enumerate() {
-            let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
-                .try_into()
-                .expect("one 16-plane bank");
-            kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
-            if wide {
-                crate::field::f128_slice::add_scaled(
-                    &mut state.partial_ab,
-                    &bank_f128,
-                    *eq_bot_val,
-                );
-            } else {
-                for lane in 0..ELL {
-                    state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
-                }
-            }
-        }
+        fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
+        return;
     }
     if r1_eqfold_x4_enabled() {
         let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
@@ -3925,6 +3937,202 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
             state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn fold_ab_plane_banks_fallback_cold(
+    state: &mut WorkerStateAbOnly,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    wide: bool,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    // Plane-major → F128 through the same vectorized kernel the C drain
+    // uses (identical bank layout: plane k, byte `k*ELL + lane`), instead
+    // of 16 scalar byte loads per lane. The eq_bot multiply then rides the
+    // shared `add_scaled` leaf, which selects the architecture kernel.
+    let mut bank_f128 = [F128::ZERO; ELL];
+    for (u, eq_bot_val) in eq_bot.iter().enumerate() {
+        let bank: &[u8; 16 * ELL] = state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL]
+            .try_into()
+            .expect("one 16-plane bank");
+        kernels::c_plane_bank_to_f128(bank, &mut bank_f128);
+        if wide {
+            crate::field::f128_slice::add_scaled(
+                &mut state.partial_ab,
+                &bank_f128,
+                *eq_bot_val,
+            );
+        } else {
+            for lane in 0..ELL {
+                state.partial_ab[lane] += *eq_bot_val * bank_f128[lane];
+            }
+        }
+    }
+    if wide {
+        let (dst, src) = (&mut state.local_res_ab, &state.partial_ab);
+        crate::field::f128_slice::add_scaled(dst, src, eq_hi_val);
+    } else {
+        for lane in 0..ELL {
+            state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn process_one_x_hi_ab_only_direct_x86(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_hi_val: F128,
+    eq_bot: &[F128],
+    mats: &[u64],
+    bank_bits: usize,
+    plane_first_write: bool,
+    plane_cache: bool,
+    ranked_one_rows_elided: bool,
+    ranked_compact: bool,
+    state: &mut WorkerStateAbOnly,
+) {
+    debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+    debug_assert!(
+        ranked_one_rows_elided
+            && within_outer_mask == 1
+            && (b_med_counts == [16, 15] || b_med_counts == [16, 14])
+    );
+    debug_assert!(!ranked_compact || ranked_one_rows_elided);
+    let plane_len = eq_bot.len() * 16 * ELL;
+    if state.plane_banks.len() != plane_len {
+        if state.cached_plane_banks {
+            state.cached_plane_banks = false;
+            give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+        }
+        state.plane_banks = if plane_cache {
+            state.cached_plane_banks = true;
+            take_ranked_ab_plane()
+        } else if plane_first_write {
+            crate::alloc_uninit_vec(plane_len)
+        } else {
+            vec![0u8; plane_len]
+        };
+    } else if !plane_first_write {
+        state.plane_banks.fill(0);
+    }
+    let n_lo = n_lo_and_inner - N_INNER;
+    #[inline(always)]
+    fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
+        if compact {
+            let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
+            debug_assert!((2..31).contains(&row_in_block));
+            (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
+        } else {
+            x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
+        }
+    }
+    let pf_windows = if zc_r1ab_pf_enabled() {
+        ZC_R1AB_PF_WINDOWS
+    } else {
+        0
+    };
+    let ab_inner_ptr = ab_inner.as_ptr();
+    let pf_spread = zc_r1ab_pf_spread_enabled();
+    let bank_mask = (1usize << bank_bits) - 1;
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+            2
+        } else {
+            0
+        };
+        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+            let x_next = x_outer_lo + pf_windows;
+            let x_next_outer = x_next | (x_hi << n_lo);
+            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided
+                && ((x_outer + pf_windows) & within_outer_mask) == 0
+            {
+                2
+            } else {
+                0
+            };
+            (
+                n_next,
+                live_row_base(x_next_outer, next_first, ranked_compact),
+                next_first,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let w_idx = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & bank_mask;
+        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+            .try_into()
+            .expect("one 16x16 qword matrix block per w");
+        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
+            .try_into()
+            .expect("one plane bank per low index");
+        let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+        let prefetch = kernels::AbDirectPrefetch {
+            next_window: if pf_windows == 0 {
+                core::ptr::null()
+            } else {
+                ab_inner_ptr.wrapping_add(next_live_base)
+            },
+            first: next_first_b_med,
+            end: n_next,
+            spread: pf_spread,
+        };
+        if plane_first_write && w_idx == 0 {
+            kernels::convert_ab_nomul_gfni_direct::<true>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        } else {
+            kernels::convert_ab_nomul_gfni_direct::<false>(
+                live_rows,
+                first_b_med,
+                n_b_med,
+                mats_w,
+                bank,
+                &prefetch,
+            );
+        }
+    }
+    let wide = r1_eqfold_x4_enabled();
+    if wide {
+        unsafe {
+            kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                &mut state.plane_banks,
+                eq_bot,
+                eq_hi_val,
+                &mut state.local_res_ab,
+            );
+        }
+        return;
+    }
+    fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
 /// Ranked default routes the round-one AB band folds — the plane-bank
@@ -4254,10 +4462,8 @@ fn round1_lifted_from_fold8(
     };
     let c_s_inv = c_s_inv_for_identity_c();
     let mut res_s = [F128::ZERO; ELL];
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat[lane] + prefix * s_hat[ELL + lane];
-        res_s[lane] = c_s_inv * naive;
-    }
+    crate::field::f128_slice::scale_slice(&mut res_s, &s_hat[..ELL], c_s_inv * (F128::ONE + prefix));
+    crate::field::f128_slice::add_scaled(&mut res_s, &s_hat[ELL..2 * ELL], c_s_inv * prefix);
     ntt_extend_f128_vec_ghash(&res_s, inv_table)
 }
 
@@ -4299,7 +4505,7 @@ pub(crate) fn round1_w30_delta_ab(
     let inner_tail = &r[k_skip + 1..k_log];
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let r_top = inner_tail[6];
-    let lifted = if w30_delta_direct_enabled() {
+    let mut lifted = if w30_delta_direct_enabled() {
         // Closed form of the chain below for its single live slot: the
         // sixty-four-bank statistic holds `r_top · row240` in the first half of
         // bank `RANKED_W30_SLOT · ELL / n_packed` and zeros everywhere else, so
@@ -4316,9 +4522,7 @@ pub(crate) fn round1_w30_delta_ab(
         let w = low_eq[bank & 3] * hi_eq[(bank >> 2) & 3] * top_eq[bank >> 4];
         let scale = c_s_inv_for_identity_c() * (F128::ONE + r[k_skip]);
         let mut res_s = [F128::ZERO; ELL];
-        for (dst, src) in res_s.iter_mut().zip(row240) {
-            *dst = scale * (w * (r_top * *src));
-        }
+        crate::field::f128_slice::scale_slice(&mut res_s, row240, scale * w * r_top);
         ntt_extend_f128_vec_ghash(&res_s, inv_table)
     } else {
         let mut fold8 = vec![F128::ZERO; 64 * n_packed];
@@ -4332,11 +4536,10 @@ pub(crate) fn round1_w30_delta_ab(
     };
     let mut beta = [F8::ZERO; ELL];
     inv_table.apply(&RANKED_W30_B_ROW.to_le_bytes(), &mut beta);
+    for (v, &b) in lifted.iter_mut().zip(beta.iter()) {
+        *v *= phi8(b);
+    }
     lifted
-        .iter()
-        .zip(beta.iter())
-        .map(|(v, b)| phi8(*b) * *v)
-        .collect()
 }
 
 /// Collapse a sixty-four-bank statistic to its 128-vector with one weighted
@@ -4366,30 +4569,26 @@ fn one_fold8_s_hat_direct(fold8: &[F128], inner_tail: &[F128]) -> Vec<F128> {
 fn one_fold8_s_hat_chain(fold8: &[F128], inner_tail: &[F128]) -> Vec<F128> {
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let retained_top_eq = build_eq(&inner_tail[4..6]);
-    let mut fold4 = vec![F128::ZERO; 16 * n_packed];
-    for high in 0..4 {
-        for bank in 0..16 {
-            let src = (bank + 16 * high) * n_packed;
-            let dst = bank * n_packed;
-            crate::field::f128_slice::add_scaled(
-                &mut fold4[dst..dst + n_packed],
-                &fold8[src..src + n_packed],
-                retained_top_eq[high],
-            );
-        }
+    let fold4_len = 16 * n_packed;
+    let mut fold4 = crate::alloc_uninit_vec::<F128>(fold4_len);
+    crate::field::f128_slice::scale_slice(&mut fold4, &fold8[..fold4_len], retained_top_eq[0]);
+    for high in 1..4 {
+        crate::field::f128_slice::add_scaled(
+            &mut fold4,
+            &fold8[high * fold4_len..(high + 1) * fold4_len],
+            retained_top_eq[high],
+        );
     }
     let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            crate::field::f128_slice::add_scaled(
-                &mut quad[dst..dst + n_packed],
-                &fold4[src..src + n_packed],
-                retained_hi_eq[q],
-            );
-        }
+    let quad_len = 4 * n_packed;
+    let mut quad = crate::alloc_uninit_vec::<F128>(quad_len);
+    crate::field::f128_slice::scale_slice(&mut quad, &fold4[..quad_len], retained_hi_eq[0]);
+    for q in 1..4 {
+        crate::field::f128_slice::add_scaled(
+            &mut quad,
+            &fold4[q * quad_len..(q + 1) * quad_len],
+            retained_hi_eq[q],
+        );
     }
     crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2])
 }
@@ -4525,25 +4724,35 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         };
         // Collapse retained coordinates 4 and 5 to recover Fold4 exactly.
         let retained_top_eq = build_eq(&inner_tail[4..6]);
-        let mut fold4 = vec![F128::ZERO; 16 * n_packed];
-        let wide = r1_cfold_x4_enabled();
-        for high in 0..4 {
-            for bank in 0..16 {
-                let src = (bank + 16 * high) * n_packed;
-                let dst = bank * n_packed;
-                if wide {
-                    crate::field::f128_slice::add_scaled(
-                        &mut fold4[dst..dst + n_packed],
-                        &fold8[src..src + n_packed],
-                        retained_top_eq[high],
-                    );
-                } else {
+        let fold4_len = 16 * n_packed;
+        let fold4 = if r1_cfold_x4_enabled() {
+            let mut fold4 = crate::alloc_uninit_vec::<F128>(fold4_len);
+            crate::field::f128_slice::scale_slice(
+                &mut fold4,
+                &fold8[..fold4_len],
+                retained_top_eq[0],
+            );
+            for high in 1..4 {
+                crate::field::f128_slice::add_scaled(
+                    &mut fold4,
+                    &fold8[high * fold4_len..(high + 1) * fold4_len],
+                    retained_top_eq[high],
+                );
+            }
+            fold4
+        } else {
+            let mut fold4 = vec![F128::ZERO; fold4_len];
+            for high in 0..4 {
+                for bank in 0..16 {
+                    let src = (bank + 16 * high) * n_packed;
+                    let dst = bank * n_packed;
                     for packed in 0..n_packed {
                         fold4[dst + packed] += retained_top_eq[high] * fold8[src + packed];
                     }
                 }
             }
-        }
+            fold4
+        };
         (fold4, fold8, one_fold8)
     } else {
         assert!(
@@ -4563,25 +4772,31 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
     // tensor (coordinates 0 and 1 stay bank selectors).
     let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    let wide_quad = r1_cfold_x4_enabled();
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            if wide_quad {
-                crate::field::f128_slice::add_scaled(
-                    &mut quad[dst..dst + n_packed],
-                    &fold4[src..src + n_packed],
-                    retained_hi_eq[q],
-                );
-            } else {
+    let quad_len = 4 * n_packed;
+    let quad = if r1_cfold_x4_enabled() {
+        let mut quad = crate::alloc_uninit_vec::<F128>(quad_len);
+        crate::field::f128_slice::scale_slice(&mut quad, &fold4[..quad_len], retained_hi_eq[0]);
+        for q in 1..4 {
+            crate::field::f128_slice::add_scaled(
+                &mut quad,
+                &fold4[q * quad_len..(q + 1) * quad_len],
+                retained_hi_eq[q],
+            );
+        }
+        quad
+    } else {
+        let mut quad = vec![F128::ZERO; quad_len];
+        for q in 0..4 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
                 for packed in 0..n_packed {
                     quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
                 }
             }
         }
-    }
+        quad
+    };
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
 
     // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
@@ -4589,9 +4804,22 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
     let c_s_inv = c_s_inv_for_identity_c();
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-        res_c_s[lane] = c_s_inv * naive;
+    if r1_cfold_x4_enabled() {
+        crate::field::f128_slice::scale_slice(
+            &mut res_c_s,
+            &s_hat_v_c[..ELL],
+            c_s_inv * (F128::ONE + prefix),
+        );
+        crate::field::f128_slice::add_scaled(
+            &mut res_c_s,
+            &s_hat_v_c[ELL..2 * ELL],
+            c_s_inv * prefix,
+        );
+    } else {
+        for lane in 0..ELL {
+            let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
+            res_c_s[lane] = c_s_inv * naive;
+        }
     }
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     let one_ab_lifted = one_fold8
