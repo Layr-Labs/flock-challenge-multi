@@ -75,7 +75,14 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
 ))]
 #[rustfmt::skip]
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[cfg_attr(
+    target_feature = "vpclmulqdq",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
+)]
 unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     use core::arch::x86_64::*;
     const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
@@ -104,7 +111,14 @@ unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
 ))]
 #[rustfmt::skip]
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[cfg_attr(
+    target_feature = "vpclmulqdq",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
+)]
 pub(crate) unsafe fn transpose_8_u64s_to_8_mats_swapped_gfni(lanes: &[u64; 8], out_mats: &mut [u64]) {
     use core::arch::x86_64::*;
     debug_assert_eq!(out_mats.len(), 8);
@@ -132,7 +146,14 @@ pub(crate) unsafe fn transpose_8_u64s_to_8_mats_swapped_gfni(lanes: &[u64; 8], o
 ))]
 #[rustfmt::skip]
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[cfg_attr(
+    target_feature = "vpclmulqdq",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
+)]
 pub(crate) unsafe fn transpose_8_f128_to_16_mats_swapped_gfni(
     basis: &[crate::field::F128],
     out_mats: &mut [u64],

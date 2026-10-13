@@ -27,7 +27,7 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
     fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
@@ -747,18 +747,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `ĉ(z, r_rest)` directly (the eq-weighted sum collapses to the MLE
     // evaluation because ĉ is linear). This is **the c-claim** — at point
     // `(z, r_rest)`, *not* `(z, ρ-values)`. ~64 F128 muls + Lagrange weights.
-    let final_c_eval = interpolate_at_z_on_lambda(&round1_c, k_skip, z);
-
+    //
     // ---- 6. Round 2: fused fold + first multilinear message ----
     //
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
     let t_round2 = std::time::Instant::now();
-    let fold_table = UniSkipFoldTable::new(k_skip, z);
-    crate::gaptime::mark("zc: fold_table built");
-    let mut mlv_arg = vec![F128::ONE; n_mlv];
-    mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
     // Diagnostics kill switch: FLOCK_NO_TAIL_FUSION=1 routes every tail round
     // through the unfused two-pass path (fold_in_place_pair, then a separate
     // round_pair_naive read of the folded arrays) for one-process A/B runs —
@@ -800,11 +795,25 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
+    let basis_only = use_nomat
+        && crate::zerocheck::multilinear::round2_basis_only_ok(m, k_skip, &r);
+    let (final_c_eval, fold_table) =
+        crate::zerocheck::multilinear::interpolate_lambda_and_fold_table(
+            &round1_c,
+            k_skip,
+            z,
+            basis_only,
+        );
+    crate::gaptime::mark("zc: fold_table built");
+    let mut mlv_arg_buf = [F128::ONE; 32];
+    let mlv_arg = &mut mlv_arg_buf[..n_mlv];
+    mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
+
     // Round two and the packed rounds-3+4 pass share the same 13 high eq
     // coordinates at the ranked split. Keep round two's small tensors until
     // that pass; its low tensor loses exactly the first two coordinates.
     let mut packed_eq = use_nomat
-        .then(|| packed_round2_split_eq(&mlv_arg))
+        .then(|| packed_round2_split_eq(mlv_arg))
         // The composed packed leaf requires at least one low variable after
         // the two-coordinate marginalization. Tiny test shapes keep their
         // independently built split.
@@ -817,7 +826,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             m,
             k_skip,
             &fold_table,
-            &mlv_arg,
+            mlv_arg,
             padding,
             packed_eq.as_ref(),
             r2_canon_rows.as_deref(),
@@ -830,7 +839,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             m,
             k_skip,
             &fold_table,
-            &mlv_arg,
+            mlv_arg,
             padding,
         );
         (a, b, m1, mi, Some(la))
@@ -841,7 +850,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             m,
             k_skip,
             &fold_table,
-            &mlv_arg,
+            mlv_arg,
             padding,
         );
         (a, b, m1, mi, None)
@@ -985,6 +994,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `lm_in` carries the layout the previous level stored.
     let lm_handoff = zc_lane_major_handoff_on();
     let mut lm_in = false;
+    let mut r_next_buf = [F128::ONE; 32];
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
@@ -1003,7 +1013,8 @@ fn prove_packed_padded_inner<C: Challenger>(
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         let log_n_cur = n_cur.trailing_zeros() as usize;
         let quarter = n_cur / 4;
-        let mut r_next = vec![F128::ONE; log_n_cur - 2];
+        let r_next = &mut r_next_buf[..log_n_cur - 2];
+        r_next[0] = F128::ONE;
         r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 3..]);
         // This level may store lane-major tiles only for another lookahead
         // level (the last level's pair fold reads row-major) whose chunks are
@@ -1017,12 +1028,23 @@ fn prove_packed_padded_inner<C: Challenger>(
             let mut a4 = crate::scratch::take_f128(quarter);
             let mut b4 = crate::scratch::take_f128(quarter);
             let round2_eq = packed_eq.take();
-            let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
-            let eq_override = match (&eq_lo, &round2_eq) {
-                (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
-                _ => None,
+            let mut eq_lo_stack = [F128::ZERO; 1024];
+            let eq_lo_heap;
+            let eq_override = if let Some(eq) = round2_eq.as_ref() {
+                let lo_slice: &[F128] = if eq.lo.len() == 4096 {
+                    for (dst, v) in eq_lo_stack.iter_mut().zip(eq.lo.chunks_exact(4)) {
+                        *dst = v[0] + v[1] + v[2] + v[3];
+                    }
+                    &eq_lo_stack[..]
+                } else {
+                    eq_lo_heap = marginalize_eq_low2(&eq.lo);
+                    &eq_lo_heap[..]
+                };
+                Some((lo_slice, &eq.hi[..]))
+            } else {
+                None
             };
-            let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
+            let lm_out = lm_reader_ok && eq_override.is_some_and(|(lo, _)| lo.len() % 8 == 0);
             let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 a_packed,
                 b_packed,
@@ -1034,7 +1056,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &mut b4,
                 mlv_rhos[0],
                 mlv_rhos[1],
-                &r_next,
+                r_next,
                 eq_override,
                 lm_out,
             );
@@ -1053,7 +1075,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &mut b_nxt[..quarter],
                 mlv_rhos[2 * level],
                 mlv_rhos[2 * level + 1],
-                &r_next,
+                r_next,
                 lm_in,
                 lm_out,
             );
@@ -1068,7 +1090,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &mut b_nxt[..quarter],
                 mlv_rhos[2 * level],
                 mlv_rhos[2 * level + 1],
-                &r_next,
+                r_next,
             );
             (m1, mi, false)
         };
@@ -1100,7 +1122,8 @@ fn prove_packed_padded_inner<C: Challenger>(
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
         // weights for the remaining variables = r[k_skip + i + 2..m].
-        let mut r_next = vec![F128::ONE; log_n_before - 1];
+        let r_next = &mut r_next_buf[..log_n_before - 1];
+        r_next[0] = F128::ONE;
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
         let (m1, mi) = if log_n_before >= 10 && !no_tail_fusion {
@@ -1111,7 +1134,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &mut a_nxt[..half],
                 &mut b_nxt[..half],
                 rho_prev,
-                &r_next,
+                r_next,
             );
             // Swap current <-> scratch, then shrink the new current to the
             // folded size. The old (larger) buffer becomes scratch; we only
