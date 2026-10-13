@@ -682,6 +682,246 @@ unsafe fn stage_ranked_dense_side<const P: bool>(
 /// boundary or a by-value `[__m512i; 8]` return.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    a_ring: *const V8,
+    b_ring: *const V8,
+    rw: usize,
+    off: *mut u16,
+    c: WidenConsts,
+) {
+    unsafe {
+        debug_assert!(blk > 1 && blk < 30);
+        debug_assert!(proj.one_rows_elided);
+        let a_rows = tr8x16_zmm(a_ring, rw);
+        widen_ranked_dense_rows::<P>(&a_rows, off, c);
+        let b_rows = tr8x16_zmm(b_ring, rw);
+        widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+
+        if blk == 2 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0xfc,
+                );
+                j += 1;
+            }
+            return;
+        }
+        if blk == 29 {
+            let mut j = 0usize;
+            while j != 8 {
+                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                let out = &mut *proj
+                    .out
+                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                    .cast::<[u8; 64]>();
+                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
+                    &*off
+                        .add(j * ROUND1_AB_OFF_WORDS)
+                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                    out,
+                    plan,
+                    imgs,
+                    0x0f,
+                );
+                j += 1;
+            }
+            return;
+        }
+
+        if plan.bcomplement_static_eligible() {
+            match blk {
+                3 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                4 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                5 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                6 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                7 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                8 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                9 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P>(
+                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
+                    );
+                }
+                10 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        10,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                11 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        11,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                12 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        12,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                13 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        13,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                14 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        14,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                15 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        15,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                16 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        16,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                17 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        17,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                18 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        18,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                19 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        19,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                20 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        20,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                21 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        21,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                22 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        22,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                23 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        23,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                24 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        24,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                25 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        25,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                26 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        26,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                27 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        27,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                28 => {
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
+                        28,
+                        P,
+                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
+                }
+                _ => {}
+            }
+        }
+
+        let mut j = 0usize;
+        while j != 8 {
+            rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+            let out = &mut *proj
+                .out
+                .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast::<[u8; 64]>();
+            round1_ab_inner_window_from_offsets_nt2::<P>(
+                &*off
+                    .add(j * ROUND1_AB_OFF_WORDS)
+                    .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                out,
+                plan,
+                imgs,
+            );
+            j += 1;
+        }
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
 unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
@@ -1372,6 +1612,9 @@ struct Drain8<'t> {
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
+    #[allow(dead_code)]
+    ranked_fast: bool,
+    #[allow(dead_code)]
     ranked_preps: Option<&'t RankedClosedWindowPreps>,
 }
 
@@ -1409,14 +1652,14 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t, const FLUSH: bool> {
+struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
 }
 
-impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
+impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOSED> {
     #[inline(always)]
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
@@ -1434,9 +1677,13 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
             // 0..31 and 480..511 without touching this ring. Keep the flush
             // check independent of the store: a skipped epoch-ending B word
             // must still publish the completed A/B epoch.
+            #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+            let is_ranked_static = RANKED_CLOSED || self.ranked_static;
+            #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+            let is_ranked_static = self.ranked_static;
             let static_b = FLUSH
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
-                && self.ranked_static;
+                && is_ranked_static;
             if !static_b {
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
@@ -1445,9 +1692,13 @@ impl<'t, const FLUSH: bool> W8<'t, FLUSH> {
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
                 if WORD + 1 == RING_WORDS {
-                    (*self.drain).drain_range(16, 16, RING_WORDS - 16);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
                 } else {
-                    (*self.drain).drain_range(WORD + 1 - RING_WORDS, 0, RING_WORDS);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(
+                        WORD + 1 - RING_WORDS,
+                        0,
+                        RING_WORDS,
+                    );
                 }
             }
         }
@@ -1949,15 +2200,50 @@ impl RankedRows {
 /// transposed ring rows instead of the incumbent staging (two YMM transposes,
 /// sixteen stores and one reload per row). Default ON; set
 /// `FLOCK_NO_WITGEN_STATIC01_DIRECT=1` to restore staging.
-#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
-fn ranked_static01_direct_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_STATIC01_DIRECT").is_none());
-    *ON
+#[allow(dead_code)]
+pub(crate) fn ranked_static01_direct_enabled() -> bool {
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_STATIC01_DIRECT").is_none()
+        });
+        *ON
+    }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    {
+        false
+    }
 }
 
 impl Drain8<'_> {
+    #[inline(always)]
+    unsafe fn drain_range_gen<const RANKED_CLOSED: bool>(
+        &mut self,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+            if RANKED_CLOSED {
+                if base_word >= 32 && base_word <= 448 {
+                    debug_assert_eq!(ring_word, 0);
+                    debug_assert_eq!(words, 32);
+                    self.drain_pair_ranked_closed_exact_fast(base_word);
+                } else {
+                    self.drain_static_or_sparse_ranked_closed_exact_fast(
+                        base_word,
+                        ring_word,
+                        words,
+                    );
+                }
+                return;
+            }
+            self.drain_range(base_word, ring_word, words);
+        }
+    }
+
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range(&mut self, base_word: usize, ring_word: usize, words: usize) {
@@ -1989,6 +2275,166 @@ impl Drain8<'_> {
         unsafe {
             debug_assert!(self.ranked_static);
             debug_assert!(proj.one_rows_elided);
+            if base_word >= 32 && base_word <= 448 && ring_word == 0 && words == 32 {
+                return self.drain_pair_ranked_closed_exact_fast(base_word);
+            }
+            if (base_word == 16 && ring_word == 16 && words == 16)
+                || (base_word == 480 && ring_word == 0 && words == 32)
+                || (base_word == 0 && ring_word == 0 && words == 16)
+            {
+                return self.drain_static_or_sparse_ranked_closed_exact_fast(
+                    base_word,
+                    ring_word,
+                    words,
+                );
+            }
+            self.drain_range_spread_ranked_closed_exact_fallback(
+                proj,
+                preps,
+                base_word,
+                ring_word,
+                words,
+            );
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg_attr(
+        all(
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi",
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512dq",
+            target_feature = "gfni"
+        ),
+        target_feature(
+            enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+        )
+    )]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn drain_static_or_sparse_ranked_closed_exact_fast(
+        &self,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
+            if !self.ranked_fast {
+                let preps = self.ranked_preps.unwrap_unchecked();
+                return self.drain_range_spread_ranked_closed_exact_fallback(
+                    &self.proj,
+                    preps,
+                    base_word,
+                    ring_word,
+                    words,
+                );
+            }
+            if base_word == 480 {
+                let x0 = load_v8(self.ast.cast::<u32>());
+                let x1 = load_v8(self.ast.add(1).cast::<u32>());
+                let l = _mm256_unpacklo_epi32(x0, x1);
+                let h = _mm256_unpackhi_epi32(x0, x1);
+                let mut q = [0u64; 8];
+                store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
+                store_v8(q.as_mut_ptr().cast::<u32>().add(8), _mm256_permute2x128_si256::<0x31>(l, h));
+                let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480));
+                let qp = q.as_ptr();
+                let mut j = 0usize;
+                while j != 8 {
+                    rows.publish_sparse_30(j, qp.add(j));
+                    j += 1;
+                }
+            } else {
+                debug_assert!(base_word == 0 || base_word == 16);
+                let a_rows = tr8x16_zmm(self.ast, base_word);
+                let rows = RankedRows::new(
+                    self.z.add(base_word),
+                    self.a.add(base_word),
+                    self.b.add(base_word),
+                );
+                let mut j = 0usize;
+                while j != 8 {
+                    rows.publish_static_values(j, a_rows[j]);
+                    j += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg_attr(
+        all(
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi",
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512dq",
+            target_feature = "gfni"
+        ),
+        target_feature(
+            enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+        )
+    )]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn drain_pair_ranked_closed_exact_fast(&self, base_word: usize) {
+        unsafe {
+            debug_assert!(base_word >= 32 && base_word <= 448);
+            debug_assert!(base_word.is_multiple_of(32));
+            let proj = &self.proj;
+            let preps = self.ranked_preps.unwrap_unchecked();
+            if !self.ranked_fast {
+                return self.drain_range_spread_ranked_closed_exact_fallback(
+                    proj,
+                    preps,
+                    base_word,
+                    0,
+                    32,
+                );
+            }
+            let wc = WidenConsts::new();
+            #[repr(align(64))]
+            struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
+            let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+            let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
+            for step in 0..2usize {
+                let rw = step * STEP_WORDS;
+                let abs_word = base_word + rw;
+                let blk = abs_word / STEP_WORDS;
+                let rows = RankedRows::new(
+                    self.z.add(abs_word),
+                    self.a.add(abs_word),
+                    self.b.add(abs_word),
+                );
+                let (plan, imgs) = *preps.get_unchecked(blk);
+                project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
+                    proj,
+                    blk,
+                    plan,
+                    imgs,
+                    rows,
+                    self.ast,
+                    self.bs,
+                    rw,
+                    op,
+                    wc,
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn drain_range_spread_ranked_closed_exact_fallback(
+        &self,
+        proj: &StreamProj<'_>,
+        preps: &RankedClosedWindowPreps,
+        base_word: usize,
+        ring_word: usize,
+        words: usize,
+    ) {
+        unsafe {
             let wc = WidenConsts::new();
             let static01_direct = ranked_static01_direct_enabled();
             for off in (0..words).step_by(STEP_WORDS) {
@@ -1996,10 +2442,6 @@ impl Drain8<'_> {
                 let rw = ring_word + off;
                 let blk = abs_word / STEP_WORDS;
                 match blk {
-                    // Windows 0/1 straight from the transposed ring rows. The
-                    // staging in the arms below exists only to be reloaded by
-                    // `publish_static`: windows 2..29 read the ring directly
-                    // and window 30 re-stages every staging word it reads.
                     0 | 1 if static01_direct => {
                         let a_rows = tr8x16_zmm(self.ast, rw);
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
@@ -2438,8 +2880,9 @@ unsafe fn dump_elide_win(
 /// last octa, before releasing a/b to another thread (same-thread reads are
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide(
-    prepared: PreparedInputs,
+#[inline(always)]
+unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>(
+    prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
@@ -2449,8 +2892,15 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
     ranked_preps: Option<&RankedClosedWindowPreps>,
 ) {
     unsafe {
-        let cv_v = prepared.cv;
-        let m = prepared.message;
+        #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+        let ranked_static = RANKED_CLOSED || ranked_static;
+        let ranked_fast = RANKED_CLOSED
+            && ranked_static
+            && proj.w30_elided
+            && ranked_static01_direct_enabled()
+            && ranked_b_constwin_enabled();
+        let cv_v = &prepared.cv;
+        let m = &prepared.message;
         let tlo = prepared.counter_lo;
         let thi = prepared.counter_hi;
         let blen = prepared.block_len;
@@ -2490,6 +2940,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
             proj,
             elide,
             ranked_static,
+            ranked_fast,
             ranked_preps,
         };
         let maxv = dup_u32(u32::MAX);
@@ -2526,15 +2977,16 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
         // epoch boundary — publish it here instead. Constant-folded away for
         // every ring long enough to reach the round stream.
         if RING_WORDS <= PROLOGUE_WORDS + 16 {
-            drain.drain_range(16, 16, RING_WORDS - 16);
+            drain.drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
         }
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::<false>::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false, RANKED_CLOSED>::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb = W8::<true>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
+        let mut wb =
+            W8::<true, RANKED_CLOSED>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -2629,7 +3081,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
                 store_v8(bs.add(i) as *mut u32, zero);
             }
         }
-        drain.drain_range(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain.drain_range_gen::<RANKED_CLOSED>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
@@ -2646,11 +3098,25 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide(
                 store_v8(bs.add(8 + w) as *mut u32, maxv);
             }
         }
-        drain.drain_range(0, 0, 16);
+        drain.drain_range_gen::<RANKED_CLOSED>(0, 0, 16);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "avx512dq",
+        target_feature = "gfni"
+    ),
+    target_feature(
+        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+    )
+)]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: OctaInputs<'_>,
     z: *mut u32,
@@ -2745,8 +3211,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
-        build_octa_witness_ab_stream_prepared_elide(
-            prepared,
+        build_octa_witness_ab_stream_prepared_elide::<false>(
+            &prepared,
             z,
             a,
             b,
@@ -2759,6 +3225,20 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "avx512dq",
+        target_feature = "gfni"
+    ),
+    target_feature(
+        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+    )
+)]
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     init: u64,
     base: usize,
@@ -2771,20 +3251,21 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
 ) {
     unsafe {
         debug_assert_eq!(elide, [true; 3]);
-        debug_assert!(proj.one_rows_elided);
-        debug_assert_eq!(proj.out_bias, 2 * 64);
-        debug_assert!(proj.plan.offsets_eligible(2));
+        debug_assert_eq!(proj.one_rows_elided, proj.plan.offsets_eligible(2));
+        debug_assert_eq!(proj.out_bias, if proj.one_rows_elided { 2 * 64 } else { 0 });
         debug_assert!(ranked_direct_dense_publish_enabled());
         debug_assert!(ranked_direct_dense_inline_enabled());
         debug_assert!(widen_maddubs_enabled());
-        build_octa_witness_ab_stream_prepared_elide(
-            prepare_closed_inputs(init, base),
+        let ranked_static = proj.plan.offsets_eligible(2);
+        let prepared = prepare_closed_inputs(init, base);
+        build_octa_witness_ab_stream_prepared_elide::<true>(
+            &prepared,
             z,
             a,
             b,
             proj,
             elide,
-            true,
+            ranked_static,
             Some(preps),
         );
     }
@@ -3524,6 +4005,134 @@ mod tests {
                 _mm256_storeu_si256(a.as_mut_ptr().cast(), rows[i]);
                 _mm256_storeu_si256(b.as_mut_ptr().cast(), back[i]);
                 assert_eq!(a, b, "tr8² row {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_closed_matches_generic_octa() {
+        #[repr(C, align(64))]
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct AlignedWords([u32; 8 * U32_PER_BLOCK]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbCompact([u8; 8 * 29 * 64]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbFull([u8; 8 * 32 * 64]);
+        #[repr(C, align(64))]
+        struct AlignedStage([u32; STREAM_STAGE_WORDS]);
+
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let dummy_ab = Box::new(AlignedAbCompact([0u8; 8 * 29 * 64]));
+        let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+            &inv_table,
+            &dummy_ab.0,
+            true,
+        );
+        let preps = prepare_ranked_closed_window_preps(&inv_table, win_plan);
+        let crate::seed_pipe::BlockSource::Closed { init, .. } =
+            crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
+        else {
+            unreachable!()
+        };
+        let compact = win_plan.offsets_eligible(2);
+        let out_stride = if compact { 29 * 64 } else { 32 * 64 };
+        let out_bias = if compact { 2 * 64 } else { 0 };
+        let mut stage_ref = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+        let mut stage_new = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+
+        // First seed reference z/a/b with full writes (elide = [false; 3])
+        let mut z_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut a_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut b_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut ab_seed = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+        unsafe {
+            build_octa_witness_ab_stream_elide(
+                OctaInputs::Closed { init, base: 0 },
+                z_seed.0.as_mut_ptr(),
+                a_seed.0.as_mut_ptr(),
+                b_seed.0.as_mut_ptr(),
+                StreamProj {
+                    stage: stage_ref.0.as_mut_ptr(),
+                    out: ab_seed.0.as_mut_ptr(),
+                    out_stride: 32 * 64,
+                    out_bias: 0,
+                    inv_table: &inv_table,
+                    plan: win_plan,
+                    one_rows_elided: false,
+                    w30_elided: false,
+                },
+                [false; 3],
+            );
+        }
+
+        for base in [0usize, 8, 240, 131_064] {
+
+            let mut z_ref = z_seed.clone();
+            let mut a_ref = a_seed.clone();
+            let mut b_ref = b_seed.clone();
+            let mut ab_ref = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+
+            let mut z_new = z_seed.clone();
+            let mut a_new = a_seed.clone();
+            let mut b_new = b_seed.clone();
+            let mut ab_new = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+
+            unsafe {
+                build_octa_witness_ab_stream_elide(
+                    OctaInputs::Closed { init, base },
+                    z_ref.0.as_mut_ptr(),
+                    a_ref.0.as_mut_ptr(),
+                    b_ref.0.as_mut_ptr(),
+                    StreamProj {
+                        stage: stage_ref.0.as_mut_ptr(),
+                        out: ab_ref.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    [true; 3],
+                );
+                build_octa_witness_ab_stream_ranked_closed(
+                    init,
+                    base,
+                    z_new.0.as_mut_ptr(),
+                    a_new.0.as_mut_ptr(),
+                    b_new.0.as_mut_ptr(),
+                    StreamProj {
+                        stage: stage_new.0.as_mut_ptr(),
+                        out: ab_new.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    &preps,
+                    [true; 3],
+                );
+            }
+            assert_eq!(z_ref, z_new, "z mismatch at base={base}");
+            assert_eq!(a_ref, a_new, "a mismatch at base={base}");
+            assert_eq!(b_ref, b_new, "b mismatch at base={base}");
+            let check_bytes = if compact { 28 * 64 } else { 31 * 64 };
+            for j in 0..8 {
+                let s = j * out_stride;
+                assert_eq!(
+                    &ab_ref.0[s..s + check_bytes],
+                    &ab_new.0[s..s + check_bytes],
+                    "ab mismatch at base={base} lane={j}"
+                );
             }
         }
     }
