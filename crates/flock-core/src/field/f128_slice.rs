@@ -171,6 +171,35 @@ pub(crate) fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     }
 }
 
+/// Write one scaled field slice directly into another: `dst[i] = scale * src[i]`.
+///
+/// Avoids zero-filling `dst` and reading those zeros back before XORing.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
+    assert_eq!(dst.len(), src.len(), "scaled slice length changed");
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees one readable source per destination slot.
+    unsafe {
+        x86_64::scale_slice(dst, src, scale);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for (value, &extra) in dst.iter_mut().zip(src) {
+        *value = scale * extra;
+    }
+}
+
 /// Fold adjacent pairs from `src` and `addend` at `r`, add the scaled folded
 /// addend, and write the result without materializing either intermediate:
 /// `dst[t] = fold_r(src)[j] + scale * fold_r(addend)[j]`, where
@@ -330,6 +359,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fold64_banked_nested_matches_two_stage_fold() {
+        use super::*;
+        let mut state = 0x64f0_1d00_CAFE_BABEu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+            let src: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let w: [F128; 16] = core::array::from_fn(|_| F128 {
+                lo: next(),
+                hi: next(),
+            });
+            let r0 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let r1 = F128 {
+                lo: next(),
+                hi: next(),
+            };
+            let mut mid4 = vec![F128::ZERO; 4 * n];
+            let mut want = vec![F128::ZERO; n];
+            let mut got = vec![F128::ZERO; n];
+            fold16_banked(&src, &mut mid4, &w);
+            fold4_nested(&mid4, &mut want, r0, r1);
+            fold64_banked_nested(&src, &mut got, &w, r0, r1);
+            assert_eq!(got, want, "n={n}");
+        }
+    }
+
     /// The PCS open-phase materializers hand these two folds a RECYCLED
     /// destination (`crate::scratch::LocalBuf`), so both must write every
     /// output slot before reading it — the result may not depend on what an
@@ -394,6 +462,25 @@ mod tests {
             fold4_nested(&src4, &mut zeroed, r0, r1);
             fold4_nested(&src4, &mut dirty, r0, r1);
             assert_eq!(dirty, zeroed, "fold4_nested n={n}");
+
+            let src64: Vec<F128> = (0..64 * n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut m4 = vec![F128::ZERO; 4 * n];
+            let mut want64 = vec![F128::ZERO; n];
+            fold16_banked(&src64, &mut m4, &w);
+            fold4_nested(&m4, &mut want64, r0, r1);
+            let mut got64: Vec<F128> = (0..n)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            fold64_banked_nested(&src64, &mut got64, &w, r0, r1);
+            assert_eq!(got64, want64, "fold64_banked_nested n={n}");
         }
     }
 
@@ -745,6 +832,56 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
                 v += w[b] * src[16 * t + b];
             }
             *value = v;
+        }
+    }
+}
+
+/// Sixty-four-bank weighted + nested fold: fuses [`fold16_banked`] and
+/// [`fold4_nested`] without materializing the 4x intermediate slice.
+#[inline]
+pub(crate) fn fold64_banked_nested(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r0: F128,
+    r1: F128,
+) {
+    assert_eq!(
+        src.len(),
+        64 * dst.len(),
+        "fold64 source must contain sixty-four elements for every destination slot"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // bounds check above guarantees all sixty-four source elements per output.
+    unsafe {
+        x86_64::fold64_banked_nested(src, dst, w, r0, r1);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        for (t, value) in dst.iter_mut().enumerate() {
+            let mut m = [F128::ZERO; 4];
+            for (s_idx, m_slot) in m.iter_mut().enumerate() {
+                let base = 64 * t + 16 * s_idx;
+                let mut v = F128::ZERO;
+                for b in 0..16 {
+                    v += w[b] * src[base + b];
+                }
+                *m_slot = v;
+            }
+            let low = m[0] + r0 * (m[0] + m[1]);
+            let high = m[2] + r0 * (m[2] + m[3]);
+            *value = low + r1 * (low + high);
         }
     }
 }
