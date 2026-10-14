@@ -1770,6 +1770,89 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
     unreachable!("residual nt2 offsets form is x86 AVX-512+GFNI only");
 }
 
+impl Round1AbWindowPlan {
+    /// True when the plan is eligible for the direct 8-image B-complement
+    /// fast path (`nt == 2`, `bcomplement_static`, `residual_bcomplement`,
+    /// `table_images == 8`). Checked once per octa so the inner window loops
+    /// need no runtime `table_images` or `residual_bcomplement` dispatch.
+    #[inline(always)]
+    pub const fn is_ranked_img8_bcomplement(&self) -> bool {
+        self.nt == 2
+            && self.bcomplement_static
+            && self.residual_bcomplement
+            && self.table_images == 8
+    }
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_img8<
+    const BLK: usize,
+    const P: bool,
+>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img::<BLK, P, 8>(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static 8-image B-complement is x86 AVX-512+GFNI only");
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual_bcomplement_img8<
+    const KEEP: u8,
+    const P: bool,
+>(
+    off: &[u16; ROUND1_AB_OFF_WORDS],
+    out: &mut [u8; 64],
+    imgs: Round1AbTableImages,
+) {
+    debug_assert_eq!(out.as_ptr() as usize & 63, 0);
+    debug_assert!(KEEP == 0xfc || KEEP == 0x0f);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        kernels::x86_64_bcomplement::shift_reduce_residual_offw_nt2_img::<P, 8, true>(
+            off.as_ptr(),
+            out,
+            (imgs.0, imgs.1),
+            KEEP,
+        );
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("residual nt2 8-image offsets form is x86 AVX-512+GFNI only");
+}
+
 /// Bytes of the leading ab_inner prefix that a challenge-independent witness
 /// producer may SKIP because round 1's GPU URM share is planned to cover
 /// those x_hi windows from the raw a/b buffers (the CPU fold never reads the

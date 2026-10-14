@@ -2815,7 +2815,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     if let (Some(preps), Some(init)) = (ranked_closed_preps.as_ref(), ranked_closed_init)
         && w30_elided
+        && win_plan.is_ranked_img8_bcomplement()
         && blake3_witgen8::ranked_static01_direct_enabled()
+        && blake3_witgen8::ranked_b_constwin_enabled()
     {
         z.par_chunks_mut(group_f128)
             .zip(a.par_chunks_mut(group_f128))
@@ -2838,7 +2840,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             one_rows_elided: true,
                             w30_elided: true,
                         };
-                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed_fast(
                             init,
                             base,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2846,7 +2848,6 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
                             proj,
                             &preps.0,
-                            [true; 3],
                         );
                     }
                 }

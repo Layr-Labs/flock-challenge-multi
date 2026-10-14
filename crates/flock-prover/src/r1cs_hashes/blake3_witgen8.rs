@@ -31,6 +31,11 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_inner_window30_k0, round1_ab_table_images,
 };
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+use flock_core::zerocheck::univariate_skip_optimized::{
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_img8,
+    round1_ab_inner_window_from_offsets_nt2_residual_bcomplement_img8,
+};
 
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
@@ -625,7 +630,7 @@ pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
 /// Cache the rollback once and share it between the outlined and direct-inline
 /// publishers so the default ranked path cannot bypass the const-window leaf.
 #[inline(always)]
-fn ranked_b_constwin_enabled() -> bool {
+pub(crate) fn ranked_b_constwin_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_R1_B_CONSTWIN").as_deref() != Some(std::ffi::OsStr::new("1"))
     });
@@ -685,7 +690,6 @@ unsafe fn stage_ranked_dense_side<const P: bool>(
 unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
-    plan: Round1AbWindowPlan,
     imgs: Round1AbTableImages,
     rows: RankedRows,
     a_ring: *const V8,
@@ -702,217 +706,153 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
         let b_rows = tr8x16_zmm(b_ring, rw);
         widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
 
-        if blk == 2 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj
-                    .out
-                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0xfc,
-                );
-                j += 1;
+        match blk {
+            2 => {
+                let mut j = 0usize;
+                while j != 8 {
+                    rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                    let out = &mut *proj
+                        .out
+                        .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                        .cast::<[u8; 64]>();
+                    round1_ab_inner_window_from_offsets_nt2_residual_bcomplement_img8::<0xfc, P>(
+                        &*off
+                            .add(j * ROUND1_AB_OFF_WORDS)
+                            .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                        out,
+                        imgs,
+                    );
+                    j += 1;
+                }
             }
-            return;
-        }
-        if blk == 29 {
-            let mut j = 0usize;
-            while j != 8 {
-                rows.publish_dense_values(j, a_rows[j], b_rows[j]);
-                let out = &mut *proj
-                    .out
-                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
-                    .cast::<[u8; 64]>();
-                round1_ab_inner_window_from_offsets_nt2_residual::<P>(
-                    &*off
-                        .add(j * ROUND1_AB_OFF_WORDS)
-                        .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
-                    out,
-                    plan,
-                    imgs,
-                    0x0f,
-                );
-                j += 1;
+            3 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<3, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            4 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<4, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            5 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<5, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            6 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<6, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            7 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<7, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            8 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<8, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            9 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<9, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            10 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<10, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            11 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<11, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            12 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<12, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            13 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<13, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            14 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<14, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            15 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<15, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            16 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<16, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            17 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<17, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            18 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<18, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            19 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<19, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            20 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<20, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            21 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<21, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            22 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<22, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            23 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<23, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            24 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<24, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            25 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<25, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            26 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<26, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            27 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<27, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            28 => project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8::<28, P>(
+                proj, imgs, rows, &a_rows, &b_rows, off,
+            ),
+            29 => {
+                let mut j = 0usize;
+                while j != 8 {
+                    rows.publish_dense_values(j, a_rows[j], b_rows[j]);
+                    let out = &mut *proj
+                        .out
+                        .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                        .cast::<[u8; 64]>();
+                    round1_ab_inner_window_from_offsets_nt2_residual_bcomplement_img8::<0x0f, P>(
+                        &*off
+                            .add(j * ROUND1_AB_OFF_WORDS)
+                            .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
+                        out,
+                        imgs,
+                    );
+                    j += 1;
+                }
             }
-            return;
+            _ => core::hint::unreachable_unchecked(),
         }
+    }
+}
 
-        if plan.bcomplement_static_eligible() {
-            match blk {
-                3 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                4 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                5 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                6 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                7 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                8 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                9 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P>(
-                        proj, plan, imgs, rows, &a_rows, &b_rows, off,
-                    );
-                }
-                10 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        10,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                11 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        11,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                12 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        12,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                13 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        13,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                14 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        14,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                15 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        15,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                16 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        16,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                17 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        17,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                18 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        18,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                19 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        19,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                20 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        20,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                21 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        21,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                22 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        22,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                23 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        23,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                24 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        24,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                25 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        25,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                26 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        26,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                27 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        27,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                28 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
-                        28,
-                        P,
-                    >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
-                }
-                _ => {}
-            }
-        }
-
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const_img8<
+    const BLK: usize,
+    const P: bool,
+>(
+    proj: &StreamProj<'_>,
+    imgs: Round1AbTableImages,
+    rows: RankedRows,
+    a_rows: &[__m512i; 8],
+    b_rows: &[__m512i; 8],
+    off: *const u16,
+) {
+    unsafe {
+        debug_assert!((3..=28).contains(&BLK));
         let mut j = 0usize;
         while j != 8 {
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
             let out = &mut *proj
                 .out
-                .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
-            round1_ab_inner_window_from_offsets_nt2::<P>(
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_img8::<BLK, P>(
                 &*off
                     .add(j * ROUND1_AB_OFF_WORDS)
                     .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
                 out,
-                plan,
                 imgs,
             );
             j += 1;
@@ -2406,11 +2346,10 @@ impl Drain8<'_> {
                     self.a.add(abs_word),
                     self.b.add(abs_word),
                 );
-                let (plan, imgs) = *preps.get_unchecked(blk);
+                let (_, imgs) = *preps.get_unchecked(blk);
                 project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
                     proj,
                     blk,
-                    plan,
                     imgs,
                     rows,
                     self.ast,
@@ -2881,7 +2820,10 @@ unsafe fn dump_elide_win(
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>(
+unsafe fn build_octa_witness_ab_stream_prepared_elide<
+    const RANKED_CLOSED: bool,
+    const RANKED_FAST: bool,
+>(
     prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
@@ -2894,11 +2836,13 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
     unsafe {
         #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
         let ranked_static = RANKED_CLOSED || ranked_static;
-        let ranked_fast = RANKED_CLOSED
-            && ranked_static
-            && proj.w30_elided
-            && ranked_static01_direct_enabled()
-            && ranked_b_constwin_enabled();
+        let ranked_fast = RANKED_FAST
+            || (RANKED_CLOSED
+                && ranked_static
+                && proj.w30_elided
+                && proj.plan.is_ranked_img8_bcomplement()
+                && ranked_static01_direct_enabled()
+                && ranked_b_constwin_enabled());
         let cv_v = &prepared.cv;
         let m = &prepared.message;
         let tlo = prepared.counter_lo;
@@ -3211,7 +3155,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
-        build_octa_witness_ab_stream_prepared_elide::<false>(
+        build_octa_witness_ab_stream_prepared_elide::<false, false>(
             &prepared,
             z,
             a,
@@ -3251,14 +3195,15 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
 ) {
     unsafe {
         debug_assert_eq!(elide, [true; 3]);
+        debug_assert!(proj.one_rows_elided);
         debug_assert_eq!(proj.one_rows_elided, proj.plan.offsets_eligible(2));
         debug_assert_eq!(proj.out_bias, if proj.one_rows_elided { 2 * 64 } else { 0 });
         debug_assert!(ranked_direct_dense_publish_enabled());
         debug_assert!(ranked_direct_dense_inline_enabled());
         debug_assert!(widen_maddubs_enabled());
-        let ranked_static = proj.plan.offsets_eligible(2);
+        let ranked_static = proj.one_rows_elided;
         let prepared = prepare_closed_inputs(init, base);
-        build_octa_witness_ab_stream_prepared_elide::<true>(
+        build_octa_witness_ab_stream_prepared_elide::<true, false>(
             &prepared,
             z,
             a,
@@ -3266,6 +3211,55 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
             proj,
             elide,
             ranked_static,
+            Some(preps),
+        );
+    }
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "avx512dq",
+        target_feature = "gfni"
+    ),
+    target_feature(
+        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+    )
+)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed_fast(
+    init: u64,
+    base: usize,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    preps: &RankedClosedWindowPreps,
+) {
+    unsafe {
+        debug_assert!(proj.one_rows_elided);
+        debug_assert!(proj.w30_elided);
+        debug_assert!(proj.plan.is_ranked_img8_bcomplement());
+        debug_assert_eq!(proj.out_bias, 2 * 64);
+        debug_assert!(ranked_direct_dense_publish_enabled());
+        debug_assert!(ranked_direct_dense_inline_enabled());
+        debug_assert!(widen_maddubs_enabled());
+        debug_assert!(ranked_static01_direct_enabled());
+        debug_assert!(ranked_b_constwin_enabled());
+        let prepared = prepare_closed_inputs(init, base);
+        build_octa_witness_ab_stream_prepared_elide::<true, true>(
+            &prepared,
+            z,
+            a,
+            b,
+            proj,
+            [true; 3],
+            true,
             Some(preps),
         );
     }
