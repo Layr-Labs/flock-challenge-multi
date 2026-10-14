@@ -1811,6 +1811,20 @@ impl AdditiveNttF128 {
             && msg.len() / num_ntts >= 4
             && !rate_seed_disabled()
         {
+            if log_inv_rate >= 4
+                && log_d >= 10
+                && !ntt_deep_seed_fuse_disabled()
+                && self.try_seed_deep_fused_from_msg(
+                    msg,
+                    codeword,
+                    num_ntts,
+                    log_inv_rate,
+                    log_d,
+                    on_range_done,
+                )
+            {
+                return;
+            }
             self.seed_layers_pair_from_msg(msg, codeword, num_ntts, log_inv_rate);
             // Layers `log_inv_rate` and `log_inv_rate+1` are done; the deep
             // pass starts at `max(n_top, start_layer)` so a start layer past
@@ -2037,7 +2051,10 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ))]
-        let use_nt = dst % 16 == 0 && num_ntts.is_multiple_of(4) && seed_nt_enabled();
+        let use_nt = dst % 16 == 0
+            && num_ntts.is_multiple_of(4)
+            && seed_nt_enabled()
+            && (codeword.len() > (1usize << 19) || seed_nt_all_enabled());
         let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2156,6 +2173,271 @@ impl AdditiveNttF128 {
             )))]
             (0..quarter).into_par_iter().for_each(seed_row);
         }
+    }
+
+    /// Fused seed + deep NTT + Merkle leaf callback for recursive Ligerito
+    /// commits where `k = log_inv_rate >= n_top` (`L3`: `log_d = 14, k = 4`;
+    /// `L4`: `log_d = 12, k = 5`; `L5`: `log_d = 10, k = 6`).
+    ///
+    /// When `k >= n_top`, every `n_top`-subgroup `sub_idx in 0..2^n_top` owns
+    /// `blocks_per_sub = 2^(k - n_top)` whole layer-`k` seed blocks and zero
+    /// whole-buffer top layers remain (`start_layer = k + 2 > n_top`). Fusing
+    /// the seed of each subgroup's blocks directly into the subgroup task:
+    /// - eliminates the separate `seed_layers_pair_from_msg` pass and its
+    ///   non-temporal `MOVNTDQ` + `_mm_sfence()` DRAM write-out + read-back,
+    /// - parallelizes `L4` (`quarter = 32`) and `L5` (`quarter = 4`) seeding
+    ///   across all `2^n_top = 16` subgroup tasks instead of running serially
+    ///   below `PARALLEL_ROW_THRESHOLD = 256`,
+    /// - raises `L5` (`log_d = 10, num_ntts = 8`, `1,024` leaves) from the
+    ///   single-threaded scalar NTT + single-threaded BLAKE3 fallback (`n_top = 0`)
+    ///   to `n_top = 4` (`16` parallel subgroups of `64` positions = `8 KiB` =
+    ///   one 64-leaf `BLAKE3_BATCH` per worker), keeping each worker's
+    ///   `8..128 KiB` subgroup in L1D/L2 cache from seed through deep
+    ///   butterflies through BLAKE3 leaf hashing.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn try_seed_deep_fused_from_msg(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+        k: usize,
+        log_d: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) -> bool {
+        use rayon::prelude::*;
+
+        // Target one subgroup per Rayon worker (up to 16 subgroups = n_top 4),
+        // keeping each subgroup >= 64 positions (one 64-leaf BLAKE3 batch).
+        let want_subs_log = log2_pow2(rayon::current_num_threads().next_power_of_two()).min(4);
+        let max_n_top = log_d.saturating_sub(6);
+        let n_top = Self::interleaved_n_top(log_d, num_ntts).max(want_subs_log.min(max_n_top));
+        if n_top == 0 || k < n_top || log_d < 8 || k + 2 > log_d {
+            return false;
+        }
+
+        let blocks = 1usize << k;
+        debug_assert_eq!(blocks, codeword.len() / msg.len());
+        let blocks_per_sub = 1usize << (k - n_top);
+        let msg_len = msg.len();
+        let msg_positions = msg_len / num_ntts;
+        if msg_positions < 4 || !msg_positions.is_power_of_two() {
+            return false;
+        }
+        let quarter = msg_positions >> 2;
+        let sub_size_positions = 1usize << (log_d - n_top);
+        let sub_bytes = sub_size_positions * num_ntts;
+        debug_assert_eq!(sub_bytes, blocks_per_sub * msg_len);
+
+        let twiddles: Vec<[F128; 3]> = (0..blocks)
+            .map(|block| {
+                [
+                    self.twiddle(k, block),
+                    self.twiddle(k + 1, 2 * block),
+                    self.twiddle(k + 1, 2 * block + 1),
+                ]
+            })
+            .collect();
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        let fused4_ok = cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ));
+        let deep_fused4_ok = fused4_ok || cfg!(test);
+        let start_layer = k + 2;
+        let src_addr = msg.as_ptr() as usize;
+        let twiddles = &twiddles;
+
+        codeword
+            .par_chunks_mut(sub_bytes)
+            .enumerate()
+            .for_each(|(sub_idx, sub_data)| {
+                let b_base = sub_idx * blocks_per_sub;
+                let dst_ptr = sub_data.as_mut_ptr();
+                let src_ptr = src_addr as *const F128;
+                // Seed layers `k` and `k+1` into `sub_data` using temporal
+                // stores so `sub_data` stays hot in L1D/L2 for the deep layers.
+                // Iterate `r` on the outside so the 4 source rows of `msg` stay
+                // in L1D across all `blocks_per_sub` blocks of this subgroup.
+                unsafe {
+                    for r in 0..quarter {
+                        for local_b in 0..blocks_per_sub {
+                            let b = b_base + local_b;
+                            let out_ptr = dst_ptr.add(local_b * msg_len);
+                            if b == 0 {
+                                kernels::butterfly_fused_2layer_row_from_sparse(
+                                    src_ptr,
+                                    out_ptr,
+                                    quarter,
+                                    num_ntts,
+                                    r,
+                                    twiddles[0][2],
+                                );
+                            } else {
+                                kernels::butterfly_fused_2layer_row_from(
+                                    src_ptr,
+                                    out_ptr,
+                                    quarter,
+                                    num_ntts,
+                                    r,
+                                    &twiddles[b],
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Run remaining deep layers `k + 2 .. log_d` cache-resident on `sub_data`.
+                if deep_fused4_ok {
+                    let mut layer = start_layer;
+                    while layer < log_d {
+                        let layer_in_sub = layer - n_top;
+                        let num_blocks_in_sub = 1usize << layer_in_sub;
+                        let block_size = 1usize << (log_d - layer);
+                        let block_bytes = block_size * num_ntts;
+
+                        if layer + 3 < log_d {
+                            let sixteenth = block_size >> 4;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                                tw[0] = self.twiddle(layer, global_block);
+                                for s in 0..2 {
+                                    tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                }
+                                for s in 0..4 {
+                                    tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                }
+                                for s in 0..8 {
+                                    tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+                                }
+                                let block_start = block_in_sub * block_bytes;
+                                butterfly_interleaved_fused_4layer_rows(
+                                    &mut sub_data[block_start..block_start + block_bytes],
+                                    &tw,
+                                    sixteenth,
+                                    num_ntts,
+                                    if sixteenth.is_multiple_of(2) {
+                                        odd_tail
+                                    } else {
+                                        0
+                                    },
+                                    0,
+                                );
+                            }
+                            layer += 4;
+                        } else if layer + 3 == log_d && !ntt_fused3_disabled() {
+                            debug_assert_eq!(block_size, 8);
+                            #[cfg(test)]
+                            FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let dense_lanes = num_ntts - odd_tail;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                                tw[0] = self.twiddle(layer, global_block);
+                                for s in 0..2 {
+                                    tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                                }
+                                for s in 0..4 {
+                                    tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                                }
+                                let block_start = block_in_sub * block_bytes;
+                                let block = &mut sub_data[block_start..block_start + block_bytes];
+                                debug_assert_eq!(block.len(), 8 * num_ntts);
+                                unsafe {
+                                    kernels::butterfly_fused_3layer_rows(
+                                        block.as_mut_ptr(),
+                                        num_ntts,
+                                        dense_lanes,
+                                        &tw,
+                                    );
+                                }
+                            }
+                            layer += 3;
+                        } else if layer + 1 < log_d {
+                            let quarter_blk = block_size >> 2;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let t_outer = self.twiddle(layer, global_block);
+                                let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                                let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                                let block_start = block_in_sub * block_bytes;
+                                butterfly_interleaved_fused_2layer_par_rows(
+                                    &mut sub_data[block_start..block_start + block_bytes],
+                                    t_outer,
+                                    t_inner_a,
+                                    t_inner_b,
+                                    quarter_blk,
+                                    num_ntts,
+                                    if quarter_blk.is_multiple_of(2) {
+                                        odd_tail
+                                    } else {
+                                        0
+                                    },
+                                );
+                            }
+                            layer += 2;
+                        } else {
+                            let block_size_half = block_size >> 1;
+                            for block_in_sub in 0..num_blocks_in_sub {
+                                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                                let twiddle = self.twiddle(layer, global_block);
+                                let block_start = block_in_sub * block_bytes;
+                                let block = &mut sub_data[block_start..block_start + block_bytes];
+                                butterfly_interleaved_block(
+                                    block,
+                                    twiddle,
+                                    block_size_half,
+                                    num_ntts,
+                                    if block_size_half.is_multiple_of(2) {
+                                        odd_tail
+                                    } else {
+                                        0
+                                    },
+                                );
+                            }
+                            layer += 1;
+                        }
+                    }
+                } else {
+                    for layer in start_layer..log_d {
+                        let layer_in_sub = layer - n_top;
+                        let num_blocks_in_sub = 1usize << layer_in_sub;
+                        let block_size = 1usize << (log_d - layer);
+                        let block_size_half = block_size >> 1;
+                        let block_bytes = block_size * num_ntts;
+
+                        for block_in_sub in 0..num_blocks_in_sub {
+                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                            let twiddle = self.twiddle(layer, global_block);
+                            let block_start = block_in_sub * block_bytes;
+                            let block = &mut sub_data[block_start..block_start + block_bytes];
+                            butterfly_interleaved_block(
+                                block,
+                                twiddle,
+                                block_size_half,
+                                num_ntts,
+                                if block_size_half.is_multiple_of(2) {
+                                    odd_tail
+                                } else {
+                                    0
+                                },
+                            );
+                        }
+                    }
+                }
+
+                let lo = sub_idx * sub_size_positions;
+                on_range_done(lo..lo + sub_size_positions, sub_data);
+            });
+        true
     }
 
     /// One cache-blocked DRAM pass applying six consecutive top layers
@@ -4698,6 +4980,35 @@ fn seed_nt_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_SEED_NT_ALL=1` forces non-temporal `MOVNTDQ` stores in
+/// [`AdditiveNttF128::seed_layers_pair_from_msg`] even for `<= 8 MiB`
+/// codewords (`L2` at `m=32`) that fit in L2/L3 cache and have zero whole-buffer
+/// top layers before the deep subgroup pass.
+#[allow(dead_code)]
+fn seed_nt_all_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SEED_NT_ALL").is_some());
+    *ON
+}
+
+#[cfg(test)]
+static DEEP_SEED_FUSE_TEST_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_NTT_DEEP_SEED_FUSE=1` restores the separate
+/// [`AdditiveNttF128::seed_layers_pair_from_msg`] pass for `log_inv_rate >= 4`
+/// (`L3`, `L4`, `L5` recursive commits).
+#[allow(dead_code)]
+fn ntt_deep_seed_fuse_disabled() -> bool {
+    #[cfg(test)]
+    if DEEP_SEED_FUSE_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_DEEP_SEED_FUSE").is_some());
+    *OFF
+}
+
 /// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
 /// the zero-padded transform's initial copy-only layers.
 fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
@@ -7088,6 +7399,60 @@ mod low_twiddle_invariant {
                     assert_eq!(t.hi, 0, "dim={dim} layer={layer} block={block} t={t:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn deep_seed_fuse_recursive_commits_match_incumbent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Test L2 (log_d=16, k=3), L3 (log_d=14, k=4), L4 (log_d=12, k=5), L5 (log_d=10, k=6)
+        for &(log_d, k) in &[(16usize, 3usize), (14, 4), (12, 5), (10, 6)] {
+            let num_ntts = 8usize;
+            let n_positions = 1usize << log_d;
+            let msg_positions = 1usize << (log_d - k);
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            let mut st = 0x1234_5678_9ABC_DEF0u64 ^ ((log_d as u64) << 32) ^ (k as u64);
+            let mut next = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                st
+            };
+            let msg: Vec<F128> = (0..msg_positions * num_ntts)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+
+            let mut cw_fused = vec![F128::ZERO; n_positions * num_ntts];
+            let mut cw_incumbent = vec![F128::ZERO; n_positions * num_ntts];
+            let covered_fused = AtomicUsize::new(0);
+            let covered_incumbent = AtomicUsize::new(0);
+
+            DEEP_SEED_FUSE_TEST_OFF.store(false, Ordering::SeqCst);
+            ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw_fused, num_ntts, &|r, slice| {
+                assert_eq!(slice.len(), r.len() * num_ntts);
+                covered_fused.fetch_add(r.len(), Ordering::Relaxed);
+            });
+
+            DEEP_SEED_FUSE_TEST_OFF.store(true, Ordering::SeqCst);
+            ntt.rs_encode_interleaved_on_range_done(
+                &msg,
+                &mut cw_incumbent,
+                num_ntts,
+                &|r, slice| {
+                    assert_eq!(slice.len(), r.len() * num_ntts);
+                    covered_incumbent.fetch_add(r.len(), Ordering::Relaxed);
+                },
+            );
+            DEEP_SEED_FUSE_TEST_OFF.store(false, Ordering::SeqCst);
+
+            assert_eq!(covered_fused.load(Ordering::SeqCst), n_positions);
+            assert_eq!(covered_incumbent.load(Ordering::SeqCst), n_positions);
+            assert_eq!(
+                cw_fused, cw_incumbent,
+                "mismatch at log_d={log_d}, k={k}"
+            );
         }
     }
 }
