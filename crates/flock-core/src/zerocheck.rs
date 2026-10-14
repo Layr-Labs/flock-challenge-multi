@@ -27,7 +27,7 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
+    eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
     fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
@@ -747,15 +747,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `ĉ(z, r_rest)` directly (the eq-weighted sum collapses to the MLE
     // evaluation because ĉ is linear). This is **the c-claim** — at point
     // `(z, r_rest)`, *not* `(z, ρ-values)`. ~64 F128 muls + Lagrange weights.
-    let final_c_eval = interpolate_at_z_on_lambda(&round1_c, k_skip, z);
-
-    // ---- 6. Round 2: fused fold + first multilinear message ----
-    //
-    // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
-    // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
-    // verifier samples ρ_1 after observing this message.
     let t_round2 = std::time::Instant::now();
-    let fold_table = UniSkipFoldTable::new(k_skip, z);
+    let (final_c_eval, fold_table) =
+        crate::zerocheck::multilinear::interpolate_lambda_and_fold_table(&round1_c, k_skip, z);
     crate::gaptime::mark("zc: fold_table built");
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);

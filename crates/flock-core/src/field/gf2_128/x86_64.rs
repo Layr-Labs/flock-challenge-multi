@@ -38,6 +38,7 @@ unsafe fn lane1(v: __m128i) -> u64 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute. `b_lo` is the multiplier's low limb; its high limb must be 0.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     // SAFETY: function carries the required target features.
@@ -53,6 +54,7 @@ pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -83,6 +85,7 @@ pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -119,6 +122,7 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 /// # Safety
 /// The caller must run on a CPU with the `pclmulqdq` and `sse4.1` target
 /// features required by this function.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -155,6 +159,7 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -183,6 +188,7 @@ pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the required target features.
@@ -229,6 +235,7 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
 /// attribute.
+#[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     // SAFETY: function carries the required target features.
@@ -573,9 +580,9 @@ unsafe fn xor4_lanes(v: __m512i) -> __m128i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[derive(Clone, Copy)]
 pub struct WideGhashX4 {
-    lo: __m512i,
-    hi: __m512i,
-    mid: __m512i,
+    pub(crate) lo: __m512i,
+    pub(crate) hi: __m512i,
+    pub(crate) mid: __m512i,
 }
 
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -595,12 +602,39 @@ impl WideGhashX4 {
         }
     }
 
+    /// XOR two 4-lane unreduced accumulators limb-wise.
+    ///
+    /// # Safety
+    /// `avx512f` available (cfg-gated).
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn xor(self, other: Self) -> Self {
+        Self {
+            lo: _mm512_xor_si512(self.lo, other.lo),
+            hi: _mm512_xor_si512(self.hi, other.hi),
+            mid: _mm512_xor_si512(self.mid, other.mid),
+        }
+    }
+
     /// XOR-accumulate the 4 unreduced products `x[i]·y[i]` into self.
     ///
     /// # Safety
     /// `avx512f` + `vpclmulqdq` available (cfg-gated).
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn from_mul(x: __m512i, y: __m512i) -> Self {
+        Self {
+            lo: _mm512_clmulepi64_epi128::<0x00>(x, y),
+            hi: _mm512_clmulepi64_epi128::<0x11>(x, y),
+            mid: _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x01>(x, y),
+                _mm512_clmulepi64_epi128::<0x10>(x, y),
+            ),
+        }
+    }
+
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
         // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
@@ -660,6 +694,49 @@ impl WideGhashX4 {
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
         self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
+    }
+
+    /// Horizontally fold each of four `WideGhashX4` accumulators `(a0, a1, a2, a3)`
+    /// across its four 128-bit lanes and reduce all four resulting unreduced
+    /// sums simultaneously in a single 4-lane ZMM [`ghash_reduce_acc_x4`] call.
+    ///
+    /// Lane `k` of the returned `__m512i` equals `a_k.fold().reduce()`.
+    ///
+    /// # Safety
+    /// `avx512f` + `vpclmulqdq` available (cfg-gated + attr).
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn fold4_and_reduce(
+        a0: Self,
+        a1: Self,
+        a2: Self,
+        a3: Self,
+    ) -> __m512i {
+        // SAFETY: caller carries avx512f+vpclmulqdq.
+        unsafe {
+            let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+            let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+            let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+            let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+            let hfold4 = |v0: __m512i, v1: __m512i, v2: __m512i, v3: __m512i| -> __m512i {
+                let t0 = _mm512_xor_si512(
+                    _mm512_permutex2var_epi64(v0, s1_lo, v1),
+                    _mm512_permutex2var_epi64(v0, s1_hi, v1),
+                );
+                let t1 = _mm512_xor_si512(
+                    _mm512_permutex2var_epi64(v2, s1_lo, v3),
+                    _mm512_permutex2var_epi64(v2, s1_hi, v3),
+                );
+                _mm512_xor_si512(
+                    _mm512_permutex2var_epi64(t0, s2_lo, t1),
+                    _mm512_permutex2var_epi64(t0, s2_hi, t1),
+                )
+            };
+            let lo = hfold4(a0.lo, a1.lo, a2.lo, a3.lo);
+            let mid = hfold4(a0.mid, a1.mid, a2.mid, a3.mid);
+            let hi = hfold4(a0.hi, a1.hi, a2.hi, a3.hi);
+            ghash_reduce_acc_x4(lo, mid, hi)
+        }
     }
 
     /// Reduce each of the 4 lanes independently (no horizontal fold): the

@@ -4,6 +4,7 @@ use crate::field::F128;
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -34,6 +35,7 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -61,12 +63,43 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
     }
 }
 
+/// Four-lane `dst = scale * src` without reading `dst`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; slices have equal length.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert_eq!(dst.len(), src.len());
+    // SAFETY: caller supplies target features and equal slice lengths.
+    unsafe {
+        let scale_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
+        let scale_x64 = ghash_shift64_x4(scale_x4);
+        let lanes = dst.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let extra = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let scaled = ghash_mul_x4_split(extra, scale_x4, scale_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, scaled);
+            i += 4;
+        }
+        while i < dst.len() {
+            dst[i] = scale * src[i];
+            i += 1;
+        }
+    }
+}
+
 /// Four-lane `dst = fold_r(src) + scale * fold_r(addend)` with all
 /// intermediates kept in zmm and one final store.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; the caller guarantees that both input
 /// slices contain every pair selected by `base` and `dst.len()`.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_pairs_with_scaled_addend(
     src: &[F128],
@@ -148,6 +181,7 @@ fn portable_tail(src: &[F128], base: usize, dst: &mut [F128], r: F128, mut t: us
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `src.len() == 4 * dst.len()`.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -236,6 +270,7 @@ fn fold16_pf_ahead() -> usize {
 ///
 /// # Safety
 /// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 16 * dst.len()`.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
@@ -269,26 +304,38 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                     }
                 }
             }
-            let mut acc = WideGhashX4::zero();
-            for g in 0..4 {
-                // v_s = banks 4g..4g+3 of slot t+s.
-                let base = 16 * t + 4 * g;
+            let base0 = 16 * t;
+            let a0 = _mm512_loadu_si512(src.as_ptr().add(base0) as *const __m512i);
+            let a1 = _mm512_loadu_si512(src.as_ptr().add(base0 + 16) as *const __m512i);
+            let a2 = _mm512_loadu_si512(src.as_ptr().add(base0 + 32) as *const __m512i);
+            let a3 = _mm512_loadu_si512(src.as_ptr().add(base0 + 48) as *const __m512i);
+            let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+            let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+            let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+            let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+            let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+            let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+            let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+            let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+            let mut acc = WideGhashX4::from_mul(u0, wb[0]);
+            acc.mul_acc(u1, wb[1]);
+            acc.mul_acc2(u2, wb[2], u3, wb[3]);
+            for g in 1..4 {
+                let base = base0 + 4 * g;
                 let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
                 let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
                 let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
                 let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
-                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1); // [a0.L0 a1.L0 a0.L1 a1.L1]
-                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1); // [a0.L2 a1.L2 a0.L3 a1.L3]
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
                 let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
                 let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2); // bank 4g+0 over slots 0..4
-                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
-                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
-                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
@@ -304,6 +351,142 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Sixty-four-bank weighted + nested fold: fuses [`fold16_banked`] and
+/// [`fold4_nested`] in registers without materializing the 4x intermediate
+/// buffer (`mid4`).
+///
+/// For each output slot `t`:
+///   `m[s] = Σ_{b<16} w[b] · src[64t + 16s + b]` for `s in 0..4`
+///   `low  = m[0] + r0·(m[0] + m[1])`
+///   `high = m[2] + r0·(m[2] + m[3])`
+///   `dst[t] = low + r1·(low + high)`
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == 64 * dst.len()`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn fold64_banked_nested(
+    src: &[F128],
+    dst: &mut [F128],
+    w: &[F128; 16],
+    r0: F128,
+    r1: F128,
+) {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+    debug_assert_eq!(src.len(), 64 * dst.len());
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let pf_ahead = fold16_pf_ahead();
+        let pf_limit = src.len().saturating_sub(64);
+        let quads = dst.len() & !3;
+        let wb: [__m512i; 16] = core::array::from_fn(|b| {
+            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        });
+        let r0_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r0.hi as i64, r0.lo as i64));
+        let r0_x64 = ghash_shift64_x4(r0_bcast);
+        let r1_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r1.hi as i64, r1.lo as i64));
+        let r1_x64 = ghash_shift64_x4(r1_bcast);
+
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+
+        let fold16_slot = |base_elem: usize| -> __m512i {
+            if pf_ahead != 0 {
+                let ahead = base_elem + pf_ahead;
+                if ahead <= pf_limit {
+                    let p = src.as_ptr().add(ahead).cast::<i8>();
+                    let mut l = 0usize;
+                    while l < 1024 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.add(l));
+                        l += 64;
+                    }
+                }
+            }
+            let a0 = _mm512_loadu_si512(src.as_ptr().add(base_elem) as *const __m512i);
+            let a1 = _mm512_loadu_si512(src.as_ptr().add(base_elem + 16) as *const __m512i);
+            let a2 = _mm512_loadu_si512(src.as_ptr().add(base_elem + 32) as *const __m512i);
+            let a3 = _mm512_loadu_si512(src.as_ptr().add(base_elem + 48) as *const __m512i);
+            let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+            let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+            let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+            let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+            let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+            let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+            let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+            let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+            let mut acc = WideGhashX4::from_mul(u0, wb[0]);
+            acc.mul_acc(u1, wb[1]);
+            acc.mul_acc2(u2, wb[2], u3, wb[3]);
+            for g in 1..4 {
+                let base = base_elem + 4 * g;
+                let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
+                let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
+                let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
+                let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
+                let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
+                let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
+                let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
+                let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
+                let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
+                let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
+                let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
+                let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
+                acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
+            }
+            acc.reduce_lanes()
+        };
+
+        let mut t = 0usize;
+        while t < quads {
+            let v0 = fold16_slot(64 * t);
+            let v1 = fold16_slot(64 * (t + 1));
+            let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
+            let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
+            let mid01 = _mm512_xor_si512(
+                even01,
+                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
+            );
+
+            let v2 = fold16_slot(64 * (t + 2));
+            let v3 = fold16_slot(64 * (t + 3));
+            let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
+            let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
+            let mid23 = _mm512_xor_si512(
+                even23,
+                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
+            );
+
+            let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
+            let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
+            let out = _mm512_xor_si512(
+                low,
+                ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
+            );
+            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
+            t += 4;
+        }
+        while t < dst.len() {
+            let mut m = [F128::ZERO; 4];
+            for (s_idx, m_slot) in m.iter_mut().enumerate() {
+                let base = 64 * t + 16 * s_idx;
+                let mut v = F128::ZERO;
+                for b in 0..16 {
+                    v += w[b] * src[base + b];
+                }
+                *m_slot = v;
+            }
+            let low = m[0] + r0 * (m[0] + m[1]);
+            let high = m[2] + r0 * (m[2] + m[3]);
+            dst[t] = low + r1 * (low + high);
+            t += 1;
+        }
+    }
+}
+
 /// In-place DirectFold8 factor-state bind: adjacent-pair fold of `f` and `b`
 /// with fused `(u0,u2)` accumulate. Same permute body as [`fold_pairs`] and
 /// the same even/odd message layout as `msg_reduce_avx512`.
@@ -313,6 +496,7 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`. `f.len() == b.len()`, multiple of 4.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn fold_two_and_msg_in_place(
     f: &mut Vec<F128>,
@@ -402,6 +586,7 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; `hi.len() >= lo.len()`.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
@@ -440,6 +625,7 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all four slices at least `n` long.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(super) unsafe fn msg_split_half(
     chi: &[F128],
@@ -490,6 +676,7 @@ pub(super) unsafe fn msg_split_half(
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; all eight slices at least `n` long.
+#[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn bind_both_and_msg_split(
