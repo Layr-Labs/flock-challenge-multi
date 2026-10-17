@@ -341,7 +341,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, None, None, challenger,
     );
     (proof, claim)
 }
@@ -362,7 +362,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, None, None, challenger,
     );
     (
         proof,
@@ -407,6 +407,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         true,
         Some(ab_inner),
         None,
+        None,
         challenger,
     );
     (
@@ -434,15 +435,18 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
-        a_packed, b_packed, c_packed, c_identity_z, None, m, padding, ab_inner, challenger,
+        a_packed, b_packed, c_packed, c_identity_z, None, m, padding, ab_inner, None, challenger,
     )
 }
 
+/// `regen`: a per-chunk a/b row source for the packed sweeps (see
+/// [`AbRowSource`]); with it, `a_packed`/`b_packed` may be empty.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots<C: Challenger>(
     a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], c_identity_z: &[F128],
     roots: Option<&crate::lincheck::RootFoldSource>, m: usize, padding: &PaddingSpec,
-    ab_inner: univariate_skip_optimized::Round1AbInner, challenger: &mut C,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    regen: Option<&dyn AbRowSource>, challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
@@ -453,6 +457,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_
         true,
         Some(ab_inner),
         Some((c_identity_z, roots)),
+        regen,
         challenger,
     );
     (
@@ -460,6 +465,14 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
     )
+}
+
+pub use multilinear::AbRowSource;
+
+#[inline]
+fn f128_as_bytes(v: &[F128]) -> &[u8] {
+    // SAFETY: `F128` is plain data; the byte view covers exactly the slice.
+    unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) }
 }
 
 /// `FLOCK_W30_ELIDE_DEBUG=1` prints when round one adds the elided window 30
@@ -480,6 +493,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     c_identity_z: Option<(&[F128], Option<&crate::lincheck::RootFoldSource>)>,
+    regen: Option<&dyn multilinear::AbRowSource>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -490,8 +504,24 @@ fn prove_packed_padded_inner<C: Challenger>(
         k_skip + N_INNER
     );
     let expected_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    // With a row source the dense a/b views may be empty: the two packed
+    // sweeps regenerate their rows per chunk, and any other consumer gets a
+    // one-off dense materialisation (cold fallbacks only).
+    let mut a_packed = a_packed;
+    let mut b_packed = b_packed;
+    let dense_early;
+    if let Some(src) = regen
+        && a_packed.len() != expected_bytes
+        && (precomputed_ab.is_none() || c_identity_z.is_none())
+    {
+        dense_early = multilinear::materialize_ab_from_source(src, expected_bytes / 8);
+        a_packed = f128_as_bytes(&dense_early.0);
+        b_packed = f128_as_bytes(&dense_early.1);
+    }
+    if regen.is_none() || !a_packed.is_empty() {
+        assert_eq!(a_packed.len(), expected_bytes);
+        assert_eq!(b_packed.len(), expected_bytes);
+    }
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -793,6 +823,18 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
+    // The row source feeds only the no-materialize sweep and the packed
+    // rounds-3+4 pass; every other route reads dense a/b.
+    let dense_late;
+    if let Some(src) = regen
+        && !use_nomat
+        && a_packed.len() != expected_bytes
+    {
+        dense_late = multilinear::materialize_ab_from_source(src, expected_bytes / 8);
+        a_packed = f128_as_bytes(&dense_late.0);
+        b_packed = f128_as_bytes(&dense_late.1);
+    }
+    let regen_sweep = regen.filter(|_| use_nomat);
 
     // Round two and the packed rounds-3+4 pass share the same 13 high eq
     // coordinates at the ranked split. Keep round two's small tensors until
@@ -815,6 +857,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             packed_eq.as_ref(),
             r2_canon_rows.as_deref(),
+            regen_sweep,
         );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
@@ -1031,6 +1074,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next,
                 eq_override,
                 lm_out,
+                regen_sweep,
             );
             a_mlv = a4;
             b_mlv = b4;

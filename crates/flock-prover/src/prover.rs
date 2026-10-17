@@ -501,6 +501,8 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
+        false,
         challenger,
     )
 }
@@ -529,6 +531,8 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        None,
+        false,
         challenger,
     )
 }
@@ -546,6 +550,8 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
     ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    regen: Option<&dyn zerocheck::AbRowSource>,
+    ab_skipped: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_inner(
@@ -558,6 +564,8 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        regen,
+        ab_skipped,
         challenger,
     )
 }
@@ -573,6 +581,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    regen: Option<&dyn zerocheck::AbRowSource>,
+    ab_skipped: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -600,6 +610,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        regen,
+        ab_skipped,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -854,6 +866,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
+        false,
         challenger,
     )
 }
@@ -869,8 +883,11 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    regen: Option<&dyn zerocheck::AbRowSource>,
+    ab_skipped: bool,
     challenger: &mut Ch,
 ) -> ProveCore {
+    assert!(!ab_skipped || regen.is_some(), "a/b skipped without a row source");
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         assert_eq!(
             r1cs.layout,
@@ -962,17 +979,27 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         in_zerocheck_phase_pool(r1cs.m, || flock_core::in_pool(|| {
             flock_core::gaptime::mark("zerocheck: pool entered");
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-            let a_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    a_packed_f128.as_ptr() as *const u8,
-                    a_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
+            // Skipped a/b buffers hold no witness: hand zerocheck empty views
+            // so every consumer goes through the row source.
+            let a_packed: &[u8] = if ab_skipped {
+                &[]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        a_packed_f128.as_ptr() as *const u8,
+                        a_packed_f128.len() * core::mem::size_of::<F128>(),
+                    )
+                }
             };
-            let b_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    b_packed_f128.as_ptr() as *const u8,
-                    b_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
+            let b_packed: &[u8] = if ab_skipped {
+                &[]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        b_packed_f128.as_ptr() as *const u8,
+                        b_packed_f128.len() * core::mem::size_of::<F128>(),
+                    )
+                }
             };
             let c_packed: &[u8] = unsafe {
                 std::slice::from_raw_parts(
@@ -985,7 +1012,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             Some(c_identity_z) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
                     a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
-                    challenger,
+                    regen, challenger,
                 )
             }
             None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
@@ -1251,7 +1278,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             Some(c_identity_z) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
                     a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
-                    challenger,
+                    None, challenger,
                 )
             }
             None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(

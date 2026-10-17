@@ -1354,6 +1354,115 @@ fn zc_r2_setup_trim_enabled() -> bool {
     *ON
 }
 
+/// Regenerates packed a/b rows per worker chunk instead of reading them from
+/// DRAM (the ranked BLAKE3 prover recomputes them from the block inputs).
+/// Rows are 8 bytes. `fill_rows` writes rows `row_base..row_base + n_rows` of
+/// each side into tiles that `init_tile` prepared once (constant regions).
+pub trait AbRowSource: Sync {
+    /// `row_base` and `n_rows` of every fill are multiples of this.
+    fn row_granule(&self) -> usize;
+    /// # Safety
+    /// `a`/`b` each hold `n_rows * 8` writable bytes, 16-byte aligned, and
+    /// were initialised by [`Self::init_tile`] with the same `n_rows`.
+    unsafe fn fill_rows(&self, row_base: usize, n_rows: usize, a: *mut u8, b: *mut u8);
+    /// # Safety
+    /// `a`/`b` each hold `n_rows * 8` writable bytes, 16-byte aligned.
+    unsafe fn init_tile(&self, n_rows: usize, a: *mut u8, b: *mut u8);
+}
+
+/// Per-thread a/b tile for [`AbRowSource`] consumers: one 64-byte-aligned
+/// allocation holding both sides, created on first use and kept for the
+/// thread's lifetime (the sweeps' worker threads persist across proves).
+struct AbTile {
+    rows: usize,
+    buf: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+impl AbTile {
+    fn new(rows: usize) -> Self {
+        let layout =
+            std::alloc::Layout::from_size_align(2 * rows * 8, 64).expect("a/b tile layout");
+        // SAFETY: the layout has a non-zero size.
+        let buf = unsafe { std::alloc::alloc(layout) };
+        assert!(!buf.is_null(), "a/b tile allocation failed");
+        Self { rows, buf, layout }
+    }
+
+    fn a(&self) -> *mut u8 {
+        self.buf
+    }
+
+    fn b(&self) -> *mut u8 {
+        self.buf.wrapping_add(self.rows * 8)
+    }
+}
+
+impl Drop for AbTile {
+    fn drop(&mut self) {
+        // SAFETY: `buf` came from `alloc` with this exact layout.
+        unsafe { std::alloc::dealloc(self.buf, self.layout) }
+    }
+}
+
+thread_local! {
+    static AB_TILE: std::cell::RefCell<Option<AbTile>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fill this thread's tile with rows `row_base..row_base + n_rows` from `src`
+/// and return its two sides (64-byte aligned). The pointers stay valid until
+/// the next call on this thread.
+pub(crate) fn ab_tile_fill(
+    src: &dyn AbRowSource,
+    row_base: usize,
+    n_rows: usize,
+) -> (*const u8, *const u8) {
+    debug_assert_eq!(row_base % src.row_granule(), 0);
+    debug_assert_eq!(n_rows % src.row_granule(), 0);
+    AB_TILE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|t| t.rows != n_rows) {
+            let t = AbTile::new(n_rows);
+            // SAFETY: a fresh tile of `n_rows` rows per side.
+            unsafe { src.init_tile(n_rows, t.a(), t.b()) };
+            *slot = Some(t);
+        }
+        let t = slot.as_ref().expect("tile installed above");
+        // SAFETY: the tile's geometry is `n_rows` and it was initialised.
+        unsafe { src.fill_rows(row_base, n_rows, t.a(), t.b()) };
+        (t.a().cast_const(), t.b().cast_const())
+    })
+}
+
+/// Dense a/b buffers from an [`AbRowSource`]: the cold fallback for consumers
+/// that cannot stream from per-chunk tiles. `n_rows * 8` bytes per side.
+pub(crate) fn materialize_ab_from_source(
+    src: &dyn AbRowSource,
+    n_rows: usize,
+) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+    let granule = src.row_granule();
+    let chunk_rows = granule * (8192 / granule).max(1);
+    assert_eq!(n_rows % chunk_rows, 0, "row count must be whole granules");
+    let n_f128 = n_rows * 8 / core::mem::size_of::<F128>();
+    let mut a = crate::scratch::take_f128(n_f128);
+    let mut b = crate::scratch::take_f128(n_f128);
+    let chunk_f128 = chunk_rows * 8 / core::mem::size_of::<F128>();
+    a.par_chunks_mut(chunk_f128)
+        .zip(b.par_chunks_mut(chunk_f128))
+        .enumerate()
+        .for_each(|(i, (ac, bc))| {
+            let ap = ac.as_mut_ptr().cast::<u8>();
+            let bp = bc.as_mut_ptr().cast::<u8>();
+            // SAFETY: each chunk holds `chunk_rows` rows per side.
+            unsafe {
+                src.init_tile(chunk_rows, ap, bp);
+                src.fill_rows(i * chunk_rows, chunk_rows, ap, bp);
+            }
+        });
+    (a, b)
+}
+
 fn packed_split_n_hi(n_vars: usize) -> usize {
     let base = lookahead_n_hi(n_vars);
     #[cfg(test)]
@@ -1763,9 +1872,12 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         padding,
         None,
         None,
+        None,
     )
 }
 
+/// `regen`: regenerate each chunk's packed a/b rows into a per-thread tile
+/// instead of reading `a_packed`/`b_packed` (which may then be empty).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     a_packed: &[u8],
@@ -1777,14 +1889,17 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
     canon: Option<&[F128]>,
+    regen: Option<&dyn AbRowSource>,
 ) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    if regen.is_none() {
+        assert_eq!(a_packed.len(), n_out * n_chunks);
+        assert_eq!(b_packed.len(), n_out * n_chunks);
+    }
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -1803,6 +1918,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
     let (kappa, r1_inv) = lookahead_inv_factors(r1);
     let chunk_size = 2 * lo_size;
+    if let Some(src) = regen {
+        assert_eq!(chunk_size % src.row_granule(), 0, "regen chunks must be whole granules");
+    }
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
     #[cfg(all(
@@ -1947,6 +2065,21 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             let pair_idx_base = x_hi * lo_size;
             let mut none_a: [F128; 0] = [];
             let mut none_b: [F128; 0] = [];
+            #[allow(unused_variables)]
+            let (a_ptr, b_ptr, rb, a_sl, b_sl): (*const u8, *const u8, usize, &[u8], &[u8]) =
+                match regen {
+                    Some(src) => {
+                        let (ta, tb) = ab_tile_fill(src, row_base, chunk_size);
+                        // SAFETY: the thread-local tile holds `chunk_size` rows
+                        // per side and is not refilled until this closure returns.
+                        let a_sl =
+                            unsafe { core::slice::from_raw_parts(ta, chunk_size * n_chunks) };
+                        let b_sl =
+                            unsafe { core::slice::from_raw_parts(tb, chunk_size * n_chunks) };
+                        (ta, tb, 0, a_sl, b_sl)
+                    }
+                    None => (a_packed.as_ptr(), b_packed.as_ptr(), row_base, a_packed, b_packed),
+                };
 
             #[cfg(all(
                 target_arch = "x86_64",
@@ -1961,13 +2094,13 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
                 if fast_r2
                     && (pair_idx_base & 127) == 0
-                    && (row_base & 255) == 0
+                    && (rb & 255) == 0
                     && let Some(bk) = bake_arg
                 {
                     kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
+                        a_ptr,
+                        b_ptr,
+                        rb,
                         lo_size,
                         bk,
                     )
@@ -1975,9 +2108,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
                         table.data.as_ptr(),
                         r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
+                        a_ptr,
+                        b_ptr,
+                        rb,
                         &mut none_a,
                         &mut none_b,
                         eq_lo,
@@ -1991,9 +2124,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
                         table.data.as_ptr(),
                         r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
+                        a_ptr,
+                        b_ptr,
+                        rb,
                         &mut none_a,
                         &mut none_b,
                         eq_lo,
@@ -2009,9 +2142,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
                         table.data.as_ptr(),
                         r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
+                        a_ptr,
+                        b_ptr,
+                        rb,
                         &mut none_a,
                         &mut none_b,
                         eq_lo,
@@ -2025,9 +2158,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
                         table.data.as_ptr(),
                         r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
+                        a_ptr,
+                        b_ptr,
+                        rb,
                         &mut none_a,
                         &mut none_b,
                         eq_lo,
@@ -2045,13 +2178,13 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 target_feature = "vpclmulqdq"
             )))]
             let out = round2_lookahead_chunk_scalar::<false>(
-                a_packed,
-                b_packed,
+                a_sl,
+                b_sl,
                 table,
                 &mut none_a,
                 &mut none_b,
                 eq_lo,
-                row_base,
+                rb,
                 pair_idx_base,
                 pair_in_block_mask,
                 useful_pairs_inclusive,
@@ -2126,7 +2259,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
-        false,
+        false, None,
     )
 }
 
@@ -2149,6 +2282,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
+    regen: Option<&dyn AbRowSource>,
 ) -> (F128, F128, Round3Lookahead) {
     // Composed-fold coefficients: expanding the two pair-fold levels (char 2)
     // gives `out = Σ_k c_k · fold(row 4x+k)` with
@@ -2222,8 +2356,10 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let n_chunks = table.n_chunks;
     let n = 1usize << (m - k_skip);
     assert!(n >= 16);
-    assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    if regen.is_none() {
+        assert_eq!(a_packed.len(), n * n_chunks);
+        assert_eq!(b_packed.len(), n * n_chunks);
+    }
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
     assert_eq!(b_out.len(), quarter);
@@ -2253,6 +2389,9 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     );
     let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_out = 2 * lo_size;
+    if let Some(src) = regen {
+        assert_eq!(4 * chunk_out % src.row_granule(), 0, "regen chunks must be whole granules");
+    }
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
     // functions of the odd eq_lo lanes, hoisted out of the sweep (the
     // companion CLMUL sat on the head of the chain feeding all eight
@@ -2318,6 +2457,20 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         .map(|(x_hi, (a_out, b_out))| {
             // Output x of this chunk ← packed rows 4x..4x+4 (pairs 2x, 2x+1).
             let out_base = x_hi * chunk_out;
+            #[allow(unused_variables)]
+            let (a_ptr, b_ptr, ob, a_sl, b_sl): (*const u8, *const u8, usize, &[u8], &[u8]) =
+                match regen {
+                    Some(src) => {
+                        let rows = 4 * chunk_out;
+                        let (ta, tb) = ab_tile_fill(src, 4 * out_base, rows);
+                        // SAFETY: the thread-local tile holds `rows` rows per
+                        // side and is not refilled until this closure returns.
+                        let a_sl = unsafe { core::slice::from_raw_parts(ta, rows * n_chunks) };
+                        let b_sl = unsafe { core::slice::from_raw_parts(tb, rows * n_chunks) };
+                        (ta, tb, 0, a_sl, b_sl)
+                    }
+                    None => (a_packed.as_ptr(), b_packed.as_ptr(), out_base, a_packed, b_packed),
+                };
 
             #[cfg(all(
                 target_arch = "x86_64",
@@ -2332,27 +2485,27 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 if fast_r34
                     && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg)
                 {
-                    let ap = a_packed.as_ptr();
-                    let bp = b_packed.as_ptr();
+                    let ap = a_ptr;
+                    let bp = b_ptr;
                     match (nt_out, out_lm) {
                         (true, true) => {
                             kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                                ap, bp, ob, a_out, b_out, lo_size, c, wt,
                             )
                         }
                         (true, false) => {
                             kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                                ap, bp, ob, a_out, b_out, lo_size, c, wt,
                             )
                         }
                         (false, true) => {
                             kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                                ap, bp, ob, a_out, b_out, lo_size, c, wt,
                             )
                         }
                         (false, false) => {
                             kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                                ap, bp, ob, a_out, b_out, lo_size, c, wt,
                             )
                         }
                     }
@@ -2360,9 +2513,9 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                         table.data.as_ptr(),
                         r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        out_base,
+                        a_ptr,
+                        b_ptr,
+                        ob,
                         a_out,
                         b_out,
                         rho1,
@@ -2381,9 +2534,9 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                     table.data.as_ptr(),
                     r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    out_base,
+                    a_ptr,
+                    b_ptr,
+                    ob,
                     a_out,
                     b_out,
                     rho1,
@@ -2404,10 +2557,10 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 target_feature = "vpclmulqdq"
             )))]
             let out = fold2_from_packed_lookahead_scalar(
-                a_packed,
-                b_packed,
+                a_sl,
+                b_sl,
                 table,
-                out_base,
+                ob,
                 a_out,
                 b_out,
                 rho1,

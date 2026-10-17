@@ -2260,6 +2260,32 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// [`generate_witness_with_ab_packed_and_round1_inner_from`] with the a/b
+/// skip request (see `..._impl_tuned_opts`).
+pub(crate) fn generate_witness_with_ab_packed_and_round1_inner_from_opts(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    skip_ab: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    bool,
+) {
+    let use_nt = cfg!(target_arch = "aarch64")
+        && super::common::u64_per_block_is_nt_compatible(K / 64)
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+    generate_witness_with_ab_packed_and_round1_inner_impl_tuned_opts(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        live_witgen_simd_enabled(),
+        witgen_simd::witgen_ab_nt_enabled(),
+        skip_ab,
+    )
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -2334,6 +2360,30 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     Vec<F128>,
     Vec<F128>,
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let (z, a, b, ab_inner, _) = generate_witness_with_ab_packed_and_round1_inner_impl_tuned_opts(
+        blocks, n_blocks_log, use_nt, use_simd, ab_nt, false,
+    );
+    (z, a, b, ab_inner)
+}
+
+/// [`generate_witness_with_ab_packed_and_round1_inner_impl_tuned`] with the
+/// a/b skip request; the last element says whether `a`/`b` were written
+/// (when `false` the returned buffers hold only their constant regions and
+/// the caller must regenerate a/b per chunk).
+fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned_opts(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    use_nt: bool,
+    use_simd: bool,
+    ab_nt: bool,
+    skip_ab: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    bool,
 ) {
     use rayon::prelude::*;
 
@@ -2455,7 +2505,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         // z-only behaviour on the fused arm (exact same-binary A/B).
         let elide_on = witgen_simd::const_elide_enabled();
         let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
-        generate_round1_inner_octa(
+        let ab_written = generate_round1_inner_octa(
             blocks,
             skip_blocks,
             &mut z,
@@ -2466,6 +2516,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            skip_ab,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -2486,10 +2537,10 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             z.as_ptr(),
             witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
         );
-        return (z, a, b, ab_inner);
+        return (z, a, b, ab_inner, ab_written);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
+    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok, skip_ab);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let _ = (ab_nt, a_tok, b_tok, z_tok);
 
@@ -2622,7 +2673,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         z.as_ptr(),
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
-    (z, a, b, ab_inner)
+    (z, a, b, ab_inner, true)
 }
 
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
@@ -2674,6 +2725,10 @@ unsafe impl Sync for SharedRankedClosedWindowPreps {}
 /// sees the same bytes either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
+/// Returns whether `a`/`b` were written. `skip_ab` asks the ranked closed
+/// fast route to publish z only (zerocheck regenerates a/b per chunk); every
+/// other route ignores it and returns `true`.
+#[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa(
     blocks: crate::seed_pipe::BlockSource<'_>,
     skip_blocks: usize,
@@ -2685,7 +2740,8 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
-) {
+    skip_ab: bool,
+) -> bool {
     generate_round1_inner_octa_with_ranked_closed_dispatch(
         blocks,
         skip_blocks,
@@ -2698,6 +2754,7 @@ fn generate_round1_inner_octa(
         elide,
         ab_nt,
         RankedClosedDispatch::Auto,
+        skip_ab,
     )
 }
 
@@ -2715,7 +2772,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     elide: [bool; 3],
     ab_nt: bool,
     ranked_closed_dispatch: RankedClosedDispatch,
-) {
+    skip_ab: bool,
+) -> bool {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
@@ -2817,6 +2875,45 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         && w30_elided
         && blake3_witgen8::ranked_static01_direct_enabled()
     {
+        if skip_ab && blake3_witgen8::ranked_b_constwin_enabled() {
+            // z-only publish: zerocheck regenerates a/b per chunk, so the
+            // two 512 MiB streams are never written (their pool buffers keep
+            // the constant regions from the prove that last wrote them).
+            z.par_chunks_mut(group_f128)
+                .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+                .enumerate()
+                .for_each(|(g, (z_out, ab_out))| {
+                    let n_here = z_out.len() / F128_PER_BLOCK;
+                    unsafe {
+                        for half in 0..(n_here / SIMD) {
+                            let base = GROUP * g + half * SIMD;
+                            let off = half * SIMD * F128_PER_BLOCK;
+                            let proj = blake3_witgen8::StreamProj {
+                                stage: core::ptr::null_mut(),
+                                out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                                out_stride: ab_block_bytes,
+                                out_bias: 2 * 64,
+                                inv_table,
+                                plan: win_plan,
+                                one_rows_elided: true,
+                                w30_elided: true,
+                            };
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed::<false>(
+                                init,
+                                base,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                core::ptr::null_mut(),
+                                core::ptr::null_mut(),
+                                proj,
+                                &preps.0,
+                                [true; 3],
+                            );
+                        }
+                    }
+                    flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                });
+            return false;
+        }
         z.par_chunks_mut(group_f128)
             .zip(a.par_chunks_mut(group_f128))
             .zip(b.par_chunks_mut(group_f128))
@@ -2838,7 +2935,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             one_rows_elided: true,
                             w30_elided: true,
                         };
-                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed::<true>(
                             init,
                             base,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2852,8 +2949,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 }
                 flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
             });
-        return;
+        return true;
     }
+    #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
+    let _ = skip_ab;
     z.par_chunks_mut(group_f128)
         .zip(a.par_chunks_mut(group_f128))
         .zip(b.par_chunks_mut(group_f128))
@@ -2930,7 +3029,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             }
                         }).unwrap_unchecked();
                         if let Some(preps) = ranked_closed_preps.as_ref() {
-                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed::<true>(
                                 ranked_closed_init.unwrap_unchecked(),
                                 base,
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -3046,6 +3145,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 }
             },
         );
+    true
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -3061,6 +3161,56 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
 /// Parallelism granularity: 8 compressions per task; each task writes its 8
 /// commit chunks then bit-transposes the just-written z u64s into its
 /// lincheck stripe while they are still hot in L1.
+/// `FLOCK_NO_ZC_AB_REGEN=1` restores the dense a/b buffers for zerocheck's
+/// round-2 and rounds-3+4 sweeps. Default ON: at the ranked shape the sweeps
+/// regenerate each 32-block chunk's a/b rows from the block inputs.
+fn zc_ab_regen_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_REGEN").is_none());
+    *ON
+}
+
+/// Zerocheck a/b row source for the BLAKE3 circuit: recomputes the packed
+/// a/b rows of whole blocks from the compression inputs with the 8-wide
+/// witness kernel, writing only into the caller's tile (no z, no round-1
+/// projection). See [`blake3_witgen8::fill_ab_tile_closed`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct Blake3AbRows<'a> {
+    blocks: crate::seed_pipe::BlockSource<'a>,
+    inv_table: &'static flock_core::ntt::InvNttTableByteSingleGf8,
+    plan: flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl flock_core::zerocheck::AbRowSource for Blake3AbRows<'_> {
+    fn row_granule(&self) -> usize {
+        8 * (K / 64)
+    }
+
+    unsafe fn fill_rows(&self, row_base: usize, n_rows: usize, a: *mut u8, b: *mut u8) {
+        const ROWS_PER_BLOCK: usize = K / 64;
+        debug_assert_eq!(row_base % ROWS_PER_BLOCK, 0);
+        debug_assert_eq!(n_rows % (8 * ROWS_PER_BLOCK), 0);
+        // SAFETY: the caller's tile holds `n_rows` 8-byte rows per side.
+        unsafe {
+            blake3_witgen8::fill_ab_tile_closed(
+                &self.blocks,
+                row_base / ROWS_PER_BLOCK,
+                n_rows / ROWS_PER_BLOCK,
+                a.cast::<u32>(),
+                b.cast::<u32>(),
+                self.inv_table,
+                self.plan,
+            )
+        }
+    }
+
+    unsafe fn init_tile(&self, n_rows: usize, a: *mut u8, b: *mut u8) {
+        // SAFETY: as above.
+        unsafe { blake3_witgen8::init_ab_tile(a.cast::<u32>(), b.cast::<u32>(), n_rows / (K / 64)) }
+    }
+}
+
 pub(crate) mod witgen_simd {
     use super::{
         ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, N_G,
@@ -4447,21 +4597,57 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
-                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
+                // Ranked a/b regeneration: zerocheck's two packed sweeps
+                // rebuild each chunk's a/b rows from the block inputs in an
+                // L2 tile instead of streaming the 1 GiB buffers from DRAM,
+                // and the witness generator then skips writing them.
+                let regen_on = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+                    && zc_ab_regen_enabled()
+                    && self.n_blocks == 1 << 18;
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner, ab_written)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner_from(
+                            generate_witness_with_ab_packed_and_round1_inner_from_opts(
                                 blocks,
                                 self.n_blocks_log(),
+                                regen_on,
                             )
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
                     });
                 flock_core::gaptime::mark("witness: pool exited");
+                assert!(ab_written || regen_on, "a/b skipped without a row source");
+                if std::env::var_os("FLOCK_AB_REGEN_DEBUG").is_some() {
+                    eprintln!(
+                        "[ab-regen] regen_on={regen_on} ab_written={ab_written} source={}",
+                        match blocks {
+                            crate::seed_pipe::BlockSource::Closed { .. } => "closed",
+                            crate::seed_pipe::BlockSource::Slice(_) => "slice",
+                        }
+                    );
+                }
                 let lc_circuit = self.lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                let regen_src = regen_on.then(|| {
+                    let inv_table = flock_core::zerocheck::shared_urm_inv_table();
+                    Blake3AbRows {
+                        blocks,
+                        inv_table,
+                        plan: flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                            inv_table,
+                            &[],
+                            false,
+                        ),
+                    }
+                });
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                let regen: Option<&dyn flock_core::zerocheck::AbRowSource> =
+                    regen_src.as_ref().map(|s| s as &dyn flock_core::zerocheck::AbRowSource);
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                let regen: Option<&dyn flock_core::zerocheck::AbRowSource> = None;
                 crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
                     &self.r1cs,
                     &self.pcs_params,
@@ -4471,6 +4657,8 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    regen,
+                    !ab_written,
                     challenger,
                 )
             }
@@ -5401,6 +5589,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    false,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
@@ -5612,6 +5801,7 @@ mod tests {
                 elide,
                 true,
                 dispatch,
+                false,
             );
             (z, a, b, ab_inner)
         };

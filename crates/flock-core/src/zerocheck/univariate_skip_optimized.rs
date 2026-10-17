@@ -720,6 +720,10 @@ impl Round1AbInner {
         if n == 0 {
             return;
         }
+        assert!(
+            !a_packed.is_empty() && !b_packed.is_empty(),
+            "invalid-prefix fill needs dense a/b"
+        );
         use rayon::prelude::*;
         const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
         assert_eq!(n % OUTER_BYTES, 0);
@@ -4174,8 +4178,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
-    assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    // Empty views are allowed when the caller regenerates a/b per chunk
+    // downstream; round one reads them only for the invalid-prefix fill.
+    assert!(a_packed.is_empty() || a_packed.len() == total_bytes);
+    assert!(b_packed.is_empty() || b_packed.len() == total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
