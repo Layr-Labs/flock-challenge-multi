@@ -8224,6 +8224,87 @@ fn materialize_direct_fold8_f_for_precommit(
         });
 }
 
+/// DIAGNOSTIC lever: fold8 f-materialization and the two-claim GFNI b-side
+/// (plus its M6 partial) in ONE block pass, so the b-side compute runs while
+/// other threads stream the 512 MiB witness from DRAM. Same outputs as
+/// `materialize_direct_fold8_f_for_precommit` followed by
+/// `materialize_direct_fold8_b_gfni_for_precommit`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+fn materialize_direct_fold8_fb_fused_for_precommit(
+    packed_witness: &[F128],
+    folded_f: &mut [F128],
+    folded_b: &mut [F128],
+    block_len: usize,
+    fold16_weight: &[F128; 16],
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+) -> SumcheckMessage {
+    use rayon::prelude::*;
+
+    assert_eq!(claims.len(), 2);
+    assert!(block_len.is_multiple_of(64));
+    assert_eq!(folded_b.len(), folded_f.len());
+    let (r4, r5) = (challenges[4], challenges[5]);
+    let direct_gfni_mats = [
+        super::ring_switch::build_gfni_direct_fold_map_from_generators(
+            &direct_fold8_final_generators(&claims[0], r5),
+        ),
+        super::ring_switch::build_gfni_direct_fold_map_from_generators(
+            &direct_fold8_final_generators(&claims[1], r5),
+        ),
+    ];
+    let direct_gfni_rows = [
+        split_eq_lo_halves_avx512(&claims[0].eq_lo),
+        split_eq_lo_halves_avx512(&claims[1].eq_lo),
+    ];
+
+    const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
+    let stats = folded_f
+        .par_chunks_mut(block_len)
+        .zip(folded_b.par_chunks_mut(block_len))
+        .enumerate()
+        .map_init(
+            || {
+                crate::scratch::LocalBuf::new(
+                    64usize.max(ALIGN64_MIN_F128),
+                    crate::scratch::fold_buf_pool_enabled(),
+                )
+            },
+            |gfni_tmp, (block, (f_out, b_out))| {
+                let start = 64 * block * block_len;
+                let f_in = &packed_witness[start..start + 64 * block_len];
+                crate::field::f128_slice::fold64_banked_nested(f_in, f_out, fold16_weight, r4, r5);
+                unsafe {
+                    materialize_direct_fold8_b_gfni_block_x86(
+                        &direct_gfni_mats,
+                        &direct_gfni_rows,
+                        claims[0].eq_hi[block],
+                        claims[1].eq_hi[block],
+                        block_len,
+                        b_out,
+                        f_out,
+                        gfni_tmp,
+                    )
+                }
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+    SumcheckMessage {
+        u_0: stats.0,
+        u_2: stats.1,
+    }
+}
+
 /// Materialize the exact ranked two-claim GFNI basis and M6 after folded_f is
 /// complete. This is deliberately separate from the incumbent fused loop so
 /// the precommit arm can lend folded_f immutably to both Rayon branches while
@@ -8445,6 +8526,33 @@ fn materialize_direct_fold8(
                 (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
             );
             let mut folded_f = crate::scratch::take_f128(out_len);
+            if crate::gaptime::lever_hoist_on() {
+                let mut folded_b = crate::scratch::take_f128(out_len);
+                let msg = materialize_direct_fold8_fb_fused_for_precommit(
+                    &packed_witness,
+                    &mut folded_f,
+                    &mut folded_b,
+                    block_len,
+                    &fold16_weight,
+                    claims,
+                    challenges,
+                );
+                crate::gaptime::mark("lig: f8 materialized");
+                crate::scratch::give_f128(packed_witness);
+                crate::scratch::give_f128(ordinary_basis);
+                let ntt =
+                    AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
+                let precommitted = ligero_commit(
+                    &folded_f,
+                    precommit.log_msg_cols,
+                    precommit.log_num_interleaved,
+                    precommit.log_inv_rate,
+                    &ntt,
+                    precommit.kind,
+                );
+                crate::gaptime::mark("lig: L1 join done");
+                return (folded_f, folded_b, msg, Some(precommitted));
+            }
             materialize_direct_fold8_f_for_precommit(
                 &packed_witness,
                 &mut folded_f,
@@ -8455,6 +8563,7 @@ fn materialize_direct_fold8(
             );
             // Preserve incumbent buffer custody: acquire both folded outputs
             // before returning the much larger input to the shared pool.
+            crate::gaptime::mark("lig: f8 materialized");
             let folded_b = crate::scratch::take_f128(out_len);
             crate::scratch::give_f128(packed_witness);
             crate::scratch::give_f128(ordinary_basis);
@@ -8478,6 +8587,7 @@ fn materialize_direct_fold8(
                     )
                 },
             );
+            crate::gaptime::mark("lig: L1 join done");
             return (folded_f, folded_b, msg, Some(precommitted));
         }
     }
@@ -10149,6 +10259,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
+        crate::gaptime::mark("lig: init round");
     }
     if trace {
         t_init_sumcheck += _t.elapsed();
@@ -10181,6 +10292,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // Transcript order is unchanged: M6 was observed inside the initial loop;
     // only now is the already-computed root appended to Fiat-Shamir.
     challenger.observe_bytes(&wtns_1.root());
+    crate::gaptime::mark("lig: L1 root observed");
 
     let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
         config,
@@ -10226,6 +10338,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             t_ood += _t.elapsed();
         }
     }
+    crate::gaptime::mark("lig: L1 ood");
 
     // Query-phase PoW grinding for L0: each ground bit substitutes for
     // ~1/log₂(1/(1−γ)) queries at this level (the Slim profile grinds 16
@@ -10234,6 +10347,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // separately by the fold-challenge grinds above.)
     let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
+    crate::gaptime::mark("lig: L0 grind");
 
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
@@ -10253,6 +10367,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
+    crate::gaptime::mark("lig: L0 opens");
     // The proof's copy of the opened rows is the SAME data the induce below
     // reads. The incumbent cloned all 218 rows (218 allocations, 223 KiB) here,
     // on one core, purely to keep `opened_rows_0` alive for the induce; moving
@@ -10325,6 +10440,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         ));
     }
 
+    crate::gaptime::mark("lig: L0 induce");
     let initial_proof = initial_proof.take().unwrap_or_else(|| RecursiveProof {
         opened_rows: opened_rows_0,
         merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
@@ -10369,6 +10485,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_intro_glue += _t.elapsed();
     }
+    crate::gaptime::mark("lig: L0 intro+glue");
 
     // Recursive levels — same as recursive_prover_inner from here.
     let mut wtns_prev = wtns_1;
@@ -10459,6 +10576,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_sumcheck_folds += _t.elapsed();
         }
+        crate::gaptime::mark("lig: lvl folds");
 
         if i == r - 1 {
             let yr = sc_prover.f().to_vec();
@@ -10468,6 +10586,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // PoW grinding for the last level before sampling its queries.
             let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
             grinding_nonces.push(nonce_last);
+            crate::gaptime::mark("lig: last grind");
             let num_queries_last = config.queries[i + 1];
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
@@ -10476,6 +10595,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            crate::gaptime::mark("lig: last opens");
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -10560,6 +10680,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let root_next = wtns_next.root();
         challenger.observe_bytes(&root_next);
         recursive_roots.push(root_next);
+        crate::gaptime::mark("lig: lvl commit");
 
         let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
             config,
@@ -10603,10 +10724,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 t_ood += _t.elapsed();
             }
         }
+        crate::gaptime::mark("lig: lvl ood");
 
         // PoW grinding for this iteration's query phase.
         let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         grinding_nonces.push(nonce_i);
+        crate::gaptime::mark("lig: lvl grind");
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
@@ -10615,6 +10738,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        crate::gaptime::mark("lig: lvl opens");
         if trace {
             t_opens += _t.elapsed();
         }
@@ -10712,6 +10836,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             ));
         }
 
+        crate::gaptime::mark("lig: lvl induce");
         if let Some(mp) = merkle_proof_i.take() {
             recursive_proofs.push(RecursiveProof {
                 opened_rows: opened_rows_i,
@@ -10755,6 +10880,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_intro_glue += _t.elapsed();
         }
+        crate::gaptime::mark("lig: lvl intro+glue");
 
         wtns_prev = wtns_next;
     }

@@ -1083,6 +1083,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_1);
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
+        crate::gaptime::mark("zc: cascade level");
     }
     let loop_start = 2 * n_levels;
 
@@ -1127,6 +1128,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+        crate::gaptime::mark("zc: tail round");
     }
     // Last ML ρ is in. RowMajor `x_outer = mlv[k_log − k_skip ..]` is
     // complete here (not URM `r`). Kick today's one-shot leftover z-fold
