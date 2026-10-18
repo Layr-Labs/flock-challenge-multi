@@ -8453,6 +8453,21 @@ fn materialize_direct_fold8(
                 r4,
                 r5,
             );
+            // DIAGNOSTIC BUILD: re-run the f-side fold8 materialization twice
+            // into a pooled scratch buffer and discard it (pure function of
+            // its inputs; the real `folded_f` above is what the prove uses).
+            for _ in 0..2 {
+                let mut dup = crate::scratch::take_f128(out_len);
+                materialize_direct_fold8_f_for_precommit(
+                    &packed_witness,
+                    &mut dup,
+                    block_len,
+                    &fold16_weight,
+                    r4,
+                    r5,
+                );
+                crate::scratch::give_f128(dup);
+            }
             // Preserve incumbent buffer custody: acquire both folded outputs
             // before returning the much larger input to the shared pool.
             let folded_b = crate::scratch::take_f128(out_len);
