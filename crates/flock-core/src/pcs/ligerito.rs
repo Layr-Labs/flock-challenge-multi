@@ -8459,6 +8459,34 @@ fn materialize_direct_fold8(
             crate::scratch::give_f128(packed_witness);
             crate::scratch::give_f128(ordinary_basis);
 
+            // DIAGNOSTIC BUILD: run the L1 precommit join (ligero_commit of
+            // folded_f ‖ GFNI b-side materialization) twice more and discard
+            // both results; the real join below is what the prove uses.
+            for _ in 0..2 {
+                let fb = crate::scratch::take_f128(out_len);
+                let (w_dup, (fb_dup, _msg_dup)) = rayon::join(
+                    || {
+                        let ntt = AdditiveNttF128::standard(
+                            precommit.log_msg_cols + precommit.log_inv_rate,
+                        );
+                        ligero_commit(
+                            &folded_f,
+                            precommit.log_msg_cols,
+                            precommit.log_num_interleaved,
+                            precommit.log_inv_rate,
+                            &ntt,
+                            precommit.kind,
+                        )
+                    },
+                    || {
+                        materialize_direct_fold8_b_gfni_for_precommit(
+                            &folded_f, fb, claims, challenges, block_len,
+                        )
+                    },
+                );
+                crate::scratch::give_f128(fb_dup);
+                drop(w_dup);
+            }
             let (precommitted, (folded_b, msg)) = rayon::join(
                 || {
                     let ntt =
