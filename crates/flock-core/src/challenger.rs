@@ -57,6 +57,13 @@ pub trait Challenger: Send {
     /// Produce one F128 challenge.
     fn sample_f128(&mut self) -> F128;
 
+    /// Diagnostic only: an independent copy of a Fiat-Shamir transcript so a
+    /// phase can be re-run against a throwaway transcript without touching
+    /// this one. `None` for every challenger that is not `FsChallenger`.
+    fn fork_fs_for_diagnostic(&self) -> Option<FsChallenger> {
+        None
+    }
+
     /// Produce `n` F128 challenges, in order.
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         (0..n).map(|_| self.sample_f128()).collect()
@@ -321,6 +328,9 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
+    fn fork_fs_for_diagnostic(&self) -> Option<FsChallenger> {
+        Some(self.clone())
+    }
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb(&[OP_LABEL]);
         self.absorb(&(label.len() as u64).to_le_bytes());

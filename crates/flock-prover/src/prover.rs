@@ -647,6 +647,32 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         None
     };
     let claims_arr = [ab, c];
+    // DIAGNOSTIC BUILD: run the PCS open `OPEN_DIAG_EXTRA` extra times on a
+    // forked transcript and a pooled stand-in for `z_packed` (same length,
+    // stale contents; the open's running time is data-oblivious) and discard
+    // the results. The real open below is untouched, so the proof is
+    // byte-identical; the score delta against the frontier measures the
+    // open phase's wall time on the runner.
+    const OPEN_DIAG_EXTRA: usize = 2;
+    if OPEN_DIAG_EXTRA > 0 {
+        if let Some(mut ch2) = challenger.fork_fs_for_diagnostic() {
+            for _ in 0..OPEN_DIAG_EXTRA {
+                let z_dup = flock_core::scratch::take_f128(z_packed.len());
+                let claims_dup = claims_arr.clone();
+                let _discard = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
+                    z_dup,
+                    &prover_data,
+                    &commitment,
+                    &claims_dup,
+                    &[pre_ab, pre_c],
+                    &padding,
+                    &lig_config,
+                    &mut ch2,
+                ));
+                flock_core::gaptime::mark("open: DIAGNOSTIC extra open done");
+            }
+        }
+    }
     let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
