@@ -10299,6 +10299,22 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             &queries_0,
             &alpha_0,
         );
+        // DIAGNOSTIC BUILD: build the L0 sparse dual twice more from the same
+        // inputs and discard the results (pure function of its inputs).
+        for _ in 0..2 {
+            let (dual_dup, _sum_dup) = SparseDualL0::new(
+                depth,
+                n1 + log_inv_rate_0,
+                log_inv_rate_0,
+                l0_codeword,
+                l0_num_interleaved,
+                &opened_rows_0,
+                &r_lane_fold,
+                &queries_0,
+                &alpha_0,
+            );
+            drop(dual_dup);
+        }
         (None, Some(dual), enforced_sum)
     } else {
         let (basis, enforced_sum) = induce_sumcheck_poly_auto(
