@@ -625,7 +625,7 @@ pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
 /// Cache the rollback once and share it between the outlined and direct-inline
 /// publishers so the default ranked path cannot bypass the const-window leaf.
 #[inline(always)]
-fn ranked_b_constwin_enabled() -> bool {
+pub(crate) fn ranked_b_constwin_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_R1_B_CONSTWIN").as_deref() != Some(std::ffi::OsStr::new("1"))
     });
@@ -682,12 +682,12 @@ unsafe fn stage_ranked_dense_side<const P: bool>(
 /// boundary or a by-value `[__m512i; 8]` return.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
-unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
+unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool, const AB: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
     plan: Round1AbWindowPlan,
     imgs: Round1AbTableImages,
-    rows: RankedRows,
+    rows: RankedRows<AB>,
     a_ring: *const V8,
     b_ring: *const V8,
     rw: usize,
@@ -748,37 +748,37 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
         if plan.bcomplement_static_eligible() {
             match blk {
                 3 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 4 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 5 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 6 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 7 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 8 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 9 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P, AB>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
@@ -786,114 +786,133 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         10,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 11 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         11,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 12 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         12,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 13 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         13,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 14 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         14,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 15 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         15,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 16 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         16,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 17 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         17,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 18 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         18,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 19 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         19,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 20 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         20,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 21 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         21,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 22 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         22,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 23 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         23,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 24 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         24,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 25 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         25,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 26 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         26,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 27 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         27,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 28 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         28,
                         P,
+                        AB,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 _ => {}
@@ -987,37 +1006,37 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
         if plan.bcomplement_static_eligible() && ranked_b_constwin_enabled() {
             match blk {
                 3 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<3, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 4 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<4, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 5 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<5, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 6 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<6, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 7 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<7, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 8 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<8, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
                 9 => {
-                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P>(
+                    return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<9, P, true>(
                         proj, plan, imgs, rows, &a_rows, &b_rows, off,
                     );
                 }
@@ -1025,114 +1044,133 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         10,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 11 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         11,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 12 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         12,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 13 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         13,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 14 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         14,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 15 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         15,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 16 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         16,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 17 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         17,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 18 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         18,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 19 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         19,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 20 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         20,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 21 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         21,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 22 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         22,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 23 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         23,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 24 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         24,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 25 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         25,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 26 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         26,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 27 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         27,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 28 => {
                     return project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const::<
                         28,
                         P,
+                        true,
                     >(proj, plan, imgs, rows, &a_rows, &b_rows, off);
                 }
                 _ => {}
@@ -1179,11 +1217,12 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
 unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
     const BLK: usize,
     const P: bool,
+    const AB: bool,
 >(
     proj: &StreamProj<'_>,
     plan: Round1AbWindowPlan,
     imgs: Round1AbTableImages,
-    rows: RankedRows,
+    rows: RankedRows<AB>,
     a_rows: &[__m512i; 8],
     b_rows: &[__m512i; 8],
     off: *const u16,
@@ -1652,14 +1691,22 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false> {
+struct W8<
+    't,
+    const FLUSH: bool,
+    const RANKED_CLOSED: bool = false,
+    const TILE: bool = false,
+    const AB: bool = true,
+> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
 }
 
-impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOSED> {
+impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const TILE: bool, const AB: bool>
+    W8<'t, FLUSH, RANKED_CLOSED, TILE, AB>
+{
     #[inline(always)]
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
@@ -1692,9 +1739,9 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOS
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
                 if WORD + 1 == RING_WORDS {
-                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED, TILE, AB>(16, 16, RING_WORDS - 16);
                 } else {
-                    (*self.drain).drain_range_gen::<RANKED_CLOSED>(
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED, TILE, AB>(
                         WORD + 1 - RING_WORDS,
                         0,
                         RING_WORDS,
@@ -2078,13 +2125,15 @@ impl StepRows {
 /// store needs to carry the generic publisher's flags, width policy, or
 /// runtime alignment recovery.
 #[derive(Clone, Copy)]
-struct RankedRows {
+struct RankedRows<const AB: bool = true> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
 }
 
-impl RankedRows {
+/// `AB = false`: publish z only (a/b are regenerated per chunk by zerocheck,
+/// see `fill_ab_tile_closed`); the a/b pointers are then never dereferenced.
+impl<const AB: bool> RankedRows<AB> {
     #[inline(always)]
     fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
         #[cfg(target_feature = "avx512f")]
@@ -2108,8 +2157,12 @@ impl RankedRows {
                 let av = _mm512_load_si512(ap.cast::<__m512i>());
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
-                stream_ranked_line(self.a.add(o), av);
-                stream_ranked_line(self.b.add(o), bv);
+                if AB {
+                    stream_ranked_line(self.a.add(o), av);
+                }
+                if AB {
+                    stream_ranked_line(self.b.add(o), bv);
+                }
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
@@ -2118,8 +2171,12 @@ impl RankedRows {
                 let b_lo = load_v8(bp);
                 let b_hi = load_v8(bp.add(8));
                 stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
-                stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
-                stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                if AB {
+                    stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+                }
+                if AB {
+                    stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                }
             }
         }
     }
@@ -2132,8 +2189,12 @@ impl RankedRows {
         unsafe {
             let o = j * U32_PER_BLOCK;
             stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
-            stream_ranked_line(self.a.add(o), av);
-            stream_ranked_line(self.b.add(o), bv);
+            if AB {
+                stream_ranked_line(self.a.add(o), av);
+            }
+            if AB {
+                stream_ranked_line(self.b.add(o), bv);
+            }
         }
     }
 
@@ -2146,7 +2207,9 @@ impl RankedRows {
         unsafe {
             let o = j * U32_PER_BLOCK;
             stream_ranked_line(self.z.add(o), av);
-            stream_ranked_line(self.a.add(o), av);
+            if AB {
+                stream_ranked_line(self.a.add(o), av);
+            }
         }
     }
 
@@ -2161,14 +2224,18 @@ impl RankedRows {
             {
                 let av = _mm512_load_si512(ap.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), av);
-                stream_ranked_line(self.a.add(o), av);
+                if AB {
+                    stream_ranked_line(self.a.add(o), av);
+                }
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
                 let a_lo = load_v8(ap);
                 let a_hi = load_v8(ap.add(8));
                 stream_pair_v8(self.z.add(o), a_lo, a_hi, true);
-                stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+                if AB {
+                    stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
+                }
             }
         }
     }
@@ -2183,14 +2250,18 @@ impl RankedRows {
             {
                 let av = _mm512_maskz_loadu_epi64(1, p.cast::<i64>());
                 stream_ranked_line(self.z.add(o), av);
-                stream_ranked_line(self.a.add(o), av);
+                if AB {
+                    stream_ranked_line(self.a.add(o), av);
+                }
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
                 let lo = _mm256_set_epi64x(0, 0, 0, core::ptr::read_unaligned(p) as i64);
                 let hi = _mm256_setzero_si256();
                 stream_pair_v8(self.z.add(o), lo, hi, true);
-                stream_pair_v8(self.a.add(o), lo, hi, true);
+                if AB {
+                    stream_pair_v8(self.a.add(o), lo, hi, true);
+                }
             }
         }
     }
@@ -2218,21 +2289,25 @@ pub(crate) fn ranked_static01_direct_enabled() -> bool {
 
 impl Drain8<'_> {
     #[inline(always)]
-    unsafe fn drain_range_gen<const RANKED_CLOSED: bool>(
+    unsafe fn drain_range_gen<const RANKED_CLOSED: bool, const TILE: bool, const AB: bool>(
         &mut self,
         base_word: usize,
         ring_word: usize,
         words: usize,
     ) {
         unsafe {
+            if TILE {
+                self.drain_tile(base_word, ring_word, words);
+                return;
+            }
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             if RANKED_CLOSED {
                 if base_word >= 32 && base_word <= 448 {
                     debug_assert_eq!(ring_word, 0);
                     debug_assert_eq!(words, 32);
-                    self.drain_pair_ranked_closed_exact_fast(base_word);
+                    self.drain_pair_ranked_closed_exact_fast::<AB>(base_word);
                 } else {
-                    self.drain_static_or_sparse_ranked_closed_exact_fast(
+                    self.drain_static_or_sparse_ranked_closed_exact_fast::<AB>(
                         base_word,
                         ring_word,
                         words,
@@ -2240,7 +2315,63 @@ impl Drain8<'_> {
                 }
                 return;
             }
+            debug_assert!(AB, "z-only publish is the ranked closed fast route only");
             self.drain_range(base_word, ring_word, words);
+        }
+    }
+
+    /// a/b-only drain into an L2 tile (see [`fill_ab_tile_closed`]): no z,
+    /// no round-1 projection, temporal stores. Only content-dependent words
+    /// are written; the tile's constant regions come from [`init_ab_tile`].
+    #[inline(never)]
+    unsafe fn drain_tile(&self, base_word: usize, ring_word: usize, words: usize) {
+        unsafe {
+            if base_word == RANKED_STATIC_B_TAIL_START {
+                // Window 30: A words 480/481 are the only live tail words
+                // (17 pending bits in 481); B's tail is static in the tile.
+                debug_assert_eq!(ring_word, 0);
+                let x0 = load_v8(self.ast.cast::<u32>());
+                let x1 = load_v8(self.ast.add(1).cast::<u32>());
+                let l = _mm256_unpacklo_epi32(x0, x1);
+                let h = _mm256_unpackhi_epi32(x0, x1);
+                let mut q = [0u64; 8];
+                store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
+                store_v8(
+                    q.as_mut_ptr().cast::<u32>().add(8),
+                    _mm256_permute2x128_si256::<0x31>(l, h),
+                );
+                for j in 0..8 {
+                    self.a
+                        .add(j * U32_PER_BLOCK + base_word)
+                        .cast::<u64>()
+                        .write(q[j]);
+                }
+                return;
+            }
+            // B words 0..31 are static ones; the rings hold B only from 32.
+            let b_live = base_word >= RANKED_STATIC_B_PREFIX_END;
+            let mut off = 0;
+            while off < words {
+                let rw = ring_word + off;
+                let w = base_word + off;
+                let a_lo = tr8_chunk(self.ast, rw);
+                let a_hi = tr8_chunk(self.ast, rw + 8);
+                for j in 0..8 {
+                    let p = self.a.add(j * U32_PER_BLOCK + w);
+                    store_v8(p, a_lo[j]);
+                    store_v8(p.add(8), a_hi[j]);
+                }
+                if b_live {
+                    let b_lo = tr8_chunk(self.bs, rw);
+                    let b_hi = tr8_chunk(self.bs, rw + 8);
+                    for j in 0..8 {
+                        let p = self.b.add(j * U32_PER_BLOCK + w);
+                        store_v8(p, b_lo[j]);
+                        store_v8(p.add(8), b_hi[j]);
+                    }
+                }
+                off += STEP_WORDS;
+            }
         }
     }
 
@@ -2276,13 +2407,13 @@ impl Drain8<'_> {
             debug_assert!(self.ranked_static);
             debug_assert!(proj.one_rows_elided);
             if base_word >= 32 && base_word <= 448 && ring_word == 0 && words == 32 {
-                return self.drain_pair_ranked_closed_exact_fast(base_word);
+                return self.drain_pair_ranked_closed_exact_fast::<true>(base_word);
             }
             if (base_word == 16 && ring_word == 16 && words == 16)
                 || (base_word == 480 && ring_word == 0 && words == 32)
                 || (base_word == 0 && ring_word == 0 && words == 16)
             {
-                return self.drain_static_or_sparse_ranked_closed_exact_fast(
+                return self.drain_static_or_sparse_ranked_closed_exact_fast::<true>(
                     base_word,
                     ring_word,
                     words,
@@ -2313,7 +2444,7 @@ impl Drain8<'_> {
     )]
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn drain_static_or_sparse_ranked_closed_exact_fast(
+    unsafe fn drain_static_or_sparse_ranked_closed_exact_fast<const AB: bool>(
         &self,
         base_word: usize,
         ring_word: usize,
@@ -2321,6 +2452,7 @@ impl Drain8<'_> {
     ) {
         unsafe {
             if !self.ranked_fast {
+                debug_assert!(AB, "z-only publish requires the ranked fast drains");
                 let preps = self.ranked_preps.unwrap_unchecked();
                 return self.drain_range_spread_ranked_closed_exact_fallback(
                     &self.proj,
@@ -2338,7 +2470,11 @@ impl Drain8<'_> {
                 let mut q = [0u64; 8];
                 store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
                 store_v8(q.as_mut_ptr().cast::<u32>().add(8), _mm256_permute2x128_si256::<0x31>(l, h));
-                let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480));
+                let rows = RankedRows::<AB>::new(
+                    self.z.add(480),
+                    self.a.wrapping_add(480),
+                    self.b.wrapping_add(480),
+                );
                 let qp = q.as_ptr();
                 let mut j = 0usize;
                 while j != 8 {
@@ -2348,10 +2484,10 @@ impl Drain8<'_> {
             } else {
                 debug_assert!(base_word == 0 || base_word == 16);
                 let a_rows = tr8x16_zmm(self.ast, base_word);
-                let rows = RankedRows::new(
+                let rows = RankedRows::<AB>::new(
                     self.z.add(base_word),
-                    self.a.add(base_word),
-                    self.b.add(base_word),
+                    self.a.wrapping_add(base_word),
+                    self.b.wrapping_add(base_word),
                 );
                 let mut j = 0usize;
                 while j != 8 {
@@ -2377,13 +2513,14 @@ impl Drain8<'_> {
     )]
     #[rustfmt::skip]
     #[inline(never)]
-    unsafe fn drain_pair_ranked_closed_exact_fast(&self, base_word: usize) {
+    unsafe fn drain_pair_ranked_closed_exact_fast<const AB: bool>(&self, base_word: usize) {
         unsafe {
             debug_assert!(base_word >= 32 && base_word <= 448);
             debug_assert!(base_word.is_multiple_of(32));
             let proj = &self.proj;
             let preps = self.ranked_preps.unwrap_unchecked();
             if !self.ranked_fast {
+                debug_assert!(AB, "z-only publish requires the ranked fast drains");
                 return self.drain_range_spread_ranked_closed_exact_fallback(
                     proj,
                     preps,
@@ -2401,13 +2538,13 @@ impl Drain8<'_> {
                 let rw = step * STEP_WORDS;
                 let abs_word = base_word + rw;
                 let blk = abs_word / STEP_WORDS;
-                let rows = RankedRows::new(
+                let rows = RankedRows::<AB>::new(
                     self.z.add(abs_word),
-                    self.a.add(abs_word),
-                    self.b.add(abs_word),
+                    self.a.wrapping_add(abs_word),
+                    self.b.wrapping_add(abs_word),
                 );
                 let (plan, imgs) = *preps.get_unchecked(blk);
-                project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
+                project_blocks_ranked_hot_offsets_direct_inline_fast::<true, AB>(
                     proj,
                     blk,
                     plan,
@@ -2444,7 +2581,7 @@ impl Drain8<'_> {
                 match blk {
                     0 | 1 if static01_direct => {
                         let a_rows = tr8x16_zmm(self.ast, rw);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static_values(j, a_rows[j]);
@@ -2460,7 +2597,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<0>(j, sa);
@@ -2476,7 +2613,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<1>(j, sa);
@@ -2494,7 +2631,7 @@ impl Drain8<'_> {
                         let z = _mm256_setzero_si256();
                         store_v8(sa.add(16), z);
                         store_v8(sa.add(24), z);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let (plan, imgs) = preps[30];
                         proj.project_blocks_ranked_30(plan, imgs, rows);
                     }
@@ -2504,7 +2641,7 @@ impl Drain8<'_> {
                         struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                         let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                         let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         let (plan, imgs) = preps[blk];
                         project_blocks_ranked_hot_offsets_direct_inline::<true>(
                             proj,
@@ -2578,7 +2715,7 @@ impl Drain8<'_> {
                 }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -2645,7 +2782,7 @@ impl Drain8<'_> {
                     // z/a/b.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
                                 if maddubs {
@@ -2691,7 +2828,7 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::<true>::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                         proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                     }
                 } else {
@@ -2881,7 +3018,11 @@ unsafe fn dump_elide_win(
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>(
+unsafe fn build_octa_witness_ab_stream_prepared_elide<
+    const RANKED_CLOSED: bool,
+    const TILE: bool,
+    const AB: bool,
+>(
     prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
@@ -2899,6 +3040,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             && proj.w30_elided
             && ranked_static01_direct_enabled()
             && ranked_b_constwin_enabled();
+        debug_assert!(AB || ranked_fast, "z-only publish is the ranked closed fast route only");
         let cv_v = &prepared.cv;
         let m = &prepared.message;
         let tlo = prepared.counter_lo;
@@ -2977,16 +3119,20 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         // epoch boundary — publish it here instead. Constant-folded away for
         // every ring long enough to reach the round stream.
         if RING_WORDS <= PROLOGUE_WORDS + 16 {
-            drain.drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
+            drain.drain_range_gen::<RANKED_CLOSED, TILE, AB>(16, 16, RING_WORDS - 16);
         }
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::<false, RANKED_CLOSED>::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false, RANKED_CLOSED, TILE, AB>::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb =
-            W8::<true, RANKED_CLOSED>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
+        let mut wb = W8::<true, RANKED_CLOSED, TILE, AB>::at(
+            bs,
+            packer_initial_bit(one),
+            drain_ptr,
+            ranked_static,
+        );
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -3081,7 +3227,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
                 store_v8(bs.add(i) as *mut u32, zero);
             }
         }
-        drain.drain_range_gen::<RANKED_CLOSED>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain.drain_range_gen::<RANKED_CLOSED, TILE, AB>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
@@ -3098,7 +3244,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
                 store_v8(bs.add(8 + w) as *mut u32, maxv);
             }
         }
-        drain.drain_range_gen::<RANKED_CLOSED>(0, 0, 16);
+        drain.drain_range_gen::<RANKED_CLOSED, TILE, AB>(0, 0, 16);
     }
 }
 
@@ -3129,7 +3275,25 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
-        let prepared = match inputs {
+        let prepared = prepare_octa_inputs(inputs);
+        build_octa_witness_ab_stream_prepared_elide::<false, false, true>(
+            &prepared,
+            z,
+            a,
+            b,
+            proj,
+            elide,
+            ranked_static,
+            None,
+        );
+    }
+}
+
+/// Word-major SIMD inputs for one octa, from either input form.
+#[inline(always)]
+unsafe fn prepare_octa_inputs(inputs: OctaInputs<'_>) -> PreparedInputs {
+    unsafe {
+        match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
                     inputs[0].0.as_ptr(),
@@ -3210,17 +3374,97 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 }
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
-        };
-        build_octa_witness_ab_stream_prepared_elide::<false>(
-            &prepared,
-            z,
-            a,
-            b,
-            proj,
-            elide,
-            ranked_static,
-            None,
-        );
+        }
+    }
+}
+
+
+/// Write the content-independent words of an a/b tile of `n_blocks` blocks:
+/// B's all-ones prefix (rows 0..15) and tail (row 240 = 49 live ones, rows
+/// 241..255 zero) and A's zero tail (rows 241..255). Every other word is
+/// written by [`fill_ab_tile_closed`] on each fill.
+///
+/// # Safety
+/// `a`/`b` each own `n_blocks * U32_PER_BLOCK` u32s, 32-byte aligned.
+pub(crate) unsafe fn init_ab_tile(a: *mut u32, b: *mut u32, n_blocks: usize) {
+    unsafe {
+        for j in 0..n_blocks {
+            let ap = a.add(j * U32_PER_BLOCK);
+            let bp = b.add(j * U32_PER_BLOCK);
+            for w in 0..RANKED_STATIC_B_PREFIX_END {
+                bp.add(w).write(u32::MAX);
+            }
+            for w in RANKED_STATIC_B_TAIL_START..U32_PER_BLOCK {
+                ap.add(w).write(0);
+                bp.add(w).write(0);
+            }
+            // Bits 15,360..15,409 (`USEFUL_BITS`) are lin-id rows with B = 1.
+            bp.add(RANKED_STATIC_B_TAIL_START).write(u32::MAX);
+            bp.add(RANKED_STATIC_B_TAIL_START + 1)
+                .write((1u32 << (USEFUL_BITS % 32)) - 1);
+        }
+    }
+}
+
+/// Regenerate the packed a/b rows of `n_blocks` (a multiple of 8) consecutive
+/// blocks `block_base..` into `a`/`b` tiles (block `j` at `j * U32_PER_BLOCK`
+/// words), bit-identical to the witness generator's a/b buffers. The tiles
+/// must have been initialised once by [`init_ab_tile`].
+///
+/// # Safety
+/// Caller must have AVX2; `a`/`b` each own `n_blocks * U32_PER_BLOCK` u32s,
+/// 32-byte aligned; `inv_table`/`plan` are any valid pair (never read).
+pub(crate) unsafe fn fill_ab_tile_closed(
+    inputs: &crate::seed_pipe::BlockSource<'_>,
+    block_base: usize,
+    n_blocks: usize,
+    a: *mut u32,
+    b: *mut u32,
+    inv_table: &InvNttTableByteSingleGf8,
+    plan: Round1AbWindowPlan,
+) {
+    unsafe {
+        debug_assert!(n_blocks.is_multiple_of(8));
+        let mut octa = 0;
+        while octa < n_blocks {
+            let base = block_base + octa;
+            let prepared = match *inputs {
+                crate::seed_pipe::BlockSource::Closed { init, len } if base + 8 <= len => {
+                    prepare_closed_inputs(init, base)
+                }
+                crate::seed_pipe::BlockSource::Slice(s) if base + 8 <= s.len() => {
+                    prepare_octa_inputs(OctaInputs::Blocks(std::array::from_fn(|j| &s[base + j])))
+                }
+                _ => {
+                    // Ragged tail: materialise the padding semantics.
+                    let pad: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+                    let staged: [Compression; 8] =
+                        std::array::from_fn(|j| inputs.with_block(base + j, &pad, |c| *c));
+                    prepare_octa_inputs(OctaInputs::Blocks(std::array::from_fn(|j| &staged[j])))
+                }
+            };
+            let proj = StreamProj {
+                stage: core::ptr::null_mut(),
+                out: core::ptr::null_mut(),
+                out_stride: 0,
+                out_bias: 0,
+                inv_table,
+                plan,
+                one_rows_elided: true,
+                w30_elided: true,
+            };
+            build_octa_witness_ab_stream_prepared_elide::<false, true, true>(
+                &prepared,
+                core::ptr::null_mut(),
+                a.add(octa * U32_PER_BLOCK),
+                b.add(octa * U32_PER_BLOCK),
+                proj,
+                [true; 3],
+                true,
+                None,
+            );
+            octa += 8;
+        }
     }
 }
 
@@ -3239,7 +3483,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
     )
 )]
-pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed<const AB: bool>(
     init: u64,
     base: usize,
     z: *mut u32,
@@ -3258,7 +3502,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(widen_maddubs_enabled());
         let ranked_static = proj.plan.offsets_eligible(2);
         let prepared = prepare_closed_inputs(init, base);
-        build_octa_witness_ab_stream_prepared_elide::<true>(
+        build_octa_witness_ab_stream_prepared_elide::<true, false, AB>(
             &prepared,
             z,
             a,
@@ -3606,12 +3850,12 @@ mod tests {
                     let mut direct_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                     let mut direct_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                     let mut direct_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
-                    let staged = RankedRows::new(
+                    let staged = RankedRows::<true>::new(
                         staged_z.0.as_mut_ptr(),
                         staged_a.0.as_mut_ptr(),
                         staged_b.0.as_mut_ptr(),
                     );
-                    let direct = RankedRows::new(
+                    let direct = RankedRows::<true>::new(
                         direct_z.0.as_mut_ptr(),
                         direct_a.0.as_mut_ptr(),
                         direct_b.0.as_mut_ptr(),
@@ -3826,12 +4070,12 @@ mod tests {
                 let mut direct_z = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                 let mut direct_a = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
                 let mut direct_b = RankedBuf([0u32; 8 * U32_PER_BLOCK]);
-                let staged_rows = RankedRows::new(
+                let staged_rows = RankedRows::<true>::new(
                     staged_z.0.as_mut_ptr(),
                     staged_a.0.as_mut_ptr(),
                     staged_b.0.as_mut_ptr(),
                 );
-                let direct_rows = RankedRows::new(
+                let direct_rows = RankedRows::<true>::new(
                     direct_z.0.as_mut_ptr(),
                     direct_a.0.as_mut_ptr(),
                     direct_b.0.as_mut_ptr(),
@@ -4102,7 +4346,7 @@ mod tests {
                     },
                     [true; 3],
                 );
-                build_octa_witness_ab_stream_ranked_closed(
+                build_octa_witness_ab_stream_ranked_closed::<true>(
                     init,
                     base,
                     z_new.0.as_mut_ptr(),
@@ -4135,6 +4379,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn ab_tile_test_plan() -> (
+        flock_core::ntt::InvNttTableByteSingleGf8,
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan,
+    ) {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+            &inv_table,
+            &[],
+            false,
+        );
+        (inv_table, plan)
+    }
+
+    /// The a/b tile regeneration must reproduce the dense builder's a and b
+    /// blocks byte for byte, constant regions included, for closed-form and
+    /// slice inputs, at several bases, with the tile reused across fills.
+    #[test]
+    fn ab_tile_matches_dense_builder() {
+        #[repr(C, align(64))]
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct AlignedWords([u32; 8 * U32_PER_BLOCK]);
+        #[repr(C, align(64))]
+        struct AlignedTile([u32; 32 * U32_PER_BLOCK]);
+        #[repr(C, align(64))]
+        struct AlignedStage([u32; STREAM_STAGE_WORDS]);
+        #[repr(C, align(64))]
+        struct AlignedAbFull([u8; 8 * 32 * 64]);
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (inv_table, plan) = ab_tile_test_plan();
+        let crate::seed_pipe::BlockSource::Closed { init, .. } =
+            crate::seed_pipe::BlockSource::closed(18, 0x7E57_AB71_1E00_0001u64)
+        else {
+            unreachable!()
+        };
+        let closed = crate::seed_pipe::BlockSource::closed(18, 0x7E57_AB71_1E00_0001u64);
+        let slice_blocks = crate::seed_pipe::generate_compressions_par(8, 0xBEEF);
+        let slice = crate::seed_pipe::BlockSource::Slice(&slice_blocks);
+        let mut tile_a = Box::new(AlignedTile([0xA5A5_A5A5u32; 32 * U32_PER_BLOCK]));
+        let mut tile_b = Box::new(AlignedTile([0xA5A5_A5A5u32; 32 * U32_PER_BLOCK]));
+        unsafe { init_ab_tile(tile_a.0.as_mut_ptr(), tile_b.0.as_mut_ptr(), 32) };
+        let mut stage = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+        let mut ab_sink = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+        for (src, base, n) in [
+            (&closed, 0usize, 32usize),
+            (&closed, 131_040, 32),
+            (&closed, 8, 8),
+            (&slice, 0, 32),
+            (&slice, 224, 32),
+            (&closed, (1 << 18) - 32, 32),
+        ] {
+            unsafe {
+                fill_ab_tile_closed(
+                    src,
+                    base,
+                    n,
+                    tile_a.0.as_mut_ptr(),
+                    tile_b.0.as_mut_ptr(),
+                    &inv_table,
+                    plan,
+                );
+            }
+            for octa in (0..n).step_by(8) {
+                let mut z_ref = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+                let mut a_ref = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+                let mut b_ref = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+                let inputs = match *src {
+                    crate::seed_pipe::BlockSource::Closed { .. } => {
+                        OctaInputs::Closed { init, base: base + octa }
+                    }
+                    crate::seed_pipe::BlockSource::Slice(s) => OctaInputs::Blocks(
+                        std::array::from_fn(|j| &s[base + octa + j]),
+                    ),
+                };
+                unsafe {
+                    build_octa_witness_ab_stream_elide(
+                        inputs,
+                        z_ref.0.as_mut_ptr(),
+                        a_ref.0.as_mut_ptr(),
+                        b_ref.0.as_mut_ptr(),
+                        StreamProj {
+                            stage: stage.0.as_mut_ptr(),
+                            out: ab_sink.0.as_mut_ptr(),
+                            out_stride: 32 * 64,
+                            out_bias: 0,
+                            inv_table: &inv_table,
+                            plan,
+                            one_rows_elided: false,
+                            w30_elided: false,
+                        },
+                        [false; 3],
+                    );
+                }
+                let o = octa * U32_PER_BLOCK;
+                for j in 0..8 {
+                    let s = o + j * U32_PER_BLOCK;
+                    let t = j * U32_PER_BLOCK;
+                    for w in 0..U32_PER_BLOCK {
+                        assert_eq!(
+                            tile_a.0[s + w], a_ref.0[t + w],
+                            "a mismatch base={base} octa={octa} blk={j} word={w}"
+                        );
+                        assert_eq!(
+                            tile_b.0[s + w], b_ref.0[t + w],
+                            "b mismatch base={base} octa={octa} blk={j} word={w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Throughput probe for the tile regeneration at the ranked shape:
+    /// 2^18 blocks as 8192 chunks of 32, per-thread tiles. Prints ms per
+    /// full pass. `cargo test --release ... ab_tile_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ab_tile_throughput() {
+        use rayon::prelude::*;
+        #[repr(C, align(64))]
+        struct AlignedTile([u32; 32 * U32_PER_BLOCK]);
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (inv_table, plan) = ab_tile_test_plan();
+        let src = crate::seed_pipe::BlockSource::closed(18, 0x1234_5678_9ABC_DEF0u64);
+        let n_chunks = (1usize << 18) / 32;
+        let sink = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            (0..n_chunks).into_par_iter().for_each_init(
+                || {
+                    let mut a = Box::new(AlignedTile([0u32; 32 * U32_PER_BLOCK]));
+                    let mut b = Box::new(AlignedTile([0u32; 32 * U32_PER_BLOCK]));
+                    unsafe { init_ab_tile(a.0.as_mut_ptr(), b.0.as_mut_ptr(), 32) };
+                    (a, b)
+                },
+                |(a, b), c| unsafe {
+                    fill_ab_tile_closed(&src, c * 32, 32, a.0.as_mut_ptr(), b.0.as_mut_ptr(), &inv_table, plan);
+                    sink.fetch_xor(
+                        a.0[(c * 7919) % (32 * U32_PER_BLOCK)] as u64 ^ b.0[(c * 104729) % (32 * U32_PER_BLOCK)] as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                },
+            );
+            eprintln!(
+                "ab_tile 2^18 blocks: {:.2} ms ({} threads)",
+                t.elapsed().as_secs_f64() * 1e3,
+                rayon::current_num_threads()
+            );
+        }
+        eprintln!("sink {}", sink.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 // witfire-7 draw marker 10514
