@@ -924,6 +924,7 @@ fn speculative_main(
     }
 
     let seed_at = std::time::Instant::now();
+    diag_profile::seed_received();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Inline path: nothing is materialized except the two blocks the O(1)
         // adoption gate reads. Everything else is evaluated inside witgen from
@@ -968,6 +969,7 @@ fn speculative_main(
     match (direct_proof_path.as_deref(), outcome) {
         (Some(path), Ok(out)) => {
             let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                diag_profile::delay_before_publish(path);
                 publish_direct_proof(path, out)
             }))
             .is_ok_and(|result| result.is_ok());
@@ -1315,6 +1317,168 @@ mod tests {
         unsafe {
             close(fds[0]);
             close(fds[1]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC BUILD: runner phase profile through the publication delay.
+// Run r (from the harness's `run-{r}.proof` path) reports metric
+// (r - 1) % METRICS.len() by waiting g(value) before publishing the proof.
+// ---------------------------------------------------------------------------
+mod diag_profile {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEED_NS: AtomicU64 = AtomicU64::new(0);
+    static SEED_CPU: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn seed_received() {
+        SEED_NS.store(flock_core::gaptime::now_ns(), Ordering::SeqCst);
+        SEED_CPU.store(flock_core::gaptime::cpu_ns(), Ordering::SeqCst);
+    }
+
+    /// A point: `SEED`, `PUB`, or the `occ`-th mark with `label`.
+    type P = (&'static str, usize);
+    const SEED: P = ("SEED", 0);
+    const PUB: P = ("PUB", 0);
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Control,
+        Wall(P, P),
+        Util(P, P),
+    }
+    use Kind::*;
+
+    const W0: P = ("witness: pool entered", 0);
+    const W1: P = ("witness: work done (incl. prefault)", 0);
+    const C0: P = ("commit: pool entered", 0);
+    const ST: P = ("ntt: seed+top fused pass done", 0);
+    const DP: P = ("ntt: deep pass done", 0);
+    const ZV: P = ("zerocheck: views built", 0);
+    const R1: P = ("zc: round1 done (URM + C_s restore)", 0);
+    const FT: P = ("zc: fold_table built", 0);
+    const R2: P = ("zc: round2 fused fold done", 0);
+    const R34: P = ("zc: rounds 3+4 composed fold done", 0);
+    const CL0: P = ("zc: cascade level", 0);
+    const CL1: P = ("zc: cascade level", 1);
+    const CL2: P = ("zc: cascade level", 2);
+    const CL11: P = ("zc: cascade level", 11);
+    const TD: P = ("zc: tail rounds done", 0);
+    const XAB: P = ("x_ab built", 0);
+    const LC: P = ("lincheck: done", 0);
+    const OB: P = ("open: begin", 0);
+    const RS: P = ("open: ring_switch done", 0);
+    const I0: P = ("lig: init round", 0);
+    const I4: P = ("lig: init round", 4);
+    const F8: P = ("lig: f8 materialized", 0);
+    const J1: P = ("lig: L1 join done", 0);
+    const L1R: P = ("lig: L1 root observed", 0);
+    const L1O: P = ("lig: L1 ood", 0);
+    const L0G: P = ("lig: L0 grind", 0);
+    const L0O: P = ("lig: L0 opens", 0);
+    const L0I: P = ("lig: L0 induce", 0);
+    const L0G2: P = ("lig: L0 intro+glue", 0);
+    const LF0: P = ("lig: lvl folds", 0);
+    const LC0: P = ("lig: lvl commit", 0);
+    const LG0: P = ("lig: lvl intro+glue", 0);
+    const LG1: P = ("lig: lvl intro+glue", 1);
+    const LD: P = ("open: ligerito recursive prover done", 0);
+
+    const ABD: P = ("zc: r1 AB arm done", 0);
+    const CD: P = ("zc: r1 C arm done", 0);
+    const LZV: P = ("lc: z_vec ready", 0);
+    const LEQ: P = ("lc: eq built", 0);
+    const LFA: P = ("lc: fold_alpha done", 0);
+    const LZW: P = ("lc: z-fold waited", 0);
+    const LSC: P = ("lc: sumcheck done", 0);
+    const METRICS: [Kind; flock_core::gaptime::METRIC_COUNT] = [
+        Control,          // 0
+        Wall(ZV, ABD),    // 1 r1 AB arm (split)
+        Wall(ZV, CD),     // 2 r1 C arm (split)
+        Wall(ZV, R1),     // 3 r1 total (split)
+        Wall(LZW, LZV),   // 4 lc z_vec fold (inline)
+        Wall(LZV, LSC),   // 5 lc 8-round sumcheck
+        Wall(XAB, LEQ),   // 6 lc eq
+        Wall(LEQ, LFA),   // 7 lc fold_alpha
+        Wall(LFA, LZW),   // 8 lc wait kicked fold
+        Wall(LZW, LSC),   // 9 lc z_vec + sumcheck
+        Wall(LSC, LC),    // 10 lc finish
+        Util(ZV, R1),     // 11
+        Util(XAB, LC),    // 12
+        Wall(ZV, R1),     // 13 r1 total (plain join)
+        Wall(ZV, ABD),    // 14 r1 AB arm (plain join)
+        Wall(ZV, CD),     // 15 r1 C arm (plain join)
+        Wall(ZV, R1),     // 16 r1 total (plain join)
+        Wall(ZV, R1),     // 17 r1 total (split)
+        Wall(SEED, PUB),  // 18 whole (plain join)
+        Wall(SEED, PUB),  // 19 whole (split)
+    ];
+
+    fn run_index(path: &Path) -> Option<usize> {
+        let name = path.file_name()?.to_str()?;
+        name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()
+    }
+
+    fn find(log: &[flock_core::gaptime::Rec], p: P, pub_ns: u64, pub_cpu: u64) -> Option<(u64, u64)> {
+        match p.0 {
+            "SEED" => Some((SEED_NS.load(Ordering::SeqCst), SEED_CPU.load(Ordering::SeqCst))),
+            "PUB" => Some((pub_ns, pub_cpu)),
+            label => log
+                .iter()
+                .filter(|r| r.label == label)
+                .nth(p.1)
+                .map(|r| (r.wall_ns, r.cpu_ns)),
+        }
+    }
+
+    /// Encoded delay in ms for a wall interval of `x` ms.
+    fn g_wall(x: f64) -> f64 {
+        if x <= 2.0 { 100.0 * x } else { 200.0 + 10.0 * (x - 2.0) }
+    }
+
+    pub(super) fn delay_before_publish(path: &Path) {
+        let pub_ns = flock_core::gaptime::now_ns();
+        let pub_cpu = flock_core::gaptime::cpu_ns();
+        let Some(run) = run_index(path) else { return };
+        let log = flock_core::gaptime::snapshot();
+        let metric = METRICS[(run.max(1) - 1) % METRICS.len()];
+        debug_assert_eq!(METRICS.len(), flock_core::gaptime::METRIC_COUNT);
+        let threads = std::thread::available_parallelism().map_or(16, |n| n.get()) as f64;
+        let delay_ms = match metric {
+            Control => 0.0,
+            Wall(a, b) | Util(a, b) => {
+                match (find(&log, a, pub_ns, pub_cpu), find(&log, b, pub_ns, pub_cpu)) {
+                    (Some((wa, ca)), Some((wb, cb))) if wb >= wa => {
+                        let wall_ms = (wb - wa) as f64 / 1e6;
+                        if let Util(..) = metric {
+                            let cpu_ms = cb.saturating_sub(ca) as f64 / 1e6;
+                            300.0 * (cpu_ms / (wall_ms * threads).max(1e-9)).min(1.5)
+                        } else {
+                            g_wall(wall_ms)
+                        }
+                    }
+                    // Missing mark: a large, recognisable sentinel.
+                    _ => 900.0,
+                }
+            }
+        };
+        if std::env::var_os("FLOCK_DIAG_PROFILE_DEBUG").is_some() {
+            eprintln!("[diag-profile] run {run} metric {} delay {delay_ms:.3} ms", (run.max(1) - 1) % METRICS.len());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(delay_ms / 1e3);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let left = deadline - now;
+            if left > std::time::Duration::from_millis(2) {
+                std::thread::sleep(left - std::time::Duration::from_millis(1));
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 }

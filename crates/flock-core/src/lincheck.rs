@@ -4352,12 +4352,14 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             // the leftover fold starts after the last ρ, when C is no
             // longer written).
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
+            crate::gaptime::mark("lc: kick start");
             let trace = std::env::var_os("LINCHECK_TRACE").is_some();
             let t0 = std::time::Instant::now();
             let out = match roots {
                 Some(roots) => roots.fold(z, m, &x_outer),
                 None => fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer),
             };
+            crate::gaptime::mark("lc: kicked fold done");
             if trace {
                 eprintln!(
                     "[lc] {:<26} {:>7.2} ms",
@@ -4665,6 +4667,7 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    crate::gaptime::mark("lc: eq built");
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -4706,6 +4709,7 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    crate::gaptime::mark("lc: fold_alpha done");
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -4720,6 +4724,7 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         kicked_z_vec = wait_last_rho_z_fold();
+        crate::gaptime::mark("lc: z-fold waited");
         if let Some(t) = t_wait {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -4779,6 +4784,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
     // At the ranked shape, the first lincheck bind and the downstream Fold8
     // map use the same halves and challenge. Capture that output directly.
+    crate::gaptime::mark("lc: z_vec ready");
     let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
         && inner_rest_len == 8
         && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
@@ -4843,6 +4849,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
+    crate::gaptime::mark("lc: sumcheck done");
     let z_partial = z_vec;
     challenger.observe_f128_slice(&z_partial);
 

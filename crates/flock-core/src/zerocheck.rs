@@ -582,6 +582,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                     ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
                 );
+                crate::gaptime::mark("zc: r1 AB arm done");
                 (ab, t.elapsed().as_secs_f64() * 1e3)
             };
             let c_closure = || {
@@ -599,6 +600,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         capture_canon,
                         roots,
                     );
+                crate::gaptime::mark("zc: r1 C arm done");
                 (
                     c,
                     s_hat_v_c,
@@ -618,7 +620,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // identical inputs, so the proof bytes are unchanged. Falls back to
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, t_c_ms)) =
-                match crate::smt_split::zc_r1_pools() {
+                match crate::smt_split::zc_r1_pools().filter(|_| !crate::gaptime::lever_r1_plain_join_on()) {
                     Some((ab_pool, c_pool)) => {
                         rayon::join(|| ab_pool.install(ab_closure), || c_pool.install(c_closure))
                     }
@@ -1083,6 +1085,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_1);
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
+        crate::gaptime::mark("zc: cascade level");
     }
     let loop_start = 2 * n_levels;
 
@@ -1127,6 +1130,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+        crate::gaptime::mark("zc: tail round");
     }
     // Last ML ρ is in. RowMajor `x_outer = mlv[k_log − k_skip ..]` is
     // complete here (not URM `r`). Kick today's one-shot leftover z-fold
