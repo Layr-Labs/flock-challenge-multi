@@ -54,6 +54,7 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    gaptime::apply_slot_knobs();
     let built = init_global_pool();
     // Process start, on the (unpinned) main thread, after the global pool
     // exists. This is the only place the zerocheck round-1 half-pools may be
