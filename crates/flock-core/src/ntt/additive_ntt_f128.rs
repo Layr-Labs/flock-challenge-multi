@@ -744,6 +744,48 @@ fn staging_init_mode() -> StagingInit {
 ///
 /// `alloc_uninit_vec` additionally `madvise(MADV_HUGEPAGE)`s blocks ≥ 2 MiB,
 /// which the `vec![F128::ZERO; …]` it replaces did not.
+/// Runs the seed+top fused tasks of one ranked commit on behalf of
+/// [`AdditiveNttF128::seed_top_fused_with_scheduler`].
+pub trait SeedTopScheduler: Sync {
+    /// Run `task(staging, r)` exactly once for every `r < n_tasks`, each call
+    /// on a staging block from [`seed_top_staging_block`] that no other task
+    /// is using at the same time, and return once all have finished.
+    fn run(&self, n_tasks: usize, row_len: usize, task: &(dyn Fn(&mut Vec<F128>, usize) + Sync));
+}
+
+/// A staging block sized for one seed+top fused task.
+pub fn seed_top_staging_block(row_len: usize) -> Vec<F128> {
+    staging_block(512, row_len)
+}
+
+/// SMT sibling pairs `(cpu, sibling)` covering the rayon pool one pair per
+/// physical core, as the deep pass's producer/consumer split resolves them;
+/// `None` when the machine or pool cannot be paired.
+#[cfg(target_os = "linux")]
+pub fn smt_sibling_pairs() -> Option<&'static Vec<(usize, usize)>> {
+    deep_split_pairs()
+}
+#[cfg(not(target_os = "linux"))]
+pub fn smt_sibling_pairs() -> Option<&'static Vec<(usize, usize)>> {
+    None
+}
+
+/// This thread's CPU affinity mask (1024 bits).
+#[cfg(target_os = "linux")]
+pub fn cpu_mask() -> [u64; 16] {
+    affinity::get()
+}
+/// Restore a mask from [`cpu_mask`].
+#[cfg(target_os = "linux")]
+pub fn set_cpu_mask(m: &[u64; 16]) {
+    affinity::set(m)
+}
+/// Pin this thread to one logical CPU.
+#[cfg(target_os = "linux")]
+pub fn pin_cpu(cpu: usize) {
+    affinity::pin(cpu)
+}
+
 fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
     let n = rows * row_len;
     match staging_init_mode() {
@@ -2611,23 +2653,25 @@ impl AdditiveNttF128 {
         }
     }
 
-    #[allow(clippy::manual_is_multiple_of)]
+    #[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
     fn seed_top_fused8_pass(
         &self,
-        msg: &[F128],
+        msg_ptr: *const F128,
+        msg_len: usize,
         data: &mut [F128],
         num_ntts: usize,
         log_d: usize,
         odd_tail: usize,
+        sched: Option<&dyn SeedTopScheduler>,
     ) {
         use rayon::prelude::*;
         #[cfg(test)]
         SEED_TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         const LAYER: usize = 3;
         debug_assert!(log_d >= 9);
-        debug_assert_eq!(data.len(), 2 * msg.len());
+        debug_assert_eq!(data.len(), 2 * msg_len);
         let block_size = 1usize << (log_d - LAYER); // B, also the seed quarter
-        let msg_positions = msg.len() / num_ntts;
+        let msg_positions = msg_len / num_ntts;
         debug_assert_eq!(msg_positions >> 2, block_size);
         let block_bytes = block_size * num_ntts;
         let sub_stride = block_size >> 6; // S
@@ -2689,7 +2733,7 @@ impl AdditiveNttF128 {
             })
             .collect();
 
-        let src_addr = msg.as_ptr() as usize;
+        let src_addr = msg_ptr as usize;
         let base_addr = data.as_mut_ptr() as usize;
         // Publish with non-temporal stores when allowed and 16-byte aligned
         // (see `publish_row_nt`); decided once per pass.
@@ -3052,6 +3096,13 @@ impl AdditiveNttF128 {
             }
         };
 
+        // External scheduler (witness-overlapped ranked commit): it runs every
+        // task exactly once, each on a staging block it owns, and returns only
+        // when all have retired. Same `task` body, same codeword bytes.
+        if let Some(s) = sched {
+            s.run(sub_stride, row_len, &|buf, r| task(buf, r));
+            return;
+        }
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // across every lane the selected downstream path can read. The exact
@@ -3084,6 +3135,82 @@ impl AdditiveNttF128 {
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
         }
+    }
+
+    /// Rate-1/2 seed+top fused pass driven by an external
+    /// [`SeedTopScheduler`], so the ranked commit's first eight layers can run
+    /// while the message is still being produced. Returns `false` without
+    /// touching `codeword` when this build or shape would not take the fused
+    /// seed+top task (the caller then commits through the ordinary entry);
+    /// on `true` the codeword holds exactly the state the ordinary entry
+    /// leaves after its fused pass, and
+    /// [`Self::rs_encode_interleaved_on_range_done_preseeded`] finishes it.
+    ///
+    /// # Safety
+    /// `msg_ptr..msg_ptr + msg_len` must stay valid for the call. The
+    /// scheduler must run `task(_, r)` only after every message row task `r`
+    /// reads (positions `r + k·S + i·B`, `k < 64`, `i < 4`) is fully written
+    /// and published to the running thread.
+    pub unsafe fn seed_top_fused_with_scheduler(
+        &self,
+        msg_ptr: *const F128,
+        msg_len: usize,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        sched: &dyn SeedTopScheduler,
+    ) -> bool {
+        if !(num_ntts.is_power_of_two() && num_ntts > 0)
+            || msg_len == 0
+            || msg_len % num_ntts != 0
+            || codeword.len() != 2 * msg_len
+        {
+            return false;
+        }
+        let n_positions = codeword.len() / num_ntts;
+        if !n_positions.is_power_of_two() {
+            return false;
+        }
+        let log_d = log2_pow2(n_positions);
+        if log_d > self.log_domain_size() || log_d < 12 || rate_half_seed_disabled() {
+            return false;
+        }
+        let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        let fuse_seed = Self::top_fusion_available()
+            && !ntt_top_fusion_disabled()
+            && !ntt_seed_top_fusion_disabled()
+            && n_top >= 9
+            && log_d >= 9;
+        if !fuse_seed {
+            return false;
+        }
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        self.seed_top_fused8_pass(msg_ptr, msg_len, codeword, num_ntts, log_d, odd_tail, Some(sched));
+        crate::gaptime::mark("ntt: seed+top fused pass done (scheduled)");
+        true
+    }
+
+    /// Continuation of [`Self::rs_encode_interleaved_on_range_done`] for a
+    /// codeword whose seed+top fused pass already ran through
+    /// [`Self::seed_top_fused_with_scheduler`]: the same deep pass and
+    /// callbacks from layer 9 on.
+    pub(crate) fn rs_encode_interleaved_on_range_done_preseeded(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        assert!(n_top >= 9 && log_d >= 12, "preseeded continuation outside the fused seed+top shape");
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            codeword,
+            num_ntts,
+            9,
+            None,
+            Some(on_range_done),
+            None,
+        );
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -3327,7 +3454,7 @@ impl AdditiveNttF128 {
             if let Some(msg) = seed_msg.take() {
                 // Checked above: layer == 3, top fusion on, n_top ≥ 9.
                 debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
-                self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
+                self.seed_top_fused8_pass(msg.as_ptr(), msg.len(), data, num_ntts, log_d, odd_tail, None);
                 crate::gaptime::mark("ntt: seed+top fused pass done");
                 layer += 6;
             } else if top_fusion_ok && layer + 5 < n_top {

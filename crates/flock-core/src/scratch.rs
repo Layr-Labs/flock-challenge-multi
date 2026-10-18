@@ -59,7 +59,7 @@ pub fn take_f128(n: usize) -> Vec<F128> {
 /// back to a fresh allocation. Lets callers branch on warm-vs-cold (e.g.
 /// the commit prefault skips its page-touch thread when the pool can
 /// supply an already-resident buffer).
-pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
+pub fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     try_take_f128_tagged(n, 0).map(|(v, _)| v)
 }
 

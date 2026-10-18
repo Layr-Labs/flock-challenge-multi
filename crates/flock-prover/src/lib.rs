@@ -15,6 +15,7 @@
 pub use flock_core::*;
 
 pub mod chain;
+pub(crate) mod fused_seed_top;
 pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;

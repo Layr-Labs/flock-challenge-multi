@@ -217,7 +217,23 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    finalize_commit(codeword, z_packed, params)
+    finalize_commit(codeword, z_packed, params, false)
+}
+
+/// [`commit_into`] for a codeword whose rate-1/2 seed+top fused NTT pass
+/// already ran (see
+/// [`AdditiveNttF128::seed_top_fused_with_scheduler`]); the encode resumes at
+/// the deep pass and everything else is identical.
+pub fn commit_into_preseeded(
+    z_packed: &[F128],
+    params: &PcsParams,
+    codeword: Vec<F128>,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(codeword.len(), codeword_len, "commit_into_preseeded: codeword buffer has wrong length");
+    finalize_commit(codeword, z_packed, params, true)
 }
 
 /// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
@@ -250,6 +266,7 @@ fn finalize_commit(
     mut codeword: Vec<F128>,
     z_packed: &[F128],
     params: &PcsParams,
+    preseeded: bool,
 ) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let ntt = AdditiveNttF128::standard(params.k_code());
@@ -261,7 +278,8 @@ fn finalize_commit(
     // size, GPU Merkle pipeline available (Metal present, not latched off,
     // FLOCK_NO_GPU / FLOCK_NO_GPU_MERKLE unset). Everything else — and any
     // in-flight GPU failure — lands on the existing pure-CPU path below.
-    if merkle_cut_depth == 0
+    if !preseeded
+        && merkle_cut_depth == 0
         && params.merkle_hash == HashKind::Blake3
         && params.n_leaves() >= (1 << 18)
         && merkle::blake3_leaf_size_is_batchable(params.leaf_size_bytes())
@@ -328,11 +346,7 @@ fn finalize_commit(
     let local_levels = AtomicUsize::new(usize::MAX);
 
     let t_ntt = std::time::Instant::now();
-    ntt.rs_encode_interleaved_on_range_done(
-        z_packed,
-        &mut codeword,
-        num_ntts,
-        &|range, sub_data| {
+    let on_range_done = |range: core::ops::Range<usize>, sub_data: &[F128]| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
             // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
             // the one-shot `merkle_tree` cast in the previous barrier path.
@@ -442,8 +456,12 @@ fn finalize_commit(
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
             }
-        },
-    );
+    };
+    if preseeded {
+        ntt.rs_encode_interleaved_on_range_done_preseeded(&mut codeword, num_ntts, &on_range_done);
+    } else {
+        ntt.rs_encode_interleaved_on_range_done(z_packed, &mut codeword, num_ntts, &on_range_done);
+    }
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",

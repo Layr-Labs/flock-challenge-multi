@@ -2260,6 +2260,34 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// [`generate_witness_with_ab_packed_and_round1_inner_from`] that also runs
+/// the commit's seed+top fused NTT pass on `fused`'s codeword while the
+/// witness is produced (see [`crate::fused_seed_top`]). Whether the pass ran
+/// is reported by `fused.seeded()`; when it did not, the witness is the same
+/// and the codeword is untouched.
+pub(crate) fn generate_witness_with_ab_packed_and_round1_inner_from_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    fused: &crate::fused_seed_top::FusedSeedTopInputs<'_>,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let use_nt = cfg!(target_arch = "aarch64")
+        && super::common::u64_per_block_is_nt_compatible(K / 64)
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+    generate_witness_with_ab_packed_and_round1_inner_impl_tuned_fused(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        live_witgen_simd_enabled(),
+        witgen_simd::witgen_ab_nt_enabled(),
+        Some(fused),
+    )
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -2329,6 +2357,31 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     use_nt: bool,
     use_simd: bool,
     ab_nt: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    generate_witness_with_ab_packed_and_round1_inner_impl_tuned_fused(
+        blocks,
+        n_blocks_log,
+        use_nt,
+        use_simd,
+        ab_nt,
+        None,
+    )
+}
+
+/// [`generate_witness_with_ab_packed_and_round1_inner_impl_tuned`] with the
+/// optional witness-overlapped seed+top pass (`fused`, ranked octa arm only).
+fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+    use_nt: bool,
+    use_simd: bool,
+    ab_nt: bool,
+    fused: Option<&crate::fused_seed_top::FusedSeedTopInputs<'_>>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -2455,7 +2508,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         // z-only behaviour on the fused arm (exact same-binary A/B).
         let elide_on = witgen_simd::const_elide_enabled();
         let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
-        generate_round1_inner_octa(
+        generate_round1_inner_octa_fused(
             blocks,
             skip_blocks,
             &mut z,
@@ -2466,6 +2519,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
+            fused,
         );
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
@@ -2489,9 +2543,9 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         return (z, a, b, ab_inner);
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok);
+    let _ = (use_simd, ab_nt, a_tok, b_tok, z_tok, fused);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    let _ = (ab_nt, a_tok, b_tok, z_tok);
+    let _ = (ab_nt, a_tok, b_tok, z_tok, fused);
 
     z.par_chunks_mut(F128_PER_BLOCK)
         .zip(a.par_chunks_mut(F128_PER_BLOCK))
@@ -2701,6 +2755,39 @@ fn generate_round1_inner_octa(
     )
 }
 
+/// [`generate_round1_inner_octa`] with the optional witness-overlapped
+/// seed+top pass (see [`crate::fused_seed_top`]).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    fused: Option<&crate::fused_seed_top::FusedSeedTopInputs<'_>>,
+) {
+    generate_round1_inner_octa_with_ranked_closed_dispatch_fused(
+        blocks,
+        skip_blocks,
+        z,
+        a,
+        b,
+        ab_inner,
+        inv_table,
+        padding,
+        elide,
+        ab_nt,
+        RankedClosedDispatch::Auto,
+        fused,
+    )
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa_with_ranked_closed_dispatch(
@@ -2715,6 +2802,38 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     elide: [bool; 3],
     ab_nt: bool,
     ranked_closed_dispatch: RankedClosedDispatch,
+) {
+    generate_round1_inner_octa_with_ranked_closed_dispatch_fused(
+        blocks,
+        skip_blocks,
+        z,
+        a,
+        b,
+        ab_inner,
+        inv_table,
+        padding,
+        elide,
+        ab_nt,
+        ranked_closed_dispatch,
+        None,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_with_ranked_closed_dispatch_fused(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    ranked_closed_dispatch: RankedClosedDispatch,
+    fused: Option<&crate::fused_seed_top::FusedSeedTopInputs<'_>>,
 ) {
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
@@ -2817,6 +2936,55 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         && w30_elided
         && blake3_witgen8::ranked_static01_direct_enabled()
     {
+        // Witness-overlapped commit seed+top: the same octa builder per
+        // 16-block group, with the groups handed out in the NTT's stride-class
+        // order and the seed tasks interleaved (`crate::fused_seed_top`).
+        if let Some(fs) = fused {
+            let n_groups = z.len() / group_f128;
+            let n_blocks_total = z.len() / F128_PER_BLOCK;
+            let zp = z.as_mut_ptr() as usize;
+            let ap = a.as_mut_ptr() as usize;
+            let bp = b.as_mut_ptr() as usize;
+            let abp = ab_inner_bytes.as_mut_ptr() as usize;
+            let group_fn = |g: usize| {
+                let n_here = GROUP.min(n_blocks_total - GROUP * g);
+                // SAFETY: as for the chunked loop below — group `g` owns
+                // F128s `[g·group_f128, (g+1)·group_f128)` of z/a/b and bytes
+                // `[g·group_bytes, …)` of ab_inner, and no other group touches
+                // them.
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        let off = g * group_f128 + half * SIMD * F128_PER_BLOCK;
+                        let proj = blake3_witgen8::StreamProj {
+                            stage: core::ptr::null_mut(),
+                            out: (abp as *mut u8)
+                                .add(g * group_bytes + half * SIMD * ab_block_bytes),
+                            out_stride: ab_block_bytes,
+                            out_bias: 2 * 64,
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided: true,
+                            w30_elided: true,
+                        };
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                            init,
+                            base,
+                            (zp as *mut F128).add(off).cast::<u32>(),
+                            (ap as *mut F128).add(off).cast::<u32>(),
+                            (bp as *mut F128).add(off).cast::<u32>(),
+                            proj,
+                            &preps.0,
+                            [true; 3],
+                        );
+                    }
+                }
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            };
+            if crate::fused_seed_top::run_fused(fs, z.as_ptr(), z.len(), n_groups, &group_fn) {
+                return;
+            }
+        }
         z.par_chunks_mut(group_f128)
             .zip(a.par_chunks_mut(group_f128))
             .zip(b.par_chunks_mut(group_f128))
@@ -4447,17 +4615,65 @@ impl Blake3Setup {
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
-                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
+                // Ranked warm proves: the pooled codeword buffer is already
+                // resident, so the commit's seed+top NTT pass runs inside the
+                // witness phase (`crate::fused_seed_top`) and the commit
+                // resumes at its deep pass. Cold proves and every other shape
+                // keep the prefault-under-witness schedule.
+                let fused_ok = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+                    && crate::fused_seed_top::fused_seed_top_enabled()
+                    && self.n_blocks == 1 << 18
+                    && rayon::current_thread_index().is_none();
+                let codeword_len = self.pcs_params.n_positions() * self.pcs_params.num_ntts();
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner), preseeded) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
-                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        if fused_ok {
+                            if let Some(mut buf) = flock_core::scratch::try_take_f128(codeword_len) {
+                                let padding = self.r1cs.padding_spec();
+                                let num_ntts = self.pcs_params.num_ntts();
+                                // Same zero-odd-tail publication the commit
+                                // makes before its encode; the seed tasks read
+                                // it when they run here.
+                                let _zero_lane_skip =
+                                    flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
+                                        num_ntts,
+                                        flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                                            num_ntts,
+                                            padding.k_log,
+                                            padding.useful_bits_per_block,
+                                        ),
+                                    );
+                                let ntt = flock_core::ntt::additive_ntt_f128::AdditiveNttF128::standard(
+                                    self.pcs_params.k_code(),
+                                );
+                                let fs = crate::fused_seed_top::FusedSeedTopInputs::new(
+                                    &ntt,
+                                    &mut buf,
+                                    num_ntts,
+                                );
+                                let w = generate_witness_with_ab_packed_and_round1_inner_from_fused(
+                                    blocks,
+                                    self.n_blocks_log(),
+                                    &fs,
+                                );
+                                let seeded = fs.seeded();
+                                flock_core::gaptime::mark(if seeded {
+                                    "witness: work done (seed+top fused in)"
+                                } else {
+                                    "witness: work done (fused declined)"
+                                });
+                                return (Some(buf), w, seeded);
+                            }
+                        }
+                        let (cw, w) = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                             generate_witness_with_ab_packed_and_round1_inner_from(
                                 blocks,
                                 self.n_blocks_log(),
                             )
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
-                        r
+                        (cw, w, false)
                     });
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.lincheck_circuit();
@@ -4471,6 +4687,7 @@ impl Blake3Setup {
                     ab_inner,
                     lc_circuit,
                     codeword,
+                    preseeded,
                     challenger,
                 )
             }
