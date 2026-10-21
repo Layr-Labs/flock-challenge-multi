@@ -121,7 +121,6 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
@@ -4255,9 +4254,18 @@ enum LastRhoSlot {
     Running(JoinHandle<Vec<F128>>),
 }
 
-thread_local! {
-    static LAST_RHO: RefCell<LastRhoSlot> = const { RefCell::new(LastRhoSlot::Empty) };
-}
+// Process-global slot (NOT thread-local): `prepare_last_rho_z_fold` runs on
+// the caller's thread, while `kick_last_rho_z_fold` fires from inside the
+// zerocheck phase body and `wait_last_rho_z_fold` from the lincheck phase
+// body — both reached through `flock_core::in_pool`, which executes the
+// body on a rayon worker thread, not the registering thread. A thread-local
+// slot therefore never carried the registration across those boundaries on
+// the ranked x86 path (the kick saw `Empty` and no-op'd, so the 8 ms
+// one-shot fold always ran inline, serially, at the top of lincheck). The
+// mutex is uncontended: each prove touches it three times (prepare, kick,
+// wait), never from inside a loop.
+static LAST_RHO: std::sync::Mutex<LastRhoSlot> =
+    std::sync::Mutex::new(LastRhoSlot::Empty);
 
 /// Keeps packed `z` alive until a kicked leftover fold is waited. Drop
 /// joins any in-flight handle so the raw pointer cannot dangle.
@@ -4296,16 +4304,14 @@ pub fn prepare_last_rho_z_fold_with_roots(
     // A previous prepare on this thread that was never waited would leave a
     // live handle holding a pointer into a now-dead buffer. Join it first.
     let _ = wait_last_rho_z_fold();
-    LAST_RHO.with(|slot| {
-        *slot.borrow_mut() = LastRhoSlot::Prepared(LastRhoPrepared {
-            roots,
-            z_ptr: z.as_ptr(),
-            z_len: z.len(),
-            m,
-            k_log,
-            useful_bits,
-            inner_rest_len,
-        });
+    *LAST_RHO.lock().unwrap() = LastRhoSlot::Prepared(LastRhoPrepared {
+        roots,
+        z_ptr: z.as_ptr(),
+        z_len: z.len(),
+        m,
+        k_log,
+        useful_bits,
+        inner_rest_len,
     });
     LastRhoZFoldGuard
 }
@@ -4318,8 +4324,8 @@ pub fn prepare_last_rho_z_fold_with_roots(
 /// kick is REJECT, so we refuse to start. A second kick, or a kick after
 /// wait / after zc with no prepare, is a no-op.
 pub fn kick_last_rho_z_fold(mlv: &[F128]) {
-    let prepared = LAST_RHO.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    let prepared = {
+        let mut slot = LAST_RHO.lock().unwrap();
         match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
             LastRhoSlot::Prepared(p) if mlv.len() == p.inner_rest_len + (p.m - p.k_log) => Some(p),
             LastRhoSlot::Prepared(p) => {
@@ -4331,7 +4337,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
                 None
             }
         }
-    });
+    };
     let Some(p) = prepared else {
         return;
     };
@@ -4368,9 +4374,7 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             out
         })
         .expect("spawn last-ρ z-fold");
-    LAST_RHO.with(|slot| {
-        *slot.borrow_mut() = LastRhoSlot::Running(handle);
-    });
+    *LAST_RHO.lock().unwrap() = LastRhoSlot::Running(handle);
 }
 
 /// Join a kicked leftover fold. Call **after** serial FS and **before**
@@ -4378,12 +4382,13 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
 /// a kick was running; `None` if nothing was kicked (caller runs today's
 /// sequential one-shot).
 pub fn wait_last_rho_z_fold() -> Option<Vec<F128>> {
-    let handle = LAST_RHO.with(|slot| {
-        match std::mem::replace(&mut *slot.borrow_mut(), LastRhoSlot::Empty) {
+    let handle = {
+        let mut slot = LAST_RHO.lock().unwrap();
+        match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
             LastRhoSlot::Running(h) => Some(h),
             LastRhoSlot::Prepared(_) | LastRhoSlot::Empty => None,
         }
-    });
+    };
     handle.map(|h| h.join().expect("last-ρ z-fold thread"))
 }
 
