@@ -567,11 +567,10 @@ impl InvNttTableByteSingleGf8 {
         (self.data_ptr(), self.half_swapped_data_ptr())
     }
 
-    /// Wide-read twin of
+    /// Mixed-width twin of
     /// [`Self::apply_x86_avx512_register_2img_off_unchecked`]. Identical value
-    /// and identical table addresses; the eight pre-scaled `u16` offsets are
-    /// fetched as two 64-bit reads and split with shifts instead of eight
-    /// separate 16-bit reads.
+    /// and identical table addresses; the eight pre-scaled `u16` offsets use
+    /// two 32-bit reads and four 16-bit reads, retaining the original order.
     ///
     /// # Safety
     /// As for [`Self::apply_x86_avx512_register_2img_off_unchecked`].
@@ -589,6 +588,26 @@ impl InvNttTableByteSingleGf8 {
         let (base, base8) = self.image_ptrs();
         // SAFETY: forwarded from this function's contract.
         unsafe { apply_x86_avx512_register_2img_offw_at(base, base8, off) }
+    }
+}
+
+/// Read four pre-scaled row offsets with one dword and two word loads.
+/// This keeps fewer scalar shifts than a qword unpack while avoiding four
+/// scalar loads per word. The returned indices and their order are unchanged.
+///
+/// # Safety
+/// `p` must point to eight readable bytes. No alignment is required.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load4_offsets_mixed(p: *const u16) -> [usize; 4] {
+    unsafe {
+        let pair = p.cast::<u32>().read_unaligned();
+        [
+            pair as u16 as usize,
+            (pair >> 16) as usize,
+            p.add(2).read_unaligned() as usize,
+            p.add(3).read_unaligned() as usize,
+        ]
     }
 }
 
@@ -614,24 +633,24 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
     // 64 readable bytes per row.
     {
         unsafe {
-            let w0 = (off as *const u64).read_unaligned();
-            let w1 = (off.add(4) as *const u64).read_unaligned();
+            let w0 = load4_offsets_mixed(off);
+            let w1 = load4_offsets_mixed(off.add(4));
             let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
             let u0 = _mm512_xor_si512(
-                row(base, w0 as u16 as usize),
-                row(base8, (w0 >> 16) as u16 as usize),
+                row(base, w0[0]),
+                row(base8, w0[1]),
             );
             let u1 = _mm512_xor_si512(
-                row(base, (w0 >> 32) as u16 as usize),
-                row(base8, (w0 >> 48) as usize),
+                row(base, w0[2]),
+                row(base8, w0[3]),
             );
             let u2 = _mm512_xor_si512(
-                row(base, w1 as u16 as usize),
-                row(base8, (w1 >> 16) as u16 as usize),
+                row(base, w1[0]),
+                row(base8, w1[1]),
             );
             let u3 = _mm512_xor_si512(
-                row(base, (w1 >> 32) as u16 as usize),
-                row(base8, (w1 >> 48) as usize),
+                row(base, w1[2]),
+                row(base8, w1[3]),
             );
             let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
             let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
@@ -666,24 +685,24 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
     // SAFETY: two readable 64-bit words per the contract; each extracted
     // field is one pre-scaled offset inside the readable image.
     unsafe {
-        let we = (even as *const u64).read_unaligned();
-        let wo = (even.add(32) as *const u64).read_unaligned();
+        let we = load4_offsets_mixed(even);
+        let wo = load4_offsets_mixed(even.add(32));
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
         let u0 = _mm512_xor_si512(
-            row(base, we as u16 as usize),
-            row(base8, wo as u16 as usize),
+            row(base, we[0]),
+            row(base8, wo[0]),
         );
         let u1 = _mm512_xor_si512(
-            row(base, (we >> 16) as u16 as usize),
-            row(base8, (wo >> 16) as u16 as usize),
+            row(base, we[1]),
+            row(base8, wo[1]),
         );
         let u2 = _mm512_xor_si512(
-            row(base, (we >> 32) as u16 as usize),
-            row(base8, (wo >> 32) as u16 as usize),
+            row(base, we[2]),
+            row(base8, wo[2]),
         );
         let u3 = _mm512_xor_si512(
-            row(base, (we >> 48) as usize),
-            row(base8, (wo >> 48) as usize),
+            row(base, we[3]),
+            row(base8, wo[3]),
         );
         let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
         let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
@@ -1315,5 +1334,35 @@ mod tests {
         assert_eq!(a1, a2);
         assert_eq!(b1, b2);
         assert_eq!(c1, c2);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod mixed_offset_tests {
+    use super::load4_offsets_mixed;
+
+    #[test]
+    fn mixed_offsets_preserve_each_field_and_unaligned_inputs() {
+        // Exercise every bit pattern in each independent field, including
+        // unaligned starts. Neighbours differ to expose lane/order mistakes.
+        for alignment in 0..8 {
+            for field in 0..4 {
+                for value in 0..=u16::MAX {
+                    let mut words = [0x1357u16, 0x2468, 0xabcd, 0xfedc];
+                    words[field] = value;
+                    let mut bytes = [0xa5u8; 16];
+                    for (i, word) in words.iter().enumerate() {
+                        bytes[alignment+2*i..alignment+2*i+2]
+                            .copy_from_slice(&word.to_le_bytes());
+                    }
+                    // SAFETY: the complete eight-byte window is readable;
+                    // the helper explicitly permits an unaligned pointer.
+                    let actual = unsafe {
+                        load4_offsets_mixed(bytes.as_ptr().add(alignment).cast())
+                    };
+                    assert_eq!(actual, words.map(usize::from));
+                }
+            }
+        }
     }
 }
