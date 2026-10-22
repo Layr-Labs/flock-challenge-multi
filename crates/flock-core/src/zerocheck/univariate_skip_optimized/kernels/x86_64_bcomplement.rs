@@ -85,7 +85,7 @@ const WINDOW_PLANS: [WindowPlan; 28] = build_window_plans();
 ///   is 64-byte aligned. The caller performs the ordinary non-temporal
 ///   publish fence.
 #[inline(always)]
-pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool, const L: bool>(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -95,17 +95,17 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
     unsafe {
         let plan = WINDOW_PLANS[blk - 2];
         let mut modes = plan.modes;
-        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
+        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P, L>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
         let (bv, correction) =
-            apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
+            apply_b_mode::<P, L>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
         let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
         let x = _mm512_set1_epi8(2);
         for k in (0..7usize).rev() {
             modes >>= 8;
             let av = apply(op.add(offw_krow_words::<P>(k)));
             let (bv, correction) =
-                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
+                apply_b_mode::<P, L>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
             let product = _mm512_gf2p8mul_epi8(av, bv);
             acc = _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8mul_epi8(acc, x),
@@ -118,7 +118,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
 }
 
 #[inline(always)]
-pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, const P: bool>(
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, const P: bool, const L: bool>(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -126,9 +126,9 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
     debug_assert!((3..=28).contains(&BLK));
     unsafe {
         let plan = WINDOW_PLANS[BLK - 2];
-        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
+        let apply = |p| apply_x86_avx512_register_2img_krow_at::<P, L>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode::<P>(
+        let (bv, correction) = apply_b_mode::<P, L>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
             plan.modes as u8,
@@ -139,7 +139,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode::<P>(
+                let (bv, correction) = apply_b_mode::<P, L>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
                     (plan.modes >> $shift) as u8,
@@ -178,7 +178,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     const BLK: usize,
     const P: bool,
     const I: u8,
->(
+ const L: bool>(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -186,9 +186,9 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     debug_assert!((3..=28).contains(&BLK));
     unsafe {
         let plan = WINDOW_PLANS[BLK - 2];
-        let apply = |p| apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, p);
+        let apply = |p| apply_x86_avx512_register_img_krow_at::<I, P, L>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode_img::<P, I>(
+        let (bv, correction) = apply_b_mode_img::<P, I, L>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
             plan.modes as u8,
@@ -199,7 +199,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode_img::<P, I>(
+                let (bv, correction) = apply_b_mode_img::<P, I, L>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
                     (plan.modes >> $shift) as u8,
@@ -234,26 +234,26 @@ const RESIDUAL_MODES_29: u64 = WINDOW_PLANS[27].modes;
 /// complement identity `T(A)·T(B) = T(A)·T(!B) ⊕ T(A)` through
 /// [`apply_b_mode_img`]; every other row keeps the full B apply.
 #[inline(always)]
-unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool>(
+unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool, const L: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
     k: usize,
     mode: u8,
 ) -> __m512i {
     unsafe {
-        let av = apply_x86_avx512_register_img_krow_at::<I, P>(
+        let av = apply_x86_avx512_register_img_krow_at::<I, P, L>(
             imgs.0,
             imgs.1,
             op.add(offw_krow_words::<P>(k)),
         );
         let b = op.add(64 + offw_krow_words::<P>(k));
         if BC && mode != 0 {
-            let (bv, correction) = apply_b_mode_img::<P, I>(imgs, b, mode, av);
+            let (bv, correction) = apply_b_mode_img::<P, I, L>(imgs, b, mode, av);
             _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
         } else {
             _mm512_gf2p8mul_epi8(
                 av,
-                apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, b),
+                apply_x86_avx512_register_img_krow_at::<I, P, L>(imgs.0, imgs.1, b),
             )
         }
     }
@@ -274,7 +274,7 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
     const P: bool,
     const I: u8,
     const BC: bool,
->(
+ const L: bool>(
     op: *const u16,
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
@@ -289,7 +289,7 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
             0xfc => {
                 let p = |k: usize| {
                     scaled(
-                        residual_krow_product::<P, I, BC>(imgs, op, k, mode(RESIDUAL_MODES_2, k)),
+                        residual_krow_product::<P, I, BC, L>(imgs, op, k, mode(RESIDUAL_MODES_2, k)),
                         k,
                     )
                 };
@@ -305,10 +305,10 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
                 )
             }
             0x0f => {
-                let p0 = residual_krow_product::<P, I, BC>(imgs, op, 0, mode(RESIDUAL_MODES_29, 0));
+                let p0 = residual_krow_product::<P, I, BC, L>(imgs, op, 0, mode(RESIDUAL_MODES_29, 0));
                 let p = |k: usize| {
                     scaled(
-                        residual_krow_product::<P, I, BC>(imgs, op, k, mode(RESIDUAL_MODES_29, k)),
+                        residual_krow_product::<P, I, BC, L>(imgs, op, k, mode(RESIDUAL_MODES_29, k)),
                         k,
                     )
                 };
@@ -323,7 +323,7 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
 /// Shared dispatch inside the existing consumer, not one call per K-row.
 /// `op` addresses this K-row in the `P` layout.
 #[inline(always)]
-unsafe fn apply_b_mode<const P: bool>(
+unsafe fn apply_b_mode<const P: bool, const L: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
     mode: u8,
@@ -331,23 +331,23 @@ unsafe fn apply_b_mode<const P: bool>(
 ) -> (__m512i, __m512i) {
     unsafe {
         match mode {
-            1 => (apply_b_complement::<1, 8, P>(imgs, op), av),
-            2 => (apply_b_complement::<2, 8, P>(imgs, op), av),
-            3 => (apply_b_complement::<3, 8, P>(imgs, op), av),
-            4 => (apply_b_complement::<4, 8, P>(imgs, op), av),
-            5 => (apply_b_complement::<5, 8, P>(imgs, op), av),
-            6 => (apply_b_complement::<6, 8, P>(imgs, op), av),
-            7 => (apply_b_complement::<7, 8, P>(imgs, op), av),
-            8 => (apply_b_complement::<0, 7, P>(imgs, op), av),
-            9 => (apply_b_complement::<0, 6, P>(imgs, op), av),
-            10 => (apply_b_complement::<0, 5, P>(imgs, op), av),
-            11 => (apply_b_complement::<0, 4, P>(imgs, op), av),
-            12 => (apply_b_complement::<0, 3, P>(imgs, op), av),
-            13 => (apply_b_complement::<0, 2, P>(imgs, op), av),
-            14 => (apply_b_complement::<0, 1, P>(imgs, op), av),
+            1 => (apply_b_complement::<1, 8, P, L>(imgs, op), av),
+            2 => (apply_b_complement::<2, 8, P, L>(imgs, op), av),
+            3 => (apply_b_complement::<3, 8, P, L>(imgs, op), av),
+            4 => (apply_b_complement::<4, 8, P, L>(imgs, op), av),
+            5 => (apply_b_complement::<5, 8, P, L>(imgs, op), av),
+            6 => (apply_b_complement::<6, 8, P, L>(imgs, op), av),
+            7 => (apply_b_complement::<7, 8, P, L>(imgs, op), av),
+            8 => (apply_b_complement::<0, 7, P, L>(imgs, op), av),
+            9 => (apply_b_complement::<0, 6, P, L>(imgs, op), av),
+            10 => (apply_b_complement::<0, 5, P, L>(imgs, op), av),
+            11 => (apply_b_complement::<0, 4, P, L>(imgs, op), av),
+            12 => (apply_b_complement::<0, 3, P, L>(imgs, op), av),
+            13 => (apply_b_complement::<0, 2, P, L>(imgs, op), av),
+            14 => (apply_b_complement::<0, 1, P, L>(imgs, op), av),
             15 => (_mm512_setzero_si512(), av),
             _ => (
-                apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, op),
+                apply_x86_avx512_register_2img_krow_at::<P, L>(imgs.0, imgs.1, op),
                 _mm512_setzero_si512(),
             ),
         }
@@ -357,7 +357,7 @@ unsafe fn apply_b_mode<const P: bool>(
 /// Multi-image twin of [`apply_b_mode`]: `I = 2` is exactly [`apply_b_mode`];
 /// `I = 4`/`8` return the same pair from the multi-image applies.
 #[inline(always)]
-unsafe fn apply_b_mode_img<const P: bool, const I: u8>(
+unsafe fn apply_b_mode_img<const P: bool, const I: u8, const L: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
     mode: u8,
@@ -365,26 +365,26 @@ unsafe fn apply_b_mode_img<const P: bool, const I: u8>(
 ) -> (__m512i, __m512i) {
     unsafe {
         if I == 2 {
-            return apply_b_mode::<P>(imgs, op, mode, av);
+            return apply_b_mode::<P, L>(imgs, op, mode, av);
         }
         match mode {
-            1 => (apply_b_complement_img::<1, 8, P, I>(imgs, op), av),
-            2 => (apply_b_complement_img::<2, 8, P, I>(imgs, op), av),
-            3 => (apply_b_complement_img::<3, 8, P, I>(imgs, op), av),
-            4 => (apply_b_complement_img::<4, 8, P, I>(imgs, op), av),
-            5 => (apply_b_complement_img::<5, 8, P, I>(imgs, op), av),
-            6 => (apply_b_complement_img::<6, 8, P, I>(imgs, op), av),
-            7 => (apply_b_complement_img::<7, 8, P, I>(imgs, op), av),
-            8 => (apply_b_complement_img::<0, 7, P, I>(imgs, op), av),
-            9 => (apply_b_complement_img::<0, 6, P, I>(imgs, op), av),
-            10 => (apply_b_complement_img::<0, 5, P, I>(imgs, op), av),
-            11 => (apply_b_complement_img::<0, 4, P, I>(imgs, op), av),
-            12 => (apply_b_complement_img::<0, 3, P, I>(imgs, op), av),
-            13 => (apply_b_complement_img::<0, 2, P, I>(imgs, op), av),
-            14 => (apply_b_complement_img::<0, 1, P, I>(imgs, op), av),
+            1 => (apply_b_complement_img::<1, 8, P, I, L>(imgs, op), av),
+            2 => (apply_b_complement_img::<2, 8, P, I, L>(imgs, op), av),
+            3 => (apply_b_complement_img::<3, 8, P, I, L>(imgs, op), av),
+            4 => (apply_b_complement_img::<4, 8, P, I, L>(imgs, op), av),
+            5 => (apply_b_complement_img::<5, 8, P, I, L>(imgs, op), av),
+            6 => (apply_b_complement_img::<6, 8, P, I, L>(imgs, op), av),
+            7 => (apply_b_complement_img::<7, 8, P, I, L>(imgs, op), av),
+            8 => (apply_b_complement_img::<0, 7, P, I, L>(imgs, op), av),
+            9 => (apply_b_complement_img::<0, 6, P, I, L>(imgs, op), av),
+            10 => (apply_b_complement_img::<0, 5, P, I, L>(imgs, op), av),
+            11 => (apply_b_complement_img::<0, 4, P, I, L>(imgs, op), av),
+            12 => (apply_b_complement_img::<0, 3, P, I, L>(imgs, op), av),
+            13 => (apply_b_complement_img::<0, 2, P, I, L>(imgs, op), av),
+            14 => (apply_b_complement_img::<0, 1, P, I, L>(imgs, op), av),
             15 => (_mm512_setzero_si512(), av),
             _ => (
-                apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, op),
+                apply_x86_avx512_register_img_krow_at::<I, P, L>(imgs.0, imgs.1, op),
                 _mm512_setzero_si512(),
             ),
         }
@@ -403,7 +403,7 @@ unsafe fn apply_b_complement_img<
     const END: usize,
     const P: bool,
     const I: u8,
->(
+ const L: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> __m512i {
@@ -509,7 +509,7 @@ unsafe fn apply_b_complement_img<
 /// Either way a word is read only when one of its bytes is live, and every
 /// byte is complemented, extracted and applied exactly as before.
 #[inline(always)]
-unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool>(
+unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool, const L: bool>(
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> __m512i {
@@ -711,13 +711,13 @@ mod tests {
             let mut got = Output([0xA5; 64]);
             let mut expected = Output([0x5A; 64]);
             unsafe {
-                shift_reduce_bcomplement_offw_nt2::<false>(
+                shift_reduce_bcomplement_offw_nt2::<false, false>(
                     off.as_ptr(),
                     &mut got.0,
                     table.image_ptrs(),
                     blk,
                 );
-                super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<false>(
+                super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<false, false>(
                     off.as_ptr(),
                     &mut expected.0,
                     table.image_ptrs(),
@@ -800,36 +800,36 @@ mod tests {
                 check!(
                     "horner nt2",
                     blk,
-                    horner_nt2::<false>(pw, &mut got_w.0, imgs),
-                    horner_nt2::<true>(pp, &mut got_p.0, imgs)
+                    horner_nt2::<false, false>(pw, &mut got_w.0, imgs),
+                    horner_nt2::<true, false>(pp, &mut got_p.0, imgs)
                 );
                 check!(
                     "horner temporal",
                     blk,
-                    horner::<false>(pw, &mut got_w.0, 0, imgs),
-                    horner::<true>(pp, &mut got_p.0, 0, imgs)
+                    horner::<false, false>(pw, &mut got_w.0, 0, imgs),
+                    horner::<true, false>(pp, &mut got_p.0, 0, imgs)
                 );
                 for keep in [0xfcu8, 0x0f] {
                     check!(
                         "residual",
                         blk,
-                        residual::<false>(pw, &mut got_w.0, imgs, keep),
-                        residual::<true>(pp, &mut got_p.0, imgs, keep)
+                        residual::<false, false>(pw, &mut got_w.0, imgs, keep),
+                        residual::<true, false>(pp, &mut got_p.0, imgs, keep)
                     );
                 }
                 check!(
                     "bcomplement runtime",
                     blk,
-                    bcomp::<false>(pw, &mut got_w.0, imgs, blk),
-                    bcomp::<true>(pp, &mut got_p.0, imgs, blk)
+                    bcomp::<false, false>(pw, &mut got_w.0, imgs, blk),
+                    bcomp::<true, false>(pp, &mut got_p.0, imgs, blk)
                 );
                 // The parity B-complement must also still equal the generic
                 // kernel (the structural-0xff bytes are set above).
                 check!(
                     "bcomplement parity vs generic",
                     blk,
-                    horner_nt2::<false>(pw, &mut got_w.0, imgs),
-                    bcomp::<true>(pp, &mut got_p.0, imgs, blk)
+                    horner_nt2::<false, false>(pw, &mut got_w.0, imgs),
+                    bcomp::<true, false>(pp, &mut got_p.0, imgs, blk)
                 );
                 macro_rules! const_blk {
                     ($($n:literal),*) => {
@@ -837,8 +837,8 @@ mod tests {
                             $($n => check!(
                                 "bcomplement const",
                                 blk,
-                                bcomp_const::<$n, false>(pw, &mut got_w.0, imgs),
-                                bcomp_const::<$n, true>(pp, &mut got_p.0, imgs)
+                                bcomp_const::<$n, false, false>(pw, &mut got_w.0, imgs),
+                                bcomp_const::<$n, true, false>(pp, &mut got_p.0, imgs)
                             ),)*
                             _ => {}
                         }
@@ -917,9 +917,9 @@ mod tests {
                         expected.0 = [0xA5; 64];
                         unsafe {
                             if layout {
-                                residual::<true>(op, &mut expected.0, imgs, keep);
+                                residual::<true, false>(op, &mut expected.0, imgs, keep);
                             } else {
-                                residual::<false>(op, &mut expected.0, imgs, keep);
+                                residual::<false, false>(op, &mut expected.0, imgs, keep);
                             }
                             _mm_sfence();
                         }
@@ -928,11 +928,11 @@ mod tests {
                                 got.0 = [0x5A; 64];
                                 unsafe {
                                     if layout {
-                                        shift_reduce_residual_offw_nt2_img::<true, $i, $bc>(
+                                        shift_reduce_residual_offw_nt2_img::<true, $i, $bc, false>(
                                             op, &mut got.0, imgs, keep,
                                         );
                                     } else {
-                                        shift_reduce_residual_offw_nt2_img::<false, $i, $bc>(
+                                        shift_reduce_residual_offw_nt2_img::<false, $i, $bc, false>(
                                             op, &mut got.0, imgs, keep,
                                         );
                                     }
@@ -959,11 +959,11 @@ mod tests {
                                     expected.0 = [0xA5; 64];
                                     unsafe {
                                         if layout {
-                                            shift_reduce_bcomplement_offw_nt2_const::<$n, true>(
+                                            shift_reduce_bcomplement_offw_nt2_const::<$n, true, false>(
                                                 op, &mut expected.0, imgs,
                                             );
                                         } else {
-                                            shift_reduce_bcomplement_offw_nt2_const::<$n, false>(
+                                            shift_reduce_bcomplement_offw_nt2_const::<$n, false, false>(
                                                 op, &mut expected.0, imgs,
                                             );
                                         }
@@ -973,10 +973,10 @@ mod tests {
                                         got.0 = [0x5A; 64];
                                         unsafe {
                                             match (layout, images) {
-                                                (true, 4) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, true, 4>(op, &mut got.0, imgs),
-                                                (false, 4) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, false, 4>(op, &mut got.0, imgs),
-                                                (true, _) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, true, 8>(op, &mut got.0, imgs),
-                                                (false, _) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, false, 8>(op, &mut got.0, imgs),
+                                                (true, 4) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, true, 4, false>(op, &mut got.0, imgs),
+                                                (false, 4) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, false, 4, false>(op, &mut got.0, imgs),
+                                                (true, _) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, true, 8, false>(op, &mut got.0, imgs),
+                                                (false, _) => shift_reduce_bcomplement_offw_nt2_const_img::<$n, false, 8, false>(op, &mut got.0, imgs),
                                             }
                                             _mm_sfence();
                                         }

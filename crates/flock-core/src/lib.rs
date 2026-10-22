@@ -18,6 +18,7 @@
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
 pub mod bits;
+pub mod calib;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;
@@ -185,6 +186,7 @@ pub(crate) mod topology_pool {
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .start_handler(move |i| {
+                    crate::hot_pool::record_top();
                     if let Some(&cpu) = o2.get(i) {
                         pin_to(cpu);
                     }
@@ -493,6 +495,129 @@ fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 /// Schedule only: the closure runs to completion before this returns, on the
 /// same pool, with the same work. `FLOCK_NO_IN_POOL=1` restores the direct
 /// call, and a caller that is already a worker takes the direct call anyway.
+/// Keep the calling pool's idle workers out of rayon's sleep path for the
+/// duration of a latency-bound phase.
+///
+/// The PCS open (and similar tails) alternates short serial Fiat–Shamir steps
+/// with many small parallel regions. Any serial step longer than rayon's
+/// spin window parks the idle workers on their condvars, so the next region
+/// starts with a wake cascade (one futex wake per stolen split, each paying
+/// the sleeping CPU's wake-up latency). A ranked prove performs ~200 such
+/// sleep/wake cycles inside the open alone.
+///
+/// [`HotPool::start`] posts one job to every other worker of the current pool
+/// (`spawn_broadcast`, so each worker runs only its own copy). Picked up at
+/// the worker's top level, the job loops on [`rayon::yield_now`] — running
+/// any pending work (local deque, broadcasts, steals, injected jobs) exactly
+/// as an idle worker would, pausing otherwise — until the guard is dropped.
+/// Picked up nested inside another job's `join` wait it returns at once, so
+/// it can never hold that wait open. Work placement and arithmetic are
+/// unchanged, so proof bytes are identical. Whether it runs is a
+/// [`crate::calib`] variant (the warm-up keeps it only where it pays);
+/// `FLOCK_NO_HOT_POOL=1` disables it outright.
+pub mod hot_pool {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn enabled() -> bool {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT_POOL").is_some());
+        crate::calib::HOT_POOL.get() && !*OFF
+    }
+
+    std::thread_local! {
+        /// Stack address recorded by the pool's start handler, i.e. the
+        /// depth of the worker's idle loop. Zero on threads that never
+        /// recorded it (any pool other than the pinned ranked one).
+        static TOP_SP: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Spinners within this many bytes of the recorded idle-loop depth run
+    /// at the worker's top level (measured: ~0.6 KiB; anything nested inside
+    /// another job sits at least ~2 KiB deeper).
+    const TOP_LEVEL_DEPTH: usize = 1024;
+
+    /// Record this worker's idle-loop stack depth. Called from the ranked
+    /// pool's start handler.
+    #[inline(never)]
+    pub(crate) fn record_top() {
+        let marker = 0u8;
+        TOP_SP.with(|t| t.set(core::hint::black_box(&marker) as *const u8 as usize));
+    }
+
+    /// Whether the caller runs directly under the worker's idle loop. A job
+    /// picked up while the worker waits inside another job's `join` is
+    /// nested, and must not hold that wait open.
+    #[inline(never)]
+    fn at_top_level() -> bool {
+        let marker = 0u8;
+        let here = core::hint::black_box(&marker) as *const u8 as usize;
+        let top = TOP_SP.with(|t| t.get());
+        top != 0 && here <= top && top - here < TOP_LEVEL_DEPTH
+    }
+
+    fn spins_per_job() -> usize {
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_HOT_POOL_SPINS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+        });
+        *V
+    }
+
+    /// One bounded keep-alive slice. Runs only directly under the worker's
+    /// idle loop; then re-queues itself (the worker's own idle loop pops it
+    /// straight back) so rayon regains control between slices.
+    fn spinner(run: Arc<AtomicBool>, owner: usize, backoff: usize) {
+        if rayon::current_thread_index() == Some(owner) || !at_top_level() {
+            return;
+        }
+        for _ in 0..spins_per_job() {
+            if !run.load(Ordering::Acquire) {
+                return;
+            }
+            if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                for _ in 0..backoff {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        rayon::spawn(move || spinner(run, owner, backoff));
+    }
+
+    /// Active keep-alive window; dropping it releases the workers.
+    pub struct HotPool(Arc<AtomicBool>);
+
+    impl HotPool {
+        /// Start a window on the current pool. `None` off a worker thread
+        /// (nothing to keep alive) or when disabled.
+        pub fn start() -> Option<Self> {
+            if !enabled() {
+                return None;
+            }
+            let owner = rayon::current_thread_index()?;
+            let n = rayon::current_num_threads();
+            // Under the pinned ranked pool worker `i` and `i + n/2` share a
+            // physical core; that sibling backs off harder so the owner's
+            // serial Fiat–Shamir steps keep most of their core.
+            let sibling = (owner + n / 2) % n.max(1);
+            let run = Arc::new(AtomicBool::new(true));
+            let flag = run.clone();
+            rayon::spawn_broadcast(move |ctx| {
+                let me = ctx.index();
+                if me != owner {
+                    spinner(flag.clone(), owner, if me == sibling { 64 } else { 8 });
+                }
+            });
+            Some(Self(run))
+        }
+    }
+
+    impl Drop for HotPool {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
