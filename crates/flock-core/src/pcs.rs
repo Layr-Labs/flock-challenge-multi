@@ -27,7 +27,7 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
+    Commitment, FusedTop, PcsParams, ProverData, commit, commit_into, prefault_codeword_during, prefault_codeword_during_fused,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -257,6 +257,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         )
     };
     crate::gaptime::mark("open: ligerito recursive prover done");
+    crate::calib::TAIL.end();
     if trace {
         eprintln!(
             "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",

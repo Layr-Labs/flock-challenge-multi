@@ -326,6 +326,11 @@ fn finalize_commit(
     let regroup_subtree_parents =
         subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
     let local_levels = AtomicUsize::new(usize::MAX);
+    let blocks_done: Vec<AtomicUsize> = if regroup_subtree_parents {
+        (0..n_leaves.div_ceil(RANKED_PARENT_SUBGROUP_LEAVES)).map(|_| AtomicUsize::new(0)).collect()
+    } else {
+        Vec::new()
+    };
 
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
@@ -374,12 +379,29 @@ fn finalize_commit(
             // The deep block-fused schedule retires sixteen 128-leaf blocks
             // per 2048-leaf subgroup. Keep hashing each block's leaves at
             // retirement for producer/consumer overlap, but fold parents
-            // only when the subgroup's final FIFO block arrives. At that
-            // point all 2048 leaf CVs are ready, so one depth-11 fold fills
-            // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
-            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
-            else {
-                return;
+            // only once all sixteen of the subgroup's blocks are hashed. At
+            // that point all 2048 leaf CVs are ready, so one depth-11 fold
+            // fills the BLAKE3 SIMD lanes that sixteen depth-7 folds leave
+            // sparse. Either sibling of the paired deep pass may hash a
+            // block, so blocks can complete out of order: a per-subgroup
+            // counter (AcqRel, so the last hasher sees every leaf CV) elects
+            // the thread that hashed the last one to fold.
+            let parent_range = if regroup_subtree_parents
+                && range.len() == RANKED_PARENT_BLOCK_LEAVES
+                && range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
+            {
+                let sub = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
+                let done = blocks_done[sub].fetch_add(1, Ordering::AcqRel) + 1;
+                if done != RANKED_PARENT_SUBGROUP_LEAVES / RANKED_PARENT_BLOCK_LEAVES {
+                    return;
+                }
+                sub * RANKED_PARENT_SUBGROUP_LEAVES..(sub + 1) * RANKED_PARENT_SUBGROUP_LEAVES
+            } else {
+                let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
+                else {
+                    return;
+                };
+                parent_range
             };
             let parent_range = if merkle_cut_depth == 1 {
                 (parent_range.start >> 1)..(parent_range.end >> 1)
@@ -1354,6 +1376,142 @@ pub fn prefault_codeword_during<R>(
         let r = generate();
         (Some(h.join().unwrap()), r)
     })
+}
+
+/// Commit seed+top pass fused into the witness producer (ranked shape only).
+///
+/// The producer builds the witness in units of 256 blocks `c0 + 1024·m`;
+/// those are exactly the message rows read by seed+top tasks `2·c0` and
+/// `2·c0 + 1`, so after a unit it runs both tasks from its cached copy
+/// ([`FusedTop::run_unit`]) and writes their outputs into the codeword
+/// buffer the commit will use. [`FusedTop::finish`] marks the buffer so the
+/// commit's encode starts at layer 9. Same butterflies, same twiddles, same
+/// lane bounds on the same rows: the codeword is byte-identical.
+pub struct FusedTop {
+    ntt: AdditiveNttF128,
+    codeword: usize,
+    codeword_len: usize,
+    msg_len: usize,
+    _tail: crate::ntt::additive_ntt_f128::ZeroOddTailLanes,
+}
+
+// SAFETY: the raw codeword address is only written through disjoint task row
+// sets (distinct `c0`), exactly as the parallel seed+top pass writes it.
+unsafe impl Send for FusedTop {}
+unsafe impl Sync for FusedTop {}
+
+static FUSED_TOP: std::sync::Mutex<Option<FusedTop>> = std::sync::Mutex::new(None);
+
+impl FusedTop {
+    /// Hand the next ranked witness producer a fused seed+top over `codeword`.
+    pub fn offer(params: &PcsParams, codeword: &mut [F128], zero_odd_tail_lanes: usize) {
+        let ok = params.n_positions() == 1 << 20
+            && params.num_ntts() == 64
+            && codeword.len() == params.n_positions() * params.num_ntts()
+            && 1usize << params.log_msg_len() == codeword.len() / 2;
+        let ft = ok.then(|| FusedTop {
+            ntt: AdditiveNttF128::standard(params.k_code()),
+            codeword: codeword.as_mut_ptr() as usize,
+            codeword_len: codeword.len(),
+            msg_len: codeword.len() / 2,
+            _tail: crate::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
+                params.num_ntts(),
+                zero_odd_tail_lanes,
+            ),
+        });
+        *FUSED_TOP.lock().unwrap() = ft;
+    }
+
+    /// Withdraw an offer that no producer took.
+    pub fn withdraw() {
+        FUSED_TOP.lock().unwrap().take();
+    }
+
+    /// Take the pending offer (the ranked strided producer).
+    pub fn take() -> Option<FusedTop> {
+        FUSED_TOP.lock().unwrap().take()
+    }
+
+    /// Run seed+top tasks `2·c0`, `2·c0 + 1` from `staging` (256 cached
+    /// message blocks, block m = `c0 + 1024·m` at `m · 128` F128s). `z` is the
+    /// full message (only its length and address are used). Returns false
+    /// when this build's seed+top route cannot run per unit (nothing written).
+    ///
+    /// # Safety
+    /// `staging` holds the unit's 256 final message blocks; no other thread
+    /// runs the same `c0`; `z` has `msg_len` elements.
+    pub unsafe fn run_unit(&self, z: *const F128, staging: *const F128, c0: usize) -> bool {
+        unsafe {
+            let msg = std::slice::from_raw_parts(z, self.msg_len);
+            let data = std::slice::from_raw_parts_mut(self.codeword as *mut F128, self.codeword_len);
+            let odd_tail = crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(20, 64);
+            self.ntt.seed_top_fused8_pass_ex(
+                msg,
+                data,
+                64,
+                20,
+                odd_tail,
+                Some(crate::ntt::additive_ntt_f128::SeedTopUnit { staging, c0 }),
+            )
+        }
+    }
+
+    /// Run `n_units` produce/consume units on SMT sibling pairs (see
+    /// `ntt::additive_ntt_f128::paired_units`); false = not run.
+    ///
+    /// # Safety
+    /// As `paired_units`.
+    pub unsafe fn paired_units(
+        n_units: usize,
+        slot_len: usize,
+        produce: &(dyn Fn(usize, *mut F128) + Sync),
+        consume: &(dyn Fn(usize, *const F128) + Sync),
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            crate::ntt::additive_ntt_f128::paired_units(n_units, slot_len, produce, consume)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (n_units, slot_len, produce, consume);
+            false
+        }
+    }
+
+    /// All 1024 units ran: the commit's encode skips layers 1..8.
+    pub fn finish(self) {
+        crate::ntt::additive_ntt_f128::PRETOPPED
+            .store(self.codeword, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// [`prefault_codeword_during`], and when the pooled codeword is already
+/// resident, offer it to the ranked witness producer as a [`FusedTop`] for
+/// the duration of `generate` (`FLOCK_WIT_FUSE_TOP=1`).
+pub fn prefault_codeword_during_fused<R>(
+    params: &PcsParams,
+    zero_odd_tail_lanes: usize,
+    generate: impl FnOnce() -> R,
+) -> (Option<Vec<F128>>, R) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_WIT_FUSE_TOP").is_some_and(|v| v != "0")
+    });
+    // A mark is only ever valid for the encode right after the witness phase
+    // that set it; never let one survive into a later prove's buffer.
+    crate::ntt::additive_ntt_f128::PRETOPPED.store(0, std::sync::atomic::Ordering::Release);
+    if !(*ON || crate::calib::WITNESS_FUSE.get()) || rayon::current_num_threads() <= 1 {
+        return prefault_codeword_during(params, generate);
+    }
+    let codeword_len = params.n_positions() * params.num_ntts();
+    match crate::scratch::try_take_f128(codeword_len) {
+        Some(mut buf) => {
+            FusedTop::offer(params, &mut buf, zero_odd_tail_lanes);
+            let r = generate();
+            FusedTop::withdraw();
+            (Some(buf), r)
+        }
+        None => prefault_codeword_during(params, generate),
+    }
 }
 
 #[cfg(test)]
