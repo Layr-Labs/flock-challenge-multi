@@ -311,7 +311,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for n in [1usize, 3, 4, 5, 8, 13, 64, 257] {
+        for n in [0usize, 1, 2, 3, 4, 5, 8, 13, 64, 257] {
             let src: Vec<F128> = (0..16 * n)
                 .map(|_| F128 {
                     lo: next(),
@@ -395,6 +395,48 @@ mod tests {
             fold4_nested(&mid4, &mut want, r0, r1);
             fold64_banked_nested(&src, &mut got, &w, r0, r1);
             assert_eq!(got, want, "n={n}");
+        }
+    }
+
+    #[test]
+    fn fold64_banked_nested_edge_coefficients_and_dirty_tail() {
+        use super::*;
+        let high = F128 {
+            lo: u64::MAX,
+            hi: 1u64 << 63,
+        };
+        for n in [0usize, 1, 2, 3, 4, 5, 8, 13] {
+            // Offset the source so SIMD loads cannot assume 64-byte alignment.
+            let storage: Vec<F128> = (0..64 * n + 1)
+                .map(|i| F128 {
+                    lo: (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                    hi: !(i as u64),
+                })
+                .collect();
+            let src = &storage[1..];
+            for coefficient in [F128::ZERO, F128::ONE, high] {
+                let w = [coefficient; 16];
+                for (r0, r1) in [
+                    (F128::ZERO, F128::ONE),
+                    (F128::ONE, F128::ZERO),
+                    (high, high),
+                ] {
+                    let mut mid4 = vec![F128::ZERO; 4 * n];
+                    let mut want = vec![F128::ZERO; n];
+                    let mut guarded = vec![high; n + 2];
+                    let got = &mut guarded[1..n + 1];
+                    fold16_banked(src, &mut mid4, &w);
+                    fold4_nested(&mid4, &mut want, r0, r1);
+                    fold64_banked_nested(src, got, &w, r0, r1);
+                    assert_eq!(
+                        got,
+                        &want[..],
+                        "n={n}, coefficient={coefficient:?}, r0={r0:?}, r1={r1:?}"
+                    );
+                    assert_eq!(guarded[0], high, "prefix guard n={n}");
+                    assert_eq!(guarded[n + 1], high, "suffix guard n={n}");
+                }
+            }
         }
     }
 
