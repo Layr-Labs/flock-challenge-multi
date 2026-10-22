@@ -561,6 +561,34 @@ impl DeepQueue {
         self.head.store(h + 1, Ordering::Release);
         true
     }
+    /// Publish a block only if the ring has room within `depth`.
+    fn try_push(&self, b: DeepBlock, depth: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        if h - self.tail.load(Ordering::Acquire) >= depth || self.gone.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: the slot is free (checked above) and only this producer
+        // writes it.
+        unsafe {
+            *self.slots[h % Self::CAP].get() = b;
+        }
+        self.head.store(h + 1, Ordering::Release);
+        true
+    }
+    /// Take the next published block, if any, without waiting.
+    fn try_pop(&self) -> Option<DeepBlock> {
+        use std::sync::atomic::Ordering;
+        let t = self.tail.load(Ordering::Relaxed);
+        if self.head.load(Ordering::Acquire) > t {
+            // SAFETY: published by the producer with Release before the
+            // Acquire load above.
+            let b = unsafe { *self.slots[t % Self::CAP].get() };
+            self.tail.store(t + 1, Ordering::Release);
+            return Some(b);
+        }
+        None
+    }
     fn pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
         let t = self.tail.load(Ordering::Relaxed);
@@ -584,6 +612,17 @@ impl DeepQueue {
             std::hint::spin_loop();
         }
     }
+}
+
+/// `FLOCK_NO_NTT_DEEP_BALANCE=1` restores the strict roles of the paired
+/// deep pass: the producer waits for ring space and the consumer only hashes.
+/// By default an idle consumer transforms whole unclaimed sub-groups itself
+/// and a producer facing a full ring hashes that block inline.
+#[cfg(target_os = "linux")]
+fn deep_balance_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BALANCE").is_none());
+    *ON
 }
 
 /// Line-hint level for the deep pass's fused-four row driver under the
@@ -3731,6 +3770,7 @@ impl AdditiveNttF128 {
                     let n_pairs = pairs.len();
                     let depth = deep_split_depth();
                     let hint = deep_pf_hint();
+                    let balance = deep_balance_enabled();
                     let queues: Vec<DeepQueue> = (0..n_pairs).map(|_| DeepQueue::new()).collect();
                     let next_sub = AtomicUsize::new(0);
                     let base_addr = data.as_mut_ptr() as usize;
@@ -3783,7 +3823,12 @@ impl AdditiveNttF128 {
                                     lo: range.start,
                                     hi: range.end,
                                 };
-                                if !q.push(b, depth) {
+                                let queued = if balance {
+                                    q.try_push(b, depth)
+                                } else {
+                                    q.push(b, depth)
+                                };
+                                if !queued {
                                     cb(range, blk);
                                 }
                             };
@@ -3806,6 +3851,48 @@ impl AdditiveNttF128 {
                                         i * sub_size_positions..(i + 1) * sub_size_positions,
                                         sub_data,
                                     );
+                                }
+                            }
+                        } else if balance {
+                            // Hash whatever the paired producer has published;
+                            // while its ring is empty, transform and hash a
+                            // whole unclaimed sub-group here instead of
+                            // spinning. Leaves are written by index, so the
+                            // tree is the same whichever sibling hashes a
+                            // block.
+                            loop {
+                                if let Some(b) = q.try_pop() {
+                                    // SAFETY: as below.
+                                    let blk = unsafe {
+                                        std::slice::from_raw_parts(b.ptr as *const F128, b.len_f128)
+                                    };
+                                    cb(b.lo..b.hi, blk);
+                                    continue;
+                                }
+                                if q.done.load(Ordering::Acquire) {
+                                    if q.head.load(Ordering::Acquire) > q.tail.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                let i = next_sub.fetch_add(1, Ordering::Relaxed);
+                                if i < n_subs {
+                                    // SAFETY: `i` is claimed by exactly one
+                                    // worker, as on the producer side.
+                                    let sub_data = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            (base_addr as *mut F128).add(i * sub_bytes),
+                                            sub_bytes,
+                                        )
+                                    };
+                                    if !deep_sub(i, sub_data, Some(cb), hint) {
+                                        cb(
+                                            i * sub_size_positions..(i + 1) * sub_size_positions,
+                                            sub_data,
+                                        );
+                                    }
+                                } else {
+                                    std::hint::spin_loop();
                                 }
                             }
                         } else {

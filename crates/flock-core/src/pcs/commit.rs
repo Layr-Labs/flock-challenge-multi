@@ -326,6 +326,11 @@ fn finalize_commit(
     let regroup_subtree_parents =
         subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
     let local_levels = AtomicUsize::new(usize::MAX);
+    let blocks_done: Vec<AtomicUsize> = if regroup_subtree_parents {
+        (0..n_leaves.div_ceil(RANKED_PARENT_SUBGROUP_LEAVES)).map(|_| AtomicUsize::new(0)).collect()
+    } else {
+        Vec::new()
+    };
 
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
@@ -374,12 +379,29 @@ fn finalize_commit(
             // The deep block-fused schedule retires sixteen 128-leaf blocks
             // per 2048-leaf subgroup. Keep hashing each block's leaves at
             // retirement for producer/consumer overlap, but fold parents
-            // only when the subgroup's final FIFO block arrives. At that
-            // point all 2048 leaf CVs are ready, so one depth-11 fold fills
-            // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
-            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
-            else {
-                return;
+            // only once all sixteen of the subgroup's blocks are hashed. At
+            // that point all 2048 leaf CVs are ready, so one depth-11 fold
+            // fills the BLAKE3 SIMD lanes that sixteen depth-7 folds leave
+            // sparse. Either sibling of the paired deep pass may hash a
+            // block, so blocks can complete out of order: a per-subgroup
+            // counter (AcqRel, so the last hasher sees every leaf CV) elects
+            // the thread that hashed the last one to fold.
+            let parent_range = if regroup_subtree_parents
+                && range.len() == RANKED_PARENT_BLOCK_LEAVES
+                && range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
+            {
+                let sub = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
+                let done = blocks_done[sub].fetch_add(1, Ordering::AcqRel) + 1;
+                if done != RANKED_PARENT_SUBGROUP_LEAVES / RANKED_PARENT_BLOCK_LEAVES {
+                    return;
+                }
+                sub * RANKED_PARENT_SUBGROUP_LEAVES..(sub + 1) * RANKED_PARENT_SUBGROUP_LEAVES
+            } else {
+                let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
+                else {
+                    return;
+                };
+                parent_range
             };
             let parent_range = if merkle_cut_depth == 1 {
                 (parent_range.start >> 1)..(parent_range.end >> 1)
