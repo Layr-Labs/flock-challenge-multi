@@ -434,15 +434,31 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c<
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
-        a_packed, b_packed, c_packed, c_identity_z, None, m, padding, ab_inner, challenger,
+        a_packed,
+        b_packed,
+        c_packed,
+        c_identity_z,
+        None,
+        m,
+        padding,
+        ab_inner,
+        challenger,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots<C: Challenger>(
-    a_packed: &[u8], b_packed: &[u8], c_packed: &[u8], c_identity_z: &[F128],
-    roots: Option<&crate::lincheck::RootFoldSource>, m: usize, padding: &PaddingSpec,
-    ab_inner: univariate_skip_optimized::Round1AbInner, challenger: &mut C,
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    roots: Option<&crate::lincheck::RootFoldSource>,
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
@@ -569,8 +585,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
             let ranked_one_rows = ab_inner.ranked_one_rows_elided();
             let w30_elided = ab_inner.ranked_w30_elided();
-            let capture_canon = ranked_one_rows
-                && (multilinear::round2_canonical_elide_enabled() || w30_elided);
+            let capture_canon =
+                ranked_one_rows && (multilinear::round2_canonical_elide_enabled() || w30_elided);
             // The two halves are independent (round one has no Fiat-Shamir
             // dependency inside it), so run them concurrently rather than
             // back to back: each alone reaches only ~35 GB/s, while the pair
@@ -739,6 +755,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128_slice(&round1_c);
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
+    let _hot_pool = crate::hot_pool::HotPool::start();
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -1031,6 +1048,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next,
                 eq_override,
                 lm_out,
+                r2_canon_rows.is_some(),
             );
             a_mlv = a4;
             b_mlv = b4;

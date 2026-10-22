@@ -185,6 +185,7 @@ pub(crate) mod topology_pool {
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
                 .start_handler(move |i| {
+                    crate::hot_pool::record_top();
                     if let Some(&cpu) = o2.get(i) {
                         pin_to(cpu);
                     }
@@ -480,6 +481,95 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 /// Prewarm marker ab
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 
+pub mod hot_pool {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn enabled() -> bool {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT_POOL").is_some());
+        !*OFF
+    }
+
+    std::thread_local! {
+        static TOP_SP: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    const TOP_LEVEL_DEPTH: usize = 1024;
+
+    #[inline(never)]
+    pub(crate) fn record_top() {
+        let marker = 0u8;
+        TOP_SP.with(|t| t.set(core::hint::black_box(&marker) as *const u8 as usize));
+    }
+
+    #[inline(never)]
+    fn at_top_level() -> bool {
+        let marker = 0u8;
+        let here = core::hint::black_box(&marker) as *const u8 as usize;
+        let top = TOP_SP.with(|t| t.get());
+        top != 0 && here <= top && top - here < TOP_LEVEL_DEPTH
+    }
+
+    fn spins_per_job() -> usize {
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_HOT_POOL_SPINS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048)
+        });
+        *V
+    }
+
+    fn spinner(run: Arc<AtomicBool>, owner: usize, backoff: usize) {
+        if rayon::current_thread_index() == Some(owner) || !at_top_level() {
+            return;
+        }
+        for _ in 0..spins_per_job() {
+            if !run.load(Ordering::Acquire) {
+                return;
+            }
+            if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                for _ in 0..backoff {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        rayon::spawn(move || spinner(run, owner, backoff));
+    }
+
+    pub struct HotPool(Arc<AtomicBool>);
+
+    impl HotPool {
+        pub fn start() -> Option<Self> {
+            if !enabled() {
+                return None;
+            }
+            if TOP_SP.with(|top| top.get()) == 0 {
+                return None;
+            }
+            let owner = rayon::current_thread_index()?;
+            let n = rayon::current_num_threads();
+            let sibling = (owner + n / 2) % n.max(1);
+            let run = Arc::new(AtomicBool::new(true));
+            let flag = run.clone();
+            rayon::spawn_broadcast(move |ctx| {
+                let me = ctx.index();
+                if me != owner {
+                    spinner(flag.clone(), owner, if me == sibling { 64 } else { 8 });
+                }
+            });
+            Some(Self(run))
+        }
+    }
+
+    impl Drop for HotPool {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Run `op` on a pool worker instead of the calling thread.
 ///
 /// Every top-level parallel region opened from a NON-worker thread parks that
@@ -501,7 +591,6 @@ pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     }
     rayon::join(op, || ()).0
 }
-
 
 /// Best-effort `madvise(MADV_COLLAPSE)` over an already-touched buffer: where
 /// the first-touch faults lost the THP lottery under fragmentation, this asks
@@ -557,7 +646,6 @@ pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) -> bool {
     true
 }
 
-
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
@@ -587,7 +675,9 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     let bytes = n * core::mem::size_of::<T>();
     let tail = if bytes >= (2 << 20) {
         core::hint::black_box(EY_TAIL_PAGES) * 4096 / core::mem::size_of::<T>().max(1)
-    } else { 0 };
+    } else {
+        0
+    };
     LAST_ALLOC_RECYCLED.with(|c| c.set(false));
     let mut v: Vec<T> = Vec::with_capacity(n + tail);
     // SAFETY:

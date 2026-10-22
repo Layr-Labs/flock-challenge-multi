@@ -1320,8 +1320,7 @@ fn build_r2_eq_bake_checked(
     // Scaling a fold table's 64 basis columns scales every XOR-composed image
     // by the same factor, so the matrices of `c · fold` are the matrices of
     // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
-    let cols: [F128; 64] =
-        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
     let scaled = |c: F128| {
         let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
@@ -1663,8 +1662,7 @@ pub(crate) fn round2_canonical_window_deltas(
     assert_eq!(table.n_chunks, 8);
     assert_eq!(rows.len(), CANON_ROWS * 64);
     assert!(mlv_challenges.len() >= 8);
-    let cols: [F128; 64] =
-        std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
     let fold = |slot: usize| -> F128 {
         crate::pcs::ring_switch::inner_product(&cols, &rows[slot * 64..(slot + 1) * 64])
     };
@@ -2126,7 +2124,7 @@ pub fn fold2_from_packed_and_round_pair_lookahead_into(
 ) -> (F128, F128, Round3Lookahead) {
     fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho1, rho2, r_next4, None,
-        false,
+        false, false,
     )
 }
 
@@ -2149,7 +2147,18 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     r_next4: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
+    canonical_b: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    // The flag comes only from the private ranked AB + identity-C producer.
+    // Public arbitrary witnesses pass false. Full-block kernel guards remain
+    // in the dispatch wrapper, including chunk alignment and minimum size.
+    let _canonical_b_known = (canonical_b
+        && m == 32
+        && k_skip == 6
+        && table.n_chunks == 8
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15409)
+        .then(|| c4_canonical_b_constants(table, rho1, rho2));
     // Composed-fold coefficients: expanding the two pair-fold levels (char 2)
     // gives `out = Σ_k c_k · fold(row 4x+k)` with
     //   c₀=(1+ρ₁)(1+ρ₂)  c₁=ρ₁(1+ρ₂)  c₂=(1+ρ₁)ρ₂  c₃=ρ₁ρ₂,
@@ -2329,30 +2338,54 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             // protocol-fixed shape; the cfg gate supplies every feature.
             let out = unsafe {
                 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-                if fast_r34
-                    && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg)
-                {
+                if fast_r34 && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg) {
                     let ap = a_packed.as_ptr();
                     let bp = b_packed.as_ptr();
                     match (nt_out, out_lm) {
-                        (true, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (true, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (false, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
+                        (true, true) => kernels::x86_64::fold2_c4_with_canonical_b::<true, true>(
+                            ap,
+                            bp,
+                            out_base,
+                            a_out,
+                            b_out,
+                            lo_size,
+                            c,
+                            wt,
+                            _canonical_b_known.as_ref(),
+                        ),
+                        (true, false) => kernels::x86_64::fold2_c4_with_canonical_b::<true, false>(
+                            ap,
+                            bp,
+                            out_base,
+                            a_out,
+                            b_out,
+                            lo_size,
+                            c,
+                            wt,
+                            _canonical_b_known.as_ref(),
+                        ),
+                        (false, true) => kernels::x86_64::fold2_c4_with_canonical_b::<false, true>(
+                            ap,
+                            bp,
+                            out_base,
+                            a_out,
+                            b_out,
+                            lo_size,
+                            c,
+                            wt,
+                            _canonical_b_known.as_ref(),
+                        ),
                         (false, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
+                            kernels::x86_64::fold2_c4_with_canonical_b::<false, false>(
+                                ap,
+                                bp,
+                                out_base,
+                                a_out,
+                                b_out,
+                                lo_size,
+                                c,
+                                wt,
+                                _canonical_b_known.as_ref(),
                             )
                         }
                     }
@@ -3337,11 +3370,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let fast_plain = kernels::x86_64::fold2_plain_defer_wtab_route_ok(
-        split,
-        lo_size,
-        wtab_arg.is_some(),
-    );
+    let fast_plain =
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(split, lo_size, wtab_arg.is_some());
 
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -3370,56 +3400,72 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
                                 false,
                                 true,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, false, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 false,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, true, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 true,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, false, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 false,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, true, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 true,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, false, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 false,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, true, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 true,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, false, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 false,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                     }
                 } else {
@@ -4963,9 +5009,7 @@ mod tests {
             (64, true),
             (128, true),
         ];
-        for (&(lo_size, canon), unroll16) in
-            shapes.iter().flat_map(|s| [(s, true), (s, false)])
-        {
+        for (&(lo_size, canon), unroll16) in shapes.iter().flat_map(|s| [(s, true), (s, false)]) {
             let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
@@ -4987,8 +5031,7 @@ mod tests {
                         .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
                 }
             }
-            let bake =
-                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let bake = build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
             let mut a_s: [F128; 0] = [];
             let mut b_s: [F128; 0] = [];
             let out_s = round2_lookahead_chunk_scalar::<false>(
@@ -5114,10 +5157,18 @@ mod tests {
                 &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
             );
             let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
-            assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
+            assert_eq!(
+                full.0,
+                rest.0 + mlv[0] * d_g1,
+                "G(1) blocks_log={blocks_log}"
+            );
             assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
             for i in 0..6 {
-                assert_eq!(full.2.c[i], rest.2.c[i] + d_c[i], "c[{i}] blocks_log={blocks_log}");
+                assert_eq!(
+                    full.2.c[i],
+                    rest.2.c[i] + d_c[i],
+                    "c[{i}] blocks_log={blocks_log}"
+                );
             }
         }
     }
@@ -5162,15 +5213,32 @@ mod tests {
                     let eq = SplitEqGhash::with_n_hi(&mlv[1..], n_hi);
                     assert!((1usize << eq.n_lo) >= 32 && eq.n_lo < mlv.len());
                     let incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None,
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        None,
                     );
                     let hits = kernels::x86_64::R2_CANON_ELIDE_HITS
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let elided = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows),
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        Some(&rows),
                     );
                     assert!(
-                        kernels::x86_64::R2_CANON_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                        kernels::x86_64::R2_CANON_ELIDE_HITS
+                            .load(std::sync::atomic::Ordering::Relaxed)
                             > hits,
                         "elision never engaged"
                     );
@@ -5361,7 +5429,10 @@ mod tests {
             let mut rng = Rng::new(0x1A00 + log_n as u64);
             let n = 1usize << log_n;
             assert!(plain_cascade_lo_size(n).is_multiple_of(8), "log_n={log_n}");
-            assert!(plain_cascade_lo_size(n / 4).is_multiple_of(8), "log_n={log_n}");
+            assert!(
+                plain_cascade_lo_size(n / 4).is_multiple_of(8),
+                "log_n={log_n}"
+            );
             let a = rng.f128_vec(n);
             let b = rng.f128_vec(n);
             let (rho_a, rho_b, rho_c, rho_d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
@@ -5377,8 +5448,9 @@ mod tests {
 
             let mut a1 = vec![F128::ZERO; n / 4];
             let mut b1 = vec![F128::ZERO; n / 4];
-            let (m1, mi1, la1) =
-                fold2_plain_and_round_pair_lookahead_into(&a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1);
+            let (m1, mi1, la1) = fold2_plain_and_round_pair_lookahead_into(
+                &a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1,
+            );
             let mut a1l = vec![F128::ZERO; n / 4];
             let mut b1l = vec![F128::ZERO; n / 4];
             let (m1l, mi1l, la1l) = fold2_plain_and_round_pair_lookahead_into_lm(
@@ -5409,7 +5481,11 @@ mod tests {
                 } else {
                     (a2.clone(), b2.clone())
                 };
-                assert_eq!((m2, mi2), (m2l, mi2l), "reader msg log_n={log_n} out_lm={out_lm}");
+                assert_eq!(
+                    (m2, mi2),
+                    (m2l, mi2l),
+                    "reader msg log_n={log_n} out_lm={out_lm}"
+                );
                 assert_eq!(a_want, a2l, "reader a log_n={log_n} out_lm={out_lm}");
                 assert_eq!(b_want, b2l, "reader b log_n={log_n} out_lm={out_lm}");
                 assert_eq!(
@@ -5875,6 +5951,253 @@ mod tests {
         assert_eq!(plain_a_shared, plain_a_incumbent, "plain a output");
         assert_eq!(plain_b_shared, plain_b_incumbent, "plain b output");
         assert_eq!(plain_shared, plain_incumbent, "plain message/lookahead");
+    }
+
+    /// Pins the active NT/lane-major route and 64-byte output alignment.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn preserved_c4_ranked_shape_matches_scalar() {
+        #[repr(C, align(64))]
+        struct Aligned([F128; 4]);
+        for lo_size in [256usize, 1024] {
+            let mut rng = Rng::new(0x7c4011 + lo_size as u64);
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let out_base = 4 * lo_size;
+            let n_rows = 8 * (out_base + 2 * lo_size);
+            let ap: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let bp: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let rho1 = rng.f128();
+            let rho2 = rng.f128();
+            let one = F128::ONE;
+            let eq = rng.f128_vec(lo_size);
+            let wt = build_w_pair_table(&eq);
+            let cfold = kernels::x86_64::build_cfold_mats(
+                &table.data,
+                [
+                    (one + rho1) * (one + rho2),
+                    rho1 * (one + rho2),
+                    (one + rho1) * rho2,
+                    rho1 * rho2,
+                ],
+            );
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = a_s.clone();
+            let want = fold2_from_packed_lookahead_scalar(
+                &ap,
+                &bp,
+                &table,
+                out_base,
+                &mut a_s,
+                &mut b_s,
+                rho1,
+                rho2,
+                &eq,
+                0,
+                usize::MAX,
+            );
+            let mut aa: Vec<Aligned> = (0..lo_size / 2 + 2).map(|_| Aligned([one; 4])).collect();
+            let mut bb: Vec<Aligned> = (0..lo_size / 2 + 2).map(|_| Aligned([one; 4])).collect();
+            let a = unsafe {
+                core::slice::from_raw_parts_mut(aa.as_mut_ptr().add(1).cast::<F128>(), 2 * lo_size)
+            };
+            let b = unsafe {
+                core::slice::from_raw_parts_mut(bb.as_mut_ptr().add(1).cast::<F128>(), 2 * lo_size)
+            };
+            assert_eq!(a.as_ptr() as usize % 64, 0);
+            assert_eq!(b.as_ptr() as usize % 64, 0);
+            let got = unsafe {
+                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
+                    ap.as_ptr(),
+                    bp.as_ptr(),
+                    out_base,
+                    a,
+                    b,
+                    lo_size,
+                    &cfold,
+                    &wt,
+                )
+            };
+            assert_eq!(got, want, "message lo={lo_size}");
+            assert_eq!(a, lane_major_tiles(&a_s));
+            assert_eq!(b, lane_major_tiles(&b_s));
+            assert_eq!(aa.first().unwrap().0, [one; 4]);
+            assert_eq!(aa.last().unwrap().0, [one; 4]);
+            assert_eq!(bb.first().unwrap().0, [one; 4]);
+            assert_eq!(bb.last().unwrap().0, [one; 4]);
+        }
+    }
+
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    #[test]
+    fn boundary_pair_reordered_matches_scalar() {
+        #[repr(C, align(64))]
+        struct Aligned([F128; 4]);
+        for &(lo_size, offset) in &[
+            (16usize, 0usize),
+            (32, 0),
+            (64, 0),
+            (256, 0),
+            (1024, 0),
+            (32, 16),
+            (64, 16),
+        ] {
+            let mut rng = Rng::new(0x7c4011 + lo_size as u64);
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let out_base = 4 * lo_size + offset;
+            let n_rows = 8 * (out_base + 2 * lo_size);
+            let ap: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let mut bp: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            for block in bp.chunks_exact_mut(2048) {
+                block[..128].fill(255);
+                block[1920..].fill(0);
+                block[1920..1928].copy_from_slice(&0x0001ffffffffffffu64.to_le_bytes());
+            }
+            let rho1 = rng.f128();
+            let rho2 = rng.f128();
+            let one = F128::ONE;
+            let eq = rng.f128_vec(lo_size);
+            let wt = build_w_pair_table(&eq);
+            let cfold = kernels::x86_64::build_cfold_mats(
+                &table.data,
+                [
+                    (one + rho1) * (one + rho2),
+                    rho1 * (one + rho2),
+                    (one + rho1) * rho2,
+                    rho1 * rho2,
+                ],
+            );
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = a_s.clone();
+            let want = fold2_from_packed_lookahead_scalar(
+                &ap,
+                &bp,
+                &table,
+                out_base,
+                &mut a_s,
+                &mut b_s,
+                rho1,
+                rho2,
+                &eq,
+                0,
+                usize::MAX,
+            );
+            let known = c4_canonical_b_constants(&table, rho1, rho2);
+            if out_base % 64 == 0 && lo_size >= 32 {
+                assert_eq!(
+                    known,
+                    [
+                        b_s[0], b_s[1], b_s[2], b_s[3], b_s[60], b_s[61], b_s[62], b_s[63]
+                    ]
+                );
+            }
+            for alignment in 0..4usize {
+                for &(nt, lm) in &[(false, false), (false, true), (true, false), (true, true)] {
+                    let mut aa: Vec<Aligned> =
+                        (0..lo_size / 2 + 3).map(|_| Aligned([one; 4])).collect();
+                    let mut bb: Vec<Aligned> =
+                        (0..lo_size / 2 + 3).map(|_| Aligned([one; 4])).collect();
+                    let a = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            aa.as_mut_ptr().add(1).cast::<F128>().add(alignment),
+                            2 * lo_size,
+                        )
+                    };
+                    let b = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            bb.as_mut_ptr().add(1).cast::<F128>().add(alignment),
+                            2 * lo_size,
+                        )
+                    };
+                    assert_eq!(a.as_ptr() as usize % 64, alignment * 16);
+                    assert_eq!(b.as_ptr() as usize % 64, alignment * 16);
+                    macro_rules! invoke {($fun:ident,$nt:literal,$lm:literal $(,$k:expr)?)=>{unsafe{kernels::x86_64::$fun::<$nt,$lm>(ap.as_ptr(),bp.as_ptr(),out_base,a,b,lo_size,&cfold,&wt $(,$k)? )}};}
+                    let reference = match (nt, lm) {
+                        (false, false) => {
+                            invoke!(fold2_c4_with_canonical_b, false, false, None)
+                        }
+                        (false, true) => {
+                            invoke!(fold2_c4_with_canonical_b, false, true, None)
+                        }
+                        (true, false) => {
+                            invoke!(fold2_c4_with_canonical_b, true, false, None)
+                        }
+                        (true, true) => invoke!(fold2_c4_with_canonical_b, true, true, None),
+                    };
+                    assert_eq!(reference, want);
+                    assert_eq!(
+                        a,
+                        if lm {
+                            lane_major_tiles(&a_s)
+                        } else {
+                            a_s.clone()
+                        }
+                    );
+                    assert_eq!(
+                        b,
+                        if lm {
+                            lane_major_tiles(&b_s)
+                        } else {
+                            b_s.clone()
+                        }
+                    );
+                    a.fill(one);
+                    b.fill(one);
+                    let got = match (nt, lm) {
+                        (false, false) => {
+                            invoke!(fold2_c4_with_canonical_b, false, false, Some(&known))
+                        }
+                        (false, true) => {
+                            invoke!(fold2_c4_with_canonical_b, false, true, Some(&known))
+                        }
+                        (true, false) => {
+                            invoke!(fold2_c4_with_canonical_b, true, false, Some(&known))
+                        }
+                        (true, true) => {
+                            invoke!(fold2_c4_with_canonical_b, true, true, Some(&known))
+                        }
+                    };
+                    assert_eq!(got, want, "message lo={lo_size}");
+                    assert_eq!(
+                        a,
+                        if lm {
+                            lane_major_tiles(&a_s)
+                        } else {
+                            a_s.clone()
+                        }
+                    );
+                    assert_eq!(
+                        b,
+                        if lm {
+                            lane_major_tiles(&b_s)
+                        } else {
+                            b_s.clone()
+                        }
+                    );
+                    assert_eq!(aa.first().unwrap().0, [one; 4]);
+                    assert_eq!(aa.last().unwrap().0, [one; 4]);
+                    assert_eq!(bb.first().unwrap().0, [one; 4]);
+                    assert_eq!(bb.last().unwrap().0, [one; 4]);
+                }
+            }
+        }
     }
 
     /// AVX-512 packed→composed kernel vs the portable reference on one chunk,
@@ -6858,4 +7181,18 @@ mod tests {
             );
         }
     }
+}
+
+/// Constant canonical B boundary outputs derived from the linear fold table.
+/// No witness values or cached proof values enter this construction.
+fn c4_canonical_b_constants(table: &UniSkipFoldTable, rho1: F128, rho2: F128) -> [F128; 8] {
+    assert_eq!(table.n_chunks, 8);
+    let mut all = F128::ZERO;
+    let mut low49 = F128::ZERO;
+    for j in 0..8 {
+        all += table.data[256 * j + 255];
+        low49 += table.data[256 * j + ((0x0001ffffffffffffu64 >> (8 * j)) as u8 as usize)];
+    }
+    let tail = low49 * (F128::ONE + rho1) * (F128::ONE + rho2);
+    [all, all, all, all, tail, F128::ZERO, F128::ZERO, F128::ZERO]
 }
