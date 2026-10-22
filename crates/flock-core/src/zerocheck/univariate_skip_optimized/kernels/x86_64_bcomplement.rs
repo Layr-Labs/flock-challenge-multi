@@ -99,19 +99,14 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
         let av = apply(op.add(offw_krow_words::<P>(7)));
         let (bv, correction) =
             apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = krow_seed(av, bv, correction, modes as u8);
         let x = _mm512_set1_epi8(2);
         for k in (0..7usize).rev() {
             modes >>= 8;
             let av = apply(op.add(offw_krow_words::<P>(k)));
             let (bv, correction) =
                 apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_ternarylogic_epi64::<0x96>(
-                _mm512_gf2p8mul_epi8(acc, x),
-                product,
-                correction,
-            );
+            acc = krow_horner(acc, x, av, bv, correction, modes as u8);
         }
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
@@ -134,7 +129,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
             plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = krow_seed(av, bv, correction, plan.modes as u8);
         let x = _mm512_set1_epi8(2);
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
@@ -145,12 +140,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
                     (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
-                acc = _mm512_ternarylogic_epi64::<0x96>(
-                    _mm512_gf2p8mul_epi8(acc, x),
-                    product,
-                    correction,
-                );
+                acc = krow_horner(acc, x, av, bv, correction, (plan.modes >> $shift) as u8);
             }};
         }
         step!(6, 8);
@@ -194,7 +184,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
             plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+        let mut acc = krow_seed(av, bv, correction, plan.modes as u8);
         let x = _mm512_set1_epi8(2);
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
@@ -205,12 +195,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
                     (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
-                acc = _mm512_ternarylogic_epi64::<0x96>(
-                    _mm512_gf2p8mul_epi8(acc, x),
-                    product,
-                    correction,
-                );
+                acc = krow_horner(acc, x, av, bv, correction, (plan.modes >> $shift) as u8);
             }};
         }
         step!(6, 8);
@@ -249,7 +234,7 @@ unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool>(
         let b = op.add(64 + offw_krow_words::<P>(k));
         if BC && mode != 0 {
             let (bv, correction) = apply_b_mode_img::<P, I>(imgs, b, mode, av);
-            _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
+            krow_seed(av, bv, correction, mode)
         } else {
             _mm512_gf2p8mul_epi8(
                 av,
@@ -317,6 +302,45 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
             _ => core::hint::unreachable_unchecked(),
         };
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
+    }
+}
+
+#[inline(always)]
+unsafe fn krow_seed(av: __m512i, bv: __m512i, correction: __m512i, mode: u8) -> __m512i {
+    unsafe {
+        if mode == 15 {
+            correction
+        } else {
+            _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn krow_horner(
+    acc: __m512i,
+    x: __m512i,
+    av: __m512i,
+    bv: __m512i,
+    correction: __m512i,
+    mode: u8,
+) -> __m512i {
+    unsafe {
+        // Multiply-by-2 (xtime) is GF(2)-linear: one GF2P8AFFINEQB replaces the
+        // GF2P8MULB on the serial chain. Bit-matrix proven equal over all 256
+        // bytes; affine dispatches on two ports vs mul's single port, halving
+        // the serial-chain port pressure and shortening its latency.
+        let _ = x;
+        const XTIME_AFFINE: i64 = 0x4020108884028180u64 as i64;
+        let shifted = _mm512_gf2p8affine_epi64_epi8::<0>(
+            _mm512_set1_epi64(XTIME_AFFINE),
+            acc,
+        );
+        if mode == 15 {
+            _mm512_xor_si512(shifted, correction)
+        } else {
+            _mm512_ternarylogic_epi64::<0x96>(shifted, _mm512_gf2p8mul_epi8(av, bv), correction)
+        }
     }
 }
 
