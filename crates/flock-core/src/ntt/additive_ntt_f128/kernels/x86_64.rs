@@ -77,6 +77,87 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
     }
 }
 
+/// A split product represented as `lo + cross*x^64`, before the last
+/// polynomial reduction. The companion in `t` has already been reduced;
+/// this pair is only added to other pairs, never used as a field operand.
+///
+/// # Safety
+/// Requires AVX512F/BW and VPCLMULQDQ. LOW requires t.0's high limb zero;
+/// otherwise t.1 must equal t.0*x^64 modulo the field polynomial.
+#[inline(always)]
+unsafe fn mul_x4_split_accum<const LOW: bool>(t: TwX4, v: core::arch::x86_64::__m512i) -> TwX4 {
+    use core::arch::x86_64::*;
+    unsafe {
+        if LOW {
+            (
+                _mm512_clmulepi64_epi128::<0x00>(v, t.0),
+                _mm512_clmulepi64_epi128::<0x01>(v, t.0),
+            )
+        } else {
+            (
+                _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x00>(v, t.0),
+                    _mm512_clmulepi64_epi128::<0x01>(v, t.1),
+                ),
+                _mm512_xor_si512(
+                    _mm512_clmulepi64_epi128::<0x10>(v, t.0),
+                    _mm512_clmulepi64_epi128::<0x11>(v, t.1),
+                ),
+            )
+        }
+    }
+}
+
+/// # Safety
+/// Requires AVX512F/BW and VPCLMULQDQ; x represents lo + cross*x^64.
+#[inline(always)]
+unsafe fn reduce_x4_accum(x: TwX4) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    unsafe {
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        _mm512_xor_si512(
+            _mm512_xor_si512(x.0, _mm512_bslli_epi128::<8>(x.1)),
+            _mm512_clmulepi64_epi128::<0x01>(x.1, poly),
+        )
+    }
+}
+
+/// Two butterfly layers with four products and only three final reductions.
+/// B=b+s*d and D=B+d are reduced before multiplying them. The unreduced
+/// s*c contribution is shared solely as an addend in the two output sums:
+/// A=a+reduce(raw(s*c)+raw(ta*B)); C=a+c+reduce(raw(s*c)+raw(tb*D)).
+/// Linearity of reduction makes these the original two-layer butterfly.
+///
+/// # Safety
+/// Requires AVX512F/BW and VPCLMULQDQ and the prepared-twiddle contracts of
+/// mul_x4_split_accum for the corresponding LOW parameters.
+#[inline(always)]
+unsafe fn butterfly2_deferred<const OL: bool, const IL: bool>(
+    values: [core::arch::x86_64::__m512i; 4],
+    outer: TwX4,
+    inner_a: TwX4,
+    inner_b: TwX4,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let [a, b, c, d] = values;
+        let b1 = _mm512_xor_si512(b, reduce_x4_accum(mul_x4_split_accum::<OL>(outer, d)));
+        let d1 = _mm512_xor_si512(b1, d);
+        let ac = mul_x4_split_accum::<OL>(outer, c);
+        let ab = mul_x4_split_accum::<IL>(inner_a, b1);
+        let cd = mul_x4_split_accum::<IL>(inner_b, d1);
+        let aa = _mm512_xor_si512(
+            a,
+            reduce_x4_accum((_mm512_xor_si512(ac.0, ab.0), _mm512_xor_si512(ac.1, ab.1))),
+        );
+        let cc = _mm512_xor_si512(
+            _mm512_xor_si512(a, c),
+            reduce_x4_accum((_mm512_xor_si512(ac.0, cd.0), _mm512_xor_si512(ac.1, cd.1))),
+        );
+        [aa, _mm512_xor_si512(aa, b1), cc, _mm512_xor_si512(cc, d1)]
+    }
+}
+
 /// Three-CLMUL product for a broadcast twiddle `t = a + x^64`.
 /// Writing `v = b + c*x^64` gives
 /// `t*v = a*b + x^64*(a*c + v)`, so the LOW product only needs one extra
@@ -87,10 +168,7 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
 /// 128-bit lane of `t.0`.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn mul_x4_high_one(
-    t: TwX4,
-    v: core::arch::x86_64::__m512i,
-) -> core::arch::x86_64::__m512i {
+unsafe fn mul_x4_high_one(t: TwX4, v: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
     // SAFETY: caller establishes the features and the high-limb value.
     unsafe {
@@ -305,33 +383,48 @@ unsafe fn butterfly_fused_2layer_impl<
             let mut vc1 = _mm512_loadu_si512(c.as_ptr().add(i + 4) as *const __m512i);
             let mut vd1 = _mm512_loadu_si512(d.as_ptr().add(i + 4) as *const __m512i);
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
-            vc0 = _mm512_xor_si512(vc0, new_a0);
-            vc1 = _mm512_xor_si512(vc1, new_a1);
-            va0 = new_a0;
-            va1 = new_a1;
+            if DIET {
+                [va0, vb0, vc0, vd0] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va0, vb0, vc0, vd0],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                [va1, vb1, vc1, vd1] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va1, vb1, vc1, vd1],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+            } else {
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
 
-            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
-            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
-            vd0 = _mm512_xor_si512(vd0, new_b0);
-            vd1 = _mm512_xor_si512(vd1, new_b1);
-            vb0 = new_b0;
-            vb1 = new_b1;
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
-            vb0 = _mm512_xor_si512(vb0, new_a0);
-            vb1 = _mm512_xor_si512(vb1, new_a1);
-            va0 = new_a0;
-            va1 = new_a1;
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
-            vd0 = _mm512_xor_si512(vd0, new_c0);
-            vd1 = _mm512_xor_si512(vd1, new_c1);
-            vc0 = new_c0;
-            vc1 = new_c1;
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+            }
 
             _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va0);
             _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb0);
@@ -350,19 +443,28 @@ unsafe fn butterfly_fused_2layer_impl<
             let mut vc = _mm512_loadu_si512(c.as_ptr().add(i) as *const __m512i);
             let mut vd = _mm512_loadu_si512(d.as_ptr().add(i) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
-            vc = _mm512_xor_si512(vc, new_a);
-            va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
-            vd = _mm512_xor_si512(vd, new_b);
-            vb = new_b;
+            if DIET {
+                [va, vb, vc, vd] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va, vb, vc, vd],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+            } else {
+                let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
+                vc = _mm512_xor_si512(vc, new_a);
+                va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
+                vd = _mm512_xor_si512(vd, new_b);
+                vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
-            vb = _mm512_xor_si512(vb, new_a);
-            va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
-            vd = _mm512_xor_si512(vd, new_c);
-            vc = new_c;
+                let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
+                vb = _mm512_xor_si512(vb, new_a);
+                va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
+                vd = _mm512_xor_si512(vd, new_c);
+                vc = new_c;
+            }
 
             _mm512_storeu_si512(a.as_mut_ptr().add(i) as *mut __m512i, va);
             _mm512_storeu_si512(b.as_mut_ptr().add(i) as *mut __m512i, vb);
@@ -537,33 +639,48 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             let mut vc1 = _mm512_loadu_si512(c.add(i + 4) as *const __m512i);
             let mut vd1 = _mm512_loadu_si512(d.add(i + 4) as *const __m512i);
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
-            vc0 = _mm512_xor_si512(vc0, new_a0);
-            vc1 = _mm512_xor_si512(vc1, new_a1);
-            va0 = new_a0;
-            va1 = new_a1;
+            if DIET {
+                [va0, vb0, vc0, vd0] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va0, vb0, vc0, vd0],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                [va1, vb1, vc1, vd1] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va1, vb1, vc1, vd1],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+            } else {
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
 
-            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
-            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
-            vd0 = _mm512_xor_si512(vd0, new_b0);
-            vd1 = _mm512_xor_si512(vd1, new_b1);
-            vb0 = new_b0;
-            vb1 = new_b1;
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
-            vb0 = _mm512_xor_si512(vb0, new_a0);
-            vb1 = _mm512_xor_si512(vb1, new_a1);
-            va0 = new_a0;
-            va1 = new_a1;
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
-            vd0 = _mm512_xor_si512(vd0, new_c0);
-            vd1 = _mm512_xor_si512(vd1, new_c1);
-            vc0 = new_c0;
-            vc1 = new_c1;
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+            }
 
             stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
             stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
@@ -582,19 +699,28 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             let mut vc = _mm512_loadu_si512(c.add(i) as *const __m512i);
             let mut vd = _mm512_loadu_si512(d.add(i) as *const __m512i);
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
-            vc = _mm512_xor_si512(vc, new_a);
-            va = new_a;
-            let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
-            vd = _mm512_xor_si512(vd, new_b);
-            vb = new_b;
+            if DIET {
+                [va, vb, vc, vd] = butterfly2_deferred::<OUTER_LOW, INNER_LOW>(
+                    [va, vb, vc, vd],
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+            } else {
+                let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
+                vc = _mm512_xor_si512(vc, new_a);
+                va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
+                vd = _mm512_xor_si512(vd, new_b);
+                vb = new_b;
 
-            let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
-            vb = _mm512_xor_si512(vb, new_a);
-            va = new_a;
-            let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
-            vd = _mm512_xor_si512(vd, new_c);
-            vc = new_c;
+                let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
+                vb = _mm512_xor_si512(vb, new_a);
+                va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
+                vd = _mm512_xor_si512(vd, new_c);
+                vc = new_c;
+            }
 
             stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
             stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
@@ -1099,24 +1225,32 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_nt(
                 right_twiddle,
                 core::ptr::null(),
             ),
-            (false, false) => butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                true,
-                false,
-                true,
-                false,
-            >(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle,
-                core::ptr::null(),
-            ),
-            (false, true) => butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                true,
-                false,
-                true,
-                true,
-            >(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle,
-                core::ptr::null(),
-            ),
+            (false, false) => {
+                butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, false>(
+                    src,
+                    src_quarter,
+                    src_r,
+                    dst,
+                    dst_quarter,
+                    dst_r,
+                    num_ntts,
+                    right_twiddle,
+                    core::ptr::null(),
+                )
+            }
+            (false, true) => {
+                butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, true>(
+                    src,
+                    src_quarter,
+                    src_r,
+                    dst,
+                    dst_quarter,
+                    dst_r,
+                    num_ntts,
+                    right_twiddle,
+                    core::ptr::null(),
+                )
+            }
         }
     }
 }
@@ -1883,37 +2017,86 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 }};
             }
 
-            pf_quad!(0);
-            let outer = tw_top[0];
-            for i in 0..8 {
-                butterfly!(i, i + 8, outer);
-            }
-            pf_quad!(1);
-            for s in 0..2 {
-                let twiddle = tw_top[1 + s];
+            if DIET {
+                // Four independent groups traverse the first two layers.
+                // Keep the same sixteen prefetches, spread over four points.
+                pf_quad!(0);
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    if i == 2 {
+                        pf_quad!(1);
+                    }
+                    [values[i], values[i + 4], values[i + 8], values[i + 12]] =
+                        butterfly2_deferred::<false, false>(
+                            [values[i], values[i + 4], values[i + 8], values[i + 12]],
+                            tw_top[0],
+                            tw_top[1],
+                            tw_top[2],
+                        );
                 }
-            }
-            pf_quad!(2);
-            for s in 0..4 {
-                let p = tw_c_ptr.add(s) as *const __m128i;
-                let twiddle = (
-                    _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
-                    _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
-                );
-                for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                pf_quad!(2);
+                for s in 0..4 {
+                    if s == 2 {
+                        pf_quad!(3);
+                    }
+                    // Lower twiddles stay compact; only the current group's
+                    // three pairs need to be broadcast together.
+                    let load_tw = |index: usize| {
+                        let p = tw_c_ptr.add(index) as *const __m128i;
+                        (
+                            _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                            _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                        )
+                    };
+                    [
+                        values[4 * s],
+                        values[4 * s + 1],
+                        values[4 * s + 2],
+                        values[4 * s + 3],
+                    ] = butterfly2_deferred::<false, false>(
+                        [
+                            values[4 * s],
+                            values[4 * s + 1],
+                            values[4 * s + 2],
+                            values[4 * s + 3],
+                        ],
+                        load_tw(s),
+                        load_tw(4 + 2 * s),
+                        load_tw(5 + 2 * s),
+                    );
                 }
-            }
-            pf_quad!(3);
-            for s in 0..8 {
-                let p = tw_c_ptr.add(4 + s) as *const __m128i;
-                let twiddle = (
-                    _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
-                    _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
-                );
-                butterfly!(2 * s, 2 * s + 1, twiddle);
+            } else {
+                pf_quad!(0);
+                let outer = tw_top[0];
+                for i in 0..8 {
+                    butterfly!(i, i + 8, outer);
+                }
+                pf_quad!(1);
+                for s in 0..2 {
+                    let twiddle = tw_top[1 + s];
+                    for i in 0..4 {
+                        butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    }
+                }
+                pf_quad!(2);
+                for s in 0..4 {
+                    let p = tw_c_ptr.add(s) as *const __m128i;
+                    let twiddle = (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    );
+                    for i in 0..2 {
+                        butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    }
+                }
+                pf_quad!(3);
+                for s in 0..8 {
+                    let p = tw_c_ptr.add(4 + s) as *const __m128i;
+                    let twiddle = (
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
+                    );
+                    butterfly!(2 * s, 2 * s + 1, twiddle);
+                }
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -2057,16 +2240,28 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
         if high_one_outer {
             match (mul_diet_disabled(), low_inner) {
                 (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (false, true) => butterfly_fused_3layer_rows_impl::<true, true, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
             }
             return;
@@ -2074,30 +2269,70 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
         match (mul_diet_disabled(), low_inner) {
             (true, false) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (true, true) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (false, false) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (false, true) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
         }
@@ -2603,30 +2838,38 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
+                        (false, false) => {
+                            butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (false, true) => {
+                            butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (true, false) => {
+                            butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (true, true) => {
+                            butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
                     }
                 }
                 assert_eq!(
@@ -2899,12 +3142,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                            true,
-                            false,
-                            false,
-                            false,
-                        >(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2916,12 +3154,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                            false,
-                            false,
-                            false,
-                            false,
-                        >(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -3017,6 +3250,80 @@ mod diet_tests {
                 buf
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
+        }
+    }
+
+    /// Independent bit-polynomial oracle for the shared unreduced addend.
+    /// Exercise all low-twiddle specializations, including the top bit of
+    /// both field limbs, rather than comparing two copies of the formula.
+    #[test]
+    fn deferred_pair_matches_scalar() {
+        use core::arch::x86_64::*;
+        fn mul(mut a: u128, mut b: u128) -> u128 {
+            let mut out = 0;
+            for _ in 0..128 {
+                if b & 1 != 0 {
+                    out ^= a;
+                }
+                b >>= 1;
+                let high = a >> 127;
+                a <<= 1;
+                if high != 0 {
+                    a ^= 0x87;
+                }
+            }
+            out
+        }
+        unsafe fn check<const OL: bool, const IL: bool>() {
+            let mut next = rng(0xD3F3_22ED);
+            for case in 0..64 {
+                let mut ts = [next(), next(), next()];
+                if OL {
+                    ts[0].hi = 0;
+                }
+                if IL {
+                    ts[1].hi = 0;
+                    ts[2].hi = 0;
+                }
+                let input: [[F128; 4]; 4] =
+                    core::array::from_fn(|_| core::array::from_fn(|_| next()));
+                let mut actual = [[F128::ZERO; 4]; 4];
+                // SAFETY: the test module is feature-gated, each row contains
+                // four F128 lanes, and LOW twiddles were constrained above.
+                unsafe {
+                    let x = input.map(|row| _mm512_loadu_si512(row.as_ptr().cast()));
+                    let y = butterfly2_deferred::<OL, IL>(
+                        x,
+                        tw_x4::<OL, true>(ts[0]),
+                        tw_x4::<IL, true>(ts[1]),
+                        tw_x4::<IL, true>(ts[2]),
+                    );
+                    for i in 0..4 {
+                        _mm512_storeu_si512(actual[i].as_mut_ptr().cast(), y[i]);
+                    }
+                }
+                let bits = |v: F128| u128::from(v.lo) | (u128::from(v.hi) << 64);
+                for lane in 0..4 {
+                    let a = bits(input[0][lane]) ^ mul(bits(ts[0]), bits(input[2][lane]));
+                    let c = bits(input[2][lane]) ^ a;
+                    let b = bits(input[1][lane]) ^ mul(bits(ts[0]), bits(input[3][lane]));
+                    let d = bits(input[3][lane]) ^ b;
+                    let aa = a ^ mul(bits(ts[1]), b);
+                    let cc = c ^ mul(bits(ts[2]), d);
+                    assert_eq!(
+                        actual.map(|row| bits(row[lane])),
+                        [aa, b ^ aa, cc, d ^ cc],
+                        "case={case} lane={lane} OL={OL} IL={IL}"
+                    );
+                }
+            }
+        }
+        // SAFETY: the surrounding module is compiled only for AVX512 targets.
+        unsafe {
+            check::<false, false>();
+            check::<false, true>();
+            check::<true, false>();
+            check::<true, true>();
         }
     }
 }
