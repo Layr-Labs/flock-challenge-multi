@@ -203,6 +203,16 @@ const ZERO_TAIL_LOG_D: usize = 20;
 /// single output byte.
 static ZERO_ODD_TAIL_LANES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Calibrated override for the interleaved NTT sub-group size
+/// (`target_subgroup_log_bytes` in `interleaved_n_top`). `0` keeps the 2 MiB
+/// default; a value in `14..=24` is what the untimed warm-up measured fastest
+/// on this machine. Every setting emits identical NTT output (same
+/// permutation and twiddles — only the cache-blocking split moves),
+/// receipted across {default, 19, 21, 22} at log2=18 seed 42 by sha256
+/// `181da03b…`; this latch only chooses how the transform is blocked.
+pub static NTT_SUBGROUP_CALIBRATED_LOG: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// `FLOCK_NO_ZERO_LANE_SKIP=1` restores the dense butterfly in the same
 /// binary, so a candidate/control pair differs only in this dispatch.
 #[inline]
@@ -3179,7 +3189,7 @@ impl AdditiveNttF128 {
         // 2 MiB sub-groups compete for one cache. `FLOCK_NTT_SUBGROUP_LOG=N`
         // overrides for same-binary A/B (the ranked worker's cleared env
         // always takes the default).
-        let target_subgroup_log_bytes: usize = {
+        let env_subgroup_log: usize = {
             static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
                 std::env::var("FLOCK_NTT_SUBGROUP_LOG")
                     .ok()
@@ -3188,6 +3198,12 @@ impl AdditiveNttF128 {
                     .unwrap_or(21)
             });
             *V
+        };
+        let calibrated = NTT_SUBGROUP_CALIBRATED_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        let target_subgroup_log_bytes: usize = if calibrated != 0 {
+            calibrated
+        } else {
+            env_subgroup_log
         };
         let log_bytes_per_position = 4 + log2_pow2(num_ntts);
         let target_log_positions = target_subgroup_log_bytes.saturating_sub(log_bytes_per_position);

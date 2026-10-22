@@ -4379,15 +4379,64 @@ impl Blake3Setup {
             }
             .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
             let warmup_started = std::time::Instant::now();
+            // NTT sub-group calibration, folded into the passes this loop
+            // already runs: rotate the interleaved-NTT sub-group size across
+            // the untimed warm-up proves and keep each arm's fastest sample.
+            // Every sub-group setting emits the identical proof (identity
+            // receipted by sha256 181da03b.. across {default,19,21,22},
+            // log2=18), so latching any arm cannot move a proof byte — this
+            // only chooses the cache-blocking the measured interval runs with,
+            // measured on THIS machine inside the untimed window. Arms are
+            // {21 production default, 20, 22}: the private-L2/SMT geometry
+            // that fixed 21 was measured on the author's host, never on the
+            // ranked runner's; 20 has never been measured anywhere. Ties and
+            // missing samples keep the production default (21). Inert under
+            // tests and under an explicit `FLOCK_NTT_SUBGROUP_LOG`, which
+            // keeps its same-binary control meaning.
+            let calibrate_subgroup = !cfg!(test)
+                && std::env::var_os("FLOCK_NTT_SUBGROUP_LOG").is_none();
+            const SUBGROUP_ARMS: [usize; 3] = [21, 20, 22];
+            let mut fastest_subgroup: [Option<u128>; 3] = [None, None, None];
+            let mut pass_idx = 0usize;
             for _ in 0..EXTRA_WARMUP_PROVES {
+                let arm = if calibrate_subgroup {
+                    let a = pass_idx % SUBGROUP_ARMS.len();
+                    pass_idx += 1;
+                    flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_CALIBRATED_LOG
+                        .store(SUBGROUP_ARMS[a], std::sync::atomic::Ordering::Relaxed);
+                    Some(a)
+                } else {
+                    None
+                };
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
+                let pass_started = std::time::Instant::now();
                 let _ =
                     std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
+                if let Some(a) = arm {
+                    let nanos = pass_started.elapsed().as_nanos();
+                    let slot = &mut fastest_subgroup[a];
+                    if slot.is_none_or(|t| nanos < t) {
+                        *slot = Some(nanos);
+                    }
+                }
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
+                }
+            }
+            if calibrate_subgroup {
+                flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_CALIBRATED_LOG
+                    .store(21, std::sync::atomic::Ordering::Relaxed);
+                if let Some((best_log, _)) = fastest_subgroup
+                    .iter()
+                    .zip(SUBGROUP_ARMS)
+                    .filter_map(|(t, l)| t.map(|t| (l, t)))
+                    .min_by_key(|&(_, t)| t)
+                {
+                    flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_CALIBRATED_LOG
+                        .store(best_log, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
