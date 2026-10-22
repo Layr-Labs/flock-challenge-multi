@@ -739,6 +739,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128_slice(&round1_c);
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
+    // Round-one half-pools have finished; keep the ambient pool responsive.
+    let _hot_pool = crate::hot_pool::HotPool::start();
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
