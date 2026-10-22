@@ -647,7 +647,9 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         None
     };
     let claims_arr = [ab, c];
-    let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
+    let pcs_open = flock_core::in_pool(|| {
+        let _hot = flock_core::hot_pool::HotPool::start();
+        open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
         &commitment,
@@ -656,7 +658,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &padding,
         &lig_config,
         challenger,
-    ));
+        )
+    });
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -1014,7 +1017,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
-    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| match lincheck_input {
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| {
+        let _hot = flock_core::hot_pool::HotPool::start();
+        match lincheck_input {
         FastLincheckInput::Stripe(z_packed_lincheck) => {
             let result = lincheck::prove_padded_capture_z_vec_mode(
                 &z_packed_lincheck,
@@ -1044,6 +1049,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             ab_capture_mode(r1cs, &s_hat_v_c),
             challenger,
         ),
+        }
     });
     drop(roots);
     flock_core::gaptime::mark("lincheck: done");
