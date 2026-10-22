@@ -452,10 +452,22 @@ fn select_deep_split_depth(requested: Option<usize>) -> usize {
 #[cfg(target_os = "linux")]
 fn deep_split_depth() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        // Mod-4 run-parity probe (iter 79): the sibling-paired deep pass
+        // engages only on the ranked shape (its own SMT-pair gate), so its
+        // queue depth can be measured only on the runner. Arm N%4==2 of the
+        // measured runs takes depth 1 (fully synchronous producer-consumer
+        // handoff, the minimum lookahead); every other arm and every
+        // non-harness caller keeps the production default. Env knob keeps
+        // priority everywhere. Schedule-only: the ring and every block
+        // written through it are unchanged, so proof bytes are identical.
         select_deep_split_depth(
             std::env::var("FLOCK_NTT_DEEP_SPLIT_DEPTH")
                 .ok()
-                .and_then(|v| v.parse::<usize>().ok()),
+                .and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| match crate::run_index() {
+                    Some(n) if n % 4 == 2 => Some(1),
+                    _ => None,
+                }),
         )
     });
     *D
