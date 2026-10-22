@@ -636,27 +636,26 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
             // SAFETY: valid shared references for the lifetime of this closure,
             // bounded by `done.wait()` below.
             unsafe {
-                crate::proof_io::stash_pre_encoded_prefix(
-                    &*ptrs.commitment,
-                    &*ptrs.zc,
-                    &*ptrs.lc,
-                );
+                crate::proof_io::stash_pre_encoded_prefix(&*ptrs.commitment, &*ptrs.zc, &*ptrs.lc);
             }
         }))
     } else {
         None
     };
     let claims_arr = [ab, c];
-    let pcs_open = flock_core::in_pool(|| open_claims_with_precomputed_ligerito(
-        z_packed,
-        &prover_data,
-        &commitment,
-        &claims_arr,
-        &[pre_ab, pre_c],
-        &padding,
-        &lig_config,
-        challenger,
-    ));
+    let pcs_open = flock_core::in_pool(|| {
+        let _hot = flock_core::hot_pool::HotPool::start();
+        open_claims_with_precomputed_ligerito(
+            z_packed,
+            &prover_data,
+            &commitment,
+            &claims_arr,
+            &[pre_ab, pre_c],
+            &padding,
+            &lig_config,
+            challenger,
+        )
+    });
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -937,10 +936,12 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // start today's one-shot fold. Guard keeps `z_packed` live until
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
-        lincheck_circuit.root_fold_plan().map(|plan| std::sync::Arc::new(
-            lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan)
-        ))
-    } else { None };
+        lincheck_circuit.root_fold_plan().map(|plan| {
+            std::sync::Arc::new(lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan))
+        })
+    } else {
+        None
+    };
     let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
@@ -958,8 +959,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || flock_core::in_pool(|| {
+    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        flock_core::in_pool(|| {
             flock_core::gaptime::mark("zerocheck: pool entered");
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
@@ -994,7 +995,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         };
             flock_core::gaptime::mark("zerocheck: work done");
             r
-        }));
+        })
+    });
     flock_core::gaptime::mark("zerocheck: pool exited");
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
@@ -1014,36 +1016,41 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
-    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| match lincheck_input {
-        FastLincheckInput::Stripe(z_packed_lincheck) => {
-            let result = lincheck::prove_padded_capture_z_vec_mode(
-                &z_packed_lincheck,
-                r1cs.m,
-                r1cs.k_log,
-                r1cs.k_skip,
-                r1cs.useful_bits,
-                lincheck_circuit,
-                &x_ab,
-                ab_capture_mode(r1cs, &s_hat_v_c),
-                challenger,
-            );
-            // The stripe copy is dead after lincheck. Stripe-based callers
-            // retain their existing allocation lifecycle.
-            drop(z_packed_lincheck);
-            result
+    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| {
+        let _hot = flock_core::hot_pool::HotPool::start();
+        match lincheck_input {
+            FastLincheckInput::Stripe(z_packed_lincheck) => {
+                let result = lincheck::prove_padded_capture_z_vec_mode(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    challenger,
+                );
+                // The stripe copy is dead after lincheck. Stripe-based callers
+                // retain their existing allocation lifecycle.
+                drop(z_packed_lincheck);
+                result
+            }
+            FastLincheckInput::BlockMajor => {
+                lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
+                    &z_packed,
+                    roots.as_deref(),
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    challenger,
+                )
+            }
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
-            &z_packed,
-            roots.as_deref(),
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
-            lincheck_circuit,
-            &x_ab,
-            ab_capture_mode(r1cs, &s_hat_v_c),
-            challenger,
-        ),
     });
     drop(roots);
     flock_core::gaptime::mark("lincheck: done");
@@ -1204,10 +1211,12 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     bind_statement(challenger, r1cs, &commitment);
 
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
-        lincheck_circuit.root_fold_plan().map(|plan| std::sync::Arc::new(
-            lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan)
-        ))
-    } else { None };
+        lincheck_circuit.root_fold_plan().map(|plan| {
+            std::sync::Arc::new(lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan))
+        })
+    } else {
+        None
+    };
     let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
@@ -1227,27 +1236,26 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
-    let (zc_proof, zc_claim, s_hat_v_c) =
-        in_zerocheck_phase_pool(r1cs.m, || {
-            let a_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    a_packed_f128.as_ptr() as *const u8,
-                    a_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let b_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    b_packed_f128.as_ptr() as *const u8,
-                    b_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let c_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    z_packed.as_ptr() as *const u8,
-                    z_packed.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            match c_identity_z {
+    let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        match c_identity_z {
             Some(c_identity_z) => {
                 zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
                     a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
@@ -1258,7 +1266,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             ),
         }
-        });
+    });
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
@@ -1283,18 +1291,20 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             drop(z_packed_lincheck);
             result
         }
-        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
-            &z_packed,
-            roots.as_deref(),
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
-            lincheck_circuit,
-            &x_ab,
-            ab_capture_mode(r1cs, &s_hat_v_c),
-            challenger,
-        ),
+        FastLincheckInput::BlockMajor => {
+            lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
+                &z_packed,
+                roots.as_deref(),
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                ab_capture_mode(r1cs, &s_hat_v_c),
+                challenger,
+            )
+        }
     };
     drop(roots);
     let ab = ZClaim {
