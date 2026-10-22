@@ -99,19 +99,13 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
         let av = apply(op.add(offw_krow_words::<P>(7)));
         let (bv, correction) =
             apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
-        let x = _mm512_set1_epi8(2);
+        let mut acc = krow_term_scaled(7, av, bv, correction, modes as u8);
         for k in (0..7usize).rev() {
             modes >>= 8;
             let av = apply(op.add(offw_krow_words::<P>(k)));
             let (bv, correction) =
                 apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_ternarylogic_epi64::<0x96>(
-                _mm512_gf2p8mul_epi8(acc, x),
-                product,
-                correction,
-            );
+            acc = _mm512_xor_si512(acc, krow_term_scaled(k, av, bv, correction, modes as u8));
         }
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
@@ -134,8 +128,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
             plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
-        let x = _mm512_set1_epi8(2);
+        let mut acc = krow_term_scaled(7, av, bv, correction, plan.modes as u8);
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
@@ -145,11 +138,9 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
                     (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
-                acc = _mm512_ternarylogic_epi64::<0x96>(
-                    _mm512_gf2p8mul_epi8(acc, x),
-                    product,
-                    correction,
+                acc = _mm512_xor_si512(
+                    acc,
+                    krow_term_scaled($k, av, bv, correction, (plan.modes >> $shift) as u8),
                 );
             }};
         }
@@ -194,8 +185,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
             plan.modes as u8,
             av,
         );
-        let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
-        let x = _mm512_set1_epi8(2);
+        let mut acc = krow_term_scaled(7, av, bv, correction, plan.modes as u8);
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
@@ -205,11 +195,9 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
                     (plan.modes >> $shift) as u8,
                     av,
                 );
-                let product = _mm512_gf2p8mul_epi8(av, bv);
-                acc = _mm512_ternarylogic_epi64::<0x96>(
-                    _mm512_gf2p8mul_epi8(acc, x),
-                    product,
-                    correction,
+                acc = _mm512_xor_si512(
+                    acc,
+                    krow_term_scaled($k, av, bv, correction, (plan.modes >> $shift) as u8),
                 );
             }};
         }
@@ -249,7 +237,7 @@ unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool>(
         let b = op.add(64 + offw_krow_words::<P>(k));
         if BC && mode != 0 {
             let (bv, correction) = apply_b_mode_img::<P, I>(imgs, b, mode, av);
-            _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
+            krow_seed(av, bv, correction, mode)
         } else {
             _mm512_gf2p8mul_epi8(
                 av,
@@ -319,6 +307,50 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
 }
+
+#[inline(always)]
+#[inline(always)]
+unsafe fn krow_seed(av: __m512i, bv: __m512i, correction: __m512i, mode: u8) -> __m512i {
+    unsafe {
+        if mode == 15 {
+            correction
+        } else {
+            _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn krow_term_scaled(
+    k: usize,
+    av: __m512i,
+    bv: __m512i,
+    correction: __m512i,
+    mode: u8,
+) -> __m512i {
+    unsafe {
+        // Reassociation proven offline (all 256 values per position, both
+        // mode classes): the Horner chain acc_{k} = 2*acc_{k+1} ^ t_k equals
+        // the parallel XOR sum XOR_k 2^k * t_k. Scale each K-row term as it
+        // is computed; the serial multiply-by-2 dependency chain disappears.
+        // Ops are exactly the runner-proven set (gf2p8mul + ternarylogic
+        // 0x96), used the same way the residual kernels in this file already
+        // scale products by 2^k.
+        // Scale MULTIPLIES into the product (as the residual kernels' own
+        // `scaled(product, k)` does), it must never enter the XOR sum: an
+        // earlier encoding XORed the constant and the runner rejected with
+        // Zerocheck(SumcheckFinalFailed) (4dd496e8 receipt).
+        let scale = _mm512_set1_epi8((1u16 << k) as i8);
+        if mode == 15 {
+            _mm512_gf2p8mul_epi8(correction, scale)
+        } else {
+            let prod = _mm512_gf2p8mul_epi8(av, bv);
+            _mm512_xor_si512(_mm512_gf2p8mul_epi8(prod, scale), correction)
+        }
+    }
+}
+
+
 
 /// Shared dispatch inside the existing consumer, not one call per K-row.
 /// `op` addresses this K-row in the `P` layout.
