@@ -28,6 +28,7 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window_from_offsets, round1_ab_inner_window_from_offsets_nt2,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static,
     round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const,
+    round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_precomplemented,
     round1_ab_inner_window_from_offsets_nt2_residual, round1_ab_inner_window_with_images,
     round1_ab_inner_window30_k0, round1_ab_table_images,
 };
@@ -655,6 +656,27 @@ unsafe fn widen_ranked_dense_rows<const P: bool>(
     }
 }
 
+/// Widen !B for the corrected const-window kernel while retaining original
+/// transposed rows for ordinary witness publication.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn widen_ranked_complemented_rows<const P: bool>(
+    rows: &[__m512i; 8],
+    op: *mut u16,
+    c: WidenConsts,
+) {
+    unsafe {
+        for r in 0..8 {
+            let v = _mm512_xor_si512(rows[r], _mm512_set1_epi8(-1));
+            if P {
+                widen_off_line_parity(v, op.add(r * ROUND1_AB_OFF_WORDS), c);
+            } else {
+                widen_off_line(v, op.add(r * ROUND1_AB_OFF_WORDS));
+            }
+        }
+    }
+}
+
 /// Transpose and stage one fully-live ranked side, preserving each complete
 /// ZMM row long enough to build its two offset halves without a stage reload.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -700,7 +722,11 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
         let a_rows = tr8x16_zmm(a_ring, rw);
         widen_ranked_dense_rows::<P>(&a_rows, off, c);
         let b_rows = tr8x16_zmm(b_ring, rw);
-        widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+        if (3..=28).contains(&blk) && plan.bcomplement_static_eligible() {
+            widen_ranked_complemented_rows::<P>(&b_rows, off.add(64), c);
+        } else {
+            widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+        }
 
         if blk == 2 {
             let mut j = 0usize;
@@ -939,7 +965,14 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
         let a_rows = tr8x16_zmm(a_ring, rw);
         widen_ranked_dense_rows::<P>(&a_rows, off, c);
         let b_rows = tr8x16_zmm(b_ring, rw);
-        widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+        if (3..=28).contains(&blk)
+            && plan.bcomplement_static_eligible()
+            && ranked_b_constwin_enabled()
+        {
+            widen_ranked_complemented_rows::<P>(&b_rows, off.add(64), c);
+        } else {
+            widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
+        }
 
         if proj.one_rows_elided && blk == 2 {
             let mut j = 0usize;
@@ -1198,7 +1231,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
                 .out
                 .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
-            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_precomplemented::<
+                BLK,
+                P,
+            >(
                 &*off
                     .add(j * ROUND1_AB_OFF_WORDS)
                     .cast::<[u16; ROUND1_AB_OFF_WORDS]>(),
@@ -2233,9 +2269,7 @@ impl Drain8<'_> {
                     self.drain_pair_ranked_closed_exact_fast(base_word);
                 } else {
                     self.drain_static_or_sparse_ranked_closed_exact_fast(
-                        base_word,
-                        ring_word,
-                        words,
+                        base_word, ring_word, words,
                     );
                 }
                 return;
@@ -3113,9 +3147,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         target_feature = "avx512dq",
         target_feature = "gfni"
     ),
-    target_feature(
-        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
-    )
+    target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: OctaInputs<'_>,
@@ -3235,9 +3267,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         target_feature = "avx512dq",
         target_feature = "gfni"
     ),
-    target_feature(
-        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
-    )
+    target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     init: u64,
@@ -4023,18 +4053,20 @@ mod tests {
         #[repr(C, align(64))]
         struct AlignedStage([u32; STREAM_STAGE_WORDS]);
 
-        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_s =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
         let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
             super::super::K_SKIP,
             flock_core::field::F8(1u8 << super::super::K_SKIP),
         );
         let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
         let dummy_ab = Box::new(AlignedAbCompact([0u8; 8 * 29 * 64]));
-        let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-            &inv_table,
-            &dummy_ab.0,
-            true,
-        );
+        let win_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                &inv_table,
+                &dummy_ab.0,
+                true,
+            );
         let preps = prepare_ranked_closed_window_preps(&inv_table, win_plan);
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
@@ -4073,7 +4105,6 @@ mod tests {
         }
 
         for base in [0usize, 8, 240, 131_064] {
-
             let mut z_ref = z_seed.clone();
             let mut a_ref = a_seed.clone();
             let mut b_ref = b_seed.clone();

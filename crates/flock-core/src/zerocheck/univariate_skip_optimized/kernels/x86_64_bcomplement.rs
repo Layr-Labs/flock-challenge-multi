@@ -123,12 +123,27 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
 ) {
+    unsafe { shift_reduce_bcomplement_offw_nt2_const_pre::<BLK, P, false>(op, out, imgs) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_pre<
+    const BLK: usize,
+    const P: bool,
+    const PRE: bool,
+>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
     debug_assert!((3..=28).contains(&BLK));
     unsafe {
         let plan = WINDOW_PLANS[BLK - 2];
         let apply = |p| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode::<P>(
+        let (bv, correction) = apply_b_mode_pre::<P, PRE>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
             plan.modes as u8,
@@ -139,7 +154,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode::<P>(
+                let (bv, correction) = apply_b_mode_pre::<P, PRE>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
                     (plan.modes >> $shift) as u8,
@@ -183,12 +198,28 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     out: &mut [u8; 64],
     imgs: (*const u8, *const u8),
 ) {
+    unsafe { shift_reduce_bcomplement_offw_nt2_const_img_pre::<BLK, P, I, false>(op, out, imgs) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img_pre<
+    const BLK: usize,
+    const P: bool,
+    const I: u8,
+    const PRE: bool,
+>(
+    op: *const u16,
+    out: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
     debug_assert!((3..=28).contains(&BLK));
     unsafe {
         let plan = WINDOW_PLANS[BLK - 2];
         let apply = |p| apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, p);
         let av = apply(op.add(offw_krow_words::<P>(7)));
-        let (bv, correction) = apply_b_mode_img::<P, I>(
+        let (bv, correction) = apply_b_mode_img_pre::<P, I, PRE>(
             imgs,
             op.add(64 + offw_krow_words::<P>(7)),
             plan.modes as u8,
@@ -199,7 +230,7 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
         macro_rules! step {
             ($k:expr, $shift:expr) => {{
                 let av = apply(op.add(offw_krow_words::<P>($k)));
-                let (bv, correction) = apply_b_mode_img::<P, I>(
+                let (bv, correction) = apply_b_mode_img_pre::<P, I, PRE>(
                     imgs,
                     op.add(64 + offw_krow_words::<P>($k)),
                     (plan.modes >> $shift) as u8,
@@ -329,26 +360,38 @@ unsafe fn apply_b_mode<const P: bool>(
     mode: u8,
     av: __m512i,
 ) -> (__m512i, __m512i) {
+    unsafe { apply_b_mode_pre::<P, false>(imgs, op, mode, av) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+unsafe fn apply_b_mode_pre<const P: bool, const PRE: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    mode: u8,
+    av: __m512i,
+) -> (__m512i, __m512i) {
     unsafe {
         match mode {
-            1 => (apply_b_complement::<1, 8, P>(imgs, op), av),
-            2 => (apply_b_complement::<2, 8, P>(imgs, op), av),
-            3 => (apply_b_complement::<3, 8, P>(imgs, op), av),
-            4 => (apply_b_complement::<4, 8, P>(imgs, op), av),
-            5 => (apply_b_complement::<5, 8, P>(imgs, op), av),
-            6 => (apply_b_complement::<6, 8, P>(imgs, op), av),
-            7 => (apply_b_complement::<7, 8, P>(imgs, op), av),
-            8 => (apply_b_complement::<0, 7, P>(imgs, op), av),
-            9 => (apply_b_complement::<0, 6, P>(imgs, op), av),
-            10 => (apply_b_complement::<0, 5, P>(imgs, op), av),
-            11 => (apply_b_complement::<0, 4, P>(imgs, op), av),
-            12 => (apply_b_complement::<0, 3, P>(imgs, op), av),
-            13 => (apply_b_complement::<0, 2, P>(imgs, op), av),
-            14 => (apply_b_complement::<0, 1, P>(imgs, op), av),
+            1 => (apply_b_complement_pre::<1, 8, P, PRE>(imgs, op), av),
+            2 => (apply_b_complement_pre::<2, 8, P, PRE>(imgs, op), av),
+            3 => (apply_b_complement_pre::<3, 8, P, PRE>(imgs, op), av),
+            4 => (apply_b_complement_pre::<4, 8, P, PRE>(imgs, op), av),
+            5 => (apply_b_complement_pre::<5, 8, P, PRE>(imgs, op), av),
+            6 => (apply_b_complement_pre::<6, 8, P, PRE>(imgs, op), av),
+            7 => (apply_b_complement_pre::<7, 8, P, PRE>(imgs, op), av),
+            8 => (apply_b_complement_pre::<0, 7, P, PRE>(imgs, op), av),
+            9 => (apply_b_complement_pre::<0, 6, P, PRE>(imgs, op), av),
+            10 => (apply_b_complement_pre::<0, 5, P, PRE>(imgs, op), av),
+            11 => (apply_b_complement_pre::<0, 4, P, PRE>(imgs, op), av),
+            12 => (apply_b_complement_pre::<0, 3, P, PRE>(imgs, op), av),
+            13 => (apply_b_complement_pre::<0, 2, P, PRE>(imgs, op), av),
+            14 => (apply_b_complement_pre::<0, 1, P, PRE>(imgs, op), av),
             15 => (_mm512_setzero_si512(), av),
             _ => (
                 apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, op),
-                _mm512_setzero_si512(),
+                if PRE { av } else { _mm512_setzero_si512() },
             ),
         }
     }
@@ -363,29 +406,41 @@ unsafe fn apply_b_mode_img<const P: bool, const I: u8>(
     mode: u8,
     av: __m512i,
 ) -> (__m512i, __m512i) {
+    unsafe { apply_b_mode_img_pre::<P, I, false>(imgs, op, mode, av) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+unsafe fn apply_b_mode_img_pre<const P: bool, const I: u8, const PRE: bool>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+    mode: u8,
+    av: __m512i,
+) -> (__m512i, __m512i) {
     unsafe {
         if I == 2 {
-            return apply_b_mode::<P>(imgs, op, mode, av);
+            return apply_b_mode_pre::<P, PRE>(imgs, op, mode, av);
         }
         match mode {
-            1 => (apply_b_complement_img::<1, 8, P, I>(imgs, op), av),
-            2 => (apply_b_complement_img::<2, 8, P, I>(imgs, op), av),
-            3 => (apply_b_complement_img::<3, 8, P, I>(imgs, op), av),
-            4 => (apply_b_complement_img::<4, 8, P, I>(imgs, op), av),
-            5 => (apply_b_complement_img::<5, 8, P, I>(imgs, op), av),
-            6 => (apply_b_complement_img::<6, 8, P, I>(imgs, op), av),
-            7 => (apply_b_complement_img::<7, 8, P, I>(imgs, op), av),
-            8 => (apply_b_complement_img::<0, 7, P, I>(imgs, op), av),
-            9 => (apply_b_complement_img::<0, 6, P, I>(imgs, op), av),
-            10 => (apply_b_complement_img::<0, 5, P, I>(imgs, op), av),
-            11 => (apply_b_complement_img::<0, 4, P, I>(imgs, op), av),
-            12 => (apply_b_complement_img::<0, 3, P, I>(imgs, op), av),
-            13 => (apply_b_complement_img::<0, 2, P, I>(imgs, op), av),
-            14 => (apply_b_complement_img::<0, 1, P, I>(imgs, op), av),
+            1 => (apply_b_complement_img_pre::<1, 8, P, I, PRE>(imgs, op), av),
+            2 => (apply_b_complement_img_pre::<2, 8, P, I, PRE>(imgs, op), av),
+            3 => (apply_b_complement_img_pre::<3, 8, P, I, PRE>(imgs, op), av),
+            4 => (apply_b_complement_img_pre::<4, 8, P, I, PRE>(imgs, op), av),
+            5 => (apply_b_complement_img_pre::<5, 8, P, I, PRE>(imgs, op), av),
+            6 => (apply_b_complement_img_pre::<6, 8, P, I, PRE>(imgs, op), av),
+            7 => (apply_b_complement_img_pre::<7, 8, P, I, PRE>(imgs, op), av),
+            8 => (apply_b_complement_img_pre::<0, 7, P, I, PRE>(imgs, op), av),
+            9 => (apply_b_complement_img_pre::<0, 6, P, I, PRE>(imgs, op), av),
+            10 => (apply_b_complement_img_pre::<0, 5, P, I, PRE>(imgs, op), av),
+            11 => (apply_b_complement_img_pre::<0, 4, P, I, PRE>(imgs, op), av),
+            12 => (apply_b_complement_img_pre::<0, 3, P, I, PRE>(imgs, op), av),
+            13 => (apply_b_complement_img_pre::<0, 2, P, I, PRE>(imgs, op), av),
+            14 => (apply_b_complement_img_pre::<0, 1, P, I, PRE>(imgs, op), av),
             15 => (_mm512_setzero_si512(), av),
             _ => (
                 apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, op),
-                _mm512_setzero_si512(),
+                if PRE { av } else { _mm512_setzero_si512() },
             ),
         }
     }
@@ -407,6 +462,22 @@ unsafe fn apply_b_complement_img<
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> __m512i {
+    unsafe { apply_b_complement_img_pre::<FIRST, END, P, I, false>(imgs, op) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+unsafe fn apply_b_complement_img_pre<
+    const FIRST: usize,
+    const END: usize,
+    const P: bool,
+    const I: u8,
+    const PRE: bool,
+>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> __m512i {
     const COMPLEMENT_OFFSETS: u64 = 0x3fc0_3fc0_3fc0_3fc0;
     unsafe {
         let (wa, wb) = if P {
@@ -420,12 +491,13 @@ unsafe fn apply_b_complement_img<
                 || END == 8;
             (
                 if has_even {
-                    op.cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.cast::<u64>().read_unaligned() ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
                 if has_odd {
-                    op.add(32).cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.add(32).cast::<u64>().read_unaligned()
+                        ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
@@ -433,12 +505,13 @@ unsafe fn apply_b_complement_img<
         } else {
             (
                 if FIRST < 4 {
-                    op.cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.cast::<u64>().read_unaligned() ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
                 if END > 4 {
-                    op.add(4).cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.add(4).cast::<u64>().read_unaligned()
+                        ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
@@ -454,7 +527,10 @@ unsafe fn apply_b_complement_img<
         };
         let base = imgs.0;
         let row = |image: usize, b: usize| {
-            _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + field(b)).cast::<__m512i>())
+            _mm512_loadu_si512(
+                base.add(image * IMAGE_STRIDE_64 + field(b))
+                    .cast::<__m512i>(),
+            )
         };
         macro_rules! live {
             ($b:literal) => {
@@ -513,6 +589,21 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
     imgs: (*const u8, *const u8),
     op: *const u16,
 ) -> __m512i {
+    unsafe { apply_b_complement_pre::<FIRST, END, P, false>(imgs, op) }
+}
+
+/// PRE means the B-side offsets already describe !B. Dense rows still
+/// require the linear-map correction T(B) = T(!B) + ONE.
+#[inline(always)]
+unsafe fn apply_b_complement_pre<
+    const FIRST: usize,
+    const END: usize,
+    const P: bool,
+    const PRE: bool,
+>(
+    imgs: (*const u8, *const u8),
+    op: *const u16,
+) -> __m512i {
     const COMPLEMENT_OFFSETS: u64 = 0x3fc0_3fc0_3fc0_3fc0;
     unsafe {
         // An offset is byte << 6, so complementing a byte XORs exactly these
@@ -530,12 +621,13 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
                 || END == 8;
             (
                 if has_even {
-                    op.cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.cast::<u64>().read_unaligned() ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
                 if has_odd {
-                    op.add(32).cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.add(32).cast::<u64>().read_unaligned()
+                        ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
@@ -543,12 +635,13 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
         } else {
             (
                 if FIRST < 4 {
-                    op.cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.cast::<u64>().read_unaligned() ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
                 if END > 4 {
-                    op.add(4).cast::<u64>().read_unaligned() ^ COMPLEMENT_OFFSETS
+                    op.add(4).cast::<u64>().read_unaligned()
+                        ^ if PRE { 0 } else { COMPLEMENT_OFFSETS }
                 } else {
                     0
                 },
@@ -873,10 +966,17 @@ mod tests {
         // The residual complement is not vacuous: some live residual K-row
         // carries structural B bytes, and each mode matches the geometry.
         let mut complemented = 0;
-        for (blk, modes, rows) in [(2usize, RESIDUAL_MODES_2, 2..8usize), (29, RESIDUAL_MODES_29, 0..4)] {
+        for (blk, modes, rows) in [
+            (2usize, RESIDUAL_MODES_2, 2..8usize),
+            (29, RESIDUAL_MODES_29, 0..4),
+        ] {
             for k in rows {
                 let mode = (modes >> (8 * (7 - k))) as u8;
-                assert_eq!(fixed_bytes_for_mode(mode), geometry_known_bytes(blk, k), "blk={blk} k={k}");
+                assert_eq!(
+                    fixed_bytes_for_mode(mode),
+                    geometry_known_bytes(blk, k),
+                    "blk={blk} k={k}"
+                );
                 complemented += usize::from(mode != 0);
             }
         }
@@ -911,7 +1011,11 @@ mod tests {
                     core::array::from_fn(|i| u16::from(if i < 64 { a[i] } else { b[i - 64] }) << 6);
                 let off_p = parity_layout(&off_w);
                 for layout in [false, true] {
-                    let op = if layout { off_p.as_ptr() } else { off_w.as_ptr() };
+                    let op = if layout {
+                        off_p.as_ptr()
+                    } else {
+                        off_w.as_ptr()
+                    };
                     if blk == 2 || blk == 29 {
                         let keep = if blk == 2 { 0xfcu8 } else { 0x0f };
                         expected.0 = [0xA5; 64];
@@ -994,6 +1098,243 @@ mod tests {
                         3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
                         23, 24, 25, 26, 27, 28
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precomplemented_offsets_match_original_all_images() {
+        use crate::ntt::inv_table::force_table_images_for_test;
+        type Kernel = unsafe fn(*const u16, &mut [u8; 64], (*const u8, *const u8));
+        let kernels: [[Kernel; 26]; 6] = [
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, false, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, false, 2, true>,
+            ],
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, true, 2, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, true, 2, true>,
+            ],
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, false, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, false, 4, true>,
+            ],
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, true, 4, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, true, 4, true>,
+            ],
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, false, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, false, 8, true>,
+            ],
+            [
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<3, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<4, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<5, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<6, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<7, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<8, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<9, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<10, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<11, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<12, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<13, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<14, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<15, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<16, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<17, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<18, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<19, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<20, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<21, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<22, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<23, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<24, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<25, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<26, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<27, true, 8, true>,
+                shift_reduce_bcomplement_offw_nt2_const_img_pre::<28, true, 8, true>,
+            ],
+        ];
+        let mut seed = 1357u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        };
+        for (image_index, images) in [2usize, 4, 8].into_iter().enumerate() {
+            force_table_images_for_test(images);
+            let table = InvNttTableByteSingleGf8::new(
+                &AdditiveNttGf8::new(6, F8::ZERO),
+                &AdditiveNttGf8::new(6, F8(64)),
+            );
+            force_table_images_for_test(0);
+            for case in 0..32 {
+                for blk in 3..=28 {
+                    let a: [u8; 64] = core::array::from_fn(|_| next());
+                    let mut b: [u8; 64] = core::array::from_fn(|_| next());
+                    for k in 0..8 {
+                        let known = geometry_known_bytes(blk, k);
+                        for j in 0..8 {
+                            if known & (1 << j) != 0 {
+                                b[k * 8 + j] = 255;
+                            }
+                        }
+                    }
+                    let off: [u16; 128] = core::array::from_fn(|i| {
+                        u16::from(if i < 64 { a[i] } else { b[i - 64] }) << 6
+                    });
+                    let mut expected = Output([0; 64]);
+                    unsafe {
+                        super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2::<false>(
+                            off.as_ptr(),
+                            &mut expected.0,
+                            table.image_ptrs(),
+                        );
+                        _mm_sfence();
+                    }
+                    let mut complemented = off;
+                    for x in &mut complemented[64..] {
+                        *x ^= 0x3fc0;
+                    }
+                    let parity = parity_layout(&complemented);
+                    for (layout, input) in [&complemented, &parity].into_iter().enumerate() {
+                        let mut actual = Output([0xA5; 64]);
+                        unsafe {
+                            kernels[2 * image_index + layout][blk - 3](
+                                input.as_ptr(),
+                                &mut actual.0,
+                                table.image_ptrs(),
+                            );
+                            _mm_sfence();
+                        }
+                        assert_eq!(
+                            expected.0, actual.0,
+                            "images={images} layout={layout} blk={blk} case={case}"
+                        );
+                    }
                 }
             }
         }
