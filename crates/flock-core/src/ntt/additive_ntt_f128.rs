@@ -45,6 +45,16 @@ use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
 
+/// Warm-up calibration latch for the interleaved deep-pass sub-group size
+/// (`target_subgroup_log_bytes` below). `0` = uncalibrated → env/default
+/// (2^21). Values 14..=24 are honored as the calibrated winner. Set once by
+/// `prove_fast`'s untimed extra warm-up (`crates/flock-prover/src/r1cs_hashes/
+/// blake3.rs`) so measured proves run with the runner-measured winner; the
+/// explicit `FLOCK_NTT_SUBGROUP_LOG` env override keeps priority (hard
+/// same-binary A/B control).
+pub static NTT_SUBGROUP_LOG_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 mod kernels;
 
 /// Compute the normalized subspace-polynomial evaluation table.
@@ -3180,14 +3190,26 @@ impl AdditiveNttF128 {
         // overrides for same-binary A/B (the ranked worker's cleared env
         // always takes the default).
         let target_subgroup_log_bytes: usize = {
-            static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            // Resolution order: explicit `FLOCK_NTT_SUBGROUP_LOG` (hard
+            // same-binary A/B control — keeps priority) → the warm-up
+            // calibration latch (see `prove_fast`'s untimed extra warm-up)
+            // → parent default 2^21. The latch is read per transform (one
+            // relaxed load per `interleaved_n_top` call, not per
+            // butterfly), so calibration passes can move it and measured
+            // proves observe the latched winner.
+            static ENV_DEFAULT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
                 std::env::var("FLOCK_NTT_SUBGROUP_LOG")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .filter(|v| (14..=24).contains(v))
                     .unwrap_or(21)
             });
-            *V
+            let latched = NTT_SUBGROUP_LOG_LATCH.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            if (14..=24).contains(&latched) {
+                latched
+            } else {
+                *ENV_DEFAULT
+            }
         };
         let log_bytes_per_position = 4 + log2_pow2(num_ntts);
         let target_log_positions = target_subgroup_log_bytes.saturating_sub(log_bytes_per_position);

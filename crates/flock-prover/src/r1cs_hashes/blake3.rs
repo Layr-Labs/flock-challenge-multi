@@ -4379,16 +4379,122 @@ impl Blake3Setup {
             }
             .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
             let warmup_started = std::time::Instant::now();
-            for _ in 0..EXTRA_WARMUP_PROVES {
+            // Route calibration, folded into the passes this loop already
+            // runs: alternate the zerocheck round-two sweep route across the
+            // untimed warm-up proves and keep each route's fastest sample.
+            // Latching either route cannot change a proof byte -- the two
+            // routes emit the same transcript (identity receipted by
+            // sha256 181da03b.. on both latches, log2=18) -- so this only
+            // chooses which route's stores/loads the measured interval runs,
+            // measured on THIS machine inside the untimed window. Rank 1 =
+            // materialize, 2 = no-materialize; ties and missing samples keep
+            // the production default (no-materialize). Inert under tests
+            // (latch stays 0) and under an explicit
+            // `FLOCK_NO_ZC_SWEEP_NOMAT`, which keeps its control meaning.
+            let calibrate_route = !cfg!(test)
+                && std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_none();
+            // NTT deep-pass sub-group calibration (same instrument, second
+            // knob): alternate the latch between the parent default 2^21 and
+            // 2^23 (8 MiB sub-groups — the untested LARGER direction; 2^19
+            // was runner-measured −9.44%, so the profitable side, if any, is
+            // this one) for six passes with the ZC route pinned to its
+            // production default, latch the per-arm minimum winner, THEN run
+            // the route alternation with the NTT winner latched — so the
+            // route decision is made in the environment the measured proves
+            // will actually run. The latch only re-partitions the same NTT
+            // butterflies (schedule-only; parent proofs are byte-identical
+            // under every sub-group size, receipted iteration-74), so this
+            // cannot move a proof byte. Inert under tests and under an
+            // explicit `FLOCK_NTT_SUBGROUP_LOG`, which keeps priority and its
+            // hard same-binary A/B meaning. `FLOCK_NO_NTT_SUB_CAL=1` skips
+            // the extra passes.
+            let calibrate_ntt_sub = !cfg!(test)
+                && std::env::var_os("FLOCK_NTT_SUBGROUP_LOG").is_none()
+                && std::env::var_os("FLOCK_NO_NTT_SUB_CAL").is_none();
+            let mut fastest_ntt_sub: [Option<u128>; 2] = [None, None];
+            const NTT_SUB_ARMS: [u8; 2] = [21, 23];
+            if calibrate_ntt_sub {
+                flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_LOG_LATCH
+                    .store(21, std::sync::atomic::Ordering::Relaxed);
+            }
+            let ntt_cal_passes = if calibrate_ntt_sub { 6 } else { 0 };
+            let ntt_then_route_passes = EXTRA_WARMUP_PROVES + ntt_cal_passes;
+            let mut fastest_route: [Option<u128>; 2] = [None, None];
+            let mut pass_idx = 0u8;
+            for _ in 0..ntt_then_route_passes {
+                let ntt_arm = if calibrate_ntt_sub
+                    && (pass_idx as usize) < ntt_cal_passes
+                {
+                    // Strict alternation across the NTT block: three samples
+                    // per arm.
+                    let a = (pass_idx % 2) as usize;
+                    flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_LOG_LATCH
+                        .store(NTT_SUB_ARMS[a], std::sync::atomic::Ordering::Relaxed);
+                    Some(a)
+                } else {
+                    None
+                };
+                let route = if calibrate_route && ntt_arm.is_none() {
+                    // Strict alternation: arm 1 sees six passes, arm 2 five;
+                    // per-arm minimums make the imbalance immaterial.
+                    pass_idx += 1;
+                    let r = 1 + (pass_idx % 2);
+                    flock_core::zerocheck::ZC_NOMAT_ROUTE
+                        .store(r, std::sync::atomic::Ordering::Relaxed);
+                    Some(r)
+                } else {
+                    None
+                };
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
+                let pass_started = std::time::Instant::now();
                 let _ =
                     std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
+                let nanos = pass_started.elapsed().as_nanos();
+                if let Some(a) = ntt_arm {
+                    let slot = &mut fastest_ntt_sub[a];
+                    if slot.is_none_or(|t| nanos < t) {
+                        *slot = Some(nanos);
+                    }
+                }
+                if let Some(r) = route {
+                    let slot = &mut fastest_route[(r - 1) as usize];
+                    if slot.is_none_or(|t| nanos < t) {
+                        *slot = Some(nanos);
+                    }
+                }
+                pass_idx += 1;
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
                 }
+            }
+            if calibrate_ntt_sub {
+                // Latch the runner-measured winner; ties and missing samples
+                // keep the parent default 2^21. (`fastest_ntt_sub[0]` holds
+                // arm 0 = 2^21 default, `[1]` arm 1 = 2^23 — 23 wins only
+                // when ITS minimum beats the default's.)
+                let winner = match (fastest_ntt_sub[1], fastest_ntt_sub[0]) {
+                    (Some(big), Some(def)) if big < def => 23,
+                    _ => 21,
+                };
+                flock_core::ntt::additive_ntt_f128::NTT_SUBGROUP_LOG_LATCH
+                    .store(winner, std::sync::atomic::Ordering::Relaxed);
+                if std::env::var_os("FLOCK_DEBUG_NTT_CAL").is_some() {
+                    eprintln!(
+                        "[ntt-sub-cal] 2^23 best {:?} vs 2^21 best {:?} -> latch {winner}",
+                        fastest_ntt_sub[1], fastest_ntt_sub[0]
+                    );
+                }
+            }
+            if calibrate_route {
+                let winner = match (fastest_route[0], fastest_route[1]) {
+                    (Some(mat), Some(nomat)) if mat < nomat => 1,
+                    _ => 2,
+                };
+                flock_core::zerocheck::ZC_NOMAT_ROUTE
+                    .store(winner, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);

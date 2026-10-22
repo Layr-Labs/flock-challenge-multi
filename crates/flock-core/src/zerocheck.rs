@@ -99,6 +99,20 @@ fn cascade2_off() -> bool {
 #[cfg(test)]
 pub(crate) static ZC_NOMAT_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Runtime route latch for the no-materialize sweep, set by the worker's
+/// untimed calibration proves and read by [`nomat_off`]. Encoded as:
+/// `0` = not latched (default route), `1` = latched OFF (materialize),
+/// `2` = latched ON (no-materialize). The two routes are bit-identical
+/// (the no-materialize pass re-derives the same folded rows from the packed
+/// witness), so latching either way cannot change any proof byte — only
+/// which sweep stores/loads run.
+///
+/// The ranked worker runs its calibration during the harness's untimed
+/// warm-up phase (before the ready signal), so the measured trial inherits
+/// the winner without ever observing a calibration prove.
+pub static ZC_NOMAT_ROUTE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 /// Test-only: whether the last prove ran the no-materialize route.
 #[cfg(test)]
 pub(crate) static ZC_NOMAT_LAST: std::sync::atomic::AtomicBool =
@@ -116,7 +130,13 @@ fn nomat_off() -> bool {
     if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
+    // An explicit same-binary control request always wins; below that, a
+    // worker-side calibration decision outranks the default route. Tests
+    // gate through the forced-off latch above.
+    if std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some() {
+        return true;
+    }
+    ZC_NOMAT_ROUTE.load(std::sync::atomic::Ordering::Relaxed) == 1
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
