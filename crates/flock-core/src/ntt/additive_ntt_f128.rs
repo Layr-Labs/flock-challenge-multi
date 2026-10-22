@@ -561,6 +561,34 @@ impl DeepQueue {
         self.head.store(h + 1, Ordering::Release);
         true
     }
+    /// Publish a block only if the ring has room within `depth`.
+    fn try_push(&self, b: DeepBlock, depth: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let h = self.head.load(Ordering::Relaxed);
+        if h - self.tail.load(Ordering::Acquire) >= depth || self.gone.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: the slot is free (checked above) and only this producer
+        // writes it.
+        unsafe {
+            *self.slots[h % Self::CAP].get() = b;
+        }
+        self.head.store(h + 1, Ordering::Release);
+        true
+    }
+    /// Take the next published block, if any, without waiting.
+    fn try_pop(&self) -> Option<DeepBlock> {
+        use std::sync::atomic::Ordering;
+        let t = self.tail.load(Ordering::Relaxed);
+        if self.head.load(Ordering::Acquire) > t {
+            // SAFETY: published by the producer with Release before the
+            // Acquire load above.
+            let b = unsafe { *self.slots[t % Self::CAP].get() };
+            self.tail.store(t + 1, Ordering::Release);
+            return Some(b);
+        }
+        None
+    }
     fn pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
         let t = self.tail.load(Ordering::Relaxed);
@@ -584,6 +612,17 @@ impl DeepQueue {
             std::hint::spin_loop();
         }
     }
+}
+
+/// `FLOCK_NO_NTT_DEEP_BALANCE=1` restores the strict roles of the paired
+/// deep pass: the producer waits for ring space and the consumer only hashes.
+/// By default an idle consumer transforms whole unclaimed sub-groups itself
+/// and a producer facing a full ring hashes that block inline.
+#[cfg(target_os = "linux")]
+fn deep_balance_enabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BALANCE").is_some());
+    crate::calib::DEEP_BALANCE.get() && !*OFF
 }
 
 /// Line-hint level for the deep pass's fused-four row driver under the
@@ -869,6 +908,24 @@ fn row_lanes(r: usize, num_ntts: usize, odd_tail: usize) -> usize {
 ))]
 const fn direct_fused2_publish_shape(log_d: usize, num_ntts: usize, odd_tail: usize) -> bool {
     log_d == 20 && num_ntts == 64 && (odd_tail == 0 || odd_tail == 4)
+}
+
+/// Address of a ranked codeword whose layers 1..8 (the seed+top pass) were
+/// already applied in place by the witness producer (`pcs::FusedTop`), or 0.
+/// The next rate-1/2 encode of exactly that buffer starts at layer 9.
+pub(crate) static PRETOPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One fused seed+top unit (see `seed_top_fused8_pass_ex`): the 256 message
+/// blocks `c0 + 1024·m` (m < 256), each two message rows of 64 lanes, cached
+/// contiguously at `staging` (block m at `m · 128` F128s) by the producer.
+#[derive(Clone, Copy)]
+pub(crate) struct SeedTopUnit {
+    pub(crate) staging: *const F128,
+    pub(crate) c0: usize,
+}
+
+std::thread_local! {
+    static SEED_TOP_UNIT_STAGE: std::cell::RefCell<Vec<F128>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Physical staging row that holds logical row `k` in a seed+top block.
@@ -1713,6 +1770,29 @@ impl AdditiveNttF128 {
         on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
     ) {
         let n_top = Self::interleaved_n_top(log_d, num_ntts);
+        if n_top == 9
+            && PRETOPPED
+                .compare_exchange(
+                    codeword.as_ptr() as usize,
+                    0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            crate::gaptime::mark("ntt: seed+top fused pass done");
+            crate::calib::DEEP.begin();
+            crate::calib::FRONT.end();
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword,
+                num_ntts,
+                9,
+                None,
+                on_sub_done,
+                None,
+            );
+            return;
+        }
         let fuse_seed = Self::top_fusion_available()
             && !ntt_top_fusion_disabled()
             && !ntt_seed_top_fusion_disabled()
@@ -2620,6 +2700,22 @@ impl AdditiveNttF128 {
         log_d: usize,
         odd_tail: usize,
     ) {
+        self.seed_top_fused8_pass_ex(msg, data, num_ntts, log_d, odd_tail, None);
+    }
+
+    /// [`Self::seed_top_fused8_pass`], or with `unit = Some` only its two
+    /// tasks `r = 2·c0, 2·c0 + 1`, seeded from a cached copy of the 256
+    /// message blocks those tasks read (see [`SeedTopUnit`]) instead of from
+    /// `msg`. Returns false (nothing done) when the unit route does not apply.
+    pub(crate) fn seed_top_fused8_pass_ex(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        odd_tail: usize,
+        unit: Option<SeedTopUnit>,
+    ) -> bool {
         use rayon::prelude::*;
         #[cfg(test)]
         SEED_TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2745,9 +2841,19 @@ impl AdditiveNttF128 {
         //
         // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
         // `bufp` addresses the 512 staging rows that only this task writes.
-        let seed = |bufp: *mut F128, r: usize| {
+        // `src`/`quarter`/`r0`/`kstep` locate the task's message rows: step
+        // `k`, quarter `i` reads row `r0 + k·kstep + i·quarter` of `src`
+        // (`msg` itself: `r, sub_stride, block_size`). `pf` = DRAM source.
+        let seed_gen = |bufp: *mut F128,
+                        r: usize,
+                        src: *const F128,
+                        quarter: usize,
+                        r0: usize,
+                        kstep: usize,
+                        pf: bool| {
             unsafe {
-                let src = src_addr as *const F128;
+                let pf_dist = if pf { pf_dist } else { 0 };
+                let (block_size, sub_stride) = (quarter, kstep);
                 // Seed: 64 row groups → staging rows [block][k].
                 //
                 // The four message rows a step reads are asked for a fixed
@@ -2756,11 +2862,11 @@ impl AdditiveNttF128 {
                 #[cfg(target_arch = "x86_64")]
                 if pf_dist != 0 {
                     for k in 0..pf_dist.min(64) {
-                        pf_msg_rows(src, r + k * sub_stride, block_size, row_len, pf_lines);
+                        pf_msg_rows(src, r0 + k * sub_stride, block_size, row_len, pf_lines);
                     }
                 }
                 for k in 0..64 {
-                    let r_s = r + k * sub_stride;
+                    let r_s = r0 + k * sub_stride;
                     let kp = perm(k);
                     // One line per lane step from inside the kernel, or the
                     // whole burst up front; never both.
@@ -2897,10 +3003,13 @@ impl AdditiveNttF128 {
                 }
             }
         };
-        let task = |buf: &mut Vec<F128>, r: usize| {
+        let seed = |bufp: *mut F128, r: usize| {
+            seed_gen(bufp, r, src_addr as *const F128, block_size, r, sub_stride, true)
+        };
+
+        // Everything after the seed: fused-four + fused-two and the publish.
+        let post_seed = |bufp: *mut F128, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
-            let bufp = buf.as_mut_ptr();
-            seed(bufp, r);
             // SAFETY: codeword rows `block·B + r + k·S` are inside `data`;
             // distinct `r` select pairwise-disjoint codeword row sets, so no two
             // concurrent tasks write the same element. `buf` (512 rows) is this
@@ -3004,6 +3113,12 @@ impl AdditiveNttF128 {
             }
         };
 
+        let task = |buf: &mut Vec<F128>, r: usize| {
+            let bufp = buf.as_mut_ptr();
+            seed(bufp, r);
+            post_seed(bufp, r);
+        };
+
         // The two halves of one task's post-seed work, split at the exact seam
         // the co-residency measurement priced: the fused-four staging fold
         // (`F`) and the fused-two NT publish (`P`). Only the ranked
@@ -3052,6 +3167,32 @@ impl AdditiveNttF128 {
             }
         };
 
+        if let Some(u) = unit {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if direct_publish && log_d == 20 && row_len == 64 {
+                SEED_TOP_UNIT_STAGE.with(|b| {
+                    let mut b = b.borrow_mut();
+                    if b.is_empty() {
+                        *b = staging_block(512, row_len);
+                    }
+                    let bufp = b.as_mut_ptr();
+                    for h in 0..2 {
+                        let r = 2 * u.c0 + h;
+                        // Unit block m (compression c0 + 1024·m) holds message
+                        // rows 2·(c0 + 1024·m) + {0, 1}: task r's step k,
+                        // quarter i reads block k + 64·i, half h.
+                        seed_gen(bufp, r, u.staging.wrapping_add(h * row_len), 128, 0, 2, false);
+                        post_seed(bufp, r);
+                    }
+                });
+                return true;
+            }
+            return false;
+        }
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // across every lane the selected downstream path can read. The exact
@@ -3078,12 +3219,13 @@ impl AdditiveNttF128 {
                 target_feature = "vpclmulqdq"
             ))]
             if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2) {
-                return;
+                return true;
             }
             (0..sub_stride)
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
         }
+        true
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -3329,6 +3471,8 @@ impl AdditiveNttF128 {
                 debug_assert!(layer == 3 && top_fusion_ok && layer + 5 < n_top);
                 self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail);
                 crate::gaptime::mark("ntt: seed+top fused pass done");
+                crate::calib::DEEP.begin();
+            crate::calib::FRONT.end();
                 layer += 6;
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
@@ -3731,6 +3875,7 @@ impl AdditiveNttF128 {
                     let n_pairs = pairs.len();
                     let depth = deep_split_depth();
                     let hint = deep_pf_hint();
+                    let balance = deep_balance_enabled();
                     let queues: Vec<DeepQueue> = (0..n_pairs).map(|_| DeepQueue::new()).collect();
                     let next_sub = AtomicUsize::new(0);
                     let base_addr = data.as_mut_ptr() as usize;
@@ -3783,7 +3928,12 @@ impl AdditiveNttF128 {
                                     lo: range.start,
                                     hi: range.end,
                                 };
-                                if !q.push(b, depth) {
+                                let queued = if balance {
+                                    q.try_push(b, depth)
+                                } else {
+                                    q.push(b, depth)
+                                };
+                                if !queued {
                                     cb(range, blk);
                                 }
                             };
@@ -3808,6 +3958,48 @@ impl AdditiveNttF128 {
                                     );
                                 }
                             }
+                        } else if balance {
+                            // Hash whatever the paired producer has published;
+                            // while its ring is empty, transform and hash a
+                            // whole unclaimed sub-group here instead of
+                            // spinning. Leaves are written by index, so the
+                            // tree is the same whichever sibling hashes a
+                            // block.
+                            loop {
+                                if let Some(b) = q.try_pop() {
+                                    // SAFETY: as below.
+                                    let blk = unsafe {
+                                        std::slice::from_raw_parts(b.ptr as *const F128, b.len_f128)
+                                    };
+                                    cb(b.lo..b.hi, blk);
+                                    continue;
+                                }
+                                if q.done.load(Ordering::Acquire) {
+                                    if q.head.load(Ordering::Acquire) > q.tail.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                let i = next_sub.fetch_add(1, Ordering::Relaxed);
+                                if i < n_subs {
+                                    // SAFETY: `i` is claimed by exactly one
+                                    // worker, as on the producer side.
+                                    let sub_data = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            (base_addr as *mut F128).add(i * sub_bytes),
+                                            sub_bytes,
+                                        )
+                                    };
+                                    if !deep_sub(i, sub_data, Some(cb), hint) {
+                                        cb(
+                                            i * sub_size_positions..(i + 1) * sub_size_positions,
+                                            sub_data,
+                                        );
+                                    }
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
                         } else {
                             while let Some(b) = q.pop() {
                                 // SAFETY: the producer finished every write to
@@ -3822,6 +4014,7 @@ impl AdditiveNttF128 {
                         }
                     });
                     crate::gaptime::mark("ntt: deep pass done");
+                    crate::calib::DEEP.end();
                     return;
                 }
                 data.par_chunks_mut(sub_bytes)
@@ -3836,6 +4029,7 @@ impl AdditiveNttF128 {
                     });
                 if big {
                     crate::gaptime::mark("ntt: deep pass done");
+                    crate::calib::DEEP.end();
                 }
             }
             Some((n_chunks, on_chunk)) => {

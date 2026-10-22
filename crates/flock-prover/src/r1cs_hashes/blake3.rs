@@ -2701,6 +2701,36 @@ fn generate_round1_inner_octa(
     )
 }
 
+/// Cached copy of one strided unit's z blocks (256 blocks, 512 KiB).
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct StageLine([F128; 4]);
+
+struct UnitStage(Vec<StageLine>);
+
+impl UnitStage {
+    fn new() -> Self {
+        Self(vec![StageLine([F128::ZERO; 4]); 256 * (K / 128) / 4])
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut F128 {
+        self.0.as_mut_ptr().cast()
+    }
+
+    fn f128s(&self) -> &[F128] {
+        // SAFETY: StageLine is four F128s with no padding.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast(), self.0.len() * 4) }
+    }
+}
+
+/// Witness blocks in strided unit order (see the ranked closed branch of
+/// [`generate_round1_inner_octa_with_ranked_closed_dispatch`]). `FLOCK_WIT_STRIDED=1`.
+fn witness_strided_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_WIT_STRIDED").is_some_and(|v| v != "0"));
+    *ON || flock_core::calib::WITNESS_FUSE.get()
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
 fn generate_round1_inner_octa_with_ranked_closed_dispatch(
@@ -2817,6 +2847,79 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         && w30_elided
         && blake3_witgen8::ranked_static01_direct_enabled()
     {
+        if witness_strided_enabled() && z.len() / F128_PER_BLOCK == 1 << 18 {
+            // Strided order: unit `c0` builds compressions `c0 + 1024·m`
+            // (m < 256) as 32 octas whose lanes sit 1024 blocks apart. Same
+            // compressions, same bytes at the same addresses; only which
+            // worker produces which block changes.
+            const UNITS: usize = 1024;
+            const LANE: usize = UNITS;
+            let zp = z.as_mut_ptr() as usize;
+            let ap = a.as_mut_ptr() as usize;
+            let bp = b.as_mut_ptr() as usize;
+            let abp = ab_inner_bytes.as_mut_ptr() as usize;
+            let check = std::env::var_os("FLOCK_WIT_MIRROR_CHECK").is_some();
+            // Fused commit seed+top: after each unit, its two NTT tasks run
+            // from the unit's cached z blocks (see `flock_core::pcs::FusedTop`).
+            let fused = flock_core::pcs::FusedTop::take();
+            let all_fused = std::sync::atomic::AtomicBool::new(fused.is_some());
+            (0..UNITS).into_par_iter().for_each_init(|| UnitStage::new(), |stage, c0| unsafe {
+                let zs = stage.as_mut_ptr().cast::<u32>();
+                for jj in 0..32usize {
+                    let base = c0 + jj * SIMD * LANE;
+                    let off = base * F128_PER_BLOCK;
+                    let proj = blake3_witgen8::StreamProj {
+                        stage: core::ptr::null_mut(),
+                        out: (abp as *mut u8).add(base * ab_block_bytes),
+                        out_stride: LANE * ab_block_bytes,
+                        out_bias: 2 * 64,
+                        inv_table,
+                        plan: win_plan,
+                        one_rows_elided: true,
+                        w30_elided: true,
+                        lane_words: LANE * U32_PER_BLOCK,
+                        zs: zs.add(jj * SIMD * U32_PER_BLOCK),
+                    };
+                    blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                        init,
+                        base,
+                        LANE,
+                        (zp as *mut F128).add(off).cast::<u32>(),
+                        (ap as *mut F128).add(off).cast::<u32>(),
+                        (bp as *mut F128).add(off).cast::<u32>(),
+                        proj,
+                        &preps.0,
+                        [true; 3],
+                    );
+                }
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                if let Some(ft) = fused.as_ref()
+                    && !ft.run_unit(zp as *const F128, stage.as_mut_ptr(), c0)
+                {
+                    all_fused.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if check {
+                    for m in 0..256usize {
+                        let blk = c0 + m * LANE;
+                        let want = std::slice::from_raw_parts(
+                            (zp as *const F128).add(blk * F128_PER_BLOCK),
+                            F128_PER_BLOCK,
+                        );
+                        let got = &stage.f128s()[m * F128_PER_BLOCK..(m + 1) * F128_PER_BLOCK];
+                        if want != got {
+                            let bad = (0..F128_PER_BLOCK).filter(|&i| want[i] != got[i]).collect::<Vec<_>>();
+                            panic!("z mirror mismatch unit {c0} m {m}: f128 idx {:?}", &bad[..bad.len().min(16)]);
+                        }
+                    }
+                }
+            });
+            if let Some(ft) = fused
+                && all_fused.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                ft.finish();
+            }
+            return;
+        }
         z.par_chunks_mut(group_f128)
             .zip(a.par_chunks_mut(group_f128))
             .zip(b.par_chunks_mut(group_f128))
@@ -2837,10 +2940,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             plan: win_plan,
                             one_rows_elided: true,
                             w30_elided: true,
+                            lane_words: U32_PER_BLOCK,
+                            zs: core::ptr::null_mut(),
                         };
                         blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
                             init,
                             base,
+                            1,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -2927,12 +3033,15 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                                 plan: win_plan,
                                 one_rows_elided,
                                 w30_elided,
+                                lane_words: U32_PER_BLOCK,
+                                zs: core::ptr::null_mut(),
                             }
                         }).unwrap_unchecked();
                         if let Some(preps) = ranked_closed_preps.as_ref() {
                             blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
                                 ranked_closed_init.unwrap_unchecked(),
                                 base,
+                                1,
                                 z_out.as_mut_ptr().add(off).cast::<u32>(),
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
@@ -4362,7 +4471,7 @@ impl Blake3Setup {
             // makes the realised count come from the guard rather than from
             // the constant, so an instance an order of magnitude slower than
             // this host still publishes its ready file in time.
-            const EXTRA_WARMUP_PROVES: usize = 11;
+            const EXTRA_WARMUP_PROVES: usize = 17;
             const EXTRA_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
             // Warm the supply path the timed prove will actually run. When
             // the generator verified above, the scored prove evaluates blocks
@@ -4379,16 +4488,33 @@ impl Blake3Setup {
             }
             .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
             let warmup_started = std::time::Instant::now();
-            for _ in 0..EXTRA_WARMUP_PROVES {
+            // Self-calibration (`flock_core::calib`): passes 1.. alternate the
+            // bit-identical variants and time the phases they affect; the
+            // faster arm of each is latched after the loop, so the timed
+            // prove runs whichever this machine prefers. Pass 0 is discarded
+            // (first touch of the warm-up buffers).
+            let mut calib =
+                flock_core::calib::enabled().then(flock_core::calib::Calibration::new);
+            for pass in 0..EXTRA_WARMUP_PROVES {
+                if let Some(c) = calib.as_mut() {
+                    c.before_pass();
+                }
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
                 let _ =
                     std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
+                if let Some(c) = calib.as_mut() {
+                    c.after_pass(pass > 0);
+                }
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
                 }
+            }
+            match calib {
+                Some(c) => c.finish(),
+                None => flock_core::calib::apply_overrides(),
             }
         }
         let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
@@ -4450,13 +4576,21 @@ impl Blake3Setup {
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
-                        let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        flock_core::calib::WITNESS.begin();
+                        flock_core::calib::FRONT.begin();
+                        let tail = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                            self.pcs_params.num_ntts(),
+                            K_LOG,
+                            USEFUL_BITS,
+                        );
+                        let r = flock_core::pcs::prefault_codeword_during_fused(&self.pcs_params, tail, || {
                             generate_witness_with_ab_packed_and_round1_inner_from(
                                 blocks,
                                 self.n_blocks_log(),
                             )
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
+                        flock_core::calib::WITNESS.end();
                         r
                     });
                 flock_core::gaptime::mark("witness: pool exited");

@@ -657,7 +657,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at<const L: bool>(
     base: *const u8,
     base8: *const u8,
     even: *const u16,
@@ -666,28 +666,47 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
     // SAFETY: two readable 64-bit words per the contract; each extracted
     // field is one pre-scaled offset inside the readable image.
     unsafe {
-        let we = (even as *const u64).read_unaligned();
-        let wo = (even.add(32) as *const u64).read_unaligned();
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
-        let u0 = _mm512_xor_si512(
-            row(base, we as u16 as usize),
-            row(base8, wo as u16 as usize),
-        );
-        let u1 = _mm512_xor_si512(
-            row(base, (we >> 16) as u16 as usize),
-            row(base8, (wo >> 16) as u16 as usize),
-        );
-        let u2 = _mm512_xor_si512(
-            row(base, (we >> 32) as u16 as usize),
-            row(base8, (wo >> 32) as u16 as usize),
-        );
-        let u3 = _mm512_xor_si512(
-            row(base, (we >> 48) as usize),
-            row(base8, (wo >> 48) as usize),
-        );
+        let [e0, e1, e2, e3] = side_offsets::<L>(even);
+        let [o0, o1, o2, o3] = side_offsets::<L>(even.add(32));
+        let u0 = _mm512_xor_si512(row(base, e0), row(base8, o0));
+        let u1 = _mm512_xor_si512(row(base, e1), row(base8, o1));
+        let u2 = _mm512_xor_si512(row(base, e2), row(base8, o2));
+        let u3 = _mm512_xor_si512(row(base, e3), row(base8, o3));
         let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
         let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
         _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+    }
+}
+
+/// The four pre-scaled offsets at `p`, in order. `L = false` reads them as
+/// one 64-bit word split with three shifts; `L = true` reads two 32-bit words
+/// (one shift each), trading two scalar shifts for one extra load. On cores
+/// whose scalar shifts share issue ports with the surrounding vector work
+/// (Sapphire Rapids: ports 0 and 6, next to the GFNI on port 0) the second
+/// form can be faster; the ranked worker measures both during its untimed
+/// warm-up (`crate::calib`). Same four offsets either way.
+///
+/// # Safety
+/// `p` must address four readable `u16`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) unsafe fn side_offsets<const L: bool>(p: *const u16) -> [usize; 4] {
+    // SAFETY: four readable u16 per the contract; unaligned reads.
+    unsafe {
+        if L {
+            let lo = (p as *const u32).read_unaligned();
+            let hi = (p.add(2) as *const u32).read_unaligned();
+            [lo as u16 as usize, (lo >> 16) as usize, hi as u16 as usize, (hi >> 16) as usize]
+        } else {
+            let w = (p as *const u64).read_unaligned();
+            [
+                w as u16 as usize,
+                (w >> 16) as u16 as usize,
+                (w >> 32) as u16 as usize,
+                (w >> 48) as usize,
+            ]
+        }
     }
 }
 
@@ -709,7 +728,7 @@ pub(crate) const fn offw_krow_words<const P: bool>(k: usize) -> usize {
 /// [`apply_x86_avx512_register_2img_offp_at`] (`P = true`).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
+pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool, const L: bool>(
     base: *const u8,
     base8: *const u8,
     p: *const u16,
@@ -717,7 +736,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_krow_at<const P: bool>(
     // SAFETY: forwarded from this function's contract.
     unsafe {
         if P {
-            apply_x86_avx512_register_2img_offp_at(base, base8, p)
+            apply_x86_avx512_register_2img_offp_at::<L>(base, base8, p)
         } else {
             apply_x86_avx512_register_2img_offw_at(base, base8, p)
         }
@@ -754,22 +773,13 @@ pub(crate) const IMAGE_STRIDE_64: usize = 256 * 64;
     allow(dead_code)
 )]
 #[inline(always)]
-pub(crate) unsafe fn krow_offsets<const P: bool>(p: *const u16) -> [usize; 8] {
+pub(crate) unsafe fn krow_offsets<const P: bool, const L: bool>(p: *const u16) -> [usize; 8] {
     // SAFETY: two readable 64-bit words per the contract.
     unsafe {
         if P {
-            let we = (p as *const u64).read_unaligned();
-            let wo = (p.add(32) as *const u64).read_unaligned();
-            [
-                we as u16 as usize,
-                wo as u16 as usize,
-                (we >> 16) as u16 as usize,
-                (wo >> 16) as u16 as usize,
-                (we >> 32) as u16 as usize,
-                (wo >> 32) as u16 as usize,
-                (we >> 48) as usize,
-                (wo >> 48) as usize,
-            ]
+            let [e0, e1, e2, e3] = side_offsets::<L>(p);
+            let [o0, o1, o2, o3] = side_offsets::<L>(p.add(32));
+            [e0, o0, e1, o1, e2, o2, e3, o3]
         } else {
             let w0 = (p as *const u64).read_unaligned();
             let w1 = (p.add(4) as *const u64).read_unaligned();
@@ -808,7 +818,7 @@ pub(crate) unsafe fn krow_offsets<const P: bool>(p: *const u16) -> [usize; 8] {
 )]
 #[inline]
 #[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool>(
+pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool, const L: bool>(
     base: *const u8,
     p: *const u16,
 ) -> core::arch::x86_64::__m512i {
@@ -816,7 +826,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool>(
     // SAFETY: every offset is `byte * 64` with `byte <= 255`, so each load lands
     // inside one 256-row image of 64 readable bytes per row.
     unsafe {
-        let o = krow_offsets::<P>(p);
+        let o = krow_offsets::<P, L>(p);
         let row = |image: usize, offset: usize| {
             _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + offset) as *const __m512i)
         };
@@ -850,14 +860,14 @@ pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool>(
 )]
 #[inline]
 #[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn apply_x86_avx512_register_8img_krow_at<const P: bool>(
+pub(crate) unsafe fn apply_x86_avx512_register_8img_krow_at<const P: bool, const L: bool>(
     base: *const u8,
     p: *const u16,
 ) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
     // SAFETY: as for the four-image form; image `b` exists for every `b < 8`.
     unsafe {
-        let o = krow_offsets::<P>(p);
+        let o = krow_offsets::<P, L>(p);
         let row = |image: usize| {
             _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + o[image]) as *const __m512i)
         };
@@ -889,7 +899,7 @@ pub(crate) unsafe fn apply_x86_avx512_register_8img_krow_at<const P: bool>(
     allow(dead_code)
 )]
 #[inline(always)]
-pub(crate) unsafe fn apply_x86_avx512_register_img_krow_at<const I: u8, const P: bool>(
+pub(crate) unsafe fn apply_x86_avx512_register_img_krow_at<const I: u8, const P: bool, const L: bool>(
     base: *const u8,
     base8: *const u8,
     p: *const u16,
@@ -897,9 +907,9 @@ pub(crate) unsafe fn apply_x86_avx512_register_img_krow_at<const I: u8, const P:
     // SAFETY: forwarded from this function's contract.
     unsafe {
         match I {
-            8 => apply_x86_avx512_register_8img_krow_at::<P>(base, p),
-            4 => apply_x86_avx512_register_4img_krow_at::<P>(base, p),
-            _ => apply_x86_avx512_register_2img_krow_at::<P>(base, base8, p),
+            8 => apply_x86_avx512_register_8img_krow_at::<P, L>(base, p),
+            4 => apply_x86_avx512_register_4img_krow_at::<P, L>(base, p),
+            _ => apply_x86_avx512_register_2img_krow_at::<P, L>(base, base8, p),
         }
     }
 }
@@ -1177,7 +1187,7 @@ mod tests {
                     // SAFETY: avx512f; both images present; `offp` holds the
                     // even word at 0 and the odd word at 32.
                     let reg = unsafe {
-                        apply_x86_avx512_register_2img_offp_at(base, base8, offp.as_ptr())
+                        apply_x86_avx512_register_2img_offp_at::<false>(base, base8, offp.as_ptr())
                     };
                     let mut got = [0u8; 64];
                     // SAFETY: 64-byte destination for one ZMM store.
@@ -1272,13 +1282,13 @@ mod tests {
             // eight `byte * 64` offsets.
             unsafe {
                 let expected =
-                    store(apply_x86_avx512_register_2img_krow_at::<false>(base, base8, offw.as_ptr()));
+                    store(apply_x86_avx512_register_2img_krow_at::<false, false>(base, base8, offw.as_ptr()));
                 let cases = [
-                    ("2img parity", store(apply_x86_avx512_register_2img_krow_at::<true>(base, base8, offp.as_ptr()))),
-                    ("4img", store(apply_x86_avx512_register_4img_krow_at::<false>(base, offw.as_ptr()))),
-                    ("4img parity", store(apply_x86_avx512_register_4img_krow_at::<true>(base, offp.as_ptr()))),
-                    ("8img", store(apply_x86_avx512_register_8img_krow_at::<false>(base, offw.as_ptr()))),
-                    ("8img parity", store(apply_x86_avx512_register_8img_krow_at::<true>(base, offp.as_ptr()))),
+                    ("2img parity", store(apply_x86_avx512_register_2img_krow_at::<true, false>(base, base8, offp.as_ptr()))),
+                    ("4img", store(apply_x86_avx512_register_4img_krow_at::<false, false>(base, offw.as_ptr()))),
+                    ("4img parity", store(apply_x86_avx512_register_4img_krow_at::<true, false>(base, offp.as_ptr()))),
+                    ("8img", store(apply_x86_avx512_register_8img_krow_at::<false, false>(base, offw.as_ptr()))),
+                    ("8img parity", store(apply_x86_avx512_register_8img_krow_at::<true, false>(base, offp.as_ptr()))),
                 ];
                 for (name, got) in cases {
                     assert_eq!(got, expected, "{name}, bytes={bytes:02x?}");
