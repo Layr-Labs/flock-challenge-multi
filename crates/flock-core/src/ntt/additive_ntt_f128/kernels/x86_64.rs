@@ -2042,12 +2042,17 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     dense_lanes: usize,
     twiddles: &[F128; 7],
 ) {
-    let short_twiddles = !low_twiddle_fused3_disabled();
+    // One cached policy read per row group. The old shaped dispatcher
+    // called three independent OnceLock wrappers and queried DIET again
+    // on each arm. All four controls are process-constant; preserve their
+    // exact presence-based semantics in a single packed policy.
+    let policy = fused3_policy();
+    let short_twiddles = policy & 1 != 0;
     let low_inner = short_twiddles && twiddles[1..].iter().all(|t| t.hi == 0);
     // Select each outer short form from its exact high-limb value, without
     // assuming a particular basis or a fixed fraction of eligible blocks.
-    let low_outer = short_twiddles && !low_outer_fused3_disabled() && twiddles[0].hi == 0;
-    let high_one_outer = short_twiddles && twiddles[0].hi == 1 && !high_one_fused3_disabled();
+    let low_outer = short_twiddles && policy & 2 != 0 && twiddles[0].hi == 0;
+    let high_one_outer = short_twiddles && twiddles[0].hi == 1 && policy & 4 != 0;
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]`; low_outer/high_one_outer establish
     // their respective outer preconditions. NN equals the runtime stride.
@@ -2055,7 +2060,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
         // Inspect the value, rather than assuming a particular standard
         // basis or domain size. Every other high limb keeps its prior path.
         if high_one_outer {
-            match (mul_diet_disabled(), low_inner) {
+            match (policy & 8 == 0, low_inner) {
                 (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN, false, true>(
                     ptr, NN, dense_lanes, twiddles,
                 ),
@@ -2071,7 +2076,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
             }
             return;
         }
-        match (mul_diet_disabled(), low_inner) {
+        match (policy & 8 == 0, low_inner) {
             (true, false) => {
                 if low_outer {
                     butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(ptr, NN, dense_lanes, twiddles)
@@ -2104,20 +2109,57 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     }
 }
 
-/// Restore the general product for outer twiddles whose high limb is zero.
-/// Read once per process, outside every butterfly lane loop.
-#[inline(never)]
-fn low_outer_fused3_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
+
+/// Pack the same four presence-based environment controls used by the
+/// original shaped fused-three dispatcher. This is configuration only;
+/// eligibility still checks the actual twiddle high limbs on every call.
+fn fused3_policy_bits(no_short: bool, no_low: bool, no_high_one: bool, no_diet: bool) -> u8 {
+    u8::from(!no_short)
+        | (u8::from(!no_low) << 1)
+        | (u8::from(!no_high_one) << 2)
+        | (u8::from(!no_diet) << 3)
 }
 
-/// Restore the general product for outer twiddles whose high limb is one.
-/// Read once per process, outside every butterfly lane loop.
-#[inline(never)]
-fn high_one_fused3_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some())
+#[inline]
+fn fused3_policy() -> u8 {
+    static POLICY: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        fused3_policy_bits(
+            std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some(),
+            std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some(),
+            std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some(),
+            std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some(),
+        )
+    });
+    *POLICY
+}
+
+#[cfg(test)]
+mod fused3_policy_tests {
+    use super::fused3_policy_bits;
+
+    #[test]
+    fn packed_policy_preserves_dispatch_for_all_overrides() {
+        // Exercise all control combinations against the previous independent
+        // Boolean decisions, including ineligible/nonstandard high limbs.
+        for controls in 0..16 {
+            let no_short = controls & 1 != 0;
+            let no_low = controls & 2 != 0;
+            let no_one = controls & 4 != 0;
+            let no_diet = controls & 8 != 0;
+            let p = fused3_policy_bits(no_short, no_low, no_one, no_diet);
+            for high in [0u64, 1, 22, 23, u64::MAX] {
+                for inner_zero in [false, true] {
+                    let old = (!no_short && inner_zero,
+                               !no_short && !no_low && high == 0,
+                               !no_short && !no_one && high == 1, no_diet);
+                    let new = (p & 1 != 0 && inner_zero,
+                               p & 1 != 0 && p & 2 != 0 && high == 0,
+                               p & 1 != 0 && p & 4 != 0 && high == 1, p & 8 == 0);
+                    assert_eq!(old, new);
+                }
+            }
+        }
+    }
 }
 
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores general products in all three
