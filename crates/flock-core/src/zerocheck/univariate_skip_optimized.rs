@@ -1722,6 +1722,56 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
     unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
 }
 
+
+/// Project eight ranked windows using shared four-K-row instruction bodies.
+///
+/// # Safety
+/// As for the single-window const wrapper, for each of eight records at
+/// `off + j*ROUND1_AB_OFF_WORDS`; each 64-byte output at `out+j*out_stride`
+/// is writable, disjoint, 64-byte aligned, and does not alias the inputs.
+#[inline(never)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_batch8<
+    const BLK: usize, const P: bool,
+>(off: *const u16, out: *mut u8, out_stride: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out as usize & 63, 0);
+    debug_assert_eq!(out_stride & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(target_arch="x86_64",target_feature="gfni",target_feature="avx512f",target_feature="avx512bw"))]
+    unsafe {
+        if plan.table_images == 2 {
+            kernels::x86_64_bcomplement::shift_reduce_bcomplement_batch8::<BLK,P>(off,out,out_stride,(imgs.0,imgs.1));
+            return;
+        }
+        round1_ab_inner_window_from_offsets_nt2_bcomplement_batch8_other::<BLK,P>(
+            off,out,out_stride,plan,imgs,
+        );
+    }
+    #[cfg(not(all(target_arch="x86_64",target_feature="gfni",target_feature="avx512f",target_feature="avx512bw")))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+
+/// Cold table-layout fallback; keep it out of the default batch's code and
+/// stack frame while preserving the existing four/eight-image behavior.
+#[cfg(all(target_arch="x86_64",target_feature="gfni",target_feature="avx512f",target_feature="avx512bw"))]
+#[cold]
+#[inline(never)]
+unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_batch8_other<const BLK:usize,const P:bool>(
+    off:*const u16,out:*mut u8,out_stride:usize,plan:Round1AbWindowPlan,imgs:Round1AbTableImages,
+) {
+    unsafe {
+        for j in 0..8 {
+            round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK,P>(
+                &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
+                &mut *out.add(j*out_stride).cast::<[u8;64]>(),plan,imgs,
+            );
+        }
+    }
+}
+
 /// Residual twin for the two ranked windows containing complete B=1 K-rows.
 /// `keep` is `0xfc` for block 2 and `0x0f` for block 29.
 #[inline(always)]

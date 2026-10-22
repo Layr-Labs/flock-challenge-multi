@@ -729,6 +729,56 @@ mod tests {
         assert_eq!(seen_modes, 0xfffe, "all pruned prefix/suffix modes");
     }
 
+
+    #[test]
+    fn half_horner_batch8_matches_generic_with_guards() {
+        use super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2 as generic;
+        #[repr(align(64))]
+        struct Guarded([u8; 1664]);
+        let table = InvNttTableByteSingleGf8::new(
+            &AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(64)));
+        let imgs = table.image_ptrs();
+        let mut seed = 0x73abcde274156u64;
+        for round in 0..32 {
+            for blk in 3..=28 {
+                let mut off = [0u16; 1024];
+                let mut parity = [0u16; 1024];
+                let mut expected = [0u8; 512];
+                for j in 0..8 {
+                    let mut row = [0u16; 128];
+                    for i in 0..128 {
+                        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                        let mut byte = seed as u8;
+                        if i >= 64 && geometry_known_bytes(blk, (i-64)/8) & (1 << (i%8)) != 0 { byte = 255; }
+                        row[i] = u16::from(byte) << 6;
+                    }
+                    off[j*128..(j+1)*128].copy_from_slice(&row);
+                    parity[j*128..(j+1)*128].copy_from_slice(&parity_layout(&row));
+                    let mut want = Output([0;64]);
+                    unsafe { generic::<false>(row.as_ptr(), &mut want.0, imgs); _mm_sfence(); }
+                    expected[j*64..(j+1)*64].copy_from_slice(&want.0);
+                }
+                for stride in [64,128,192] {
+                    for layout in [false,true] {
+                        let mut got = Guarded([0xa5;1664]);
+                        let op = if layout { parity.as_ptr() } else { off.as_ptr() };
+                        macro_rules! run { ($($b:literal),*) => { match blk {
+                            $($b => unsafe {
+                                if layout { shift_reduce_bcomplement_batch8::<$b,true>(op,got.0.as_mut_ptr().add(64),stride,imgs); }
+                                else { shift_reduce_bcomplement_batch8::<$b,false>(op,got.0.as_mut_ptr().add(64),stride,imgs); }
+                            },)* _ => unreachable!()
+                        } }; }
+                        run!(3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28);
+                        unsafe { _mm_sfence(); }
+                        let mut want = [0xa5;1664];
+                        for j in 0..8 { want[64+j*stride..128+j*stride].copy_from_slice(&expected[j*64..(j+1)*64]); }
+                        assert_eq!(got.0,want,"round={round} blk={blk} P={layout} stride={stride}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Scalar definition of the parity-split arena: offset `i` of a side
     /// lives at word `(i & 1) * 32 + (i >> 1)`.
     fn parity_layout(off: &[u16; 128]) -> [u16; 128] {
@@ -996,6 +1046,110 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+}
+
+
+/// Four consecutive K-row products for eight independent witness blocks.
+/// `MODES` stores the K3 mode in its low byte. Offsets retain the full
+/// 128-word per-block layout; shifting `op` selects K0..3 or K4..7.
+/// The scratch is written temporally and every byte is initialized here.
+/// Separating this body by its four mode bytes lets different windows share
+/// the same generated instructions, without changing any projected values.
+#[inline(never)]
+unsafe fn half_horner_batch8<const MODES: u32, const P: bool>(
+    op: *const u16,
+    scratch: *mut u8,
+    imgs: (*const u8, *const u8),
+) {
+    unsafe {
+        let x = _mm512_set1_epi8(2);
+        for j in 0..8 {
+            let p = op.add(j * 128);
+            let apply = |k| apply_x86_avx512_register_2img_krow_at::<P>(
+                imgs.0, imgs.1, p.add(offw_krow_words::<P>(k)),
+            );
+            let av = apply(3);
+            let (bv, correction) = apply_b_mode::<P>(
+                imgs, p.add(64 + offw_krow_words::<P>(3)), MODES as u8, av,
+            );
+            let mut acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av, bv), correction);
+            macro_rules! step {
+                ($k:expr, $shift:expr) => {{
+                    let av = apply($k);
+                    let (bv, correction) = apply_b_mode::<P>(
+                        imgs, p.add(64 + offw_krow_words::<P>($k)),
+                        (MODES >> $shift) as u8, av,
+                    );
+                    acc = _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_gf2p8mul_epi8(acc, x),
+                        _mm512_gf2p8mul_epi8(av, bv), correction,
+                    );
+                }};
+            }
+            step!(2, 8); step!(1, 16); step!(0, 24);
+            _mm512_storeu_si512(scratch.add(j * 64).cast::<__m512i>(), acc);
+        }
+    }
+}
+
+/// Same eight-row Horner polynomial, split as H_low + 2^4 H_high.
+/// `off` covers eight complete offset records. Outputs are 64-byte aligned,
+/// 64-byte long, disjoint and separated by `out_stride` (a multiple of 64).
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_batch8<const BLK: usize, const P: bool>(
+    off: *const u16,
+    out: *mut u8,
+    out_stride: usize,
+    imgs: (*const u8, *const u8),
+) {
+    unsafe {
+        let mut scratch = core::mem::MaybeUninit::<[u8; 1024]>::uninit();
+        let tmp = scratch.as_mut_ptr().cast::<u8>();
+        macro_rules! halves {
+            ($blk:literal) => {{
+                half_horner_batch8::<{(WINDOW_PLANS[$blk - 2].modes >> 32) as u32}, P>(off, tmp, imgs);
+                half_horner_batch8::<{WINDOW_PLANS[$blk - 2].modes as u32}, P>(
+                    off.add(offw_krow_words::<P>(4)), tmp.add(512), imgs,
+                );
+            }};
+        }
+        match BLK {
+            // Generated only from the pre-existing, geometry-validated plans.
+            3 => halves!(3),
+            4 => halves!(4),
+            5 => halves!(5),
+            6 => halves!(6),
+            7 => halves!(7),
+            8 => halves!(8),
+            9 => halves!(9),
+            10 => halves!(10),
+            11 => halves!(11),
+            12 => halves!(12),
+            13 => halves!(13),
+            14 => halves!(14),
+            15 => halves!(15),
+            16 => halves!(16),
+            17 => halves!(17),
+            18 => halves!(18),
+            19 => halves!(19),
+            20 => halves!(20),
+            21 => halves!(21),
+            22 => halves!(22),
+            23 => halves!(23),
+            24 => halves!(24),
+            25 => halves!(25),
+            26 => halves!(26),
+            27 => halves!(27),
+            28 => halves!(28),
+            _ => unreachable!("batch8 requires a full ranked window"),
+        }
+        for j in 0..8 {
+            let lo = _mm512_loadu_si512(tmp.add(j * 64).cast::<__m512i>());
+            let hi = _mm512_loadu_si512(tmp.add(512 + j * 64).cast::<__m512i>());
+            let value = _mm512_xor_si512(lo, _mm512_gf2p8mul_epi8(hi, _mm512_set1_epi8(16)));
+            _mm512_stream_si512(out.add(j * out_stride).cast::<__m512i>(), value);
         }
     }
 }
