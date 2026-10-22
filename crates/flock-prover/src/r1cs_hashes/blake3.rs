@@ -4379,16 +4379,59 @@ impl Blake3Setup {
             }
             .unwrap_or(crate::seed_pipe::BlockSource::Slice(blocks));
             let warmup_started = std::time::Instant::now();
+            // Route calibration, folded into the passes this loop already
+            // runs: alternate the zerocheck round-two sweep route across the
+            // untimed warm-up proves and keep each route's fastest sample.
+            // Latching either route cannot change a proof byte -- the two
+            // routes emit the same transcript (identity receipted by
+            // sha256 181da03b.. on both latches, log2=18) -- so this only
+            // chooses which route's stores/loads the measured interval runs,
+            // measured on THIS machine inside the untimed window. Rank 1 =
+            // materialize, 2 = no-materialize; ties and missing samples keep
+            // the production default (no-materialize). Inert under tests
+            // (latch stays 0) and under an explicit
+            // `FLOCK_NO_ZC_SWEEP_NOMAT`, which keeps its control meaning.
+            let calibrate_route = !cfg!(test)
+                && std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_none();
+            let mut fastest_route: [Option<u128>; 2] = [None, None];
+            let mut pass_idx = 0u8;
             for _ in 0..EXTRA_WARMUP_PROVES {
+                let route = if calibrate_route {
+                    // Strict alternation: arm 1 sees six passes, arm 2 five;
+                    // per-arm minimums make the imbalance immaterial.
+                    pass_idx += 1;
+                    let r = 1 + (pass_idx % 2);
+                    flock_core::zerocheck::ZC_NOMAT_ROUTE
+                        .store(r, std::sync::atomic::Ordering::Relaxed);
+                    Some(r)
+                } else {
+                    None
+                };
                 let mut warm_challenger =
                     crate::challenger::FsChallenger::with_hash(b"flock-extra-warmup-v0", {
                         self.pcs_params.merkle_hash
                     });
+                let pass_started = std::time::Instant::now();
                 let _ =
                     std::hint::black_box(self.prove_fast_inner(warm_source, &mut warm_challenger));
+                if let Some(r) = route {
+                    let nanos = pass_started.elapsed().as_nanos();
+                    let slot = &mut fastest_route[(r - 1) as usize];
+                    if slot.is_none_or(|t| nanos < t) {
+                        *slot = Some(nanos);
+                    }
+                }
                 if warmup_started.elapsed() >= EXTRA_WARMUP_BUDGET {
                     break;
                 }
+            }
+            if calibrate_route {
+                let winner = match (fastest_route[0], fastest_route[1]) {
+                    (Some(mat), Some(nomat)) if mat < nomat => 1,
+                    _ => 2,
+                };
+                flock_core::zerocheck::ZC_NOMAT_ROUTE
+                    .store(winner, std::sync::atomic::Ordering::Relaxed);
             }
         }
         let out = self.prove_fast_inner(crate::seed_pipe::BlockSource::Slice(blocks), challenger);
