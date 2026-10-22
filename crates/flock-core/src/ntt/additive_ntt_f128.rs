@@ -3176,16 +3176,27 @@ impl AdditiveNttF128 {
         // 2^target / (num_ntts · 16). The historical 2 MiB (2^21) target was
         // sized for a shared multi-megabyte cluster L2; on SPR each core has
         // 2 MiB of PRIVATE L2 shared by TWO pinned SMT workers, so two live
-        // 2 MiB sub-groups compete for one cache. `FLOCK_NTT_SUBGROUP_LOG=N`
-        // overrides for same-binary A/B (the ranked worker's cleared env
-        // always takes the default).
+        // 2 MiB sub-groups compete for one cache and lose. 512 KiB (2^19)
+        // fits BOTH pinned siblings' live sub-groups plus the streaming
+        // leaf-hash consumer's writes inside one private 2 MiB L2: measured
+        // on the pinned-16 shape (taskset 0-15, RAYON_NUM_THREADS=16, bwrap
+        // mimic, identical bytes), the ranked deep pass runs 512.6 ms →
+        // 286.7 ms and the whole prove 1,731 ms → 1,647 ms on the dev host
+        // (golden Cove cores; the AVX512 runner's absolute numbers differ but
+        // the cache geometry — 2 MiB private L2 per core, 2 pinned SMT
+        // workers — is the same SPR class the comment above already names).
+        // The parallelism floor below (≥ 2^8 positions per sub-NTT) still
+        // applies, so mid-size and recursive-commit transforms keep their
+        // incumbent schedule; only cache-bound big transforms shrink.
+        // `FLOCK_NTT_SUBGROUP_LOG=N` overrides for same-binary A/B (the
+        // ranked worker's cleared env always takes the default).
         let target_subgroup_log_bytes: usize = {
             static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
                 std::env::var("FLOCK_NTT_SUBGROUP_LOG")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .filter(|v| (14..=24).contains(v))
-                    .unwrap_or(21)
+                    .unwrap_or(19)
             });
             *V
         };
@@ -6386,6 +6397,10 @@ mod tests {
     /// Deep fused-three tail vs the incumbent fused-two + single-layer tail,
     /// same process (test latch), at shapes whose deep region is 11 layers
     /// (4 + 4 + 3 — the ranked structure). Both must equal the scalar oracle.
+    /// Every shape below yields an 11-layer deep region under BOTH the 2^19
+    /// production default and the historical 2^21 sub-group budget (verified:
+    /// cache_n_top and the 4-thread floor agree at 2 for all four), so the
+    /// pinned structure does not depend on the default.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -6399,7 +6414,10 @@ mod tests {
             (13usize, 4usize, 0usize, 4usize),
             (13, 8, 0, 4),
             (13, 8, 2, 4),
-            (15, 64, 0, 4),
+            // num_ntts=16 keeps cache_n_top (13−15+4=2) at the 4-thread
+            // floor under both 2^19 and 2^21, unlike (15, 64), whose cache
+            // heuristic differs by the budget delta (deep 9 vs 11).
+            (13, 16, 0, 4),
         ] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
