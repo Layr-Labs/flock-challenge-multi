@@ -5627,6 +5627,19 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
     // before any read; every shuffle index is in range and the cfg gate
     // supplies each intrinsic.
     unsafe {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        if dead_lines == 0 {
+            return c4_preserve::fold(rows, m, out);
+        }
+
         let mut z = [_mm512_setzero_si512(); 8];
         if dead_lines == 0 {
             for (i, slot) in z.iter_mut().enumerate() {
@@ -6369,3 +6382,15 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
         );
     }
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[path = "x86_64_c4_preserve.rs"]
+mod c4_preserve;
