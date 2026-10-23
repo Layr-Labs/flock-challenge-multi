@@ -424,7 +424,7 @@ unsafe fn project_const<const BLK: usize>(
     m: *const u64,
 ) {
     unsafe {
-        let mut acc = [_mm512_setzero_si512(); 8];
+        let mut acc: [__m512i; 8] = core::mem::MaybeUninit::uninit().assume_init();
         rows.publish_dense_values(0, a[0], b[0]);
         match mode(BLK, 7) {
 0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
@@ -448,8 +448,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(1, a[1], b[1]);
         match mode(BLK, 6) {
@@ -474,8 +476,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(2, a[2], b[2]);
         match mode(BLK, 5) {
@@ -500,8 +504,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(3, a[3], b[3]);
         match mode(BLK, 4) {
@@ -526,8 +532,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(4, a[4], b[4]);
         match mode(BLK, 3) {
@@ -552,8 +560,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(5, a[5], b[5]);
         match mode(BLK, 2) {
@@ -578,8 +588,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(6, a[6], b[6]);
         match mode(BLK, 1) {
@@ -604,8 +616,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         rows.publish_dense_values(7, a[7], b[7]);
         match mode(BLK, 0) {
@@ -630,8 +644,10 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        core::arch::asm!(
+            "/* Horner NT publication boundary, memory-only */",
+            options(nostack, preserves_flags)
+        );
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
