@@ -1354,7 +1354,7 @@ fn zc_r2_setup_trim_enabled() -> bool {
     *ON
 }
 
-fn packed_split_n_hi(n_vars: usize) -> usize {
+pub(crate) fn packed_split_n_hi(n_vars: usize) -> usize {
     let base = lookahead_n_hi(n_vars);
     #[cfg(test)]
     if let Some(over) = PACKED_SPLIT_N_HI_OVERRIDE.with(|c| c.get()) {
@@ -1369,13 +1369,36 @@ fn packed_split_n_hi(n_vars: usize) -> usize {
     base.max(PACKED_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
 }
 
-/// Build the split used by the packed round-two sweep. The no-materialize
-/// caller retains this tiny pair of tensors for the packed rounds-3+4 pass:
-/// its high coordinates are identical, while its low tensor is round two's
-/// low tensor with the first two coordinates marginalized out.
+/// Build the split used by the packed round-two sweep. When its high split
+/// matches the composed pass, the caller reuses these tensors by marginalizing
+/// two low coordinates. The ranked cache split instead rebuilds the composed
+/// split independently so its existing fan-out is unchanged.
 pub(crate) fn packed_round2_split_eq(mlv_challenges: &[F128]) -> SplitEqGhash {
     let n_vars = mlv_challenges.len() - 1;
-    SplitEqGhash::with_n_hi(&mlv_challenges[1..], packed_split_n_hi(n_vars))
+    let base = packed_split_n_hi(n_vars);
+    // Round two's 128 1-KiB B matrices exceed the target's 48-KiB L1D.
+    // For the exact ranked shape, retain 32 matrices (32 KiB) instead.
+    // The composed pass independently keeps its existing split below.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+              target_feature = "avx512vbmi", target_feature = "gfni",
+              target_feature = "vpclmulqdq"))]
+    let n_hi = if n_vars == 25 && base == 13 && r2_cache_split_enabled() {
+        15
+    } else { base };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f",
+              target_feature = "avx512vbmi", target_feature = "gfni",
+              target_feature = "vpclmulqdq")))]
+    let n_hi = base;
+    SplitEqGhash::with_n_hi(&mlv_challenges[1..], n_hi)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "avx512vbmi", target_feature = "gfni",
+          target_feature = "vpclmulqdq"))]
+fn r2_cache_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+        std::env::var_os("FLOCK_NO_R2_CACHE_SPLIT").is_none());
+    *ON
 }
 
 /// Remove the two least-significant coordinates from an eq tensor. In
@@ -4533,6 +4556,33 @@ mod tests {
         assert_eq!(la_mat, la_nm, "r2 lookahead across packed split");
         assert_eq!(a2.len(), n);
         assert_eq!(b2.len(), n);
+    }
+
+    #[test]
+    fn r2cache133_policy_and_oracle() {
+        let challenges = vec![F128::ONE; 26];
+        let split = packed_round2_split_eq(&challenges);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+                  target_feature = "avx512vbmi", target_feature = "gfni",
+                  target_feature = "vpclmulqdq"))]
+        assert_eq!(split.n_hi, if r2_cache_split_enabled() {15} else {13});
+        assert_eq!(packed_split_n_hi(23), 13);
+        let mut rng = Rng::new(133);
+        let m = 18;
+        let (a, b, padding) = lookahead_witness(&mut rng, m, true);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut mlv = rng.f128_vec(m - 6);
+        mlv[0] = F128::ONE;
+        if mlv[1] == F128::ZERO { mlv[1] = F128::ONE; }
+        let eq0 = SplitEqGhash::with_n_hi(&mlv[1..], 1);
+        let reference = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+            &a, &b, m, 6, &table, &mlv, &padding, Some(&eq0), None);
+        for hi in [2,3,4,5,6,7,8] {
+            let eq = SplitEqGhash::with_n_hi(&mlv[1..], hi);
+            let got = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a, &b, m, 6, &table, &mlv, &padding, Some(&eq), None);
+            assert_eq!(got, reference, "split {hi}");
+        }
     }
 
     /// **The big cross-check**: fused `fold_and_compute_round_pair_optimized`

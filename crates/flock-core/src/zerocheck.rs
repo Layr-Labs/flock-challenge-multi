@@ -811,9 +811,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
-    // Round two and the packed rounds-3+4 pass share the same 13 high eq
-    // coordinates at the ranked split. Keep round two's small tensors until
-    // that pass; its low tensor loses exactly the first two coordinates.
+    // Retain round two's tensor until the composed pass. Reuse it only when
+    // its high split still matches that pass's independent policy; the ranked
+    // round-two cache split deliberately has two more high coordinates.
     let mut packed_eq = use_nomat
         .then(|| packed_round2_split_eq(&mlv_arg))
         // The composed packed leaf requires at least one low variable after
@@ -1027,7 +1027,11 @@ fn prove_packed_padded_inner<C: Challenger>(
             // pair is dropped. Also yields the round-five lookahead.
             let mut a4 = crate::scratch::take_f128(quarter);
             let mut b4 = crate::scratch::take_f128(quarter);
-            let round2_eq = packed_eq.take();
+            // A round-two-only cache split must not change the composed pass's
+            // established fan-out or its matrix/prefetch working set.
+            let round2_eq = packed_eq.take().filter(|eq| {
+                eq.n_hi == multilinear::packed_split_n_hi(r_next.len() - 1)
+            });
             let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
             let eq_override = match (&eq_lo, &round2_eq) {
                 (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
