@@ -430,6 +430,20 @@ impl RootFoldSource {
         assert_eq!(x_outer.len(), m - k_log);
         let k = 1usize << k_log;
         assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+        if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG && block_major_gfni_enabled() {
+            let eq_lo = build_eq_table(&x_outer[..16]);
+            let eq_hi = build_eq_table(&x_outer[16..]);
+            let folded = match &self.source {
+                RootFoldStorage::Packed(packed) => fold_block_major_segmented_gfni(
+                    packed, k_log, self.plan.roots.len(), &eq_lo, &eq_hi,
+                    None, false, false, self.plan.roots.len().div_ceil(128), None).0,
+                RootFoldStorage::Splice(splice) => fold_block_major_segmented_gfni(
+                    z_canonical, k_log, splice.source_bits, &eq_lo, &eq_hi,
+                    None, false, false, k / 128, Some(splice)).0,
+            };
+            return self.plan.reconstruct(&folded, k);
+        }
         let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
             let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
             let eq_lo = build_eq_table(lo);
@@ -617,6 +631,7 @@ impl RootSplicePlan {
             tiles_per_worker,
             n_tiles,
             dynamic_tiles_enabled(),
+            None,
             eq8_at,
             None,
             false,
@@ -1758,6 +1773,36 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
     let log_b = eq_lo.len().trailing_zeros() as usize;
     let lo_mask = eq_lo.len() - 1;
 
+    // A high factor is constant over an entire contiguous low-factor segment.
+    // Delay it until after the linear inner fold (and optional top bind).
+    // Specialized root and ranked-capture callers share the cached helper below.
+    if eq_lo.len() == 1 << 16 && eq_hi.len() == 4 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+        if block_major_gfni_enabled() {
+            return fold_block_major_segmented_gfni(z_packed, k_log, useful_bits,
+                eq_lo, eq_hi, top_bind, false, false, 1 << (k_log - 7), None).0;
+        }
+        let segment_len = eq_lo.len() * (1usize << (k_log - 7));
+        let mut out = vec![F128::ZERO; (1usize << k_log) >> usize::from(top_bind.is_some())];
+        for (segment, &scale) in z_packed.chunks_exact(segment_len).zip(eq_hi) {
+            let folded;
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+            { folded = partial_fold_packed_z_block_major_padded_with_tables(
+                segment, k_log + 16, k_log, useful_bits,
+                |base| std::array::from_fn(|r| eq_lo[base + r]), top_bind,
+            ); }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni")))]
+            { folded = partial_fold_packed_z_block_major_padded_with_tables(
+                segment, k_log + 16, k_log, useful_bits,
+                |base| std::array::from_fn(|r| eq_lo[base + r]), top_bind,
+            ); }
+            for (dst, value) in out.iter_mut().zip(folded) {
+                *dst += value * scale;
+            }
+        }
+        return out;
+    }
+
     #[allow(unused_variables)]
     let eq8_x4 = lc_eq8_x4_enabled();
     partial_fold_packed_z_block_major_padded_with_tables(
@@ -1778,6 +1823,51 @@ fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
         },
         top_bind,
     )
+}
+
+/// Delay a constant high factor through all linear fold/reduce/capture operations.
+/// Each contiguous low-factor segment is read once. Its matrix cache is shared
+/// read-only across segments; the root splice carry remains per-worker/tile.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_segmented_gfni(
+    z: &[F128], k_log: usize, useful_bits: usize, eq_lo: &[F128], eq_hi: &[F128],
+    top_bind: Option<F128>, ranked_one_rows: bool, capture_canon: bool,
+    source_stride: usize, root_splice: Option<&RootSplicePlan>,
+) -> (Vec<F128>, Option<Vec<F128>>) {
+    use rayon::prelude::*;
+    assert_eq!(z.len(), eq_lo.len() * eq_hi.len() * source_stride);
+    assert_eq!(eq_lo.len() % 64, 0);
+    let mats_cache: Vec<[u64; 128]> = (0..eq_lo.len() / 64).into_par_iter().map(|tile| {
+        let mut mats = [0u64; 128];
+        for t in 0..8 {
+            let basis: [F128; 8] = std::array::from_fn(|r| eq_lo[tile * 64 + t * 8 + r]);
+            kernels::fold_mats_from_basis(&basis, &mut mats[t * 16..(t + 1) * 16]);
+        }
+        mats
+    }).collect();
+    let n_tiles = mats_cache.len();
+    let tiles_per_worker = n_tiles.div_ceil(rayon::current_num_threads().max(1));
+    let mut out = Vec::new();
+    let mut one: Option<Vec<F128>> = None;
+    for (segment, &scale) in z.chunks_exact(eq_lo.len() * source_stride).zip(eq_hi) {
+        let (folded, captured) = fold_block_major_gfni(
+            segment, 1 << k_log, source_stride, useful_bits, useful_bits.div_ceil(128),
+            n_tiles.div_ceil(tiles_per_worker), tiles_per_worker, n_tiles,
+            dynamic_tiles_enabled(), Some(&mats_cache),
+            &|base| std::array::from_fn(|r| eq_lo[base + r]), top_bind,
+            ranked_one_rows, capture_canon, root_splice,
+        );
+        if out.is_empty() { out.resize(folded.len(), F128::ZERO); }
+        out.par_chunks_mut(1024).zip(folded.par_chunks(1024))
+            .for_each(|(dst, src)| crate::field::f128_slice::add_scaled(dst, src, scale));
+        if let Some(captured) = captured {
+            let dst = one.get_or_insert_with(|| vec![F128::ZERO; captured.len()]);
+            dst.par_chunks_mut(1024).zip(captured.par_chunks(1024))
+                .for_each(|(dst, src)| crate::field::f128_slice::add_scaled(dst, src, scale));
+        }
+    }
+    (out, one)
 }
 
 /// `FLOCK_NO_LC_EQ8_X4=1` restores eight scalar `eq_lo * eq_hi` products per
@@ -1890,7 +1980,7 @@ pub(crate) fn fold_block_major_one_shot(
     let n_log = m - k_log;
     debug_assert_eq!(x_outer.len(), n_log);
     if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
-        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+        let (outer_lo, outer_hi) = x_outer.split_at(16);
         let eq_lo = build_eq_table(outer_lo);
         let eq_hi = build_eq_table(outer_hi);
         partial_fold_packed_z_block_major_factorized_padded(
@@ -1921,7 +2011,7 @@ pub(crate) fn fold_block_major_one_shot_bind_top(
     let n_log = m - k_log;
     debug_assert_eq!(x_outer.len(), n_log);
     if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
-        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+        let (outer_lo, outer_hi) = x_outer.split_at(16);
         let eq_lo = build_eq_table(outer_lo);
         let eq_hi = build_eq_table(outer_hi);
         partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
@@ -1973,6 +2063,16 @@ pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
     assert_eq!(k_log, 14);
     assert_eq!(useful_bits, 15409);
     assert_eq!(x_outer.len(), BLOCK_MAJOR_FACTORED_EQ_N_LOG);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "gfni"))]
+    if block_major_gfni_enabled() {
+        let eq_lo = build_eq_table(&x_outer[..16]);
+        let eq_hi = build_eq_table(&x_outer[16..]);
+        let (full, one) = fold_block_major_segmented_gfni(z, k_log, useful_bits,
+            &eq_lo, &eq_hi, Some(r_top), true, capture_canon, 1 << (k_log - 7), None);
+        let mut one = one.expect("ranked one-row fold requested");
+        let canon = capture_canon.then(|| one.split_off(1usize << (k_log - 1)));
+        return (full, one, canon);
+    }
     let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
     let eq_lo = build_eq_table(outer_lo);
     let eq_hi = build_eq_table(outer_hi);
@@ -2592,6 +2692,7 @@ fn fold_block_major_gfni(
     tiles_per_worker: usize,
     n_tiles: usize,
     dynamic: bool,
+    mats_cache: Option<&[[u64; 128]]>,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     top_bind: Option<F128>,
     ranked_one_rows: bool,
@@ -2643,6 +2744,7 @@ fn fold_block_major_gfni(
                         n_tiles,
                         dynamic,
                         &next_tile,
+                        mats_cache,
                         eq8_at,
                         root_splice,
                         worker,
@@ -2659,6 +2761,7 @@ fn fold_block_major_gfni(
                         n_tiles,
                         dynamic,
                         &next_tile,
+                        mats_cache,
                         eq8_at,
                         None,
                         worker,
@@ -2683,6 +2786,7 @@ fn fold_block_major_gfni(
                     n_tiles,
                     dynamic,
                     &next_tile,
+                    mats_cache,
                     eq8_at,
                     root_splice,
                     worker,
@@ -2699,6 +2803,7 @@ fn fold_block_major_gfni(
                     n_tiles,
                     dynamic,
                     &next_tile,
+                    mats_cache,
                     eq8_at,
                     None,
                     worker,
@@ -2832,6 +2937,7 @@ unsafe fn fold_block_major_gfni_worker<const TILE_GRAB: usize, const HAS_SPLICE:
     n_tiles: usize,
     dynamic: bool,
     next_tile: &std::sync::atomic::AtomicUsize,
+    mats_cache: Option<&[[u64; 128]]>,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     root_splice: Option<&RootSplicePlan>,
     worker: usize,
@@ -2847,6 +2953,7 @@ unsafe fn fold_block_major_gfni_worker<const TILE_GRAB: usize, const HAS_SPLICE:
         n_tiles,
         dynamic,
         next_tile,
+        mats_cache,
         eq8_at,
         root_splice,
         worker,
@@ -2871,6 +2978,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
     n_tiles: usize,
     dynamic: bool,
     next_tile: &std::sync::atomic::AtomicUsize,
+    mats_cache: Option<&[[u64; 128]]>,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     root_splice: Option<&RootSplicePlan>,
     worker: usize,
@@ -2948,9 +3056,13 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
         let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
         #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
         let mut splice_pending = false;
+        if let Some(cache) = mats_cache {
+            mats.copy_from_slice(&cache[tile]);
+        } else {
         for t in 0..DIRECT_FOLD_TILE_STRIPES {
             let eq8 = eq8_at(8 * (stripe_base + t));
             kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+        }
         }
         let mut q = 0usize;
         #[cfg(target_feature = "avx512vbmi")]
@@ -3208,6 +3320,10 @@ fn fold_block_major_gfni_reduce_block_fallback(
                 } else {
                     crate::field::f128_slice::scale_slice(one_o, hi, r);
                 }
+            } else {
+                // Delayed equality scaling consumes all entries, including
+                // rows the ranked polynomial consumer intentionally skips.
+                one_o.fill(F128::ZERO);
             }
         }
         crate::field::f128_slice::bind_split_half(o, hi, r);
@@ -3308,6 +3424,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
             tiles_per_worker,
             n_tiles,
             dynamic,
+            None,
             &eq8_at,
             top_bind,
             ranked_one_rows,
@@ -5829,6 +5946,92 @@ mod tests {
                 "m={m} k_log={k_log} useful={useful_bits} lo_log={lo_log}",
             );
         }
+    }
+
+    #[test]
+    fn segmented_16_2_fold_matches_materialized_and_9_9() {
+        let mut rng = Rng::new(0x16_02_92);
+        let k_log = 7;
+        let m = k_log + 18;
+        let x_outer = rng.f128_vec(18);
+        let z = rng.f128_vec(1 << 18);
+        let z_before = z.clone();
+        let eq = build_eq_table(&x_outer);
+        let eq_lo = build_eq_table(&x_outer[..16]);
+        let eq_hi = build_eq_table(&x_outer[16..]);
+        let eq9_lo = build_eq_table(&x_outer[..9]);
+        let eq9_hi = build_eq_table(&x_outer[9..]);
+        for useful_bits in [1, 63, 64, 65, 121, 128] {
+            let want = partial_fold_packed_z_block_major_padded(&z, m, k_log, useful_bits, &eq);
+            for bind in [None, Some(F128::ZERO), Some(F128::ONE), Some(x_outer[0])] {
+                let expected = if let Some(r) = bind {
+                    (0..64).map(|i| want[i] + r * (want[i] + want[i + 64])).collect::<Vec<_>>()
+                } else { want.clone() };
+                let got = partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
+                    &z, m, k_log, useful_bits, &eq_lo, &eq_hi, bind);
+                let old = partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
+                    &z, m, k_log, useful_bits, &eq9_lo, &eq9_hi, bind);
+                assert_eq!(got, expected, "16/2 useful={useful_bits} bind={bind:?}");
+                assert_eq!(got, old, "16/2 vs 9/9 useful={useful_bits} bind={bind:?}");
+            }
+        }
+        assert_eq!(z, z_before, "source witness must not change");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+    #[test]
+    fn segmented_16_2_capture_and_splice_match_materialized() {
+        let mut rng = Rng::new(0x92_ca_57);
+        let k_log = 14;
+        let n_outer = 256;
+        let z = rng.f128_vec(n_outer * 128);
+        let x = rng.f128_vec(8);
+        let eq_lo = build_eq_table(&x[..6]);
+        let eq_hi = build_eq_table(&x[6..]);
+        let eq = build_eq_table(&x);
+        let at = |base| std::array::from_fn(|r| eq[base + r]);
+        let r = rng.f128_vec(1)[0];
+        for capture in [false, true] {
+            let want = partial_fold_packed_z_block_major_padded_with_tables_result(
+                &z, 22, k_log, 15409, at, Some(r), true, capture, None);
+            let got = fold_block_major_segmented_gfni(&z, k_log, 15409,
+                &eq_lo, &eq_hi, Some(r), true, capture, 128, None);
+            assert_eq!(want.0.len(), got.0.len());
+            for (i, (a,b)) in want.0.iter().zip(&got.0).enumerate() {
+                assert_eq!(a, b, "full i={i} capture={capture}");
+            }
+            let a = want.1.unwrap(); let b = got.1.unwrap();
+            assert_eq!(a.len(), b.len());
+            for (i, (a,b)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(a, b, "one/canonical i={i} capture={capture}");
+            }
+        }
+        // Exercise every splice action and a masked 49-bit output tail, with
+        // random nonzero source padding. Source layout: full, start/end, tail.
+        let mut actions = vec![RootSpliceAction::Skip; 256];
+        actions[0] = RootSpliceAction::Full(0);
+        actions[1] = RootSpliceAction::Start;
+        actions[2] = RootSpliceAction::End { out: 1,
+            select: std::array::from_fn(|i| if i < 32 { i as u8 } else { (i + 64) as u8 }) };
+        actions[3] = RootSpliceAction::Tail { out: 2, mask: (1u64 << 49) - 1 };
+        let splice = RootSplicePlan { actions: actions.into_boxed_slice(),
+            source_bits: 241, root_bits: 177 };
+        let got = fold_block_major_segmented_gfni(&z, k_log, 241,
+            &eq_lo, &eq_hi, None, false, false, 128, Some(&splice)).0;
+        let want = splice.fold(&z, 1 << k_log, &at);
+        assert_eq!(want, got, "splice full/start/end/tail/skip");
+        let roots: Vec<usize> = (0..64).chain(64..96).chain(160..192).chain(192..241).collect();
+        for (i, &bit) in roots.iter().enumerate() {
+            let mut expected = F128::ZERO;
+            for outer in 0..n_outer {
+                let word = z[outer * 128 + bit / 128];
+                let set = if bit % 128 < 64 { (word.lo >> (bit % 64)) & 1 }
+                          else { (word.hi >> (bit % 64)) & 1 };
+                if set == 1 { expected += eq[outer]; }
+            }
+            assert_eq!(got[i], expected, "scalar splice oracle root={i}");
+        }
+        assert!(got[177..].iter().all(|x| *x == F128::ZERO));
     }
 
     /// Last-ρ kick then wait produces the same packed fold as today's
