@@ -1,35 +1,42 @@
 //! Eight-row XOR convolution of the inverse-NTT column map.
 //! Over characteristic two, the substitution epsilon=x+1 has epsilon^2=0.
 //! Superset XOR transforms turn eight-term XOR convolution into 27 bilinear
-//! GFNI products. Table setup is once per shared ranked-closed invocation.
+//! GFNI products. Eight matrix banks absorb the Horner weights into A,
+//! eliminating accumulator field multiplies. Setup is once per shared invocation.
 use super::*;
 use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
 #[repr(align(64))]
-pub(super) struct Tables([u64; 128]);
+pub(super) struct Tables([u64; 8 * 128]);
 impl Tables {
     pub(super) fn new(table: &InvNttTableByteSingleGf8) -> Self {
         assert_eq!(table.ell, 64);
-        let mut m = [0u64; 128];
-        // GFNI's matrix byte order is reversed with respect to output bit order.
-        for i in 0..64 {
-            for outbit in 0..8 {
-                let mut row = 0u8;
-                for bit in 0..8 {
-                    let c = unsafe { *table.data_ptr().add((1 << bit) * 64 + i) };
-                    row |= ((c >> outbit) & 1) << bit;
-                }
-                m[i] |= (row as u64) << (8 * (7 - outbit));
-            }
-        }
-        for s in 0..8 {
-            for c in 0..8 {
-                let mut v = 0;
-                for t in 0..8 {
-                    if t & s == s {
-                        v ^= m[t * 8 + c];
+        // Bank k absorbs the Horner weight 2^k into the linear A map.
+        // GF(256) multiplication distributes over both the byte map and XOR
+        // convolution. B keeps bank zero; products then accumulate by XOR.
+        let mut m = [0u64; 8 * 128];
+        for k in 0..8 {
+            let bank = &mut m[k * 128..(k + 1) * 128];
+            for i in 0..64 {
+                for outbit in 0..8 {
+                    let mut row = 0u8;
+                    for bit in 0..8 {
+                        let c = unsafe { *table.data_ptr().add((1 << bit) * 64 + i) };
+                        let scaled = flock_core::field::F8(c) * flock_core::field::F8(1u8 << k);
+                        row |= ((scaled.0 >> outbit) & 1) << bit;
                     }
+                    bank[i] |= (row as u64) << (8 * (7 - outbit));
                 }
-                m[64 + s * 8 + c] = v;
+            }
+            for subset in 0..8 {
+                for c in 0..8 {
+                    let mut v = 0;
+                    for t in 0..8 {
+                        if t & subset == subset {
+                            v ^= bank[t * 8 + c];
+                        }
+                    }
+                    bank[64 + subset * 8 + c] = v;
+                }
             }
         }
         Self(m)
@@ -397,11 +404,10 @@ unsafe fn project_const<const BLK: usize>(
     m: *const u64,
 ) {
     unsafe {
-        let two = _mm512_set1_epi8(2);
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         {
-            let av = affine_conv(ap.as_ptr().add(56), m, 0);
+            let av = affine_conv(ap.as_ptr().add(56), m.add(7 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7));
             let v = if mode(BLK, 7) == 15 {
                 av[0]
@@ -500,7 +506,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(1, a[1], b[1]);
         {
-            let av = affine_conv(ap.as_ptr().add(48), m, 0);
+            let av = affine_conv(ap.as_ptr().add(48), m.add(6 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6));
             let v = if mode(BLK, 6) == 15 {
                 av[0]
@@ -512,7 +518,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 6) == 15 {
                 av[1]
             } else {
@@ -523,7 +529,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 6) == 15 {
                 av[2]
             } else {
@@ -534,7 +540,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 6) == 15 {
                 av[3]
             } else {
@@ -545,7 +551,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 6) == 15 {
                 av[4]
             } else {
@@ -556,7 +562,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 6) == 15 {
                 av[5]
             } else {
@@ -567,7 +573,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 6) == 15 {
                 av[6]
             } else {
@@ -578,7 +584,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 6) == 15 {
                 av[7]
             } else {
@@ -589,7 +595,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -599,7 +605,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(2, a[2], b[2]);
         {
-            let av = affine_conv(ap.as_ptr().add(40), m, 0);
+            let av = affine_conv(ap.as_ptr().add(40), m.add(5 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5));
             let v = if mode(BLK, 5) == 15 {
                 av[0]
@@ -611,7 +617,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 5) == 15 {
                 av[1]
             } else {
@@ -622,7 +628,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 5) == 15 {
                 av[2]
             } else {
@@ -633,7 +639,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 5) == 15 {
                 av[3]
             } else {
@@ -644,7 +650,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 5) == 15 {
                 av[4]
             } else {
@@ -655,7 +661,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 5) == 15 {
                 av[5]
             } else {
@@ -666,7 +672,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 5) == 15 {
                 av[6]
             } else {
@@ -677,7 +683,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 5) == 15 {
                 av[7]
             } else {
@@ -688,7 +694,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -698,7 +704,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(3, a[3], b[3]);
         {
-            let av = affine_conv(ap.as_ptr().add(32), m, 0);
+            let av = affine_conv(ap.as_ptr().add(32), m.add(4 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4));
             let v = if mode(BLK, 4) == 15 {
                 av[0]
@@ -710,7 +716,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 4) == 15 {
                 av[1]
             } else {
@@ -721,7 +727,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 4) == 15 {
                 av[2]
             } else {
@@ -732,7 +738,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 4) == 15 {
                 av[3]
             } else {
@@ -743,7 +749,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 4) == 15 {
                 av[4]
             } else {
@@ -754,7 +760,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 4) == 15 {
                 av[5]
             } else {
@@ -765,7 +771,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 4) == 15 {
                 av[6]
             } else {
@@ -776,7 +782,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 4) == 15 {
                 av[7]
             } else {
@@ -787,7 +793,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -797,7 +803,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(4, a[4], b[4]);
         {
-            let av = affine_conv(ap.as_ptr().add(24), m, 0);
+            let av = affine_conv(ap.as_ptr().add(24), m.add(3 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3));
             let v = if mode(BLK, 3) == 15 {
                 av[0]
@@ -809,7 +815,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 3) == 15 {
                 av[1]
             } else {
@@ -820,7 +826,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 3) == 15 {
                 av[2]
             } else {
@@ -831,7 +837,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 3) == 15 {
                 av[3]
             } else {
@@ -842,7 +848,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 3) == 15 {
                 av[4]
             } else {
@@ -853,7 +859,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 3) == 15 {
                 av[5]
             } else {
@@ -864,7 +870,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 3) == 15 {
                 av[6]
             } else {
@@ -875,7 +881,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 3) == 15 {
                 av[7]
             } else {
@@ -886,7 +892,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -896,7 +902,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(5, a[5], b[5]);
         {
-            let av = affine_conv(ap.as_ptr().add(16), m, 0);
+            let av = affine_conv(ap.as_ptr().add(16), m.add(2 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2));
             let v = if mode(BLK, 2) == 15 {
                 av[0]
@@ -908,7 +914,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 2) == 15 {
                 av[1]
             } else {
@@ -919,7 +925,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 2) == 15 {
                 av[2]
             } else {
@@ -930,7 +936,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 2) == 15 {
                 av[3]
             } else {
@@ -941,7 +947,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 2) == 15 {
                 av[4]
             } else {
@@ -952,7 +958,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 2) == 15 {
                 av[5]
             } else {
@@ -963,7 +969,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 2) == 15 {
                 av[6]
             } else {
@@ -974,7 +980,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 2) == 15 {
                 av[7]
             } else {
@@ -985,7 +991,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -995,7 +1001,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(6, a[6], b[6]);
         {
-            let av = affine_conv(ap.as_ptr().add(8), m, 0);
+            let av = affine_conv(ap.as_ptr().add(8), m.add(1 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1));
             let v = if mode(BLK, 1) == 15 {
                 av[0]
@@ -1007,7 +1013,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 1) == 15 {
                 av[1]
             } else {
@@ -1018,7 +1024,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 1) == 15 {
                 av[2]
             } else {
@@ -1029,7 +1035,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 1) == 15 {
                 av[3]
             } else {
@@ -1040,7 +1046,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 1) == 15 {
                 av[4]
             } else {
@@ -1051,7 +1057,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 1) == 15 {
                 av[5]
             } else {
@@ -1062,7 +1068,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 1) == 15 {
                 av[6]
             } else {
@@ -1073,7 +1079,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 1) == 15 {
                 av[7]
             } else {
@@ -1084,7 +1090,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -1094,7 +1100,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(7, a[7], b[7]);
         {
-            let av = affine_conv(ap.as_ptr().add(0), m, 0);
+            let av = affine_conv(ap.as_ptr().add(0), m.add(0 * 128), 0);
             let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0));
             let v = if mode(BLK, 0) == 15 {
                 av[0]
@@ -1106,7 +1112,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[0])
                 }
             };
-            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            acc[0] = _mm512_xor_si512(acc[0], v);
             let v = if mode(BLK, 0) == 15 {
                 av[1]
             } else {
@@ -1117,7 +1123,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[1])
                 }
             };
-            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            acc[1] = _mm512_xor_si512(acc[1], v);
             let v = if mode(BLK, 0) == 15 {
                 av[2]
             } else {
@@ -1128,7 +1134,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[2])
                 }
             };
-            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            acc[2] = _mm512_xor_si512(acc[2], v);
             let v = if mode(BLK, 0) == 15 {
                 av[3]
             } else {
@@ -1139,7 +1145,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[3])
                 }
             };
-            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            acc[3] = _mm512_xor_si512(acc[3], v);
             let v = if mode(BLK, 0) == 15 {
                 av[4]
             } else {
@@ -1150,7 +1156,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[4])
                 }
             };
-            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            acc[4] = _mm512_xor_si512(acc[4], v);
             let v = if mode(BLK, 0) == 15 {
                 av[5]
             } else {
@@ -1161,7 +1167,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[5])
                 }
             };
-            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            acc[5] = _mm512_xor_si512(acc[5], v);
             let v = if mode(BLK, 0) == 15 {
                 av[6]
             } else {
@@ -1172,7 +1178,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[6])
                 }
             };
-            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            acc[6] = _mm512_xor_si512(acc[6], v);
             let v = if mode(BLK, 0) == 15 {
                 av[7]
             } else {
@@ -1183,7 +1189,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                     _mm512_xor_si512(p, av[7])
                 }
             };
-            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+            acc[7] = _mm512_xor_si512(acc[7], v);
         }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
@@ -1309,6 +1315,28 @@ mod tests {
     struct Buf([u8; 8 * BYTES_PER_BLOCK]);
     #[repr(align(32))]
     struct Ring([[u32; 8]; 32]);
+    #[test]
+    fn ranked_inverse_table_is_dense_not_two_sparse() {
+        let ns = AdditiveNttGf8::new(6, F8::ZERO);
+        let nl = AdditiveNttGf8::new(6, F8(64));
+        let table = InvNttTableByteSingleGf8::new(&ns, &nl);
+        for t in 0..64 {
+            let mut unit = [F8::ZERO; 64];
+            unit[t] = F8::ONE;
+            ns.inverse(&mut unit);
+            nl.forward(&mut unit);
+            assert_eq!(unit.iter().filter(|v| **v != F8::ZERO).count(), 64);
+            let mut input = [0u8; 8];
+            input[t / 8] = 1 << (t % 8);
+            let mut actual = [F8::ZERO; 64];
+            table.apply_scalar(&input, &mut actual);
+            assert_eq!(actual, unit);
+            if t == 0 {
+                assert_eq!(actual[0], F8(0x76));
+            }
+        }
+        println!("PASS 64 actual NTT unit columns are dense; sparse/involution claim refuted");
+    }
     #[test]
     fn xor_projection_publishes_and_matches_scalar() {
         unsafe {
