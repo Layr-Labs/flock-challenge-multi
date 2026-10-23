@@ -9328,7 +9328,7 @@ fn merkle_multi_proof_for_l0(
     assert_eq!(codeword.len(), block_len * num_interleaved);
 
     use rayon::prelude::*;
-    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+    let indices = merkle::merkle_multi_proof_sibling_indices_sorted(block_len, queries);
     let leaf_size = num_interleaved * core::mem::size_of::<F128>();
     // SAFETY: `F128` has no padding and the full codeword slice remains alive
     // for the duration of this gather.
@@ -9407,7 +9407,7 @@ fn merkle_multi_proof_for_l0(
 fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: bool) -> Vec<Hash> {
     use rayon::prelude::*;
     if par {
-        let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+        let indices = merkle::merkle_multi_proof_sibling_indices_sorted(block_len, queries);
         if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
             return indices
                 .par_iter()
@@ -9415,6 +9415,9 @@ fn multi_proof_gather(tree: &[Hash], block_len: usize, queries: &[usize], par: b
                 .map(|&i| tree[i])
                 .collect();
         }
+        // The index walk is already complete. Below the parallel floor,
+        // gather it serially rather than repeating sort + canonical walk.
+        return indices.into_iter().map(|i| tree[i]).collect();
     }
     merkle::merkle_multi_proof(tree, block_len, queries)
 }

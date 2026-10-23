@@ -1021,7 +1021,42 @@ pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut indices = Vec::new();
+    merkle_multi_proof_sibling_indices_from_active(num_leaves, active)
+}
+
+/// Internal query path: sampling already returns sorted, distinct positions.
+/// Keep the general public entry point above permissive for other callers.
+pub(crate) fn merkle_multi_proof_sibling_indices_sorted(
+    num_leaves: usize,
+    positions: &[usize],
+) -> Vec<usize> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    if positions.is_empty() || num_leaves == 1 {
+        return Vec::new();
+    }
+    debug_assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(positions.iter().all(|&p| p < num_leaves));
+    merkle_multi_proof_sibling_indices_from_active(num_leaves, positions.to_vec())
+}
+
+fn merkle_multi_proof_sibling_indices_from_active(
+    num_leaves: usize,
+    mut active: Vec<usize>,
+) -> Vec<usize> {
+    // If a_l nodes are active at level l, its sibling count is
+    // 2*a_(l+1) - a_l. Summing gives H = 2 - q + sum(a_l)
+    // over the non-root parent levels, since a_root = 1. At a level
+    // containing n nodes, a_l <= min(q, n). Reserve this tight maximum
+    // instead of growing the sparse index vector geometrically.
+    let q = active.len();
+    let mut max_siblings = 2usize;
+    let mut nodes = num_leaves / 2;
+    while nodes > 1 {
+        max_siblings += q.min(nodes);
+        nodes /= 2;
+    }
+    max_siblings -= q;
+    let mut indices = Vec::with_capacity(max_siblings);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
 
@@ -1701,6 +1736,81 @@ mod tests {
             *b = ((z >> 33) & 0xff) as u8;
         }
         data
+    }
+
+    // Independent level-set oracle: no in-place compaction, no capacity formula.
+    #[test]
+    fn query_phase_multi_proof_index_capacity_and_sorted_path_match_reference() {
+        use std::collections::BTreeSet;
+        let reference = |n: usize, queries: &[usize]| {
+            let mut set: BTreeSet<usize> = queries.iter().copied().collect();
+            let mut out = Vec::new();
+            let (mut offset, mut width) = (0, n);
+            while width > 1 {
+                for &p in &set {
+                    if !set.contains(&(p ^ 1)) {
+                        out.push(offset + (p ^ 1));
+                    }
+                }
+                set = set.iter().map(|p| p / 2).collect();
+                offset += width;
+                width /= 2;
+            }
+            out
+        };
+        let mut cases = 0usize;
+        let mut check = |n: usize, raw: &[usize]| {
+            let mut sorted = raw.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let want = reference(n, raw);
+            let general = merkle_multi_proof_sibling_indices(n, raw);
+            let fast = merkle_multi_proof_sibling_indices_sorted(n, &sorted);
+            assert_eq!(general, want, "general n={n} q={}", raw.len());
+            assert_eq!(fast, want, "sorted n={n} q={}", sorted.len());
+            let mut max_siblings = 0usize;
+            // Independent count bound: a level's active parents cannot
+            // exceed either q or the number of nodes at that level.
+            if !sorted.is_empty() && n > 1 {
+                let mut width = n / 2;
+                let mut sum = 0;
+                while width > 1 {
+                    sum += sorted.len().min(width);
+                    width /= 2;
+                }
+                max_siblings = (2 + sum) - sorted.len();
+            }
+            assert!(want.len() <= max_siblings);
+            // Vec<usize>'s requested capacity is exact: any geometric
+            // growth would violate this bound/capacity equality.
+            assert_eq!(general.capacity(), max_siblings);
+            assert_eq!(fast.capacity(), max_siblings);
+            cases += 1;
+        };
+        // All subsets for every tiny tree, including empty and all leaves.
+        for log in 0..=4 {
+            let n = 1usize << log;
+            for mask in 0..(1usize << n) {
+                let queries: Vec<_> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
+                check(n, &queries);
+            }
+        }
+        let mut rng = 0x104D_1FFEu64;
+        for log in 5..=20 {
+            let n = 1usize << log;
+            for q in [0, 1, 2, 3, 16, 218, 243, 600] {
+                let raw: Vec<_> = (0..q).map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng as usize % n
+                }).collect();
+                check(n, &raw);
+            }
+            // Duplicates and descending input retain the general API contract.
+            check(n, &[n - 1, 0, n - 1, 1, 0]);
+        }
+        eprintln!("MERKLE104 {cases} independent differential index cases passed");
     }
 
     #[test]
