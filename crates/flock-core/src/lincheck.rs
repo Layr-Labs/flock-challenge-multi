@@ -462,7 +462,7 @@ enum RootSpliceAction {
     Skip,
     Full(usize),
     Start,
-    End { out: usize, select: [u8; 64] },
+    End { out: usize, low_mask: u64 },
     Tail { out: usize, mask: u64 },
 }
 
@@ -518,9 +518,9 @@ impl RootSplicePlan {
                 {
                     return None;
                 }
-                let select = std::array::from_fn(|i| (roots[i] - first) as u8);
+                let low_mask = (1u64 << split) - 1;
                 actions[block] = RootSpliceAction::Start;
-                actions[block + 1] = RootSpliceAction::End { out, select };
+                actions[block + 1] = RootSpliceAction::End { out, low_mask };
                 pairs += 1;
             }
         }
@@ -558,12 +558,15 @@ impl RootSplicePlan {
                         next += 1;
                     }
                 }
-                RootSpliceAction::End { out, select } => {
+                RootSpliceAction::End { out, low_mask } => {
                     assert_eq!(first.take(), Some(block - 1));
                     assert_eq!(out * 64, next);
-                    for &bit in select {
-                        assert!(bit < 128);
-                        assert_eq!(roots[next], (block - 1) * 64 + bit as usize);
+                    assert_ne!(*low_mask, 0);
+                    assert_ne!(*low_mask, u64::MAX);
+                    assert_eq!(*low_mask & low_mask.wrapping_add(1), 0);
+                    for bit in 0..64 {
+                        let selected = bit + if low_mask & (1u64 << bit) == 0 { 64 } else { 0 };
+                        assert_eq!(roots[next], (block - 1) * 64 + selected);
                         next += 1;
                     }
                 }
@@ -643,8 +646,8 @@ impl RootSplicePlan {
         not(target_feature = "vpclmulqdq"),
         target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
     )]
-    #[inline]
-    unsafe fn fold_chunk(
+    #[inline(never)]
+    unsafe fn fold_chunk<const RAW: bool>(
         &self,
         q: usize,
         tile: *const u8,
@@ -656,61 +659,91 @@ impl RootSplicePlan {
     ) {
         use core::arch::x86_64::*;
         unsafe {
-            for half in 0..2 {
-                let input = tile.add(half * 64);
-                match &self.actions[2 * q + half] {
-                    RootSpliceAction::Skip => {}
-                    RootSpliceAction::Full(out) => kernels::gfni_fold_tile(
-                        input,
-                        128,
-                        1,
-                        mats,
-                        planes.add(out * 1024),
-                        seed_zero,
-                    ),
-                    RootSpliceAction::Start => {
-                        debug_assert!(!*pending);
-                        for t in 0..8 {
-                            let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            _mm512_storeu_si512(
-                                carry.as_mut_ptr().add(t * 64) as *mut __m512i,
-                                row,
-                            );
-                        }
-                        *pending = true;
-                    }
-                    RootSpliceAction::End { out, select } => {
-                        debug_assert!(*pending);
-                        let indices = _mm512_loadu_si512(select.as_ptr() as *const __m512i);
-                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
-                            let lo =
-                                _mm512_loadu_si512(carry.as_ptr().add(t * 64) as *const __m512i);
-                            let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            _mm512_permutex2var_epi8(lo, indices, hi)
-                        });
-                        kernels::gfni_fold_rows(
-                            &rows,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
-                        *pending = false;
-                    }
-                    RootSpliceAction::Tail { out, mask } => {
-                        debug_assert!(!*pending);
-                        let rows: [__m512i; 8] = core::array::from_fn(|t| {
-                            let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
-                            _mm512_maskz_mov_epi8(*mask, row)
-                        });
-                        kernels::gfni_fold_rows(
-                            &rows,
-                            mats,
-                            planes.add(out * 1024),
-                            seed_zero,
-                        );
-                    }
+            // RAW tiles contain the byte-transposed matrices. Defer the GFNI
+            // bit transpose until the root halves have been selected.
+            let ident = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+            let finish = |row| {
+                if RAW {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, row)
+                } else {
+                    row
                 }
+            };
+            // Expand the two source halves explicitly. A loop lets LLVM hoist
+            // all eight carry loads above the action dispatch, even on Full
+            // and Skip chunks. Each End now loads carry only where it is used.
+            macro_rules! half {
+                ($h:expr) => {{
+                    let half: usize = $h;
+                    let input = tile.add(half * 64);
+                    let ready = match &self.actions[2 * q + half] {
+                        RootSpliceAction::Skip => None,
+                        RootSpliceAction::Full(out) => {
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                finish(_mm512_loadu_si512(input.add(t * 128).cast()))
+                            });
+                            Some((*out, rows))
+                        }
+                        RootSpliceAction::Start => {
+                            debug_assert!(!*pending);
+                            for t in 0..8 {
+                                let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                _mm512_storeu_si512(
+                                    carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                    row,
+                                );
+                            }
+                            *pending = true;
+                            None
+                        }
+                        RootSpliceAction::End { out, low_mask } => {
+                            debug_assert!(*pending);
+                            // Each source bit position has the same position in the next
+                            // half. In matrix form, repeat its selector byte across
+                            // all eight witness rows of that byte group.
+                            const REPEAT: [u8; 64] = {
+                                let mut a = [0u8; 64];
+                                let mut i = 0;
+                                while i < 64 {
+                                    a[i] = (i / 8) as u8;
+                                    i += 1;
+                                }
+                                a
+                            };
+                            let mask = _mm512_shuffle_epi8(
+                                _mm512_set1_epi64(*low_mask as i64),
+                                _mm512_loadu_si512(REPEAT.as_ptr().cast()),
+                            );
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                let lo = _mm512_loadu_si512(
+                                    carry.as_ptr().add(t * 64) as *const __m512i
+                                );
+                                let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                if RAW {
+                                    finish(_mm512_ternarylogic_epi64::<0xca>(mask, lo, hi))
+                                } else {
+                                    _mm512_mask_blend_epi8(*low_mask, hi, lo)
+                                }
+                            });
+                            *pending = false;
+                            Some((*out, rows))
+                        }
+                        RootSpliceAction::Tail { out, mask } => {
+                            debug_assert!(!*pending);
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                _mm512_maskz_mov_epi8(*mask, finish(row))
+                            });
+                            Some((*out, rows))
+                        }
+                    };
+                    if let Some((out, rows)) = ready {
+                        kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                    }
+                }};
             }
+            half!(0);
+            half!(1);
         }
     }
 }
@@ -2301,7 +2334,7 @@ fn gather_transpose_tile_scalar(
 )]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn gather_transpose_group4_x86<const FUSE: bool>(
+unsafe fn gather_transpose_group4_x86<const FUSE: bool, const RAW: bool>(
     z_packed: &[F128],
     chunks_per_block: usize,
     stripe_base: usize,
@@ -2352,7 +2385,7 @@ unsafe fn gather_transpose_group4_x86<const FUSE: bool>(
         // r in 0..8, c in 0..4 are the four full chunks selected by the
         // caller; every column slab is 1024 writable bytes.
         unsafe {
-            kernels::gather_transpose_stripe4_x86::<FUSE>(
+            kernels::gather_transpose_stripe4_x86::<FUSE, RAW>(
                 z_packed.as_ptr().add(outer_base * chunks_per_block + q),
                 chunks_per_block,
                 transposed.as_mut_ptr().add(t * 128),
@@ -2378,7 +2411,7 @@ unsafe fn gather_transpose_group4_x86<const FUSE: bool>(
     target_feature(enable = "avx512f,avx512vbmi,gfni")
 )]
 #[inline]
-unsafe fn gather_transpose_tile_x86<const FUSE: bool>(
+unsafe fn gather_transpose_tile_x86<const FUSE: bool, const RAW: bool>(
     z_packed: &[F128],
     chunks_per_block: usize,
     stripe_base: usize,
@@ -2407,7 +2440,7 @@ unsafe fn gather_transpose_tile_x86<const FUSE: bool>(
         // SAFETY: the caller's q is a live chunk, all eight row-strided
         // F128 values are in bounds, and the destination stripe is 128 B.
         unsafe {
-            kernels::gather_transpose_stripe_x86::<FUSE>(
+            kernels::gather_transpose_stripe_x86::<FUSE, RAW>(
                 z_packed.as_ptr().add(outer_base * chunks_per_block + q),
                 chunks_per_block,
                 transposed.as_mut_ptr().add(t * 128),
@@ -2734,8 +2767,9 @@ fn fold_block_major_gfni(
     // every 64-column chunk of `one[..out_len]` is overwritten by `reduce_block`
     // below, and every 64-column slot of `one[out_len..]` is either overwritten
     // by `reduce_worker_plane_block` or zero-filled when `row >= live_blocks`.
-    let mut one = ranked_one_rows
-        .then(|| crate::alloc_uninit_vec::<F128>(out_len + if capture_canon { 17 * 64 } else { 0 }));
+    let mut one = ranked_one_rows.then(|| {
+        crate::alloc_uninit_vec::<F128>(out_len + if capture_canon { 17 * 64 } else { 0 })
+    });
     debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
     let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
         #[cfg(all(
@@ -2959,7 +2993,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
             while q + 4 <= full_chunks {
                 unsafe {
                     if gather_tr_vpermt2b {
-                        gather_transpose_group4_x86::<true>(
+                        gather_transpose_group4_x86::<true, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
@@ -2971,7 +3005,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             transposed,
                         );
                     } else {
-                        gather_transpose_group4_x86::<false>(
+                        gather_transpose_group4_x86::<false, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
@@ -2990,9 +3024,9 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                         if qn <= full_chunks && qn < chunks_per_block {
                             unsafe {
                                 lc_prefetch_rows16(
-                                    z_packed.as_ptr().add(
-                                        (8 * stripe_base + 16 * c) * chunks_per_block + qn,
-                                    ),
+                                    z_packed
+                                        .as_ptr()
+                                        .add((8 * stripe_base + 16 * c) * chunks_per_block + qn),
                                     chunks_per_block,
                                     cpb_ranked,
                                 );
@@ -3001,10 +3035,8 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                     }
                     unsafe {
                         #[cfg(target_feature = "avx512bw")]
-                        if HAS_SPLICE
-                            && let Some(splice) = root_splice
-                        {
-                            splice.fold_chunk(
+                        if HAS_SPLICE && let Some(splice) = root_splice {
+                            splice.fold_chunk::<true>(
                                 q + c,
                                 transposed.as_ptr().add(c * 1024),
                                 mats,
@@ -3035,7 +3067,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
             if gather_tr_fused {
                 unsafe {
                     if gather_tr_vpermt2b {
-                        gather_transpose_tile_x86::<true>(
+                        gather_transpose_tile_x86::<true, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
@@ -3043,7 +3075,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             transposed,
                         );
                     } else {
-                        gather_transpose_tile_x86::<false>(
+                        gather_transpose_tile_x86::<false, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
@@ -3062,27 +3094,31 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                 );
             }
             #[cfg(not(target_feature = "avx512vbmi"))]
-            gather_transpose_tile_scalar(
-                z_packed,
-                chunks_per_block,
-                stripe_base,
-                q,
-                transposed,
-            );
+            gather_transpose_tile_scalar(z_packed, chunks_per_block, stripe_base, q, transposed);
             unsafe {
                 #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-                if HAS_SPLICE
-                    && let Some(splice) = root_splice
-                {
-                    splice.fold_chunk(
-                        q,
-                        transposed.as_ptr(),
-                        mats,
-                        wplanes.as_mut_ptr().cast::<u8>(),
-                        first_tile,
-                        splice_carry,
-                        &mut splice_pending,
-                    );
+                if HAS_SPLICE && let Some(splice) = root_splice {
+                    if gather_tr_fused {
+                        splice.fold_chunk::<true>(
+                            q,
+                            transposed.as_ptr(),
+                            mats,
+                            wplanes.as_mut_ptr().cast::<u8>(),
+                            first_tile,
+                            splice_carry,
+                            &mut splice_pending,
+                        );
+                    } else {
+                        splice.fold_chunk::<false>(
+                            q,
+                            transposed.as_ptr(),
+                            mats,
+                            wplanes.as_mut_ptr().cast::<u8>(),
+                            first_tile,
+                            splice_carry,
+                            &mut splice_pending,
+                        );
+                    }
                     q += 1;
                     continue;
                 }
@@ -3179,13 +3215,7 @@ fn fold_block_major_gfni_reduce_block_fallback(
         let hi = unsafe { &mut *hi_store.as_mut_ptr() };
         if hi_blk < live_blocks {
             unsafe {
-                reduce_worker_plane_block(
-                    planes,
-                    worker_stride,
-                    active_workers,
-                    hi_blk,
-                    hi,
-                );
+                reduce_worker_plane_block(planes, worker_stride, active_workers, hi_blk, hi);
             }
         } else {
             hi.fill(F128::ZERO);
@@ -5662,13 +5692,13 @@ mod tests {
                 // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
                 unsafe {
                     if fuse {
-                        kernels::gather_transpose_stripe_x86::<true>(
+                        kernels::gather_transpose_stripe_x86::<true, false>(
                             z.as_ptr(),
                             stride,
                             got.as_mut_ptr(),
                         );
                     } else {
-                        kernels::gather_transpose_stripe_x86::<false>(
+                        kernels::gather_transpose_stripe_x86::<false, false>(
                             z.as_ptr(),
                             stride,
                             got.as_mut_ptr(),
@@ -5694,14 +5724,14 @@ mod tests {
                     // output-stride slab covers 128 writable bytes.
                     unsafe {
                         if fuse {
-                            kernels::gather_transpose_stripe4_x86::<true>(
+                            kernels::gather_transpose_stripe4_x86::<true, false>(
                                 z.as_ptr().add(q),
                                 stride,
                                 got.as_mut_ptr(),
                                 1024,
                             );
                         } else {
-                            kernels::gather_transpose_stripe4_x86::<false>(
+                            kernels::gather_transpose_stripe4_x86::<false, false>(
                                 z.as_ptr().add(q),
                                 stride,
                                 got.as_mut_ptr(),
@@ -6482,6 +6512,159 @@ mod canon_capture_tests {
                     }
                 }
                 assert_eq!(canon[slot * 64 + s], want, "row {row} bit {s}");
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[test]
+fn root_preselect_matrix_domain_matches_scalar() {
+    use core::arch::x86_64::*;
+    let mut seed = 93u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for split in [1, 7, 8, 15, 16, 31, 32, 49, 56, 63] {
+        let low_mask = (1u64 << split) - 1;
+        let roots: Vec<usize> = (0..64)
+            .chain((0..64).map(|i| 64 + i + if i >= split { 64 } else { 0 }))
+            .chain(192..256)
+            .chain(256..305)
+            .collect();
+        let plan = RootSplicePlan {
+            actions: vec![
+                RootSpliceAction::Full(0),
+                RootSpliceAction::Start,
+                RootSpliceAction::End { out: 1, low_mask },
+                RootSpliceAction::Full(2),
+                RootSpliceAction::Tail {
+                    out: 3,
+                    mask: (1u64 << 49) - 1,
+                },
+                RootSpliceAction::Skip,
+            ]
+            .into_boxed_slice(),
+            source_bits: 305,
+            root_bits: 241,
+        };
+        plan.check_columns(&roots);
+        for case in 0..4 {
+            let mut z = vec![F128::ZERO; 64 * 3];
+            for v in &mut z {
+                v.lo = next();
+                v.hi = next();
+            }
+            if case == 0 {
+                z.fill(F128::ZERO);
+            }
+            if case == 1 {
+                z.fill(F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                });
+            }
+            let mats: [u64; 128] = core::array::from_fn(|_| next());
+            for seeded in [true, false] {
+                let initial: Vec<u8> = (0..4096)
+                    .map(|_| if seeded { 0 } else { next() as u8 })
+                    .collect();
+                let mut expected = initial.clone();
+                for (out, &bit) in roots.iter().enumerate() {
+                    let plane = out / 64;
+                    let col = out % 64;
+                    for t in 0..8 {
+                        let mut x = 0u8;
+                        for row in 0..8 {
+                            let v = z[(t * 8 + row) * 3 + bit / 128];
+                            let word = if bit % 128 < 64 { v.lo } else { v.hi };
+                            x |= (((word >> (bit % 64)) & 1) as u8) << row;
+                        }
+                        for byte in 0..16 {
+                            let m = mats[t * 16 + byte];
+                            let mut y = 0u8;
+                            for ob in 0..8 {
+                                y |= ((((m >> (8 * (7 - ob))) as u8 & x).count_ones() & 1) as u8)
+                                    << ob;
+                            }
+                            expected[plane * 1024 + byte * 64 + col] ^= y;
+                        }
+                    }
+                }
+                for raw in [false, true] {
+                    for fuse in [false, true] {
+                        let mut got = initial.clone();
+                        let mut carry = [0u8; 512];
+                        let mut pending = false;
+                        for q in 0..3 {
+                            let mut tile = [0u8; 1024];
+                            unsafe {
+                                for t in 0..8 {
+                                    let ptr = z.as_ptr().add(t * 8 * 3 + q);
+                                    let dst = tile.as_mut_ptr().add(t * 128);
+                                    match (raw, fuse) {
+                                        (false, false) => {
+                                            kernels::gather_transpose_stripe_x86::<false, false>(
+                                                ptr, 3, dst,
+                                            )
+                                        }
+                                        (false, true) => {
+                                            kernels::gather_transpose_stripe_x86::<true, false>(
+                                                ptr, 3, dst,
+                                            )
+                                        }
+                                        (true, false) => {
+                                            kernels::gather_transpose_stripe_x86::<false, true>(
+                                                ptr, 3, dst,
+                                            )
+                                        }
+                                        (true, true) => {
+                                            kernels::gather_transpose_stripe_x86::<true, true>(
+                                                ptr, 3, dst,
+                                            )
+                                        }
+                                    }
+                                }
+                                if raw {
+                                    plan.fold_chunk::<true>(
+                                        q,
+                                        tile.as_ptr(),
+                                        &mats,
+                                        got.as_mut_ptr(),
+                                        seeded,
+                                        &mut carry,
+                                        &mut pending,
+                                    );
+                                } else {
+                                    plan.fold_chunk::<false>(
+                                        q,
+                                        tile.as_ptr(),
+                                        &mats,
+                                        got.as_mut_ptr(),
+                                        seeded,
+                                        &mut carry,
+                                        &mut pending,
+                                    );
+                                }
+                            }
+                        }
+                        assert!(!pending);
+                        assert_eq!(
+                            got, expected,
+                            "split={split} case={case} raw={raw} fuse={fuse} seeded={seeded}"
+                        );
+                    }
+                }
             }
         }
     }
