@@ -2439,7 +2439,7 @@ impl Drain8<'_> {
                 );
                 let (plan, imgs) = *preps.get_unchecked(blk);
 #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
-                if (3..=28).contains(&blk) && plan.bcomplement_static_eligible(){
+                if (2..=29).contains(&blk) && plan.bcomplement_static_eligible(){
                     xor_projection::project(proj,blk,rows,self.ast,self.bs,rw,&preps.tables);
                     continue;
                 }
