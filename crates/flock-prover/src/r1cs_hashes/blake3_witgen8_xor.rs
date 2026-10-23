@@ -1,0 +1,1432 @@
+//! Eight-row XOR convolution of the inverse-NTT column map.
+//! Over characteristic two, the substitution epsilon=x+1 has epsilon^2=0.
+//! Superset XOR transforms turn eight-term XOR convolution into 27 bilinear
+//! GFNI products. Table setup is once per shared ranked-closed invocation.
+use super::*;
+use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
+#[repr(align(64))]
+pub(super) struct Tables([u64; 128]);
+impl Tables {
+    pub(super) fn new(table: &InvNttTableByteSingleGf8) -> Self {
+        assert_eq!(table.ell, 64);
+        let mut m = [0u64; 128];
+        // GFNI's matrix byte order is reversed with respect to output bit order.
+        for i in 0..64 {
+            for outbit in 0..8 {
+                let mut row = 0u8;
+                for bit in 0..8 {
+                    let c = unsafe { *table.data_ptr().add((1 << bit) * 64 + i) };
+                    row |= ((c >> outbit) & 1) << bit;
+                }
+                m[i] |= (row as u64) << (8 * (7 - outbit));
+            }
+        }
+        for s in 0..8 {
+            for c in 0..8 {
+                let mut v = 0;
+                for t in 0..8 {
+                    if t & s == s {
+                        v ^= m[t * 8 + c];
+                    }
+                }
+                m[64 + s * 8 + c] = v;
+            }
+        }
+        Self(m)
+    }
+}
+
+#[inline(always)]
+const fn known(mode: u8) -> u8 {
+    if mode == 15 {
+        255
+    } else if mode == 0 {
+        0
+    } else if mode <= 7 {
+        (1u16 << mode) as u8 - 1
+    } else {
+        (255u16 << (15 - mode)) as u8
+    }
+}
+
+#[inline(always)]
+unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+    unsafe {
+        let z = _mm512_setzero_si512();
+        let mut v = [z; 8];
+        macro_rules! add {
+            ($j:expr) => {
+                if known(mode_value) & (1 << $j) == 0 {
+                    let w = *p.add($j);
+                    let w = if mode_value == 0 { w } else { !w };
+                    let x = _mm512_set1_epi64(w as i64);
+                    v[0] = _mm512_xor_si512(
+                        v[0],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 0) * 8).cast()),
+                        ),
+                    );
+                    v[1] = _mm512_xor_si512(
+                        v[1],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 1) * 8).cast()),
+                        ),
+                    );
+                    v[2] = _mm512_xor_si512(
+                        v[2],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 2) * 8).cast()),
+                        ),
+                    );
+                    v[3] = _mm512_xor_si512(
+                        v[3],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 3) * 8).cast()),
+                        ),
+                    );
+                    v[4] = _mm512_xor_si512(
+                        v[4],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 4) * 8).cast()),
+                        ),
+                    );
+                    v[5] = _mm512_xor_si512(
+                        v[5],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 5) * 8).cast()),
+                        ),
+                    );
+                    v[6] = _mm512_xor_si512(
+                        v[6],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 6) * 8).cast()),
+                        ),
+                    );
+                    v[7] = _mm512_xor_si512(
+                        v[7],
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            x,
+                            _mm512_loadu_si512(m.add(($j ^ 7) * 8).cast()),
+                        ),
+                    );
+                }
+            };
+        }
+        add!(0);
+        add!(1);
+        add!(2);
+        add!(3);
+        add!(4);
+        add!(5);
+        add!(6);
+        add!(7);
+        v
+    }
+}
+
+#[inline(always)]
+unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+    unsafe {
+        // For sparse complement inputs keep the direct projection: <=3*8 products.
+        if known(mode_value).count_ones() >= 5 {
+            return affine(p, m, mode_value);
+        }
+        let mut x: [u64; 8] = core::array::from_fn(|j| {
+            if known(mode_value) & (1 << j) != 0 {
+                0
+            } else if mode_value == 0 {
+                *p.add(j)
+            } else {
+                !*p.add(j)
+            }
+        });
+        x[0] ^= x[1];
+        x[2] ^= x[3];
+        x[4] ^= x[5];
+        x[6] ^= x[7];
+        x[0] ^= x[2];
+        x[1] ^= x[3];
+        x[4] ^= x[6];
+        x[5] ^= x[7];
+        x[0] ^= x[4];
+        x[1] ^= x[5];
+        x[2] ^= x[6];
+        x[3] ^= x[7];
+        let mut c = [_mm512_setzero_si512(); 8];
+        c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
+            _mm512_set1_epi64(x[0] as i64),
+            _mm512_loadu_si512(m.add(64).cast()),
+        );
+        c[1] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(72).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[1] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[2] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(80).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[2] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[3] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(88).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[1] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[2] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[3] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[4] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(96).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[4] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[5] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(104).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[1] as i64),
+                    _mm512_loadu_si512(m.add(96).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[4] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[5] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[6] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(112).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[2] as i64),
+                    _mm512_loadu_si512(m.add(96).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[4] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[6] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[7] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[0] as i64),
+                            _mm512_loadu_si512(m.add(120).cast()),
+                        ),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[1] as i64),
+                            _mm512_loadu_si512(m.add(112).cast()),
+                        ),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[2] as i64),
+                            _mm512_loadu_si512(m.add(104).cast()),
+                        ),
+                    ),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        _mm512_set1_epi64(x[3] as i64),
+                        _mm512_loadu_si512(m.add(96).cast()),
+                    ),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        _mm512_set1_epi64(x[4] as i64),
+                        _mm512_loadu_si512(m.add(88).cast()),
+                    ),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[5] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[6] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[7] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[0] = _mm512_xor_si512(c[0], c[1]);
+        c[2] = _mm512_xor_si512(c[2], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[5]);
+        c[6] = _mm512_xor_si512(c[6], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[2]);
+        c[1] = _mm512_xor_si512(c[1], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[6]);
+        c[5] = _mm512_xor_si512(c[5], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[4]);
+        c[1] = _mm512_xor_si512(c[1], c[5]);
+        c[2] = _mm512_xor_si512(c[2], c[6]);
+        c[3] = _mm512_xor_si512(c[3], c[7]);
+        c
+    }
+}
+
+#[inline(always)]
+unsafe fn trq(x: [__m512i; 8]) -> [__m512i; 8] {
+    unsafe {
+        let lo1 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let hi1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let lo2 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let hi2 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let lo4 = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let hi4 = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let t0 = _mm512_permutex2var_epi64(x[0], lo1, x[1]);
+        let t1 = _mm512_permutex2var_epi64(x[0], hi1, x[1]);
+        let t2 = _mm512_permutex2var_epi64(x[2], lo1, x[3]);
+        let t3 = _mm512_permutex2var_epi64(x[2], hi1, x[3]);
+        let t4 = _mm512_permutex2var_epi64(x[4], lo1, x[5]);
+        let t5 = _mm512_permutex2var_epi64(x[4], hi1, x[5]);
+        let t6 = _mm512_permutex2var_epi64(x[6], lo1, x[7]);
+        let t7 = _mm512_permutex2var_epi64(x[6], hi1, x[7]);
+        let u0 = _mm512_permutex2var_epi64(t0, lo2, t2);
+        let u1 = _mm512_permutex2var_epi64(t0, hi2, t2);
+        let u2 = _mm512_permutex2var_epi64(t1, lo2, t3);
+        let u3 = _mm512_permutex2var_epi64(t1, hi2, t3);
+        let u4 = _mm512_permutex2var_epi64(t4, lo2, t6);
+        let u5 = _mm512_permutex2var_epi64(t4, hi2, t6);
+        let u6 = _mm512_permutex2var_epi64(t5, lo2, t7);
+        let u7 = _mm512_permutex2var_epi64(t5, hi2, t7);
+        [
+            _mm512_permutex2var_epi64(u0, lo4, u4),
+            _mm512_permutex2var_epi64(u0, hi4, u4),
+            _mm512_permutex2var_epi64(u1, lo4, u5),
+            _mm512_permutex2var_epi64(u1, hi4, u5),
+            _mm512_permutex2var_epi64(u2, lo4, u6),
+            _mm512_permutex2var_epi64(u2, hi4, u6),
+            _mm512_permutex2var_epi64(u3, lo4, u7),
+            _mm512_permutex2var_epi64(u3, hi4, u7),
+        ]
+    }
+}
+const BYTE_TR: [u8; 64] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3,
+    11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6,
+    14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+];
+#[inline(always)]
+unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
+    unsafe {
+        // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
+        // One fixed byte permutation packs each of their eight byte positions across
+        // rows directly, avoiding canonical-row -> qword -> byte retransposition.
+        const INDEX: [u8; 64] = [
+            0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29, 2, 6, 10, 14, 18, 22, 26, 30,
+            3, 7, 11, 15, 19, 23, 27, 31, 32, 36, 40, 44, 48, 52, 56, 60, 33, 37, 41, 45, 49, 53,
+            57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
+        ];
+        let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
+        let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
+        let p = out.as_mut_ptr().cast::<u64>();
+        let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
+        _mm512_storeu_si512(p.add(0).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
+        _mm512_storeu_si512(p.add(8).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
+        _mm512_storeu_si512(p.add(16).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
+        _mm512_storeu_si512(p.add(24).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
+        _mm512_storeu_si512(p.add(32).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
+        _mm512_storeu_si512(p.add(40).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
+        _mm512_storeu_si512(p.add(48).cast(), _mm512_permutexvar_epi8(ix, v));
+        let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
+        _mm512_storeu_si512(p.add(56).cast(), _mm512_permutexvar_epi8(ix, v));
+        out.assume_init()
+    }
+}
+
+#[inline(always)]
+unsafe fn project_const<const BLK: usize>(
+    proj: &StreamProj<'_>,
+    rows: RankedRows,
+    a: [__m512i; 8],
+    b: [__m512i; 8],
+    ap: &[u64; 64],
+    bp: &[u64; 64],
+    m: *const u64,
+) {
+    unsafe {
+        let two = _mm512_set1_epi8(2);
+        let mut acc = [_mm512_setzero_si512(); 8];
+        rows.publish_dense_values(0, a[0], b[0]);
+        {
+            let av = affine_conv(ap.as_ptr().add(56), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7));
+            let v = if mode(BLK, 7) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = v;
+            let v = if mode(BLK, 7) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 7) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = v;
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(1, a[1], b[1]);
+        {
+            let av = affine_conv(ap.as_ptr().add(48), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6));
+            let v = if mode(BLK, 6) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 6) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 6) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(2, a[2], b[2]);
+        {
+            let av = affine_conv(ap.as_ptr().add(40), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5));
+            let v = if mode(BLK, 5) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 5) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 5) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(3, a[3], b[3]);
+        {
+            let av = affine_conv(ap.as_ptr().add(32), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4));
+            let v = if mode(BLK, 4) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 4) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 4) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(4, a[4], b[4]);
+        {
+            let av = affine_conv(ap.as_ptr().add(24), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3));
+            let v = if mode(BLK, 3) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 3) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 3) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(5, a[5], b[5]);
+        {
+            let av = affine_conv(ap.as_ptr().add(16), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2));
+            let v = if mode(BLK, 2) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 2) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 2) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(6, a[6], b[6]);
+        {
+            let av = affine_conv(ap.as_ptr().add(8), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1));
+            let v = if mode(BLK, 1) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 1) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 1) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        rows.publish_dense_values(7, a[7], b[7]);
+        {
+            let av = affine_conv(ap.as_ptr().add(0), m, 0);
+            let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0));
+            let v = if mode(BLK, 0) == 15 {
+                av[0]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[0])
+                }
+            };
+            acc[0] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[0], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[1]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[1])
+                }
+            };
+            acc[1] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[1], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[2]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[2])
+                }
+            };
+            acc[2] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[2], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[3]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[3])
+                }
+            };
+            acc[3] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[3], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[4]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[4])
+                }
+            };
+            acc[4] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[4], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[5]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[5])
+                }
+            };
+            acc[5] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[5], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[6]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[6])
+                }
+            };
+            acc[6] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[6], two), v);
+            let v = if mode(BLK, 0) == 15 {
+                av[7]
+            } else {
+                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
+                if mode(BLK, 0) == 0 {
+                    p
+                } else {
+                    _mm512_xor_si512(p, av[7])
+                }
+            };
+            acc[7] = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc[7], two), v);
+        }
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+
+        let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
+        let out = trq([
+            _mm512_permutexvar_epi8(ix, acc[0]),
+            _mm512_permutexvar_epi8(ix, acc[1]),
+            _mm512_permutexvar_epi8(ix, acc[2]),
+            _mm512_permutexvar_epi8(ix, acc[3]),
+            _mm512_permutexvar_epi8(ix, acc[4]),
+            _mm512_permutexvar_epi8(ix, acc[5]),
+            _mm512_permutexvar_epi8(ix, acc[6]),
+            _mm512_permutexvar_epi8(ix, acc[7]),
+        ]);
+        _mm512_stream_si512(
+            proj.out
+                .add(0 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[0],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(1 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[1],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(2 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[2],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(3 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[3],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(4 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[4],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(5 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[5],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(6 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[6],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(7 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .cast(),
+            out[7],
+        );
+    }
+}
+/// Same ring, ranked-static and non-temporal publication contract as the
+/// direct-inline path. The caller issues the task's existing final sfence.
+#[inline(never)]
+pub(super) unsafe fn project(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    rows: RankedRows,
+    ar: *const V8,
+    br: *const V8,
+    rw: usize,
+    t: &Tables,
+) {
+    unsafe {
+        let ap = pretranspose_ring(ar, rw);
+        let bp = pretranspose_ring(br, rw);
+        let a = tr8x16_zmm(ar, rw);
+        let b = tr8x16_zmm(br, rw);
+        match blk {
+            3 => project_const::<3>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            4 => project_const::<4>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            5 => project_const::<5>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            6 => project_const::<6>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            7 => project_const::<7>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            8 => project_const::<8>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            9 => project_const::<9>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            10 => project_const::<10>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            11 => project_const::<11>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            12 => project_const::<12>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            13 => project_const::<13>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            14 => project_const::<14>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            15 => project_const::<15>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            16 => project_const::<16>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            17 => project_const::<17>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            18 => project_const::<18>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            19 => project_const::<19>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            20 => project_const::<20>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            21 => project_const::<21>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            22 => project_const::<22>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            23 => project_const::<23>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            24 => project_const::<24>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            25 => project_const::<25>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            26 => project_const::<26>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            27 => project_const::<27>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            28 => project_const::<28>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            _ => unreachable!("only fully-live ranked mixed windows reach XOR projection"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flock_core::{field::F8, ntt::AdditiveNttGf8};
+    #[repr(align(64))]
+    struct Buf([u8; 8 * BYTES_PER_BLOCK]);
+    #[repr(align(32))]
+    struct Ring([[u32; 8]; 32]);
+    #[test]
+    fn xor_projection_publishes_and_matches_scalar() {
+        unsafe {
+            let ns = AdditiveNttGf8::new(6, F8::ZERO);
+            let nl = AdditiveNttGf8::new(6, F8(64));
+            let table = InvNttTableByteSingleGf8::new(&ns, &nl);
+            let t = Tables::new(&table);
+            let mut seed = 1357u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            };
+            for rw in [0, 16] {
+                for case in 0..5 {
+                    for blk in 3..29 {
+                        let mut aa = [[0u8; 64]; 8];
+                        let mut bb = [[0u8; 64]; 8];
+                        let mut ar = Ring([[0xdeadbeef; 8]; 32]);
+                        let mut br = Ring([[0xdeadbeef; 8]; 32]);
+                        for row in 0..8 {
+                            for i in 0..64 {
+                                aa[row][i] = if case == 0 {
+                                    0
+                                } else if case == 1 {
+                                    255
+                                } else {
+                                    next()
+                                };
+                                bb[row][i] = if known(mode(blk, i / 8)) & (1 << (i % 8)) != 0 {
+                                    255
+                                } else if case == 0 {
+                                    0
+                                } else if case == 1 {
+                                    255
+                                } else {
+                                    next()
+                                };
+                            }
+                            for w in 0..16 {
+                                ar.0[rw + w][row] = u32::from_le_bytes(
+                                    aa[row][w * 4..w * 4 + 4].try_into().unwrap(),
+                                );
+                                br.0[rw + w][row] = u32::from_le_bytes(
+                                    bb[row][w * 4..w * 4 + 4].try_into().unwrap(),
+                                );
+                            }
+                        }
+                        let mut a = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut b = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut z = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut output = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let stride = 29 * 64;
+                        let bias = 128;
+                        let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
+                        assert!(plan.bcomplement_static_eligible());
+                        let proj = StreamProj {
+                            stage: core::ptr::null_mut(),
+                            out: output.0.as_mut_ptr(),
+                            out_stride: stride,
+                            out_bias: bias,
+                            inv_table: &table,
+                            plan,
+                            one_rows_elided: true,
+                            w30_elided: true,
+                        };
+                        let offset = blk * 64;
+                        let rows = RankedRows::new(
+                            z.0.as_mut_ptr().add(offset).cast(),
+                            a.0.as_mut_ptr().add(offset).cast(),
+                            b.0.as_mut_ptr().add(offset).cast(),
+                        );
+                        project(
+                            &proj,
+                            blk,
+                            rows,
+                            ar.0.as_ptr().cast(),
+                            br.0.as_ptr().cast(),
+                            rw,
+                            &t,
+                        );
+                        _mm_sfence();
+                        let mut want = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wa = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wb = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wz = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        for row in 0..8 {
+                            let start = row * BYTES_PER_BLOCK + offset;
+                            wa.0[start..start + 64].copy_from_slice(&aa[row]);
+                            wb.0[start..start + 64].copy_from_slice(&bb[row]);
+                            for i in 0..64 {
+                                wz.0[start + i] = aa[row][i] & bb[row][i];
+                            }
+                            let mut acc = [F8::ZERO; 64];
+                            for k in (0..8).rev() {
+                                let mut av = [F8::ZERO; 64];
+                                let mut bv = [F8::ZERO; 64];
+                                table.apply_scalar(&aa[row][k * 8..k * 8 + 8], &mut av);
+                                table.apply_scalar(&bb[row][k * 8..k * 8 + 8], &mut bv);
+                                for i in 0..64 {
+                                    acc[i] = acc[i] * F8(2) + av[i] * bv[i];
+                                }
+                            }
+                            for i in 0..64 {
+                                want.0[row * stride + offset - bias + i] = acc[i].0;
+                            }
+                        }
+                        assert_eq!(output.0, want.0, "projection rw={rw} case={case} blk={blk}");
+                        assert_eq!(a.0, wa.0);
+                        assert_eq!(b.0, wb.0);
+                        assert_eq!(z.0, wz.0);
+                    }
+                }
+            }
+            println!(
+                "260 complete ring-to-published-window cases, including A/B/Z, compact output stride, both ring halves and untouched bytes"
+            );
+        }
+    }
+}

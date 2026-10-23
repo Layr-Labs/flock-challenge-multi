@@ -1262,16 +1262,49 @@ pub(crate) struct StreamProj<'t> {
     pub(crate) w30_elided: bool,
 }
 
-pub(crate) type RankedClosedWindowPreps = [(Round1AbWindowPlan, Round1AbTableImages); 31];
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[path = "blake3_witgen8_xor.rs"]
+mod xor_projection;
+
+pub(crate) struct RankedClosedWindowPreps {
+    windows: [(Round1AbWindowPlan, Round1AbTableImages); 31],
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    tables: xor_projection::Tables,
+}
+impl core::ops::Deref for RankedClosedWindowPreps {
+    type Target = [(Round1AbWindowPlan, Round1AbTableImages); 31];
+    fn deref(&self) -> &Self::Target {
+        &self.windows
+    }
+}
 
 pub(crate) fn prepare_ranked_closed_window_preps(
     inv_table: &InvNttTableByteSingleGf8,
     plan: Round1AbWindowPlan,
 ) -> RankedClosedWindowPreps {
-    std::array::from_fn(|blk| {
-        let plan = plan.for_window(blk);
-        (plan, round1_ab_table_images(inv_table, plan))
-    })
+    RankedClosedWindowPreps {
+        windows: std::array::from_fn(|blk| {
+            let plan = plan.for_window(blk);
+            (plan, round1_ab_table_images(inv_table, plan))
+        }),
+        #[cfg(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        tables: xor_projection::Tables::new(inv_table),
+    }
 }
 
 #[repr(C, align(64))]
@@ -2233,9 +2266,7 @@ impl Drain8<'_> {
                     self.drain_pair_ranked_closed_exact_fast(base_word);
                 } else {
                     self.drain_static_or_sparse_ranked_closed_exact_fast(
-                        base_word,
-                        ring_word,
-                        words,
+                        base_word, ring_word, words,
                     );
                 }
                 return;
@@ -2407,6 +2438,11 @@ impl Drain8<'_> {
                     self.b.add(abs_word),
                 );
                 let (plan, imgs) = *preps.get_unchecked(blk);
+#[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
+                if (3..=28).contains(&blk) && plan.bcomplement_static_eligible(){
+                    xor_projection::project(proj,blk,rows,self.ast,self.bs,rw,&preps.tables);
+                    continue;
+                }
                 project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
                     proj,
                     blk,
@@ -3113,9 +3149,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         target_feature = "avx512dq",
         target_feature = "gfni"
     ),
-    target_feature(
-        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
-    )
+    target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
 pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     inputs: OctaInputs<'_>,
@@ -3235,9 +3269,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
         target_feature = "avx512dq",
         target_feature = "gfni"
     ),
-    target_feature(
-        enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
-    )
+    target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     init: u64,
@@ -4023,18 +4055,20 @@ mod tests {
         #[repr(C, align(64))]
         struct AlignedStage([u32; STREAM_STAGE_WORDS]);
 
-        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_s =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
         let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
             super::super::K_SKIP,
             flock_core::field::F8(1u8 << super::super::K_SKIP),
         );
         let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
         let dummy_ab = Box::new(AlignedAbCompact([0u8; 8 * 29 * 64]));
-        let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
-            &inv_table,
-            &dummy_ab.0,
-            true,
-        );
+        let win_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                &inv_table,
+                &dummy_ab.0,
+                true,
+            );
         let preps = prepare_ranked_closed_window_preps(&inv_table, win_plan);
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
@@ -4073,7 +4107,6 @@ mod tests {
         }
 
         for base in [0usize, 8, 240, 131_064] {
-
             let mut z_ref = z_seed.clone();
             let mut a_ref = a_seed.clone();
             let mut b_ref = b_seed.clone();
