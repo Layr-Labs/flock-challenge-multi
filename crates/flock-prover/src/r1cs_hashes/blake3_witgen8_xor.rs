@@ -57,16 +57,15 @@ const fn known(mode: u8) -> u8 {
 }
 
 #[inline(always)]
-unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine(p: __m512i, m: *const u64, mode_value: u8) -> [__m512i; 8] {
     unsafe {
         let z = _mm512_setzero_si512();
         let mut v = [z; 8];
         macro_rules! add {
             ($j:expr) => {
                 if known(mode_value) & (1 << $j) == 0 {
-                    let w = *p.add($j);
-                    let w = if mode_value == 0 { w } else { !w };
-                    let x = _mm512_set1_epi64(w as i64);
+                    let w = _mm512_permutexvar_epi64(_mm512_set1_epi64($j), p);
+                    let x = if mode_value == 0 { w } else { _mm512_xor_si512(w, _mm512_set1_epi64(-1)) };
                     v[0] = _mm512_xor_si512(
                         v[0],
                         _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -139,125 +138,119 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
-unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_conv(p: __m512i, m: *const u64, mode_value: u8) -> [__m512i; 8] {
     unsafe {
         // For sparse complement inputs keep the direct projection: <=3*8 products.
         if known(mode_value).count_ones() >= 5 {
             return affine(p, m, mode_value);
         }
-        let mut x: [u64; 8] = core::array::from_fn(|j| {
-            if known(mode_value) & (1 << j) != 0 {
-                0
-            } else if mode_value == 0 {
-                *p.add(j)
-            } else {
-                !*p.add(j)
-            }
-        });
-        x[0] ^= x[1];
-        x[2] ^= x[3];
-        x[4] ^= x[5];
-        x[6] ^= x[7];
-        x[0] ^= x[2];
-        x[1] ^= x[3];
-        x[4] ^= x[6];
-        x[5] ^= x[7];
-        x[0] ^= x[4];
-        x[1] ^= x[5];
-        x[2] ^= x[6];
-        x[3] ^= x[7];
+        // Keep byte columns in one ZMM. Each butterfly updates only the
+        // lower member of a cube edge; high members retain their old value.
+        let mask = !known(mode_value);
+        let mut v = if mode_value == 0 { p } else {
+            _mm512_xor_si512(p, _mm512_set1_epi64(-1))
+        };
+        v = _mm512_maskz_mov_epi64(mask, v);
+        v = _mm512_mask_xor_epi64(v, 0x55, v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7,7,5,5,3,3,1,1),v));
+        v = _mm512_mask_xor_epi64(v, 0x33, v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7,6,7,6,3,2,3,2),v));
+        v = _mm512_mask_xor_epi64(v, 0x0f, v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7,6,5,4,7,6,5,4),v));
+        let x: [__m512i; 8] = core::array::from_fn(|j|
+            _mm512_permutexvar_epi64(_mm512_set1_epi64(j as i64), v));
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
-            _mm512_set1_epi64(x[0] as i64),
+            x[0],
             _mm512_loadu_si512(m.add(64).cast()),
         );
         c[1] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                x[0],
                 _mm512_loadu_si512(m.add(72).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[1] as i64),
+                x[1],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[2] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                x[0],
                 _mm512_loadu_si512(m.add(80).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[2] as i64),
+                x[2],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[3] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    x[0],
                     _mm512_loadu_si512(m.add(88).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    x[1],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    x[2],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[3] as i64),
+                x[3],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[4] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                x[0],
                 _mm512_loadu_si512(m.add(96).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[4] as i64),
+                x[4],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[5] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    x[0],
                     _mm512_loadu_si512(m.add(104).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    x[1],
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    x[4],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[5] as i64),
+                x[5],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[6] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    x[0],
                     _mm512_loadu_si512(m.add(112).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    x[2],
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    x[4],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[6] as i64),
+                x[6],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
@@ -266,38 +259,38 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
                 _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[0] as i64),
+                            x[0],
                             _mm512_loadu_si512(m.add(120).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[1] as i64),
+                            x[1],
                             _mm512_loadu_si512(m.add(112).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[2] as i64),
+                            x[2],
                             _mm512_loadu_si512(m.add(104).cast()),
                         ),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[3] as i64),
+                        x[3],
                         _mm512_loadu_si512(m.add(96).cast()),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[4] as i64),
+                        x[4],
                         _mm512_loadu_si512(m.add(88).cast()),
                     ),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[5] as i64),
+                    x[5],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[6] as i64),
+                    x[6],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[7] as i64),
+                x[7],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
@@ -360,7 +353,7 @@ const BYTE_TR: [u8; 64] = [
     14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
 ];
 #[inline(always)]
-unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [__m512i; 8] {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -371,25 +364,10 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
             57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
         ];
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
-        let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-        let p = out.as_mut_ptr().cast::<u64>();
-        let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
-        _mm512_storeu_si512(p.add(0).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
-        _mm512_storeu_si512(p.add(8).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
-        _mm512_storeu_si512(p.add(16).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
-        _mm512_storeu_si512(p.add(24).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
-        _mm512_storeu_si512(p.add(32).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
-        _mm512_storeu_si512(p.add(40).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
-        _mm512_storeu_si512(p.add(48).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
-        _mm512_storeu_si512(p.add(56).cast(), _mm512_permutexvar_epi8(ix, v));
-        out.assume_init()
+        core::array::from_fn(|j| {
+            let v = _mm512_loadu_si512(ring.add(rw + 2*j).cast());
+            _mm512_permutexvar_epi8(ix, v)
+        })
     }
 }
 
@@ -399,16 +377,16 @@ unsafe fn project_const<const BLK: usize>(
     rows: RankedRows,
     a: [__m512i; 8],
     b: [__m512i; 8],
-    ap: &[u64; 64],
-    bp: &[u64; 64],
+    ap: &[__m512i; 8],
+    bp: &[__m512i; 8],
     m: *const u64,
 ) {
     unsafe {
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         {
-            let av = affine_conv(ap.as_ptr().add(56), m.add(7 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7));
+            let av = affine_conv(ap[7], m.add(7 * 128), 0);
+            let bv = affine_conv(bp[7], m, mode(BLK, 7));
             let v = if mode(BLK, 7) == 15 {
                 av[0]
             } else {
@@ -506,8 +484,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(1, a[1], b[1]);
         {
-            let av = affine_conv(ap.as_ptr().add(48), m.add(6 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6));
+            let av = affine_conv(ap[6], m.add(6 * 128), 0);
+            let bv = affine_conv(bp[6], m, mode(BLK, 6));
             let v = if mode(BLK, 6) == 15 {
                 av[0]
             } else {
@@ -605,8 +583,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(2, a[2], b[2]);
         {
-            let av = affine_conv(ap.as_ptr().add(40), m.add(5 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5));
+            let av = affine_conv(ap[5], m.add(5 * 128), 0);
+            let bv = affine_conv(bp[5], m, mode(BLK, 5));
             let v = if mode(BLK, 5) == 15 {
                 av[0]
             } else {
@@ -704,8 +682,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(3, a[3], b[3]);
         {
-            let av = affine_conv(ap.as_ptr().add(32), m.add(4 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4));
+            let av = affine_conv(ap[4], m.add(4 * 128), 0);
+            let bv = affine_conv(bp[4], m, mode(BLK, 4));
             let v = if mode(BLK, 4) == 15 {
                 av[0]
             } else {
@@ -803,8 +781,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(4, a[4], b[4]);
         {
-            let av = affine_conv(ap.as_ptr().add(24), m.add(3 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3));
+            let av = affine_conv(ap[3], m.add(3 * 128), 0);
+            let bv = affine_conv(bp[3], m, mode(BLK, 3));
             let v = if mode(BLK, 3) == 15 {
                 av[0]
             } else {
@@ -902,8 +880,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(5, a[5], b[5]);
         {
-            let av = affine_conv(ap.as_ptr().add(16), m.add(2 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2));
+            let av = affine_conv(ap[2], m.add(2 * 128), 0);
+            let bv = affine_conv(bp[2], m, mode(BLK, 2));
             let v = if mode(BLK, 2) == 15 {
                 av[0]
             } else {
@@ -1001,8 +979,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(6, a[6], b[6]);
         {
-            let av = affine_conv(ap.as_ptr().add(8), m.add(1 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1));
+            let av = affine_conv(ap[1], m.add(1 * 128), 0);
+            let bv = affine_conv(bp[1], m, mode(BLK, 1));
             let v = if mode(BLK, 1) == 15 {
                 av[0]
             } else {
@@ -1100,8 +1078,8 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(7, a[7], b[7]);
         {
-            let av = affine_conv(ap.as_ptr().add(0), m.add(0 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0));
+            let av = affine_conv(ap[0], m.add(0 * 128), 0);
+            let bv = affine_conv(bp[0], m, mode(BLK, 0));
             let v = if mode(BLK, 0) == 15 {
                 av[0]
             } else {
