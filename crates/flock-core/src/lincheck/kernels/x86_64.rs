@@ -167,7 +167,7 @@ pub fn partial_fold_packed_z_x86_gfni_padded(
     target_feature(enable = "avx512f,avx512vbmi,gfni")
 )]
 #[inline]
-pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
+pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool, const RAW: bool>(
     z_ptr: *const F128,
     stride: usize,
     out: *mut u8,
@@ -196,10 +196,16 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
             // byte transpose. Index bit 6 selects z1 (rows 4..8).
             let f_lo = _mm512_load_si512(FUSED_GATHER_LO.0.as_ptr() as *const __m512i);
             let f_hi = _mm512_load_si512(FUSED_GATHER_HI.0.as_ptr() as *const __m512i);
-            let t_lo =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_lo, z1));
-            let t_hi =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_hi, z1));
+            let t_lo = if RAW {
+                _mm512_permutex2var_epi8(z0, f_lo, z1)
+            } else {
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_lo, z1))
+            };
+            let t_hi = if RAW {
+                _mm512_permutex2var_epi8(z0, f_hi, z1)
+            } else {
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutex2var_epi8(z0, f_hi, z1))
+            };
             _mm512_storeu_si512(out as *mut __m512i, t_lo);
             _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
         } else {
@@ -220,16 +226,24 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
                 BIdx(t)
             };
             let bidx = _mm512_load_si512(BIDX.0.as_ptr() as *const __m512i);
-            let t_lo =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
-            let t_hi =
-                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
+            let t_lo = if RAW {
+                _mm512_permutexvar_epi8(bidx, zlo)
+            } else {
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo))
+            };
+            let t_hi = if RAW {
+                _mm512_permutexvar_epi8(bidx, zhi)
+            } else {
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi))
+            };
             _mm512_storeu_si512(out as *mut __m512i, t_lo);
             _mm512_storeu_si512(out.add(64) as *mut __m512i, t_hi);
         }
     }
 }
 
+/// With `RAW`, output the byte-transposed GFNI matrices before bit transpose.
+/// This lets root selection commute with the linear bit-transpose operator.
 /// Four-column twin of [`gather_transpose_stripe_x86`]: gathers columns
 /// `q..q+4` of the eight rows in ONE pass — eight 64-byte row loads plus two
 /// 4×4 lane transposes replace thirty-two 16-byte strided loads and
@@ -258,7 +272,7 @@ pub(crate) unsafe fn gather_transpose_stripe_x86<const FUSE: bool>(
     target_feature(enable = "avx512f,avx512vbmi,gfni")
 )]
 #[inline]
-pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
+pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool, const RAW: bool>(
     z_ptr: *const F128,
     stride: usize,
     out: *mut u8,
@@ -296,14 +310,22 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
             let f_lo = _mm512_load_si512(FUSED_GATHER_LO.0.as_ptr() as *const __m512i);
             let f_hi = _mm512_load_si512(FUSED_GATHER_HI.0.as_ptr() as *const __m512i);
             for c in 0..4 {
-                let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    ident,
-                    _mm512_permutex2var_epi8(z0s[c], f_lo, z1s[c]),
-                );
-                let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    ident,
-                    _mm512_permutex2var_epi8(z0s[c], f_hi, z1s[c]),
-                );
+                let t_lo = if RAW {
+                    _mm512_permutex2var_epi8(z0s[c], f_lo, z1s[c])
+                } else {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        ident,
+                        _mm512_permutex2var_epi8(z0s[c], f_lo, z1s[c]),
+                    )
+                };
+                let t_hi = if RAW {
+                    _mm512_permutex2var_epi8(z0s[c], f_hi, z1s[c])
+                } else {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        ident,
+                        _mm512_permutex2var_epi8(z0s[c], f_hi, z1s[c]),
+                    )
+                };
                 let dst = out.add(c * out_stride);
                 _mm512_storeu_si512(dst as *mut __m512i, t_lo);
                 _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
@@ -326,10 +348,16 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool>(
             for c in 0..4 {
                 let zlo = _mm512_permutex2var_epi64(z0s[c], lo_idx, z1s[c]);
                 let zhi = _mm512_permutex2var_epi64(z0s[c], hi_idx, z1s[c]);
-                let t_lo =
-                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo));
-                let t_hi =
-                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi));
+                let t_lo = if RAW {
+                    _mm512_permutexvar_epi8(bidx, zlo)
+                } else {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zlo))
+                };
+                let t_hi = if RAW {
+                    _mm512_permutexvar_epi8(bidx, zhi)
+                } else {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(bidx, zhi))
+                };
                 let dst = out.add(c * out_stride);
                 _mm512_storeu_si512(dst as *mut __m512i, t_lo);
                 _mm512_storeu_si512(dst.add(64) as *mut __m512i, t_hi);
@@ -418,31 +446,30 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
     }
     #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     {
+        let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
+            // SAFETY: len==8 asserted; cfg supplies avx512f.
+            unsafe { aos8_lohi(eq8) }
+        } else {
+            (
+                std::array::from_fn(|j| eq8[j].lo),
+                std::array::from_fn(|j| eq8[j].hi),
+            )
+        };
+        let mut lo_bytes = [0u8; 64];
+        let mut hi_bytes = [0u8; 64];
+        crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
+        crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
 
-    let (lo_lanes, hi_lanes) = if lc_mats_aos_enabled() {
-        // SAFETY: len==8 asserted; cfg supplies avx512f.
-        unsafe { aos8_lohi(eq8) }
-    } else {
-        (
-            std::array::from_fn(|j| eq8[j].lo),
-            std::array::from_fn(|j| eq8[j].hi),
-        )
-    };
-    let mut lo_bytes = [0u8; 64];
-    let mut hi_bytes = [0u8; 64];
-    crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut lo_bytes);
-    crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut hi_bytes);
-
-    // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
-    // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
-    // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
-    // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
-    for c in 0..8 {
-        let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
-        mats[c] = u64::from_le_bytes(lo).swap_bytes();
-        mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
-    }
+        // `transpose_8_u64s_to_64_bytes` writes group `c` at `bytes[c*8 .. c*8+8]`
+        // with `bytes[c*8 + i] bit j = lane[j] bit (8*c + i)` — exactly the
+        // extract-loop `row` for `(byte_k = c, i)`. The affine qword wants that
+        // row at byte `7 − i` = `from_le_bytes(group).swap_bytes()`.
+        for c in 0..8 {
+            let lo: [u8; 8] = lo_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            let hi: [u8; 8] = hi_bytes[c * 8..c * 8 + 8].try_into().unwrap();
+            mats[c] = u64::from_le_bytes(lo).swap_bytes();
+            mats[c + 8] = u64::from_le_bytes(hi).swap_bytes();
+        }
     }
 }
 
