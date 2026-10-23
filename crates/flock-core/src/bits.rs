@@ -154,31 +154,25 @@ pub(crate) unsafe fn transpose_8_u64s_to_8_mats_swapped_gfni(lanes: &[u64; 8], o
     not(target_feature = "vpclmulqdq"),
     target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
 )]
-pub(crate) unsafe fn transpose_8_f128_to_16_mats_swapped_gfni(
-    basis: &[crate::field::F128],
-    out_mats: &mut [u64],
-) {
+pub(crate) unsafe fn transpose_8_f128_to_16_mats_swapped_gfni(basis: &[crate::field::F128], out_mats: &mut [u64]) {
     use core::arch::x86_64::*;
     debug_assert_eq!(basis.len(), 8);
     debug_assert_eq!(out_mats.len(), 16);
-    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
-    const BSWAP:[u8;64]=[7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8,23,22,21,20,19,18,17,16,31,30,29,28,27,26,25,24,39,38,37,36,35,34,33,32,47,46,45,44,43,42,41,40,55,54,53,52,51,50,49,48,63,62,61,60,59,58,57,56];
+    // Transpose each four-row AoS input locally. Each 128-bit lane holds
+    // [lo col0, lo col1, hi col0, hi col1] in four reversed-row dwords.
+    const I: [u8; 64] = [48, 32, 16, 0, 49, 33, 17, 1, 56, 40, 24, 8, 57, 41, 25, 9, 50, 34, 18, 2, 51, 35, 19, 3, 58, 42, 26, 10, 59, 43, 27, 11, 52, 36, 20, 4, 53, 37, 21, 5, 60, 44, 28, 12, 61, 45, 29, 13, 54, 38, 22, 6, 55, 39, 23, 7, 62, 46, 30, 14, 63, 47, 31, 15];
     unsafe {
-        let p = basis.as_ptr() as *const __m512i;
-        let v0 = _mm512_loadu_si512(p);
-        let v1 = _mm512_loadu_si512(p.add(1));
-        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
-        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
-        let lo = _mm512_permutex2var_epi64(v0, lo_idx, v1);
-        let hi = _mm512_permutex2var_epi64(v0, hi_idx, v1);
+        let src = basis.as_ptr() as *const __m512i;
         let i = _mm512_loadu_si512(I.as_ptr() as *const __m512i);
-        let bswap = _mm512_loadu_si512(BSWAP.as_ptr() as *const __m512i);
-        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let a = _mm512_permutexvar_epi8(i, _mm512_loadu_si512(src));
+        let b = _mm512_permutexvar_epi8(i, _mm512_loadu_si512(src.add(1)));
+        // High-row dword first: GFNI expects matrix rows reversed.
+        let lo = _mm512_unpacklo_epi32(b, a);
+        let hi = _mm512_unpackhi_epi32(b, a);
+        let id = _mm512_set1_epi64(0x0102040810204080u64 as i64);
         let dst = out_mats.as_mut_ptr() as *mut __m512i;
-        let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, lo));
-        let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, hi));
-        _mm512_storeu_si512(dst, _mm512_shuffle_epi8(t_lo, bswap));
-        _mm512_storeu_si512(dst.add(1), _mm512_shuffle_epi8(t_hi, bswap));
+        _mm512_storeu_si512(dst, _mm512_gf2p8affine_epi64_epi8::<0>(id, lo));
+        _mm512_storeu_si512(dst.add(1), _mm512_gf2p8affine_epi64_epi8::<0>(id, hi));
     }
 }
 
