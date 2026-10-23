@@ -4532,15 +4532,16 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
 }
 
 
-/// Fold four packed-u64 maps through two staged claim accumulations. Each
-/// stage keeps only its two eight-plane inputs live and immediately stores
-/// each completed output-byte plane. This replaces LLVM's accidental
-/// 16-plane spills plus the inter-claim row-major temporary with one explicit
-/// 16-ZMM plane buffer whose traffic is fixed and easy to audit.
+/// Fold four packed-u64 maps with register-resident output planes.
+/// Each GF(2)-linear map contributes by XOR. Only one eight-plane input
+/// is live at a time, leaving room for all sixteen accumulated outputs.
+/// Empty inout-register asm constraints bound LLVM's live partial sums;
+/// without them scheduling introduces spills despite the source lifetimes.
+/// The legacy scratch pointer is retained for caller compatibility but unused.
 ///
 /// # Safety
-/// Each row pointer covers 512 bytes, `out` covers 64 F128s, `planes` covers
-/// sixteen ZMMs, and the target features in the cfg are available.
+/// Each row pointer covers 512 bytes, `out` covers 64 F128s, and the
+/// target features in the cfg are available. Scratch is not accessed.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4566,7 +4567,7 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
     rows3: *const u8,
     mats3: &[u64; 128],
     out: *mut F128,
-    planes: *mut core::arch::x86_64::__m512i,
+    _planes: *mut core::arch::x86_64::__m512i,
 ) {
     use core::arch::x86_64::*;
     unsafe {
@@ -4625,25 +4626,141 @@ pub(crate) unsafe fn gfni_fold64_four_maps_staged(
             _mm512_xor_si512(v2, v3)
         };
 
-        {
-            let p0 = input_planes(rows0);
-            let p1 = input_planes(rows1);
-            for k in 0..16 {
-                let value = _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
-                _mm512_storeu_si512(planes.add(k), value);
-            }
-        }
-        {
-            let p2 = input_planes(rows2);
-            let p3 = input_planes(rows3);
-            for k in 0..16 {
-                let value = _mm512_xor_si512(map_plane(&p2, mats2, k), map_plane(&p3, mats3, k));
-                let value = _mm512_xor_si512(value, _mm512_loadu_si512(planes.add(k)));
-                _mm512_storeu_si512(planes.add(k), value);
-            }
-        }
-
-        let acc: [__m512i; 16] = core::array::from_fn(|k| _mm512_loadu_si512(planes.add(k)));
+        // Linear maps add by XOR. Keep the completed planes live across
+        // one input map at a time rather than round-tripping through scratch.
+        let p = input_planes(rows0);
+        let mut a0 = map_plane(&p, mats0, 0);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a0, options(nomem, nostack, preserves_flags));
+        let mut a1 = map_plane(&p, mats0, 1);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a1, options(nomem, nostack, preserves_flags));
+        let mut a2 = map_plane(&p, mats0, 2);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a2, options(nomem, nostack, preserves_flags));
+        let mut a3 = map_plane(&p, mats0, 3);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a3, options(nomem, nostack, preserves_flags));
+        let mut a4 = map_plane(&p, mats0, 4);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a4, options(nomem, nostack, preserves_flags));
+        let mut a5 = map_plane(&p, mats0, 5);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a5, options(nomem, nostack, preserves_flags));
+        let mut a6 = map_plane(&p, mats0, 6);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a6, options(nomem, nostack, preserves_flags));
+        let mut a7 = map_plane(&p, mats0, 7);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a7, options(nomem, nostack, preserves_flags));
+        let mut a8 = map_plane(&p, mats0, 8);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a8, options(nomem, nostack, preserves_flags));
+        let mut a9 = map_plane(&p, mats0, 9);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a9, options(nomem, nostack, preserves_flags));
+        let mut a10 = map_plane(&p, mats0, 10);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a10, options(nomem, nostack, preserves_flags));
+        let mut a11 = map_plane(&p, mats0, 11);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a11, options(nomem, nostack, preserves_flags));
+        let mut a12 = map_plane(&p, mats0, 12);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a12, options(nomem, nostack, preserves_flags));
+        let mut a13 = map_plane(&p, mats0, 13);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a13, options(nomem, nostack, preserves_flags));
+        let mut a14 = map_plane(&p, mats0, 14);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a14, options(nomem, nostack, preserves_flags));
+        let mut a15 = map_plane(&p, mats0, 15);
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a15, options(nomem, nostack, preserves_flags));
+        let p = input_planes(rows1);
+        a0 = _mm512_xor_si512(a0, map_plane(&p, mats1, 0));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a0, options(nomem, nostack, preserves_flags));
+        a1 = _mm512_xor_si512(a1, map_plane(&p, mats1, 1));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a1, options(nomem, nostack, preserves_flags));
+        a2 = _mm512_xor_si512(a2, map_plane(&p, mats1, 2));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a2, options(nomem, nostack, preserves_flags));
+        a3 = _mm512_xor_si512(a3, map_plane(&p, mats1, 3));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a3, options(nomem, nostack, preserves_flags));
+        a4 = _mm512_xor_si512(a4, map_plane(&p, mats1, 4));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a4, options(nomem, nostack, preserves_flags));
+        a5 = _mm512_xor_si512(a5, map_plane(&p, mats1, 5));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a5, options(nomem, nostack, preserves_flags));
+        a6 = _mm512_xor_si512(a6, map_plane(&p, mats1, 6));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a6, options(nomem, nostack, preserves_flags));
+        a7 = _mm512_xor_si512(a7, map_plane(&p, mats1, 7));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a7, options(nomem, nostack, preserves_flags));
+        a8 = _mm512_xor_si512(a8, map_plane(&p, mats1, 8));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a8, options(nomem, nostack, preserves_flags));
+        a9 = _mm512_xor_si512(a9, map_plane(&p, mats1, 9));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a9, options(nomem, nostack, preserves_flags));
+        a10 = _mm512_xor_si512(a10, map_plane(&p, mats1, 10));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a10, options(nomem, nostack, preserves_flags));
+        a11 = _mm512_xor_si512(a11, map_plane(&p, mats1, 11));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a11, options(nomem, nostack, preserves_flags));
+        a12 = _mm512_xor_si512(a12, map_plane(&p, mats1, 12));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a12, options(nomem, nostack, preserves_flags));
+        a13 = _mm512_xor_si512(a13, map_plane(&p, mats1, 13));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a13, options(nomem, nostack, preserves_flags));
+        a14 = _mm512_xor_si512(a14, map_plane(&p, mats1, 14));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a14, options(nomem, nostack, preserves_flags));
+        a15 = _mm512_xor_si512(a15, map_plane(&p, mats1, 15));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a15, options(nomem, nostack, preserves_flags));
+        let p = input_planes(rows2);
+        a0 = _mm512_xor_si512(a0, map_plane(&p, mats2, 0));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a0, options(nomem, nostack, preserves_flags));
+        a1 = _mm512_xor_si512(a1, map_plane(&p, mats2, 1));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a1, options(nomem, nostack, preserves_flags));
+        a2 = _mm512_xor_si512(a2, map_plane(&p, mats2, 2));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a2, options(nomem, nostack, preserves_flags));
+        a3 = _mm512_xor_si512(a3, map_plane(&p, mats2, 3));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a3, options(nomem, nostack, preserves_flags));
+        a4 = _mm512_xor_si512(a4, map_plane(&p, mats2, 4));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a4, options(nomem, nostack, preserves_flags));
+        a5 = _mm512_xor_si512(a5, map_plane(&p, mats2, 5));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a5, options(nomem, nostack, preserves_flags));
+        a6 = _mm512_xor_si512(a6, map_plane(&p, mats2, 6));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a6, options(nomem, nostack, preserves_flags));
+        a7 = _mm512_xor_si512(a7, map_plane(&p, mats2, 7));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a7, options(nomem, nostack, preserves_flags));
+        a8 = _mm512_xor_si512(a8, map_plane(&p, mats2, 8));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a8, options(nomem, nostack, preserves_flags));
+        a9 = _mm512_xor_si512(a9, map_plane(&p, mats2, 9));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a9, options(nomem, nostack, preserves_flags));
+        a10 = _mm512_xor_si512(a10, map_plane(&p, mats2, 10));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a10, options(nomem, nostack, preserves_flags));
+        a11 = _mm512_xor_si512(a11, map_plane(&p, mats2, 11));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a11, options(nomem, nostack, preserves_flags));
+        a12 = _mm512_xor_si512(a12, map_plane(&p, mats2, 12));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a12, options(nomem, nostack, preserves_flags));
+        a13 = _mm512_xor_si512(a13, map_plane(&p, mats2, 13));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a13, options(nomem, nostack, preserves_flags));
+        a14 = _mm512_xor_si512(a14, map_plane(&p, mats2, 14));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a14, options(nomem, nostack, preserves_flags));
+        a15 = _mm512_xor_si512(a15, map_plane(&p, mats2, 15));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a15, options(nomem, nostack, preserves_flags));
+        let p = input_planes(rows3);
+        a0 = _mm512_xor_si512(a0, map_plane(&p, mats3, 0));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a0, options(nomem, nostack, preserves_flags));
+        a1 = _mm512_xor_si512(a1, map_plane(&p, mats3, 1));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a1, options(nomem, nostack, preserves_flags));
+        a2 = _mm512_xor_si512(a2, map_plane(&p, mats3, 2));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a2, options(nomem, nostack, preserves_flags));
+        a3 = _mm512_xor_si512(a3, map_plane(&p, mats3, 3));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a3, options(nomem, nostack, preserves_flags));
+        a4 = _mm512_xor_si512(a4, map_plane(&p, mats3, 4));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a4, options(nomem, nostack, preserves_flags));
+        a5 = _mm512_xor_si512(a5, map_plane(&p, mats3, 5));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a5, options(nomem, nostack, preserves_flags));
+        a6 = _mm512_xor_si512(a6, map_plane(&p, mats3, 6));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a6, options(nomem, nostack, preserves_flags));
+        a7 = _mm512_xor_si512(a7, map_plane(&p, mats3, 7));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a7, options(nomem, nostack, preserves_flags));
+        a8 = _mm512_xor_si512(a8, map_plane(&p, mats3, 8));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a8, options(nomem, nostack, preserves_flags));
+        a9 = _mm512_xor_si512(a9, map_plane(&p, mats3, 9));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a9, options(nomem, nostack, preserves_flags));
+        a10 = _mm512_xor_si512(a10, map_plane(&p, mats3, 10));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a10, options(nomem, nostack, preserves_flags));
+        a11 = _mm512_xor_si512(a11, map_plane(&p, mats3, 11));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a11, options(nomem, nostack, preserves_flags));
+        a12 = _mm512_xor_si512(a12, map_plane(&p, mats3, 12));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a12, options(nomem, nostack, preserves_flags));
+        a13 = _mm512_xor_si512(a13, map_plane(&p, mats3, 13));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a13, options(nomem, nostack, preserves_flags));
+        a14 = _mm512_xor_si512(a14, map_plane(&p, mats3, 14));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a14, options(nomem, nostack, preserves_flags));
+        a15 = _mm512_xor_si512(a15, map_plane(&p, mats3, 15));
+        core::arch::asm!("/* {v} */", v = inout(zmm_reg) a15, options(nomem, nostack, preserves_flags));
+        let acc = [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15];
         let lo_half = qword_transpose(acc[..8].try_into().unwrap());
         let hi_half = qword_transpose(acc[8..].try_into().unwrap());
         let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
