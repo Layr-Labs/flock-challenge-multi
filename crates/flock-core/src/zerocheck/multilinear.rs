@@ -1940,9 +1940,32 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let r2_mats_arg = r2_mats.as_ref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    let (sum1_even, sum_inf_even, agg) = (0..hi_size)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+        target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    let pair_hi = fast_r2 && hi_size >= 2 && hi_size.is_multiple_of(2)
+        && lo_size >= 128 && lo_size.is_multiple_of(128)
+        && std::env::var_os("FLOCK_NO_R2_HI_PAIR").is_none();
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f",
+        target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+    let pair_hi = false;
+    let width = if pair_hi { 2 } else { 1 };
+    let (sum1_even, sum_inf_even, agg) = (0..hi_size / width)
         .into_par_iter()
-        .map(|x_hi| {
+        .map(|group| {
+            let first_hi = group * width;
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+                target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+            let paired = if pair_hi {
+                // SAFETY: both chunks satisfy the incumbent fast kernel's
+                // geometry; input bounds follow from lo_size*hi_size*2=n_out.
+                Some(unsafe { kernels::x86_64::round2_lookahead_pair_baked_elide_x86(
+                    a_packed.as_ptr(), b_packed.as_ptr(),
+                    [first_hi * chunk_size, (first_hi + 1) * chunk_size],
+                    lo_size, bake_arg.expect("fast route has bake")) })
+            } else { None };
+            let mut combined = (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
+            for h in 0..width {
+            let x_hi = first_hi + h;
             let row_base = x_hi * chunk_size;
             let pair_idx_base = x_hi * lo_size;
             let mut none_a: [F128; 0] = [];
@@ -1959,7 +1982,9 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             // every intrinsic feature.
             let out = unsafe {
                 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-                if fast_r2
+                if let Some(pair) = paired {
+                    pair[h]
+                } else if fast_r2
                     && (pair_idx_base & 127) == 0
                     && (row_base & 255) == 0
                     && let Some(bk) = bake_arg
@@ -2058,18 +2083,11 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             );
 
             let eq_h = eq_hi[x_hi];
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
+            combined.0 += eq_h * out[0];
+            combined.1 += eq_h * out[1];
+            for i in 0..6 { combined.2[i] += eq_h * out[i+2]; }
+            }
+            combined
         })
         .reduce(
             || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
@@ -5123,6 +5141,38 @@ mod tests {
     }
 
     /// AVX-512 sweep with the canonical windows elided (and their deltas added)
+    /// Direct same-kernel equivalence across two distinct high chunks.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+        target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn r2pair134_distinct_chunks_match_single() {
+        let mut rng = Rng::new(0x134BEEF);
+        for n_lo in [7usize, 8, 12] {
+            let lo_size = 1usize << n_lo;
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let r_lo: Vec<F128> = (0..n_lo).map(|_| rng.f128()).collect();
+            let eq_lo = crate::zerocheck::univariate_skip::build_eq(&r_lo);
+            let mut bake = build_r2_eq_bake_checked(&table, &eq_lo, &r_lo, true).unwrap();
+            bake.canonical_elide = true;
+            let a: Vec<u8> = (0..lo_size*8*8).map(|_| rng.next_u64() as u8).collect();
+            let b: Vec<u8> = (0..a.len()).map(|_| rng.next_u64() as u8).collect();
+            for bases in [[0usize, 2*lo_size], [2*lo_size, 6*lo_size], [6*lo_size, 0]] {
+                let refs = bases.map(|base| unsafe {
+                    kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
+                        a.as_ptr(), b.as_ptr(), base, lo_size, &bake)
+                });
+                assert_ne!(refs[0], refs[1], "test requires distinct nonzero chunks");
+                let mut tested_bases = bases;
+                if std::env::var_os("FLOCK_R2PAIR134_BAD_ROW").is_some() {
+                    tested_bases[1] = tested_bases[0];
+                }
+                let got = unsafe { kernels::x86_64::round2_lookahead_pair_baked_elide_x86(
+                    a.as_ptr(), b.as_ptr(), tested_bases, lo_size, &bake) };
+                assert_eq!(got, refs, "n_lo={n_lo}, bases={bases:?}");
+            }
+        }
+    }
+
     /// is bit-identical to the incumbent sweep, on both round-two body arms.
     #[cfg(all(
         target_arch = "x86_64",

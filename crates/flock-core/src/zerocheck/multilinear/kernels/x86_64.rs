@@ -546,6 +546,226 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
     }
 }
 
+/// Two independent high chunks, interleaved at 128-pair granularity.
+/// The equality split and per-chunk arithmetic are unchanged. Each four-matrix
+/// B tile is consumed by both chunks before advancing to the next tile.
+/// Safety requirements are the single-chunk kernel's requirements for EACH base;
+/// no aliasing output exists (both inputs are read-only and results are by value).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+pub(crate) unsafe fn round2_lookahead_pair_baked_elide_x86(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_bases: [usize; 2],
+    lo_size: usize,
+    bk: &R2EqBake,
+) -> [[F128; 8]; 2] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
+    debug_assert!(row_bases.iter().all(|r| r & 255 == 0));
+
+    unsafe {
+        let mut accs = [[WideGhashX4::zero(); 8]; 2];
+        let mut acc: &mut [WideGhashX4; 8];
+        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
+        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
+        let b_mats_slice = bk.b_mats.as_ptr();
+
+        macro_rules! pf_quarter {
+            ($g0:expr, $q:expr) => {{
+                let next = ($g0 + 64 * ZC_PKT_PF_TILES) * 8;
+                let l0 = 2 * ($q as usize);
+                for l in l0..l0 + 2 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }};
+        }
+
+        macro_rules! ld_group {
+            ($g:expr) => {{
+                let g_off = 4 * ($g as usize);
+                (
+                    _mm512_loadu_si512(fa.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(48 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(48 + g_off).cast::<__m512i>()),
+                )
+            }};
+        }
+
+        macro_rules! accum1 {
+            ($g0:expr, $grp:expr) => {{
+                pf_quarter!($g0, $grp);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp);
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }};
+        }
+
+        macro_rules! accum2 {
+            ($g0:expr, $grp0:expr, $grp1:expr) => {{
+                pf_quarter!($g0, $grp0);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp0);
+                pf_quarter!($g0, $grp1);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($grp1);
+                acc[0].mul_acc2(a1w, b1, c1w, d1);
+                acc[1].mul_acc2(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(c0w, c1w),
+                    _mm512_xor_si512(d0, d1),
+                );
+                acc[2].mul_acc2(a3w, b3, c3w, d3);
+                acc[3].mul_acc2(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(c2w, c3w),
+                    _mm512_xor_si512(d2, d3),
+                );
+                acc[4].mul_acc2(a2w, b2, c2w, d2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                let e_cw = _mm512_xor_si512(c0w, c2w);
+                let e_d = _mm512_xor_si512(d0, d2);
+                let o_cw = _mm512_xor_si512(c1w, c3w);
+                let o_d = _mm512_xor_si512(d1, d3);
+                acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                acc[7].mul_acc2(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(e_cw, o_cw),
+                    _mm512_xor_si512(e_d, o_d),
+                );
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 128 <= lo_size {
+            let batch_base = x_lo >> 5;
+            for h in 0..2 {
+                let row_base = row_bases[h];
+                acc = &mut accs[h];
+            // Batch 0 (g0 & 255 == 0): elide group 0
+            {
+                let g0 = row_base + 2 * x_lo;
+                let bm = &(*b_mats_slice.add(batch_base)).0;
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(
+                    a_pkt.add(g0 * 8),
+                    a_mats_ptr,
+                    fa,
+                    0,
+                );
+                gfni_fold64_rows_tr_bcast_skip_group::<false>(
+                    b_pkt.add(g0 * 8),
+                    bm.as_ptr(),
+                    fb,
+                    0,
+                );
+                pf_quarter!(g0, 0);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                accum1!(g0, 1);
+                accum2!(g0, 2, 3);
+            }
+            // Batch 1 (g0 & 255 == 64): full 4 groups
+            {
+                let g0 = row_base + 2 * (x_lo + 32);
+                let bm = &(*b_mats_slice.add(batch_base + 1)).0;
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+            }
+            // Batch 2 (g0 & 255 == 128): full 4 groups
+            {
+                let g0 = row_base + 2 * (x_lo + 64);
+                let bm = &(*b_mats_slice.add(batch_base + 2)).0;
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+            }
+            // Batch 3 (g0 & 255 == 192): elide group 3
+            {
+                let g0 = row_base + 2 * (x_lo + 96);
+                let bm = &(*b_mats_slice.add(batch_base + 3)).0;
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(
+                    a_pkt.add(g0 * 8),
+                    a_mats_ptr,
+                    fa,
+                    3,
+                );
+                gfni_fold64_rows_tr_bcast_skip_group::<false>(
+                    b_pkt.add(g0 * 8),
+                    bm.as_ptr(),
+                    fb,
+                    3,
+                );
+                accum2!(g0, 0, 1);
+                accum1!(g0, 2);
+                pf_quarter!(g0, 3);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            }
+            x_lo += 128;
+        }
+
+        let mut out = [[F128::ZERO; 8]; 2];
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        for h in 0..2 {
+          for i in 0..8 {
+            let scaled = ghash_mul_x4(lane_w, accs[h][i].reduce_lanes());
+            let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
+            out[h][i] = l[0] + l[1] + l[2] + l[3];
+          }
+        }
+        out
+    }
+}
+
 /// # Safety
 /// `table_data` must point to the 8 × 256 `F128` fold table; `a_pkt`/`b_pkt`
 /// must expose 8 readable bytes for every post-URM row
