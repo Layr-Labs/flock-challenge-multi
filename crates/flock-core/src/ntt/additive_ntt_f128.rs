@@ -489,12 +489,14 @@ mod affinity {
     }
 }
 
-/// One finished block handed from a butterfly worker to its paired
-/// leaf-hash worker: where the block starts in the codeword, how many
-/// elements it holds, and the leaf range it covers.
+/// One disjoint block handed to the paired leaf-hash worker. A ready block
+/// is read-only; a deferred block transfers exclusive write ownership for
+/// its last seven NTT layers before hashing the same leaf range.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct DeepBlock {
+    // True transfers exclusive ownership of a not-yet-transformed tail block.
+    needs_tail: bool,
     ptr: usize,
     len_f128: usize,
     lo: usize,
@@ -528,6 +530,7 @@ impl DeepQueue {
             slots: (0..Self::CAP)
                 .map(|_| {
                     std::cell::UnsafeCell::new(DeepBlock {
+                        needs_tail: false,
                         ptr: 0,
                         len_f128: 0,
                         lo: 0,
@@ -540,6 +543,12 @@ impl DeepQueue {
             done: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+    /// No queued work: the consumer may still be finishing its current block.
+    /// Only the producer calls this hint. A stale tail only declines a handoff.
+    fn is_empty(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.head.load(Ordering::Relaxed) == self.tail.load(Ordering::Acquire)
     }
     /// Publish a block, waiting while the consumer is more than `depth`
     /// blocks behind. Returns false if the consumer is gone (its panic is
@@ -3490,7 +3499,8 @@ impl AdditiveNttF128 {
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
-                        hint: u8|
+                        hint: u8,
+                        defer_tail: Option<&(dyn Fn(usize, *mut F128, usize) -> bool + Sync)>|
          -> bool {
             if fuse_blocks && let Some(cb) = block_cb {
                 #[cfg(all(
@@ -3510,6 +3520,7 @@ impl AdditiveNttF128 {
                         odd_tail,
                         sub_size_positions,
                         hint,
+                        defer_tail,
                     )
                 };
                 #[cfg(not(all(
@@ -3527,6 +3538,7 @@ impl AdditiveNttF128 {
                     odd_tail,
                     sub_size_positions,
                     hint,
+                    defer_tail,
                 );
             }
             // The cache-blocked tail normally sweeps each subgroup once per
@@ -3778,6 +3790,7 @@ impl AdditiveNttF128 {
                         if producer {
                             let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
                                 let b = DeepBlock {
+                                    needs_tail: false,
                                     ptr: blk.as_ptr() as usize,
                                     len_f128: blk.len(),
                                     lo: range.start,
@@ -3786,6 +3799,22 @@ impl AdditiveNttF128 {
                                 if !q.push(b, depth) {
                                     cb(range, blk);
                                 }
+                            };
+                            let defer_tail = |lo: usize, ptr: *mut F128, len_f128: usize| {
+                                // Avoid adding compute behind an existing hash backlog.
+                                // Every block, deferred or ready, still passes through
+                                // this producer's FIFO. Parent-fold completion is unchanged.
+                                q.is_empty()
+                                    && q.push(
+                                        DeepBlock {
+                                            needs_tail: true,
+                                            ptr: ptr as usize,
+                                            len_f128,
+                                            lo,
+                                            hi: lo + 128,
+                                        },
+                                        depth,
+                                    )
                             };
                             loop {
                                 let i = next_sub.fetch_add(1, Ordering::Relaxed);
@@ -3801,7 +3830,7 @@ impl AdditiveNttF128 {
                                         sub_bytes,
                                     )
                                 };
-                                if !deep_sub(i, sub_data, Some(&enqueue), hint) {
+                                if !deep_sub(i, sub_data, Some(&enqueue), hint, Some(&defer_tail)) {
                                     enqueue(
                                         i * sub_size_positions..(i + 1) * sub_size_positions,
                                         sub_data,
@@ -3810,6 +3839,29 @@ impl AdditiveNttF128 {
                             }
                         } else {
                             while let Some(b) = q.pop() {
+                                if b.needs_tail {
+                                    // SAFETY: the producer completed the first four layers,
+                                    // published this unique disjoint tail with Release, and
+                                    // relinquished all access. This consumer owns it until
+                                    // the callback returns. The broadcast joins before data
+                                    // can be read outside the paired pass.
+                                    let blk = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            b.ptr as *mut F128,
+                                            b.len_f128,
+                                        )
+                                    };
+                                    self.deep_block_last_seven(
+                                        b.lo / 128,
+                                        blk,
+                                        n_top,
+                                        num_ntts,
+                                        odd_tail,
+                                        hint,
+                                    );
+                                    cb(b.lo..b.hi, blk);
+                                    continue;
+                                }
                                 // SAFETY: the producer finished every write to
                                 // this block before publishing it, and the
                                 // release/acquire pair on the ring head orders
@@ -3827,7 +3879,7 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0, None) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
@@ -3857,7 +3909,7 @@ impl AdditiveNttF128 {
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
                             .for_each(|(i, sub_data)| {
-                                deep_sub(sub_cursor + i, sub_data, None, 0);
+                                deep_sub(sub_cursor + i, sub_data, None, 0, None);
                             });
                         on_chunk(
                             c,
@@ -3954,7 +4006,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None, 0);
+                    deep_sub(i, sub_data, None, 0, None);
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -4252,6 +4304,7 @@ impl AdditiveNttF128 {
         odd_tail: usize,
         sub_size_positions: usize,
         hint: u8,
+        defer_tail: Option<&(dyn Fn(usize, *mut F128, usize) -> bool + Sync)>,
     ) -> bool {
         self.deep_sub_fused_blocks_fallback(
             sub_idx,
@@ -4263,6 +4316,7 @@ impl AdditiveNttF128 {
             odd_tail,
             sub_size_positions,
             hint,
+            defer_tail,
         )
     }
 
@@ -4279,6 +4333,7 @@ impl AdditiveNttF128 {
         odd_tail: usize,
         sub_size_positions: usize,
         hint: u8,
+        defer_tail: Option<&(dyn Fn(usize, *mut F128, usize) -> bool + Sync)>,
     ) -> bool {
         // Sweep 1: fused-four over the whole sub-group (layers
         // n_top..n_top+4) — verbatim the incumbent's first pass.
@@ -4317,68 +4372,95 @@ impl AdditiveNttF128 {
         let layer4 = n_top + 4;
         let block_size4 = 1usize << (log_d - layer4);
         let block_bytes4 = block_size4 * num_ntts;
-        let sixteenth4 = block_size4 >> 4;
-        let layer3 = n_top + 8;
-        let dense_lanes = num_ntts - odd_tail;
+        // Keep a single raw base before any tail is handed off. Reborrowing
+        // the whole subgroup after publication would overlap the consumer's
+        // mutable block. Every later borrow is confined to one unique block.
+        let sub_ptr = sub_data.as_mut_ptr();
         #[cfg(test)]
         FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for b in 0..16usize {
             let g4 = sub_idx * 16 + b;
-            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-            tw[0] = self.twiddle(layer4, g4);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-            }
-            for s in 0..8 {
-                tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-            }
-            let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-            butterfly_interleaved_fused_4layer_rows(
-                blk,
-                &tw,
-                sixteenth4,
-                num_ntts,
-                if sixteenth4.is_multiple_of(2) {
-                    odd_tail
-                } else {
-                    0
-                },
-                hint,
-            );
-            for j in 0..16usize {
-                let g8 = g4 * 16 + j;
-                let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
-                tw3[0] = self.twiddle(layer3, g8);
-                for s in 0..2 {
-                    tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
-                }
-                for s in 0..4 {
-                    tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
-                }
-                let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
-                // SAFETY: eight consecutive rows of `num_ntts` lanes,
-                // owned exclusively by this sub-group task; the zero
-                // tail lives on odd rows exactly as in the sweep
-                // schedule (blocks start at even global rows).
-                unsafe {
-                    kernels::butterfly_fused_3layer_rows(
-                        eight.as_mut_ptr(),
-                        num_ntts,
-                        dense_lanes,
-                        &tw3,
-                    );
-                }
-            }
             let lo = sub_idx * sub_size_positions + b * block_size4;
-            cb(
-                lo..lo + block_size4,
-                &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
-            );
+            // SAFETY: the fused-11 shape has exactly sixteen 128-row blocks.
+            let ptr = unsafe { sub_ptr.add(b * block_bytes4) };
+            if defer_tail.is_some_and(|defer| defer(lo, ptr, block_bytes4)) {
+                // The queue's release hands this disjoint block to the consumer.
+                // Do not read/write it again before the enclosing broadcast joins.
+                continue;
+            }
+            // SAFETY: this block was not handed off; all previously delegated
+            // blocks are disjoint. No whole-subgroup borrow is used again.
+            let blk = unsafe { std::slice::from_raw_parts_mut(ptr, block_bytes4) };
+            self.deep_block_last_seven(g4, blk, n_top, num_ntts, odd_tail, hint);
+            cb(lo..lo + block_size4, blk);
         }
         true
+    }
+
+    /// Complete one independent 128-position tail after the subgroup's first
+    /// four layers. Shared by the producer and its paired hash consumer.
+    #[inline(always)]
+    fn deep_block_last_seven(
+        &self,
+        g4: usize,
+        blk: &mut [F128],
+        n_top: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        hint: u8,
+    ) {
+        debug_assert_eq!(blk.len(), 128 * num_ntts);
+        let layer4 = n_top + 4;
+        let sixteenth4 = 8;
+        let layer3 = n_top + 8;
+        let dense_lanes = num_ntts - odd_tail;
+        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+        tw[0] = self.twiddle(layer4, g4);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+        }
+        butterfly_interleaved_fused_4layer_rows(
+            blk,
+            &tw,
+            sixteenth4,
+            num_ntts,
+            if sixteenth4.is_multiple_of(2) {
+                odd_tail
+            } else {
+                0
+            },
+            hint,
+        );
+        for j in 0..16usize {
+            let g8 = g4 * 16 + j;
+            let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+            tw3[0] = self.twiddle(layer3, g8);
+            for s in 0..2 {
+                tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+            }
+            for s in 0..4 {
+                tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+            }
+            let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+            // SAFETY: eight consecutive rows of `num_ntts` lanes,
+            // owned exclusively by this sub-group task; the zero
+            // tail lives on odd rows exactly as in the sweep
+            // schedule (blocks start at even global rows).
+            unsafe {
+                kernels::butterfly_fused_3layer_rows(
+                    eight.as_mut_ptr(),
+                    num_ntts,
+                    dense_lanes,
+                    &tw3,
+                );
+            }
+        }
     }
 }
 
@@ -5101,6 +5183,7 @@ mod tests {
                 for i in 0..N {
                     all_published &= queue.push(
                         DeepBlock {
+                            needs_tail: i % 2 == 0,
                             ptr: i,
                             len_f128: i + 1,
                             lo: i * 2,
@@ -5122,7 +5205,13 @@ mod tests {
             };
             let mut seen = Vec::with_capacity(N);
             while let Some(block) = queue.pop() {
-                seen.push((block.ptr, block.len_f128, block.lo, block.hi));
+                seen.push((
+                    block.needs_tail,
+                    block.ptr,
+                    block.len_f128,
+                    block.lo,
+                    block.hi,
+                ));
             }
             (producer.join().unwrap(), initial_head, seen)
         });
@@ -5131,10 +5220,143 @@ mod tests {
         assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
         assert_eq!(seen.len(), N);
         for (i, block) in seen.into_iter().enumerate() {
-            assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
+            assert_eq!(block, (i % 2 == 0, i, i + 1, i * 2, i * 2 + 1));
         }
         assert_eq!(queue.head.load(Ordering::Relaxed), N);
         assert_eq!(queue.tail.load(Ordering::Relaxed), N);
+    }
+
+    /// Force no, all and queue-empty tail handoffs through a real SPSC pair.
+    /// The oracle is the scalar per-layer transform, including nonzero global
+    /// twiddles in subgroup one and the zero suffix on odd rows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_tail_handoff_matches_scalar_and_fifo() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let log_d = 12;
+        let n_top = 1;
+        let sub_positions = 1usize << (log_d - n_top);
+        let ntt = AdditiveNttF128::standard(log_d);
+        for (num_ntts, odd_tail) in [(4usize, 0usize), (8, 4)] {
+            for mode in 0..3 {
+                let mut rng = Rng::new(0x7A11 + mode);
+                let mut got = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+                for row in (1..1usize << log_d).step_by(2) {
+                    got[(row + 1) * num_ntts - odd_tail..(row + 1) * num_ntts].fill(F128::ZERO);
+                }
+                let mut want = got.clone();
+                ntt.forward_transform_interleaved_scalar_from_layer(&mut want, num_ntts, n_top);
+                let queue = DeepQueue::new();
+                let deferred = AtomicUsize::new(0);
+                let callbacks = std::thread::scope(|scope| {
+                    // These mirror the production unwind guards: a failed
+                    // assertion must not strand the other side of the pair.
+                    struct ProducerDone<'a>(&'a DeepQueue);
+                    impl Drop for ProducerDone<'_> {
+                        fn drop(&mut self) {
+                            self.0.done.store(true, Ordering::Release);
+                        }
+                    }
+                    struct ConsumerGone<'a>(&'a DeepQueue);
+                    impl Drop for ConsumerGone<'_> {
+                        fn drop(&mut self) {
+                            self.0.gone.store(true, Ordering::Release);
+                        }
+                    }
+                    let _consumer = ConsumerGone(&queue);
+                    let producer = scope.spawn(|| {
+                        let _producer = ProducerDone(&queue);
+                        let ready = |range: core::ops::Range<usize>, block: &[F128]| {
+                            assert!(queue.push(
+                                DeepBlock {
+                                    needs_tail: false,
+                                    ptr: block.as_ptr() as usize,
+                                    len_f128: block.len(),
+                                    lo: range.start,
+                                    hi: range.end,
+                                },
+                                DeepQueue::DEFAULT_DEPTH,
+                            ));
+                        };
+                        let handoff = |lo: usize, ptr: *mut F128, len_f128: usize| {
+                            if mode == 0 || (mode == 2 && !queue.is_empty()) {
+                                return false;
+                            }
+                            if queue.push(
+                                DeepBlock {
+                                    needs_tail: true,
+                                    ptr: ptr as usize,
+                                    len_f128,
+                                    lo,
+                                    hi: lo + 128,
+                                },
+                                DeepQueue::DEFAULT_DEPTH,
+                            ) {
+                                deferred.fetch_add(1, Ordering::Relaxed);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        for (sub_idx, sub) in got.chunks_mut(sub_positions * num_ntts).enumerate() {
+                            ntt.deep_sub_fused_blocks_fallback(
+                                sub_idx,
+                                sub,
+                                &ready,
+                                n_top,
+                                log_d,
+                                num_ntts,
+                                odd_tail,
+                                sub_positions,
+                                0,
+                                Some(&handoff),
+                            );
+                        }
+                    });
+                    let mut seen = 0;
+                    while let Some(block) = queue.pop() {
+                        assert_eq!(block.lo, seen * 128, "FIFO parent-fold prerequisite");
+                        // SAFETY: as in the production consumer. A true tag
+                        // owns exclusive writes; a false tag owns reads only.
+                        if block.needs_tail {
+                            let values = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    block.ptr as *mut F128,
+                                    block.len_f128,
+                                )
+                            };
+                            ntt.deep_block_last_seven(
+                                block.lo / 128,
+                                values,
+                                n_top,
+                                num_ntts,
+                                odd_tail,
+                                0,
+                            );
+                        }
+                        let values = unsafe {
+                            std::slice::from_raw_parts(block.ptr as *const F128, block.len_f128)
+                        };
+                        assert_eq!(values, &want[block.lo * num_ntts..block.hi * num_ntts]);
+                        seen += 1;
+                    }
+                    producer.join().unwrap();
+                    seen
+                });
+                assert_eq!(callbacks, 32);
+                assert_eq!(
+                    got, want,
+                    "mode={mode} lanes={num_ntts} odd_tail={odd_tail}"
+                );
+                let count = deferred.load(Ordering::Relaxed);
+                match mode {
+                    0 => assert_eq!(count, 0),
+                    1 => assert_eq!(count, 32),
+                    _ => assert!(count > 0),
+                }
+            }
+        }
     }
 
     struct Rng(u64);
