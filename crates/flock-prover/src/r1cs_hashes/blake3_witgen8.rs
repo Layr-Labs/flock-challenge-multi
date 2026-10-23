@@ -517,19 +517,35 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
 unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe { tr8x16_from(ring_zmm8(stage, w)) }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn ring_zmm8(stage: *const V8, w: usize) -> [__m512i; 8] {
     unsafe {
         debug_assert!(w + STEP_WORDS <= RING_WORDS);
         debug_assert!(w.is_multiple_of(STEP_WORDS));
 
         // Each unaligned ZMM is [word 2k lanes 0..7 | word 2k+1 lanes 0..7].
-        let x0 = _mm512_loadu_si512(stage.add(w).cast::<__m512i>());
-        let x1 = _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>());
-        let x2 = _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>());
-        let x3 = _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>());
-        let x4 = _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>());
-        let x5 = _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>());
-        let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
-        let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
+        [
+            _mm512_loadu_si512(stage.add(w).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>()),
+        ]
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_from(x: [__m512i; 8]) -> [__m512i; 8] {
+    unsafe {
+        let [x0, x1, x2, x3, x4, x5, x6, x7] = x;
 
         let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
         let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
