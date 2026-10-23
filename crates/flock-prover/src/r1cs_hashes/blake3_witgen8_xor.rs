@@ -56,17 +56,77 @@ const fn known(mode: u8) -> u8 {
     }
 }
 
+const fn zeta_step(dep: [u8; 8], mask: u8, perm: [u8; 8]) -> [u8; 8] {
+    let mut out = dep;
+    let mut i = 0usize;
+    while i < 8 {
+        if mask & (1u8 << i) != 0 {
+            out[i] ^= dep[perm[i] as usize];
+        }
+        i += 1;
+    }
+    out
+}
+
+const fn zeta_dead(mode: u8) -> u8 {
+    let known_bits = known(mode);
+    let mut dep = [0u8; 8];
+    let mut j = 0u8;
+    while j < 8 {
+        if known_bits & (1u8 << j) == 0 {
+            dep[j as usize] = 1u8 << j;
+        }
+        j += 1;
+    }
+    dep = zeta_step(dep, 0x55, [1, 1, 3, 3, 5, 5, 7, 7]);
+    dep = zeta_step(dep, 0x33, [2, 3, 2, 3, 6, 7, 6, 7]);
+    dep = zeta_step(dep, 0x0f, [4, 5, 6, 7, 4, 5, 6, 7]);
+    let mut dead = 0u8;
+    let mut i = 0usize;
+    while i < 8 {
+        if dep[i] == 0 {
+            dead |= 1u8 << i;
+        }
+        i += 1;
+    }
+    dead
+}
+
+const fn conv_products(mode: u8) -> u32 {
+    let dead = zeta_dead(mode);
+    const LANES: [u8; 27] = [
+        0, 0, 1, 0, 2, 0, 1, 2, 3, 0, 4, 0, 1, 4, 5, 0, 2, 4, 6, 0, 1, 2, 3, 4, 5, 6, 7,
+    ];
+    let mut n = 0u32;
+    let mut i = 0usize;
+    while i < 27 {
+        if dead & (1u8 << LANES[i]) == 0 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+const fn use_direct(mode: u8) -> bool {
+    let direct = (8 - known(mode).count_ones()) * 8;
+    direct <= conv_products(mode)
+}
+
 #[inline(always)]
-unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine(p: __m512i, m: *const u64, mode_value: u8) -> [__m512i; 8] {
     unsafe {
         let z = _mm512_setzero_si512();
         let mut v = [z; 8];
         macro_rules! add {
             ($j:expr) => {
                 if known(mode_value) & (1 << $j) == 0 {
-                    let w = *p.add($j);
-                    let w = if mode_value == 0 { w } else { !w };
-                    let x = _mm512_set1_epi64(w as i64);
+                    let w = _mm512_permutexvar_epi64(_mm512_set1_epi64($j), p);
+                    let x = if mode_value == 0 {
+                        w
+                    } else {
+                        _mm512_xor_si512(w, _mm512_set1_epi64(-1))
+                    };
                     v[0] = _mm512_xor_si512(
                         v[0],
                         _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -139,169 +199,195 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
-unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_conv<const MODE: u8>(p: *const u64, m: *const u64) -> [__m512i; 8] {
+    // Inline const blocks capture generic parameters on stable Rust. Evaluate
+    // the structural dependency analysis here, never in the hot projection.
+    let mode_value = MODE;
+    let normalized = const {
+        let value = MODE;
+        if value >= 1 && value <= 6 {
+            value + 7
+        } else {
+            value
+        }
+    };
+    let (dead, direct) = const {
+        let value = MODE;
+        let value = if value >= 1 && value <= 6 {
+            value + 7
+        } else {
+            value
+        };
+        (zeta_dead(value), use_direct(value))
+    };
     unsafe {
-        // For sparse complement inputs keep the direct projection: <=3*8 products.
-        if known(mode_value).count_ones() >= 5 {
+        let p = _mm512_loadu_si512(p.cast());
+        // XOR convolution is equivariant under j -> j XOR 7. Reversing
+        // the input qwords turns a known low prefix into a known high
+        // suffix, where the superset transform preserves the zero lanes.
+        // Restore output group g from group g XOR 7; byte positions inside
+        // each group are unchanged. Mode 7 already costs only eight maps.
+        if (1..=6).contains(&mode_value) {
+            let reversed = _mm512_permutexvar_epi64(_mm512_set_epi64(0, 1, 2, 3, 4, 5, 6, 7), p);
+            let v = affine_conv_inner(reversed, m, normalized, dead, direct);
+            [v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]]
+        } else {
+            affine_conv_inner(p, m, normalized, dead, direct)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn affine_conv_inner(
+    p: __m512i,
+    m: *const u64,
+    mode_value: u8,
+    dead: u8,
+    direct: bool,
+) -> [__m512i; 8] {
+    unsafe {
+        if direct {
             return affine(p, m, mode_value);
         }
-        let mut x: [u64; 8] = [
-            if known(mode_value) & (1 << 0) != 0 { 0 } else if mode_value == 0 { *p.add(0) } else { !*p.add(0) },
-            if known(mode_value) & (1 << 1) != 0 { 0 } else if mode_value == 0 { *p.add(1) } else { !*p.add(1) },
-            if known(mode_value) & (1 << 2) != 0 { 0 } else if mode_value == 0 { *p.add(2) } else { !*p.add(2) },
-            if known(mode_value) & (1 << 3) != 0 { 0 } else if mode_value == 0 { *p.add(3) } else { !*p.add(3) },
-            if known(mode_value) & (1 << 4) != 0 { 0 } else if mode_value == 0 { *p.add(4) } else { !*p.add(4) },
-            if known(mode_value) & (1 << 5) != 0 { 0 } else if mode_value == 0 { *p.add(5) } else { !*p.add(5) },
-            if known(mode_value) & (1 << 6) != 0 { 0 } else if mode_value == 0 { *p.add(6) } else { !*p.add(6) },
-            if known(mode_value) & (1 << 7) != 0 { 0 } else if mode_value == 0 { *p.add(7) } else { !*p.add(7) }
-        ];
-        x[0] ^= x[1];
-        x[2] ^= x[3];
-        x[4] ^= x[5];
-        x[6] ^= x[7];
-        x[0] ^= x[2];
-        x[1] ^= x[3];
-        x[4] ^= x[6];
-        x[5] ^= x[7];
-        x[0] ^= x[4];
-        x[1] ^= x[5];
-        x[2] ^= x[6];
-        x[3] ^= x[7];
+        let mask = !known(mode_value);
+        let mut v = if mode_value == 0 {
+            p
+        } else {
+            _mm512_xor_si512(p, _mm512_set1_epi64(-1))
+        };
+        v = _mm512_maskz_mov_epi64(mask, v);
+        v = _mm512_mask_xor_epi64(
+            v,
+            0x55,
+            v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7, 7, 5, 5, 3, 3, 1, 1), v),
+        );
+        v = _mm512_mask_xor_epi64(
+            v,
+            0x33,
+            v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7, 6, 7, 6, 3, 2, 3, 2), v),
+        );
+        v = _mm512_mask_xor_epi64(
+            v,
+            0x0f,
+            v,
+            _mm512_permutexvar_epi64(_mm512_set_epi64(7, 6, 5, 4, 7, 6, 5, 4), v),
+        );
+        let x: [__m512i; 8] =
+            core::array::from_fn(|j| _mm512_permutexvar_epi64(_mm512_set1_epi64(j as i64), v));
         let mut c = [_mm512_setzero_si512(); 8];
-        c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
-            _mm512_set1_epi64(x[0] as i64),
-            _mm512_loadu_si512(m.add(64).cast()),
-        );
-        c[1] = _mm512_xor_si512(
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(72).cast()),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[1] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[2] = _mm512_xor_si512(
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(80).cast()),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[2] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[3] = _mm512_xor_si512(
-            _mm512_ternarylogic_epi64::<0x96>(
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(88).cast()),
+        if dead != 0 {
+            macro_rules! acc {
+                ($dst:literal, $lane:literal, $off:literal) => {
+                    if dead & (1u8 << $lane) == 0 {
+                        c[$dst] = _mm512_xor_si512(
+                            c[$dst],
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                x[$lane],
+                                _mm512_loadu_si512(m.add($off).cast()),
+                            ),
+                        );
+                    }
+                };
+            }
+            acc!(0, 0, 64);
+            acc!(1, 0, 72);
+            acc!(1, 1, 64);
+            acc!(2, 0, 80);
+            acc!(2, 2, 64);
+            acc!(3, 0, 88);
+            acc!(3, 1, 80);
+            acc!(3, 2, 72);
+            acc!(3, 3, 64);
+            acc!(4, 0, 96);
+            acc!(4, 4, 64);
+            acc!(5, 0, 104);
+            acc!(5, 1, 96);
+            acc!(5, 4, 72);
+            acc!(5, 5, 64);
+            acc!(6, 0, 112);
+            acc!(6, 2, 96);
+            acc!(6, 4, 80);
+            acc!(6, 6, 64);
+            acc!(7, 0, 120);
+            acc!(7, 1, 112);
+            acc!(7, 2, 104);
+            acc!(7, 3, 96);
+            acc!(7, 4, 88);
+            acc!(7, 5, 80);
+            acc!(7, 6, 72);
+            acc!(7, 7, 64);
+        } else {
+            c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(64).cast()));
+            c[1] = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(72).cast())),
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[1], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[2] = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(80).cast())),
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[2], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[3] = _mm512_xor_si512(
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(88).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[1], _mm512_loadu_si512(m.add(80).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[2], _mm512_loadu_si512(m.add(72).cast())),
                 ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[3], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[4] = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(96).cast())),
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[4], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[5] = _mm512_xor_si512(
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(104).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[1], _mm512_loadu_si512(m.add(96).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[4], _mm512_loadu_si512(m.add(72).cast())),
                 ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[5], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[6] = _mm512_xor_si512(
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[0], _mm512_loadu_si512(m.add(112).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[2], _mm512_loadu_si512(m.add(96).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[4], _mm512_loadu_si512(m.add(80).cast())),
                 ),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[3] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[4] = _mm512_xor_si512(
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(96).cast()),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[4] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[5] = _mm512_xor_si512(
-            _mm512_ternarylogic_epi64::<0x96>(
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(104).cast()),
-                ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
-                ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
-                ),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[5] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[6] = _mm512_xor_si512(
-            _mm512_ternarylogic_epi64::<0x96>(
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(112).cast()),
-                ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
-                ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
-                ),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[6] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
-        c[7] = _mm512_xor_si512(
-            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[6], _mm512_loadu_si512(m.add(64).cast())),
+            );
+            c[7] = _mm512_xor_si512(
                 _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[0] as i64),
-                            _mm512_loadu_si512(m.add(120).cast()),
+                        _mm512_ternarylogic_epi64::<0x96>(
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                x[0],
+                                _mm512_loadu_si512(m.add(120).cast()),
+                            ),
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                x[1],
+                                _mm512_loadu_si512(m.add(112).cast()),
+                            ),
+                            _mm512_gf2p8affine_epi64_epi8::<0>(
+                                x[2],
+                                _mm512_loadu_si512(m.add(104).cast()),
+                            ),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[1] as i64),
-                            _mm512_loadu_si512(m.add(112).cast()),
+                            x[3],
+                            _mm512_loadu_si512(m.add(96).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[2] as i64),
-                            _mm512_loadu_si512(m.add(104).cast()),
+                            x[4],
+                            _mm512_loadu_si512(m.add(88).cast()),
                         ),
                     ),
-                    _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[3] as i64),
-                        _mm512_loadu_si512(m.add(96).cast()),
-                    ),
-                    _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[4] as i64),
-                        _mm512_loadu_si512(m.add(88).cast()),
-                    ),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[5], _mm512_loadu_si512(m.add(80).cast())),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(x[6], _mm512_loadu_si512(m.add(72).cast())),
                 ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[5] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
-                ),
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[6] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
-                ),
-            ),
-            _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[7] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
-            ),
-        );
+                _mm512_gf2p8affine_epi64_epi8::<0>(x[7], _mm512_loadu_si512(m.add(64).cast())),
+            );
+        }
         c[0] = _mm512_xor_si512(c[0], c[1]);
         c[2] = _mm512_xor_si512(c[2], c[3]);
         c[4] = _mm512_xor_si512(c[4], c[5]);
@@ -398,18 +484,31 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
 // weights remain selected by the caller's matrix-bank pointer.
 #[inline(never)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool>(
-    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    ap: *const u64,
+    bp: *const u64,
+    ma: *const u64,
+    mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
     unsafe {
-        let av = affine_conv(ap, ma, 0);
-        let bv = affine_conv(bp, mb, MODE);
+        let av = affine_conv::<0>(ap, ma);
+        let bv = affine_conv::<MODE>(bp, mb);
         for i in 0..8 {
-            let value = if MODE == 15 { av[i] } else {
+            let value = if MODE == 15 {
+                av[i]
+            } else {
                 let value = _mm512_gf2p8mul_epi8(av[i], bv[i]);
-                if MODE == 0 { value } else { _mm512_xor_si512(value, av[i]) }
+                if MODE == 0 {
+                    value
+                } else {
+                    _mm512_xor_si512(value, av[i])
+                }
             };
-            acc[i] = if FIRST { value } else { _mm512_xor_si512(acc[i], value) };
+            acc[i] = if FIRST {
+                value
+            } else {
+                _mm512_xor_si512(acc[i], value)
+            };
         }
     }
 }
@@ -427,24 +526,120 @@ unsafe fn project_const<const BLK: usize>(
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         match mode(BLK, 7) {
-0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-1 => row_product::<1, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-2 => row_product::<2, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-3 => row_product::<3, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-4 => row_product::<4, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-5 => row_product::<5, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-6 => row_product::<6, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-7 => row_product::<7, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-8 => row_product::<8, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-9 => row_product::<9, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-10 => row_product::<10, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-11 => row_product::<11, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-12 => row_product::<12, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-13 => row_product::<13, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-14 => row_product::<14, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-15 => row_product::<15, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, true>(
+                ap.as_ptr().add(7 * 8),
+                bp.as_ptr().add(7 * 8),
+                m.add(7 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -453,24 +648,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(1, a[1], b[1]);
         match mode(BLK, 6) {
-0 => row_product::<0, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(6 * 8),
+                bp.as_ptr().add(6 * 8),
+                m.add(6 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -479,24 +770,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(2, a[2], b[2]);
         match mode(BLK, 5) {
-0 => row_product::<0, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(5 * 8),
+                bp.as_ptr().add(5 * 8),
+                m.add(5 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -505,24 +892,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(3, a[3], b[3]);
         match mode(BLK, 4) {
-0 => row_product::<0, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(4 * 8),
+                bp.as_ptr().add(4 * 8),
+                m.add(4 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -531,24 +1014,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(4, a[4], b[4]);
         match mode(BLK, 3) {
-0 => row_product::<0, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(3 * 8),
+                bp.as_ptr().add(3 * 8),
+                m.add(3 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -557,24 +1136,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(5, a[5], b[5]);
         match mode(BLK, 2) {
-0 => row_product::<0, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(2 * 8),
+                bp.as_ptr().add(2 * 8),
+                m.add(2 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -583,24 +1258,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(6, a[6], b[6]);
         match mode(BLK, 1) {
-0 => row_product::<0, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(1 * 8),
+                bp.as_ptr().add(1 * 8),
+                m.add(1 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
@@ -609,24 +1380,120 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(7, a[7], b[7]);
         match mode(BLK, 0) {
-0 => row_product::<0, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-1 => row_product::<1, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-2 => row_product::<2, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-3 => row_product::<3, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-4 => row_product::<4, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-5 => row_product::<5, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-6 => row_product::<6, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-7 => row_product::<7, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-8 => row_product::<8, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-9 => row_product::<9, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-10 => row_product::<10, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-11 => row_product::<11, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-12 => row_product::<12, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-13 => row_product::<13, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-14 => row_product::<14, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-15 => row_product::<15, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
-_ => unreachable!(),
-}
+            0 => row_product::<0, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            1 => row_product::<1, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            2 => row_product::<2, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            3 => row_product::<3, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            4 => row_product::<4, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            5 => row_product::<5, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            6 => row_product::<6, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            7 => row_product::<7, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            8 => row_product::<8, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            9 => row_product::<9, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            10 => row_product::<10, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            11 => row_product::<11, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            12 => row_product::<12, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            13 => row_product::<13, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            14 => row_product::<14, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            15 => row_product::<15, false>(
+                ap.as_ptr().add(0 * 8),
+                bp.as_ptr().add(0 * 8),
+                m.add(0 * 128),
+                m,
+                &mut acc,
+            ),
+            _ => unreachable!(),
+        }
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
