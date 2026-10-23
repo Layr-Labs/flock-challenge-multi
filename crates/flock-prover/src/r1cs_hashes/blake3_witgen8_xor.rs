@@ -6,14 +6,14 @@
 use super::*;
 use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
 #[repr(align(64))]
-pub(super) struct Tables([u64; 8 * 128]);
+pub(super) struct Tables([u64; 1088]);
 impl Tables {
     pub(super) fn new(table: &InvNttTableByteSingleGf8) -> Self {
         assert_eq!(table.ell, 64);
         // Bank k absorbs the Horner weight 2^k into the linear A map.
         // GF(256) multiplication distributes over both the byte map and XOR
         // convolution. B keeps bank zero; products then accumulate by XOR.
-        let mut m = [0u64; 8 * 128];
+        let mut m = [0u64; 1088];
         for k in 0..8 {
             let bank = &mut m[k * 128..(k + 1) * 128];
             for i in 0..64 {
@@ -39,6 +39,16 @@ impl Tables {
                 }
             }
         }
+        // Partial B maps: equal transformed-input masks share one affine map.
+        // These matrices depend only on the inverse-NTT table, not witness data.
+        for lane in 0..8 { m[1024 + lane] = m[64 + lane] ^ m[96 + lane]; }
+        for lane in 0..8 { m[1032 + lane] = m[72 + lane] ^ m[104 + lane]; }
+        for lane in 0..8 { m[1040 + lane] = m[80 + lane] ^ m[112 + lane]; }
+        for lane in 0..8 { m[1048 + lane] = m[88 + lane] ^ m[120 + lane]; }
+        for lane in 0..8 { m[1056 + lane] = m[64 + lane] ^ m[80 + lane]; }
+        for lane in 0..8 { m[1064 + lane] = m[72 + lane] ^ m[88 + lane]; }
+        for lane in 0..8 { m[1072 + lane] = m[64 + lane] ^ m[80 + lane] ^ m[96 + lane] ^ m[112 + lane]; }
+        for lane in 0..8 { m[1080 + lane] = m[72 + lane] ^ m[88 + lane] ^ m[104 + lane] ^ m[120 + lane]; }
         Self(m)
     }
 }
@@ -317,6 +327,159 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
     }
 }
 
+// Partial-input convolution, generated from the superset algebra.
+// Complement is applied only to active inputs exactly as in affine_conv.
+#[inline(always)]
+unsafe fn affine_partial(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+    unsafe {
+        let mut c = [_mm512_setzero_si512(); 8];
+        match mode_value {
+            4 => {
+                let x128 = _mm512_set1_epi64((!(*p.add(7))) as i64);
+                let x160 = _mm512_set1_epi64((!(*p.add(5)) ^ !(*p.add(7))) as i64);
+                let x192 = _mm512_set1_epi64((!(*p.add(6)) ^ !(*p.add(7))) as i64);
+                let x240 = _mm512_set1_epi64((!(*p.add(4)) ^ !(*p.add(5)) ^ !(*p.add(6)) ^ !(*p.add(7))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(1024).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(1032).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(1024).cast())));
+                c[6] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(1040).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1024).cast())));
+                c[7] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x240, _mm512_loadu_si512(m.add(1048).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(1040).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1032).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(1024).cast())));
+            }
+            5 => {
+                let x128 = _mm512_set1_epi64((!(*p.add(7))) as i64);
+                let x160 = _mm512_set1_epi64((!(*p.add(5)) ^ !(*p.add(7))) as i64);
+                let x192 = _mm512_set1_epi64((!(*p.add(6)) ^ !(*p.add(7))) as i64);
+                let x224 = _mm512_set1_epi64((!(*p.add(5)) ^ !(*p.add(6)) ^ !(*p.add(7))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(1024).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(1032).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(1024).cast())));
+                c[6] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(1040).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1024).cast())));
+                c[7] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x224, _mm512_loadu_si512(m.add(1048).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x160, _mm512_loadu_si512(m.add(1040).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1032).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(1024).cast())));
+            }
+            6 => {
+                let x128 = _mm512_set1_epi64((!(*p.add(7))) as i64);
+                let x192 = _mm512_set1_epi64((!(*p.add(6)) ^ !(*p.add(7))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1056).cast()));
+                c[3] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1064).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(1056).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1024).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1032).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(1024).cast())));
+                c[6] = _mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1072).cast()));
+                c[7] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x192, _mm512_loadu_si512(m.add(1080).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x128, _mm512_loadu_si512(m.add(1072).cast())));
+            }
+            8 => {
+                let x8 = _mm512_set1_epi64((!(*p.add(3))) as i64);
+                let x32 = _mm512_set1_epi64((!(*p.add(5))) as i64);
+                let x42 = _mm512_set1_epi64((!(*p.add(1)) ^ !(*p.add(3)) ^ !(*p.add(5))) as i64);
+                let x64 = _mm512_set1_epi64((!(*p.add(6))) as i64);
+                let x76 = _mm512_set1_epi64((!(*p.add(2)) ^ !(*p.add(3)) ^ !(*p.add(6))) as i64);
+                let x112 = _mm512_set1_epi64((!(*p.add(4)) ^ !(*p.add(5)) ^ !(*p.add(6))) as i64);
+                let x127 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1)) ^ !(*p.add(2)) ^ !(*p.add(3)) ^ !(*p.add(4)) ^ !(*p.add(5)) ^ !(*p.add(6))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x76, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x76, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x112, _mm512_loadu_si512(m.add(64).cast())));
+                c[5] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x112, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x32, _mm512_loadu_si512(m.add(64).cast())));
+                c[6] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x76, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x112, _mm512_loadu_si512(m.add(80).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x64, _mm512_loadu_si512(m.add(64).cast())));
+                c[7] = _mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x127, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x76, _mm512_loadu_si512(m.add(104).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x112, _mm512_loadu_si512(m.add(88).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x32, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x64, _mm512_loadu_si512(m.add(72).cast())));
+            }
+            9 => {
+                let x8 = _mm512_set1_epi64((!(*p.add(3))) as i64);
+                let x12 = _mm512_set1_epi64((!(*p.add(2)) ^ !(*p.add(3))) as i64);
+                let x32 = _mm512_set1_epi64((!(*p.add(5))) as i64);
+                let x42 = _mm512_set1_epi64((!(*p.add(1)) ^ !(*p.add(3)) ^ !(*p.add(5))) as i64);
+                let x48 = _mm512_set1_epi64((!(*p.add(4)) ^ !(*p.add(5))) as i64);
+                let x63 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1)) ^ !(*p.add(2)) ^ !(*p.add(3)) ^ !(*p.add(4)) ^ !(*p.add(5))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x48, _mm512_loadu_si512(m.add(64).cast())));
+                c[5] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x48, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x32, _mm512_loadu_si512(m.add(64).cast())));
+                c[6] = _mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x48, _mm512_loadu_si512(m.add(80).cast())));
+                c[7] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x63, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x42, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(104).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x48, _mm512_loadu_si512(m.add(88).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x32, _mm512_loadu_si512(m.add(80).cast())));
+            }
+            10 => {
+                let x8 = _mm512_set1_epi64((!(*p.add(3))) as i64);
+                let x10 = _mm512_set1_epi64((!(*p.add(1)) ^ !(*p.add(3))) as i64);
+                let x12 = _mm512_set1_epi64((!(*p.add(2)) ^ !(*p.add(3))) as i64);
+                let x16 = _mm512_set1_epi64((!(*p.add(4))) as i64);
+                let x31 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1)) ^ !(*p.add(2)) ^ !(*p.add(3)) ^ !(*p.add(4))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x16, _mm512_loadu_si512(m.add(64).cast())));
+                c[5] = _mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x16, _mm512_loadu_si512(m.add(72).cast())));
+                c[6] = _mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x16, _mm512_loadu_si512(m.add(80).cast())));
+                c[7] = _mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x31, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(104).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(96).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x16, _mm512_loadu_si512(m.add(88).cast())));
+            }
+            11 => {
+                let x8 = _mm512_set1_epi64((!(*p.add(3))) as i64);
+                let x10 = _mm512_set1_epi64((!(*p.add(1)) ^ !(*p.add(3))) as i64);
+                let x12 = _mm512_set1_epi64((!(*p.add(2)) ^ !(*p.add(3))) as i64);
+                let x15 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1)) ^ !(*p.add(2)) ^ !(*p.add(3))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(72).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(64).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(96).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(96).cast())));
+                c[6] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(96).cast())));
+                c[7] = _mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x15, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x10, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x12, _mm512_loadu_si512(m.add(104).cast()))), _mm512_gf2p8affine_epi64_epi8::<0>(x8, _mm512_loadu_si512(m.add(96).cast())));
+            }
+            12 => {
+                let x2 = _mm512_set1_epi64((!(*p.add(1))) as i64);
+                let x4 = _mm512_set1_epi64((!(*p.add(2))) as i64);
+                let x7 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1)) ^ !(*p.add(2))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x4, _mm512_loadu_si512(m.add(64).cast())));
+                c[3] = _mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(80).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x4, _mm512_loadu_si512(m.add(72).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(96).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(96).cast())));
+                c[6] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x4, _mm512_loadu_si512(m.add(96).cast())));
+                c[7] = _mm512_ternarylogic_epi64::<0x96>(_mm512_gf2p8affine_epi64_epi8::<0>(x7, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(112).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x4, _mm512_loadu_si512(m.add(104).cast())));
+            }
+            13 => {
+                let x2 = _mm512_set1_epi64((!(*p.add(1))) as i64);
+                let x3 = _mm512_set1_epi64((!(*p.add(0)) ^ !(*p.add(1))) as i64);
+                c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(64).cast()));
+                c[1] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(72).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(64).cast())));
+                c[2] = _mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(80).cast()));
+                c[3] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(88).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(80).cast())));
+                c[4] = _mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(96).cast()));
+                c[5] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(104).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(96).cast())));
+                c[6] = _mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(112).cast()));
+                c[7] = _mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x3, _mm512_loadu_si512(m.add(120).cast())), _mm512_gf2p8affine_epi64_epi8::<0>(x2, _mm512_loadu_si512(m.add(112).cast())));
+            }
+            _ => return affine_conv(p, m, mode_value),
+        }
+        // Invert the superset transform (self-inverse over characteristic two).
+        c[0] = _mm512_xor_si512(c[0], c[1]);
+        c[2] = _mm512_xor_si512(c[2], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[5]);
+        c[6] = _mm512_xor_si512(c[6], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[2]);
+        c[1] = _mm512_xor_si512(c[1], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[6]);
+        c[5] = _mm512_xor_si512(c[5], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[4]);
+        c[1] = _mm512_xor_si512(c[1], c[5]);
+        c[2] = _mm512_xor_si512(c[2], c[6]);
+        c[3] = _mm512_xor_si512(c[3], c[7]);
+        c
+    }
+}
+
 #[inline(always)]
 unsafe fn trq(x: [__m512i; 8]) -> [__m512i; 8] {
     unsafe {
@@ -408,7 +571,7 @@ unsafe fn project_const<const BLK: usize>(
         rows.publish_dense_values(0, a[0], b[0]);
         {
             let av = affine_conv(ap.as_ptr().add(56), m.add(7 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7));
+            let bv = affine_partial(bp.as_ptr().add(56), m, mode(BLK, 7));
             let v = if mode(BLK, 7) == 15 {
                 av[0]
             } else {
@@ -507,7 +670,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(1, a[1], b[1]);
         {
             let av = affine_conv(ap.as_ptr().add(48), m.add(6 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6));
+            let bv = affine_partial(bp.as_ptr().add(48), m, mode(BLK, 6));
             let v = if mode(BLK, 6) == 15 {
                 av[0]
             } else {
@@ -606,7 +769,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(2, a[2], b[2]);
         {
             let av = affine_conv(ap.as_ptr().add(40), m.add(5 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5));
+            let bv = affine_partial(bp.as_ptr().add(40), m, mode(BLK, 5));
             let v = if mode(BLK, 5) == 15 {
                 av[0]
             } else {
@@ -705,7 +868,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(3, a[3], b[3]);
         {
             let av = affine_conv(ap.as_ptr().add(32), m.add(4 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4));
+            let bv = affine_partial(bp.as_ptr().add(32), m, mode(BLK, 4));
             let v = if mode(BLK, 4) == 15 {
                 av[0]
             } else {
@@ -804,7 +967,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(4, a[4], b[4]);
         {
             let av = affine_conv(ap.as_ptr().add(24), m.add(3 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3));
+            let bv = affine_partial(bp.as_ptr().add(24), m, mode(BLK, 3));
             let v = if mode(BLK, 3) == 15 {
                 av[0]
             } else {
@@ -903,7 +1066,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(5, a[5], b[5]);
         {
             let av = affine_conv(ap.as_ptr().add(16), m.add(2 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2));
+            let bv = affine_partial(bp.as_ptr().add(16), m, mode(BLK, 2));
             let v = if mode(BLK, 2) == 15 {
                 av[0]
             } else {
@@ -1002,7 +1165,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(6, a[6], b[6]);
         {
             let av = affine_conv(ap.as_ptr().add(8), m.add(1 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1));
+            let bv = affine_partial(bp.as_ptr().add(8), m, mode(BLK, 1));
             let v = if mode(BLK, 1) == 15 {
                 av[0]
             } else {
@@ -1101,7 +1264,7 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         rows.publish_dense_values(7, a[7], b[7]);
         {
             let av = affine_conv(ap.as_ptr().add(0), m.add(0 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0));
+            let bv = affine_partial(bp.as_ptr().add(0), m, mode(BLK, 0));
             let v = if mode(BLK, 0) == 15 {
                 av[0]
             } else {
