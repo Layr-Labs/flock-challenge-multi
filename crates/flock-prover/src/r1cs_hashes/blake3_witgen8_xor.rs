@@ -2,7 +2,10 @@
 //! Over characteristic two, the substitution epsilon=x+1 has epsilon^2=0.
 //! Superset XOR transforms turn eight-term XOR convolution into 27 bilinear
 //! GFNI products. Eight matrix banks absorb the Horner weights into A,
-//! eliminating accumulator field multiplies. Setup is once per shared invocation.
+//! eliminating accumulator field multiplies. Complemented B's affine offset is
+//! injected before the inverse superset transform only for the seed row;
+//! later accumulation rows retain ternary-fused correction.
+//! Setup is once per shared invocation.
 use super::*;
 use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
 #[repr(align(64))]
@@ -56,8 +59,21 @@ const fn known(mode: u8) -> u8 {
     }
 }
 
+// GFNI's immediate XOR is the constant field element one in every byte.
+// Every call site specializes `add_one` from the ranked block/window mode.
 #[inline(always)]
-unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_offset(x: __m512i, matrix: __m512i, add_one: bool) -> __m512i {
+    unsafe {
+        if add_one {
+            _mm512_gf2p8affine_epi64_epi8::<1>(x, matrix)
+        } else {
+            _mm512_gf2p8affine_epi64_epi8::<0>(x, matrix)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8, offset: bool) -> [__m512i; 8] {
     unsafe {
         let z = _mm512_setzero_si512();
         let mut v = [z; 8];
@@ -69,58 +85,66 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
                     let x = _mm512_set1_epi64(w as i64);
                     v[0] = _mm512_xor_si512(
                         v[0],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 0) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[1] = _mm512_xor_si512(
                         v[1],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 1) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[2] = _mm512_xor_si512(
                         v[2],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 2) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[3] = _mm512_xor_si512(
                         v[3],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 3) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[4] = _mm512_xor_si512(
                         v[4],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 4) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[5] = _mm512_xor_si512(
                         v[5],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 5) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[6] = _mm512_xor_si512(
                         v[6],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 6) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                     v[7] = _mm512_xor_si512(
                         v[7],
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             x,
                             _mm512_loadu_si512(m.add(($j ^ 7) * 8).cast()),
+                            offset && mode_value != 0 && $j == if mode_value <= 7 { 7 } else { 0 },
                         ),
                     );
                 }
@@ -139,11 +163,11 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
-unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8, offset: bool) -> [__m512i; 8] {
     unsafe {
         // For sparse complement inputs keep the direct projection: <=3*8 products.
         if known(mode_value).count_ones() >= 5 {
-            return affine(p, m, mode_value);
+            return affine(p, m, mode_value, offset);
         }
         let mut x: [u64; 8] = core::array::from_fn(|j| {
             if known(mode_value) & (1 << j) != 0 {
@@ -265,9 +289,10 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                        affine_offset(
                             _mm512_set1_epi64(x[0] as i64),
                             _mm512_loadu_si512(m.add(120).cast()),
+                            offset && mode_value != 0,
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[1] as i64),
@@ -296,6 +321,9 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
+            // c[7] participates once in every output of the inverse
+            // superset transform. Adding one here turns all eight Bbar
+            // projections into Bbar+1 without eight post-product XORs.
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[7] as i64),
                 _mm512_loadu_si512(m.add(64).cast()),
@@ -407,94 +435,54 @@ unsafe fn project_const<const BLK: usize>(
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         {
-            let av = affine_conv(ap.as_ptr().add(56), m.add(7 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7));
+            let av = affine_conv(ap.as_ptr().add(56), m.add(7 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(56), m, mode(BLK, 7), true);
             let v = if mode(BLK, 7) == 15 {
                 av[0]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[0])
-                }
+                _mm512_gf2p8mul_epi8(av[0], bv[0])
             };
             acc[0] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[1]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[1])
-                }
+                _mm512_gf2p8mul_epi8(av[1], bv[1])
             };
             acc[1] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[2]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[2])
-                }
+                _mm512_gf2p8mul_epi8(av[2], bv[2])
             };
             acc[2] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[3]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[3])
-                }
+                _mm512_gf2p8mul_epi8(av[3], bv[3])
             };
             acc[3] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[4]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[4])
-                }
+                _mm512_gf2p8mul_epi8(av[4], bv[4])
             };
             acc[4] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[5]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[5])
-                }
+                _mm512_gf2p8mul_epi8(av[5], bv[5])
             };
             acc[5] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[6]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[6])
-                }
+                _mm512_gf2p8mul_epi8(av[6], bv[6])
             };
             acc[6] = v;
             let v = if mode(BLK, 7) == 15 {
                 av[7]
             } else {
-                let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 7) == 0 {
-                    p
-                } else {
-                    _mm512_xor_si512(p, av[7])
-                }
+                _mm512_gf2p8mul_epi8(av[7], bv[7])
             };
             acc[7] = v;
         }
@@ -506,16 +494,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(1, a[1], b[1]);
         {
-            let av = affine_conv(ap.as_ptr().add(48), m.add(6 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6));
+            let av = affine_conv(ap.as_ptr().add(48), m.add(6 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(48), m, mode(BLK, 6), false);
             let v = if mode(BLK, 6) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -523,10 +511,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -534,10 +522,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -545,10 +533,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -556,10 +544,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -567,10 +555,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -578,10 +566,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -589,10 +577,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 6) == 0 {
-                    p
-                } else {
+                if mode(BLK, 6) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -605,16 +593,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(2, a[2], b[2]);
         {
-            let av = affine_conv(ap.as_ptr().add(40), m.add(5 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5));
+            let av = affine_conv(ap.as_ptr().add(40), m.add(5 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(40), m, mode(BLK, 5), false);
             let v = if mode(BLK, 5) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -622,10 +610,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -633,10 +621,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -644,10 +632,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -655,10 +643,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -666,10 +654,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -677,10 +665,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -688,10 +676,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 5) == 0 {
-                    p
-                } else {
+                if mode(BLK, 5) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -704,16 +692,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(3, a[3], b[3]);
         {
-            let av = affine_conv(ap.as_ptr().add(32), m.add(4 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4));
+            let av = affine_conv(ap.as_ptr().add(32), m.add(4 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(32), m, mode(BLK, 4), false);
             let v = if mode(BLK, 4) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -721,10 +709,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -732,10 +720,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -743,10 +731,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -754,10 +742,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -765,10 +753,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -776,10 +764,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -787,10 +775,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 4) == 0 {
-                    p
-                } else {
+                if mode(BLK, 4) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -803,16 +791,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(4, a[4], b[4]);
         {
-            let av = affine_conv(ap.as_ptr().add(24), m.add(3 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3));
+            let av = affine_conv(ap.as_ptr().add(24), m.add(3 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(24), m, mode(BLK, 3), false);
             let v = if mode(BLK, 3) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -820,10 +808,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -831,10 +819,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -842,10 +830,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -853,10 +841,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -864,10 +852,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -875,10 +863,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -886,10 +874,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 3) == 0 {
-                    p
-                } else {
+                if mode(BLK, 3) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -902,16 +890,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(5, a[5], b[5]);
         {
-            let av = affine_conv(ap.as_ptr().add(16), m.add(2 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2));
+            let av = affine_conv(ap.as_ptr().add(16), m.add(2 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(16), m, mode(BLK, 2), false);
             let v = if mode(BLK, 2) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -919,10 +907,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -930,10 +918,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -941,10 +929,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -952,10 +940,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -963,10 +951,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -974,10 +962,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -985,10 +973,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 2) == 0 {
-                    p
-                } else {
+                if mode(BLK, 2) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -1001,16 +989,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(6, a[6], b[6]);
         {
-            let av = affine_conv(ap.as_ptr().add(8), m.add(1 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1));
+            let av = affine_conv(ap.as_ptr().add(8), m.add(1 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(8), m, mode(BLK, 1), false);
             let v = if mode(BLK, 1) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -1018,10 +1006,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -1029,10 +1017,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -1040,10 +1028,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -1051,10 +1039,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -1062,10 +1050,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -1073,10 +1061,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -1084,10 +1072,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 1) == 0 {
-                    p
-                } else {
+                if mode(BLK, 1) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -1100,16 +1088,16 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 
         rows.publish_dense_values(7, a[7], b[7]);
         {
-            let av = affine_conv(ap.as_ptr().add(0), m.add(0 * 128), 0);
-            let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0));
+            let av = affine_conv(ap.as_ptr().add(0), m.add(0 * 128), 0, false);
+            let bv = affine_conv(bp.as_ptr().add(0), m, mode(BLK, 0), false);
             let v = if mode(BLK, 0) == 15 {
                 av[0]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[0], bv[0]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[0])
+                } else {
+                    p
                 }
             };
             acc[0] = _mm512_xor_si512(acc[0], v);
@@ -1117,10 +1105,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[1]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[1], bv[1]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[1])
+                } else {
+                    p
                 }
             };
             acc[1] = _mm512_xor_si512(acc[1], v);
@@ -1128,10 +1116,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[2]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[2], bv[2]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[2])
+                } else {
+                    p
                 }
             };
             acc[2] = _mm512_xor_si512(acc[2], v);
@@ -1139,10 +1127,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[3]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[3], bv[3]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[3])
+                } else {
+                    p
                 }
             };
             acc[3] = _mm512_xor_si512(acc[3], v);
@@ -1150,10 +1138,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[4]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[4], bv[4]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[4])
+                } else {
+                    p
                 }
             };
             acc[4] = _mm512_xor_si512(acc[4], v);
@@ -1161,10 +1149,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[5]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[5], bv[5]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[5])
+                } else {
+                    p
                 }
             };
             acc[5] = _mm512_xor_si512(acc[5], v);
@@ -1172,10 +1160,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[6]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[6], bv[6]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[6])
+                } else {
+                    p
                 }
             };
             acc[6] = _mm512_xor_si512(acc[6], v);
@@ -1183,10 +1171,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
                 av[7]
             } else {
                 let p = _mm512_gf2p8mul_epi8(av[7], bv[7]);
-                if mode(BLK, 0) == 0 {
-                    p
-                } else {
+                if mode(BLK, 0) != 0 {
                     _mm512_xor_si512(p, av[7])
+                } else {
+                    p
                 }
             };
             acc[7] = _mm512_xor_si512(acc[7], v);
@@ -1315,6 +1303,48 @@ mod tests {
     struct Buf([u8; 8 * BYTES_PER_BLOCK]);
     #[repr(align(32))]
     struct Ring([[u32; 8]; 32]);
+    #[test]
+    fn affine_offsets_all_complement_modes_match_direct_map() {
+        unsafe {
+            let ns = AdditiveNttGf8::new(6, F8::ZERO);
+            let nl = AdditiveNttGf8::new(6, F8(64));
+            let table = InvNttTableByteSingleGf8::new(&ns, &nl);
+            let tables = Tables::new(&table);
+            let mut seed = 0xd213ef8ab10945u64;
+            for _case in 0..32 {
+                let p: [u64; 8] = core::array::from_fn(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                });
+                for mode_value in 0..15 {
+                    let input: [u64; 8] = core::array::from_fn(|j| {
+                        if known(mode_value) & (1 << j) != 0 {
+                            0
+                        } else if mode_value == 0 {
+                            p[j]
+                        } else {
+                            !p[j]
+                        }
+                    });
+                    let actual = affine_conv(p.as_ptr(), tables.0.as_ptr(), mode_value, true);
+                    let reference = affine(input.as_ptr(), tables.0.as_ptr(), 0, false);
+                    for i in 0..8 {
+                        let want = if mode_value == 0 {
+                            reference[i]
+                        } else {
+                            _mm512_xor_si512(reference[i], _mm512_set1_epi8(1))
+                        };
+                        let got: [u8; 64] = core::mem::transmute(actual[i]);
+                        let want: [u8; 64] = core::mem::transmute(want);
+                        assert_eq!(got, want, "mode={mode_value} output={i}");
+                    }
+                }
+            }
+            println!("PASS 480 complete affine-map mode cases (245760 output bytes)");
+        }
+    }
     #[test]
     fn ranked_inverse_table_is_dense_not_two_sparse() {
         let ns = AdditiveNttGf8::new(6, F8::ZERO);
