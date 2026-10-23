@@ -5654,7 +5654,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     deferred: Option<(&[F128], F128)>,
     ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, KaratsubaGhashX4 as WideGhashX4};
     use core::arch::x86_64::*;
 
     let len = fc.len();
@@ -17669,3 +17669,121 @@ mod tests {
 // draw marker 2
 
 // draw marker 3
+
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod kara115_tests {
+    use super::*;
+    use core::arch::x86_64::*;
+    // Independent bit-serial GHASH polynomial oracle, not production MUL.
+    fn mul(a: F128, b: F128) -> F128 {
+        let mut a = (a.hi as u128) << 64 | a.lo as u128;
+        let mut b = (b.hi as u128) << 64 | b.lo as u128;
+        let mut y = 0u128;
+        for _ in 0..128 {
+            if b & 1 != 0 { y ^= a; }
+            let carry = a >> 127;
+            a <<= 1;
+            if carry != 0 { a ^= 0x87; }
+            b >>= 1;
+        }
+        F128::new(y as u64, (y >> 64) as u64)
+    }
+    fn next(s: &mut u64) -> F128 {
+        *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17;
+        let lo = *s;
+        *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17;
+        F128::new(lo, *s)
+    }
+    fn msg(f: &[F128], b: &[F128]) -> (F128, F128, F128) {
+        let (mut a, mut s, mut y) = (F128::ZERO, F128::ZERO, F128::ZERO);
+        for k in (0..f.len()).step_by(2) {
+            a += mul(f[k], b[k]);
+            s += mul(f[k]+f[k+1], b[k]+b[k+1]);
+            y += mul(f[k], b[k]) + mul(f[k+1], b[k+1]);
+        }
+        (a,s,y)
+    }
+    #[test]
+    fn kara115_statistics() {
+        let mut seed = 0x114f00dabc123;
+        let mut cases = 0;
+        for n in (0..=40).step_by(2).chain([64,126,128,130,1024,4096]) {
+            for offset in 0..4 {
+                for pattern in 0..5 {
+                    let mut f: Vec<_> = (0..n+offset).map(|_|next(&mut seed)).collect();
+                    let mut b: Vec<_> = (0..n+offset).map(|_|next(&mut seed)).collect();
+                    for i in 0..n {
+                        match pattern {
+                            1 if i%2 == 0 => f[offset+i]=F128::ZERO,
+                            2 if i%2 == 1 => b[offset+i]=F128::ZERO,
+                            3 => f[offset+i]=F128::ONE,
+                            4 => b[offset+i]=f[offset+i],
+                            _ => ()
+                        }
+                    }
+                    let f=&f[offset..];let b=&b[offset..];
+                    let want=msg(f,b);
+                    assert_eq!(unsafe{msg_reduce_avx512(f,b)}, (want.0,want.1));
+                    assert_eq!(unsafe{msg_reduce_eval_avx512(f,b)}, want);
+                    let w: Vec<_> = (0..n/2).map(|_|next(&mut seed)).collect();
+                    let (mut a,mut s)=(F128::ZERO,F128::ZERO);
+                    for j in 0..n/2 { a+=mul(f[2*j],w[j]); s+=mul(f[2*j]+f[2*j+1],w[j]); }
+                    assert_eq!(unsafe{factorized_eq_round0_avx512(f,&w)},(a,s));
+                    cases+=1;
+                }
+            }
+        }
+        println!("KARA115 statistics={cases} three kernels; bit-serial oracle");
+        assert_eq!(cases,540);
+    }
+    #[test]
+    fn kara115_fold_corrections() {
+        let mut seed=0xc011ec7148;
+        let mut cases=0;
+        for n in [2,6,8,10,14,16,18,64,130,2048] {
+            for base in [0,1,4,17] {
+                for offset in [0,1,2,3] {
+                    for mode in 0..6 {
+                        let total=2*(base+n);
+                        let f:Vec<_>=(0..total).map(|_|next(&mut seed)).collect();
+                        let b:Vec<_>=(0..total).map(|_|next(&mut seed)).collect();
+                        let basis:Vec<_>=(0..total).map(|_|next(&mut seed)).collect();
+                        let eq:Vec<_>=(0..n).map(|_|next(&mut seed)).collect();
+                        let r=match mode {0=>F128::ZERO,1=>F128::ONE,_=>next(&mut seed)};
+                        let alpha=if mode==3 {F128::ONE} else {next(&mut seed)};
+                        let scale=next(&mut seed);
+                        let deferred=if mode>=2 && mode!=4 {Some((basis.as_slice(),alpha))} else {None};
+                        let ood=if mode>=4 {Some((eq.as_slice(),scale))} else {None};
+                        let mut want_f=vec![F128::ZERO;n];let mut want_b=want_f.clone();
+                        for t in 0..n {
+                            let k=2*(base+t);
+                            want_f[t]=f[k]+mul(f[k]+f[k+1],r);
+                            want_b[t]=b[k]+mul(b[k]+b[k+1],r);
+                            if let Some((d,a))=deferred {want_b[t]+=mul(d[k]+mul(d[k]+d[k+1],r),a);}
+                            if let Some((e,s))=ood {want_b[t]+=mul(e[t],s);}
+                        }
+                        let expected=msg(&want_f,&want_b);
+                        for stream in [false,true] {
+                            // Prefix/suffix guards, including NT destinations not 64B aligned.
+                            let guard=F128::new(0x114,0x148);
+                            let mut fc=vec![guard;n+offset+4];let mut bc=fc.clone();
+                            let (rx,rx64)=unsafe{let x=_mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64,r.lo as i64));(x,crate::field::gf2_128::x86_64::ghash_shift64_x4(x))};
+                            let got=unsafe{
+                                if mode<2 {fold_and_msg_chunk_x86::<false>(&f,&b,base,&mut fc[offset..offset+n],&mut bc[offset..offset+n],r,rx,rx64,stream,None,None)}
+                                else {fold_and_msg_chunk_x86::<true>(&f,&b,base,&mut fc[offset..offset+n],&mut bc[offset..offset+n],r,rx,rx64,stream,deferred,ood)}
+                            };
+                            assert_eq!(&fc[offset..offset+n],want_f.as_slice(),"n={n} mode={mode}");
+                            assert_eq!(&bc[offset..offset+n],want_b.as_slice(),"n={n} mode={mode}");
+                            assert_eq!(got,(expected.0,expected.1),"n={n} mode={mode}");
+                            for v in [&fc,&bc] {assert!(v[..offset].iter().chain(v[offset+n..].iter()).all(|&x|x==guard));}
+                            cases+=1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("KARA115 fold={cases} bit-serial oracle; corrections/stream/offset/tails/guards");
+        assert_eq!(cases,1920);
+    }
+}

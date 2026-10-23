@@ -576,6 +576,57 @@ unsafe fn xor4_lanes(v: __m512i) -> __m128i {
     _mm_xor_si128(_mm_xor_si128(l0, l1), _mm_xor_si128(l2, l3))
 }
 
+/// Deferred Karatsuba accumulator for long dot products. The middle register
+/// stores sum((x.lo ^ x.hi) * (y.lo ^ y.hi)), not the conventional cross limb.
+/// Recover the cross limb only once, after all products have accumulated.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub struct KaratsubaGhashX4 {
+    lo: __m512i,
+    hi: __m512i,
+    sum: __m512i,
+}
+
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+impl KaratsubaGhashX4 {
+    /// # Safety
+    /// Requires AVX-512F.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn zero() -> Self {
+        let z = _mm512_setzero_si512();
+        Self { lo: z, hi: z, sum: z }
+    }
+
+    /// # Safety
+    /// Requires AVX-512F and VPCLMULQDQ.
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
+        // SAFETY: caller guarantees the declared instruction features.
+        unsafe {
+            let xs = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4e>(x));
+            let ys = _mm512_xor_si512(y, _mm512_shuffle_epi32::<0x4e>(y));
+            self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
+            self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
+            self.sum = _mm512_xor_si512(self.sum, _mm512_clmulepi64_epi128::<0x00>(xs, ys));
+        }
+    }
+
+    /// # Safety
+    /// Requires AVX-512F and VPCLMULQDQ.
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    pub unsafe fn fold(self) -> F256Unreduced {
+        // SAFETY: caller guarantees the declared instruction features.
+        unsafe {
+            // Characteristic two: cross = (lo+hi)*(lo+hi) + lo*lo + hi*hi.
+            // Reconstruct after accumulation, so this costs one ternlog per dot.
+            let mid = _mm512_ternarylogic_epi64::<0x96>(self.sum, self.lo, self.hi);
+            unsafe { WideGhashX4 { lo: self.lo, hi: self.hi, mid }.fold() }
+        }
+    }
+}
+
 /// 4-lane unreduced GF(2^128) product accumulator (deferred reduction).
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[derive(Clone, Copy)]
