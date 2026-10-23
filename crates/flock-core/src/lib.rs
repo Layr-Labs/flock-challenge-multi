@@ -213,9 +213,11 @@ pub(crate) mod topology_pool {
 /// **1.85** for C beside C (sum 3.50), against **1.69 / 1.64** for the
 /// heterogeneous pairing (sum 3.33). The two kernels stress different parts
 /// of a core, so pairing one of each on a core is ~5% cheaper than pairing
-/// like with like. Giving each half its own 8-thread pool, pinned one thread
-/// per physical core to opposite SMT siblings, makes every core run exactly
-/// one AB thread beside one C thread.
+/// like with like. The inherited split gives each half eight workers. This
+/// candidate transfers one of those workers to identity-C on eight-core SMT
+/// machines: seven cores retain AB/C pairing, and one core runs C/C. This
+/// tests whether reducing C's longer tail outweighs the lost heterogeneous
+/// pairing and AB's smaller pool. Other topologies retain the equal split.
 ///
 /// The pools are built **here, at process start, on the unpinned main
 /// thread**, from an explicit CPU list read out of
@@ -260,6 +262,55 @@ pub(crate) mod smt_split {
                 return;
             }
             let _ = POOLS.set(imp::build());
+        }
+    }
+
+    /// Called only after the topology and affinity checks in `imp::build`.
+    /// Keep the same CPU union and worker count; only change arm ownership.
+    #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+    fn round1_arm_cpus(groups: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>) {
+        let mut ab: Vec<usize> = groups.iter().map(|g| g[0]).collect();
+        let mut c: Vec<usize> = groups.iter().map(|g| g[1]).collect();
+        if groups.len() == 8 {
+            c.push(ab.pop().expect("eight validated physical cores"));
+        }
+        (ab, c)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::round1_arm_cpus;
+
+        #[test]
+        fn ranked_round1_partition_preserves_cpu_union() {
+            // Non-contiguous OS CPU identifiers must be preserved verbatim.
+            let groups: Vec<_> = (0..8).map(|i| vec![3 * i + 1, 3 * i + 101]).collect();
+            let (ab, c) = round1_arm_cpus(&groups);
+            assert_eq!(ab.len(), 7);
+            assert_eq!(c.len(), 9);
+            assert_eq!(ab, groups[..7].iter().map(|g| g[0]).collect::<Vec<_>>());
+            for group in &groups[..7] {
+                assert!(ab.contains(&group[0]));
+                assert!(c.contains(&group[1]));
+            }
+            assert!(c.contains(&groups[7][0]) && c.contains(&groups[7][1]));
+            let mut union: Vec<_> = ab.iter().chain(&c).copied().collect();
+            union.sort_unstable();
+            let mut expected: Vec<_> = groups.iter().flatten().copied().collect();
+            expected.sort_unstable();
+            assert_eq!(union, expected);
+            union.dedup();
+            assert_eq!(union.len(), 16);
+        }
+
+        #[test]
+        fn other_topologies_keep_equal_arms() {
+            for cores in [0, 1, 2, 4, 7, 9, 16] {
+                let groups: Vec<_> = (0..cores).map(|i| vec![i, i + cores]).collect();
+                let (ab, c) = round1_arm_cpus(&groups);
+                assert_eq!(ab, (0..cores).collect::<Vec<_>>());
+                assert_eq!(c, (cores..2 * cores).collect::<Vec<_>>());
+            }
         }
     }
 
@@ -412,8 +463,7 @@ pub(crate) mod smt_split {
                     }
                 }
             }
-            let s0: Vec<usize> = groups.iter().map(|g| g[0]).collect();
-            let s1: Vec<usize> = groups.iter().map(|g| g[1]).collect();
+            let (s0, s1) = super::round1_arm_cpus(&groups);
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
