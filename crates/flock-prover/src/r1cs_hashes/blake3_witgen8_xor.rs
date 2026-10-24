@@ -396,8 +396,30 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
 
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
-#[inline(never)]
+// Seven-known-column B rows have only one variable column. Inline this
+// reduced affine case to avoid an accumulator roundtrip, while retaining
+// shared outlined kernels for the larger row modes.
+#[inline(always)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8],
+) {
+    unsafe {
+        if MODE == 7 {
+            let av = affine_conv(ap, ma, 0);
+            let bv = affine_conv(bp, mb, MODE);
+            for i in 0..8 {
+                let value = _mm512_xor_si512(_mm512_gf2p8mul_epi8(av[i], bv[i]), av[i]);
+                acc[i] = if FIRST { value } else { _mm512_xor_si512(acc[i], value) };
+            }
+        } else {
+            row_product_outlined::<MODE, FIRST>(ap, bp, ma, mb, acc);
+        }
+    }
+}
+
+#[inline(never)]
+unsafe fn row_product_outlined<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
