@@ -2777,6 +2777,580 @@ fn low_twiddle_fused3_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
 }
 
+
+// Sixteen row vectors stay live while independent butterflies are scheduled
+// across each layer's twiddle groups. Scalar and four-lane tails reuse the
+// returned broadcasts. Row pitch is exactly 64 and dense_lanes is a valid
+// prefix rounded down to eight; the enclosing caller supplies these bounds.
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn butterfly_three_dense_fixed_registers(
+    ptr: *mut F128,
+    twiddles: &[F128; 7],
+    dense_lanes: usize,
+) -> [TwX4; 7] {
+    unsafe {
+        let (t0, t1, t2, t3, t4, t5, t6, companion);
+        core::arch::asm!(
+            "vbroadcasti32x4 zmm16, [rsi+0]",
+            "vbroadcasti32x4 zmm17, [rsi+16]",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm19, [rsi+48]",
+            "vbroadcasti32x4 zmm20, [rsi+64]",
+            "vbroadcasti32x4 zmm21, [rsi+80]",
+            "vbroadcasti32x4 zmm22, [rsi+96]",
+            "mov eax, 0x87",
+            "vmovq xmm24, rax",
+            "vshufi32x4 zmm24, zmm24, zmm24, 0",
+            "vpslldq zmm23, zmm16, 8",
+            "vpclmulqdq zmm31, zmm16, zmm24, 1",
+            "vpxorq zmm23, zmm23, zmm31",
+            "test rdx, rdx",
+            "jz 3f",
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            "vmovdqu64 zmm0, [rdi+rax+0]",
+            "vmovdqu64 zmm1, [rdi+rax+1024]",
+            "vmovdqu64 zmm2, [rdi+rax+2048]",
+            "vmovdqu64 zmm3, [rdi+rax+3072]",
+            "vmovdqu64 zmm4, [rdi+rax+4096]",
+            "vmovdqu64 zmm5, [rdi+rax+5120]",
+            "vmovdqu64 zmm6, [rdi+rax+6144]",
+            "vmovdqu64 zmm7, [rdi+rax+7168]",
+            "vmovdqu64 zmm8, [rdi+rax+64]",
+            "vmovdqu64 zmm9, [rdi+rax+1088]",
+            "vmovdqu64 zmm10, [rdi+rax+2112]",
+            "vmovdqu64 zmm11, [rdi+rax+3136]",
+            "vmovdqu64 zmm12, [rdi+rax+4160]",
+            "vmovdqu64 zmm13, [rdi+rax+5184]",
+            "vmovdqu64 zmm14, [rdi+rax+6208]",
+            "vmovdqu64 zmm15, [rdi+rax+7232]",
+            "vpclmulqdq zmm29, zmm4, zmm16, 0",
+            "vpclmulqdq zmm30, zmm4, zmm23, 1",
+            "vpternlogq zmm0, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm12, zmm16, 0",
+            "vpclmulqdq zmm30, zmm12, zmm23, 1",
+            "vpternlogq zmm8, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm5, zmm16, 0",
+            "vpclmulqdq zmm30, zmm5, zmm23, 1",
+            "vpternlogq zmm1, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm13, zmm16, 0",
+            "vpclmulqdq zmm30, zmm13, zmm23, 1",
+            "vpternlogq zmm9, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm25, zmm4, zmm16, 16",
+            "vpclmulqdq zmm31, zmm4, zmm23, 17",
+            "vpxorq zmm25, zmm25, zmm31",
+            "vpclmulqdq zmm26, zmm12, zmm16, 16",
+            "vpclmulqdq zmm31, zmm12, zmm23, 17",
+            "vpxorq zmm26, zmm26, zmm31",
+            "vpclmulqdq zmm27, zmm5, zmm16, 16",
+            "vpclmulqdq zmm31, zmm5, zmm23, 17",
+            "vpxorq zmm27, zmm27, zmm31",
+            "vpclmulqdq zmm28, zmm13, zmm16, 16",
+            "vpclmulqdq zmm31, zmm13, zmm23, 17",
+            "vpxorq zmm28, zmm28, zmm31",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm12, zmm12, zmm8",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm1, zmm31, zmm27, 0x96",
+            "vpxorq zmm5, zmm5, zmm1",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm9, zmm31, zmm28, 0x96",
+            "vpxorq zmm13, zmm13, zmm9",
+            "vpclmulqdq zmm29, zmm6, zmm16, 0",
+            "vpclmulqdq zmm30, zmm6, zmm23, 1",
+            "vpternlogq zmm2, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm14, zmm16, 0",
+            "vpclmulqdq zmm30, zmm14, zmm23, 1",
+            "vpternlogq zmm10, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm7, zmm16, 0",
+            "vpclmulqdq zmm30, zmm7, zmm23, 1",
+            "vpternlogq zmm3, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm29, zmm15, zmm16, 0",
+            "vpclmulqdq zmm30, zmm15, zmm23, 1",
+            "vpternlogq zmm11, zmm29, zmm30, 0x96",
+            "vpclmulqdq zmm25, zmm6, zmm16, 16",
+            "vpclmulqdq zmm31, zmm6, zmm23, 17",
+            "vpxorq zmm25, zmm25, zmm31",
+            "vpclmulqdq zmm26, zmm14, zmm16, 16",
+            "vpclmulqdq zmm31, zmm14, zmm23, 17",
+            "vpxorq zmm26, zmm26, zmm31",
+            "vpclmulqdq zmm27, zmm7, zmm16, 16",
+            "vpclmulqdq zmm31, zmm7, zmm23, 17",
+            "vpxorq zmm27, zmm27, zmm31",
+            "vpclmulqdq zmm28, zmm15, zmm16, 16",
+            "vpclmulqdq zmm31, zmm15, zmm23, 17",
+            "vpxorq zmm28, zmm28, zmm31",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm2, zmm31, zmm25, 0x96",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm10, zmm31, zmm26, 0x96",
+            "vpxorq zmm14, zmm14, zmm10",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm3, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm3",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm11, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm11",
+            "vpclmulqdq zmm29, zmm2, zmm17, 0",
+            "vpxorq zmm0, zmm0, zmm29",
+            "vpclmulqdq zmm29, zmm10, zmm17, 0",
+            "vpxorq zmm8, zmm8, zmm29",
+            "vpclmulqdq zmm29, zmm3, zmm17, 0",
+            "vpxorq zmm1, zmm1, zmm29",
+            "vpclmulqdq zmm29, zmm11, zmm17, 0",
+            "vpxorq zmm9, zmm9, zmm29",
+            "vpclmulqdq zmm25, zmm2, zmm17, 1",
+            "vpclmulqdq zmm26, zmm10, zmm17, 1",
+            "vpclmulqdq zmm27, zmm3, zmm17, 1",
+            "vpclmulqdq zmm28, zmm11, zmm17, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm2, zmm2, zmm0",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm10, zmm10, zmm8",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm1, zmm31, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm9, zmm31, zmm28, 0x96",
+            "vpxorq zmm11, zmm11, zmm9",
+            "vpclmulqdq zmm29, zmm6, zmm18, 0",
+            "vpxorq zmm4, zmm4, zmm29",
+            "vpclmulqdq zmm29, zmm14, zmm18, 0",
+            "vpxorq zmm12, zmm12, zmm29",
+            "vpclmulqdq zmm29, zmm7, zmm18, 0",
+            "vpxorq zmm5, zmm5, zmm29",
+            "vpclmulqdq zmm29, zmm15, zmm18, 0",
+            "vpxorq zmm13, zmm13, zmm29",
+            "vpclmulqdq zmm25, zmm6, zmm18, 1",
+            "vpclmulqdq zmm26, zmm14, zmm18, 1",
+            "vpclmulqdq zmm27, zmm7, zmm18, 1",
+            "vpclmulqdq zmm28, zmm15, zmm18, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm4, zmm31, zmm25, 0x96",
+            "vpxorq zmm6, zmm6, zmm4",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm12, zmm31, zmm26, 0x96",
+            "vpxorq zmm14, zmm14, zmm12",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm5, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm5",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm13, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm13",
+            "vpclmulqdq zmm29, zmm1, zmm19, 0",
+            "vpxorq zmm0, zmm0, zmm29",
+            "vpclmulqdq zmm29, zmm9, zmm19, 0",
+            "vpxorq zmm8, zmm8, zmm29",
+            "vpclmulqdq zmm29, zmm3, zmm20, 0",
+            "vpxorq zmm2, zmm2, zmm29",
+            "vpclmulqdq zmm29, zmm11, zmm20, 0",
+            "vpxorq zmm10, zmm10, zmm29",
+            "vpclmulqdq zmm25, zmm1, zmm19, 1",
+            "vpclmulqdq zmm26, zmm9, zmm19, 1",
+            "vpclmulqdq zmm27, zmm3, zmm20, 1",
+            "vpclmulqdq zmm28, zmm11, zmm20, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm1, zmm1, zmm0",
+            "vmovdqu64 [rdi+rax+0], zmm0",
+            "vmovdqu64 [rdi+rax+1024], zmm1",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm9, zmm9, zmm8",
+            "vmovdqu64 [rdi+rax+64], zmm8",
+            "vmovdqu64 [rdi+rax+1088], zmm9",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm2, zmm31, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm2",
+            "vmovdqu64 [rdi+rax+2048], zmm2",
+            "vmovdqu64 [rdi+rax+3072], zmm3",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm10, zmm31, zmm28, 0x96",
+            "vpxorq zmm11, zmm11, zmm10",
+            "vmovdqu64 [rdi+rax+2112], zmm10",
+            "vmovdqu64 [rdi+rax+3136], zmm11",
+            "vpclmulqdq zmm29, zmm5, zmm21, 0",
+            "vpxorq zmm4, zmm4, zmm29",
+            "vpclmulqdq zmm29, zmm13, zmm21, 0",
+            "vpxorq zmm12, zmm12, zmm29",
+            "vpclmulqdq zmm29, zmm7, zmm22, 0",
+            "vpxorq zmm6, zmm6, zmm29",
+            "vpclmulqdq zmm29, zmm15, zmm22, 0",
+            "vpxorq zmm14, zmm14, zmm29",
+            "vpclmulqdq zmm25, zmm5, zmm21, 1",
+            "vpclmulqdq zmm26, zmm13, zmm21, 1",
+            "vpclmulqdq zmm27, zmm7, zmm22, 1",
+            "vpclmulqdq zmm28, zmm15, zmm22, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm4, zmm31, zmm25, 0x96",
+            "vpxorq zmm5, zmm5, zmm4",
+            "vmovdqu64 [rdi+rax+4096], zmm4",
+            "vmovdqu64 [rdi+rax+5120], zmm5",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm12, zmm31, zmm26, 0x96",
+            "vpxorq zmm13, zmm13, zmm12",
+            "vmovdqu64 [rdi+rax+4160], zmm12",
+            "vmovdqu64 [rdi+rax+5184], zmm13",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm6, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm6",
+            "vmovdqu64 [rdi+rax+6144], zmm6",
+            "vmovdqu64 [rdi+rax+7168], zmm7",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm14, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm14",
+            "vmovdqu64 [rdi+rax+6208], zmm14",
+            "vmovdqu64 [rdi+rax+7232], zmm15",
+            "add rax, 128",
+            "cmp rax, rdx",
+            "jb 2b",
+            "3:",
+            in("rdi") ptr, in("rsi") twiddles.as_ptr(), in("rdx") dense_lanes * 16,
+            out("rax") _,
+            lateout("zmm16") t0,
+            lateout("zmm17") t1,
+            lateout("zmm18") t2,
+            lateout("zmm19") t3,
+            lateout("zmm20") t4,
+            lateout("zmm21") t5,
+            lateout("zmm22") t6,
+            lateout("zmm23") companion,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm24") _,
+            out("zmm25") _,
+            out("zmm26") _,
+            out("zmm27") _,
+            out("zmm28") _,
+            out("zmm29") _,
+            out("zmm30") _,
+            out("zmm31") _,
+            options(nostack),
+        );
+        [(t0, companion), (t1, t1), (t2, t2), (t3, t3), (t4, t4), (t5, t5), (t6, t6)]
+    }
+}
+
+// Sixteen row vectors stay live while independent butterflies are scheduled
+// across each layer's twiddle groups. Scalar and four-lane tails reuse the
+// returned broadcasts. Row pitch is exactly 64 and dense_lanes is a valid
+// prefix rounded down to eight; the enclosing caller supplies these bounds.
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn butterfly_three_low_dense_fixed_registers(
+    ptr: *mut F128,
+    twiddles: &[F128; 7],
+    dense_lanes: usize,
+) -> [TwX4; 7] {
+    unsafe {
+        let (t0, t1, t2, t3, t4, t5, t6);
+        core::arch::asm!(
+            "vbroadcasti32x4 zmm16, [rsi+0]",
+            "vbroadcasti32x4 zmm17, [rsi+16]",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm19, [rsi+48]",
+            "vbroadcasti32x4 zmm20, [rsi+64]",
+            "vbroadcasti32x4 zmm21, [rsi+80]",
+            "vbroadcasti32x4 zmm22, [rsi+96]",
+            "mov eax, 0x87",
+            "vmovq xmm24, rax",
+            "vshufi32x4 zmm24, zmm24, zmm24, 0",
+            "test rdx, rdx",
+            "jz 3f",
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            "vmovdqu64 zmm0, [rdi+rax+0]",
+            "vmovdqu64 zmm1, [rdi+rax+1024]",
+            "vmovdqu64 zmm2, [rdi+rax+2048]",
+            "vmovdqu64 zmm3, [rdi+rax+3072]",
+            "vmovdqu64 zmm4, [rdi+rax+4096]",
+            "vmovdqu64 zmm5, [rdi+rax+5120]",
+            "vmovdqu64 zmm6, [rdi+rax+6144]",
+            "vmovdqu64 zmm7, [rdi+rax+7168]",
+            "vmovdqu64 zmm8, [rdi+rax+64]",
+            "vmovdqu64 zmm9, [rdi+rax+1088]",
+            "vmovdqu64 zmm10, [rdi+rax+2112]",
+            "vmovdqu64 zmm11, [rdi+rax+3136]",
+            "vmovdqu64 zmm12, [rdi+rax+4160]",
+            "vmovdqu64 zmm13, [rdi+rax+5184]",
+            "vmovdqu64 zmm14, [rdi+rax+6208]",
+            "vmovdqu64 zmm15, [rdi+rax+7232]",
+            "vpclmulqdq zmm29, zmm4, zmm16, 0",
+            "vpxorq zmm0, zmm0, zmm29",
+            "vpclmulqdq zmm29, zmm12, zmm16, 0",
+            "vpxorq zmm8, zmm8, zmm29",
+            "vpclmulqdq zmm29, zmm5, zmm16, 0",
+            "vpxorq zmm1, zmm1, zmm29",
+            "vpclmulqdq zmm29, zmm13, zmm16, 0",
+            "vpxorq zmm9, zmm9, zmm29",
+            "vpclmulqdq zmm25, zmm4, zmm16, 1",
+            "vpclmulqdq zmm26, zmm12, zmm16, 1",
+            "vpclmulqdq zmm27, zmm5, zmm16, 1",
+            "vpclmulqdq zmm28, zmm13, zmm16, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm12, zmm12, zmm8",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm1, zmm31, zmm27, 0x96",
+            "vpxorq zmm5, zmm5, zmm1",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm9, zmm31, zmm28, 0x96",
+            "vpxorq zmm13, zmm13, zmm9",
+            "vpclmulqdq zmm29, zmm6, zmm16, 0",
+            "vpxorq zmm2, zmm2, zmm29",
+            "vpclmulqdq zmm29, zmm14, zmm16, 0",
+            "vpxorq zmm10, zmm10, zmm29",
+            "vpclmulqdq zmm29, zmm7, zmm16, 0",
+            "vpxorq zmm3, zmm3, zmm29",
+            "vpclmulqdq zmm29, zmm15, zmm16, 0",
+            "vpxorq zmm11, zmm11, zmm29",
+            "vpclmulqdq zmm25, zmm6, zmm16, 1",
+            "vpclmulqdq zmm26, zmm14, zmm16, 1",
+            "vpclmulqdq zmm27, zmm7, zmm16, 1",
+            "vpclmulqdq zmm28, zmm15, zmm16, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm2, zmm31, zmm25, 0x96",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm10, zmm31, zmm26, 0x96",
+            "vpxorq zmm14, zmm14, zmm10",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm3, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm3",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm11, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm11",
+            "vpclmulqdq zmm29, zmm2, zmm17, 0",
+            "vpxorq zmm0, zmm0, zmm29",
+            "vpclmulqdq zmm29, zmm10, zmm17, 0",
+            "vpxorq zmm8, zmm8, zmm29",
+            "vpclmulqdq zmm29, zmm3, zmm17, 0",
+            "vpxorq zmm1, zmm1, zmm29",
+            "vpclmulqdq zmm29, zmm11, zmm17, 0",
+            "vpxorq zmm9, zmm9, zmm29",
+            "vpclmulqdq zmm25, zmm2, zmm17, 1",
+            "vpclmulqdq zmm26, zmm10, zmm17, 1",
+            "vpclmulqdq zmm27, zmm3, zmm17, 1",
+            "vpclmulqdq zmm28, zmm11, zmm17, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm2, zmm2, zmm0",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm10, zmm10, zmm8",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm1, zmm31, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm9, zmm31, zmm28, 0x96",
+            "vpxorq zmm11, zmm11, zmm9",
+            "vpclmulqdq zmm29, zmm6, zmm18, 0",
+            "vpxorq zmm4, zmm4, zmm29",
+            "vpclmulqdq zmm29, zmm14, zmm18, 0",
+            "vpxorq zmm12, zmm12, zmm29",
+            "vpclmulqdq zmm29, zmm7, zmm18, 0",
+            "vpxorq zmm5, zmm5, zmm29",
+            "vpclmulqdq zmm29, zmm15, zmm18, 0",
+            "vpxorq zmm13, zmm13, zmm29",
+            "vpclmulqdq zmm25, zmm6, zmm18, 1",
+            "vpclmulqdq zmm26, zmm14, zmm18, 1",
+            "vpclmulqdq zmm27, zmm7, zmm18, 1",
+            "vpclmulqdq zmm28, zmm15, zmm18, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm4, zmm31, zmm25, 0x96",
+            "vpxorq zmm6, zmm6, zmm4",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm12, zmm31, zmm26, 0x96",
+            "vpxorq zmm14, zmm14, zmm12",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm5, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm5",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm13, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm13",
+            "vpclmulqdq zmm29, zmm1, zmm19, 0",
+            "vpxorq zmm0, zmm0, zmm29",
+            "vpclmulqdq zmm29, zmm9, zmm19, 0",
+            "vpxorq zmm8, zmm8, zmm29",
+            "vpclmulqdq zmm29, zmm3, zmm20, 0",
+            "vpxorq zmm2, zmm2, zmm29",
+            "vpclmulqdq zmm29, zmm11, zmm20, 0",
+            "vpxorq zmm10, zmm10, zmm29",
+            "vpclmulqdq zmm25, zmm1, zmm19, 1",
+            "vpclmulqdq zmm26, zmm9, zmm19, 1",
+            "vpclmulqdq zmm27, zmm3, zmm20, 1",
+            "vpclmulqdq zmm28, zmm11, zmm20, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm0, zmm31, zmm25, 0x96",
+            "vpxorq zmm1, zmm1, zmm0",
+            "vmovdqu64 [rdi+rax+0], zmm0",
+            "vmovdqu64 [rdi+rax+1024], zmm1",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm8, zmm31, zmm26, 0x96",
+            "vpxorq zmm9, zmm9, zmm8",
+            "vmovdqu64 [rdi+rax+64], zmm8",
+            "vmovdqu64 [rdi+rax+1088], zmm9",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm2, zmm31, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm2",
+            "vmovdqu64 [rdi+rax+2048], zmm2",
+            "vmovdqu64 [rdi+rax+3072], zmm3",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm10, zmm31, zmm28, 0x96",
+            "vpxorq zmm11, zmm11, zmm10",
+            "vmovdqu64 [rdi+rax+2112], zmm10",
+            "vmovdqu64 [rdi+rax+3136], zmm11",
+            "vpclmulqdq zmm29, zmm5, zmm21, 0",
+            "vpxorq zmm4, zmm4, zmm29",
+            "vpclmulqdq zmm29, zmm13, zmm21, 0",
+            "vpxorq zmm12, zmm12, zmm29",
+            "vpclmulqdq zmm29, zmm7, zmm22, 0",
+            "vpxorq zmm6, zmm6, zmm29",
+            "vpclmulqdq zmm29, zmm15, zmm22, 0",
+            "vpxorq zmm14, zmm14, zmm29",
+            "vpclmulqdq zmm25, zmm5, zmm21, 1",
+            "vpclmulqdq zmm26, zmm13, zmm21, 1",
+            "vpclmulqdq zmm27, zmm7, zmm22, 1",
+            "vpclmulqdq zmm28, zmm15, zmm22, 1",
+            "vpslldq zmm31, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm24, 1",
+            "vpternlogq zmm4, zmm31, zmm25, 0x96",
+            "vpxorq zmm5, zmm5, zmm4",
+            "vmovdqu64 [rdi+rax+4096], zmm4",
+            "vmovdqu64 [rdi+rax+5120], zmm5",
+            "vpslldq zmm31, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm24, 1",
+            "vpternlogq zmm12, zmm31, zmm26, 0x96",
+            "vpxorq zmm13, zmm13, zmm12",
+            "vmovdqu64 [rdi+rax+4160], zmm12",
+            "vmovdqu64 [rdi+rax+5184], zmm13",
+            "vpslldq zmm31, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm24, 1",
+            "vpternlogq zmm6, zmm31, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm6",
+            "vmovdqu64 [rdi+rax+6144], zmm6",
+            "vmovdqu64 [rdi+rax+7168], zmm7",
+            "vpslldq zmm31, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm24, 1",
+            "vpternlogq zmm14, zmm31, zmm28, 0x96",
+            "vpxorq zmm15, zmm15, zmm14",
+            "vmovdqu64 [rdi+rax+6208], zmm14",
+            "vmovdqu64 [rdi+rax+7232], zmm15",
+            "add rax, 128",
+            "cmp rax, rdx",
+            "jb 2b",
+            "3:",
+            in("rdi") ptr, in("rsi") twiddles.as_ptr(), in("rdx") dense_lanes * 16,
+            out("rax") _,
+            lateout("zmm16") t0,
+            lateout("zmm17") t1,
+            lateout("zmm18") t2,
+            lateout("zmm19") t3,
+            lateout("zmm20") t4,
+            lateout("zmm21") t5,
+            lateout("zmm22") t6,
+            out("zmm23") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm24") _,
+            out("zmm25") _,
+            out("zmm26") _,
+            out("zmm27") _,
+            out("zmm28") _,
+            out("zmm29") _,
+            out("zmm30") _,
+            out("zmm31") _,
+            options(nostack),
+        );
+        [(t0, t0), (t1, t1), (t2, t2), (t3, t3), (t4, t4), (t5, t5), (t6, t6)]
+    }
+}
+
 /// # Safety
 /// Same contract as [`butterfly_fused_3layer_rows`]. `NNC` is either 0 (use
 /// the runtime `num_ntts`) or the exact runtime value (the shaped wrapper):
@@ -2817,17 +3391,42 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // loads and two stores for the same 12.
         let zero = _mm512_setzero_si512();
         let mut tw = [(zero, zero); 7];
-        // The high-one product needs only the original twiddle broadcast.
-        tw[0] = if HIGH_ONE_OUTER {
-            tw_x4::<false, false>(twiddles[0])
+        let mut lane = 0;
+        let use_fixed_dense = cfg!(target_feature = "avx512bw")
+            && LOW_INNER && NNC == 64 && !HIGH_ONE_OUTER
+            && (DIET || LOW_OUTER);
+        #[cfg(target_feature = "avx512bw")]
+        if use_fixed_dense {
+            lane = dense_lanes & !7;
+            tw = if LOW_OUTER {
+                butterfly_three_low_dense_fixed_registers(ptr, twiddles, lane)
+            } else {
+                butterfly_three_dense_fixed_registers(ptr, twiddles, lane)
+            };
         } else {
-            tw_x4::<LOW_OUTER, DIET>(twiddles[0])
-        };
-        for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
-            *slot = tw_x4::<LOW_INNER, DIET>(*value);
+            // The high-one product needs only the original twiddle broadcast.
+            tw[0] = if HIGH_ONE_OUTER {
+                tw_x4::<false, false>(twiddles[0])
+            } else {
+                tw_x4::<LOW_OUTER, DIET>(twiddles[0])
+            };
+            for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
+                *slot = tw_x4::<LOW_INNER, DIET>(*value);
+            }
+        }
+        #[cfg(not(target_feature = "avx512bw"))]
+        {
+            // The high-one product needs only the original twiddle broadcast.
+            tw[0] = if HIGH_ONE_OUTER {
+                tw_x4::<false, false>(twiddles[0])
+            } else {
+                tw_x4::<LOW_OUTER, DIET>(twiddles[0])
+            };
+            for (slot, value) in tw[1..].iter_mut().zip(twiddles[1..].iter()) {
+                *slot = tw_x4::<LOW_INNER, DIET>(*value);
+            }
         }
         let row = |i: usize| ptr.add(i * num_ntts);
-        let mut lane = 0;
 
         macro_rules! butterfly {
             ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
@@ -2866,7 +3465,9 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }};
         }
 
-        while lane + 8 <= dense_lanes {
+        // The fixed schedule already consumed every complete eight-lane chunk.
+        // Keep the compile-time guard explicit so the old loop is eliminated.
+        while !use_fixed_dense && lane + 8 <= dense_lanes {
             let mut values = [[zero; 8]; 2];
             for (c, chunk) in values.iter_mut().enumerate() {
                 for (i, value) in chunk.iter_mut().enumerate() {
@@ -3783,5 +4384,77 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
         butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
         )
+    }
+}
+
+
+#[cfg(test)]
+mod fixed_three_dense_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_three_complete_rows_match_scalar() {
+        let mut state = 0x72831273abcu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F128 { lo: state, hi: state.rotate_left(23) ^ 0x91f3 }
+        };
+        let guard = F128 { lo: 0xabcd17, hi: 0x654321 };
+        let mut cases = 0;
+        for low_outer in [false, true] {
+            for dense in [0usize, 1, 3, 4, 7, 8, 9, 12, 15, 16, 31, 32, 57, 60, 63, 64] {
+                for offset in 0..4 {
+                    for pattern in 0..5 {
+                        let mut tw = core::array::from_fn(|_| next());
+                        for value in &mut tw[1..] { value.hi = 0; }
+                        if low_outer { tw[0].hi = 0; }
+                        if pattern == 0 { tw.fill(F128::ZERO); }
+                        else if pattern == 1 { tw.fill(F128::ONE); }
+                        let start = 4 + offset;
+                        let mut input = vec![guard; start + 8 * 64 + 4];
+                        for value in &mut input[start..start + 8 * 64] {
+                            *value = match pattern {
+                                0 => F128::ZERO,
+                                1 => F128::ONE,
+                                2 => F128 { lo: u64::MAX, hi: u64::MAX },
+                                _ => next(),
+                            };
+                        }
+                        for row in [1usize, 3, 5, 7] {
+                            for lane in dense..64 { input[start + row * 64 + lane] = F128::ZERO; }
+                        }
+                        let mut expected = input.clone();
+                        for lane in 0..64 {
+                            let mut values = core::array::from_fn(|row| expected[start + row * 64 + lane]);
+                            super::super::portable::butterfly_fused_3layer(&mut values, &tw);
+                            for row in 0..8 { expected[start + row * 64 + lane] = values[row]; }
+                        }
+                        let mut actual = input.clone();
+                        let mut low_nodiet = input.clone();
+                        let mut fallback = input;
+                        unsafe {
+                            if low_outer {
+                                butterfly_fused_3layer_rows_impl::<true, true, 64, true, false>(actual.as_mut_ptr().add(start), 64, dense, &tw);
+                                butterfly_fused_3layer_rows_impl::<false, true, 64, true, false>(low_nodiet.as_mut_ptr().add(start), 64, dense, &tw);
+                                butterfly_fused_3layer_rows_impl::<false, true, 0, true, false>(fallback.as_mut_ptr().add(start), 64, dense, &tw);
+                            } else {
+                                butterfly_fused_3layer_rows_impl::<true, true, 64, false, false>(actual.as_mut_ptr().add(start), 64, dense, &tw);
+                                butterfly_fused_3layer_rows_impl::<false, true, 64, false, false>(fallback.as_mut_ptr().add(start), 64, dense, &tw);
+                            }
+                        }
+                        assert_eq!(actual, expected, "low={low_outer} dense={dense} offset={offset} pattern={pattern}");
+                        assert_eq!(fallback, expected, "rollback low={low_outer} dense={dense} offset={offset} pattern={pattern}");
+                        if low_outer {
+                            assert_eq!(low_nodiet, expected, "low non-DIET dense={dense} offset={offset} pattern={pattern}");
+                            cases += 1;
+                        }
+                        cases += 2;
+                    }
+                }
+            }
+        }
+        eprintln!("{cases} complete three-layer row cases passed, including dense and published zero-odd tails");
     }
 }
