@@ -394,10 +394,8 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
     }
 }
 
-// Share the expensive arithmetic by structural row mode. The eight Horner
-// weights remain selected by the caller's matrix-bank pointer.
-#[inline(never)]
-unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+#[inline(always)]
+unsafe fn row_product_body<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
@@ -413,6 +411,23 @@ unsafe fn row_product<const MODE: u8, const FIRST: bool>(
         }
     }
 }
+// Inline only the common dense row: keep its eight accumulators in registers
+// across adjacent row publication boundaries, without cloning partial-mode kernels.
+#[inline(always)]
+unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8],
+) {
+    unsafe {
+        if MODE == 0 { row_product_body::<MODE, FIRST>(ap,bp,ma,mb,acc); }
+        else { row_product_cold::<MODE, FIRST>(ap,bp,ma,mb,acc); }
+    }
+}
+#[inline(never)]
+unsafe fn row_product_cold<const MODE: u8, const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8],
+) { unsafe { row_product_body::<MODE, FIRST>(ap,bp,ma,mb,acc); } }
 #[inline(always)]
 unsafe fn project_const<const BLK: usize>(
     proj: &StreamProj<'_>,
