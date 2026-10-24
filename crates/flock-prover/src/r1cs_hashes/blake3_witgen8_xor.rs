@@ -396,8 +396,147 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
 
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
-#[inline(never)]
+#[cfg(all(
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "gfni"
+))]
+mod dense_registers {
+    use core::arch::x86_64::__m512i;
+    core::arch::global_asm!(include_str!("blake3_witgen8_xor_dense_regs.S"));
+    // These symbols are referenced only by asm!, whose operands describe the
+    // custom calling convention, including preservation of all general registers. They must not be invoked as Rust/C functions.
+    unsafe extern "C" {
+        fn flock_projection_dense_register_add();
+        fn flock_projection_dense_register_first();
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn accumulate<const FIRST: bool>(
+        ap: *const u64,
+        bp: *const u64,
+        ma: *const u64,
+        mb: *const u64,
+        acc: &mut [__m512i; 8],
+    ) {
+        // The enclosing row-product contract supplies readable row/matrix
+        // pointers. All eight outputs are assigned; FIRST never reads the
+        // incoming accumulators. Calls balance the stack, so no nostack or
+        // memory/flags-preservation option is used here.
+        unsafe {
+            if FIRST {
+                core::arch::asm!(
+                    "call {leaf}", leaf = sym flock_projection_dense_register_first,
+                    in("rdi") ap, in("rsi") bp, in("rdx") ma, in("rcx") mb,
+                    lateout("zmm24") acc[0],
+                    lateout("zmm25") acc[1],
+                    lateout("zmm26") acc[2],
+                    lateout("zmm27") acc[3],
+                    lateout("zmm28") acc[4],
+                    lateout("zmm29") acc[5],
+                    lateout("zmm30") acc[6],
+                    lateout("zmm31") acc[7],
+
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    out("zmm2") _,
+                    out("zmm3") _,
+                    out("zmm4") _,
+                    out("zmm5") _,
+                    out("zmm6") _,
+                    out("zmm7") _,
+                    out("zmm8") _,
+                    out("zmm9") _,
+                    out("zmm10") _,
+                    out("zmm11") _,
+                    out("zmm12") _,
+                    out("zmm13") _,
+                    out("zmm14") _,
+                    out("zmm15") _,
+                    out("zmm16") _,
+                    out("zmm17") _,
+                    out("zmm18") _,
+                    out("zmm19") _,
+                    out("zmm20") _,
+                    out("zmm21") _,
+                    out("zmm22") _,
+                    out("zmm23") _,
+
+                );
+            } else {
+                core::arch::asm!(
+                    "call {leaf}", leaf = sym flock_projection_dense_register_add,
+                    in("rdi") ap, in("rsi") bp, in("rdx") ma, in("rcx") mb,
+                    inout("zmm24") acc[0],
+                    inout("zmm25") acc[1],
+                    inout("zmm26") acc[2],
+                    inout("zmm27") acc[3],
+                    inout("zmm28") acc[4],
+                    inout("zmm29") acc[5],
+                    inout("zmm30") acc[6],
+                    inout("zmm31") acc[7],
+
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    out("zmm2") _,
+                    out("zmm3") _,
+                    out("zmm4") _,
+                    out("zmm5") _,
+                    out("zmm6") _,
+                    out("zmm7") _,
+                    out("zmm8") _,
+                    out("zmm9") _,
+                    out("zmm10") _,
+                    out("zmm11") _,
+                    out("zmm12") _,
+                    out("zmm13") _,
+                    out("zmm14") _,
+                    out("zmm15") _,
+                    out("zmm16") _,
+                    out("zmm17") _,
+                    out("zmm18") _,
+                    out("zmm19") _,
+                    out("zmm20") _,
+                    out("zmm21") _,
+                    out("zmm22") _,
+                    out("zmm23") _,
+
+                );
+            }
+        }
+    }
+}
+
+// Keep only the dense MODE0 accumulator live across its custom register call.
+// Other structural modes retain the original outlined arithmetic and ABI.
+#[inline(always)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+    ap: *const u64,
+    bp: *const u64,
+    ma: *const u64,
+    mb: *const u64,
+    acc: &mut [__m512i; 8],
+) {
+    #[cfg(all(
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "gfni"
+    ))]
+    if MODE == 0 {
+        unsafe {
+            dense_registers::accumulate::<FIRST>(ap, bp, ma, mb, acc);
+        }
+        return;
+    }
+    unsafe {
+        row_product_fallback::<MODE, FIRST>(ap, bp, ma, mb, acc);
+    }
+}
+
+#[inline(never)]
+unsafe fn row_product_fallback<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
@@ -445,11 +584,13 @@ unsafe fn project_const<const BLK: usize>(
 15 => row_product::<15, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 7) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(1, a[1], b[1]);
         match mode(BLK, 6) {
@@ -471,11 +612,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 6) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(2, a[2], b[2]);
         match mode(BLK, 5) {
@@ -497,11 +640,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 5) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(3, a[3], b[3]);
         match mode(BLK, 4) {
@@ -523,11 +668,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 4) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(4, a[4], b[4]);
         match mode(BLK, 3) {
@@ -549,11 +696,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 3) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(5, a[5], b[5]);
         match mode(BLK, 2) {
@@ -575,11 +724,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 2) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(6, a[6], b[6]);
         match mode(BLK, 1) {
@@ -601,11 +752,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 1) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(7, a[7], b[7]);
         match mode(BLK, 0) {
@@ -627,11 +780,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+        // The dense register call is already an opaque memory boundary and
+        // has the completed accumulator as register outputs. Preserve the
+        // original extra boundary for outlined sparse/portable row products.
+        if mode(BLK, 0) != 0 || !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+            core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
