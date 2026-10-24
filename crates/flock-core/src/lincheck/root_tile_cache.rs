@@ -1,0 +1,260 @@
+//! Proof-local root matrices shared by folds at distinct challenge points.
+//! The cache contains witness bits only; each consumer builds fresh GFNI
+//! matrices from its own challenge weights. Nothing survives RootFoldSource.
+use super::*;
+use core::arch::x86_64::*;
+use rayon::prelude::*;
+
+#[repr(C, align(64))]
+pub(super) struct Block([u8; 512]);
+
+pub(super) struct RootTileCache {
+    data: Box<[Block]>,
+    tiles: usize,
+    blocks: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Capture {
+    ptr: *mut Block,
+    tiles: usize,
+    blocks: usize,
+}
+
+// SAFETY: capture is confined to prepare(). Each producer claims a distinct
+// tile through the existing static partition or atomic tile allocator. A
+// checked RootSplicePlan emits each block in that tile exactly once. No read
+// reference to the allocation exists until all producers join and fence.
+unsafe impl Send for Capture {}
+unsafe impl Sync for Capture {}
+
+impl Capture {
+    #[inline]
+    pub(super) unsafe fn publish(&self, tile: usize, block: usize, rows: &[__m512i; 8]) {
+        debug_assert!(tile < self.tiles && block < self.blocks);
+        // SAFETY: each (tile, block) is exclusive to this producer; Block's
+        // alignment and its 512-byte stride satisfy every streaming store.
+        unsafe {
+            let dst = self.ptr.add(tile * self.blocks + block).cast::<__m512i>();
+            for (i, value) in rows.iter().enumerate() {
+                _mm512_stream_si512(dst.add(i), *value);
+            }
+        }
+    }
+}
+
+fn prepare(
+    splice: &RootSplicePlan,
+    z: &[F128],
+    k: usize,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+) -> (RootTileCache, Vec<F128>) {
+    let tiles = z.len() / (k / 128) / (DIRECT_FOLD_TILE_STRIPES * 8);
+    let blocks = splice.root_bits.div_ceil(64);
+    assert!(tiles > 0 && blocks > 0);
+    assert_eq!(z.len(), tiles * (k / 128) * DIRECT_FOLD_TILE_STRIPES * 8);
+    let mut storage = Box::<[Block]>::new_uninit_slice(tiles * blocks);
+    let mut writer = splice.clone();
+    writer.capture = Some(Capture {
+        ptr: storage.as_mut_ptr().cast::<Block>(),
+        tiles,
+        blocks,
+    });
+    let folded = writer.fold(z, k, eq8_at);
+    // SAFETY: the checked plan visits each output block exactly once in
+    // every claimed tile, including all zero padding of the final block.
+    // The producer join has completed. Each producer executed SFENCE after
+    // its final streaming store. On panic this conversion is never reached.
+    let data = unsafe { storage.assume_init() };
+    (
+        RootTileCache {
+            data,
+            tiles,
+            blocks,
+        },
+        folded,
+    )
+}
+
+pub(super) fn fold(
+    source: &RootFoldSource,
+    splice: &RootSplicePlan,
+    z: &[F128],
+    k: usize,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+) -> Vec<F128> {
+    let mut first_fold = None;
+    let cache = source.cached_tiles.get_or_init(|| {
+        let (cache, folded) = prepare(splice, z, k, eq8_at);
+        first_fold = Some(folded);
+        cache
+    });
+    if let Some(folded) = first_fold {
+        folded
+    } else {
+        cache.fold(eq8_at)
+    }
+}
+
+impl RootTileCache {
+    fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
+        let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
+        let workers = self.tiles.div_ceil(tiles_per_worker);
+        let stride = self.blocks * 1024;
+        let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride);
+        let mut active = vec![0u8; workers];
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let dynamic = dynamic_tiles_enabled();
+        planes
+            .par_chunks_mut(stride)
+            .zip(active.par_iter_mut())
+            .enumerate()
+            .for_each(|(worker, (dst, active))| {
+                let mut mats = [0u64; 128];
+                let mut first = true;
+                let (mut lo, mut hi) = if dynamic {
+                    (0, 0)
+                } else {
+                    (
+                        worker * tiles_per_worker,
+                        ((worker + 1) * tiles_per_worker).min(self.tiles),
+                    )
+                };
+                loop {
+                    if lo == hi {
+                        if !dynamic {
+                            break;
+                        }
+                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        if lo >= self.tiles {
+                            break;
+                        }
+                        hi = (lo + 4).min(self.tiles);
+                    }
+                    let tile = lo;
+                    lo += 1;
+                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                        let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
+                        kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                    }
+                    for block in 0..self.blocks {
+                        // SAFETY: the fully initialized immutable cache is
+                        // 64-byte aligned; this worker owns every dst plane.
+                        // Its first tile initializes all live planes before
+                        // subsequent tiles load their accumulators.
+                        unsafe {
+                            let src = self.data[tile * self.blocks + block]
+                                .0
+                                .as_ptr()
+                                .cast::<__m512i>();
+                            let rows = core::array::from_fn(|i| _mm512_load_si512(src.add(i)));
+                            kernels::gfni_fold_rows(
+                                &rows,
+                                &mats,
+                                dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                first,
+                            );
+                        }
+                    }
+                    first = false;
+                }
+                *active = u8::from(!first);
+            });
+        let active_workers: Vec<usize> = active
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, v)| (v != 0).then_some(i))
+            .collect();
+        let mut out = vec![F128::ZERO; self.blocks * 64];
+        out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
+            // SAFETY: every active worker initialized this live block and
+            // the Rayon producer join completed before reduction starts.
+            unsafe {
+                reduce_worker_plane_block(&planes, stride, &active_workers, block, dst);
+            }
+        });
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_tile_cache_reweights_and_masks_tail() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let roots: Vec<usize> = (0..64)
+                .chain((0..64).map(|i| 64 + i + if i >= 17 { 64 } else { 0 }))
+                .chain(192..256)
+                .chain(256..305)
+                .collect();
+            let plan = RootSplicePlan {
+                actions: vec![
+                    RootSpliceAction::Full(0),
+                    RootSpliceAction::Start,
+                    RootSpliceAction::End {
+                        out: 1,
+                        low_mask: (1 << 17) - 1,
+                    },
+                    RootSpliceAction::Full(2),
+                    RootSpliceAction::Tail {
+                        out: 3,
+                        mask: (1 << 49) - 1,
+                    },
+                    RootSpliceAction::Skip,
+                ]
+                .into_boxed_slice(),
+                source_bits: 305,
+                root_bits: 241,
+                capture: None,
+            };
+            plan.check_columns(&roots);
+            let mut seed = 0x6182ab49u64;
+            let mut rng = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let z: Vec<F128> = (0..9 * 64 * 3)
+                .map(|_| F128 {
+                    lo: rng(),
+                    hi: rng(),
+                })
+                .collect();
+            let eq1 = |i: usize| {
+                core::array::from_fn(|j| F128 {
+                    lo: (i + j + 1) as u64 * 0x21931,
+                    hi: ((i + j + 5) as u64).rotate_left(29),
+                })
+            };
+            let eq2 = |i: usize| {
+                core::array::from_fn(|j| F128 {
+                    lo: ((i + j + 13) as u64).rotate_left(37),
+                    hi: (i + j + 1) as u64 * 0x821117,
+                })
+            };
+            let reference1 = plan.fold(&z, 384, &eq1);
+            let reference2 = plan.fold(&z, 384, &eq2);
+            assert_ne!(reference1, reference2);
+            let (cache, produced) = prepare(&plan, &z, 384, &eq1);
+            assert_eq!(produced, reference1);
+            assert_eq!(cache.fold(&eq1), reference1);
+            assert_eq!(cache.fold(&eq2), reference2);
+            let (a, b) = rayon::join(|| cache.fold(&eq1), || cache.fold(&eq2));
+            assert_eq!(a, reference1);
+            assert_eq!(b, reference2);
+            for tile in 0..cache.tiles {
+                let tail = &cache.data[tile * cache.blocks + 3].0;
+                for row in 0..8 {
+                    assert!(tail[row * 64 + 49..row * 64 + 64].iter().all(|&v| v == 0));
+                }
+            }
+        });
+    }
+}
