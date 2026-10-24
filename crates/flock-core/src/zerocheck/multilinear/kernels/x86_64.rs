@@ -6033,15 +6033,13 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool>(
             );
         }
         let mp = mats;
-        // Stage-1 qword gathers: pack `(lo,hi)` qword pairs of two residues.
-        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
-        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
-        // Stage-2: the two 256-bit halves of the residue pair.
-        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
-        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
-        for g in 0..4 {
-            let mut a01 = [_mm512_setzero_si512(); 2];
-            let mut a23 = [_mm512_setzero_si512(); 2];
+        // Pair the two output limbs within each 128-bit lane. The low/high
+        // unpacks hold rows 0,2,4,6 and 1,3,5,7 respectively.
+        // Expanding four distinct matrix groups shortens their live ranges.
+        // Keep one reused matrix set in the loop: expanding it increases spills.
+        macro_rules! group { ($g:expr) => {{ let g:usize=$g;
+            let mut even_halves = [_mm512_setzero_si512(); 2];
+            let mut odd_halves = [_mm512_setzero_si512(); 2];
             for half in 0..2 {
                 let i = 2 * g + half;
                 let b: [__m512i; 8] =
@@ -6066,17 +6064,22 @@ unsafe fn gfni_fold64_regs_sigma_bcast_gen<const MULTI: bool>(
                 // qword q of `l`/`hh` = output bytes 0..8 / 8..16 of row 8i+q.
                 let l = _mm512_permutexvar_epi8(bt, plane(0));
                 let hh = _mm512_permutexvar_epi8(bt, plane(1));
-                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
-                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+                even_halves[half] = _mm512_unpacklo_epi64(l, hh);
+                odd_halves[half] = _mm512_unpackhi_epi64(l, hh);
             }
             // Residue-major ZMM (k, g) holds rows 16g + 4·lane + k and lands
             // at F128 index 16k + 4g — the `_tr` layout, byte for byte.
             // F128 index 16k + 4g == ZMM index 4k + g.
             let dst = (out as *mut __m512i).add(g);
-            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
-            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
-            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
-            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+            _mm512_storeu_si512(dst, _mm512_shuffle_i32x4::<0x88>(even_halves[0], even_halves[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_shuffle_i32x4::<0x88>(odd_halves[0], odd_halves[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_shuffle_i32x4::<0xdd>(even_halves[0], even_halves[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_shuffle_i32x4::<0xdd>(odd_halves[0], odd_halves[1]));
+         }}; }
+        if MULTI {
+            group!(0); group!(1); group!(2); group!(3);
+        } else {
+            for g in 0..4 { group!(g); }
         }
     }
 }
@@ -6263,17 +6266,14 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
         }
 
         let mp = mats;
-        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
-        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
-        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
-        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        // Low/high unpacks keep even/odd rows as complete F128 lanes.
         for relative in 0..3 {
             let g = first_g + relative;
             // `MULTI`: one eq-baked matrix set per 16-row group, exactly as
             // `gfni_fold64_regs_sigma_bcast_gen::<true>` selects it.
             let mi = if MULTI { mp.add(128 * g) } else { mp };
-            let mut a01 = [_mm512_setzero_si512(); 2];
-            let mut a23 = [_mm512_setzero_si512(); 2];
+            let mut even_halves = [_mm512_setzero_si512(); 2];
+            let mut odd_halves = [_mm512_setzero_si512(); 2];
             for half in 0..2 {
                 let i = 2 * g + half;
                 let b: [__m512i; 8] =
@@ -6292,14 +6292,15 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
                 };
                 let l = _mm512_permutexvar_epi8(bt, plane(0));
                 let hh = _mm512_permutexvar_epi8(bt, plane(1));
-                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
-                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+                even_halves[half] = _mm512_unpacklo_epi64(l, hh);
+                odd_halves[half] = _mm512_unpackhi_epi64(l, hh);
             }
+            // Select lane pairs (0,2) or (1,3) from consecutive halves.
             let dst = out.cast::<__m512i>().add(g);
-            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
-            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
-            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
-            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+            _mm512_storeu_si512(dst, _mm512_shuffle_i32x4::<0x88>(even_halves[0], even_halves[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_shuffle_i32x4::<0x88>(odd_halves[0], odd_halves[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_shuffle_i32x4::<0xdd>(even_halves[0], even_halves[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_shuffle_i32x4::<0xdd>(odd_halves[0], odd_halves[1]));
         }
 
         if WRITE_CANONICAL {
