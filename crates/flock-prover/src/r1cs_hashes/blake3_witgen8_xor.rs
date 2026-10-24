@@ -394,6 +394,86 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
     }
 }
 
+// Canonical 27-product tensor over F2[e0,e1,e2]/(e0^2,e1^2,e2^2).
+// Compose the input/output superset transforms and factor their shared XORs.
+// Coefficient matrices are the existing transformed bank, in the same order.
+// Declared-register XOR helpers keep shared input expressions in registers.
+#[inline(always)] unsafe fn vxor(a:__m512i,b:__m512i)->__m512i{unsafe{let o;core::arch::asm!("vpxorq {o}, {a}, {b}",o=out(zmm_reg)o,a=in(zmm_reg)a,b=in(zmm_reg)b,options(pure,nomem,nostack,preserves_flags));o}}
+#[inline(always)] unsafe fn vxor3(mut a:__m512i,b:__m512i,c:__m512i)->__m512i{unsafe{core::arch::asm!("vpternlogq {a}, {b}, {c}, 0x96",a=inout(zmm_reg)a,b=in(zmm_reg)b,c=in(zmm_reg)c,options(pure,nomem,nostack,preserves_flags));a}}
+#[inline(always)] unsafe fn affine_factored27(p:*const u64,m:*const u64)->[__m512i;8]{unsafe{
+let v0=_mm512_set1_epi64(*p.add(0) as i64);
+let v1=_mm512_set1_epi64(*p.add(1) as i64);
+let v2=_mm512_set1_epi64(*p.add(2) as i64);
+let v3=_mm512_set1_epi64(*p.add(3) as i64);
+let v4=_mm512_set1_epi64(*p.add(4) as i64);
+let v5=_mm512_set1_epi64(*p.add(5) as i64);
+let v6=_mm512_set1_epi64(*p.add(6) as i64);
+let v7=_mm512_set1_epi64(*p.add(7) as i64);
+let v8=vxor(v6,v7);
+let v9=vxor3(v4,v5,v8);
+let v10=vxor(v5,v7);
+let v11=vxor(v2,v3);
+let x1=vxor3(vxor(v0,v1),v9,v11);
+let x2=vxor3(v1,v3,v10);
+let x4=vxor(v8,v11);
+let x8=vxor(v3,v7);
+let x16=v9;
+let x32=v10;
+let x64=v8;
+let x128=v7;
+let m1=_mm512_loadu_si512(m.add(0).cast());
+let m2=_mm512_loadu_si512(m.add(8).cast());
+let m4=_mm512_loadu_si512(m.add(16).cast());
+let m8=_mm512_loadu_si512(m.add(24).cast());
+let m16=_mm512_loadu_si512(m.add(32).cast());
+let m32=_mm512_loadu_si512(m.add(40).cast());
+let m64=_mm512_loadu_si512(m.add(48).cast());
+let m128=_mm512_loadu_si512(m.add(56).cast());
+let t0=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m1);
+let t1=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m2);
+let t2=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m4);
+let t3=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m8);
+let t4=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m16);
+let t5=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m32);
+let t6=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m64);
+let t7=_mm512_gf2p8affine_epi64_epi8::<0>(x1,m128);
+let t8=_mm512_gf2p8affine_epi64_epi8::<0>(x2,m1);
+let t9=_mm512_gf2p8affine_epi64_epi8::<0>(x2,m4);
+let t10=_mm512_gf2p8affine_epi64_epi8::<0>(x2,m16);
+let t11=_mm512_gf2p8affine_epi64_epi8::<0>(x2,m64);
+let t12=_mm512_gf2p8affine_epi64_epi8::<0>(x4,m1);
+let t13=_mm512_gf2p8affine_epi64_epi8::<0>(x4,m2);
+let t14=_mm512_gf2p8affine_epi64_epi8::<0>(x4,m16);
+let t15=_mm512_gf2p8affine_epi64_epi8::<0>(x4,m32);
+let t16=_mm512_gf2p8affine_epi64_epi8::<0>(x8,m1);
+let t17=_mm512_gf2p8affine_epi64_epi8::<0>(x8,m16);
+let t18=_mm512_gf2p8affine_epi64_epi8::<0>(x16,m1);
+let t19=_mm512_gf2p8affine_epi64_epi8::<0>(x16,m2);
+let t20=_mm512_gf2p8affine_epi64_epi8::<0>(x16,m4);
+let t21=_mm512_gf2p8affine_epi64_epi8::<0>(x16,m8);
+let t22=_mm512_gf2p8affine_epi64_epi8::<0>(x32,m1);
+let t23=_mm512_gf2p8affine_epi64_epi8::<0>(x32,m4);
+let t24=_mm512_gf2p8affine_epi64_epi8::<0>(x64,m1);
+let t25=_mm512_gf2p8affine_epi64_epi8::<0>(x64,m2);
+let t26=_mm512_gf2p8affine_epi64_epi8::<0>(x128,m1);
+let t27=_mm512_ternarylogic_epi64::<0x96>(t23,t25,t26);
+let t28=_mm512_ternarylogic_epi64::<0x96>(t17,t21,t27);
+let t29=_mm512_ternarylogic_epi64::<0x96>(t11,t15,t28);
+let t30=_mm512_xor_si512(t7,t29);
+let t31=_mm512_ternarylogic_epi64::<0x96>(t20,t24,t30);
+let t32=_mm512_ternarylogic_epi64::<0x96>(t10,t19,t22);
+let t33=_mm512_ternarylogic_epi64::<0x96>(t9,t13,t16);
+let t34=_mm512_ternarylogic_epi64::<0x96>(t6,t14,t31);
+let t35=_mm512_xor_si512(t5,t32);
+let t36=_mm512_xor_si512(t3,t33);
+let t37=_mm512_ternarylogic_epi64::<0x96>(t18,t34,t35);
+let t38=_mm512_ternarylogic_epi64::<0x96>(t2,t12,t36);
+let t39=_mm512_xor_si512(t30,t36);
+let t40=_mm512_xor_si512(t4,t37);
+let t41=_mm512_xor_si512(t1,t8);
+[_mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(t0,t38),t40,t41),_mm512_ternarylogic_epi64::<0x96>(t35,t39,t41),_mm512_xor_si512(t34,t38),t39,t40,_mm512_xor_si512(t30,t35),t34,t30]
+}}
+
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
 #[inline(never)]
@@ -402,8 +482,8 @@ unsafe fn row_product<const MODE: u8, const FIRST: bool>(
     acc: &mut [__m512i; 8],
 ) {
     unsafe {
-        let av = affine_conv(ap, ma, 0);
-        let bv = affine_conv(bp, mb, MODE);
+        let av = if MODE == 0 { affine_factored27(ap, ma.add(64)) } else { affine_conv(ap, ma, 0) };
+        let bv = if MODE == 0 { affine_factored27(bp, mb.add(64)) } else { affine_conv(bp, mb, MODE) };
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
                 let value = _mm512_gf2p8mul_epi8(av[i], bv[i]);
