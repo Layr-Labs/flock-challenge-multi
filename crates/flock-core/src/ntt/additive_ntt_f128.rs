@@ -1487,7 +1487,7 @@ unsafe fn st_fmp_fold4(
     r: usize,
     lanes4_tail: usize,
     stage_perm: bool,
-    tw4: &[[F128; 15]],
+    tw4: &[kernels::FourBlock],
 ) {
     let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
@@ -1498,7 +1498,7 @@ unsafe fn st_fmp_fold4(
             let tw = &tw4[block];
             for j in 0..4 {
                 let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                kernels::butterfly_fused_4layer_row(
+                kernels::butterfly_fused_4layer_cached(
                     region.add(j * g4_base * row_len),
                     g4_stride,
                     row_len,
@@ -2221,7 +2221,7 @@ impl AdditiveNttF128 {
         };
 
         // Per-block twiddles for the fused-four levels (layer..layer+4).
-        let tw4: Vec<[F128; 15]> = (0..num_blocks)
+        let tw4: Vec<kernels::FourBlock> = (0..num_blocks)
             .map(|block| {
                 let mut tw = [F128 { lo: 0, hi: 0 }; 15];
                 tw[0] = self.twiddle(layer, block);
@@ -2234,7 +2234,7 @@ impl AdditiveNttF128 {
                 for s in 0..8 {
                     tw[7 + s] = self.twiddle(layer + 3, 8 * block + s);
                 }
-                tw
+                kernels::FourBlock::new(tw)
             })
             .collect();
 
@@ -2267,7 +2267,7 @@ impl AdditiveNttF128 {
                 for j in 0..4 {
                     // The incumbent fused-four row group is r' = r + j·S.
                     let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
+                    kernels::butterfly_fused_4layer_cached(
                         buf.as_mut_ptr(),
                         4,
                         row_len,
@@ -2432,7 +2432,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         lanes4_tail: usize,
         stage_perm: bool,
-        tw4: &[[F128; 15]],
+        tw4: &[kernels::FourBlock],
         tw2: &[[[F128; 3]; 16]],
     ) {
         debug_assert_eq!(row_len, 64);
@@ -2453,7 +2453,7 @@ impl AdditiveNttF128 {
                 let tw = &tw4[block];
                 for j in 0..4 {
                     let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
-                    kernels::butterfly_fused_4layer_row(
+                    kernels::butterfly_fused_4layer_cached(
                         region.add(j * g4_base * row_len),
                         g4_stride,
                         row_len,
@@ -2659,7 +2659,7 @@ impl AdditiveNttF128 {
         let seed_right = seed_tw[0][2];
         let seed_dense = seed_tw[1];
 
-        let tw4: Vec<[F128; 15]> = (0..8)
+        let tw4: Vec<kernels::FourBlock> = (0..8)
             .map(|block| {
                 let mut tw = [F128 { lo: 0, hi: 0 }; 15];
                 tw[0] = self.twiddle(LAYER, block);
@@ -2672,7 +2672,7 @@ impl AdditiveNttF128 {
                 for s in 0..8 {
                     tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
                 }
-                tw
+                kernels::FourBlock::new(tw)
             })
             .collect();
 
@@ -2956,7 +2956,7 @@ impl AdditiveNttF128 {
                     let tw = &tw4[block];
                     for j in 0..4 {
                         let lanes4 = row_lanes(r + j * sub_stride, num_ntts, lanes4_tail);
-                        kernels::butterfly_fused_4layer_row(
+                        kernels::butterfly_fused_4layer_cached(
                             region.add(j * g4_base * row_len),
                             g4_stride,
                             row_len,
@@ -4608,6 +4608,44 @@ unsafe fn butterfly_interleaved_fused_4layer_rows_x86(
     odd_tail: usize,
     hint: u8,
 ) {
+    // The twiddles are identical for every r in this block. Build companions
+    // once, retain original driver for exact same-binary arithmetic rollback.
+    if let Some(prepared) = unsafe { kernels::prepare_four(t) } {
+        let base = block.as_mut_ptr();
+        for r in 0..sixteenth {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            unsafe {
+                if hint == 0 || r + 1 >= sixteenth {
+                    kernels::row_prepared::<0>(
+                        base, sixteenth, num_ntts, lanes, r, t, 0, &prepared,
+                    );
+                } else if hint == 1 {
+                    kernels::row_prepared::<1>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                        &prepared,
+                    );
+                } else {
+                    kernels::row_prepared::<2>(
+                        base,
+                        sixteenth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        t,
+                        r + 1,
+                        &prepared,
+                    );
+                }
+            }
+        }
+        return;
+    }
     butterfly_interleaved_fused_4layer_rows_fallback(block, t, sixteenth, num_ntts, odd_tail, hint)
 }
 
@@ -7089,5 +7127,107 @@ mod low_twiddle_invariant {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_four_composition_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_four_owned_and_block_drivers_match_raw_rows() {
+        let shapes = [
+            (1usize, 64usize),
+            (4, 64),
+            (8, 64),
+            (128, 64),
+            (1, 8),
+            (2, 8),
+            (4, 8),
+            (8, 8),
+            (16, 8),
+            (64, 8),
+            (128, 8),
+            (1024, 8),
+            (3, 7),
+            (2, 13),
+            (5, 16),
+        ];
+        let mut state = 0x173529ad618203efu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let guard = F128::new(0x85349617a2834619, 0x6396517b35612893);
+        let mut cases = 0usize;
+        for (sixteenth, num_ntts) in shapes {
+            for hint in 0..3u8 {
+                for tail in [0usize, num_ntts - 1] {
+                    if tail != 0 && sixteenth % 2 != 0 {
+                        continue;
+                    }
+                    for pattern in 0..3 {
+                        let offset = 4 + cases % 4;
+                        let n = 16 * sixteenth * num_ntts;
+                        let mut original = vec![guard; offset + n + 4];
+                        for v in &mut original[offset..offset + n] {
+                            *v = F128::new(next(), next());
+                        }
+                        let tw = std::array::from_fn(|_| match pattern {
+                            0 => F128::ZERO,
+                            1 => F128::ONE,
+                            _ => F128::new(next(), next()),
+                        });
+                        let mut expected = original.clone();
+                        butterfly_interleaved_fused_4layer_rows_fallback(
+                            &mut expected[offset..offset + n],
+                            &tw,
+                            sixteenth,
+                            num_ntts,
+                            tail,
+                            hint,
+                        );
+                        let mut block = original.clone();
+                        butterfly_interleaved_fused_4layer_rows(
+                            &mut block[offset..offset + n],
+                            &tw,
+                            sixteenth,
+                            num_ntts,
+                            tail,
+                            hint,
+                        );
+                        assert_eq!(
+                            block, expected,
+                            "block s={sixteenth} nn={num_ntts} h={hint} tail={tail} p={pattern}"
+                        );
+                        let owned = kernels::FourBlock::new(tw);
+                        let mut cached = original;
+                        for r in 0..sixteenth {
+                            // Each row group is disjoint and stays in the guarded block.
+                            unsafe {
+                                kernels::butterfly_fused_4layer_cached(
+                                    cached.as_mut_ptr().add(offset),
+                                    sixteenth,
+                                    num_ntts,
+                                    row_lanes(r, num_ntts, tail),
+                                    r,
+                                    &owned,
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            cached, expected,
+                            "owned s={sixteenth} nn={num_ntts} h={hint} tail={tail} p={pattern}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{cases} complete prepared-four block and owned-table cases matched raw rows with guards"
+        );
     }
 }

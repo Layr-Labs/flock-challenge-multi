@@ -286,10 +286,29 @@ impl LinearFoldPlan {
 
 /// Root fold preparation, shared by C and AB at their distinct Fiat-Shamir
 /// points. GFNI selects roots from canonical tiles; other targets compact them.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+mod root_tile_cache;
+
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
     source: RootFoldStorage,
     k_log: usize,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    cached_tiles: std::sync::OnceLock<root_tile_cache::RootTileCache>,
 }
 
 enum RootFoldStorage {
@@ -332,6 +351,15 @@ impl RootFoldSource {
                     plan,
                     source: RootFoldStorage::Splice(splice),
                     k_log,
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vbmi",
+                        target_feature = "gfni",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    cached_tiles: std::sync::OnceLock::new(),
                 };
             }
         }
@@ -388,6 +416,15 @@ impl RootFoldSource {
             plan,
             source: RootFoldStorage::Packed(packed),
             k_log,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            cached_tiles: std::sync::OnceLock::new(),
         }
     }
 
@@ -421,7 +458,16 @@ impl RootFoldSource {
                 target_feature = "avx512vbmi",
                 target_feature = "gfni"
             ))]
-            RootFoldStorage::Splice(splice) => splice.fold(z_canonical, k, &eq8_at),
+            RootFoldStorage::Splice(splice) => {
+                #[cfg(target_feature = "vpclmulqdq")]
+                {
+                    root_tile_cache::fold(self, splice, z_canonical, k, &eq8_at)
+                }
+                #[cfg(not(target_feature = "vpclmulqdq"))]
+                {
+                    splice.fold(z_canonical, k, &eq8_at)
+                }
+            }
         }
     }
 
@@ -466,10 +512,20 @@ enum RootSpliceAction {
     Tail { out: usize, mask: u64 },
 }
 
+#[derive(Clone)]
 struct RootSplicePlan {
     actions: Box<[RootSpliceAction]>,
     source_bits: usize,
     root_bits: usize,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    capture: Option<root_tile_cache::Capture>,
 }
 
 impl RootSplicePlan {
@@ -536,6 +592,15 @@ impl RootSplicePlan {
             actions: actions.into_boxed_slice(),
             source_bits,
             root_bits: plan.roots.len(),
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            capture: None,
         };
         splice.check_columns(&plan.roots);
         Some(splice)
@@ -656,6 +721,7 @@ impl RootSplicePlan {
         seed_zero: bool,
         carry: &mut [u8; 512],
         pending: &mut bool,
+        tile_index: usize,
     ) {
         use core::arch::x86_64::*;
         unsafe {
@@ -682,6 +748,17 @@ impl RootSplicePlan {
                             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                                 finish(_mm512_loadu_si512(input.add(t * 128).cast()))
                             });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
                             kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                         }
                         RootSpliceAction::Start => {
@@ -724,6 +801,17 @@ impl RootSplicePlan {
                                     _mm512_mask_blend_epi8(*low_mask, hi, lo)
                                 }
                             });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
                             kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                             *pending = false;
                         }
@@ -733,6 +821,17 @@ impl RootSplicePlan {
                                 let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
                                 _mm512_maskz_mov_epi8(*mask, finish(row))
                             });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
                             kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                         }
                     }
@@ -3040,6 +3139,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                                 first_tile,
                                 splice_carry,
                                 &mut splice_pending,
+                                tile,
                             );
                             continue;
                         }
@@ -3103,6 +3203,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             first_tile,
                             splice_carry,
                             &mut splice_pending,
+                            tile,
                         );
                     } else {
                         splice.fold_chunk::<false>(
@@ -3113,6 +3214,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             first_tile,
                             splice_carry,
                             &mut splice_pending,
+                            tile,
                         );
                     }
                     q += 1;
@@ -3132,6 +3234,20 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
         #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
         debug_assert!(!splice_pending, "root pair must finish within its tile");
         first_tile = false;
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    if root_splice.is_some_and(|p| p.capture.is_some()) {
+        // Publish this worker's non-temporal cache stores before the Rayon join.
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
     }
     *worker_active = u8::from(!first_tile);
 }
@@ -6553,6 +6669,15 @@ fn root_preselect_matrix_domain_matches_scalar() {
             .into_boxed_slice(),
             source_bits: 305,
             root_bits: 241,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            capture: None,
         };
         plan.check_columns(&roots);
         for case in 0..4 {
@@ -6640,6 +6765,7 @@ fn root_preselect_matrix_domain_matches_scalar() {
                                         seeded,
                                         &mut carry,
                                         &mut pending,
+                                        0,
                                     );
                                 } else {
                                     plan.fold_chunk::<false>(
@@ -6650,6 +6776,7 @@ fn root_preselect_matrix_domain_matches_scalar() {
                                         seeded,
                                         &mut carry,
                                         &mut pending,
+                                        0,
                                     );
                                 }
                             }
