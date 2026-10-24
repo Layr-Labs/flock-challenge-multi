@@ -381,16 +381,13 @@ pub(super) unsafe fn fold64_banked_nested(
         let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
 
-        #[repr(align(64))]
-        struct AlignedM4(core::mem::MaybeUninit<[__m512i; 4]>);
-        let mut m4_buf = AlignedM4(core::mem::MaybeUninit::uninit());
-        let m4_ptr = core::hint::black_box(m4_buf.0.as_mut_ptr() as *mut __m512i);
-
         let mut t = 0usize;
         while t < quads {
-            let mut slot_idx = 0usize;
-            while slot_idx < 4 {
-                let base_elem = 64 * (t + slot_idx);
+            // Constant slot calls expose all four results directly, without
+            // materializing an array between weighted sums and pair binds.
+            macro_rules! slot {
+                ($slot_idx:expr) => {{
+                let base_elem = 64 * (t + $slot_idx);
                 if pf_ahead != 0 {
                     let ahead = base_elem + pf_ahead;
                     if ahead <= pf_limit {
@@ -422,12 +419,12 @@ pub(super) unsafe fn fold64_banked_nested(
                     acc.mul_acc(u2, wb[4 * g + 2]);
                     acc.mul_acc(u3, wb[4 * g + 3]);
                 }
-                _mm512_store_si512(m4_ptr.add(slot_idx), acc.reduce_lanes());
-                slot_idx += 1;
+                acc.reduce_lanes()
+                }};
             }
 
-            let v0 = _mm512_load_si512(m4_ptr);
-            let v1 = _mm512_load_si512(m4_ptr.add(1));
+            let v0 = slot!(0);
+            let v1 = slot!(1);
             let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
             let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
             let mid01 = _mm512_xor_si512(
@@ -435,8 +432,8 @@ pub(super) unsafe fn fold64_banked_nested(
                 ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
             );
 
-            let v2 = _mm512_load_si512(m4_ptr.add(2));
-            let v3 = _mm512_load_si512(m4_ptr.add(3));
+            let v2 = slot!(2);
+            let v3 = slot!(3);
             let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
             let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
             let mid23 = _mm512_xor_si512(
