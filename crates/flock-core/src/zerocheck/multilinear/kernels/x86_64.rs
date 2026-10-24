@@ -5407,82 +5407,56 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast(
         let mp = m.1.as_ptr() as *const u64;
         let dst = out as *mut __m512i;
 
-        // ---- affine + reduce, one half at a time ---------------------------
-        // Both passes are expanded HERE, in this function, rather than
-        // through a closure LLVM outlines and calls twice: `h` stays a
-        // constant, so every octet read and every output store keeps its
-        // immediate displacement and the whole call is one straight-line
-        // block, exactly the ledgered one.
-        macro_rules! pass {
-            ($h:expr) => {{
-                const H: usize = $h;
-                // OPAQUE MATRIX BASE, per pass. The two passes read the same 64
-                // matrix ZMMs, so a transparent base lets LLVM common them up,
-                // hold all 64 live across both passes, and spill the whole 4 KiB
-                // table to the stack — 86 spill stores per call and every affine
-                // demoted to a register operand. Per-pass opacity keeps each
-                // affine's matrix as its own `m512` memory operand, which is
-                // free: the load rides the affine's own uop pair.
-                let mp = core::hint::black_box(mp);
-                // Residue `a`, output-byte half `hh`: eight affines reduce to the
-                // pair `(v2, v3)`, and the running pair absorbs it in one more
-                // ternlog — sixteen XOR-class ops per (half, hh), the floor of a
-                // 32-input tree, with the four-residue reduction inside it.
-                //
-                // BOTH OUTPUT-BYTE HALVES ARE FOLDED BEFORE EITHER IS REDUCED, AND
-                // THAT COSTS NOTHING AND SAVES ELEVEN UOPS. Reduced half by half,
-                // the eight affine results of `(a, hh)` are born and consumed
-                // inside one four-op window while the eight broadcasts of residue
-                // `a` and both accumulator pairs are still live, and the register
-                // allocator spills: the emitted body pays four stack stores and
-                // seven reloads per call that the map never asks for. Materialising
-                // all sixteen results of the residue first widens the window the
-                // scheduler has to place the reduction in without widening the peak
-                // live set. The uop map and the port split are untouched: 128
-                // affines, 32 port-5 shuffles, 64 XOR-class, 64 broadcasts.
-                let mut accp = [_mm512_setzero_si512(); 2];
-                let mut accq = [_mm512_setzero_si512(); 2];
-                for a in 0..4usize {
-                    let b: [__m512i; 8] = core::array::from_fn(|j| {
-                        _mm512_set1_epi64(*rp.add(32 * H + 8 * a + j) as i64)
-                    });
-                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
-                        core::array::from_fn(|j| {
-                            _mm512_gf2p8affine_epi64_epi8::<0>(
-                                b[j],
-                                _mm512_loadu_si512(
-                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
-                                ),
-                            )
-                        })
-                    });
-                    for hh in 0..2usize {
-                        let g = f[hh];
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
-                        if a == 0 {
-                            accp[hh] = v2;
-                            accq[hh] = v3;
-                        } else {
-                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
-                            accq[hh] = v3;
-                        }
+        let mp = core::hint::black_box(mp);
+        let mut acc = [[_mm512_setzero_si512(); 2]; 2];
+        macro_rules! pair_halves {
+            ($a:expr, $j:expr) => {{
+                let b: [[__m512i; 2]; 2] = core::array::from_fn(|h| {
+                    core::array::from_fn(|d| {
+                        _mm512_set1_epi64(*rp.add(32 * h + 8 * $a + $j + d) as i64)
+                    })
+                });
+                for hh in 0..2usize {
+                    let m0 = _mm512_loadu_si512(
+                        mp.add(8 * (32 * hh + 8 * $a + $j)) as *const __m512i,
+                    );
+                    let m1 = _mm512_loadu_si512(
+                        mp.add(8 * (32 * hh + 8 * $a + $j + 1)) as *const __m512i,
+                    );
+                    for h in 0..2usize {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(b[h][0], m0);
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(b[h][1], m1);
+                        acc[h][hh] = _mm512_ternarylogic_epi64::<0x96>(acc[h][hh], g0, g1);
                     }
                 }
-                // `r{0,1}.byte[8k + t]` = output byte `8·hh + k` of super-row
-                // 8h+t; the byte transpose turns that into qword `t` = one half
-                // of `out[8h + t]`, and the interleave rebuilds the `F128`s.
-                let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
-                let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
-                let a0 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[0], accq[0]));
-                let a1 = _mm512_permutexvar_epi8(bt, _mm512_xor_si512(accp[1], accq[1]));
-                _mm512_storeu_si512(dst.add(2 * H), _mm512_permutex2var_epi64(a0, il_lo, a1));
-                _mm512_storeu_si512(dst.add(2 * H + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
             }};
         }
-        pass!(0);
-        pass!(1);
+        pair_halves!(0, 0);
+        pair_halves!(0, 2);
+        pair_halves!(0, 4);
+        pair_halves!(0, 6);
+        pair_halves!(1, 0);
+        pair_halves!(1, 2);
+        pair_halves!(1, 4);
+        pair_halves!(1, 6);
+        pair_halves!(2, 0);
+        pair_halves!(2, 2);
+        pair_halves!(2, 4);
+        pair_halves!(2, 6);
+        pair_halves!(3, 0);
+        pair_halves!(3, 2);
+        pair_halves!(3, 4);
+        pair_halves!(3, 6);
+        // 8h+t; the byte transpose turns that into qword `t` = one half
+        // of `out[8h + t]`, and the interleave rebuilds the `F128`s.
+        let il_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let il_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        for h in 0..2usize {
+            let a0 = _mm512_permutexvar_epi8(bt, acc[h][0]);
+            let a1 = _mm512_permutexvar_epi8(bt, acc[h][1]);
+            _mm512_storeu_si512(dst.add(2 * h), _mm512_permutex2var_epi64(a0, il_lo, a1));
+            _mm512_storeu_si512(dst.add(2 * h + 1), _mm512_permutex2var_epi64(a0, il_hi, a1));
+        }
     }
 }
 
@@ -5680,54 +5654,45 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
         let out_odd = _mm512_loadu_si512(C4_LM_OUT_ODD.as_ptr() as *const __m512i);
 
-        // ---- affine + reduce, one pass at a time -----------------------------
-        // Identical to the incumbent's pass body; only the output assembly
-        // differs (lane-major, fused with the byte transpose).
-        macro_rules! pass {
-            ($p:expr) => {{
-                const P: usize = $p;
-                let mp = core::hint::black_box(mp);
-                let mut accp = [_mm512_setzero_si512(); 2];
-                let mut accq = [_mm512_setzero_si512(); 2];
-                for a in 0..4usize {
-                    let b: [__m512i; 8] = core::array::from_fn(|j| {
-                        _mm512_set1_epi64(*rp.add(32 * P + 8 * a + j) as i64)
-                    });
-                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
-                        core::array::from_fn(|j| {
-                            _mm512_gf2p8affine_epi64_epi8::<0>(
-                                b[j],
-                                _mm512_loadu_si512(
-                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
-                                ),
-                            )
-                        })
-                    });
-                    for hh in 0..2usize {
-                        let g = f[hh];
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
-                        if a == 0 {
-                            accp[hh] = v2;
-                            accq[hh] = v3;
-                        } else {
-                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
-                            accq[hh] = v3;
-                        }
+        let mut acc = [[_mm512_setzero_si512(); 2]; 2];
+        macro_rules! pair148 {
+            ($a:expr, $j:expr) => {{
+                let b: [[__m512i; 2]; 2] = core::array::from_fn(|p| {
+                    core::array::from_fn(|d| {
+                        _mm512_set1_epi64(*rp.add(32 * p + 8 * $a + $j + d) as i64)
+                    })
+                });
+                for hh in 0..2usize {
+                    let m0 = _mm512_loadu_si512(mp.add(8 * (32 * hh + 8 * $a + $j)) as *const __m512i);
+                    let m1 = _mm512_loadu_si512(mp.add(8 * (32 * hh + 8 * $a + $j + 1)) as *const __m512i);
+                    for p in 0..2usize {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(b[p][0], m0);
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(b[p][1], m1);
+                        acc[p][hh] = _mm512_ternarylogic_epi64::<0x96>(acc[p][hh], g0, g1);
                     }
                 }
-                // `r{0,1}.byte[8k + s]` = output byte `8·hh + k` of the output
-                // in slot `s`; slots `2u` / `2u + 1` are lane `u` of ZMMs
-                // `2p` / `2p + 1`.
-                let r0 = _mm512_xor_si512(accp[0], accq[0]);
-                let r1 = _mm512_xor_si512(accp[1], accq[1]);
-                _mm512_storeu_si512(dst.add(2 * P), _mm512_permutex2var_epi8(r0, out_even, r1));
-                _mm512_storeu_si512(dst.add(2 * P + 1), _mm512_permutex2var_epi8(r0, out_odd, r1));
             }};
         }
-        pass!(0);
-        pass!(1);
+        pair148!(0, 0);
+        pair148!(0, 2);
+        pair148!(0, 4);
+        pair148!(0, 6);
+        pair148!(1, 0);
+        pair148!(1, 2);
+        pair148!(1, 4);
+        pair148!(1, 6);
+        pair148!(2, 0);
+        pair148!(2, 2);
+        pair148!(2, 4);
+        pair148!(2, 6);
+        pair148!(3, 0);
+        pair148!(3, 2);
+        pair148!(3, 4);
+        pair148!(3, 6);
+        for p in 0..2usize {
+            _mm512_storeu_si512(dst.add(2 * p), _mm512_permutex2var_epi8(acc[p][0], out_even, acc[p][1]));
+            _mm512_storeu_si512(dst.add(2 * p + 1), _mm512_permutex2var_epi8(acc[p][0], out_odd, acc[p][1]));
+        }
     }
 }
 
