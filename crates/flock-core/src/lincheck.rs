@@ -646,7 +646,7 @@ impl RootSplicePlan {
         not(target_feature = "vpclmulqdq"),
         target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
     )]
-    #[inline]
+    #[inline(never)]
     unsafe fn fold_chunk<const RAW: bool>(
         &self,
         q: usize,
@@ -676,13 +676,13 @@ impl RootSplicePlan {
                 ($h:expr) => {{
                     let half: usize = $h;
                     let input = tile.add(half * 64);
-                    match &self.actions[2 * q + half] {
-                        RootSpliceAction::Skip => {}
+                    let ready = match &self.actions[2 * q + half] {
+                        RootSpliceAction::Skip => None,
                         RootSpliceAction::Full(out) => {
                             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                                 finish(_mm512_loadu_si512(input.add(t * 128).cast()))
                             });
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                            Some((*out, rows))
                         }
                         RootSpliceAction::Start => {
                             debug_assert!(!*pending);
@@ -694,6 +694,7 @@ impl RootSplicePlan {
                                 );
                             }
                             *pending = true;
+                            None
                         }
                         RootSpliceAction::End { out, low_mask } => {
                             debug_assert!(*pending);
@@ -724,8 +725,8 @@ impl RootSplicePlan {
                                     _mm512_mask_blend_epi8(*low_mask, hi, lo)
                                 }
                             });
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                             *pending = false;
+                            Some((*out, rows))
                         }
                         RootSpliceAction::Tail { out, mask } => {
                             debug_assert!(!*pending);
@@ -733,8 +734,11 @@ impl RootSplicePlan {
                                 let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
                                 _mm512_maskz_mov_epi8(*mask, finish(row))
                             });
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                            Some((*out, rows))
                         }
+                    };
+                    if let Some((out, rows)) = ready {
+                        kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                     }
                 }};
             }
@@ -6665,3 +6669,5 @@ fn root_preselect_matrix_domain_matches_scalar() {
         }
     }
 }
+#[allow(dead_code)]
+const GAUNTLET_REDRAW_491da7c4_20261024T085953Z: u8 = 0;
