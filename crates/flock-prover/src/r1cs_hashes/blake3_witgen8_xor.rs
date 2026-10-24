@@ -396,8 +396,152 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
 
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+mod all_registers {
+use core::arch::x86_64::__m512i;
+core::arch::global_asm!(include_str!("blake3_witgen8_xor_all_regs.S"));
+unsafe extern "C"{
+fn flock_projection_mode00_register_add();
+fn flock_projection_mode00_register_first();
+fn flock_projection_mode01_register_add();
+fn flock_projection_mode01_register_first();
+fn flock_projection_mode02_register_add();
+fn flock_projection_mode02_register_first();
+fn flock_projection_mode03_register_add();
+fn flock_projection_mode03_register_first();
+fn flock_projection_mode04_register_add();
+fn flock_projection_mode04_register_first();
+fn flock_projection_mode05_register_add();
+fn flock_projection_mode05_register_first();
+fn flock_projection_mode06_register_add();
+fn flock_projection_mode06_register_first();
+fn flock_projection_mode07_register_add();
+fn flock_projection_mode07_register_first();
+fn flock_projection_mode08_register_add();
+fn flock_projection_mode08_register_first();
+fn flock_projection_mode09_register_add();
+fn flock_projection_mode09_register_first();
+fn flock_projection_mode10_register_add();
+fn flock_projection_mode10_register_first();
+fn flock_projection_mode11_register_add();
+fn flock_projection_mode11_register_first();
+fn flock_projection_mode12_register_add();
+fn flock_projection_mode12_register_first();
+fn flock_projection_mode13_register_add();
+fn flock_projection_mode13_register_first();
+fn flock_projection_mode14_register_add();
+fn flock_projection_mode14_register_first();
+fn flock_projection_mode15_register_add();
+fn flock_projection_mode15_register_first();
+}
+#[inline(always)]
+pub(super) unsafe fn accumulate<const MODE:u8,const FIRST:bool>(ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]){
+    // Each call exposes ordinary memory, flags and stack effects. Its private
+    // arithmetic body preserves GPRs and returns all eight accumulator vectors.
+    macro_rules! invoke {($first:path,$add:path)=>{unsafe{if FIRST{
+        core::arch::asm!("call {leaf}",leaf=sym $first,
+        in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+lateout("zmm24")acc[0],
+lateout("zmm25")acc[1],
+lateout("zmm26")acc[2],
+lateout("zmm27")acc[3],
+lateout("zmm28")acc[4],
+lateout("zmm29")acc[5],
+lateout("zmm30")acc[6],
+lateout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}else{
+core::arch::asm!("call {leaf}",leaf=sym $add,in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+inout("zmm24")acc[0],
+inout("zmm25")acc[1],
+inout("zmm26")acc[2],
+inout("zmm27")acc[3],
+inout("zmm28")acc[4],
+inout("zmm29")acc[5],
+inout("zmm30")acc[6],
+inout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}}}}
+match MODE{
+0=>invoke!(flock_projection_mode00_register_first,flock_projection_mode00_register_add),
+1=>invoke!(flock_projection_mode01_register_first,flock_projection_mode01_register_add),
+2=>invoke!(flock_projection_mode02_register_first,flock_projection_mode02_register_add),
+3=>invoke!(flock_projection_mode03_register_first,flock_projection_mode03_register_add),
+4=>invoke!(flock_projection_mode04_register_first,flock_projection_mode04_register_add),
+5=>invoke!(flock_projection_mode05_register_first,flock_projection_mode05_register_add),
+6=>invoke!(flock_projection_mode06_register_first,flock_projection_mode06_register_add),
+7=>invoke!(flock_projection_mode07_register_first,flock_projection_mode07_register_add),
+8=>invoke!(flock_projection_mode08_register_first,flock_projection_mode08_register_add),
+9=>invoke!(flock_projection_mode09_register_first,flock_projection_mode09_register_add),
+10=>invoke!(flock_projection_mode10_register_first,flock_projection_mode10_register_add),
+11=>invoke!(flock_projection_mode11_register_first,flock_projection_mode11_register_add),
+12=>invoke!(flock_projection_mode12_register_first,flock_projection_mode12_register_add),
+13=>invoke!(flock_projection_mode13_register_first,flock_projection_mode13_register_add),
+14=>invoke!(flock_projection_mode14_register_first,flock_projection_mode14_register_add),
+15=>invoke!(flock_projection_mode15_register_first,flock_projection_mode15_register_add),
+_=>unreachable!(),
+}
+}
+}
+
+// Private vector-returning calls keep the complete accumulator independent
+// of the outlined portable arithmetic's pointer-based calling convention.
+#[inline(always)]
+unsafe fn row_product<const MODE:u8,const FIRST:bool>(ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]){
+    #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+    unsafe { all_registers::accumulate::<MODE,FIRST>(ap,bp,ma,mb,acc); }
+    #[cfg(not(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")))]
+    unsafe { row_product_fallback::<MODE,FIRST>(ap,bp,ma,mb,acc); }
+}
+
 #[inline(never)]
-unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+unsafe fn row_product_fallback<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
@@ -448,8 +592,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(1, a[1], b[1]);
         match mode(BLK, 6) {
@@ -474,8 +621,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(2, a[2], b[2]);
         match mode(BLK, 5) {
@@ -500,8 +650,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(3, a[3], b[3]);
         match mode(BLK, 4) {
@@ -526,8 +679,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(4, a[4], b[4]);
         match mode(BLK, 3) {
@@ -552,8 +708,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(5, a[5], b[5]);
         match mode(BLK, 2) {
@@ -578,8 +737,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(6, a[6], b[6]);
         match mode(BLK, 1) {
@@ -604,8 +766,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(7, a[7], b[7]);
         match mode(BLK, 0) {
@@ -630,8 +795,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
