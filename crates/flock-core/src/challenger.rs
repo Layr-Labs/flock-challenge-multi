@@ -910,11 +910,17 @@ mod blake3_pow_avx512 {
         debug_assert!((1..=32).contains(&bits));
         // SAFETY: the enclosing cfg gates this module on compile-time
         // AVX-512F + BW, so every intrinsic below is available.
-        unsafe { scan_impl(state_digest, start, len, bits) }
+        // Prove the high nonce word is zero for every active lane. The
+        // final padded lanes may cross the boundary, but are masked out.
+        if start < (1u64 << 32) && start.saturating_add(len) <= (1u64 << 32) {
+            unsafe { scan_impl::<true>(state_digest, start, len, bits) }
+        } else {
+            unsafe { scan_impl::<false>(state_digest, start, len, bits) }
+        }
     }
 
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn scan_impl(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+    unsafe fn scan_impl<const ZERO_HIGH: bool>(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
         let zero = _mm512_setzero_si512();
         let mut dig = [zero; 8];
         for (i, d) in dig.iter_mut().enumerate() {
@@ -952,7 +958,9 @@ mod blake3_pow_avx512 {
                 // carry iff the 32-bit add wrapped: lo < lo_base (unsigned)
                 let carry: __mmask16 = _mm512_cmplt_epu32_mask(lo, lo_base);
                 let hi_base = _mm512_set1_epi32((gb >> 32) as u32 as i32);
-                let hi = _mm512_mask_add_epi32(hi_base, carry, hi_base, _mm512_set1_epi32(1));
+                let hi = if ZERO_HIGH { zero } else {
+                    _mm512_mask_add_epi32(hi_base, carry, hi_base, _mm512_set1_epi32(1))
+                };
                 Msg {
                     dig,
                     n_lo: lo,
