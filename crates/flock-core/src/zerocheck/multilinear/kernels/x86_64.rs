@@ -5621,6 +5621,40 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
     dead_lines: u8,
 ) {
     use core::arch::x86_64::*;
+    // GFNI(X,M) = GFNI(I,GFNI(M,reverse_bytes(X))) per qword.
+    // Transpose only the four final XOR sums, sharing each coefficient
+    // vector across both passes. Input gathers compose the byte reversal.
+    // SAFETY: every helper call reads exactly one initialized scratch u64.
+    // The assembly only reads memory and changes its declared vector output;
+    // it does not change flags or the stack. WORD is a compile-time offset.
+    #[inline(always)]
+    unsafe fn affine_m64<const WORD: usize>(data: __m512i, mat: *const u64) -> __m512i {
+        let out: __m512i;
+        core::arch::asm!(
+            "vgf2p8affineqb {out}, {data}, qword ptr [{mat}+{offset}]{{1to8}}, 0",
+            out=lateout(zmm_reg)out,
+            data=in(zmm_reg)data,
+            mat=in(reg)mat,
+            offset=const (WORD*8),
+            options(pure,readonly,nostack,preserves_flags)
+        );
+        out
+    }
+    const fn c4_lm_dual_octet_index(e: usize) -> [i8; 64] {
+        let old = c4_lm_octet_index(e);
+        let mut out = [0i8; 64];
+        let mut i = 0;
+        while i < 64 {
+            let v = old[i ^ 7] as u8 as usize;
+            let map = [0usize, 2, 4, 6, 1, 3, 5, 7];
+            out[i] = (64 * (v / 64) + 8 * map[(v % 64) / 8] + v % 8) as i8;
+            i += 1;
+        }
+        out
+    }
+    const C4_DUAL_OCT_EVEN: [i8; 64] = c4_lm_dual_octet_index(0);
+    const C4_DUAL_OCT_ODD: [i8; 64] = c4_lm_dual_octet_index(4);
+
     // SAFETY (whole body): caller guarantees 64 readable bytes at
     // `rows.add(64 * i)` for every line not marked dead and 16 writable
     // `F128`s at `out`; the scratch is a local 512-byte array written in full
@@ -5644,26 +5678,25 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         struct Octs([u64; 64]);
         let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
         let op = octs.as_mut_ptr().cast::<u64>();
-        let oct_even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr() as *const __m512i);
-        let oct_odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr() as *const __m512i);
+        let oct_even = _mm512_loadu_si512(C4_DUAL_OCT_EVEN.as_ptr() as *const __m512i);
+        let oct_odd = _mm512_loadu_si512(C4_DUAL_OCT_ODD.as_ptr() as *const __m512i);
 
         // ---- gather, both passes, BEFORE any affine -------------------------
         // Slot order inside a pass: s = 2u + e for output 4u + 2p + e, i.e.
         // (line p even, line p odd, line p+2 even, line p+2 odd) from pair A
         // and the same from lines p+4, p+6 in pair B.
         let gather = |p: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
-            // Stage 1: qwords `{a, a + 4}` of two lines, as the incumbent.
-            let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
-            let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
-            let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
-            let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
-            let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
-            let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+            // Stage 1: select fixed 128-bit lanes from each pair of lines.
+            // Select complete 128-bit lanes; the following byte selectors
+            // compose the removed qword interleave into the same octets.
+            let p01 = _mm512_shuffle_i64x2::<0x88>(s0, s1);
+            let p23 = _mm512_shuffle_i64x2::<0xdd>(s0, s1);
+            let p45 = _mm512_shuffle_i64x2::<0x88>(s2, s3);
+            let p67 = _mm512_shuffle_i64x2::<0xdd>(s2, s3);
             let base = op.add(32 * p);
             // `oct[a].qword[j]` = chunk `j` of the eight residue-`a` rows.
-            let oct = |a: usize, v: __m512i| {
-                _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v)
-            };
+            let oct =
+                |a: usize, v: __m512i| _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v);
             oct(0, _mm512_permutex2var_epi8(p01, oct_even, p45));
             oct(1, _mm512_permutex2var_epi8(p01, oct_odd, p45));
             oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
@@ -5680,54 +5713,282 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
         let out_odd = _mm512_loadu_si512(C4_LM_OUT_ODD.as_ptr() as *const __m512i);
 
-        // ---- affine + reduce, one pass at a time -----------------------------
-        // Identical to the incumbent's pass body; only the output assembly
-        // differs (lane-major, fused with the byte transpose).
-        macro_rules! pass {
-            ($p:expr) => {{
-                const P: usize = $p;
-                let mp = core::hint::black_box(mp);
-                let mut accp = [_mm512_setzero_si512(); 2];
-                let mut accq = [_mm512_setzero_si512(); 2];
-                for a in 0..4usize {
-                    let b: [__m512i; 8] = core::array::from_fn(|j| {
-                        _mm512_set1_epi64(*rp.add(32 * P + 8 * a + j) as i64)
-                    });
-                    let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
-                        core::array::from_fn(|j| {
-                            _mm512_gf2p8affine_epi64_epi8::<0>(
-                                b[j],
-                                _mm512_loadu_si512(
-                                    mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i
-                                ),
-                            )
-                        })
-                    });
-                    for hh in 0..2usize {
-                        let g = f[hh];
-                        let v1 = _mm512_ternarylogic_epi64::<0x96>(g[0], g[1], g[2]);
-                        let v2 = _mm512_ternarylogic_epi64::<0x96>(g[3], g[4], g[5]);
-                        let v3 = _mm512_ternarylogic_epi64::<0x96>(g[6], g[7], v1);
-                        if a == 0 {
-                            accp[hh] = v2;
-                            accq[hh] = v3;
-                        } else {
-                            accp[hh] = _mm512_ternarylogic_epi64::<0x96>(accp[hh], accq[hh], v2);
-                            accq[hh] = v3;
-                        }
-                    }
-                }
-                // `r{0,1}.byte[8k + s]` = output byte `8·hh + k` of the output
-                // in slot `s`; slots `2u` / `2u + 1` are lane `u` of ZMMs
-                // `2p` / `2p + 1`.
-                let r0 = _mm512_xor_si512(accp[0], accq[0]);
-                let r1 = _mm512_xor_si512(accp[1], accq[1]);
-                _mm512_storeu_si512(dst.add(2 * P), _mm512_permutex2var_epi8(r0, out_even, r1));
-                _mm512_storeu_si512(dst.add(2 * P + 1), _mm512_permutex2var_epi8(r0, out_odd, r1));
-            }};
+        // ---- dual affine reduction with one coefficient load for both passes ----
+        let ident = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let mut accp = [_mm512_setzero_si512(); 4];
+        let mut accq = [_mm512_setzero_si512(); 4];
+        {
+            let m0_0 = _mm512_loadu_si512(mp.add(0) as *const __m512i);
+            let f0_0 = affine_m64::<0>(m0_0, rp);
+            let f2_0 = affine_m64::<32>(m0_0, rp);
+            let m1_0 = _mm512_loadu_si512(mp.add(256) as *const __m512i);
+            let f1_0 = affine_m64::<0>(m1_0, rp);
+            let f3_0 = affine_m64::<32>(m1_0, rp);
+            let m0_1 = _mm512_loadu_si512(mp.add(8) as *const __m512i);
+            let f0_1 = affine_m64::<1>(m0_1, rp);
+            let f2_1 = affine_m64::<33>(m0_1, rp);
+            let m1_1 = _mm512_loadu_si512(mp.add(264) as *const __m512i);
+            let f1_1 = affine_m64::<1>(m1_1, rp);
+            let f3_1 = affine_m64::<33>(m1_1, rp);
+            let m0_2 = _mm512_loadu_si512(mp.add(16) as *const __m512i);
+            let f0_2 = affine_m64::<2>(m0_2, rp);
+            let f2_2 = affine_m64::<34>(m0_2, rp);
+            let m1_2 = _mm512_loadu_si512(mp.add(272) as *const __m512i);
+            let f1_2 = affine_m64::<2>(m1_2, rp);
+            let f3_2 = affine_m64::<34>(m1_2, rp);
+            let v1_0 = _mm512_ternarylogic_epi64::<0x96>(f0_0, f0_1, f0_2);
+            let v1_1 = _mm512_ternarylogic_epi64::<0x96>(f1_0, f1_1, f1_2);
+            let v1_2 = _mm512_ternarylogic_epi64::<0x96>(f2_0, f2_1, f2_2);
+            let v1_3 = _mm512_ternarylogic_epi64::<0x96>(f3_0, f3_1, f3_2);
+            let m0_3 = _mm512_loadu_si512(mp.add(24) as *const __m512i);
+            let f0_3 = affine_m64::<3>(m0_3, rp);
+            let f2_3 = affine_m64::<35>(m0_3, rp);
+            let m1_3 = _mm512_loadu_si512(mp.add(280) as *const __m512i);
+            let f1_3 = affine_m64::<3>(m1_3, rp);
+            let f3_3 = affine_m64::<35>(m1_3, rp);
+            let m0_4 = _mm512_loadu_si512(mp.add(32) as *const __m512i);
+            let f0_4 = affine_m64::<4>(m0_4, rp);
+            let f2_4 = affine_m64::<36>(m0_4, rp);
+            let m1_4 = _mm512_loadu_si512(mp.add(288) as *const __m512i);
+            let f1_4 = affine_m64::<4>(m1_4, rp);
+            let f3_4 = affine_m64::<36>(m1_4, rp);
+            let m0_5 = _mm512_loadu_si512(mp.add(40) as *const __m512i);
+            let f0_5 = affine_m64::<5>(m0_5, rp);
+            let f2_5 = affine_m64::<37>(m0_5, rp);
+            let m1_5 = _mm512_loadu_si512(mp.add(296) as *const __m512i);
+            let f1_5 = affine_m64::<5>(m1_5, rp);
+            let f3_5 = affine_m64::<37>(m1_5, rp);
+            let v2_0 = _mm512_ternarylogic_epi64::<0x96>(f0_3, f0_4, f0_5);
+            accp[0] = v2_0;
+            let v2_1 = _mm512_ternarylogic_epi64::<0x96>(f1_3, f1_4, f1_5);
+            accp[1] = v2_1;
+            let v2_2 = _mm512_ternarylogic_epi64::<0x96>(f2_3, f2_4, f2_5);
+            accp[2] = v2_2;
+            let v2_3 = _mm512_ternarylogic_epi64::<0x96>(f3_3, f3_4, f3_5);
+            accp[3] = v2_3;
+            let m0_6 = _mm512_loadu_si512(mp.add(48) as *const __m512i);
+            let f0_6 = affine_m64::<6>(m0_6, rp);
+            let f2_6 = affine_m64::<38>(m0_6, rp);
+            let m1_6 = _mm512_loadu_si512(mp.add(304) as *const __m512i);
+            let f1_6 = affine_m64::<6>(m1_6, rp);
+            let f3_6 = affine_m64::<38>(m1_6, rp);
+            let m0_7 = _mm512_loadu_si512(mp.add(56) as *const __m512i);
+            let f0_7 = affine_m64::<7>(m0_7, rp);
+            let f2_7 = affine_m64::<39>(m0_7, rp);
+            let m1_7 = _mm512_loadu_si512(mp.add(312) as *const __m512i);
+            let f1_7 = affine_m64::<7>(m1_7, rp);
+            let f3_7 = affine_m64::<39>(m1_7, rp);
+            accq[0] = _mm512_ternarylogic_epi64::<0x96>(f0_6, f0_7, v1_0);
+            accq[1] = _mm512_ternarylogic_epi64::<0x96>(f1_6, f1_7, v1_1);
+            accq[2] = _mm512_ternarylogic_epi64::<0x96>(f2_6, f2_7, v1_2);
+            accq[3] = _mm512_ternarylogic_epi64::<0x96>(f3_6, f3_7, v1_3);
         }
-        pass!(0);
-        pass!(1);
+        {
+            let m0_0 = _mm512_loadu_si512(mp.add(64) as *const __m512i);
+            let f0_0 = affine_m64::<8>(m0_0, rp);
+            let f2_0 = affine_m64::<40>(m0_0, rp);
+            let m1_0 = _mm512_loadu_si512(mp.add(320) as *const __m512i);
+            let f1_0 = affine_m64::<8>(m1_0, rp);
+            let f3_0 = affine_m64::<40>(m1_0, rp);
+            let m0_1 = _mm512_loadu_si512(mp.add(72) as *const __m512i);
+            let f0_1 = affine_m64::<9>(m0_1, rp);
+            let f2_1 = affine_m64::<41>(m0_1, rp);
+            let m1_1 = _mm512_loadu_si512(mp.add(328) as *const __m512i);
+            let f1_1 = affine_m64::<9>(m1_1, rp);
+            let f3_1 = affine_m64::<41>(m1_1, rp);
+            let m0_2 = _mm512_loadu_si512(mp.add(80) as *const __m512i);
+            let f0_2 = affine_m64::<10>(m0_2, rp);
+            let f2_2 = affine_m64::<42>(m0_2, rp);
+            let m1_2 = _mm512_loadu_si512(mp.add(336) as *const __m512i);
+            let f1_2 = affine_m64::<10>(m1_2, rp);
+            let f3_2 = affine_m64::<42>(m1_2, rp);
+            let v1_0 = _mm512_ternarylogic_epi64::<0x96>(f0_0, f0_1, f0_2);
+            let v1_1 = _mm512_ternarylogic_epi64::<0x96>(f1_0, f1_1, f1_2);
+            let v1_2 = _mm512_ternarylogic_epi64::<0x96>(f2_0, f2_1, f2_2);
+            let v1_3 = _mm512_ternarylogic_epi64::<0x96>(f3_0, f3_1, f3_2);
+            let m0_3 = _mm512_loadu_si512(mp.add(88) as *const __m512i);
+            let f0_3 = affine_m64::<11>(m0_3, rp);
+            let f2_3 = affine_m64::<43>(m0_3, rp);
+            let m1_3 = _mm512_loadu_si512(mp.add(344) as *const __m512i);
+            let f1_3 = affine_m64::<11>(m1_3, rp);
+            let f3_3 = affine_m64::<43>(m1_3, rp);
+            let m0_4 = _mm512_loadu_si512(mp.add(96) as *const __m512i);
+            let f0_4 = affine_m64::<12>(m0_4, rp);
+            let f2_4 = affine_m64::<44>(m0_4, rp);
+            let m1_4 = _mm512_loadu_si512(mp.add(352) as *const __m512i);
+            let f1_4 = affine_m64::<12>(m1_4, rp);
+            let f3_4 = affine_m64::<44>(m1_4, rp);
+            let m0_5 = _mm512_loadu_si512(mp.add(104) as *const __m512i);
+            let f0_5 = affine_m64::<13>(m0_5, rp);
+            let f2_5 = affine_m64::<45>(m0_5, rp);
+            let m1_5 = _mm512_loadu_si512(mp.add(360) as *const __m512i);
+            let f1_5 = affine_m64::<13>(m1_5, rp);
+            let f3_5 = affine_m64::<45>(m1_5, rp);
+            let v2_0 = _mm512_ternarylogic_epi64::<0x96>(f0_3, f0_4, f0_5);
+            accp[0] = _mm512_ternarylogic_epi64::<0x96>(accp[0], accq[0], v2_0);
+            let v2_1 = _mm512_ternarylogic_epi64::<0x96>(f1_3, f1_4, f1_5);
+            accp[1] = _mm512_ternarylogic_epi64::<0x96>(accp[1], accq[1], v2_1);
+            let v2_2 = _mm512_ternarylogic_epi64::<0x96>(f2_3, f2_4, f2_5);
+            accp[2] = _mm512_ternarylogic_epi64::<0x96>(accp[2], accq[2], v2_2);
+            let v2_3 = _mm512_ternarylogic_epi64::<0x96>(f3_3, f3_4, f3_5);
+            accp[3] = _mm512_ternarylogic_epi64::<0x96>(accp[3], accq[3], v2_3);
+            let m0_6 = _mm512_loadu_si512(mp.add(112) as *const __m512i);
+            let f0_6 = affine_m64::<14>(m0_6, rp);
+            let f2_6 = affine_m64::<46>(m0_6, rp);
+            let m1_6 = _mm512_loadu_si512(mp.add(368) as *const __m512i);
+            let f1_6 = affine_m64::<14>(m1_6, rp);
+            let f3_6 = affine_m64::<46>(m1_6, rp);
+            let m0_7 = _mm512_loadu_si512(mp.add(120) as *const __m512i);
+            let f0_7 = affine_m64::<15>(m0_7, rp);
+            let f2_7 = affine_m64::<47>(m0_7, rp);
+            let m1_7 = _mm512_loadu_si512(mp.add(376) as *const __m512i);
+            let f1_7 = affine_m64::<15>(m1_7, rp);
+            let f3_7 = affine_m64::<47>(m1_7, rp);
+            accq[0] = _mm512_ternarylogic_epi64::<0x96>(f0_6, f0_7, v1_0);
+            accq[1] = _mm512_ternarylogic_epi64::<0x96>(f1_6, f1_7, v1_1);
+            accq[2] = _mm512_ternarylogic_epi64::<0x96>(f2_6, f2_7, v1_2);
+            accq[3] = _mm512_ternarylogic_epi64::<0x96>(f3_6, f3_7, v1_3);
+        }
+        {
+            let m0_0 = _mm512_loadu_si512(mp.add(128) as *const __m512i);
+            let f0_0 = affine_m64::<16>(m0_0, rp);
+            let f2_0 = affine_m64::<48>(m0_0, rp);
+            let m1_0 = _mm512_loadu_si512(mp.add(384) as *const __m512i);
+            let f1_0 = affine_m64::<16>(m1_0, rp);
+            let f3_0 = affine_m64::<48>(m1_0, rp);
+            let m0_1 = _mm512_loadu_si512(mp.add(136) as *const __m512i);
+            let f0_1 = affine_m64::<17>(m0_1, rp);
+            let f2_1 = affine_m64::<49>(m0_1, rp);
+            let m1_1 = _mm512_loadu_si512(mp.add(392) as *const __m512i);
+            let f1_1 = affine_m64::<17>(m1_1, rp);
+            let f3_1 = affine_m64::<49>(m1_1, rp);
+            let m0_2 = _mm512_loadu_si512(mp.add(144) as *const __m512i);
+            let f0_2 = affine_m64::<18>(m0_2, rp);
+            let f2_2 = affine_m64::<50>(m0_2, rp);
+            let m1_2 = _mm512_loadu_si512(mp.add(400) as *const __m512i);
+            let f1_2 = affine_m64::<18>(m1_2, rp);
+            let f3_2 = affine_m64::<50>(m1_2, rp);
+            let v1_0 = _mm512_ternarylogic_epi64::<0x96>(f0_0, f0_1, f0_2);
+            let v1_1 = _mm512_ternarylogic_epi64::<0x96>(f1_0, f1_1, f1_2);
+            let v1_2 = _mm512_ternarylogic_epi64::<0x96>(f2_0, f2_1, f2_2);
+            let v1_3 = _mm512_ternarylogic_epi64::<0x96>(f3_0, f3_1, f3_2);
+            let m0_3 = _mm512_loadu_si512(mp.add(152) as *const __m512i);
+            let f0_3 = affine_m64::<19>(m0_3, rp);
+            let f2_3 = affine_m64::<51>(m0_3, rp);
+            let m1_3 = _mm512_loadu_si512(mp.add(408) as *const __m512i);
+            let f1_3 = affine_m64::<19>(m1_3, rp);
+            let f3_3 = affine_m64::<51>(m1_3, rp);
+            let m0_4 = _mm512_loadu_si512(mp.add(160) as *const __m512i);
+            let f0_4 = affine_m64::<20>(m0_4, rp);
+            let f2_4 = affine_m64::<52>(m0_4, rp);
+            let m1_4 = _mm512_loadu_si512(mp.add(416) as *const __m512i);
+            let f1_4 = affine_m64::<20>(m1_4, rp);
+            let f3_4 = affine_m64::<52>(m1_4, rp);
+            let m0_5 = _mm512_loadu_si512(mp.add(168) as *const __m512i);
+            let f0_5 = affine_m64::<21>(m0_5, rp);
+            let f2_5 = affine_m64::<53>(m0_5, rp);
+            let m1_5 = _mm512_loadu_si512(mp.add(424) as *const __m512i);
+            let f1_5 = affine_m64::<21>(m1_5, rp);
+            let f3_5 = affine_m64::<53>(m1_5, rp);
+            let v2_0 = _mm512_ternarylogic_epi64::<0x96>(f0_3, f0_4, f0_5);
+            accp[0] = _mm512_ternarylogic_epi64::<0x96>(accp[0], accq[0], v2_0);
+            let v2_1 = _mm512_ternarylogic_epi64::<0x96>(f1_3, f1_4, f1_5);
+            accp[1] = _mm512_ternarylogic_epi64::<0x96>(accp[1], accq[1], v2_1);
+            let v2_2 = _mm512_ternarylogic_epi64::<0x96>(f2_3, f2_4, f2_5);
+            accp[2] = _mm512_ternarylogic_epi64::<0x96>(accp[2], accq[2], v2_2);
+            let v2_3 = _mm512_ternarylogic_epi64::<0x96>(f3_3, f3_4, f3_5);
+            accp[3] = _mm512_ternarylogic_epi64::<0x96>(accp[3], accq[3], v2_3);
+            let m0_6 = _mm512_loadu_si512(mp.add(176) as *const __m512i);
+            let f0_6 = affine_m64::<22>(m0_6, rp);
+            let f2_6 = affine_m64::<54>(m0_6, rp);
+            let m1_6 = _mm512_loadu_si512(mp.add(432) as *const __m512i);
+            let f1_6 = affine_m64::<22>(m1_6, rp);
+            let f3_6 = affine_m64::<54>(m1_6, rp);
+            let m0_7 = _mm512_loadu_si512(mp.add(184) as *const __m512i);
+            let f0_7 = affine_m64::<23>(m0_7, rp);
+            let f2_7 = affine_m64::<55>(m0_7, rp);
+            let m1_7 = _mm512_loadu_si512(mp.add(440) as *const __m512i);
+            let f1_7 = affine_m64::<23>(m1_7, rp);
+            let f3_7 = affine_m64::<55>(m1_7, rp);
+            accq[0] = _mm512_ternarylogic_epi64::<0x96>(f0_6, f0_7, v1_0);
+            accq[1] = _mm512_ternarylogic_epi64::<0x96>(f1_6, f1_7, v1_1);
+            accq[2] = _mm512_ternarylogic_epi64::<0x96>(f2_6, f2_7, v1_2);
+            accq[3] = _mm512_ternarylogic_epi64::<0x96>(f3_6, f3_7, v1_3);
+        }
+        {
+            let m0_0 = _mm512_loadu_si512(mp.add(192) as *const __m512i);
+            let f0_0 = affine_m64::<24>(m0_0, rp);
+            let f2_0 = affine_m64::<56>(m0_0, rp);
+            let m1_0 = _mm512_loadu_si512(mp.add(448) as *const __m512i);
+            let f1_0 = affine_m64::<24>(m1_0, rp);
+            let f3_0 = affine_m64::<56>(m1_0, rp);
+            let m0_1 = _mm512_loadu_si512(mp.add(200) as *const __m512i);
+            let f0_1 = affine_m64::<25>(m0_1, rp);
+            let f2_1 = affine_m64::<57>(m0_1, rp);
+            let m1_1 = _mm512_loadu_si512(mp.add(456) as *const __m512i);
+            let f1_1 = affine_m64::<25>(m1_1, rp);
+            let f3_1 = affine_m64::<57>(m1_1, rp);
+            let m0_2 = _mm512_loadu_si512(mp.add(208) as *const __m512i);
+            let f0_2 = affine_m64::<26>(m0_2, rp);
+            let f2_2 = affine_m64::<58>(m0_2, rp);
+            let m1_2 = _mm512_loadu_si512(mp.add(464) as *const __m512i);
+            let f1_2 = affine_m64::<26>(m1_2, rp);
+            let f3_2 = affine_m64::<58>(m1_2, rp);
+            let v1_0 = _mm512_ternarylogic_epi64::<0x96>(f0_0, f0_1, f0_2);
+            let v1_1 = _mm512_ternarylogic_epi64::<0x96>(f1_0, f1_1, f1_2);
+            let v1_2 = _mm512_ternarylogic_epi64::<0x96>(f2_0, f2_1, f2_2);
+            let v1_3 = _mm512_ternarylogic_epi64::<0x96>(f3_0, f3_1, f3_2);
+            let m0_3 = _mm512_loadu_si512(mp.add(216) as *const __m512i);
+            let f0_3 = affine_m64::<27>(m0_3, rp);
+            let f2_3 = affine_m64::<59>(m0_3, rp);
+            let m1_3 = _mm512_loadu_si512(mp.add(472) as *const __m512i);
+            let f1_3 = affine_m64::<27>(m1_3, rp);
+            let f3_3 = affine_m64::<59>(m1_3, rp);
+            let m0_4 = _mm512_loadu_si512(mp.add(224) as *const __m512i);
+            let f0_4 = affine_m64::<28>(m0_4, rp);
+            let f2_4 = affine_m64::<60>(m0_4, rp);
+            let m1_4 = _mm512_loadu_si512(mp.add(480) as *const __m512i);
+            let f1_4 = affine_m64::<28>(m1_4, rp);
+            let f3_4 = affine_m64::<60>(m1_4, rp);
+            let m0_5 = _mm512_loadu_si512(mp.add(232) as *const __m512i);
+            let f0_5 = affine_m64::<29>(m0_5, rp);
+            let f2_5 = affine_m64::<61>(m0_5, rp);
+            let m1_5 = _mm512_loadu_si512(mp.add(488) as *const __m512i);
+            let f1_5 = affine_m64::<29>(m1_5, rp);
+            let f3_5 = affine_m64::<61>(m1_5, rp);
+            let v2_0 = _mm512_ternarylogic_epi64::<0x96>(f0_3, f0_4, f0_5);
+            accp[0] = _mm512_ternarylogic_epi64::<0x96>(accp[0], accq[0], v2_0);
+            let v2_1 = _mm512_ternarylogic_epi64::<0x96>(f1_3, f1_4, f1_5);
+            accp[1] = _mm512_ternarylogic_epi64::<0x96>(accp[1], accq[1], v2_1);
+            let v2_2 = _mm512_ternarylogic_epi64::<0x96>(f2_3, f2_4, f2_5);
+            accp[2] = _mm512_ternarylogic_epi64::<0x96>(accp[2], accq[2], v2_2);
+            let v2_3 = _mm512_ternarylogic_epi64::<0x96>(f3_3, f3_4, f3_5);
+            accp[3] = _mm512_ternarylogic_epi64::<0x96>(accp[3], accq[3], v2_3);
+            let m0_6 = _mm512_loadu_si512(mp.add(240) as *const __m512i);
+            let f0_6 = affine_m64::<30>(m0_6, rp);
+            let f2_6 = affine_m64::<62>(m0_6, rp);
+            let m1_6 = _mm512_loadu_si512(mp.add(496) as *const __m512i);
+            let f1_6 = affine_m64::<30>(m1_6, rp);
+            let f3_6 = affine_m64::<62>(m1_6, rp);
+            let m0_7 = _mm512_loadu_si512(mp.add(248) as *const __m512i);
+            let f0_7 = affine_m64::<31>(m0_7, rp);
+            let f2_7 = affine_m64::<63>(m0_7, rp);
+            let m1_7 = _mm512_loadu_si512(mp.add(504) as *const __m512i);
+            let f1_7 = affine_m64::<31>(m1_7, rp);
+            let f3_7 = affine_m64::<63>(m1_7, rp);
+            accq[0] = _mm512_ternarylogic_epi64::<0x96>(f0_6, f0_7, v1_0);
+            accq[1] = _mm512_ternarylogic_epi64::<0x96>(f1_6, f1_7, v1_1);
+            accq[2] = _mm512_ternarylogic_epi64::<0x96>(f2_6, f2_7, v1_2);
+            accq[3] = _mm512_ternarylogic_epi64::<0x96>(f3_6, f3_7, v1_3);
+        }
+        let r0 = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_xor_si512(accp[0], accq[0]));
+        let r1 = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_xor_si512(accp[1], accq[1]));
+        _mm512_storeu_si512(dst.add(0), _mm512_permutex2var_epi8(r0, out_even, r1));
+        _mm512_storeu_si512(dst.add(1), _mm512_permutex2var_epi8(r0, out_odd, r1));
+        let r0 = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_xor_si512(accp[2], accq[2]));
+        let r1 = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_xor_si512(accp[3], accq[3]));
+        _mm512_storeu_si512(dst.add(2), _mm512_permutex2var_epi8(r0, out_even, r1));
+        _mm512_storeu_si512(dst.add(3), _mm512_permutex2var_epi8(r0, out_odd, r1));
     }
 }
 
