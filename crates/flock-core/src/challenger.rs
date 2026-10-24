@@ -910,11 +910,24 @@ mod blake3_pow_avx512 {
         debug_assert!((1..=32).contains(&bits));
         // SAFETY: the enclosing cfg gates this module on compile-time
         // AVX-512F + BW, so every intrinsic below is available.
-        unsafe { scan_impl(state_digest, start, len, bits) }
+        unsafe { scan_impl(state_digest, start, len, bits, None) }
+    }
+
+    /// A higher chunk cannot improve the ordered answer once a lower chunk
+    /// matched. Lower chunks must still finish, even after publication.
+    pub(super) fn scan_until(
+        state_digest: &[u8; 32], start: u64, len: u64, bits: u32,
+        best_chunk: &std::sync::atomic::AtomicU64, chunk_index: u64,
+    ) -> Option<u64> {
+        debug_assert!((1..=32).contains(&bits));
+        unsafe { scan_impl(state_digest, start, len, bits, Some((best_chunk, chunk_index))) }
     }
 
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn scan_impl(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+    unsafe fn scan_impl(
+        state_digest: &[u8; 32], start: u64, len: u64, bits: u32,
+        cutoff: Option<(&std::sync::atomic::AtomicU64, u64)>,
+    ) -> Option<u64> {
         let zero = _mm512_setzero_si512();
         let mut dig = [zero; 8];
         for (i, d) in dig.iter_mut().enumerate() {
@@ -941,6 +954,11 @@ mod blake3_pow_avx512 {
         let end = start.saturating_add(len);
         let mut base = start;
         while base < end {
+            if let Some((best, index)) = cutoff {
+                if index > best.load(std::sync::atomic::Ordering::Acquire) {
+                    return None;
+                }
+            }
             let n = (end - base).min(LANES as u64) as u32;
             // Lane nonces `base + 16k + i`: low word = (base_lo + 16k) + i
             // with the carry folded into the high word per lane (a ragged
@@ -1427,7 +1445,22 @@ fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: 
             if c > best_chunk.load(Ordering::Acquire) {
                 break;
             }
-            if let Some(n) = pow_scan(state_digest, c.saturating_mul(chunk), chunk, bits, kind) {
+            let start = c.saturating_mul(chunk);
+            #[cfg(all(target_arch = "x86_64", target_os = "linux",
+                target_feature = "avx512f", target_feature = "avx512bw"))]
+            let found = if kind == HashKind::Blake3 && (1..=32).contains(&bits) && {
+                static OPT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+                    std::env::var_os("FLOCK_NO_GRIND_OPT").is_none());
+                *OPT
+            } {
+                blake3_pow_avx512::scan_until(state_digest, start, chunk, bits, &best_chunk, c)
+            } else {
+                pow_scan(state_digest, start, chunk, bits, kind)
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux",
+                target_feature = "avx512f", target_feature = "avx512bw")))]
+            let found = pow_scan(state_digest, start, chunk, bits, kind);
+            if let Some(n) = found {
                 let mut guard = best.lock().unwrap_or_else(|poison| poison.into_inner());
                 if c < guard.0 {
                     *guard = (c, n);
@@ -1476,6 +1509,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux",
+        target_feature = "avx512f", target_feature = "avx512bw"))]
+    fn grind_cutoff174_matches_scalar() {
+        use std::sync::atomic::AtomicU64;
+        let mut cases = 0;
+        for seed in 0..8u8 {
+            let digest = std::array::from_fn(|i| seed.wrapping_mul(31).wrapping_add(i as u8 * 7));
+            for start in [0, 7, (1u64 << 32) - 17, u64::MAX - 65] {
+                for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 65, 1024] {
+                    for bits in [1, 8, 13, 32] {
+                        let want = (start..start.saturating_add(len)).find(|&n|
+                            pow_has_leading_zero_bits(&digest, n, bits, HashKind::Blake3));
+                        for (index, best, cancelled) in [(0, 0, false), (0, 1, false),
+                            (1, 0, true), (7, u64::MAX, false)] {
+                            let got = blake3_pow_avx512::scan_until(&digest, start, len, bits,
+                                &AtomicU64::new(best), index);
+                            assert_eq!(got, if cancelled { None } else { want },
+                                "seed={seed} start={start} len={len} bits={bits} index={index} best={best}");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("CUTOFF174_SCALAR_CASES={cases}");
     }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
