@@ -277,6 +277,15 @@ const BLAKE3_IV: [u32; 8] = [
 ];
 
 /// BLAKE3 domain flags, fixed by the spec.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512vl"
+))]
+#[path = "merkle_contiguous.rs"]
+mod contiguous;
+
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
@@ -330,6 +339,28 @@ fn blake3_hash_many<const N: usize>(
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_feature = "avx512f",
+            target_feature = "avx512vl"
+        ))]
+        let (outs, msgs) = {
+            let full = outs.len() / 16 * 16;
+            if full != 0 {
+                contiguous::hash_many::<N>(
+                    &msgs[..full * N],
+                    &mut outs[..full],
+                    flags,
+                    flags_start,
+                    flags_end,
+                );
+            }
+            (&mut outs[full..], &msgs[full * N..])
+        };
+        if outs.is_empty() {
+            continue;
+        }
         let n = outs.len();
         let base_ptr = msgs.as_ptr();
         // SAFETY: every element 0..n is written directly into the MaybeUninit buffer.
@@ -337,11 +368,12 @@ fn blake3_hash_many<const N: usize>(
         let inputs_ptr = inputs.as_mut_ptr() as *mut &[u8; N];
         for i in 0..n {
             unsafe {
-                inputs_ptr.add(i).write(&*(base_ptr.add(i * N) as *const [u8; N]));
+                inputs_ptr
+                    .add(i)
+                    .write(&*(base_ptr.add(i * N) as *const [u8; N]));
             }
         }
-        let inputs_slice: &[&[u8; N]] =
-            unsafe { core::slice::from_raw_parts(inputs_ptr, n) };
+        let inputs_slice: &[&[u8; N]] = unsafe { core::slice::from_raw_parts(inputs_ptr, n) };
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
         // writes for `n` inputs.
@@ -401,9 +433,8 @@ pub(crate) fn hash_indexed_blake3_1k(data: &[u8], indices: &[usize], out: &mut [
                 unsafe { core::slice::from_raw_parts(inputs_ptr, n) };
             // SAFETY: Hash is exactly 32 initialized bytes; `hash_many`
             // overwrites every byte in this output chunk.
-            let out_bytes = unsafe {
-                core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32)
-            };
+            let out_bytes =
+                unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr().cast::<u8>(), n * 32) };
             blake3_platform().hash_many(
                 inputs_slice,
                 &BLAKE3_IV,
@@ -1370,6 +1401,57 @@ mod tests {
                         blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]),
                         "leaf {i} of {n} at size {leaf_size}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blake3_contiguous_groups_and_tails_match_scalar() {
+        let mut seed = 0x9b85da2c174930edu64;
+        for size in [64usize, 128, 256, 512, 1024] {
+            for count in [
+                0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 79, 80, 81, 127, 128, 129,
+            ] {
+                for offset in [0usize, 1, 31, 63] {
+                    let mut storage = vec![0u8; offset + size * count];
+                    for x in &mut storage {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        *x = seed as u8;
+                    }
+                    let data = &storage[offset..];
+                    let guard = [0xa5u8; 32];
+                    let mut output = vec![guard; count + 2];
+                    assert!(blake3_hash_many_leaves(
+                        data,
+                        size,
+                        &mut output[1..count + 1]
+                    ));
+                    for i in 0..count {
+                        assert_eq!(
+                            output[i + 1],
+                            blake3_leaf_cv(&data[i * size..(i + 1) * size]),
+                            "leaf size={size} count={count} offset={offset} i={i}"
+                        );
+                    }
+                    assert_eq!(output[0], guard);
+                    assert_eq!(output[count + 1], guard);
+                    if size == 64 {
+                        blake3_hash_many_parents(data, &mut output[1..count + 1]);
+                        for i in 0..count {
+                            let left: &Hash = data[i * 64..i * 64 + 32].try_into().unwrap();
+                            let right: &Hash = data[i * 64 + 32..(i + 1) * 64].try_into().unwrap();
+                            assert_eq!(
+                                output[i + 1],
+                                blake3_parent_cv(left, right),
+                                "parent count={count} offset={offset} i={i}"
+                            );
+                        }
+                        assert_eq!(output[0], guard);
+                        assert_eq!(output[count + 1], guard);
+                    }
                 }
             }
         }

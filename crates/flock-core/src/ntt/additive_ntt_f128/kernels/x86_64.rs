@@ -87,10 +87,7 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
 /// 128-bit lane of `t.0`.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn mul_x4_high_one(
-    t: TwX4,
-    v: core::arch::x86_64::__m512i,
-) -> core::arch::x86_64::__m512i {
+unsafe fn mul_x4_high_one(t: TwX4, v: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
     use core::arch::x86_64::*;
     // SAFETY: caller establishes the features and the high-limb value.
     unsafe {
@@ -1099,24 +1096,32 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_nt(
                 right_twiddle,
                 core::ptr::null(),
             ),
-            (false, false) => butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                true,
-                false,
-                true,
-                false,
-            >(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle,
-                core::ptr::null(),
-            ),
-            (false, true) => butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                true,
-                false,
-                true,
-                true,
-            >(
-                src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, right_twiddle,
-                core::ptr::null(),
-            ),
+            (false, false) => {
+                butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, false>(
+                    src,
+                    src_quarter,
+                    src_r,
+                    dst,
+                    dst_quarter,
+                    dst_r,
+                    num_ntts,
+                    right_twiddle,
+                    core::ptr::null(),
+                )
+            }
+            (false, true) => {
+                butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, true, true>(
+                    src,
+                    src_quarter,
+                    src_r,
+                    dst,
+                    dst_quarter,
+                    dst_r,
+                    num_ntts,
+                    right_twiddle,
+                    core::ptr::null(),
+                )
+            }
         }
     }
 }
@@ -1650,7 +1655,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1658,9 +1663,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1668,6 +1674,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                core::ptr::null(),
             )
         }
     }
@@ -1693,7 +1700,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1701,9 +1708,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1711,6 +1719,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         }
     }
@@ -1745,7 +1754,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     // values in the same impl body (a distinct monomorphization).
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<false, false, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1753,9 +1762,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<true, false, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1763,8 +1773,550 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         }
+    }
+}
+
+/// Fixed-register version of the prepared, shaped four-layer butterfly.
+/// Six upper twiddle vectors stay in zmm16..21 and the sixteen rows in
+/// zmm0..15. Four independent upper products are interleaved using eight
+/// temporary registers; lower layers use compact pair broadcasts. Every
+/// product uses the existing five-CLMUL split formula and full reduction.
+///
+/// # Safety
+/// Requires AVX-512F, AVX-512BW and VPCLMULQDQ. The caller provides the
+/// existing shaped-row geometry, initialized prepared pairs, disjoint rows,
+/// and valid input/output and prefetch storage for `vector_bytes` bytes.
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, const H: u8>(
+    ptr: *mut F128,
+    prepared: *const PreparedFour,
+    vector_bytes: usize,
+    prefetch: *const F128,
+) {
+    // SAFETY: the caller establishes all storage and ISA preconditions.
+    // All clobbered vector registers, flags and rax are declared. Memory is
+    // both read and written; nostack only asserts that this block uses no
+    // stack space. No options claim purity or read-only memory.
+    unsafe {
+        core::arch::asm!(
+            "test rdx, rdx",
+            "jz 3f",
+            "vbroadcasti32x4 zmm16, [rsi+0]",
+            "vbroadcasti32x4 zmm17, [rsi+16]",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm19, [rsi+48]",
+            "vbroadcasti32x4 zmm20, [rsi+64]",
+            "vbroadcasti32x4 zmm21, [rsi+80]",
+            "mov eax, 0x87",
+            "vmovq xmm30, rax",
+            "vshufi32x4 zmm30, zmm30, zmm30, 0",
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            "vmovdqu64 zmm0, [rdi+rax+{stride}*0]",
+            "vmovdqu64 zmm1, [rdi+rax+{stride}*1]",
+            "vmovdqu64 zmm2, [rdi+rax+{stride}*2]",
+            "vmovdqu64 zmm3, [rdi+rax+{stride}*3]",
+            "vmovdqu64 zmm4, [rdi+rax+{stride}*4]",
+            "vmovdqu64 zmm5, [rdi+rax+{stride}*5]",
+            "vmovdqu64 zmm6, [rdi+rax+{stride}*6]",
+            "vmovdqu64 zmm7, [rdi+rax+{stride}*7]",
+            "vmovdqu64 zmm8, [rdi+rax+{stride}*8]",
+            "vmovdqu64 zmm9, [rdi+rax+{stride}*9]",
+            "vmovdqu64 zmm10, [rdi+rax+{stride}*10]",
+            "vmovdqu64 zmm11, [rdi+rax+{stride}*11]",
+            "vmovdqu64 zmm12, [rdi+rax+{stride}*12]",
+            "vmovdqu64 zmm13, [rdi+rax+{stride}*13]",
+            "vmovdqu64 zmm14, [rdi+rax+{stride}*14]",
+            "vmovdqu64 zmm15, [rdi+rax+{stride}*15]",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*0]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*0]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*1]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*1]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*2]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*2]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*3]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*3]",
+            ".endif",
+            "vpclmulqdq zmm22, zmm8, zmm16, 0",
+            "vpclmulqdq zmm23, zmm8, zmm17, 1",
+            "vpternlogd zmm0, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm9, zmm16, 0",
+            "vpclmulqdq zmm23, zmm9, zmm17, 1",
+            "vpternlogd zmm1, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm10, zmm16, 0",
+            "vpclmulqdq zmm23, zmm10, zmm17, 1",
+            "vpternlogd zmm2, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm11, zmm16, 0",
+            "vpclmulqdq zmm23, zmm11, zmm17, 1",
+            "vpternlogd zmm3, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm8, zmm16, 16",
+            "vpclmulqdq zmm23, zmm8, zmm17, 17",
+            "vpclmulqdq zmm24, zmm9, zmm16, 16",
+            "vpclmulqdq zmm25, zmm9, zmm17, 17",
+            "vpclmulqdq zmm26, zmm10, zmm16, 16",
+            "vpclmulqdq zmm27, zmm10, zmm17, 17",
+            "vpclmulqdq zmm28, zmm11, zmm16, 16",
+            "vpclmulqdq zmm29, zmm11, zmm17, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpxorq zmm28, zmm28, zmm29",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpslldq zmm29, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm0, zmm22, zmm23, 0x96",
+            "vpxorq zmm8, zmm8, zmm0",
+            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpxorq zmm9, zmm9, zmm1",
+            "vpternlogd zmm2, zmm26, zmm27, 0x96",
+            "vpxorq zmm10, zmm10, zmm2",
+            "vpternlogd zmm3, zmm28, zmm29, 0x96",
+            "vpxorq zmm11, zmm11, zmm3",
+            "vpclmulqdq zmm22, zmm12, zmm16, 0",
+            "vpclmulqdq zmm23, zmm12, zmm17, 1",
+            "vpternlogd zmm4, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm13, zmm16, 0",
+            "vpclmulqdq zmm23, zmm13, zmm17, 1",
+            "vpternlogd zmm5, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm14, zmm16, 0",
+            "vpclmulqdq zmm23, zmm14, zmm17, 1",
+            "vpternlogd zmm6, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm15, zmm16, 0",
+            "vpclmulqdq zmm23, zmm15, zmm17, 1",
+            "vpternlogd zmm7, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm12, zmm16, 16",
+            "vpclmulqdq zmm23, zmm12, zmm17, 17",
+            "vpclmulqdq zmm24, zmm13, zmm16, 16",
+            "vpclmulqdq zmm25, zmm13, zmm17, 17",
+            "vpclmulqdq zmm26, zmm14, zmm16, 16",
+            "vpclmulqdq zmm27, zmm14, zmm17, 17",
+            "vpclmulqdq zmm28, zmm15, zmm16, 16",
+            "vpclmulqdq zmm29, zmm15, zmm17, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpxorq zmm28, zmm28, zmm29",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpslldq zmm29, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm4, zmm22, zmm23, 0x96",
+            "vpxorq zmm12, zmm12, zmm4",
+            "vpternlogd zmm5, zmm24, zmm25, 0x96",
+            "vpxorq zmm13, zmm13, zmm5",
+            "vpternlogd zmm6, zmm26, zmm27, 0x96",
+            "vpxorq zmm14, zmm14, zmm6",
+            "vpternlogd zmm7, zmm28, zmm29, 0x96",
+            "vpxorq zmm15, zmm15, zmm7",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*4]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*4]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*5]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*5]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*6]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*6]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*7]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*7]",
+            ".endif",
+            "vpclmulqdq zmm22, zmm4, zmm18, 0",
+            "vpclmulqdq zmm23, zmm4, zmm19, 1",
+            "vpternlogd zmm0, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm5, zmm18, 0",
+            "vpclmulqdq zmm23, zmm5, zmm19, 1",
+            "vpternlogd zmm1, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm6, zmm18, 0",
+            "vpclmulqdq zmm23, zmm6, zmm19, 1",
+            "vpternlogd zmm2, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm7, zmm18, 0",
+            "vpclmulqdq zmm23, zmm7, zmm19, 1",
+            "vpternlogd zmm3, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm4, zmm18, 16",
+            "vpclmulqdq zmm23, zmm4, zmm19, 17",
+            "vpclmulqdq zmm24, zmm5, zmm18, 16",
+            "vpclmulqdq zmm25, zmm5, zmm19, 17",
+            "vpclmulqdq zmm26, zmm6, zmm18, 16",
+            "vpclmulqdq zmm27, zmm6, zmm19, 17",
+            "vpclmulqdq zmm28, zmm7, zmm18, 16",
+            "vpclmulqdq zmm29, zmm7, zmm19, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpxorq zmm28, zmm28, zmm29",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpslldq zmm29, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm0, zmm22, zmm23, 0x96",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpxorq zmm5, zmm5, zmm1",
+            "vpternlogd zmm2, zmm26, zmm27, 0x96",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpternlogd zmm3, zmm28, zmm29, 0x96",
+            "vpxorq zmm7, zmm7, zmm3",
+            "vpclmulqdq zmm22, zmm12, zmm20, 0",
+            "vpclmulqdq zmm23, zmm12, zmm21, 1",
+            "vpternlogd zmm8, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm13, zmm20, 0",
+            "vpclmulqdq zmm23, zmm13, zmm21, 1",
+            "vpternlogd zmm9, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm14, zmm20, 0",
+            "vpclmulqdq zmm23, zmm14, zmm21, 1",
+            "vpternlogd zmm10, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm15, zmm20, 0",
+            "vpclmulqdq zmm23, zmm15, zmm21, 1",
+            "vpternlogd zmm11, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm12, zmm20, 16",
+            "vpclmulqdq zmm23, zmm12, zmm21, 17",
+            "vpclmulqdq zmm24, zmm13, zmm20, 16",
+            "vpclmulqdq zmm25, zmm13, zmm21, 17",
+            "vpclmulqdq zmm26, zmm14, zmm20, 16",
+            "vpclmulqdq zmm27, zmm14, zmm21, 17",
+            "vpclmulqdq zmm28, zmm15, zmm20, 16",
+            "vpclmulqdq zmm29, zmm15, zmm21, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpxorq zmm28, zmm28, zmm29",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpslldq zmm29, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm8, zmm22, zmm23, 0x96",
+            "vpxorq zmm12, zmm12, zmm8",
+            "vpternlogd zmm9, zmm24, zmm25, 0x96",
+            "vpxorq zmm13, zmm13, zmm9",
+            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpxorq zmm14, zmm14, zmm10",
+            "vpternlogd zmm11, zmm28, zmm29, 0x96",
+            "vpxorq zmm15, zmm15, zmm11",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*8]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*8]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*9]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*9]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*10]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*10]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*11]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*11]",
+            ".endif",
+            "vbroadcasti32x4 zmm22, [rsi+96]",
+            "vbroadcasti32x4 zmm23, [rsi+112]",
+            "vpclmulqdq zmm24, zmm2, zmm22, 0",
+            "vpclmulqdq zmm25, zmm2, zmm23, 1",
+            "vpternlogd zmm0, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm3, zmm22, 0",
+            "vpclmulqdq zmm25, zmm3, zmm23, 1",
+            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm2, zmm22, 16",
+            "vpclmulqdq zmm25, zmm2, zmm23, 17",
+            "vpclmulqdq zmm26, zmm3, zmm22, 16",
+            "vpclmulqdq zmm27, zmm3, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm0, zmm24, zmm25, 0x96",
+            "vpxorq zmm2, zmm2, zmm0",
+            "vpternlogd zmm1, zmm26, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vbroadcasti32x4 zmm22, [rsi+128]",
+            "vbroadcasti32x4 zmm23, [rsi+144]",
+            "vpclmulqdq zmm24, zmm6, zmm22, 0",
+            "vpclmulqdq zmm25, zmm6, zmm23, 1",
+            "vpternlogd zmm4, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm7, zmm22, 0",
+            "vpclmulqdq zmm25, zmm7, zmm23, 1",
+            "vpternlogd zmm5, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm6, zmm22, 16",
+            "vpclmulqdq zmm25, zmm6, zmm23, 17",
+            "vpclmulqdq zmm26, zmm7, zmm22, 16",
+            "vpclmulqdq zmm27, zmm7, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm4, zmm24, zmm25, 0x96",
+            "vpxorq zmm6, zmm6, zmm4",
+            "vpternlogd zmm5, zmm26, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm5",
+            "vbroadcasti32x4 zmm22, [rsi+160]",
+            "vbroadcasti32x4 zmm23, [rsi+176]",
+            "vpclmulqdq zmm24, zmm10, zmm22, 0",
+            "vpclmulqdq zmm25, zmm10, zmm23, 1",
+            "vpternlogd zmm8, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm11, zmm22, 0",
+            "vpclmulqdq zmm25, zmm11, zmm23, 1",
+            "vpternlogd zmm9, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm10, zmm22, 16",
+            "vpclmulqdq zmm25, zmm10, zmm23, 17",
+            "vpclmulqdq zmm26, zmm11, zmm22, 16",
+            "vpclmulqdq zmm27, zmm11, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm8, zmm24, zmm25, 0x96",
+            "vpxorq zmm10, zmm10, zmm8",
+            "vpternlogd zmm9, zmm26, zmm27, 0x96",
+            "vpxorq zmm11, zmm11, zmm9",
+            "vbroadcasti32x4 zmm22, [rsi+192]",
+            "vbroadcasti32x4 zmm23, [rsi+208]",
+            "vpclmulqdq zmm24, zmm14, zmm22, 0",
+            "vpclmulqdq zmm25, zmm14, zmm23, 1",
+            "vpternlogd zmm12, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm15, zmm22, 0",
+            "vpclmulqdq zmm25, zmm15, zmm23, 1",
+            "vpternlogd zmm13, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm14, zmm22, 16",
+            "vpclmulqdq zmm25, zmm14, zmm23, 17",
+            "vpclmulqdq zmm26, zmm15, zmm22, 16",
+            "vpclmulqdq zmm27, zmm15, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm26, zmm26, zmm27",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm12, zmm24, zmm25, 0x96",
+            "vpxorq zmm14, zmm14, zmm12",
+            "vpternlogd zmm13, zmm26, zmm27, 0x96",
+            "vpxorq zmm15, zmm15, zmm13",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*12]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*12]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*13]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*13]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*14]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*14]",
+            ".endif",
+            ".if {hint} == 1",
+            "prefetcht0 [rcx+rax+{stride}*15]",
+            ".elseif {hint} == 2",
+            "prefetcht1 [rcx+rax+{stride}*15]",
+            ".endif",
+            "vbroadcasti32x4 zmm22, [rsi+224]",
+            "vbroadcasti32x4 zmm23, [rsi+240]",
+            "vpclmulqdq zmm24, zmm1, zmm22, 0",
+            "vpclmulqdq zmm25, zmm1, zmm23, 1",
+            "vpternlogd zmm0, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm1, zmm22, 16",
+            "vpclmulqdq zmm25, zmm1, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm0, zmm24, zmm25, 0x96",
+            "vpxorq zmm1, zmm1, zmm0",
+            "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
+            "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
+            "vbroadcasti32x4 zmm22, [rsi+256]",
+            "vbroadcasti32x4 zmm23, [rsi+272]",
+            "vpclmulqdq zmm24, zmm3, zmm22, 0",
+            "vpclmulqdq zmm25, zmm3, zmm23, 1",
+            "vpternlogd zmm2, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm3, zmm22, 16",
+            "vpclmulqdq zmm25, zmm3, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm2, zmm24, zmm25, 0x96",
+            "vpxorq zmm3, zmm3, zmm2",
+            "vmovdqu64 [rdi+rax+{stride}*2], zmm2",
+            "vmovdqu64 [rdi+rax+{stride}*3], zmm3",
+            "vbroadcasti32x4 zmm22, [rsi+288]",
+            "vbroadcasti32x4 zmm23, [rsi+304]",
+            "vpclmulqdq zmm24, zmm5, zmm22, 0",
+            "vpclmulqdq zmm25, zmm5, zmm23, 1",
+            "vpternlogd zmm4, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm5, zmm22, 16",
+            "vpclmulqdq zmm25, zmm5, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm4, zmm24, zmm25, 0x96",
+            "vpxorq zmm5, zmm5, zmm4",
+            "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
+            "vmovdqu64 [rdi+rax+{stride}*5], zmm5",
+            "vbroadcasti32x4 zmm22, [rsi+320]",
+            "vbroadcasti32x4 zmm23, [rsi+336]",
+            "vpclmulqdq zmm24, zmm7, zmm22, 0",
+            "vpclmulqdq zmm25, zmm7, zmm23, 1",
+            "vpternlogd zmm6, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm7, zmm22, 16",
+            "vpclmulqdq zmm25, zmm7, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm6, zmm24, zmm25, 0x96",
+            "vpxorq zmm7, zmm7, zmm6",
+            "vmovdqu64 [rdi+rax+{stride}*6], zmm6",
+            "vmovdqu64 [rdi+rax+{stride}*7], zmm7",
+            "vbroadcasti32x4 zmm22, [rsi+352]",
+            "vbroadcasti32x4 zmm23, [rsi+368]",
+            "vpclmulqdq zmm24, zmm9, zmm22, 0",
+            "vpclmulqdq zmm25, zmm9, zmm23, 1",
+            "vpternlogd zmm8, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm9, zmm22, 16",
+            "vpclmulqdq zmm25, zmm9, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm8, zmm24, zmm25, 0x96",
+            "vpxorq zmm9, zmm9, zmm8",
+            "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
+            "vmovdqu64 [rdi+rax+{stride}*9], zmm9",
+            "vbroadcasti32x4 zmm22, [rsi+384]",
+            "vbroadcasti32x4 zmm23, [rsi+400]",
+            "vpclmulqdq zmm24, zmm11, zmm22, 0",
+            "vpclmulqdq zmm25, zmm11, zmm23, 1",
+            "vpternlogd zmm10, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm11, zmm22, 16",
+            "vpclmulqdq zmm25, zmm11, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm10, zmm24, zmm25, 0x96",
+            "vpxorq zmm11, zmm11, zmm10",
+            "vmovdqu64 [rdi+rax+{stride}*10], zmm10",
+            "vmovdqu64 [rdi+rax+{stride}*11], zmm11",
+            "vbroadcasti32x4 zmm22, [rsi+416]",
+            "vbroadcasti32x4 zmm23, [rsi+432]",
+            "vpclmulqdq zmm24, zmm13, zmm22, 0",
+            "vpclmulqdq zmm25, zmm13, zmm23, 1",
+            "vpternlogd zmm12, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm13, zmm22, 16",
+            "vpclmulqdq zmm25, zmm13, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm12, zmm24, zmm25, 0x96",
+            "vpxorq zmm13, zmm13, zmm12",
+            "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
+            "vmovdqu64 [rdi+rax+{stride}*13], zmm13",
+            "vbroadcasti32x4 zmm22, [rsi+448]",
+            "vbroadcasti32x4 zmm23, [rsi+464]",
+            "vpclmulqdq zmm24, zmm15, zmm22, 0",
+            "vpclmulqdq zmm25, zmm15, zmm23, 1",
+            "vpternlogd zmm14, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm15, zmm22, 16",
+            "vpclmulqdq zmm25, zmm15, zmm23, 17",
+            "vpxorq zmm24, zmm24, zmm25",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm14, zmm24, zmm25, 0x96",
+            "vpxorq zmm15, zmm15, zmm14",
+            "vmovdqu64 [rdi+rax+{stride}*14], zmm14",
+            "vmovdqu64 [rdi+rax+{stride}*15], zmm15",
+            "add rax, 64",
+            "cmp rax, rdx",
+            "jb 2b",
+            "3:",
+            stride = const S16 * NN * core::mem::size_of::<F128>(),
+            hint = const H,
+            in("rdi") ptr,
+            in("rsi") prepared,
+            in("rdx") vector_bytes,
+            in("rcx") prefetch,
+            out("rax") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm16") _,
+            out("zmm17") _,
+            out("zmm18") _,
+            out("zmm19") _,
+            out("zmm20") _,
+            out("zmm21") _,
+            out("zmm22") _,
+            out("zmm23") _,
+            out("zmm24") _,
+            out("zmm25") _,
+            out("zmm26") _,
+            out("zmm27") _,
+            out("zmm28") _,
+            out("zmm29") _,
+            out("zmm30") _,
+            options(nostack),
+        );
     }
 }
 
@@ -1778,6 +2330,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
     const DIET: bool,
+    const PREPARED: bool,
     const H: u8,
     const S16: usize,
     const NN: usize,
@@ -1789,6 +2342,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
     r: usize,
     twiddles: &[F128; 15],
     pf_r: usize,
+    prepared: *const PreparedFour,
 ) {
     use core::arch::x86_64::*;
 
@@ -1800,6 +2354,28 @@ unsafe fn butterfly_fused_4layer_row_impl<
 
     // SAFETY: caller provides target features and pointer geometry.
     unsafe {
+        #[cfg(target_feature = "avx512bw")]
+        if DIET && PREPARED && S16 != 0 && NN != 0 {
+            let lanes = active_lanes & !3;
+            butterfly_four_fixed_registers::<S16, NN, H>(
+                ptr.add(r * num_ntts),
+                prepared,
+                lanes * core::mem::size_of::<F128>(),
+                ptr.add(pf_r * num_ntts),
+            );
+            if lanes < active_lanes {
+                butterfly_fused_4layer_scalar_tail(
+                    ptr,
+                    sixteenth,
+                    num_ntts,
+                    r,
+                    lanes,
+                    active_lanes,
+                    twiddles,
+                );
+            }
+            return;
+        }
         // Broadcast (and, under DIET, x^64-companion) every twiddle ONCE per
         // row group: 15 setup CLMULs against 32 butterflies × ⌊lanes/4⌋ lane
         // steps of savings. Under DIET, keeping all 15 `(t, t·x^64)` pairs as
@@ -1814,7 +2390,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let zero = _mm512_setzero_si512();
         let mut tw_top = [(zero, zero); 3];
         let mut tw_compact = [(_mm_setzero_si128(), _mm_setzero_si128()); 12];
-        if DIET {
+        if PREPARED {
+            for i in 0..3 {
+                let p = (*prepared).pairs[i];
+                tw_top[i] = (
+                    _mm512_broadcast_i32x4(_mm_set_epi64x(p[0].hi as i64, p[0].lo as i64)),
+                    _mm512_broadcast_i32x4(_mm_set_epi64x(p[1].hi as i64, p[1].lo as i64)),
+                );
+            }
+        } else if DIET {
             for i in 0..3 {
                 tw_top[i] = tw_x4::<false, true>(twiddles[i]);
             }
@@ -1837,7 +2421,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 );
             }
         }
-        let tw_c_ptr = core::hint::black_box(tw_compact.as_ptr());
+        let tw_c_ptr = if PREPARED {
+            (*prepared)
+                .pairs
+                .as_ptr()
+                .add(3)
+                .cast::<(__m128i, __m128i)>()
+        } else {
+            core::hint::black_box(tw_compact.as_ptr())
+        };
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -1913,11 +2505,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
                 );
-                butterfly!(2 * s, 2 * s + 1, twiddle);
-            }
-
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                // This is the terminal layer: neither result participates in
+                // another butterfly. Publish each pair immediately, shortening
+                // live ranges instead of retaining sixteen output registers.
+                let u = 2 * s;
+                let v = u + 1;
+                let new_u = _mm512_xor_si512(values[u], mul_x4::<false, DIET>(twiddle, values[v]));
+                let new_v = _mm512_xor_si512(values[v], new_u);
+                _mm512_storeu_si512(row(u).add(lane) as *mut __m512i, new_u);
+                _mm512_storeu_si512(row(v).add(lane) as *mut __m512i, new_v);
             }
             lane += 4;
         }
@@ -2057,16 +2653,28 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
         if high_one_outer {
             match (mul_diet_disabled(), low_inner) {
                 (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
                 (false, true) => butterfly_fused_3layer_rows_impl::<true, true, NN, false, true>(
-                    ptr, NN, dense_lanes, twiddles,
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
                 ),
             }
             return;
@@ -2074,30 +2682,70 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
         match (mul_diet_disabled(), low_inner) {
             (true, false) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (true, true) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (false, false) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
             (false, true) => {
                 if low_outer {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 } else {
-                    butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(ptr, NN, dense_lanes, twiddles)
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
                 }
             }
         }
@@ -2603,30 +3251,38 @@ mod diet_tests {
                 // requires.
                 unsafe {
                     match (diet, low) {
-                        (false, false) => butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (false, true) => butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (true, false) => butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
-                        (true, true) => butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
-                            got.as_mut_ptr(),
-                            num_ntts,
-                            dense_lanes,
-                            &twiddles,
-                        ),
+                        (false, false) => {
+                            butterfly_fused_3layer_rows_impl::<false, false, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (false, true) => {
+                            butterfly_fused_3layer_rows_impl::<false, true, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (true, false) => {
+                            butterfly_fused_3layer_rows_impl::<true, false, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
+                        (true, true) => {
+                            butterfly_fused_3layer_rows_impl::<true, true, 0, false, false>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &twiddles,
+                            )
+                        }
                     }
                 }
                 assert_eq!(
@@ -2899,12 +3555,7 @@ mod diet_tests {
                 // SAFETY: 4 rows of `len` lanes each, src/dst disjoint.
                 unsafe {
                     if diet {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                            true,
-                            false,
-                            false,
-                            false,
-                        >(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<true, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2916,12 +3567,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_geo_impl::<
-                            false,
-                            false,
-                            false,
-                            false,
-                        >(
+                        butterfly_fused_2layer_row_from_sparse_geo_impl::<false, false, false, false>(
                             src.as_ptr(),
                             1,
                             0,
@@ -2993,7 +3639,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -3001,9 +3647,10 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -3011,6 +3658,7 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            core::ptr::null(),
                         );
                     }
                 }
@@ -3018,5 +3666,122 @@ mod diet_tests {
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
         }
+    }
+}
+
+/// Immutable split twiddles shared across all rows of a fused-four block.
+/// Plain F128 storage permits sharing between Rayon workers without SIMD ABI.
+#[repr(C, align(16))]
+pub(crate) struct PreparedFour {
+    pairs: [[F128; 2]; 15],
+}
+
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some());
+    if *OFF {
+        return None;
+    }
+    if mul_diet_disabled() {
+        return None;
+    }
+    let mut result = PreparedFour {
+        pairs: [[F128::ZERO; 2]; 15],
+    };
+    for i in 0..15 {
+        // x^64 multiplication is a field operation, not a value assumption.
+        result.pairs[i] = [t[i], t[i] * F128::new(0, 1)];
+    }
+    Some(result)
+}
+
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(crate) unsafe fn row_prepared<const H: u8>(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    t: &[F128; 15],
+    pf_r: usize,
+    p: &PreparedFour,
+) {
+    unsafe {
+        if super::super::ntt_shaped_enabled() {
+            if num_ntts == 64 {
+                match sixteenth {
+                    128 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 128, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
+                    8 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 8, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
+                    4 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 4, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
+                    1 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 1, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if super::super::ntt_shaped_enabled() && num_ntts == 8 {
+            match sixteenth {
+                1024 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 1024, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                128 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 128, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                64 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 64, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                16 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 16, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                8 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 8, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                4 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 4, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                2 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 2, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                1 => {
+                    return butterfly_fused_4layer_row_impl::<true, true, H, 1, 8>(
+                        ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                    );
+                }
+                _ => {}
+            }
+        }
+        butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
+            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+        )
     }
 }
