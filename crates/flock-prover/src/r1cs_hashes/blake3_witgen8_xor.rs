@@ -396,8 +396,587 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
 
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+mod all_registers {
+use core::arch::x86_64::__m512i;
+core::arch::global_asm!(include_str!("blake3_witgen8_xor_all_regs.S"));
+unsafe extern "C"{
+fn flock_projection_mode00_register_add();
+fn flock_projection_mode00_register_first();
+fn flock_projection_mode01_register_add();
+fn flock_projection_mode01_register_first();
+fn flock_projection_mode02_register_add();
+fn flock_projection_mode02_register_first();
+fn flock_projection_mode03_register_add();
+fn flock_projection_mode03_register_first();
+fn flock_projection_mode04_register_add();
+fn flock_projection_mode04_register_first();
+fn flock_projection_mode05_register_add();
+fn flock_projection_mode05_register_first();
+fn flock_projection_mode06_register_add();
+fn flock_projection_mode06_register_first();
+fn flock_projection_mode07_register_add();
+fn flock_projection_mode07_register_first();
+fn flock_projection_mode08_register_add();
+fn flock_projection_mode08_register_first();
+fn flock_projection_mode09_register_add();
+fn flock_projection_mode09_register_first();
+fn flock_projection_mode10_register_add();
+fn flock_projection_mode10_register_first();
+fn flock_projection_mode11_register_add();
+fn flock_projection_mode11_register_first();
+fn flock_projection_mode12_register_add();
+fn flock_projection_mode12_register_first();
+fn flock_projection_mode13_register_add();
+fn flock_projection_mode13_register_first();
+fn flock_projection_mode14_register_add();
+fn flock_projection_mode14_register_first();
+fn flock_projection_mode15_register_add();
+fn flock_projection_mode15_register_first();
+}
+#[inline(always)]
+pub(super) unsafe fn accumulate<const MODE:u8,const FIRST:bool>(ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]){
+    // Each call exposes ordinary memory, flags and stack effects. Its private
+    // arithmetic body preserves GPRs and returns all eight accumulator vectors.
+    macro_rules! invoke {($first:path,$add:path)=>{unsafe{if FIRST{
+        core::arch::asm!(
+"vpbroadcastq zmm0, qword ptr [rdi + 0]",
+"vpbroadcastq zmm1, qword ptr [rdi + 8]",
+"vpbroadcastq zmm2, qword ptr [rdi + 16]",
+"vpbroadcastq zmm3, qword ptr [rdi + 24]",
+"vpbroadcastq zmm4, qword ptr [rdi + 32]",
+"vpbroadcastq zmm5, qword ptr [rdi + 40]",
+"vpbroadcastq zmm6, qword ptr [rdi + 48]",
+"vpbroadcastq zmm7, qword ptr [rdi + 56]",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"vmovdqu64 zmm16, zmmword ptr [rdx + 512]",
+"vmovdqu64 zmm17, zmmword ptr [rdx + 576]",
+"vmovdqu64 zmm18, zmmword ptr [rdx + 640]",
+"vmovdqu64 zmm19, zmmword ptr [rdx + 704]",
+"vmovdqu64 zmm20, zmmword ptr [rdx + 768]",
+"vmovdqu64 zmm21, zmmword ptr [rdx + 832]",
+"vgf2p8affineqb zmm7, zmm7, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm6, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm5, zmm18, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm4, zmm19, 0",
+"vgf2p8affineqb zmm23, zmm3, zmm20, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm2, zmm21, 0",
+"vgf2p8affineqb zmm23, zmm1, zmmword ptr [rdx + 896], 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 960], 0",
+"vpxorq zmm7, zmm7, zmm22",
+"vgf2p8affineqb zmm6, zmm6, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm18, 0",
+"vgf2p8affineqb zmm23, zmm2, zmm20, 0",
+"vpternlogq zmm6, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 896], 0",
+"vpxorq zmm6, zmm6, zmm22",
+"vgf2p8affineqb zmm5, zmm5, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm20, 0",
+"vpternlogq zmm5, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm21, 0",
+"vpxorq zmm5, zmm5, zmm22",
+"vgf2p8affineqb zmm4, zmm4, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm20, 0",
+"vpxorq zmm4, zmm4, zmm22",
+"vgf2p8affineqb zmm3, zmm3, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm2, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm18, 0",
+"vpternlogq zmm3, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm19, 0",
+"vpxorq zmm3, zmm3, zmm22",
+"vgf2p8affineqb zmm2, zmm2, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm18, 0",
+"vpxorq zmm2, zmm2, zmm22",
+"vgf2p8affineqb zmm1, zmm1, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm17, 0",
+"vpxorq zmm1, zmm1, zmm22",
+"vgf2p8affineqb zmm0, zmm0, zmm16, 0",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"call {leaf}",leaf=sym $first,
+        in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+lateout("zmm24")acc[0],
+lateout("zmm25")acc[1],
+lateout("zmm26")acc[2],
+lateout("zmm27")acc[3],
+lateout("zmm28")acc[4],
+lateout("zmm29")acc[5],
+lateout("zmm30")acc[6],
+lateout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}else{
+core::arch::asm!(
+"vpbroadcastq zmm0, qword ptr [rdi + 0]",
+"vpbroadcastq zmm1, qword ptr [rdi + 8]",
+"vpbroadcastq zmm2, qword ptr [rdi + 16]",
+"vpbroadcastq zmm3, qword ptr [rdi + 24]",
+"vpbroadcastq zmm4, qword ptr [rdi + 32]",
+"vpbroadcastq zmm5, qword ptr [rdi + 40]",
+"vpbroadcastq zmm6, qword ptr [rdi + 48]",
+"vpbroadcastq zmm7, qword ptr [rdi + 56]",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"vmovdqu64 zmm16, zmmword ptr [rdx + 512]",
+"vmovdqu64 zmm17, zmmword ptr [rdx + 576]",
+"vmovdqu64 zmm18, zmmword ptr [rdx + 640]",
+"vmovdqu64 zmm19, zmmword ptr [rdx + 704]",
+"vmovdqu64 zmm20, zmmword ptr [rdx + 768]",
+"vmovdqu64 zmm21, zmmword ptr [rdx + 832]",
+"vgf2p8affineqb zmm7, zmm7, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm6, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm5, zmm18, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm4, zmm19, 0",
+"vgf2p8affineqb zmm23, zmm3, zmm20, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm2, zmm21, 0",
+"vgf2p8affineqb zmm23, zmm1, zmmword ptr [rdx + 896], 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 960], 0",
+"vpxorq zmm7, zmm7, zmm22",
+"vgf2p8affineqb zmm6, zmm6, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm18, 0",
+"vgf2p8affineqb zmm23, zmm2, zmm20, 0",
+"vpternlogq zmm6, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 896], 0",
+"vpxorq zmm6, zmm6, zmm22",
+"vgf2p8affineqb zmm5, zmm5, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm20, 0",
+"vpternlogq zmm5, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm21, 0",
+"vpxorq zmm5, zmm5, zmm22",
+"vgf2p8affineqb zmm4, zmm4, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm20, 0",
+"vpxorq zmm4, zmm4, zmm22",
+"vgf2p8affineqb zmm3, zmm3, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm2, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm18, 0",
+"vpternlogq zmm3, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm19, 0",
+"vpxorq zmm3, zmm3, zmm22",
+"vgf2p8affineqb zmm2, zmm2, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm18, 0",
+"vpxorq zmm2, zmm2, zmm22",
+"vgf2p8affineqb zmm1, zmm1, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm17, 0",
+"vpxorq zmm1, zmm1, zmm22",
+"vgf2p8affineqb zmm0, zmm0, zmm16, 0",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"call {leaf}",leaf=sym $add,in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+inout("zmm24")acc[0],
+inout("zmm25")acc[1],
+inout("zmm26")acc[2],
+inout("zmm27")acc[3],
+inout("zmm28")acc[4],
+inout("zmm29")acc[5],
+inout("zmm30")acc[6],
+inout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}}}}
+match MODE{
+0=>invoke!(flock_projection_mode00_register_first,flock_projection_mode00_register_add),
+1=>invoke!(flock_projection_mode01_register_first,flock_projection_mode01_register_add),
+2=>invoke!(flock_projection_mode02_register_first,flock_projection_mode02_register_add),
+3=>invoke!(flock_projection_mode03_register_first,flock_projection_mode03_register_add),
+4=>invoke!(flock_projection_mode04_register_first,flock_projection_mode04_register_add),
+5=>invoke!(flock_projection_mode05_register_first,flock_projection_mode05_register_add),
+6=>invoke!(flock_projection_mode06_register_first,flock_projection_mode06_register_add),
+7=>invoke!(flock_projection_mode07_register_first,flock_projection_mode07_register_add),
+8=>invoke!(flock_projection_mode08_register_first,flock_projection_mode08_register_add),
+9=>invoke!(flock_projection_mode09_register_first,flock_projection_mode09_register_add),
+10=>invoke!(flock_projection_mode10_register_first,flock_projection_mode10_register_add),
+11=>invoke!(flock_projection_mode11_register_first,flock_projection_mode11_register_add),
+12=>invoke!(flock_projection_mode12_register_first,flock_projection_mode12_register_add),
+13=>invoke!(flock_projection_mode13_register_first,flock_projection_mode13_register_add),
+14=>invoke!(flock_projection_mode14_register_first,flock_projection_mode14_register_add),
+15=>invoke!(flock_projection_mode15_register_first,flock_projection_mode15_register_add),
+_=>unreachable!(),
+}
+}
+// The selected symbol uses the same explicit register convention; only
+// its address selection is dynamic. The private call preserves rax too.
+const ADD_LEAVES:[unsafe extern "C" fn();16]=[
+flock_projection_mode00_register_add,
+flock_projection_mode01_register_add,
+flock_projection_mode02_register_add,
+flock_projection_mode03_register_add,
+flock_projection_mode04_register_add,
+flock_projection_mode05_register_add,
+flock_projection_mode06_register_add,
+flock_projection_mode07_register_add,
+flock_projection_mode08_register_add,
+flock_projection_mode09_register_add,
+flock_projection_mode10_register_add,
+flock_projection_mode11_register_add,
+flock_projection_mode12_register_add,
+flock_projection_mode13_register_add,
+flock_projection_mode14_register_add,
+flock_projection_mode15_register_add];
+const FIRST_LEAVES:[unsafe extern "C" fn();16]=[
+flock_projection_mode00_register_first,
+flock_projection_mode01_register_first,
+flock_projection_mode02_register_first,
+flock_projection_mode03_register_first,
+flock_projection_mode04_register_first,
+flock_projection_mode05_register_first,
+flock_projection_mode06_register_first,
+flock_projection_mode07_register_first,
+flock_projection_mode08_register_first,
+flock_projection_mode09_register_first,
+flock_projection_mode10_register_first,
+flock_projection_mode11_register_first,
+flock_projection_mode12_register_first,
+flock_projection_mode13_register_first,
+flock_projection_mode14_register_first,
+flock_projection_mode15_register_first];
+#[inline(always)]
+pub(super) unsafe fn accumulate_dynamic<const FIRST:bool>(leaf:unsafe extern "C" fn(),ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]){
+    unsafe{
+    if FIRST{core::arch::asm!(
+"vpbroadcastq zmm0, qword ptr [rdi + 0]",
+"vpbroadcastq zmm1, qword ptr [rdi + 8]",
+"vpbroadcastq zmm2, qword ptr [rdi + 16]",
+"vpbroadcastq zmm3, qword ptr [rdi + 24]",
+"vpbroadcastq zmm4, qword ptr [rdi + 32]",
+"vpbroadcastq zmm5, qword ptr [rdi + 40]",
+"vpbroadcastq zmm6, qword ptr [rdi + 48]",
+"vpbroadcastq zmm7, qword ptr [rdi + 56]",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"vmovdqu64 zmm16, zmmword ptr [rdx + 512]",
+"vmovdqu64 zmm17, zmmword ptr [rdx + 576]",
+"vmovdqu64 zmm18, zmmword ptr [rdx + 640]",
+"vmovdqu64 zmm19, zmmword ptr [rdx + 704]",
+"vmovdqu64 zmm20, zmmword ptr [rdx + 768]",
+"vmovdqu64 zmm21, zmmword ptr [rdx + 832]",
+"vgf2p8affineqb zmm7, zmm7, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm6, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm5, zmm18, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm4, zmm19, 0",
+"vgf2p8affineqb zmm23, zmm3, zmm20, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm2, zmm21, 0",
+"vgf2p8affineqb zmm23, zmm1, zmmword ptr [rdx + 896], 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 960], 0",
+"vpxorq zmm7, zmm7, zmm22",
+"vgf2p8affineqb zmm6, zmm6, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm18, 0",
+"vgf2p8affineqb zmm23, zmm2, zmm20, 0",
+"vpternlogq zmm6, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 896], 0",
+"vpxorq zmm6, zmm6, zmm22",
+"vgf2p8affineqb zmm5, zmm5, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm20, 0",
+"vpternlogq zmm5, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm21, 0",
+"vpxorq zmm5, zmm5, zmm22",
+"vgf2p8affineqb zmm4, zmm4, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm20, 0",
+"vpxorq zmm4, zmm4, zmm22",
+"vgf2p8affineqb zmm3, zmm3, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm2, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm18, 0",
+"vpternlogq zmm3, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm19, 0",
+"vpxorq zmm3, zmm3, zmm22",
+"vgf2p8affineqb zmm2, zmm2, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm18, 0",
+"vpxorq zmm2, zmm2, zmm22",
+"vgf2p8affineqb zmm1, zmm1, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm17, 0",
+"vpxorq zmm1, zmm1, zmm22",
+"vgf2p8affineqb zmm0, zmm0, zmm16, 0",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"call rax",in("rax")leaf,
+    in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+lateout("zmm24")acc[0],
+lateout("zmm25")acc[1],
+lateout("zmm26")acc[2],
+lateout("zmm27")acc[3],
+lateout("zmm28")acc[4],
+lateout("zmm29")acc[5],
+lateout("zmm30")acc[6],
+lateout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}else{
+core::arch::asm!(
+"vpbroadcastq zmm0, qword ptr [rdi + 0]",
+"vpbroadcastq zmm1, qword ptr [rdi + 8]",
+"vpbroadcastq zmm2, qword ptr [rdi + 16]",
+"vpbroadcastq zmm3, qword ptr [rdi + 24]",
+"vpbroadcastq zmm4, qword ptr [rdi + 32]",
+"vpbroadcastq zmm5, qword ptr [rdi + 40]",
+"vpbroadcastq zmm6, qword ptr [rdi + 48]",
+"vpbroadcastq zmm7, qword ptr [rdi + 56]",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"vmovdqu64 zmm16, zmmword ptr [rdx + 512]",
+"vmovdqu64 zmm17, zmmword ptr [rdx + 576]",
+"vmovdqu64 zmm18, zmmword ptr [rdx + 640]",
+"vmovdqu64 zmm19, zmmword ptr [rdx + 704]",
+"vmovdqu64 zmm20, zmmword ptr [rdx + 768]",
+"vmovdqu64 zmm21, zmmword ptr [rdx + 832]",
+"vgf2p8affineqb zmm7, zmm7, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm6, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm5, zmm18, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm4, zmm19, 0",
+"vgf2p8affineqb zmm23, zmm3, zmm20, 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm2, zmm21, 0",
+"vgf2p8affineqb zmm23, zmm1, zmmword ptr [rdx + 896], 0",
+"vpternlogq zmm7, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 960], 0",
+"vpxorq zmm7, zmm7, zmm22",
+"vgf2p8affineqb zmm6, zmm6, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm18, 0",
+"vgf2p8affineqb zmm23, zmm2, zmm20, 0",
+"vpternlogq zmm6, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmmword ptr [rdx + 896], 0",
+"vpxorq zmm6, zmm6, zmm22",
+"vgf2p8affineqb zmm5, zmm5, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm4, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm20, 0",
+"vpternlogq zmm5, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm21, 0",
+"vpxorq zmm5, zmm5, zmm22",
+"vgf2p8affineqb zmm4, zmm4, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm20, 0",
+"vpxorq zmm4, zmm4, zmm22",
+"vgf2p8affineqb zmm3, zmm3, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm2, zmm17, 0",
+"vgf2p8affineqb zmm23, zmm1, zmm18, 0",
+"vpternlogq zmm3, zmm22, zmm23, 0x96",
+"vgf2p8affineqb zmm22, zmm0, zmm19, 0",
+"vpxorq zmm3, zmm3, zmm22",
+"vgf2p8affineqb zmm2, zmm2, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm18, 0",
+"vpxorq zmm2, zmm2, zmm22",
+"vgf2p8affineqb zmm1, zmm1, zmm16, 0",
+"vgf2p8affineqb zmm22, zmm0, zmm17, 0",
+"vpxorq zmm1, zmm1, zmm22",
+"vgf2p8affineqb zmm0, zmm0, zmm16, 0",
+"vpxorq zmm0, zmm0, zmm1",
+"vpxorq zmm2, zmm2, zmm3",
+"vpxorq zmm4, zmm4, zmm5",
+"vpxorq zmm6, zmm6, zmm7",
+"vpxorq zmm0, zmm0, zmm2",
+"vpxorq zmm1, zmm1, zmm3",
+"vpxorq zmm4, zmm4, zmm6",
+"vpxorq zmm5, zmm5, zmm7",
+"vpxorq zmm0, zmm0, zmm4",
+"vpxorq zmm1, zmm1, zmm5",
+"vpxorq zmm2, zmm2, zmm6",
+"vpxorq zmm3, zmm3, zmm7",
+"call rax",in("rax")leaf,in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+inout("zmm24")acc[0],
+inout("zmm25")acc[1],
+inout("zmm26")acc[2],
+inout("zmm27")acc[3],
+inout("zmm28")acc[4],
+inout("zmm29")acc[5],
+inout("zmm30")acc[6],
+inout("zmm31")acc[7],
+out("zmm0")_,
+out("zmm1")_,
+out("zmm2")_,
+out("zmm3")_,
+out("zmm4")_,
+out("zmm5")_,
+out("zmm6")_,
+out("zmm7")_,
+out("zmm8")_,
+out("zmm9")_,
+out("zmm10")_,
+out("zmm11")_,
+out("zmm12")_,
+out("zmm13")_,
+out("zmm14")_,
+out("zmm15")_,
+out("zmm16")_,
+out("zmm17")_,
+out("zmm18")_,
+out("zmm19")_,
+out("zmm20")_,
+out("zmm21")_,
+out("zmm22")_,
+out("zmm23")_);
+}}}
+
+// Compile-time structural dispatch. Each slot is the exact mode and FIRST
+// choice already used by the original constant-window implementation.
+pub(super) static WINDOW_LEAVES:[[unsafe extern "C" fn();8];26]={
+    let mut table=[[flock_projection_mode00_register_add as unsafe extern "C" fn();8];26];
+    let mut b=3;while b<=28{let mut k=0;while k<8{
+        let mode=super::mode(b,k) as usize;assert!(mode<16);
+        table[b-3][k]=if k==7{FIRST_LEAVES[mode]}else{ADD_LEAVES[mode]};k+=1;
+    }b+=1;}table
+};
+
+}
+
+// Private vector-returning calls keep the complete accumulator independent
+// of the outlined portable arithmetic's pointer-based calling convention.
+#[inline(always)]
+unsafe fn row_product<const MODE:u8,const FIRST:bool>(ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]){
+    #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+    unsafe { all_registers::accumulate::<MODE,FIRST>(ap,bp,ma,mb,acc); }
+    #[cfg(not(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")))]
+    unsafe { row_product_fallback::<MODE,FIRST>(ap,bp,ma,mb,acc); }
+}
+
 #[inline(never)]
-unsafe fn row_product<const MODE: u8, const FIRST: bool>(
+unsafe fn row_product_fallback<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
@@ -448,8 +1027,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(1, a[1], b[1]);
         match mode(BLK, 6) {
@@ -474,8 +1056,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(2, a[2], b[2]);
         match mode(BLK, 5) {
@@ -500,8 +1085,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(3, a[3], b[3]);
         match mode(BLK, 4) {
@@ -526,8 +1114,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(4, a[4], b[4]);
         match mode(BLK, 3) {
@@ -552,8 +1143,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(5, a[5], b[5]);
         match mode(BLK, 2) {
@@ -578,8 +1172,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(6, a[6], b[6]);
         match mode(BLK, 1) {
@@ -604,8 +1201,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         rows.publish_dense_values(7, a[7], b[7]);
         match mode(BLK, 0) {
@@ -630,8 +1230,11 @@ _ => unreachable!(),
         // Keep the completed Horner state and this row's NT stores before the
         // next row's publication. The compiler barrier has no machine instruction;
         // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
         core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
 s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
@@ -694,6 +1297,170 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
         );
     }
 }
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn project_shared(
+    proj: &StreamProj<'_>,
+    rows: RankedRows,
+    a: [__m512i; 8],
+    b: [__m512i; 8],
+    ap: &[u64; 64],
+    bp: &[u64; 64],
+    m: *const u64,
+    blk: usize,
+    leaves: &[unsafe extern "C" fn();8],
+) {
+    unsafe {
+        let mut acc = [_mm512_setzero_si512(); 8];
+        rows.publish_dense_values(0, a[0], b[0]);
+        all_registers::accumulate_dynamic::<true>(*leaves.get_unchecked(7), ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(1, a[1], b[1]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(6), ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(2, a[2], b[2]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(5), ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(3, a[3], b[3]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(4), ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(4, a[4], b[4]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(3), ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(5, a[5], b[5]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(2), ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(6, a[6], b[6]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(1), ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        rows.publish_dense_values(7, a[7], b[7]);
+        all_registers::accumulate_dynamic::<false>(*leaves.get_unchecked(0), ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc);
+        // Keep the completed Horner state and this row's NT stores before the
+        // next row's publication. The compiler barrier has no machine instruction;
+        // its memory clobber prevents combining all 24 witness stores into a burst.
+        // The register call itself is the opaque memory/publication boundary.
+        if !cfg!(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")) {
+        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
+s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+
+        let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
+        let out = trq([
+            _mm512_permutexvar_epi8(ix, acc[0]),
+            _mm512_permutexvar_epi8(ix, acc[1]),
+            _mm512_permutexvar_epi8(ix, acc[2]),
+            _mm512_permutexvar_epi8(ix, acc[3]),
+            _mm512_permutexvar_epi8(ix, acc[4]),
+            _mm512_permutexvar_epi8(ix, acc[5]),
+            _mm512_permutexvar_epi8(ix, acc[6]),
+            _mm512_permutexvar_epi8(ix, acc[7]),
+        ]);
+        _mm512_stream_si512(
+            proj.out
+                .add(0 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[0],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(1 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[1],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(2 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[2],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(3 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[3],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(4 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[4],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(5 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[5],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(6 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[6],
+        );
+        _mm512_stream_si512(
+            proj.out
+                .add(7 * proj.out_stride + blk * 64 - proj.out_bias)
+                .cast(),
+            out[7],
+        );
+    }
+}
 /// Same ring, ranked-static and non-temporal publication contract as the
 /// direct-inline path. The caller issues the task's existing final sfence.
 #[inline(never)]
@@ -709,8 +1476,34 @@ pub(super) unsafe fn project(
     unsafe {
         let ap = pretranspose_ring(ar, rw);
         let bp = pretranspose_ring(br, rw);
-        let a = tr8x16_zmm(ar, rw);
-        let b = tr8x16_zmm(br, rw);
+        let mut a = tr8x16_zmm(ar, rw);
+        let mut b = tr8x16_zmm(br, rw);
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+        core::arch::asm!(
+            "/* completed input transpose {a0} {b0} {a1} {b1} {a2} {b2} {a3} {b3} {a4} {b4} {a5} {b5} {a6} {b6} {a7} {b7} */",
+            a0=inout(zmm_reg)a[0],
+            a1=inout(zmm_reg)a[1],
+            a2=inout(zmm_reg)a[2],
+            a3=inout(zmm_reg)a[3],
+            a4=inout(zmm_reg)a[4],
+            a5=inout(zmm_reg)a[5],
+            a6=inout(zmm_reg)a[6],
+            a7=inout(zmm_reg)a[7],
+            b0=inout(zmm_reg)b[0],
+            b1=inout(zmm_reg)b[1],
+            b2=inout(zmm_reg)b[2],
+            b3=inout(zmm_reg)b[3],
+            b4=inout(zmm_reg)b[4],
+            b5=inout(zmm_reg)b[5],
+            b6=inout(zmm_reg)b[6],
+            b7=inout(zmm_reg)b[7],
+            options(nostack,preserves_flags));
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+        {
+            assert!((3..=28).contains(&blk), "only fully-live ranked mixed windows reach XOR projection");
+            project_shared(proj, rows, a, b, &ap, &bp, t.0.as_ptr(), blk, &all_registers::WINDOW_LEAVES[blk-3]);
+        }
+        #[cfg(not(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")))]
         match blk {
             3 => project_const::<3>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             4 => project_const::<4>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
