@@ -149,7 +149,9 @@ impl RootTileCache {
             .zip(active.par_iter_mut())
             .enumerate()
             .for_each(|(worker, (dst, active))| {
-                let mut mats = [0u64; 128];
+                // Four matrices fit in 4KiB. Fold each block across this batch
+                // before moving on, keeping its 1KiB accumulator hot in L1.
+                let mut mats = [[0u64; 128]; 4];
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -170,32 +172,33 @@ impl RootTileCache {
                         }
                         hi = (lo + 4).min(self.tiles);
                     }
-                    let tile = lo;
-                    lo += 1;
-                    for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                        let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
-                        kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
-                    }
-                    for block in 0..self.blocks {
-                        // SAFETY: the fully initialized immutable cache is
-                        // 64-byte aligned; this worker owns every dst plane.
-                        // Its first tile initializes all live planes before
-                        // subsequent tiles load their accumulators.
-                        unsafe {
-                            let src = self
-                                .block(tile * self.blocks + block)
-                                .0
-                                .as_ptr()
-                                .cast::<__m512i>();
-                            let rows = core::array::from_fn(|i| _mm512_load_si512(src.add(i)));
-                            kernels::gfni_fold_rows(
-                                &rows,
-                                &mats,
-                                dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                first,
+                    let batch_end = (lo + 4).min(hi);
+                    for tile in lo..batch_end {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
+                            kernels::fold_mats_from_basis(
+                                &eq8, &mut mats[tile - lo][t * 16..(t + 1) * 16],
                             );
                         }
                     }
+                    for block in 0..self.blocks {
+                        for tile in lo..batch_end {
+                            // SAFETY: cache is immutable and initialized; this
+                            // worker exclusively owns dst. The first tile of
+                            // the first batch initializes every output block.
+                            unsafe {
+                                let src = self.block(tile * self.blocks + block)
+                                    .0.as_ptr().cast::<__m512i>();
+                                let rows = core::array::from_fn(|i| _mm512_load_si512(src.add(i)));
+                                kernels::gfni_fold_rows(
+                                    &rows, &mats[tile - lo],
+                                    dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                    first && tile == lo,
+                                );
+                            }
+                        }
+                    }
+                    lo = batch_end;
                     first = false;
                 }
                 *active = u8::from(!first);
@@ -308,4 +311,64 @@ mod tests {
             assert_eq!(fresh_cache.fold(&eq2), plan.fold(&fresh_z, 384, &eq2));
         });
     }
+    #[test]
+    fn root_tile_cache_batch_scalar_oracle() {
+        let mut calls = 0;
+        let mut comparisons = 0;
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for tiles in [1usize, 3, 4, 5, 9, 17, 33] {
+                for blocks in [1usize, 2, 5] {
+                    let fields = tiles * blocks * 32;
+                    let mut storage = PooledStorage(crate::scratch::take_f128(fields + 3));
+                    let offset = storage.0.as_ptr().align_offset(64);
+                    assert!(offset <= 3);
+                    let ptr = unsafe { storage.0.as_mut_ptr().add(offset).cast::<Block>() };
+                    let mut seed = 0x718293ab91233451u64;
+                    for tile in 0..tiles {
+                        for block in 0..blocks {
+                            let mut bytes = [0u8; 512];
+                            for byte in &mut bytes {
+                                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                                *byte = seed as u8;
+                            }
+                            unsafe { ptr.add(tile * blocks + block).write(Block(bytes)); }
+                        }
+                    }
+                    let cache = RootTileCache { storage, offset, tiles, blocks };
+                    for challenge in [0u64, 0x8192ab] {
+                        let eq = |i: usize| core::array::from_fn(|j| {
+                            let n = (i + j + 1) as u64;
+                            F128 { lo: n.wrapping_mul(0xa2d92d73829).rotate_left(17) ^ challenge,
+                                   hi: n.wrapping_mul(0x7a39823b5).rotate_left(39) ^ challenge.rotate_left(23) }
+                        });
+                        let mut expected = vec![F128::ZERO; blocks * 64];
+                        for tile in 0..tiles {
+                            for block in 0..blocks {
+                                let bytes = &cache.block(tile * blocks + block).0;
+                                for t in 0..8 {
+                                    let basis = eq(8 * (tile * 8 + t));
+                                    for col in 0..64 {
+                                        for j in 0..8 {
+                                            if bytes[t * 64 + col] & (1 << j) != 0 {
+                                                expected[block * 64 + col].lo ^= basis[j].lo;
+                                                expected[block * 64 + col].hi ^= basis[j].hi;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let actual = pool.install(|| cache.fold(&eq));
+                        assert_eq!(actual, expected, "threads={threads} tiles={tiles} blocks={blocks} challenge={challenge}");
+                        calls += 1; comparisons += actual.len();
+                    }
+                }
+            }
+        }
+        println!("SCALAR_CACHE_ORACLE calls={calls} field_comparisons={comparisons}");
+        assert_eq!(calls, 126);
+        assert_eq!(comparisons, 21504);
+    }
+
 }
