@@ -334,30 +334,37 @@ fn blake3_hash_many<const N: usize>(
     flags_end: u8,
 ) {
     assert_eq!(data.len(), out.len() * N);
+    // The contiguous kernel itself loops over all full SIMD groups. Enter it
+    // once for this slice, rather than repeating its SysV prologue and Rust
+    // dispatch for each 64-message pointer-array batch. Only the remainder
+    // needs the ordinary platform path below.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    let (out, data) = {
+        let full = out.len() / 16 * 16;
+        if full != 0 {
+            contiguous::hash_many::<N>(
+                &data[..full * N],
+                &mut out[..full],
+                flags,
+                flags_start,
+                flags_end,
+            );
+        }
+        (&mut out[full..], &data[full * N..])
+    };
+    if out.is_empty() {
+        return;
+    }
     let plat = blake3_platform();
     for (outs, msgs) in out
         .chunks_mut(BLAKE3_BATCH)
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_os = "linux",
-            target_feature = "avx512f",
-            target_feature = "avx512vl"
-        ))]
-        let (outs, msgs) = {
-            let full = outs.len() / 16 * 16;
-            if full != 0 {
-                contiguous::hash_many::<N>(
-                    &msgs[..full * N],
-                    &mut outs[..full],
-                    flags,
-                    flags_start,
-                    flags_end,
-                );
-            }
-            (&mut outs[full..], &msgs[full * N..])
-        };
         if outs.is_empty() {
             continue;
         }
