@@ -5623,7 +5623,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
     use core::arch::x86_64::*;
     // SAFETY (whole body): caller guarantees 64 readable bytes at
     // `rows.add(64 * i)` for every line not marked dead and 16 writable
-    // `F128`s at `out`; the scratch is a local 512-byte array written in full
+    // `F128`s at `out`; the scratch is a local 256-byte array written in full per pass
     // before any read; every shuffle index is in range and the cfg gate
     // supplies each intrinsic.
     unsafe {
@@ -5641,17 +5641,17 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         }
 
         #[repr(C, align(64))]
-        struct Octs([u64; 64]);
+        struct Octs([u64; 32]);
         let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
         let op = octs.as_mut_ptr().cast::<u64>();
         let oct_even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr() as *const __m512i);
         let oct_odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr() as *const __m512i);
 
-        // ---- gather, both passes, BEFORE any affine -------------------------
+        // ---- gather one pass into reusable 256-byte scratch -----------------
         // Slot order inside a pass: s = 2u + e for output 4u + 2p + e, i.e.
         // (line p even, line p odd, line p+2 even, line p+2 odd) from pair A
         // and the same from lines p+4, p+6 in pair B.
-        let gather = |p: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+        let gather = |s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
             // Stage 1: qwords `{a, a + 4}` of two lines, as the incumbent.
             let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
             let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
@@ -5659,7 +5659,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
             let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
             let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
             let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
-            let base = op.add(32 * p);
+            let base = op;
             // `oct[a].qword[j]` = chunk `j` of the eight residue-`a` rows.
             let oct = |a: usize, v: __m512i| {
                 _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v)
@@ -5669,12 +5669,14 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
             oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
             oct(3, _mm512_permutex2var_epi8(p23, oct_odd, p67));
         };
-        gather(0, z[0], z[2], z[4], z[6]);
-        gather(1, z[1], z[3], z[5], z[7]);
+        gather(z[0], z[2], z[4], z[6]);
+
 
         // OPAQUE READ POINTER, as the incumbent: keeps every broadcast a
         // load-port `vpbroadcastq zmm, m64` instead of a port-5 `vpermq`.
-        let rp: *const u64 = core::hint::black_box(op as *const u64);
+        // Each pass reads the same scratch after its own gather.
+        let mut rp: *const u64 = op as *const u64;
+        core::arch::asm!("/* {ptr} */", ptr = inout(reg) rp, options(nostack, preserves_flags));
         let mp = m.1.as_ptr() as *const u64;
         let dst = out as *mut __m512i;
         let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
@@ -5686,12 +5688,13 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         macro_rules! pass {
             ($p:expr) => {{
                 const P: usize = $p;
-                let mp = core::hint::black_box(mp);
+                let mut mp = mp;
+                core::arch::asm!("/* {ptr} */", ptr = inout(reg) mp, options(nostack, preserves_flags));
                 let mut accp = [_mm512_setzero_si512(); 2];
                 let mut accq = [_mm512_setzero_si512(); 2];
                 for a in 0..4usize {
                     let b: [__m512i; 8] = core::array::from_fn(|j| {
-                        _mm512_set1_epi64(*rp.add(32 * P + 8 * a + j) as i64)
+                        _mm512_set1_epi64(*rp.add(8 * a + j) as i64)
                     });
                     let f: [[__m512i; 8]; 2] = core::array::from_fn(|hh| {
                         core::array::from_fn(|j| {
@@ -5727,6 +5730,7 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
             }};
         }
         pass!(0);
+        gather(z[1], z[3], z[5], z[7]);
         pass!(1);
     }
 }
