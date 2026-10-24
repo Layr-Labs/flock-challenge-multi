@@ -1094,3 +1094,38 @@ mod low_twiddle_tests {
         }
     }
 }
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+pub(super) use x86_64::{prepare_four,row_prepared};
+
+/// Raw twiddles plus an optional immutable target-specific preparation.
+/// Built per block, never inside a row task or Rayon closure.
+pub(super) struct FourBlock {
+    raw: [F128;15],
+    #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+    cache: Option<x86_64::PreparedFour>,
+}
+impl FourBlock {
+    pub(super) fn new(raw:[F128;15]) -> Self {
+        Self { raw,
+            #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+            cache: unsafe {x86_64::prepare_four(&raw)},
+        }
+    }
+}
+impl core::ops::Deref for FourBlock {
+    type Target=[F128;15];
+    fn deref(&self)->&Self::Target {&self.raw}
+}
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_cached(
+    ptr:*mut F128,sixteenth:usize,num_ntts:usize,lanes:usize,r:usize,t:&FourBlock,
+) {
+    unsafe {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+        if let Some(p)=t.cache.as_ref() {
+            return x86_64::row_prepared::<0>(ptr,sixteenth,num_ntts,lanes,r,&t.raw,0,p);
+        }
+        butterfly_fused_4layer_row(ptr,sixteenth,num_ntts,lanes,r,&t.raw)
+    }
+}
