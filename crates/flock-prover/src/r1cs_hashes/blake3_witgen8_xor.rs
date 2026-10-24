@@ -155,6 +155,22 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
             if known(mode_value) & (1 << 6) != 0 { 0 } else if mode_value == 0 { *p.add(6) } else { !*p.add(6) },
             if known(mode_value) & (1 << 7) != 0 { 0 } else if mode_value == 0 { *p.add(7) } else { !*p.add(7) }
         ];
+        // Dense XOR-zeta transform in qword lanes. Partial complement modes
+        // retain the parent scalar specialization and its known-zero pruning.
+        let mut dense = _mm512_setzero_si512();
+        if mode_value == 0 {
+            dense = _mm512_loadu_si512(p.cast());
+            dense = _mm512_mask_xor_epi64(dense, 0x55, dense,
+                _mm512_permutexvar_epi64(_mm512_set_epi64(7,7,5,5,3,3,1,1),dense));
+            dense = _mm512_mask_xor_epi64(dense, 0x33, dense,
+                _mm512_permutexvar_epi64(_mm512_set_epi64(7,6,7,6,3,2,3,2),dense));
+            dense = _mm512_mask_xor_epi64(dense, 0x0f, dense,
+                _mm512_permutexvar_epi64(_mm512_set_epi64(7,6,5,4,7,6,5,4),dense));
+            // Keep this vector representation visible to the consumer instead
+            // of allowing LLVM to undo it into eight scalar XOR chains.
+            core::arch::asm!("/* vector zeta {v} */",v=inout(zmm_reg)dense,
+                options(nomem,nostack,preserves_flags));
+        } else {
         x[0] ^= x[1];
         x[2] ^= x[3];
         x[4] ^= x[5];
@@ -167,98 +183,99 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
         x[1] ^= x[5];
         x[2] ^= x[6];
         x[3] ^= x[7];
+        }
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
-            _mm512_set1_epi64(x[0] as i64),
+            if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
             _mm512_loadu_si512(m.add(64).cast()),
         );
         c[1] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                 _mm512_loadu_si512(m.add(72).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[1] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(1), dense) } else { _mm512_set1_epi64(x[1] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[2] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                 _mm512_loadu_si512(m.add(80).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[2] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(2), dense) } else { _mm512_set1_epi64(x[2] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[3] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                     _mm512_loadu_si512(m.add(88).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(1), dense) } else { _mm512_set1_epi64(x[1] as i64) },
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(2), dense) } else { _mm512_set1_epi64(x[2] as i64) },
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[3] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(3), dense) } else { _mm512_set1_epi64(x[3] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[4] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                 _mm512_loadu_si512(m.add(96).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[4] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(4), dense) } else { _mm512_set1_epi64(x[4] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[5] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                     _mm512_loadu_si512(m.add(104).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(1), dense) } else { _mm512_set1_epi64(x[1] as i64) },
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(4), dense) } else { _mm512_set1_epi64(x[4] as i64) },
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[5] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(5), dense) } else { _mm512_set1_epi64(x[5] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[6] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                     _mm512_loadu_si512(m.add(112).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(2), dense) } else { _mm512_set1_epi64(x[2] as i64) },
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(4), dense) } else { _mm512_set1_epi64(x[4] as i64) },
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[6] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(6), dense) } else { _mm512_set1_epi64(x[6] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
@@ -267,38 +284,38 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
                 _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[0] as i64),
+                            if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(0), dense) } else { _mm512_set1_epi64(x[0] as i64) },
                             _mm512_loadu_si512(m.add(120).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[1] as i64),
+                            if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(1), dense) } else { _mm512_set1_epi64(x[1] as i64) },
                             _mm512_loadu_si512(m.add(112).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[2] as i64),
+                            if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(2), dense) } else { _mm512_set1_epi64(x[2] as i64) },
                             _mm512_loadu_si512(m.add(104).cast()),
                         ),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[3] as i64),
+                        if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(3), dense) } else { _mm512_set1_epi64(x[3] as i64) },
                         _mm512_loadu_si512(m.add(96).cast()),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[4] as i64),
+                        if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(4), dense) } else { _mm512_set1_epi64(x[4] as i64) },
                         _mm512_loadu_si512(m.add(88).cast()),
                     ),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[5] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(5), dense) } else { _mm512_set1_epi64(x[5] as i64) },
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[6] as i64),
+                    if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(6), dense) } else { _mm512_set1_epi64(x[6] as i64) },
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[7] as i64),
+                if mode_value == 0 { _mm512_permutexvar_epi64(_mm512_set1_epi64(7), dense) } else { _mm512_set1_epi64(x[7] as i64) },
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
