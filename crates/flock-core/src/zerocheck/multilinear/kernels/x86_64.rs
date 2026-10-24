@@ -3181,8 +3181,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                gfni_fold64_rows_masked_c4_bcast_lm(a_pkt.add(4 * xg * 8), cfold, fa, 0);
-                gfni_fold64_rows_masked_c4_bcast_lm(b_pkt.add(4 * xg * 8), cfold, fb, 0);
+                gfni_fold64_rows_masked_c4_bcast_lm_ab(
+                    a_pkt.add(4 * xg * 8),
+                    b_pkt.add(4 * xg * 8),
+                    cfold,
+                    fa,
+                    fb,
+                );
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -3754,18 +3759,28 @@ unsafe fn fold2_from_packed_lookahead_general_x86_avx512(
                         if use_c4 {
                             let c = cfold.unwrap();
                             if c4_lm_on {
-                                gfni_fold64_rows_masked_c4_bcast_lm(
-                                    a_pkt.add(4 * xg * 8),
-                                    c,
-                                    fa.as_mut_ptr(),
-                                    dead,
-                                );
-                                gfni_fold64_rows_masked_c4_bcast_lm(
-                                    b_pkt.add(4 * xg * 8),
-                                    c,
-                                    fb.as_mut_ptr(),
-                                    dead,
-                                );
+                                if dead == 0 {
+                                    gfni_fold64_rows_masked_c4_bcast_lm_ab(
+                                        a_pkt.add(4 * xg * 8),
+                                        b_pkt.add(4 * xg * 8),
+                                        c,
+                                        fa.as_mut_ptr(),
+                                        fb.as_mut_ptr(),
+                                    );
+                                } else {
+                                    gfni_fold64_rows_masked_c4_bcast_lm(
+                                        a_pkt.add(4 * xg * 8),
+                                        c,
+                                        fa.as_mut_ptr(),
+                                        dead,
+                                    );
+                                    gfni_fold64_rows_masked_c4_bcast_lm(
+                                        b_pkt.add(4 * xg * 8),
+                                        c,
+                                        fb.as_mut_ptr(),
+                                        dead,
+                                    );
+                                }
                             } else if c4_bcast {
                                 gfni_fold64_rows_masked_c4_bcast(
                                     a_pkt.add(4 * xg * 8),
@@ -5728,6 +5743,119 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
         }
         pass!(0);
         pass!(1);
+    }
+}
+
+///
+/// # Safety
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_ab(
+    rows_a: *const u8,
+    rows_b: *const u8,
+    m: &CFoldMats,
+    out_a: *mut F128,
+    out_b: *mut F128,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        let mut octs_a = core::mem::MaybeUninit::<Octs>::uninit();
+        let mut octs_b = core::mem::MaybeUninit::<Octs>::uninit();
+        let op_a = octs_a.as_mut_ptr().cast::<u64>();
+        let op_b = octs_b.as_mut_ptr().cast::<u64>();
+        let oct_even = _mm512_loadu_si512(C4_LM_OCT_EVEN.as_ptr() as *const __m512i);
+        let oct_odd = _mm512_loadu_si512(C4_LM_OCT_ODD.as_ptr() as *const __m512i);
+
+        macro_rules! gather_pkt {
+            ($rows:expr, $op:expr) => {{
+                let mut z = [_mm512_setzero_si512(); 8];
+                for (i, slot) in z.iter_mut().enumerate() {
+                    *slot = _mm512_loadu_si512($rows.add(64 * i) as *const __m512i);
+                }
+                let gather = |p: usize, s0: __m512i, s1: __m512i, s2: __m512i, s3: __m512i| {
+                    let g1_lo = _mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13);
+                    let g1_hi = _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15);
+                    let p01 = _mm512_permutex2var_epi64(s0, g1_lo, s1);
+                    let p23 = _mm512_permutex2var_epi64(s0, g1_hi, s1);
+                    let p45 = _mm512_permutex2var_epi64(s2, g1_lo, s3);
+                    let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
+                    let base = $op.add(32 * p);
+                    let oct = |a: usize, v: __m512i| {
+                        _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v)
+                    };
+                    oct(0, _mm512_permutex2var_epi8(p01, oct_even, p45));
+                    oct(1, _mm512_permutex2var_epi8(p01, oct_odd, p45));
+                    oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
+                    oct(3, _mm512_permutex2var_epi8(p23, oct_odd, p67));
+                };
+                gather(0, z[0], z[2], z[4], z[6]);
+                gather(1, z[1], z[3], z[5], z[7]);
+            }};
+        }
+        gather_pkt!(rows_a, op_a);
+        gather_pkt!(rows_b, op_b);
+
+        let rp_a: *const u64 = core::hint::black_box(op_a as *const u64);
+        let rp_b: *const u64 = core::hint::black_box(op_b as *const u64);
+        let rps = [rp_a, rp_b];
+        let mp = core::hint::black_box(m.1.as_ptr() as *const u64);
+        let dsts = [out_a as *mut __m512i, out_b as *mut __m512i];
+        let out_even = _mm512_loadu_si512(C4_LM_OUT_EVEN.as_ptr() as *const __m512i);
+        let out_odd = _mm512_loadu_si512(C4_LM_OUT_ODD.as_ptr() as *const __m512i);
+
+        let mut acc = [[_mm512_setzero_si512(); 2]; 4];
+        for a in 0..4usize {
+            for j in [0usize, 2, 4, 6] {
+                let mut br = [[_mm512_setzero_si512(); 2]; 4];
+                for s in 0..4usize {
+                    let pkt = s >> 1;
+                    let p = s & 1;
+                    br[s][0] = _mm512_set1_epi64(*rps[pkt].add(32 * p + 8 * a + j) as i64);
+                    br[s][1] = _mm512_set1_epi64(*rps[pkt].add(32 * p + 8 * a + j + 1) as i64);
+                }
+                for hh in 0..2usize {
+                    let m0 = _mm512_loadu_si512(
+                        mp.add(8 * (32 * hh + 8 * a + j)) as *const __m512i,
+                    );
+                    let m1 = _mm512_loadu_si512(
+                        mp.add(8 * (32 * hh + 8 * a + j + 1)) as *const __m512i,
+                    );
+                    for s in 0..4usize {
+                        let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(br[s][0], m0);
+                        let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(br[s][1], m1);
+                        acc[s][hh] = _mm512_ternarylogic_epi64::<0x96>(acc[s][hh], g0, g1);
+                    }
+                }
+            }
+        }
+        for s in 0..4usize {
+            let pkt = s >> 1;
+            let p = s & 1;
+            _mm512_storeu_si512(
+                dsts[pkt].add(2 * p),
+                _mm512_permutex2var_epi8(acc[s][0], out_even, acc[s][1]),
+            );
+            _mm512_storeu_si512(
+                dsts[pkt].add(2 * p + 1),
+                _mm512_permutex2var_epi8(acc[s][0], out_odd, acc[s][1]),
+            );
+        }
     }
 }
 
