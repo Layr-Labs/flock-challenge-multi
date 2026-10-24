@@ -1650,7 +1650,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1658,9 +1658,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1668,6 +1669,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
                 r,
                 twiddles,
                 0,
+                core::ptr::null(),
             )
         }
     }
@@ -1693,7 +1695,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     // SAFETY: forwarded caller contract.
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<false, false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1701,9 +1703,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, 0, 0>(
+            butterfly_fused_4layer_row_impl::<true, false, H, 0, 0>(
                 ptr,
                 sixteenth,
                 num_ntts,
@@ -1711,6 +1714,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         }
     }
@@ -1745,7 +1749,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     // values in the same impl body (a distinct monomorphization).
     unsafe {
         if mul_diet_disabled() {
-            butterfly_fused_4layer_row_impl::<false, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<false, false, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1753,9 +1757,10 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         } else {
-            butterfly_fused_4layer_row_impl::<true, H, S16, NN>(
+            butterfly_fused_4layer_row_impl::<true, false, H, S16, NN>(
                 ptr,
                 S16,
                 NN,
@@ -1763,6 +1768,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
                 r,
                 twiddles,
                 pf_r,
+                core::ptr::null(),
             )
         }
     }
@@ -1778,6 +1784,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
     const DIET: bool,
+    const PREPARED: bool,
     const H: u8,
     const S16: usize,
     const NN: usize,
@@ -1789,6 +1796,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
     r: usize,
     twiddles: &[F128; 15],
     pf_r: usize,
+    prepared: *const PreparedFour,
 ) {
     use core::arch::x86_64::*;
 
@@ -1814,7 +1822,13 @@ unsafe fn butterfly_fused_4layer_row_impl<
         let zero = _mm512_setzero_si512();
         let mut tw_top = [(zero, zero); 3];
         let mut tw_compact = [(_mm_setzero_si128(), _mm_setzero_si128()); 12];
-        if DIET {
+        if PREPARED {
+            for i in 0..3 {
+                let p=(*prepared).pairs[i];
+                tw_top[i]=(_mm512_broadcast_i32x4(_mm_set_epi64x(p[0].hi as i64,p[0].lo as i64)),
+                           _mm512_broadcast_i32x4(_mm_set_epi64x(p[1].hi as i64,p[1].lo as i64)));
+            }
+        } else if DIET {
             for i in 0..3 {
                 tw_top[i] = tw_x4::<false, true>(twiddles[i]);
             }
@@ -1837,7 +1851,9 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 );
             }
         }
-        let tw_c_ptr = core::hint::black_box(tw_compact.as_ptr());
+        let tw_c_ptr = if PREPARED {
+            (*prepared).pairs.as_ptr().add(3).cast::<(__m128i,__m128i)>()
+        } else { core::hint::black_box(tw_compact.as_ptr()) };
         let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts);
         let pf_row = |i: usize| ptr.add((i * sixteenth + pf_r) * num_ntts) as *const i8;
         let lanes = active_lanes & !3;
@@ -1913,11 +1929,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
                 );
-                butterfly!(2 * s, 2 * s + 1, twiddle);
-            }
-
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                // This is the terminal layer: neither result participates in
+                // another butterfly. Publish each pair immediately, shortening
+                // live ranges instead of retaining sixteen output registers.
+                let u = 2 * s;
+                let v = u + 1;
+                let new_u = _mm512_xor_si512(values[u], mul_x4::<false, DIET>(twiddle, values[v]));
+                let new_v = _mm512_xor_si512(values[v], new_u);
+                _mm512_storeu_si512(row(u).add(lane) as *mut __m512i, new_u);
+                _mm512_storeu_si512(row(v).add(lane) as *mut __m512i, new_v);
             }
             lane += 4;
         }
@@ -2993,7 +3013,7 @@ mod diet_tests {
                 // SAFETY: 16 rows of `len` lanes, sixteenth = 1, r = 0.
                 unsafe {
                     if diet {
-                        butterfly_fused_4layer_row_impl::<true, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<true, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -3001,9 +3021,10 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_4layer_row_impl::<false, 0, 0, 0>(
+                        butterfly_fused_4layer_row_impl::<false, false, 0, 0, 0>(
                             buf.as_mut_ptr(),
                             1,
                             len,
@@ -3011,6 +3032,7 @@ mod diet_tests {
                             0,
                             &tw15,
                             0,
+                            core::ptr::null(),
                         );
                     }
                 }
@@ -3018,5 +3040,74 @@ mod diet_tests {
             };
             assert_eq!(run_fused4(true), run_fused4(false), "fused4 len={len}");
         }
+    }
+}
+
+
+/// Immutable split twiddles shared across all rows of a fused-four block.
+/// Plain F128 storage permits sharing between Rayon workers without SIMD ABI.
+#[repr(C, align(16))]
+pub(crate) struct PreparedFour { pairs: [[F128;2];15] }
+
+#[target_feature(enable="avx512f,vpclmulqdq")]
+pub(crate) unsafe fn prepare_four(t: &[F128;15]) -> Option<PreparedFour> {
+    static OFF:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some());
+    if *OFF {return None;}
+    if mul_diet_disabled() { return None; }
+    let mut result=PreparedFour {pairs:[[F128::ZERO;2];15]};
+    // x^64*t mod p is exactly one reduction stage, not a general product.
+    // Process four F128 values per vector. The final mask reads only the
+    // remaining three entries; the temporary has room for all four outputs.
+    use core::arch::x86_64::*;
+    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+    let mut companions = [F128::ZERO;16];
+    unsafe {
+        for base in [0usize,4,8,12] {
+            let v = if base == 12 {
+                _mm512_maskz_loadu_epi64(0x3f,t.as_ptr().add(base).cast())
+            } else {
+                _mm512_loadu_si512(t.as_ptr().add(base).cast())
+            };
+            let u = ghash_shift64_x4(v);
+            _mm512_storeu_si512(companions.as_mut_ptr().add(base).cast(),u);
+        }
+    }
+    for i in 0..15 {
+        result.pairs[i]=[t[i],companions[i]];
+    }
+    Some(result)
+}
+
+#[target_feature(enable="avx512f,vpclmulqdq")]
+pub(crate) unsafe fn row_prepared<const H:u8>(
+    ptr:*mut F128,sixteenth:usize,num_ntts:usize,lanes:usize,r:usize,
+    t:&[F128;15],pf_r:usize,p:&PreparedFour,
+) {
+    unsafe {
+        if super::super::ntt_shaped_enabled() {
+            if num_ntts==64 {
+                match sixteenth {
+                    128 => return butterfly_fused_4layer_row_impl::<true,true,H,128,64>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    8 => return butterfly_fused_4layer_row_impl::<true,true,H,8,64>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    4 => return butterfly_fused_4layer_row_impl::<true,true,H,4,64>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    1 => return butterfly_fused_4layer_row_impl::<true,true,H,1,64>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    _=>{}
+                }
+            }
+        }
+        if super::super::ntt_shaped_enabled() && num_ntts==8 {
+            match sixteenth {
+                1024 => return butterfly_fused_4layer_row_impl::<true,true,H,1024,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                128 => return butterfly_fused_4layer_row_impl::<true,true,H,128,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                64 => return butterfly_fused_4layer_row_impl::<true,true,H,64,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                16 => return butterfly_fused_4layer_row_impl::<true,true,H,16,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                8 => return butterfly_fused_4layer_row_impl::<true,true,H,8,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                4 => return butterfly_fused_4layer_row_impl::<true,true,H,4,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                2 => return butterfly_fused_4layer_row_impl::<true,true,H,2,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                1 => return butterfly_fused_4layer_row_impl::<true,true,H,1,8>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                _=>{}
+            }
+        }
+        butterfly_fused_4layer_row_impl::<true,true,H,0,0>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p)
     }
 }
