@@ -321,37 +321,34 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
 #[inline(always)]
 unsafe fn trq(x: [__m512i; 8]) -> [__m512i; 8] {
     unsafe {
-        let lo1 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
-        let hi1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
-        let lo2 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-        let hi2 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let lo4 = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let hi4 = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-        let t0 = _mm512_permutex2var_epi64(x[0], lo1, x[1]);
-        let t1 = _mm512_permutex2var_epi64(x[0], hi1, x[1]);
-        let t2 = _mm512_permutex2var_epi64(x[2], lo1, x[3]);
-        let t3 = _mm512_permutex2var_epi64(x[2], hi1, x[3]);
-        let t4 = _mm512_permutex2var_epi64(x[4], lo1, x[5]);
-        let t5 = _mm512_permutex2var_epi64(x[4], hi1, x[5]);
-        let t6 = _mm512_permutex2var_epi64(x[6], lo1, x[7]);
-        let t7 = _mm512_permutex2var_epi64(x[6], hi1, x[7]);
-        let u0 = _mm512_permutex2var_epi64(t0, lo2, t2);
-        let u1 = _mm512_permutex2var_epi64(t0, hi2, t2);
-        let u2 = _mm512_permutex2var_epi64(t1, lo2, t3);
-        let u3 = _mm512_permutex2var_epi64(t1, hi2, t3);
-        let u4 = _mm512_permutex2var_epi64(t4, lo2, t6);
-        let u5 = _mm512_permutex2var_epi64(t4, hi2, t6);
-        let u6 = _mm512_permutex2var_epi64(t5, lo2, t7);
-        let u7 = _mm512_permutex2var_epi64(t5, hi2, t7);
+        // Lane-local qword interleave, then two fixed 128-bit lane merges.
+        // This is the same 8x8 transpose without index vectors or destructive
+        // two-source variable permutations.
+        let t0 = _mm512_unpacklo_epi64(x[0], x[1]);
+        let t1 = _mm512_unpackhi_epi64(x[0], x[1]);
+        let t2 = _mm512_unpacklo_epi64(x[2], x[3]);
+        let t3 = _mm512_unpackhi_epi64(x[2], x[3]);
+        let t4 = _mm512_unpacklo_epi64(x[4], x[5]);
+        let t5 = _mm512_unpackhi_epi64(x[4], x[5]);
+        let t6 = _mm512_unpacklo_epi64(x[6], x[7]);
+        let t7 = _mm512_unpackhi_epi64(x[6], x[7]);
+        let u0 = _mm512_shuffle_i64x2::<0x88>(t0, t2);
+        let u1 = _mm512_shuffle_i64x2::<0xdd>(t0, t2);
+        let u2 = _mm512_shuffle_i64x2::<0x88>(t1, t3);
+        let u3 = _mm512_shuffle_i64x2::<0xdd>(t1, t3);
+        let u4 = _mm512_shuffle_i64x2::<0x88>(t4, t6);
+        let u5 = _mm512_shuffle_i64x2::<0xdd>(t4, t6);
+        let u6 = _mm512_shuffle_i64x2::<0x88>(t5, t7);
+        let u7 = _mm512_shuffle_i64x2::<0xdd>(t5, t7);
         [
-            _mm512_permutex2var_epi64(u0, lo4, u4),
-            _mm512_permutex2var_epi64(u0, hi4, u4),
-            _mm512_permutex2var_epi64(u1, lo4, u5),
-            _mm512_permutex2var_epi64(u1, hi4, u5),
-            _mm512_permutex2var_epi64(u2, lo4, u6),
-            _mm512_permutex2var_epi64(u2, hi4, u6),
-            _mm512_permutex2var_epi64(u3, lo4, u7),
-            _mm512_permutex2var_epi64(u3, hi4, u7),
+            _mm512_shuffle_i64x2::<0x88>(u0, u4),
+            _mm512_shuffle_i64x2::<0x88>(u2, u6),
+            _mm512_shuffle_i64x2::<0x88>(u1, u5),
+            _mm512_shuffle_i64x2::<0x88>(u3, u7),
+            _mm512_shuffle_i64x2::<0xdd>(u0, u4),
+            _mm512_shuffle_i64x2::<0xdd>(u2, u6),
+            _mm512_shuffle_i64x2::<0xdd>(u1, u5),
+            _mm512_shuffle_i64x2::<0xdd>(u3, u7),
         ]
     }
 }
