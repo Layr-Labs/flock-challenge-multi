@@ -1567,6 +1567,14 @@ impl AdditiveNttF128 {
         span_get(&v[1..], block)
     }
 
+    #[inline]
+    pub fn twiddles_for_layer(&self, layer: usize) -> Option<&[F128]> {
+        debug_assert!(layer < self.log_domain_size());
+        let t = self.precomputed_twiddles.as_deref()?;
+        let start = (1usize << layer) - 1;
+        Some(&t[start..start + (1usize << layer)])
+    }
+
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
     /// `log_d ≤ log_domain_size()`. Layer `l ∈ [0, log_d)` is processed in
     /// order (neighbors-last: top layer first).
