@@ -1567,6 +1567,54 @@ impl AdditiveNttF128 {
         span_get(&v[1..], block)
     }
 
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn twiddle_x4(
+        &self,
+        layer: usize,
+        block: usize,
+    ) -> core::arch::x86_64::__m512i {
+        unsafe {
+            if let Some(tw) = &self.precomputed_twiddles {
+                let base = (1usize << layer) - 1 + block;
+                let q: &[F128] = &tw[base..base + 4];
+                return core::arch::x86_64::_mm512_loadu_si512(
+                    q.as_ptr() as *const core::arch::x86_64::__m512i,
+                );
+            }
+            crate::field::gf2_128::x86_64::f128x4_set(
+                self.twiddle(layer, block),
+                self.twiddle(layer, block + 1),
+                self.twiddle(layer, block + 2),
+                self.twiddle(layer, block + 3),
+            )
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn twiddle_x2_pairs(
+        &self,
+        layer: usize,
+        block: usize,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        unsafe {
+            if let Some(tw) = &self.precomputed_twiddles {
+                let base = (1usize << layer) - 1 + block;
+                let q: &[F128] = &tw[base..base + 2];
+                let pair = _mm512_maskz_loadu_epi64::<0x0f>(q.as_ptr() as *const i64);
+                let idx = _mm512_set_epi64(3, 2, 3, 2, 1, 0, 1, 0);
+                return _mm512_permutexvar_epi64(idx, pair);
+            }
+            let t0 = self.twiddle(layer, block);
+            let t1 = self.twiddle(layer, block + 1);
+            crate::field::gf2_128::x86_64::f128x4_set(t0, t0, t1, t1)
+        }
+    }
+
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
     /// `log_d ≤ log_domain_size()`. Layer `l ∈ [0, log_d)` is processed in
     /// order (neighbors-last: top layer first).

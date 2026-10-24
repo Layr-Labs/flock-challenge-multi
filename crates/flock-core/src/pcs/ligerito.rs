@@ -3145,7 +3145,7 @@ unsafe fn inverse_ntt_layer_half1_avx512(
     global_base: usize,
     data: &mut [F128],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
     debug_assert!(data.len().is_multiple_of(8));
     unsafe {
@@ -3162,12 +3162,7 @@ unsafe fn inverse_ntt_layer_half1_avx512(
             let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
             let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
             let b = base_block + (off >> 1);
-            let vt = f128x4_set(
-                ntt.twiddle(layer, b),
-                ntt.twiddle(layer, b + 1),
-                ntt.twiddle(layer, b + 2),
-                ntt.twiddle(layer, b + 3),
-            );
+            let vt = ntt.twiddle_x4(layer, b);
             let vv = _mm512_xor_si512(y0, y1);
             let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
             let out0 = _mm512_permutex2var_epi64(vu, idx_zip0, vv);
@@ -3192,7 +3187,7 @@ unsafe fn inverse_ntt_layer_half2_avx512(
     global_base: usize,
     data: &mut [F128],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
     debug_assert!(data.len().is_multiple_of(8));
     unsafe {
@@ -3207,9 +3202,7 @@ unsafe fn inverse_ntt_layer_half2_avx512(
             let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
             let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
             let b = base_block + (off >> 2);
-            let t0 = ntt.twiddle(layer, b);
-            let t1 = ntt.twiddle(layer, b + 1);
-            let vt = f128x4_set(t0, t0, t1, t1);
+            let vt = ntt.twiddle_x2_pairs(layer, b);
             let vv = _mm512_xor_si512(y0, y1);
             let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
             let out0 = _mm512_permutex2var_epi64(vu, idx_top, vv);
