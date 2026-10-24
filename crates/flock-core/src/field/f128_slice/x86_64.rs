@@ -363,110 +363,28 @@ pub(super) unsafe fn fold64_banked_nested(
     use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert_eq!(src.len(), 64 * dst.len());
-    // SAFETY: caller guarantees the target features and source bounds.
+    // Linearity permits absorbing both nested binds into the bank weights.
+    // Input remains contiguous; no cross-bank transposes or intermediate folds.
     unsafe {
-        let pf_ahead = fold16_pf_ahead();
-        let pf_limit = src.len().saturating_sub(64);
-        let quads = dst.len() & !3;
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
-            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
+        let one = F128::ONE;
+        let coeff = [(one + r0) * (one + r1), r0 * (one + r1),
+                     (one + r0) * r1, r0 * r1];
+        let weights: [__m512i; 16] = core::array::from_fn(|g| {
+            let c = coeff[g / 4];
+            let cv = _mm512_broadcast_i32x4(_mm_set_epi64x(c.hi as i64, c.lo as i64));
+            let wv = _mm512_loadu_si512(w.as_ptr().add(4 * (g % 4)).cast());
+            ghash_mul_x4_split(wv, cv, ghash_shift64_x4(cv))
         });
-        let r0_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r0.hi as i64, r0.lo as i64));
-        let r0_x64 = ghash_shift64_x4(r0_bcast);
-        let r1_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r1.hi as i64, r1.lo as i64));
-        let r1_x64 = ghash_shift64_x4(r1_bcast);
-
-        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-
-        #[repr(align(64))]
-        struct AlignedM4(core::mem::MaybeUninit<[__m512i; 4]>);
-        let mut m4_buf = AlignedM4(core::mem::MaybeUninit::uninit());
-        let m4_ptr = core::hint::black_box(m4_buf.0.as_mut_ptr() as *mut __m512i);
-
-        let mut t = 0usize;
-        while t < quads {
-            let mut slot_idx = 0usize;
-            while slot_idx < 4 {
-                let base_elem = 64 * (t + slot_idx);
-                if pf_ahead != 0 {
-                    let ahead = base_elem + pf_ahead;
-                    if ahead <= pf_limit {
-                        let p = src.as_ptr().add(ahead).cast::<i8>();
-                        let mut l = 0usize;
-                        while l < 1024 {
-                            _mm_prefetch::<_MM_HINT_T0>(p.add(l));
-                            l += 64;
-                        }
-                    }
-                }
-                let mut acc = WideGhashX4::zero();
-                for g in 0..4 {
-                    let base = base_elem + 4 * g;
-                    let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
-                    let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
-                    let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
-                    let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
-                    let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
-                    let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
-                    let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
-                    let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                    let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
-                    let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
-                    let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
-                    let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
-                    acc.mul_acc(u0, wb[4 * g]);
-                    acc.mul_acc(u1, wb[4 * g + 1]);
-                    acc.mul_acc(u2, wb[4 * g + 2]);
-                    acc.mul_acc(u3, wb[4 * g + 3]);
-                }
-                _mm512_store_si512(m4_ptr.add(slot_idx), acc.reduce_lanes());
-                slot_idx += 1;
+        for (t, value) in dst.iter_mut().enumerate() {
+            let mut acc = WideGhashX4::zero();
+            for g in 0..16 {
+                let v = _mm512_loadu_si512(src.as_ptr().add(64 * t + 4 * g).cast());
+                acc.mul_acc(v, weights[g]);
             }
-
-            let v0 = _mm512_load_si512(m4_ptr);
-            let v1 = _mm512_load_si512(m4_ptr.add(1));
-            let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
-            let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
-            let mid01 = _mm512_xor_si512(
-                even01,
-                ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
-            );
-
-            let v2 = _mm512_load_si512(m4_ptr.add(2));
-            let v3 = _mm512_load_si512(m4_ptr.add(3));
-            let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
-            let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
-            let mid23 = _mm512_xor_si512(
-                even23,
-                ghash_mul_x4_split(_mm512_xor_si512(even23, odd23), r0_bcast, r0_x64),
-            );
-
-            let low = _mm512_shuffle_i32x4::<0x88>(mid01, mid23);
-            let high = _mm512_shuffle_i32x4::<0xDD>(mid01, mid23);
-            let out = _mm512_xor_si512(
-                low,
-                ghash_mul_x4_split(_mm512_xor_si512(low, high), r1_bcast, r1_x64),
-            );
-            _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, out);
-            t += 4;
-        }
-        while t < dst.len() {
-            let mut m = [F128::ZERO; 4];
-            for (s_idx, m_slot) in m.iter_mut().enumerate() {
-                let base = 64 * t + 16 * s_idx;
-                let mut v = F128::ZERO;
-                for b in 0..16 {
-                    v += w[b] * src[base + b];
-                }
-                *m_slot = v;
-            }
-            let low = m[0] + r0 * (m[0] + m[1]);
-            let high = m[2] + r0 * (m[2] + m[3]);
-            dst[t] = low + r1 * (low + high);
-            t += 1;
+            let v = acc.reduce_lanes();
+            let a = _mm_xor_si128(_mm512_castsi512_si128(v), _mm512_extracti32x4_epi32::<1>(v));
+            let b = _mm_xor_si128(_mm512_extracti32x4_epi32::<2>(v), _mm512_extracti32x4_epi32::<3>(v));
+            _mm_storeu_si128((value as *mut F128).cast(), _mm_xor_si128(a, b));
         }
     }
 }
