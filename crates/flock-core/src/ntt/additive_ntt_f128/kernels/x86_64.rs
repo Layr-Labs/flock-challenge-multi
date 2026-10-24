@@ -1777,7 +1777,28 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 #[inline(never)]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn butterfly_fused_4layer_row_impl<
+    const DIET: bool, const H: u8, const S16: usize, const NN: usize,
+>(ptr: *mut F128, sixteenth: usize, num_ntts: usize, active_lanes: usize,
+  r: usize, twiddles: &[F128; 15], pf_r: usize) {
+    // Inspect actual multipliers: no basis or shape assumption. Only the
+    // final two layers use the short product, and only if all are low-limb.
+    let low_inner = twiddles[3..].iter().all(|t| t.hi == 0);
+    unsafe {
+        if low_inner {
+            butterfly_fused_4layer_row_short_impl::<DIET, true, H, S16, NN>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles, pf_r);
+        } else {
+            butterfly_fused_4layer_row_short_impl::<DIET, false, H, S16, NN>(
+                ptr, sixteenth, num_ntts, active_lanes, r, twiddles, pf_r);
+        }
+    }
+}
+
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_row_short_impl<
     const DIET: bool,
+    const LOW_INNER: bool,
     const H: u8,
     const S16: usize,
     const NN: usize,
@@ -1819,7 +1840,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 tw_top[i] = tw_x4::<false, true>(twiddles[i]);
             }
             for i in 0..12 {
-                let pair = tw_x4::<false, true>(twiddles[3 + i]);
+                let pair = tw_x4::<LOW_INNER, true>(twiddles[3 + i]);
                 tw_compact[i] = (
                     _mm512_castsi512_si128(pair.0),
                     _mm512_castsi512_si128(pair.1),
@@ -1830,7 +1851,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 tw_top[i] = tw_x4::<false, false>(twiddles[i]);
             }
             for i in 0..12 {
-                let pair = tw_x4::<false, false>(twiddles[3 + i]);
+                let pair = tw_x4::<LOW_INNER, false>(twiddles[3 + i]);
                 tw_compact[i] = (
                     _mm512_castsi512_si128(pair.0),
                     _mm512_castsi512_si128(pair.1),
@@ -1875,9 +1896,9 @@ unsafe fn butterfly_fused_4layer_row_impl<
             }
 
             macro_rules! butterfly {
-                ($u:expr, $v:expr, $twiddle:expr) => {{
+                ($u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
                     let new_u =
-                        _mm512_xor_si512(values[$u], mul_x4::<false, DIET>($twiddle, values[$v]));
+                        _mm512_xor_si512(values[$u], mul_x4::<$low, DIET>($twiddle, values[$v]));
                     values[$v] = _mm512_xor_si512(values[$v], new_u);
                     values[$u] = new_u;
                 }};
@@ -1886,13 +1907,13 @@ unsafe fn butterfly_fused_4layer_row_impl<
             pf_quad!(0);
             let outer = tw_top[0];
             for i in 0..8 {
-                butterfly!(i, i + 8, outer);
+                butterfly!(i, i + 8, outer, false);
             }
             pf_quad!(1);
             for s in 0..2 {
                 let twiddle = tw_top[1 + s];
                 for i in 0..4 {
-                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle);
+                    butterfly!(8 * s + i, 8 * s + i + 4, twiddle, false);
                 }
             }
             pf_quad!(2);
@@ -1903,7 +1924,7 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
                 );
                 for i in 0..2 {
-                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle);
+                    butterfly!(4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
                 }
             }
             pf_quad!(3);
@@ -1913,11 +1934,15 @@ unsafe fn butterfly_fused_4layer_row_impl<
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p)),
                     _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1))),
                 );
-                butterfly!(2 * s, 2 * s + 1, twiddle);
-            }
-
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+                // This is the terminal layer: neither result participates in
+                // another butterfly. Publish each pair immediately, shortening
+                // live ranges instead of retaining sixteen output registers.
+                let u = 2 * s;
+                let v = u + 1;
+                let new_u = _mm512_xor_si512(values[u], mul_x4::<LOW_INNER, DIET>(twiddle, values[v]));
+                let new_v = _mm512_xor_si512(values[v], new_u);
+                _mm512_storeu_si512(row(u).add(lane) as *mut __m512i, new_u);
+                _mm512_storeu_si512(row(v).add(lane) as *mut __m512i, new_v);
             }
             lane += 4;
         }
