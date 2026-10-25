@@ -3675,6 +3675,12 @@ mod diet_tests {
 pub(crate) struct PreparedFour {
     pairs: [[F128; 2]; 15],
 }
+impl PreparedFour {
+    pub(super) fn raw188(&self) -> [F128;15] {
+        std::array::from_fn(|i| self.pairs[i][0])
+    }
+}
+
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
