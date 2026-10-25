@@ -2866,6 +2866,61 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }};
         }
 
+        if lane + 16 <= dense_lanes {
+            let mut values = [[zero; 8]; 2];
+            for (c, chunk) in values.iter_mut().enumerate() {
+                for (i, value) in chunk.iter_mut().enumerate() {
+                    *value = _mm512_loadu_si512(row(i).add(lane + 4 * c) as *const __m512i);
+                }
+            }
+            while lane + 16 <= dense_lanes {
+                let outer = tw[0];
+                for i in 0..4 {
+                    butterfly2!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+                }
+                for s in 0..2 {
+                    let twiddle = tw[1 + s];
+                    for i in 0..2 {
+                        butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    }
+                }
+                for s in 0..4 {
+                    butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                    for c in 0..2 {
+                        for k in 0..2 {
+                            let i = 2 * s + k;
+                            _mm512_storeu_si512(
+                                row(i).add(lane + 4 * c) as *mut __m512i,
+                                values[c][i],
+                            );
+                            values[c][i] = _mm512_loadu_si512(
+                                row(i).add(lane + 8 + 4 * c) as *const __m512i,
+                            );
+                        }
+                    }
+                }
+                lane += 8;
+            }
+            let outer = tw[0];
+            for i in 0..4 {
+                butterfly2!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..2 {
+                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                }
+            }
+            for s in 0..4 {
+                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+            }
+            for (c, chunk) in values.iter().enumerate() {
+                for (i, value) in chunk.iter().enumerate() {
+                    _mm512_storeu_si512(row(i).add(lane + 4 * c) as *mut __m512i, *value);
+                }
+            }
+            lane += 8;
+        }
         while lane + 8 <= dense_lanes {
             let mut values = [[zero; 8]; 2];
             for (c, chunk) in values.iter_mut().enumerate() {
