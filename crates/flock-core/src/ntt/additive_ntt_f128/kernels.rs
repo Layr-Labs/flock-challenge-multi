@@ -1153,3 +1153,59 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+
+/// Persistent prepared-only block. Raw operands already occupy each pair's first slot.
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+pub(super) struct CompactFour188(x86_64::PreparedFour);
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+impl CompactFour188 {
+    pub(super) fn new(raw: &[F128;15]) -> Option<Self> {
+        unsafe { x86_64::prepare_four(raw).map(Self) }
+    }
+}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+#[inline]
+pub(super) unsafe fn rows_compact188(ptr: *mut F128, stride: usize, lanes: usize,
+    active: usize, r: usize, t: &CompactFour188, hint: u8) {
+    // Full-vector rows never read raw twiddles. Partial rows recover them only
+    // for the scalar tail from the first element of each prepared pair.
+    static ZERO: [F128;15] = [F128::ZERO;15];
+    let tail_raw;
+    let raw = if active % 4 != 0 { tail_raw = t.0.raw188(); &tail_raw } else { &ZERO };
+    unsafe {
+        if hint == 0 || r+1 >= stride {
+            x86_64::row_prepared::<0>(ptr,stride,lanes,active,r,raw,0,&t.0);
+        } else if hint == 1 {
+            x86_64::row_prepared::<1>(ptr,stride,lanes,active,r,raw,r+1,&t.0);
+        } else {
+            x86_64::row_prepared::<2>(ptr,stride,lanes,active,r,raw,r+1,&t.0);
+        }
+    }
+}
+
+/// Four thin pointers, each addressing a complete contiguous fused level.
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+pub(super) struct SharedFour190 { levels: [*const [F128;2];4] }
+// All pointees are immutable leaked slices; construction validates their lengths.
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+unsafe impl Send for SharedFour190 {}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+unsafe impl Sync for SharedFour190 {}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+impl SharedFour190 {
+    pub(super) fn new(slices: [&'static [[F128;2]];4]) -> Option<Self> {
+        if slices.iter().enumerate().any(|(j,s)|s.len()!=1<<j) { return None; }
+        Some(Self { levels:slices.map(|s|s.as_ptr()) })
+    }
+    pub(super) fn raw(&self) -> [F128;15] {
+        std::array::from_fn(|i| {let j=(i+1).ilog2() as usize;
+            unsafe { (*self.levels[j].add(i+1-(1<<j)))[0] }})
+    }
+}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+#[inline]
+pub(super) unsafe fn rows_shared190(ptr:*mut F128,stride:usize,lanes:usize,
+    active:usize,r:usize,t:&SharedFour190,hint:u8) {
+    unsafe { x86_64::row_shared190(ptr,stride,lanes,active,r,t.levels,hint) }
+}

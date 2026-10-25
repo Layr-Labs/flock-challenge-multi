@@ -909,6 +909,7 @@ pub struct AdditiveNttF128 {
     /// Shared rather than owned so [`AdditiveNttF128::standard`] can hand out
     /// a cached table (see [`cached_standard_evals`]) instead of rebuilding it.
     evals: Arc<Vec<Vec<F128>>>,
+    standard_dim: Option<usize>,
     /// Breadth-first layer table used by production-size transforms. Keeping
     /// this separate preserves the compact fallback for unusually large
     /// domains while making every hot-path twiddle lookup O(1).
@@ -1512,6 +1513,70 @@ unsafe fn st_fmp_fold4(
 }
 
 impl AdditiveNttF128 {
+
+    /// Disjoint dyadic prefix segments share standard-subspace pairs across domains.
+    #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+    fn cached_shared190(&self, layer: usize, block: usize) -> Option<&'static kernels::SharedFour190> {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+            std::env::var_os("FLOCK_NO_NTT_PREP_CACHE").is_some() ||
+            std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some());
+        if *OFF { return None; }
+        let dim = self.standard_dim?;
+        if dim > 20 || layer < 3 || layer + 4 > dim { return None; }
+        type Pair = [F128;2];
+        type Prefix = std::sync::Mutex<Vec<&'static [Pair]>>;
+        static PREFIXES: std::sync::LazyLock<Vec<Prefix>> = std::sync::LazyLock::new(||
+            (0..=20).map(|_| std::sync::Mutex::new(Vec::new())).collect());
+        type Cell = OnceLock<Option<Box<[kernels::SharedFour190]>>>;
+        static TABLES: std::sync::LazyLock<Vec<Vec<Cell>>> = std::sync::LazyLock::new(||
+            (0..=20).map(|_| (0..=20).map(|_| OnceLock::new()).collect()).collect());
+        TABLES[dim][layer].get_or_init(|| {
+            let mut levels: [Vec<&'static [Pair]>;4] = std::array::from_fn(|_|Vec::new());
+            for j in 0..4 {
+                let l=layer+j; let needed=1usize<<l;
+                let mut segments=PREFIXES[dim-l-1].lock().unwrap();
+                let mut total:usize=segments.iter().map(|s|s.len()).sum();
+                while total < needed {
+                    // Eight initial pairs keep every aligned fused-level slice contiguous.
+                    let count=total.max(8);
+                    let pairs=(total..total+count).map(|k| {
+                        let raw=self.twiddle(l,k); [raw,raw*F128::new(0,1)]
+                    }).collect::<Vec<_>>().into_boxed_slice();
+                    segments.push(Box::leak(pairs)); total+=count;
+                }
+                levels[j]=segments.clone();
+            }
+            (0..1usize<<layer).map(|b| {
+                let slices=std::array::from_fn(|j| {
+                    let mut offset=b<<j;
+                    for segment in &levels[j] {
+                        if offset < segment.len() { return &segment[offset..offset+(1<<j)]; }
+                        offset-=segment.len();
+                    }
+                    unreachable!("prefix grew to cover layer")
+                });
+                kernels::SharedFour190::new(slices)
+            }).collect::<Option<Box<[_]>>>()
+        }).as_ref().map(|t| &t[block])
+    }
+
+    fn four_rows187(&self, block: &mut [F128], layer: usize, idx: usize,
+        stride: usize, lanes: usize, tail: usize, hint: u8) {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+        if let Some(t) = self.cached_shared190(layer,idx) {
+            let ptr = block.as_mut_ptr();
+            for r in 0..stride {
+                unsafe { kernels::rows_shared190(ptr,stride,lanes,row_lanes(r,lanes,tail),r,t,hint); }
+            }
+            return;
+        }
+        let mut tw = [F128::ZERO;15];
+        for l in 0..4 { for j in 0..1usize<<l {
+            tw[(1usize<<l)-1+j] = self.twiddle(layer+l,(idx<<l)+j);
+        }}
+        butterfly_interleaved_fused_4layer_rows(block,&tw,stride,lanes,tail,hint);
+    }
+
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
         let evals = Arc::new(generate_evals_from_subspace(basis));
@@ -1519,6 +1584,7 @@ impl AdditiveNttF128 {
         Self {
             evals,
             precomputed_twiddles,
+            standard_dim: None,
         }
     }
 
@@ -1541,6 +1607,7 @@ impl AdditiveNttF128 {
         Self {
             evals,
             precomputed_twiddles,
+            standard_dim: Some(dim),
         }
     }
 
@@ -3552,30 +3619,10 @@ impl AdditiveNttF128 {
                         let sixteenth = block_size >> 4;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
-                            for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                            }
                             let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_fused_4layer_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                &tw,
-                                sixteenth,
-                                num_ntts,
-                                if sixteenth.is_multiple_of(2) {
-                                    odd_tail
-                                } else {
-                                    0
-                                },
-                                hint,
-                            );
+                            self.four_rows187(&mut sub_data[block_start..block_start+block_bytes],
+                                layer,global_block,sixteenth,num_ntts,
+                                if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },hint);
                         }
                         layer += 4;
                     } else if layer + 3 == log_d && !ntt_fused3_disabled() {
@@ -4287,29 +4334,8 @@ impl AdditiveNttF128 {
             let block_size = 1usize << (log_d - layer);
             let sixteenth = block_size >> 4;
             let global_block = sub_idx;
-            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-            tw[0] = self.twiddle(layer, global_block);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-            }
-            for s in 0..8 {
-                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-            }
-            butterfly_interleaved_fused_4layer_rows(
-                sub_data,
-                &tw,
-                sixteenth,
-                num_ntts,
-                if sixteenth.is_multiple_of(2) {
-                    odd_tail
-                } else {
-                    0
-                },
-                hint,
-            );
+            self.four_rows187(sub_data,layer,global_block,sixteenth,num_ntts,
+                if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },hint);
         }
         // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
         // (n_top+8..n_top+11), then the leaf callback, all while the
@@ -4324,30 +4350,9 @@ impl AdditiveNttF128 {
         FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for b in 0..16usize {
             let g4 = sub_idx * 16 + b;
-            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-            tw[0] = self.twiddle(layer4, g4);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-            }
-            for s in 0..8 {
-                tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-            }
             let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-            butterfly_interleaved_fused_4layer_rows(
-                blk,
-                &tw,
-                sixteenth4,
-                num_ntts,
-                if sixteenth4.is_multiple_of(2) {
-                    odd_tail
-                } else {
-                    0
-                },
-                hint,
-            );
+            self.four_rows187(blk,layer4,g4,sixteenth4,num_ntts,
+                if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },hint);
             for j in 0..16usize {
                 let g8 = g4 * 16 + j;
                 let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
@@ -7231,3 +7236,5 @@ mod prepared_four_composition_tests {
         );
     }
 }
+
+
