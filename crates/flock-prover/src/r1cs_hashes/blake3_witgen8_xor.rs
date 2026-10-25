@@ -319,6 +319,161 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
 }
 
 #[inline(always)]
+unsafe fn affine_prepared(p: *const u64, m: *const u64) -> [__m512i; 8] {
+    unsafe {
+        let x = core::ptr::read_unaligned(p.cast::<[u64;8]>());
+        let mut c = [_mm512_setzero_si512(); 8];
+        c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
+            _mm512_set1_epi64(x[0] as i64),
+            _mm512_loadu_si512(m.add(64).cast()),
+        );
+        c[1] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(72).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[1] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[2] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(80).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[2] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[3] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(88).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[1] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[2] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[3] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[4] = _mm512_xor_si512(
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[0] as i64),
+                _mm512_loadu_si512(m.add(96).cast()),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[4] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[5] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(104).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[1] as i64),
+                    _mm512_loadu_si512(m.add(96).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[4] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[5] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[6] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[0] as i64),
+                    _mm512_loadu_si512(m.add(112).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[2] as i64),
+                    _mm512_loadu_si512(m.add(96).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[4] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[6] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[7] = _mm512_xor_si512(
+            _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_ternarylogic_epi64::<0x96>(
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[0] as i64),
+                            _mm512_loadu_si512(m.add(120).cast()),
+                        ),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[1] as i64),
+                            _mm512_loadu_si512(m.add(112).cast()),
+                        ),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            _mm512_set1_epi64(x[2] as i64),
+                            _mm512_loadu_si512(m.add(104).cast()),
+                        ),
+                    ),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        _mm512_set1_epi64(x[3] as i64),
+                        _mm512_loadu_si512(m.add(96).cast()),
+                    ),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(
+                        _mm512_set1_epi64(x[4] as i64),
+                        _mm512_loadu_si512(m.add(88).cast()),
+                    ),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[5] as i64),
+                    _mm512_loadu_si512(m.add(80).cast()),
+                ),
+                _mm512_gf2p8affine_epi64_epi8::<0>(
+                    _mm512_set1_epi64(x[6] as i64),
+                    _mm512_loadu_si512(m.add(72).cast()),
+                ),
+            ),
+            _mm512_gf2p8affine_epi64_epi8::<0>(
+                _mm512_set1_epi64(x[7] as i64),
+                _mm512_loadu_si512(m.add(64).cast()),
+            ),
+        );
+        c[0] = _mm512_xor_si512(c[0], c[1]);
+        c[2] = _mm512_xor_si512(c[2], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[5]);
+        c[6] = _mm512_xor_si512(c[6], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[2]);
+        c[1] = _mm512_xor_si512(c[1], c[3]);
+        c[4] = _mm512_xor_si512(c[4], c[6]);
+        c[5] = _mm512_xor_si512(c[5], c[7]);
+        c[0] = _mm512_xor_si512(c[0], c[4]);
+        c[1] = _mm512_xor_si512(c[1], c[5]);
+        c[2] = _mm512_xor_si512(c[2], c[6]);
+        c[3] = _mm512_xor_si512(c[3], c[7]);
+        c
+    }
+}
+
+#[inline(always)]
 unsafe fn trq(x: [__m512i; 8]) -> [__m512i; 8] {
     unsafe {
         let lo1 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
@@ -360,8 +515,23 @@ const BYTE_TR: [u8; 64] = [
     11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6,
     14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
 ];
+
+// The ring has two u32 vectors, each containing eight rows. Transform its
+// byte positions before the existing packing permutation. The prepared
+// representation is private to the following projection call.
 #[inline(always)]
-unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn ring_input_zeta(mut v: __m512i) -> __m512i {
+    unsafe {
+        let shifted = _mm512_srli_epi32::<8>(v);
+        v = _mm512_xor_si512(v, _mm512_and_si512(shifted, _mm512_set1_epi32(0x00ff00ff)));
+        v = _mm512_xor_si512(v, _mm512_srli_epi32::<16>(v));
+        let upper = _mm512_shuffle_i32x4::<0xee>(v, v);
+        _mm512_mask_xor_epi64(v, 0x0f, v, upper)
+    }
+}
+
+#[inline(always)]
+unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -375,20 +545,28 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
         let p = out.as_mut_ptr().cast::<u64>();
         let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
+        let v = if PREPARE_A || mode(BLK, 0) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(0).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
+        let v = if PREPARE_A || mode(BLK, 1) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(8).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
+        let v = if PREPARE_A || mode(BLK, 2) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(16).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
+        let v = if PREPARE_A || mode(BLK, 3) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(24).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
+        let v = if PREPARE_A || mode(BLK, 4) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(32).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
+        let v = if PREPARE_A || mode(BLK, 5) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(40).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
+        let v = if PREPARE_A || mode(BLK, 6) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(48).cast(), _mm512_permutexvar_epi8(ix, v));
         let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
+        let v = if PREPARE_A || mode(BLK, 7) == 0 { ring_input_zeta(v) } else { v };
         _mm512_storeu_si512(p.add(56).cast(), _mm512_permutexvar_epi8(ix, v));
         out.assume_init()
     }
@@ -416,8 +594,8 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
     acc: &mut [__m512i; 8], acc0: __m512i,
 ) -> __m512i {
     unsafe {
-        let av = affine_conv(ap, ma, 0);
-        let bv = affine_conv(bp, mb, MODE);
+        let av = affine_prepared(ap, ma);
+        let bv = if MODE == 0 { affine_prepared(bp, mb) } else { affine_conv(bp, mb, MODE) };
         let mut result = _mm512_setzero_si512();
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
@@ -442,10 +620,12 @@ unsafe fn project_const<const BLK: usize>(
     a: [__m512i; 8],
     b: [__m512i; 8],
     ap: &[u64; 64],
-    bp: &[u64; 64],
+    br: *const V8,
+    rw: usize,
     m: *const u64,
 ) {
     unsafe {
+        let bp = pretranspose_ring::<BLK, false>(br, rw);
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         if residual_row_live(BLK, 7) {
@@ -749,39 +929,38 @@ pub(super) unsafe fn project(
     t: &Tables,
 ) {
     unsafe {
-        let ap = pretranspose_ring(ar, rw);
-        let bp = pretranspose_ring(br, rw);
+        let ap = pretranspose_ring::<0, true>(ar, rw);
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
-            2 => project_const::<2>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            3 => project_const::<3>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            4 => project_const::<4>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            5 => project_const::<5>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            6 => project_const::<6>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            7 => project_const::<7>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            8 => project_const::<8>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            9 => project_const::<9>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            10 => project_const::<10>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            11 => project_const::<11>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            12 => project_const::<12>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            13 => project_const::<13>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            14 => project_const::<14>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            15 => project_const::<15>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            16 => project_const::<16>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            17 => project_const::<17>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            18 => project_const::<18>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            19 => project_const::<19>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            20 => project_const::<20>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            21 => project_const::<21>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            22 => project_const::<22>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            23 => project_const::<23>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            24 => project_const::<24>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            25 => project_const::<25>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            26 => project_const::<26>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            27 => project_const::<27>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            28 => project_const::<28>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            29 => project_const::<29>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            2 => project_const::<2>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
