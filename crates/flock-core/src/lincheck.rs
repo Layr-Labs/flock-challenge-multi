@@ -3935,6 +3935,41 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
     z_packed
 }
 
+#[inline(always)]
+fn transpose_8x8(mut x: u64) -> u64 {
+    let mut t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^ t ^ (t << 28)
+}
+
+fn pack_stripe_aligned(z: &[crate::field::F128], k: usize, byte_idx: usize, chunk: &mut [u8]) {
+    debug_assert_eq!(k & 7, 0);
+    debug_assert_eq!(chunk.len(), k);
+    let stride = k >> 3;
+    let base = byte_idx * k;
+    let bytes_len = z.len() * core::mem::size_of::<crate::field::F128>();
+    let last = base + k - 1;
+    assert!(stride > 0 && last < bytes_len);
+    let bytes = unsafe { core::slice::from_raw_parts(z.as_ptr().cast::<u8>(), bytes_len) };
+    let mut i = 0;
+    while i < k {
+        let mut x = 0u64;
+        let off0 = base + (i >> 3);
+        for r in 0..8 {
+            let b = unsafe { *bytes.get_unchecked(off0 + r * stride) };
+            x |= (b as u64) << (8 * r);
+        }
+        let packed = transpose_8x8(x).to_le_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(packed.as_ptr(), chunk.as_mut_ptr().add(i), 8);
+        }
+        i += 8;
+    }
+}
+
 /// Same output as [`pack_z_lincheck`] but reads bits from an F_{2^128}-packed
 /// witness (polynomial basis: bit `i` of logical = bit `i % 128` of
 /// `z_packed_f128[i / 128]`).
@@ -3960,6 +3995,10 @@ pub fn pack_z_lincheck_from_packed(
         .par_chunks_mut(k)
         .enumerate()
         .for_each(|(byte_idx, chunk)| {
+            if k & 7 == 0 {
+                pack_stripe_aligned(z_packed_f128, k, byte_idx, chunk);
+                return;
+            }
             for i_inner in 0..k {
                 let mut byte = 0u8;
                 for r in 0..8 {
