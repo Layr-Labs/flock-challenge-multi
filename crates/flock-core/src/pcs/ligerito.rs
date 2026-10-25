@@ -5762,16 +5762,41 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
 
+        // Join fold and OOD split partials before their common linear reduction.
+        let fold4_ood = |p: *const F128, source: usize,
+                             e: __m512i, sx: __m512i, sx64: __m512i| -> __m512i {
+            let a = _mm512_loadu_si512(p.add(source).cast());
+            let b = _mm512_loadu_si512(p.add(source + 4).cast());
+            let even = _mm512_shuffle_i32x4::<0x88>(a, b);
+            let odd = _mm512_shuffle_i32x4::<0xDD>(a, b);
+            let x = _mm512_xor_si512(even, odd);
+            let lo = _mm512_xor_si512(
+                _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x00>(x, r_x4), _mm512_clmulepi64_epi128::<0x01>(x, r_x64)),
+                _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x00>(e, sx), _mm512_clmulepi64_epi128::<0x01>(e, sx64)));
+            let hi = _mm512_xor_si512(
+                _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x10>(x, r_x4), _mm512_clmulepi64_epi128::<0x11>(x, r_x64)),
+                _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x10>(e, sx), _mm512_clmulepi64_epi128::<0x11>(e, sx64)));
+            let top = _mm512_clmulepi64_epi128::<0x01>(hi, _mm512_set1_epi64(0x87));
+            _mm512_xor_si512(even, _mm512_xor_si512(lo, _mm512_xor_si512(_mm512_bslli_epi128::<8>(hi), top)))
+        };
+
         let mut t = 0usize;
         while t + 8 <= len {
             let f0 = fold4(f_ptr, 2 * (base + t));
             let f1 = fold4(f_ptr, 2 * (base + t + 4));
-            let (mut b0, mut b1) = match defer_one {
-                Some(dptr) => (
+            let joined = match (defer_one, ood_vec) {
+                (None, Some((eptr, sx, sx64))) => Some((
+                    fold4_ood(b_ptr, 2 * (base + t), _mm512_loadu_si512(eptr.add(t).cast()), sx, sx64),
+                    fold4_ood(b_ptr, 2 * (base + t + 4), _mm512_loadu_si512(eptr.add(t + 4).cast()), sx, sx64))),
+                _ => None,
+            };
+            let (mut b0, mut b1) = match (joined, defer_one) {
+                (Some(pair), _) => pair,
+                (None, Some(dptr)) => (
                     fold4_sum(b_ptr, dptr, 2 * (base + t)),
                     fold4_sum(b_ptr, dptr, 2 * (base + t + 4)),
                 ),
-                None => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
+                (None, None) => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
             };
             if CORR {
                 if let (None, Some((dptr, ax, ax64))) = (defer_one, deferred_vec) {
@@ -5784,7 +5809,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
                         ghash_mul_x4_split(fold4(dptr, 2 * (base + t + 4)), ax, ax64),
                     );
                 }
-                if let Some((eptr, sx, sx64)) = ood_vec {
+                if let (None, Some((eptr, sx, sx64))) = (joined, ood_vec) {
                     let e0 = _mm512_loadu_si512(eptr.add(t) as *const __m512i);
                     let e1 = _mm512_loadu_si512(eptr.add(t + 4) as *const __m512i);
                     b0 = _mm512_xor_si512(b0, ghash_mul_x4_split(e0, sx, sx64));
