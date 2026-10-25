@@ -2464,6 +2464,56 @@ fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
     }
 }
 
+fn transpose_top_only_fold(dst: &mut [F128], srcs: &[&mut [F128]], stride: usize, group: usize) {
+    let n = dst.len();
+    debug_assert!(group >= 2);
+    debug_assert!((1..group).all(|k| srcs[k * stride - 1].len() == n));
+    let mut i = 0;
+    #[cfg(target_feature = "avx512f")]
+    {
+        use core::arch::x86_64::*;
+        unsafe {
+            let d = dst.as_mut_ptr();
+            let pair_lanes = n & !7;
+            while i < pair_lanes {
+                let mut a0 = _mm512_loadu_si512(d.add(i).cast::<__m512i>());
+                let mut a1 = _mm512_loadu_si512(d.add(i + 4).cast::<__m512i>());
+                for k in 1..group {
+                    let s = srcs.get_unchecked(k * stride - 1).as_ptr();
+                    a0 = _mm512_xor_si512(a0, _mm512_loadu_si512(s.add(i).cast::<__m512i>()));
+                    a1 = _mm512_xor_si512(a1, _mm512_loadu_si512(s.add(i + 4).cast::<__m512i>()));
+                }
+                _mm512_storeu_si512(d.add(i).cast::<__m512i>(), a0);
+                _mm512_storeu_si512(d.add(i + 4).cast::<__m512i>(), a1);
+                i += 8;
+            }
+        }
+    }
+    while i < n {
+        let mut a = dst[i];
+        for k in 1..group {
+            a += srcs[k * stride - 1][i];
+        }
+        dst[i] = a;
+        i += 1;
+    }
+}
+
+fn transpose_top_only_dead_tail(data: &mut [F128], log_d: usize, dead: usize) {
+    debug_assert!(dead >= 1 && dead <= log_d);
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    let k = 1usize << (log_d - dead);
+    if dead == 1 {
+        let (head, bot) = data.split_at_mut(k);
+        transpose_top_only(head, bot);
+        return;
+    }
+    let group = 1usize << dead;
+    let (head, rest) = data.split_at_mut(k);
+    let srcs: Vec<&mut [F128]> = rest.chunks_mut(k).collect();
+    transpose_top_only_fold(head, &srcs, 1, group);
+}
+
 /// Body of [`transpose_forward_ntt_dense_layers_blocked`]; `dead_top` as in
 /// [`transpose_forward_ntt_dense_layers_dead`].
 fn transpose_forward_ntt_dense_layers_blocked_dead(
@@ -2489,12 +2539,8 @@ fn transpose_forward_ntt_dense_layers_blocked_dead(
             let block_size = 1usize << (log_d - layer);
             let bsh = block_size >> 1;
             if layer < dead_top {
-                for jb in 0..num_blocks {
-                    let (top_h, bot) =
-                        data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                    transpose_top_only(top_h, bot);
-                }
-                continue;
+                transpose_top_only_dead_tail(data, log_d, layer + 1);
+                break;
             }
             let jb_start = if block_zero_xor {
                 let (top_h, bot) = data[..block_size].split_at_mut(bsh);
@@ -2587,12 +2633,8 @@ fn transpose_forward_ntt_dense_layers_blocked_dead(
                 let block_size = 1usize << (log_d - layer);
                 let bsh = block_size >> 1;
                 if layer < dead_top {
-                    for jb in 0..num_blocks {
-                        let (top_h, bot) =
-                            data[jb * block_size..(jb + 1) * block_size].split_at_mut(bsh);
-                        transpose_top_only(top_h, bot);
-                    }
-                    continue;
+                    transpose_top_only_dead_tail(data, log_d, layer + 1);
+                    return;
                 }
                 let jb_start = if block_zero_xor {
                     let (top_h, bot) = data[..block_size].split_at_mut(bsh);
@@ -2632,17 +2674,12 @@ fn transpose_forward_ntt_dense_layers_blocked_dead(
                 let layer = split - 1 - b;
                 let stride = 1usize << b;
                 if layer < dead_top {
-                    // Only the kept prefix is read back: `top ^= bot` for
-                    // every column pair of this layer, no bottom product.
-                    let mut j = 0;
-                    while j < nseg {
-                        for u in j..j + stride {
-                            let (lo, hi) = cols.split_at_mut(u + stride);
-                            transpose_top_only(lo[u], hi[0]);
-                        }
-                        j += stride << 1;
+                    let group = nseg >> b;
+                    for low in 0..stride {
+                        let (head, tail) = cols.split_at_mut(low + 1);
+                        transpose_top_only_fold(head[low], tail, stride, group);
                     }
-                    continue;
+                    break;
                 }
                 block_zero(&mut cols, stride, layer, ntt);
                 let mut j = stride << 1;
