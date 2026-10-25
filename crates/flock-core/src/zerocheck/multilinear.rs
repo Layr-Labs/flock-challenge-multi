@@ -5877,6 +5877,121 @@ mod tests {
         assert_eq!(plain_shared, plain_incumbent, "plain message/lookahead");
     }
 
+
+    /// Pins the active NT/lane-major route and 64-byte output alignment.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn c4_register_return_callers_match_scalar() {
+        #[repr(C, align(64))]
+        struct Aligned([F128; 4]);
+        for lo_size in [16usize, 64, 256, 1024] {
+            let mut rng = Rng::new(0x7c4011 + lo_size as u64);
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let out_base = 4 * lo_size;
+            let n_rows = 8 * (out_base + 2 * lo_size);
+            let ap: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let bp: Vec<u8> = (0..n_rows * 8).map(|_| rng.next_u64() as u8).collect();
+            let rho1 = rng.f128();
+            let rho2 = rng.f128();
+            let one = F128::ONE;
+            let eq = rng.f128_vec(lo_size);
+            let wt = build_w_pair_table(&eq);
+            let cfold = kernels::x86_64::build_cfold_mats(
+                &table.data,
+                [
+                    (one + rho1) * (one + rho2),
+                    rho1 * (one + rho2),
+                    (one + rho1) * rho2,
+                    rho1 * rho2,
+                ],
+            );
+            let mut a_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_s = a_s.clone();
+            let want = fold2_from_packed_lookahead_scalar(
+                &ap,
+                &bp,
+                &table,
+                out_base,
+                &mut a_s,
+                &mut b_s,
+                rho1,
+                rho2,
+                &eq,
+                0,
+                usize::MAX,
+            );
+            macro_rules! check {
+                ($nt:literal,$lm:literal) => {{
+                    let mut aa: Vec<Aligned> =
+                        (0..lo_size / 2 + 2).map(|_| Aligned([one; 4])).collect();
+                    let mut bb: Vec<Aligned> =
+                        (0..lo_size / 2 + 2).map(|_| Aligned([one; 4])).collect();
+                    let a = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            aa.as_mut_ptr().add(1).cast::<F128>(),
+                            2 * lo_size,
+                        )
+                    };
+                    let b = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            bb.as_mut_ptr().add(1).cast::<F128>(),
+                            2 * lo_size,
+                        )
+                    };
+                    assert_eq!(a.as_ptr() as usize % 64, 0);
+                    assert_eq!(b.as_ptr() as usize % 64, 0);
+                    let got = unsafe {
+                        kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<$nt, $lm>(
+                            ap.as_ptr(),
+                            bp.as_ptr(),
+                            out_base,
+                            a,
+                            b,
+                            lo_size,
+                            &cfold,
+                            &wt,
+                        )
+                    };
+                    assert_eq!(got, want, "message lo={lo_size}");
+                    assert_eq!(
+                        a,
+                        if $lm {
+                            lane_major_tiles(&a_s)
+                        } else {
+                            a_s.clone()
+                        }
+                    );
+                    assert_eq!(
+                        b,
+                        if $lm {
+                            lane_major_tiles(&b_s)
+                        } else {
+                            b_s.clone()
+                        }
+                    );
+                    assert_eq!(aa.first().unwrap().0, [one; 4]);
+                    assert_eq!(aa.last().unwrap().0, [one; 4]);
+                    assert_eq!(bb.first().unwrap().0, [one; 4]);
+                    assert_eq!(bb.last().unwrap().0, [one; 4]);
+                }};
+            }
+            check!(false, false);
+            check!(false, true);
+            check!(true, false);
+            check!(true, true);
+        }
+        println!(
+            "16 actual C4 caller size/layout/publication cases match scalar messages and outputs with guards"
+        );
+    }
+
     /// AVX-512 packed→composed kernel vs the portable reference on one chunk,
     /// with and without padded pairs, at several `lo_size`.
     #[cfg(all(
