@@ -3689,9 +3689,35 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
     };
-    for i in 0..15 {
+    for i in (0..12).step_by(4) {
+        unsafe {
+            use core::arch::x86_64::*;
+            let v = _mm512_loadu_si512(t.as_ptr().add(i) as *const __m512i);
+            let shifted = _mm512_xor_si512(
+                _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, v),
+                _mm512_clmulepi64_epi128::<0x01>(v, _mm512_set1_epi64(0x87)),
+            );
+            let first = _mm512_permutex2var_epi64(
+                v,
+                _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11),
+                shifted,
+            );
+            let last = _mm512_permutex2var_epi64(
+                v,
+                _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15),
+                shifted,
+            );
+            let out = result.pairs.as_mut_ptr().add(i) as *mut __m512i;
+            _mm512_storeu_si512(out, first);
+            _mm512_storeu_si512(out.add(1), last);
+        }
+    }
+    for i in 12..15 {
         // x^64 multiplication is a field operation, not a value assumption.
-        result.pairs[i] = [t[i], t[i] * F128::new(0, 1)];
+        let h = t[i].hi as u128;
+        let prod = h ^ (h << 1) ^ (h << 2) ^ (h << 7);
+        let companion = F128::new(prod as u64, t[i].lo ^ (prod >> 64) as u64);
+        result.pairs[i] = [t[i], companion];
     }
     Some(result)
 }
