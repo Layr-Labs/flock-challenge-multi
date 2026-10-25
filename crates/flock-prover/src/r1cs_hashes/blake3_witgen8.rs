@@ -32,6 +32,42 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window30_k0, round1_ab_table_images,
 };
 
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[path = "blake3_witgen16.rs"]
+mod wide16;
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+pub(crate) use wide16::build_hexa_witness_ab_stream_ranked_closed;
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vbmi2",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+pub(crate) fn ranked_witness16_enabled() -> bool {
+    ranked_b_constwin_enabled()
+}
+
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
