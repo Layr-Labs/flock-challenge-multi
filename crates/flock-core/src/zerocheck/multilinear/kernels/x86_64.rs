@@ -4782,6 +4782,14 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked_tr`].
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+core::arch::global_asm!(include_str!("gfni_sigma_limited.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+unsafe extern "C" {
+    fn flock_sigma_limited1(rows: *const u8, mats: *const u64, out: *mut F128);
+    fn flock_sigma_limited4(rows: *const u8, mats: *const u64, out: *mut F128);
+}
+
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
 #[cfg_attr(
     target_feature = "avx512bw",
@@ -4791,7 +4799,68 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    // The dense kernel keeps exactly the incumbent map and transpose scratch.
+    // Its private assembly contract preserves every GPR and ZMM27..31.
+    unsafe {
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        if dead_lines == 0 {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_sigma_limited1,
+                in("rdi") rows,
+                in("rsi") mats.as_ptr(),
+                in("rdx") out,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+                out("zmm25") _,
+                out("zmm26") _,
+            );
+            return;
+        }
+        gfni_fold64_rows_masked_tr_bcast_fallback(rows, mats, out, dead_lines);
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_fallback(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
@@ -4834,7 +4903,57 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4(
+    rows: *const u8,
+    mats4: *const u64,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    // The dense kernel keeps exactly the incumbent map and transpose scratch.
+    // Its private assembly contract preserves every GPR and ZMM16..31.
+    unsafe {
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        if dead_lines == 0 {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_sigma_limited4,
+                in("rdi") rows,
+                in("rsi") mats4,
+                in("rdx") out,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+            );
+            return;
+        }
+        gfni_fold64_rows_masked_tr_bcast4_fallback(rows, mats4, out, dead_lines);
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4_fallback(
     rows: *const u8,
     mats4: *const u64,
     out: *mut F128,
