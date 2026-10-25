@@ -508,26 +508,190 @@ pub(crate) unsafe fn gfni_fold_rows(
     seed_zero: bool,
 ) {
     use core::arch::x86_64::*;
-    unsafe {
-        for byte_k in 0..16 {
-            let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-            let mut acc = if seed_zero {
-                _mm512_setzero_si512()
-            } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
-            };
-            for t in (0..8).step_by(2) {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[t],
-                    _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
+    #[inline(always)]
+    unsafe fn const_rows<const ZERO: bool>(
+        rows: &[__m512i; 8],
+        mats: &[u64; 128],
+        planes: *mut u8,
+    ) {
+        unsafe {
+            for b in (0..16).step_by(4) {
+                let mut a0 = if ZERO {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(planes.add((b + 0) * 64).cast())
+                };
+                let mut a1 = if ZERO {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(planes.add((b + 1) * 64).cast())
+                };
+                let mut a2 = if ZERO {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(planes.add((b + 2) * 64).cast())
+                };
+                let mut a3 = if ZERO {
+                    _mm512_setzero_si512()
+                } else {
+                    _mm512_loadu_si512(planes.add((b + 3) * 64).cast())
+                };
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[0 + b + 0] as i64),
                 );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[t + 1],
-                    _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + b + 0] as i64),
                 );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                a0 = _mm512_ternarylogic_epi64::<0x96>(a0, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[0 + b + 1] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + b + 1] as i64),
+                );
+                a1 = _mm512_ternarylogic_epi64::<0x96>(a1, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[0 + b + 2] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + b + 2] as i64),
+                );
+                a2 = _mm512_ternarylogic_epi64::<0x96>(a2, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[0],
+                    _mm512_set1_epi64(mats[0 + b + 3] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[1],
+                    _mm512_set1_epi64(mats[16 + b + 3] as i64),
+                );
+                a3 = _mm512_ternarylogic_epi64::<0x96>(a3, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + b + 0] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + b + 0] as i64),
+                );
+                a0 = _mm512_ternarylogic_epi64::<0x96>(a0, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + b + 1] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + b + 1] as i64),
+                );
+                a1 = _mm512_ternarylogic_epi64::<0x96>(a1, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + b + 2] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + b + 2] as i64),
+                );
+                a2 = _mm512_ternarylogic_epi64::<0x96>(a2, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[2],
+                    _mm512_set1_epi64(mats[32 + b + 3] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[3],
+                    _mm512_set1_epi64(mats[48 + b + 3] as i64),
+                );
+                a3 = _mm512_ternarylogic_epi64::<0x96>(a3, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + b + 0] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + b + 0] as i64),
+                );
+                a0 = _mm512_ternarylogic_epi64::<0x96>(a0, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + b + 1] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + b + 1] as i64),
+                );
+                a1 = _mm512_ternarylogic_epi64::<0x96>(a1, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + b + 2] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + b + 2] as i64),
+                );
+                a2 = _mm512_ternarylogic_epi64::<0x96>(a2, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[4],
+                    _mm512_set1_epi64(mats[64 + b + 3] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[5],
+                    _mm512_set1_epi64(mats[80 + b + 3] as i64),
+                );
+                a3 = _mm512_ternarylogic_epi64::<0x96>(a3, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + b + 0] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + b + 0] as i64),
+                );
+                a0 = _mm512_ternarylogic_epi64::<0x96>(a0, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + b + 1] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + b + 1] as i64),
+                );
+                a1 = _mm512_ternarylogic_epi64::<0x96>(a1, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + b + 2] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + b + 2] as i64),
+                );
+                a2 = _mm512_ternarylogic_epi64::<0x96>(a2, x, y);
+                let x = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[6],
+                    _mm512_set1_epi64(mats[96 + b + 3] as i64),
+                );
+                let y = _mm512_gf2p8affine_epi64_epi8::<0>(
+                    rows[7],
+                    _mm512_set1_epi64(mats[112 + b + 3] as i64),
+                );
+                a3 = _mm512_ternarylogic_epi64::<0x96>(a3, x, y);
+                _mm512_storeu_si512(planes.add((b + 0) * 64).cast(), a0);
+                _mm512_storeu_si512(planes.add((b + 1) * 64).cast(), a1);
+                _mm512_storeu_si512(planes.add((b + 2) * 64).cast(), a2);
+                _mm512_storeu_si512(planes.add((b + 3) * 64).cast(), a3);
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+        }
+    }
+    unsafe {
+        if seed_zero {
+            const_rows::<true>(rows, mats, planes)
+        } else {
+            const_rows::<false>(rows, mats, planes)
         }
     }
 }
