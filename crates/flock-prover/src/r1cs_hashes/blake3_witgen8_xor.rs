@@ -649,7 +649,7 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
-unsafe fn project_const<const BLK: usize>(
+unsafe fn project_const<const BLK: usize, const PREPARED: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows,
     a: [__m512i; 8],
@@ -662,7 +662,11 @@ unsafe fn project_const<const BLK: usize>(
     unsafe {
         let bp = pretranspose_ring::<BLK, false>(br, rw);
         let mut acc = [_mm512_setzero_si512(); 8];
-        rows.publish_dense_values(0, a[0], b[0]);
+        if PREPARED {
+            rows.publish_prepared_values(0, a[0], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(0, a[0], b[0]);
+        }
         if residual_row_live(BLK, 7) {
         match mode(BLK, 7) {
 0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
@@ -688,7 +692,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(1, a[1], b[1]);
+        if PREPARED {
+            rows.publish_prepared_values(1, a[1], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(1, a[1], b[1]);
+        }
         if residual_row_live(BLK, 6) {
         match mode(BLK, 6) {
 0 => row_product::<0, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
@@ -714,7 +722,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(2, a[2], b[2]);
+        if PREPARED {
+            rows.publish_prepared_values(2, a[2], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(2, a[2], b[2]);
+        }
         if residual_row_live(BLK, 5) {
         match mode(BLK, 5) {
 0 => row_product::<0, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
@@ -740,7 +752,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(3, a[3], b[3]);
+        if PREPARED {
+            rows.publish_prepared_values(3, a[3], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(3, a[3], b[3]);
+        }
         if residual_row_live(BLK, 4) {
         match mode(BLK, 4) {
 0 => row_product::<0, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
@@ -766,7 +782,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(4, a[4], b[4]);
+        if PREPARED {
+            rows.publish_prepared_values(4, a[4], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(4, a[4], b[4]);
+        }
         if BLK == 29 {
         match mode(BLK, 3) {
 0 => row_product::<0, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
@@ -812,7 +832,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(5, a[5], b[5]);
+        if PREPARED {
+            rows.publish_prepared_values(5, a[5], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(5, a[5], b[5]);
+        }
         if residual_row_live(BLK, 2) {
         match mode(BLK, 2) {
 0 => row_product::<0, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
@@ -838,7 +862,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(6, a[6], b[6]);
+        if PREPARED {
+            rows.publish_prepared_values(6, a[6], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(6, a[6], b[6]);
+        }
         if residual_row_live(BLK, 1) {
         match mode(BLK, 1) {
 0 => row_product::<0, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
@@ -864,7 +892,11 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(7, a[7], b[7]);
+        if PREPARED {
+            rows.publish_prepared_values(7, a[7], ap.as_ptr(), bp.as_ptr());
+        } else {
+            rows.publish_dense_values(7, a[7], b[7]);
+        }
         if residual_row_live(BLK, 0) {
         match mode(BLK, 0) {
 0 => row_product::<0, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
@@ -954,7 +986,7 @@ _ => unreachable!(),
 /// Same ring, ranked-static and non-temporal publication contract as the
 /// direct-inline path. The caller issues the task's existing final sfence.
 #[inline(never)]
-pub(super) unsafe fn project(
+unsafe fn project_layout<const PREPARED: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
     rows: RankedRows,
@@ -965,38 +997,75 @@ pub(super) unsafe fn project(
 ) {
     unsafe {
         let ap = pretranspose_ring::<0, true>(ar, rw);
-        let a = tr8x16_zmm(ar, rw);
-        let b = tr8x16_zmm(br, rw);
+        let a = if PREPARED { tr8x16_zmm_and(ar, br, rw) } else { tr8x16_zmm(ar, rw) };
+        let b = if PREPARED { [_mm512_setzero_si512(); 8] } else { tr8x16_zmm(br, rw) };
         match blk {
-            2 => project_const::<2>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, PREPARED>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
+        }
+    }
+}
+
+#[inline(always)]
+pub(super) unsafe fn project(proj: &StreamProj<'_>, blk: usize, rows: RankedRows, ar: *const V8, br: *const V8, rw: usize, t: &Tables) {
+    unsafe { project_layout::<false>(proj, blk, rows, ar, br, rw, t); }
+}
+
+#[inline(always)]
+pub(super) unsafe fn project_prepared(proj: &StreamProj<'_>, blk: usize, rows: RankedRows, ar: *const V8, br: *const V8, rw: usize, t: &Tables) {
+    unsafe { project_layout::<true>(proj, blk, rows, ar, br, rw, t); }
+}
+
+/// Prefix B is all ones and its prepared owner retains raw B. A is prepared
+/// in every row; Z keeps canonical block order and equals A in this window.
+#[inline(always)]
+pub(super) unsafe fn publish_prepared_static01(z: *mut u32, a: *mut u32, ar: *const V8, rw: usize) {
+    unsafe {
+        let canonical = tr8x16_zmm(ar, rw);
+        let ap = pretranspose_ring::<0, true>(ar, rw);
+        for j in 0..8 {
+            stream_ranked_line(z.add(j * U32_PER_BLOCK), canonical[j]);
+            stream_ranked_line(a.add(j * STEP_WORDS), _mm512_loadu_si512(ap.as_ptr().add(j * 8).cast()));
+        }
+    }
+}
+
+/// Only A row zero varies in window 30. Its other seven prepared rows,
+/// window 31, and all B suffix rows must already contain their fixed values.
+#[inline(always)]
+pub(super) unsafe fn publish_prepared_sparse30(z: *mut u32, a: *mut u32, ar: *const V8, q: *const u64) {
+    unsafe {
+        let prepared = ring_prepared_pack(_mm512_loadu_si512(ar.cast()));
+        stream_ranked_line(a, prepared);
+        for j in 0..8 {
+            stream_ranked_line(z.add(j * U32_PER_BLOCK), _mm512_maskz_loadu_epi64(1, q.add(j).cast::<i64>()));
         }
     }
 }
@@ -1138,6 +1207,7 @@ mod tests {
                         let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
                         assert!(plan.bcomplement_static_eligible());
                         let proj = StreamProj {
+                            prepared_ab: false,
                             stage: core::ptr::null_mut(),
                             out: output.0.as_mut_ptr(),
                             out_stride: stride,
@@ -1171,6 +1241,152 @@ mod tests {
                             let start = row * BYTES_PER_BLOCK + offset;
                             wa.0[start..start + 64].copy_from_slice(&aa[row]);
                             wb.0[start..start + 64].copy_from_slice(&bb[row]);
+                            for i in 0..64 {
+                                wz.0[start + i] = aa[row][i] & bb[row][i];
+                            }
+                            let mut acc = [F8::ZERO; 64];
+                            for k in (0..8).rev() {
+                                let mut av = [F8::ZERO; 64];
+                                let mut bv = [F8::ZERO; 64];
+                                table.apply_scalar(&aa[row][k * 8..k * 8 + 8], &mut av);
+                                table.apply_scalar(&bb[row][k * 8..k * 8 + 8], &mut bv);
+                                for i in 0..64 {
+                                    acc[i] = acc[i] * F8(2);
+                                    if keep & (1 << k) != 0 {
+                                        acc[i] += av[i] * bv[i];
+                                    }
+                                }
+                            }
+                            for i in 0..64 {
+                                want.0[row * stride + offset - bias + i] = acc[i].0;
+                            }
+                        }
+                        assert_eq!(output.0, want.0, "projection rw={rw} case={case} blk={blk}");
+                        assert_eq!(a.0, wa.0);
+                        assert_eq!(b.0, wb.0);
+                        assert_eq!(z.0, wz.0);
+                    }
+                }
+            }
+            println!(
+                "280 complete ring-to-published-window cases, including A/B/Z, compact output stride, both ring halves and untouched bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_ab_projection_publishes_and_matches_scalar() {
+        unsafe {
+            let ns = AdditiveNttGf8::new(6, F8::ZERO);
+            let nl = AdditiveNttGf8::new(6, F8(64));
+            let table = InvNttTableByteSingleGf8::new(&ns, &nl);
+            let t = Tables::new(&table);
+            let mut seed = 1357u64;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            };
+            for rw in [0, 16] {
+                for case in 0..5 {
+                    for blk in 2..30 {
+                        // Independent residual oracle: preserve all powers of two,
+                        // but omit the complete B=1 terms already elided by the plan.
+                        let keep: u8 = match blk { 2 => 0xfc, 29 => 0x0f, _ => 0xff };
+                        for k in 0..8 {
+                            if keep & (1 << k) == 0 {
+                                assert_eq!(known(mode(blk, k)), 255);
+                            }
+                        }
+                        let mut aa = [[0u8; 64]; 8];
+                        let mut bb = [[0u8; 64]; 8];
+                        let mut ar = Ring([[0xdeadbeef; 8]; 32]);
+                        let mut br = Ring([[0xdeadbeef; 8]; 32]);
+                        for row in 0..8 {
+                            for i in 0..64 {
+                                aa[row][i] = if case == 0 {
+                                    0
+                                } else if case == 1 {
+                                    255
+                                } else {
+                                    next()
+                                };
+                                bb[row][i] = if known(mode(blk, i / 8)) & (1 << (i % 8)) != 0 {
+                                    255
+                                } else if case == 0 {
+                                    0
+                                } else if case == 1 {
+                                    255
+                                } else {
+                                    next()
+                                };
+                            }
+                            for w in 0..16 {
+                                ar.0[rw + w][row] = u32::from_le_bytes(
+                                    aa[row][w * 4..w * 4 + 4].try_into().unwrap(),
+                                );
+                                br.0[rw + w][row] = u32::from_le_bytes(
+                                    bb[row][w * 4..w * 4 + 4].try_into().unwrap(),
+                                );
+                            }
+                        }
+                        let mut a = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut b = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut z = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut output = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let stride = 29 * 64;
+                        let bias = 128;
+                        let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
+                        assert!(plan.bcomplement_static_eligible());
+                        let proj = StreamProj {
+                            prepared_ab: true,
+                            stage: core::ptr::null_mut(),
+                            out: output.0.as_mut_ptr(),
+                            out_stride: stride,
+                            out_bias: bias,
+                            inv_table: &table,
+                            plan,
+                            one_rows_elided: true,
+                            w30_elided: true,
+                        };
+                        let offset = blk * 64;
+                        let rows = RankedRows::new(
+                            z.0.as_mut_ptr().add(offset).cast(),
+                            a.0.as_mut_ptr().add(blk * 512).cast(),
+                            b.0.as_mut_ptr().add(blk * 512).cast(),
+                        );
+                        project_prepared(
+                            &proj,
+                            blk,
+                            rows,
+                            ar.0.as_ptr().cast(),
+                            br.0.as_ptr().cast(),
+                            rw,
+                            &t,
+                        );
+                        _mm_sfence();
+                        let mut want = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wa = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wb = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        let mut wz = Buf([0xa5; 8 * BYTES_PER_BLOCK]);
+                        for row in 0..8 {
+                            let start = row * BYTES_PER_BLOCK + offset;
+                            for k in 0..8 {
+                                for j in 0..8 {
+                                    let mut av = 0;
+                                    let mut bv = 0;
+                                    for t in 0..8 {
+                                        if t & j == j { av ^= aa[row][k * 8 + t]; }
+                                        if (mode(blk, k) == 0 && t & j == j) || (mode(blk, k) != 0 && t == j) {
+                                            bv ^= bb[row][k * 8 + t];
+                                        }
+                                    }
+                                    let dst = blk * 512 + k * 64 + j * 8 + row;
+                                    wa.0[dst] = av;
+                                    wb.0[dst] = bv;
+                                }
+                            }
                             for i in 0..64 {
                                 wz.0[start + i] = aa[row][i] & bb[row][i];
                             }

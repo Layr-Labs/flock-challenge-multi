@@ -21,6 +21,7 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
 
 pub mod multilinear;
+pub mod prepared_octa;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;
 pub mod univariate_skip_deg4_optimized;
@@ -45,6 +46,20 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+/// Shared producer/consumer eligibility for the private ranked A/B layout.
+/// The ordinary packed representation remains the rollback and generic path.
+pub fn prepared_ab_layout_enabled() -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    {
+        std::env::var_os("FLOCK_NO_PREPARED_AB_LAYOUT").is_none()
+            && std::env::var_os("FLOCK_NO_TAIL_FUSION").is_none()
+            && !lookahead_off() && !nomat_off() && !cascade2_off() && !cascade3_off()
+            && multilinear::prepared::route_enabled()
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+    { false }
+}
 
 /// Test-only forced-off latch for the two-challenge lookahead. Production
 /// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
@@ -509,6 +524,22 @@ fn prove_packed_padded_inner<C: Challenger>(
     assert_eq!(a_packed.len(), expected_bytes);
     assert_eq!(b_packed.len(), expected_bytes);
     assert_eq!(c_packed.len(), expected_bytes);
+    // Resolve the byte representation before any GPU-prefix repair, dense
+    // round-one restore or generic consumer can read the original owners.
+    let original_layout = precomputed_ab.as_ref().map_or(
+        prepared_octa::PackedAbLayout::Canonical, |ab| ab.packed_ab_layout());
+    let prepared_direct = original_layout == prepared_octa::PackedAbLayout::PreparedOctaV1
+        && m == 32 && padding.k_log == 14 && padding.useful_bits_per_block == 15_409
+        && c_identity_z.is_some() && prepared_ab_layout_enabled()
+        && precomputed_ab.as_ref().is_some_and(|ab|
+            ab.invalid_prefix_bytes() == 0 && ab.ranked_one_rows_elided() && ab.ranked_w30_elided());
+    let canonical_ab = (!prepared_direct).then(|| prepared_octa::CanonicalAb::new(original_layout, a_packed, b_packed));
+    let (a_packed, b_packed) = match canonical_ab.as_ref() {
+        Some(view) => (view.a(), view.b()),
+        None => (a_packed, b_packed),
+    };
+    let active_layout = if prepared_direct { prepared_octa::PackedAbLayout::PreparedOctaV1 }
+        else { prepared_octa::PackedAbLayout::Canonical };
     let n_mlv = m - k_skip;
 
     challenger.observe_label(b"flock-zerocheck-v0");
@@ -822,7 +853,8 @@ fn prove_packed_padded_inner<C: Challenger>(
         .filter(|eq| eq.n_lo >= 3);
 
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
-        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+        let (m1, mi, la) = prepared_octa::round2_with_layout(
+            active_layout,
             a_packed,
             b_packed,
             m,
@@ -1034,7 +1066,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 _ => None,
             };
             let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
-            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
+            let (m1, mi, la_next) = prepared_octa::round34_with_layout(
+                active_layout,
                 a_packed,
                 b_packed,
                 m,
