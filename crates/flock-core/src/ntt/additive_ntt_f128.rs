@@ -2583,25 +2583,39 @@ impl AdditiveNttF128 {
         stage_perm: bool,
         tw2_block: &[[F128; 3]; 16],
     ) {
-        let g2_stride: usize = if stage_perm { 16 } else { 1 };
+        // Both callers reach this private helper only under
+        // direct_fused2_publish_shape, and assert these same dimensions.
+        // Make the established contract visible across this outline boundary:
+        // the four destination rows have a fixed 2-MiB byte pitch.
+        debug_assert_eq!(row_len, 64);
+        debug_assert_eq!(block_size, 1 << 17);
+        debug_assert_eq!(sub_stride, 1 << 11);
+        let row_len = 64usize;
+        let block_size = 1usize << 17;
+        let sub_stride = 1usize << 11;
+        // Adjacent logical rows are strided in both arrays. Since k = 4*m,
+        // the staged quad starts at m in the permuted layout, or 4*m in the
+        // natural layout. Factor each layout once before the shared kernel
+        // site rather than rebuilding four codeword coordinates per quad.
+        let src_quad_step = if stage_perm { row_len } else { 4 * row_len };
+        let step = if stage_perm { 16 * row_len } else { row_len };
+        let dst_step = sub_stride * row_len;
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
-        // this block's 64 logical rows.
+        // this block's 64 logical rows. All offsets name live rows, including
+        // the last quad; no pointer is advanced beyond the allocation.
         unsafe {
+            let dst_base = base.add((block * block_size + r) * row_len);
             for (m, &[t_outer, t_inner_a, t_inner_b]) in tw2_block.iter().enumerate() {
-                let k = 4 * m;
-                let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
-                let step = g2_stride * row_len;
-                let dst = |k: usize| {
-                    base.add(seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len)
-                };
+                let p = region.add(m * src_quad_step);
+                let dst_a = dst_base.add(m * (4 * dst_step));
                 kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
                     p,
                     step,
-                    dst(k),
-                    dst(k + 1),
-                    dst(k + 2),
-                    dst(k + 3),
+                    dst_a,
+                    dst_a.add(dst_step),
+                    dst_a.add(2 * dst_step),
+                    dst_a.add(3 * dst_step),
                     lanes2,
                     t_outer,
                     t_inner_a,
@@ -7229,5 +7243,142 @@ mod prepared_four_composition_tests {
         eprintln!(
             "{cases} complete prepared-four block and owned-table cases matched raw rows with guards"
         );
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod publish_fixed_geometry_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: isize) -> *mut c_void;
+        fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn sysconf(name: i32) -> isize;
+    }
+    struct GuardMap { ptr: *mut u8, len: usize }
+    impl GuardMap {
+        fn new(len: usize) -> Self {
+            // Linux MAP_PRIVATE | MAP_ANONYMOUS; inaccessible until explicitly
+            // activated. The virtual codeword has its true 1-GiB extent.
+            let ptr = unsafe { mmap(std::ptr::null_mut(), len, 0, 2 | 0x20, -1, 0) };
+            assert_ne!(ptr as isize, -1);
+            Self { ptr: ptr.cast(), len }
+        }
+        unsafe fn protect(&self, page: usize, prot: i32) {
+            assert!(page + 4096 <= self.len);
+            assert_eq!(unsafe { mprotect(self.ptr.add(page).cast(), 4096, prot) }, 0);
+        }
+    }
+    impl Drop for GuardMap {
+        fn drop(&mut self) { unsafe { munmap(self.ptr.cast(), self.len); } }
+    }
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    struct Line([F128; 4]);
+
+    #[test]
+    fn fixed_publish_matches_scalar_with_guard_pages() {
+        assert_eq!(unsafe { sysconf(30) }, 4096, "Linux page size");
+        assert_eq!(std::mem::size_of::<F128>(), 16);
+        let ntt = AdditiveNttF128::standard(20);
+        let map = GuardMap::new((1usize << 30) + 8192);
+        let guard = F128 { lo: 0x731a542b19c81, hi: 0x6fa103d4e2789 };
+        let mut state = 0x187356fa2349u64;
+        let mut next = || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            F128 { lo: state, hi: state.rotate_left(29) ^ 0x182734ab65 }
+        };
+        let mut cases = 0;
+        for stage_perm in [false, true] {
+            for lanes in [60usize, 64] {
+                for offset in 0..4 {
+                    for mode in 0..6 {
+                        for (block, r) in [(0usize, 0usize), (3, 1001), (7, 2047)] {
+                            let source_start = 4 + offset;
+                            let mut source = vec![Line([guard; 4]); (source_start + 4096 + 11) / 4];
+                            let sp = source.as_mut_ptr().cast::<F128>();
+                            let source_len = source.len() * 4;
+                            let src = unsafe { std::slice::from_raw_parts_mut(sp, source_len) };
+                            for row in 0..64 {
+                                for lane in 0..64 {
+                                    src[source_start + row * 64 + lane] = if lane < lanes { next() } else { F128::ZERO };
+                                }
+                            }
+                            let before = src.to_vec();
+                            let tw: [[F128; 3]; 16] = core::array::from_fn(|m| core::array::from_fn(|j| {
+                                if mode == 5 {
+                                    let outer = block * 16 + m;
+                                    return if j == 0 { ntt.twiddle(7, outer) } else { ntt.twiddle(8, outer * 2 + j - 1) };
+                                }
+                                let mut t = next();
+                                if mode == 0 { t = F128::ZERO; }
+                                else if mode == 1 || (mode == 2 && j != 0) || (mode == 4 && j == 0) { t.hi = 0; }
+                                t
+                            }));
+                            let base_offset = 64 + offset * 16;
+                            let byte_offset = |k: usize| base_offset + (block * (1 << 17) + r + k * (1 << 11)) * 64 * 16;
+                            let mut pages = BTreeSet::new();
+                            for k in 0..64 {
+                                let start = byte_offset(k);
+                                for page in (start / 4096)..=((start + 1023) / 4096) { pages.insert(page * 4096); }
+                            }
+                            let mut expected: BTreeMap<usize, Vec<F128>> = pages.iter().map(|&page| (page, vec![guard; 256])).collect();
+                            for &page in &pages {
+                                unsafe {
+                                    map.protect(page, 3);
+                                    std::slice::from_raw_parts_mut(map.ptr.add(page).cast::<F128>(), 256).fill(guard);
+                                }
+                            }
+                            for m in 0..16 {
+                                for lane in 0..64 {
+                                    let mut values = [F128::ZERO; 4];
+                                    if lane < lanes {
+                                        for j in 0..4 {
+                                            let k = 4 * m + j;
+                                            let row = if stage_perm { (k % 4) * 16 + k / 4 } else { k };
+                                            values[j] = before[source_start + row * 64 + lane];
+                                        }
+                                        let [mut a, mut b, mut c, mut d] = values;
+                                        a += tw[m][0] * c; c += a;
+                                        b += tw[m][0] * d; d += b;
+                                        a += tw[m][1] * b; b += a;
+                                        c += tw[m][2] * d; d += c;
+                                        values = [a, b, c, d];
+                                    }
+                                    for (j, value) in values.into_iter().enumerate() {
+                                        let off = byte_offset(4 * m + j) + lane * 16;
+                                        expected.get_mut(&(off & !4095)).unwrap()[(off % 4096) / 16] = value;
+                                    }
+                                }
+                            }
+                            unsafe {
+                                let dp = map.ptr.add(base_offset).cast::<F128>();
+                                if offset == 0 {
+                                    ntt.seed_top_publish2_block::<true>(sp.add(source_start), dp, block, 64,
+                                        1 << 17, 1 << 11, r, lanes, stage_perm, &tw);
+                                } else {
+                                    ntt.seed_top_publish2_block::<false>(sp.add(source_start), dp, block, 64,
+                                        1 << 17, 1 << 11, r, lanes, stage_perm, &tw);
+                                }
+                                core::arch::x86_64::_mm_sfence();
+                                for (&page, values) in &expected {
+                                    assert_eq!(std::slice::from_raw_parts(map.ptr.add(page).cast::<F128>(), 256), values,
+                                        "stage={stage_perm} lanes={lanes} offset={offset} mode={mode} block={block} r={r} page={page}");
+                                }
+                                assert_eq!(std::slice::from_raw_parts(sp, source_len), before, "source modified");
+                                for &page in &pages { map.protect(page, 0); }
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 288);
+        eprintln!("{cases} exact-shape publication cases matched scalar with guarded destination gaps");
     }
 }

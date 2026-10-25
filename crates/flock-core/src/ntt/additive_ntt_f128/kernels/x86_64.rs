@@ -522,6 +522,15 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         let inner_a = tw_x4::<INNER_LOW, DIET>(t_inner_a);
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
 
+        // The private fixed-geometry caller proves this pitch. Retain the
+        // generic four-pointer path for every other permitted row layout.
+        // Wrapping pointer construction only compares addresses here; it
+        // does not assume that an arbitrary caller owns a 2-MiB gap.
+        let fixed_publish = ALIGNED_ZMM
+            && dst_b == dst_a.wrapping_add(1 << 17)
+            && dst_c == dst_a.wrapping_add(1 << 18)
+            && dst_d == dst_a.wrapping_add(3 << 17);
+
         let mut i = 0;
         while i + 8 <= lanes {
             let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
@@ -562,15 +571,40 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             vc0 = new_c0;
             vc1 = new_c1;
 
-            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
-            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
-            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
-            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+            if fixed_publish {
+                // SAFETY: all four destinations are writable, disjoint and
+                // 64-byte aligned; the predicate proves these exact offsets.
+                core::arch::asm!(
+                    "vmovntdq zmmword ptr [{out_ptr}], {a0}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 2097152], {b0}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 4194304], {c0}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 6291456], {d0}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 64], {a1}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 2097216], {b1}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 4194368], {c1}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 6291520], {d1}",
+                    out_ptr = in(reg) dst_a.add(i),
+                    a0 = in(zmm_reg) va0,
+                    b0 = in(zmm_reg) vb0,
+                    c0 = in(zmm_reg) vc0,
+                    d0 = in(zmm_reg) vd0,
+                    a1 = in(zmm_reg) va1,
+                    b1 = in(zmm_reg) vb1,
+                    c1 = in(zmm_reg) vc1,
+                    d1 = in(zmm_reg) vd1,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
 
-            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
-            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
-            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
-            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+            }
             i += 8;
         }
         while i < lanes {
@@ -593,10 +627,27 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
             vd = _mm512_xor_si512(vd, new_c);
             vc = new_c;
 
-            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
-            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
-            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
-            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+            if fixed_publish {
+                // SAFETY: all four destinations are writable, disjoint and
+                // 64-byte aligned; the predicate proves these exact offsets.
+                core::arch::asm!(
+                    "vmovntdq zmmword ptr [{out_ptr}], {a}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 2097152], {b}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 4194304], {c}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 6291456], {d}",
+                    out_ptr = in(reg) dst_a.add(i),
+                    a = in(zmm_reg) va,
+                    b = in(zmm_reg) vb,
+                    c = in(zmm_reg) vc,
+                    d = in(zmm_reg) vd,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+            }
             i += 4;
         }
 
@@ -607,10 +658,24 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         if i < 64 {
             debug_assert_eq!(i, 60);
             let zero = _mm512_setzero_si512();
-            stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
-            stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), zero);
-            stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), zero);
-            stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), zero);
+            if fixed_publish {
+                // SAFETY: all four destinations are writable, disjoint and
+                // 64-byte aligned; the predicate proves these exact offsets.
+                core::arch::asm!(
+                    "vmovntdq zmmword ptr [{out_ptr}], {zero}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 2097152], {zero}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 4194304], {zero}",
+                    "vmovntdq zmmword ptr [{out_ptr} + 6291456], {zero}",
+                    out_ptr = in(reg) dst_a.add(i),
+                    zero = in(zmm_reg) zero,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), zero);
+            }
         }
     }
 }
@@ -3783,5 +3848,54 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
         butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
         )
+    }
+}
+
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod publish_other_pitch_tests {
+    use super::*;
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy)]
+    struct Line([F128; 4]);
+    #[test]
+    fn fixed_publish_store_fallback_preserves_other_pitches() {
+        let guard = F128 { lo: 0x98ab76, hi: 0x12cd34 };
+        let mut state = 0x478abc91u64;
+        let mut next = || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            F128 { lo: state, hi: state.rotate_left(17) ^ 0x743981 }
+        };
+        for lanes in [60usize, 64] {
+            let mut source = vec![Line([guard; 4]); 66];
+            let src = unsafe { std::slice::from_raw_parts_mut(source.as_mut_ptr().cast::<F128>(), 264) };
+            for row in 0..4 {
+                for lane in 0..64 { src[4 + row * 64 + lane] = if lane < lanes { next() } else { F128::ZERO }; }
+            }
+            let before = src.to_vec();
+            let tw = [next(), next(), next()];
+            let mut output = vec![Line([guard; 4]); 82];
+            let out = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<F128>(), 328) };
+            let mut expected = out.to_vec();
+            for lane in 0..64 {
+                let mut values = [F128::ZERO; 4];
+                if lane < lanes {
+                    let [mut a, mut b, mut c, mut d] = core::array::from_fn(|j| before[4 + j * 64 + lane]);
+                    a += tw[0] * c; c += a; b += tw[0] * d; d += b;
+                    a += tw[1] * b; b += a; c += tw[2] * d; d += c;
+                    values = [a, b, c, d];
+                }
+                for j in 0..4 { expected[4 + j * 80 + lane] = values[j]; }
+            }
+            unsafe {
+                let ptr = out.as_mut_ptr().add(4);
+                butterfly_fused_2layer_publish_nt_impl::<false, false, true, true>(src.as_ptr().add(4), 64,
+                    ptr, ptr.add(80), ptr.add(160), ptr.add(240), lanes, tw[0], tw[1], tw[2]);
+                core::arch::x86_64::_mm_sfence();
+            }
+            assert_eq!(out, expected, "non-fixed pitch, lanes={lanes}");
+            assert_eq!(src, before, "source modified");
+        }
+        eprintln!("2 aligned non-fixed-pitch fallback cases matched scalar and complete halos");
     }
 }
