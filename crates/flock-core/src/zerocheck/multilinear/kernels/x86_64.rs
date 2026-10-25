@@ -338,6 +338,120 @@ pub(crate) fn round2_baked_elide_route_ok(
 ///   (`p0+120..p0+128`) is elided.
 /// This removes all per-iteration state-machine branches and fallback paths
 /// from the hot Round-2 loop.
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+core::arch::global_asm!(include_str!("gfni_round2_eight.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+unsafe extern "C" {
+    fn flock_r2eight_single_full();
+    fn flock_r2eight_single_0();
+    fn flock_r2eight_single_3();
+    fn flock_r2eight_multi_full();
+    fn flock_r2eight_multi_0();
+    fn flock_r2eight_multi_3();
+}
+
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn round2_prefold_eight<const MULTI: bool, const SKIP: i32>(rows: *const u8, mats: *const u64, out: *mut F128) {
+    // All live input is staged before publication. Clobber only RAX, flags
+    // and ZMM0..7; ZMM8..31 and every other GPR survive the call.
+    unsafe {
+        if MULTI == false && SKIP == -1 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_single_full,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else if MULTI == false && SKIP == 0 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_single_0,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else if MULTI == false && SKIP == 3 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_single_3,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else if MULTI == true && SKIP == -1 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_multi_full,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else if MULTI == true && SKIP == 0 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_multi_0,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else if MULTI == true && SKIP == 3 {
+            core::arch::asm!(
+                "call {leaf}",
+                leaf = sym flock_r2eight_multi_3,
+                in("rdi") rows, in("rsi") mats, in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+            );
+        } else {
+            unreachable!("invalid private prefold shape");
+        }
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -467,6 +581,26 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             }};
         }
 
+
+        // Only the ranked caller uses this private ABI. Other routes keep
+        // the original masked and canonical helpers.
+        macro_rules! prefold_eight {
+            ($multi:literal, $skip:literal, $rows:expr, $mats:expr, $out:expr) => {{
+                #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+                round2_prefold_eight::<$multi, $skip>($rows, $mats, $out);
+                #[cfg(not(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+                {
+                    if $skip >= 0 {
+                        gfni_fold64_rows_tr_bcast_skip_group::<$multi>($rows, $mats, $out, $skip as u8);
+                    } else if $multi {
+                        gfni_fold64_rows_masked_tr_bcast4($rows, $mats, $out, 0);
+                    } else {
+                        gfni_fold64_rows_masked_tr_bcast($rows, &*($mats as *const [u64; 128]), $out, 0);
+                    }
+                }
+            }};
+        }
+
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
@@ -474,18 +608,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
-                gfni_fold64_rows_tr_bcast_skip_group::<true>(
-                    a_pkt.add(g0 * 8),
-                    a_mats_ptr,
-                    fa,
-                    0,
-                );
-                gfni_fold64_rows_tr_bcast_skip_group::<false>(
-                    b_pkt.add(g0 * 8),
-                    bm.as_ptr(),
-                    fb,
-                    0,
-                );
+                prefold_eight!(true, 0, a_pkt.add(g0 * 8), a_mats_ptr, fa);
+                prefold_eight!(false, 0, b_pkt.add(g0 * 8), bm.as_ptr(), fb);
                 pf_quarter!(g0, 0);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -496,8 +620,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                prefold_eight!(true, -1, a_pkt.add(g0 * 8), a_mats_ptr, fa);
+                prefold_eight!(false, -1, b_pkt.add(g0 * 8), bm.as_ptr(), fb);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
             }
@@ -505,8 +629,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                prefold_eight!(true, -1, a_pkt.add(g0 * 8), a_mats_ptr, fa);
+                prefold_eight!(false, -1, b_pkt.add(g0 * 8), bm.as_ptr(), fb);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
             }
@@ -514,18 +638,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * (x_lo + 96);
                 let bm = &(*b_mats_slice.add(batch_base + 3)).0;
-                gfni_fold64_rows_tr_bcast_skip_group::<true>(
-                    a_pkt.add(g0 * 8),
-                    a_mats_ptr,
-                    fa,
-                    3,
-                );
-                gfni_fold64_rows_tr_bcast_skip_group::<false>(
-                    b_pkt.add(g0 * 8),
-                    bm.as_ptr(),
-                    fb,
-                    3,
-                );
+                prefold_eight!(true, 3, a_pkt.add(g0 * 8), a_mats_ptr, fa);
+                prefold_eight!(false, 3, b_pkt.add(g0 * 8), bm.as_ptr(), fb);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
                 pf_quarter!(g0, 3);

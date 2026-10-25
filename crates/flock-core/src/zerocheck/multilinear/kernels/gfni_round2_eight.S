@@ -1,0 +1,2135 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Private ranked round2 ABI: RDI rows, RSI matrices, RDX output.
+// RAX, flags and ZMM0..7 clobbered; every other GPR and ZMM8..31 preserved.
+// No vzeroupper; 768-byte aligned frame, including four preserved vectors; all live input staged first.
+.text
+.p2align 6
+.global flock_r2eight_single_full
+.hidden flock_r2eight_single_full
+.type flock_r2eight_single_full,@function
+flock_r2eight_single_full:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 0]
+vmovdqa64 [rsp + 0], zmm1
+vpermb zmm1, zmm0, [rdi + 64]
+vmovdqa64 [rsp + 64], zmm1
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vpermb zmm1, zmm0, [rdi + 384]
+vmovdqa64 [rsp + 384], zmm1
+vpermb zmm1, zmm0, [rdi + 448]
+vmovdqa64 [rsp + 448], zmm1
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 0]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 64]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 8]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 72]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 16]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 80]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 24]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 88]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 32]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 96]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 40]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 104]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 48]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 112]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 56]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 120]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 0], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 256], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 512], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 768], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 384]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 448]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 392]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 456]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 400]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 464]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 408]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 472]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 416]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 480]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 424]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 488]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 432]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 496]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 440]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 504]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 192], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 448], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 704], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 960], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_single_full, .-flock_r2eight_single_full
+.p2align 6
+.global flock_r2eight_single_0
+.hidden flock_r2eight_single_0
+.type flock_r2eight_single_0,@function
+flock_r2eight_single_0:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vpermb zmm1, zmm0, [rdi + 384]
+vmovdqa64 [rsp + 384], zmm1
+vpermb zmm1, zmm0, [rdi + 448]
+vmovdqa64 [rsp + 448], zmm1
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 384]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 448]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 392]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 456]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 400]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 464]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 408]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 472]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 416]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 480]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 424]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 488]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 432]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 496]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 440]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 504]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 192], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 448], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 704], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 960], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_single_0, .-flock_r2eight_single_0
+.p2align 6
+.global flock_r2eight_single_3
+.hidden flock_r2eight_single_3
+.type flock_r2eight_single_3,@function
+flock_r2eight_single_3:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 0]
+vmovdqa64 [rsp + 0], zmm1
+vpermb zmm1, zmm0, [rdi + 64]
+vmovdqa64 [rsp + 64], zmm1
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 0]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 64]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 8]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 72]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 16]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 80]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 24]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 88]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 32]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 96]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 40]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 104]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 48]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 112]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 56]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 120]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 0], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 256], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 512], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 768], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_single_3, .-flock_r2eight_single_3
+.p2align 6
+.global flock_r2eight_multi_full
+.hidden flock_r2eight_multi_full
+.type flock_r2eight_multi_full,@function
+flock_r2eight_multi_full:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 0]
+vmovdqa64 [rsp + 0], zmm1
+vpermb zmm1, zmm0, [rdi + 64]
+vmovdqa64 [rsp + 64], zmm1
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vpermb zmm1, zmm0, [rdi + 384]
+vmovdqa64 [rsp + 384], zmm1
+vpermb zmm1, zmm0, [rdi + 448]
+vmovdqa64 [rsp + 448], zmm1
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 0]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 64]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 8]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 72]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 16]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 80]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 24]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 88]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 32]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 96]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 40]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 104]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 48]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 112]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 56]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 120]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 0], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 256], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 512], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 768], zmm8
+vmovdqu64 zmm10, [rsi + 1024]
+vmovdqu64 zmm11, [rsi + 1088]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1152]
+vmovdqu64 zmm11, [rsi + 1216]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1280]
+vmovdqu64 zmm11, [rsi + 1344]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1408]
+vmovdqu64 zmm11, [rsi + 1472]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1536]
+vmovdqu64 zmm11, [rsi + 1600]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1664]
+vmovdqu64 zmm11, [rsi + 1728]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1792]
+vmovdqu64 zmm11, [rsi + 1856]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1920]
+vmovdqu64 zmm11, [rsi + 1984]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 2048]
+vmovdqu64 zmm11, [rsi + 2112]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2176]
+vmovdqu64 zmm11, [rsi + 2240]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2304]
+vmovdqu64 zmm11, [rsi + 2368]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2432]
+vmovdqu64 zmm11, [rsi + 2496]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2560]
+vmovdqu64 zmm11, [rsi + 2624]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2688]
+vmovdqu64 zmm11, [rsi + 2752]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2816]
+vmovdqu64 zmm11, [rsi + 2880]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2944]
+vmovdqu64 zmm11, [rsi + 3008]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqu64 zmm10, [rsi + 3072]
+vmovdqu64 zmm11, [rsi + 3136]
+vpbroadcastq zmm0, [rsp + 384]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 448]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3200]
+vmovdqu64 zmm11, [rsi + 3264]
+vpbroadcastq zmm4, [rsp + 392]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 456]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3328]
+vmovdqu64 zmm11, [rsi + 3392]
+vpbroadcastq zmm8, [rsp + 400]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 464]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3456]
+vmovdqu64 zmm11, [rsi + 3520]
+vpbroadcastq zmm4, [rsp + 408]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 472]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3584]
+vmovdqu64 zmm11, [rsi + 3648]
+vpbroadcastq zmm8, [rsp + 416]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 480]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3712]
+vmovdqu64 zmm11, [rsi + 3776]
+vpbroadcastq zmm4, [rsp + 424]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 488]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3840]
+vmovdqu64 zmm11, [rsi + 3904]
+vpbroadcastq zmm8, [rsp + 432]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 496]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3968]
+vmovdqu64 zmm11, [rsi + 4032]
+vpbroadcastq zmm4, [rsp + 440]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 504]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 192], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 448], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 704], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 960], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_multi_full, .-flock_r2eight_multi_full
+.p2align 6
+.global flock_r2eight_multi_0
+.hidden flock_r2eight_multi_0
+.type flock_r2eight_multi_0,@function
+flock_r2eight_multi_0:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vpermb zmm1, zmm0, [rdi + 384]
+vmovdqa64 [rsp + 384], zmm1
+vpermb zmm1, zmm0, [rdi + 448]
+vmovdqa64 [rsp + 448], zmm1
+vmovdqu64 zmm10, [rsi + 1024]
+vmovdqu64 zmm11, [rsi + 1088]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1152]
+vmovdqu64 zmm11, [rsi + 1216]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1280]
+vmovdqu64 zmm11, [rsi + 1344]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1408]
+vmovdqu64 zmm11, [rsi + 1472]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1536]
+vmovdqu64 zmm11, [rsi + 1600]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1664]
+vmovdqu64 zmm11, [rsi + 1728]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1792]
+vmovdqu64 zmm11, [rsi + 1856]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1920]
+vmovdqu64 zmm11, [rsi + 1984]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 2048]
+vmovdqu64 zmm11, [rsi + 2112]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2176]
+vmovdqu64 zmm11, [rsi + 2240]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2304]
+vmovdqu64 zmm11, [rsi + 2368]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2432]
+vmovdqu64 zmm11, [rsi + 2496]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2560]
+vmovdqu64 zmm11, [rsi + 2624]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2688]
+vmovdqu64 zmm11, [rsi + 2752]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2816]
+vmovdqu64 zmm11, [rsi + 2880]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2944]
+vmovdqu64 zmm11, [rsi + 3008]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqu64 zmm10, [rsi + 3072]
+vmovdqu64 zmm11, [rsi + 3136]
+vpbroadcastq zmm0, [rsp + 384]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 448]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3200]
+vmovdqu64 zmm11, [rsi + 3264]
+vpbroadcastq zmm4, [rsp + 392]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 456]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3328]
+vmovdqu64 zmm11, [rsi + 3392]
+vpbroadcastq zmm8, [rsp + 400]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 464]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3456]
+vmovdqu64 zmm11, [rsi + 3520]
+vpbroadcastq zmm4, [rsp + 408]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 472]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3584]
+vmovdqu64 zmm11, [rsi + 3648]
+vpbroadcastq zmm8, [rsp + 416]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 480]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3712]
+vmovdqu64 zmm11, [rsi + 3776]
+vpbroadcastq zmm4, [rsp + 424]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 488]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 3840]
+vmovdqu64 zmm11, [rsi + 3904]
+vpbroadcastq zmm8, [rsp + 432]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 496]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 3968]
+vmovdqu64 zmm11, [rsi + 4032]
+vpbroadcastq zmm4, [rsp + 440]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 504]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 192], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 448], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 704], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 960], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_multi_0, .-flock_r2eight_multi_0
+.p2align 6
+.global flock_r2eight_multi_3
+.hidden flock_r2eight_multi_3
+.type flock_r2eight_multi_3,@function
+flock_r2eight_multi_3:
+mov rax, rsp
+and rsp, -64
+sub rsp, 768
+vmovdqa64 [rsp + 512], zmm8
+vmovdqa64 [rsp + 576], zmm9
+vmovdqa64 [rsp + 640], zmm10
+vmovdqa64 [rsp + 704], zmm11
+vmovdqa64 zmm0, [rip + .Lflock_r2eight_bt]
+vpermb zmm1, zmm0, [rdi + 0]
+vmovdqa64 [rsp + 0], zmm1
+vpermb zmm1, zmm0, [rdi + 64]
+vmovdqa64 [rsp + 64], zmm1
+vpermb zmm1, zmm0, [rdi + 128]
+vmovdqa64 [rsp + 128], zmm1
+vpermb zmm1, zmm0, [rdi + 192]
+vmovdqa64 [rsp + 192], zmm1
+vpermb zmm1, zmm0, [rdi + 256]
+vmovdqa64 [rsp + 256], zmm1
+vpermb zmm1, zmm0, [rdi + 320]
+vmovdqa64 [rsp + 320], zmm1
+vmovdqu64 zmm10, [rsi + 0]
+vmovdqu64 zmm11, [rsi + 64]
+vpbroadcastq zmm0, [rsp + 0]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 64]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 128]
+vmovdqu64 zmm11, [rsi + 192]
+vpbroadcastq zmm4, [rsp + 8]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 72]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 256]
+vmovdqu64 zmm11, [rsi + 320]
+vpbroadcastq zmm8, [rsp + 16]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 80]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 384]
+vmovdqu64 zmm11, [rsi + 448]
+vpbroadcastq zmm4, [rsp + 24]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 88]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 512]
+vmovdqu64 zmm11, [rsi + 576]
+vpbroadcastq zmm8, [rsp + 32]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 96]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 640]
+vmovdqu64 zmm11, [rsi + 704]
+vpbroadcastq zmm4, [rsp + 40]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 104]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 768]
+vmovdqu64 zmm11, [rsi + 832]
+vpbroadcastq zmm8, [rsp + 48]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 112]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 896]
+vmovdqu64 zmm11, [rsi + 960]
+vpbroadcastq zmm4, [rsp + 56]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 120]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 0], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 256], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 512], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 768], zmm8
+vmovdqu64 zmm10, [rsi + 1024]
+vmovdqu64 zmm11, [rsi + 1088]
+vpbroadcastq zmm0, [rsp + 128]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 192]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1152]
+vmovdqu64 zmm11, [rsi + 1216]
+vpbroadcastq zmm4, [rsp + 136]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 200]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1280]
+vmovdqu64 zmm11, [rsi + 1344]
+vpbroadcastq zmm8, [rsp + 144]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 208]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1408]
+vmovdqu64 zmm11, [rsi + 1472]
+vpbroadcastq zmm4, [rsp + 152]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 216]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1536]
+vmovdqu64 zmm11, [rsi + 1600]
+vpbroadcastq zmm8, [rsp + 160]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 224]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1664]
+vmovdqu64 zmm11, [rsi + 1728]
+vpbroadcastq zmm4, [rsp + 168]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 232]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 1792]
+vmovdqu64 zmm11, [rsi + 1856]
+vpbroadcastq zmm8, [rsp + 176]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 240]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 1920]
+vmovdqu64 zmm11, [rsi + 1984]
+vpbroadcastq zmm4, [rsp + 184]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 248]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 64], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 320], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 576], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 832], zmm8
+vmovdqu64 zmm10, [rsi + 2048]
+vmovdqu64 zmm11, [rsi + 2112]
+vpbroadcastq zmm0, [rsp + 256]
+vgf2p8affineqb zmm1, zmm0, zmm11, 0
+vgf2p8affineqb zmm0, zmm0, zmm10, 0
+vpbroadcastq zmm2, [rsp + 320]
+vgf2p8affineqb zmm3, zmm2, zmm11, 0
+vgf2p8affineqb zmm2, zmm2, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2176]
+vmovdqu64 zmm11, [rsi + 2240]
+vpbroadcastq zmm4, [rsp + 264]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 328]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2304]
+vmovdqu64 zmm11, [rsi + 2368]
+vpbroadcastq zmm8, [rsp + 272]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 336]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2432]
+vmovdqu64 zmm11, [rsi + 2496]
+vpbroadcastq zmm4, [rsp + 280]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 344]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2560]
+vmovdqu64 zmm11, [rsi + 2624]
+vpbroadcastq zmm8, [rsp + 288]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 352]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2688]
+vmovdqu64 zmm11, [rsi + 2752]
+vpbroadcastq zmm4, [rsp + 296]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpbroadcastq zmm6, [rsp + 360]
+vgf2p8affineqb zmm7, zmm6, zmm11, 0
+vgf2p8affineqb zmm6, zmm6, zmm10, 0
+vmovdqu64 zmm10, [rsi + 2816]
+vmovdqu64 zmm11, [rsi + 2880]
+vpbroadcastq zmm8, [rsp + 304]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm0, zmm4, zmm8, 0x96
+vpternlogq zmm1, zmm5, zmm9, 0x96
+vpbroadcastq zmm8, [rsp + 368]
+vgf2p8affineqb zmm9, zmm8, zmm11, 0
+vgf2p8affineqb zmm8, zmm8, zmm10, 0
+vpternlogq zmm2, zmm6, zmm8, 0x96
+vpternlogq zmm3, zmm7, zmm9, 0x96
+vmovdqu64 zmm10, [rsi + 2944]
+vmovdqu64 zmm11, [rsi + 3008]
+vpbroadcastq zmm4, [rsp + 312]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm0, zmm0, zmm4
+vpxorq zmm1, zmm1, zmm5
+vpbroadcastq zmm4, [rsp + 376]
+vgf2p8affineqb zmm5, zmm4, zmm11, 0
+vgf2p8affineqb zmm4, zmm4, zmm10, 0
+vpxorq zmm2, zmm2, zmm4
+vpxorq zmm3, zmm3, zmm5
+vmovdqa64 zmm4, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm5, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm4, zmm0, zmm1
+vpermi2b zmm5, zmm0, zmm1
+vmovdqa64 zmm6, [rip + .Lflock_r2eight_out01]
+vmovdqa64 zmm7, [rip + .Lflock_r2eight_out23]
+vpermi2b zmm6, zmm2, zmm3
+vpermi2b zmm7, zmm2, zmm3
+vinserti64x4 zmm8, zmm4, ymm6, 1
+vmovdqu64 [rdx + 128], zmm8
+vshufi64x2 zmm8, zmm4, zmm6, 0xee
+vmovdqu64 [rdx + 384], zmm8
+vinserti64x4 zmm8, zmm5, ymm7, 1
+vmovdqu64 [rdx + 640], zmm8
+vshufi64x2 zmm8, zmm5, zmm7, 0xee
+vmovdqu64 [rdx + 896], zmm8
+vmovdqa64 zmm8, [rsp + 512]
+vmovdqa64 zmm9, [rsp + 576]
+vmovdqa64 zmm10, [rsp + 640]
+vmovdqa64 zmm11, [rsp + 704]
+mov rsp, rax
+ret
+.size flock_r2eight_multi_3, .-flock_r2eight_multi_3
+.section .rodata
+.p2align 6
+.Lflock_r2eight_bt:
+.byte 0,8,16,24,32,40,48,56,1,9,17,25,33,41,49,57,2,10,18,26,34,42,50,58,3,11,19,27,35,43,51,59,4,12,20,28,36,44,52,60,5,13,21,29,37,45,53,61,6,14,22,30,38,46,54,62,7,15,23,31,39,47,55,63
+.p2align 6
+.Lflock_r2eight_out01:
+.byte 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,4,12,20,28,36,44,52,60,68,76,84,92,100,108,116,124,1,9,17,25,33,41,49,57,65,73,81,89,97,105,113,121,5,13,21,29,37,45,53,61,69,77,85,93,101,109,117,125
+.p2align 6
+.Lflock_r2eight_out23:
+.byte 2,10,18,26,34,42,50,58,66,74,82,90,98,106,114,122,6,14,22,30,38,46,54,62,70,78,86,94,102,110,118,126,3,11,19,27,35,43,51,59,67,75,83,91,99,107,115,123,7,15,23,31,39,47,55,63,71,79,87,95,103,111,119,127
