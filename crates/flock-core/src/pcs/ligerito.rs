@@ -2189,7 +2189,25 @@ unsafe fn transpose_butterfly_avx512(top: &mut [F128], bot: &mut [F128], t: F128
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
         let tb_x64 = ghash_shift64_x4(tb);
         let lanes = top.len() & !3;
+        let lanes8 = top.len() & !7;
         let mut i = 0;
+        while i < lanes8 {
+            let va0 = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
+            let vb0 = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
+            let va1 = _mm512_loadu_si512(top.as_ptr().add(i + 4) as *const __m512i);
+            let vb1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4) as *const __m512i);
+            let s0 = _mm512_xor_si512(va0, vb0);
+            let s1 = _mm512_xor_si512(va1, vb1);
+            let p0 = ghash_mul_x4_split(s0, tb, tb_x64);
+            let p1 = ghash_mul_x4_split(s1, tb, tb_x64);
+            let nb0 = _mm512_xor_si512(vb0, p0);
+            let nb1 = _mm512_xor_si512(vb1, p1);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i) as *mut __m512i, s0);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i) as *mut __m512i, nb0);
+            _mm512_storeu_si512(top.as_mut_ptr().add(i + 4) as *mut __m512i, s1);
+            _mm512_storeu_si512(bot.as_mut_ptr().add(i + 4) as *mut __m512i, nb1);
+            i += 8;
+        }
         while i < lanes {
             let va = _mm512_loadu_si512(top.as_ptr().add(i) as *const __m512i);
             let vb = _mm512_loadu_si512(bot.as_ptr().add(i) as *const __m512i);
@@ -3104,7 +3122,25 @@ fn inverse_ntt_butterfly_local(top: &mut [F128], bot: &mut [F128], t: F128) {
             let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
             let tb_x64 = ghash_shift64_x4(tb);
             let lanes = top.len() & !3;
+            let lanes8 = top.len() & !7;
             let mut j = 0usize;
+            while j < lanes8 {
+                let y0a = _mm512_loadu_si512(top.as_ptr().add(j) as *const __m512i);
+                let y1a = _mm512_loadu_si512(bot.as_ptr().add(j) as *const __m512i);
+                let y0b = _mm512_loadu_si512(top.as_ptr().add(j + 4) as *const __m512i);
+                let y1b = _mm512_loadu_si512(bot.as_ptr().add(j + 4) as *const __m512i);
+                let va = _mm512_xor_si512(y0a, y1a);
+                let vb = _mm512_xor_si512(y0b, y1b);
+                let pa = ghash_mul_x4_split(va, tb, tb_x64);
+                let pb = ghash_mul_x4_split(vb, tb, tb_x64);
+                let ua = _mm512_xor_si512(y0a, pa);
+                let ub = _mm512_xor_si512(y0b, pb);
+                _mm512_storeu_si512(top.as_mut_ptr().add(j) as *mut __m512i, ua);
+                _mm512_storeu_si512(bot.as_mut_ptr().add(j) as *mut __m512i, va);
+                _mm512_storeu_si512(top.as_mut_ptr().add(j + 4) as *mut __m512i, ub);
+                _mm512_storeu_si512(bot.as_mut_ptr().add(j + 4) as *mut __m512i, vb);
+                j += 8;
+            }
             while j < lanes {
                 let vy0 = _mm512_loadu_si512(top.as_ptr().add(j) as *const __m512i);
                 let vy1 = _mm512_loadu_si512(bot.as_ptr().add(j) as *const __m512i);
@@ -3643,8 +3679,18 @@ impl SparseDualL0 {
                 let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
                 let ax64 = ghash_shift64_x4(ax);
                 let lanes = self.alpha_pows.len() & !3;
+                let lanes8 = self.alpha_pows.len() & !7;
                 let ptr = self.alpha_pows.as_mut_ptr();
                 let mut i = 0usize;
+                while i < lanes8 {
+                    let v0 = _mm512_loadu_si512(ptr.add(i) as *const __m512i);
+                    let v1 = _mm512_loadu_si512(ptr.add(i + 4) as *const __m512i);
+                    let p0 = ghash_mul_x4_split(v0, ax, ax64);
+                    let p1 = ghash_mul_x4_split(v1, ax, ax64);
+                    _mm512_storeu_si512(ptr.add(i) as *mut __m512i, p0);
+                    _mm512_storeu_si512(ptr.add(i + 4) as *mut __m512i, p1);
+                    i += 8;
+                }
                 while i < lanes {
                     let v = _mm512_loadu_si512(ptr.add(i) as *const __m512i);
                     let p = ghash_mul_x4_split(v, ax, ax64);
@@ -3931,11 +3977,29 @@ unsafe fn eq_expand_block_x4(out: &mut [F128], lo: &[F128], e: F128) {
         let eb = _mm512_broadcast_i32x4(_mm_set_epi64x(e.hi as i64, e.lo as i64));
         let eb_x64 = ghash_shift64_x4(eb);
         let lanes = out.len() & !3;
+        let lanes16 = out.len() & !15;
         let mut i = 0usize;
+        let lo_ptr = lo.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        while i < lanes16 {
+            let v0 = _mm512_loadu_si512(lo_ptr.add(i) as *const __m512i);
+            let v1 = _mm512_loadu_si512(lo_ptr.add(i + 4) as *const __m512i);
+            let v2 = _mm512_loadu_si512(lo_ptr.add(i + 8) as *const __m512i);
+            let v3 = _mm512_loadu_si512(lo_ptr.add(i + 12) as *const __m512i);
+            let p0 = ghash_mul_x4_split(v0, eb, eb_x64);
+            let p1 = ghash_mul_x4_split(v1, eb, eb_x64);
+            let p2 = ghash_mul_x4_split(v2, eb, eb_x64);
+            let p3 = ghash_mul_x4_split(v3, eb, eb_x64);
+            _mm512_storeu_si512(out_ptr.add(i) as *mut __m512i, p0);
+            _mm512_storeu_si512(out_ptr.add(i + 4) as *mut __m512i, p1);
+            _mm512_storeu_si512(out_ptr.add(i + 8) as *mut __m512i, p2);
+            _mm512_storeu_si512(out_ptr.add(i + 12) as *mut __m512i, p3);
+            i += 16;
+        }
         while i < lanes {
-            let v = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            let v = _mm512_loadu_si512(lo_ptr.add(i) as *const __m512i);
             _mm512_storeu_si512(
-                out.as_mut_ptr().add(i) as *mut __m512i,
+                out_ptr.add(i) as *mut __m512i,
                 ghash_mul_x4_split(v, eb, eb_x64),
             );
             i += 4;
@@ -5586,12 +5650,29 @@ unsafe fn glue_block_x4(acc: &mut [F128], src: &[F128], alpha: F128) {
         let ab = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
         let ab_x64 = ghash_shift64_x4(ab);
         let lanes = acc.len() & !3;
+        let lanes8 = acc.len() & !7;
         let mut i = 0usize;
-        while i < lanes {
-            let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const __m512i);
-            let v = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+        let acc_ptr = acc.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+        while i < lanes8 {
+            let a0 = _mm512_loadu_si512(acc_ptr.add(i) as *const __m512i);
+            let v0 = _mm512_loadu_si512(src_ptr.add(i) as *const __m512i);
+            let a1 = _mm512_loadu_si512(acc_ptr.add(i + 4) as *const __m512i);
+            let v1 = _mm512_loadu_si512(src_ptr.add(i + 4) as *const __m512i);
+            let p0 = ghash_mul_x4_split(v0, ab, ab_x64);
+            let p1 = ghash_mul_x4_split(v1, ab, ab_x64);
+            _mm512_storeu_si512(acc_ptr.add(i) as *mut __m512i, _mm512_xor_si512(a0, p0));
             _mm512_storeu_si512(
-                acc.as_mut_ptr().add(i) as *mut __m512i,
+                acc_ptr.add(i + 4) as *mut __m512i,
+                _mm512_xor_si512(a1, p1),
+            );
+            i += 8;
+        }
+        while i < lanes {
+            let a = _mm512_loadu_si512(acc_ptr.add(i) as *const __m512i);
+            let v = _mm512_loadu_si512(src_ptr.add(i) as *const __m512i);
+            _mm512_storeu_si512(
+                acc_ptr.add(i) as *mut __m512i,
                 _mm512_xor_si512(a, ghash_mul_x4_split(v, ab, ab_x64)),
             );
             i += 4;
