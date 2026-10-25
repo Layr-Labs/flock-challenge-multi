@@ -319,42 +319,29 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
 }
 
 #[inline(always)]
-unsafe fn trq(x: [__m512i; 8]) -> [__m512i; 8] {
-    unsafe {
-        let lo1 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
-        let hi1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
-        let lo2 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-        let hi2 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let lo4 = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-        let hi4 = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-        let t0 = _mm512_permutex2var_epi64(x[0], lo1, x[1]);
-        let t1 = _mm512_permutex2var_epi64(x[0], hi1, x[1]);
-        let t2 = _mm512_permutex2var_epi64(x[2], lo1, x[3]);
-        let t3 = _mm512_permutex2var_epi64(x[2], hi1, x[3]);
-        let t4 = _mm512_permutex2var_epi64(x[4], lo1, x[5]);
-        let t5 = _mm512_permutex2var_epi64(x[4], hi1, x[5]);
-        let t6 = _mm512_permutex2var_epi64(x[6], lo1, x[7]);
-        let t7 = _mm512_permutex2var_epi64(x[6], hi1, x[7]);
-        let u0 = _mm512_permutex2var_epi64(t0, lo2, t2);
-        let u1 = _mm512_permutex2var_epi64(t0, hi2, t2);
-        let u2 = _mm512_permutex2var_epi64(t1, lo2, t3);
-        let u3 = _mm512_permutex2var_epi64(t1, hi2, t3);
-        let u4 = _mm512_permutex2var_epi64(t4, lo2, t6);
-        let u5 = _mm512_permutex2var_epi64(t4, hi2, t6);
-        let u6 = _mm512_permutex2var_epi64(t5, lo2, t7);
-        let u7 = _mm512_permutex2var_epi64(t5, hi2, t7);
-        [
-            _mm512_permutex2var_epi64(u0, lo4, u4),
-            _mm512_permutex2var_epi64(u0, hi4, u4),
-            _mm512_permutex2var_epi64(u1, lo4, u5),
-            _mm512_permutex2var_epi64(u1, hi4, u5),
-            _mm512_permutex2var_epi64(u2, lo4, u6),
-            _mm512_permutex2var_epi64(u2, hi4, u6),
-            _mm512_permutex2var_epi64(u3, lo4, u7),
-            _mm512_permutex2var_epi64(u3, hi4, u7),
-        ]
-    }
-}
+// Fixed 8x8 qword transpose. Unpack row pairs inside each128-bit lane,
+// then use immediate lane shuffles to gather columns0/4,2/6 and1/5,3/7.
+// The original per-register byte permutation and output publication stay
+// at their existing call sites. All64 qword coordinates retain their order.
+unsafe fn trq(x:[__m512i;8])->[__m512i;8]{unsafe{
+let t0=_mm512_unpacklo_epi64(x[0],x[1]);
+let t1=_mm512_unpackhi_epi64(x[0],x[1]);
+let t2=_mm512_unpacklo_epi64(x[2],x[3]);
+let t3=_mm512_unpackhi_epi64(x[2],x[3]);
+let t4=_mm512_unpacklo_epi64(x[4],x[5]);
+let t5=_mm512_unpackhi_epi64(x[4],x[5]);
+let t6=_mm512_unpacklo_epi64(x[6],x[7]);
+let t7=_mm512_unpackhi_epi64(x[6],x[7]);
+let u0=_mm512_shuffle_i32x4::<136>(t0,t2);
+let u1=_mm512_shuffle_i32x4::<221>(t0,t2);
+let u2=_mm512_shuffle_i32x4::<136>(t1,t3);
+let u3=_mm512_shuffle_i32x4::<221>(t1,t3);
+let u4=_mm512_shuffle_i32x4::<136>(t4,t6);
+let u5=_mm512_shuffle_i32x4::<221>(t4,t6);
+let u6=_mm512_shuffle_i32x4::<136>(t5,t7);
+let u7=_mm512_shuffle_i32x4::<221>(t5,t7);
+[_mm512_shuffle_i32x4::<136>(u0,u4),_mm512_shuffle_i32x4::<136>(u2,u6),_mm512_shuffle_i32x4::<136>(u1,u5),_mm512_shuffle_i32x4::<136>(u3,u7),_mm512_shuffle_i32x4::<221>(u0,u4),_mm512_shuffle_i32x4::<221>(u2,u6),_mm512_shuffle_i32x4::<221>(u1,u5),_mm512_shuffle_i32x4::<221>(u3,u7)]
+}}
 const BYTE_TR: [u8; 64] = [
     0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3,
     11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6,
