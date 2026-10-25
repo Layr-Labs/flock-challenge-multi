@@ -5654,13 +5654,46 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     deferred: Option<(&[F128], F128)>,
     ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
+    // Dispatch invariant correction topology once, outside the vector loop.
+    unsafe {
+        if !CORR {
+            fold_and_msg_chunk_x86_mode::<0>(f,b,base,fc,bc,r,r_x4,r_x64,stream,None,None)
+        } else if deferred.is_none() && ood.is_some() {
+            fold_and_msg_chunk_x86_mode::<1>(f,b,base,fc,bc,r,r_x4,r_x64,stream,None,ood)
+        } else if ood.is_none() && deferred.is_some_and(|(_,a)| a == F128::ONE) && open_defer_one_xor_enabled() {
+            fold_and_msg_chunk_x86_mode::<2>(f,b,base,fc,bc,r,r_x4,r_x64,stream,deferred,None)
+        } else {
+            fold_and_msg_chunk_x86_mode::<3>(f,b,base,fc,bc,r,r_x4,r_x64,stream,deferred,ood)
+        }
+    }
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+#[target_feature(enable="avx512f,vpclmulqdq")]
+unsafe fn fold_and_msg_chunk_x86_mode<const MODE: u8>(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+    r_x4: core::arch::x86_64::__m512i,
+    r_x64: core::arch::x86_64::__m512i,
+    stream: bool,
+    deferred: Option<(&[F128], F128)>,
+    ood: Option<(&[F128], F128)>,
+) -> (F128, F128) {
+    const { assert!(MODE <= 3); }
+    let corr = MODE != 0;
+    let deferred = if MODE == 0 || MODE == 1 { None } else { deferred };
+    let ood = if MODE == 1 { Some(ood.unwrap()) } else if MODE == 0 || MODE == 2 { None } else { ood };
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
     use core::arch::x86_64::*;
 
     let len = fc.len();
     debug_assert_eq!(bc.len(), len);
     debug_assert!(len.is_multiple_of(2));
-    if CORR {
+    if corr {
         if let Some((basis, _)) = deferred {
             debug_assert!(basis.len() >= 2 * (base + len));
         }
@@ -5683,7 +5716,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         let dst_aligned =
             (fc_ptr as usize).is_multiple_of(16) && (bc_ptr as usize).is_multiple_of(16);
 
-        let deferred_vec = if CORR {
+        let deferred_vec = if MODE == 3 {
             use crate::field::gf2_128::x86_64::ghash_shift64_x4;
             deferred.map(|(basis, alpha)| {
                 let ax = _mm512_broadcast_i32x4(_mm_set_epi64x(alpha.hi as i64, alpha.lo as i64));
@@ -5692,7 +5725,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         } else {
             None
         };
-        let ood_vec = if CORR {
+        let ood_vec = if MODE == 1 || MODE == 3 {
             use crate::field::gf2_128::x86_64::ghash_shift64_x4;
             ood.map(|(eq_lo, scale)| {
                 let sx = _mm512_broadcast_i32x4(_mm_set_epi64x(scale.hi as i64, scale.lo as i64));
@@ -5738,13 +5771,13 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         // A unit deferred weight (both production callers pass `F128::ONE`)
         // folds `b ⊕ basis` once: `fold(b) + 1·fold(d) = fold(b + d)` exactly,
         // deleting the second fold product and the α product per lane group.
-        let defer_one = if CORR {
+        let defer_one = if MODE == 2 {
+            Some(deferred.unwrap().0.as_ptr())
+        } else if MODE == 3 {
             deferred.and_then(|(basis, alpha)| {
                 (alpha == F128::ONE && open_defer_one_xor_enabled()).then_some(basis.as_ptr())
             })
-        } else {
-            None
-        };
+        } else { None };
         let fold4_sum = |p: *const F128, q: *const F128, source: usize| -> __m512i {
             let lo = _mm512_xor_si512(
                 _mm512_loadu_si512(p.add(source) as *const __m512i),
@@ -5773,7 +5806,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
                 ),
                 None => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
             };
-            if CORR {
+            if corr {
                 if let (None, Some((dptr, ax, ax64))) = (defer_one, deferred_vec) {
                     b0 = _mm512_xor_si512(
                         b0,
@@ -5819,7 +5852,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
             let mut b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
             let mut b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
-            if CORR {
+            if corr {
                 if let Some((basis, alpha)) = deferred {
                     let dptr = basis.as_ptr();
                     let d0 = *dptr.add(source) + r * (*dptr.add(source) + *dptr.add(source + 1));
