@@ -530,7 +530,23 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let x5 = _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>());
         let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
         let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
+        tr8x16_from_regs(x0, x1, x2, x3, x4, x5, x6, x7)
+    }
+}
 
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+pub(super) unsafe fn tr8x16_from_regs(
+    x0: __m512i,
+    x1: __m512i,
+    x2: __m512i,
+    x3: __m512i,
+    x4: __m512i,
+    x5: __m512i,
+    x6: __m512i,
+    x7: __m512i,
+) -> [__m512i; 8] {
+    unsafe {
         let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
         let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
         let p00 = _mm512_permutex2var_epi32(x0, i10, x1);
