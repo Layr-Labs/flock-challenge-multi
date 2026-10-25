@@ -341,6 +341,26 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
     }
 }
 
+///
+///
+/// # Safety
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_karatsuba(x: __m512i, y: __m512i) -> __m512i {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let sx = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4E>(x));
+        let sy = _mm512_xor_si512(y, _mm512_shuffle_epi32::<0x4E>(y));
+        let p0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let p1 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let pm = _mm512_clmulepi64_epi128::<0x00>(sx, sy);
+        let t1 = _mm512_xor_si512(_mm512_xor_si512(pm, p0), p1);
+        let t1 = gf2_128_reduce_x4(t1, p1);
+        gf2_128_reduce_x4(p0, t1)
+    }
+}
+
 /// [`ghash_mul_x4`] specialized for a multiplier `x` whose high limb is zero
 /// in **every** lane.
 ///
