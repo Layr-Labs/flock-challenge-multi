@@ -585,6 +585,26 @@ pub struct WideGhashX4 {
     pub(crate) mid: __m512i,
 }
 
+///
+///
+/// # Safety
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn ghash_karatsuba_limbs(x: __m512i, y: __m512i) -> (__m512i, __m512i, __m512i) {
+    unsafe {
+        let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let xs = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4E>(x));
+        let ys = _mm512_xor_si512(y, _mm512_shuffle_epi32::<0x4E>(y));
+        let mid = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_clmulepi64_epi128::<0x00>(xs, ys),
+            lo,
+            hi,
+        );
+        (lo, mid, hi)
+    }
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 impl WideGhashX4 {
     /// Empty accumulator.
@@ -625,25 +645,15 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn from_mul(x: __m512i, y: __m512i) -> Self {
-        Self {
-            lo: _mm512_clmulepi64_epi128::<0x00>(x, y),
-            hi: _mm512_clmulepi64_epi128::<0x11>(x, y),
-            mid: _mm512_xor_si512(
-                _mm512_clmulepi64_epi128::<0x01>(x, y),
-                _mm512_clmulepi64_epi128::<0x10>(x, y),
-            ),
-        }
+        let (lo, mid, hi) = unsafe { ghash_karatsuba_limbs(x, y) };
+        Self { lo, hi, mid }
     }
 
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        let (lo, mid, hi) = unsafe { ghash_karatsuba_limbs(x, y) };
+        self.lo = _mm512_xor_si512(self.lo, lo);
+        self.hi = _mm512_xor_si512(self.hi, hi);
+        self.mid = _mm512_xor_si512(self.mid, mid);
     }
 
     /// XOR-accumulate two 4-lane unreduced products, `x0[i]·y0[i]` and
@@ -660,20 +670,12 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc2(&mut self, x0: __m512i, y0: __m512i, x1: __m512i, y1: __m512i) {
-        // Register-only widen (8 CLMULs) + ternlog-accumulate; cfg-gated.
-        let c00_0 = _mm512_clmulepi64_epi128::<0x00>(x0, y0);
-        let c00_1 = _mm512_clmulepi64_epi128::<0x00>(x1, y1);
-        let c11_0 = _mm512_clmulepi64_epi128::<0x11>(x0, y0);
-        let c11_1 = _mm512_clmulepi64_epi128::<0x11>(x1, y1);
-        let c01_0 = _mm512_clmulepi64_epi128::<0x01>(x0, y0);
-        let c10_0 = _mm512_clmulepi64_epi128::<0x10>(x0, y0);
-        let c01_1 = _mm512_clmulepi64_epi128::<0x01>(x1, y1);
-        let c10_1 = _mm512_clmulepi64_epi128::<0x10>(x1, y1);
+        let (lo0, mid0, hi0) = unsafe { ghash_karatsuba_limbs(x0, y0) };
+        let (lo1, mid1, hi1) = unsafe { ghash_karatsuba_limbs(x1, y1) };
         // 0x96 = a ^ b ^ c.
-        self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
-        self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+        self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, lo0, lo1);
+        self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, hi0, hi1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, mid0, mid1);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
