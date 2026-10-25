@@ -296,6 +296,16 @@ impl LinearFoldPlan {
 ))]
 mod root_tile_cache;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub use root_tile_cache::RootTileCache as WitnessRootTiles;
+
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
     source: RootFoldStorage,
@@ -324,6 +334,26 @@ enum RootFoldStorage {
 }
 
 impl RootFoldSource {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    /// Publish a completed proof-local witness cache before the first fold.
+    /// A consumer geometry mismatch keeps the ordinary capture fallback.
+    pub fn install_witness_root_tiles(&self, z: &[F128], tiles: WitnessRootTiles) -> bool {
+        if self.k_log != 14 || !z.len().is_multiple_of(128) { return false; }
+        if let RootFoldStorage::Splice(splice) = &self.source {
+            if tiles.matches_geometry(z.len() / 128, splice.root_bits) {
+                return self.cached_tiles.set(tiles).is_ok();
+            }
+        }
+        false
+    }
+
     pub fn new(z: &[F128], k_log: usize, plan: &'static LinearFoldPlan) -> Self {
         use rayon::prelude::*;
         let k = 1usize << k_log;

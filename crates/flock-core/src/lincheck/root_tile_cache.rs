@@ -11,7 +11,8 @@ use rayon::prelude::*;
 pub(super) struct Block([u8; 512]);
 
 // Only allocation capacity is recycled. take_f128 invalidates previous
-// provenance, and prepare overwrites every cache block before publication.
+// provenance; prepare or witness generation overwrites every live block
+// before publication.
 struct PooledStorage(Vec<F128>);
 
 impl Drop for PooledStorage {
@@ -20,7 +21,7 @@ impl Drop for PooledStorage {
     }
 }
 
-pub(super) struct RootTileCache {
+pub struct RootTileCache {
     storage: PooledStorage,
     offset: usize,
     tiles: usize,
@@ -120,11 +121,47 @@ pub(super) fn fold(
 }
 
 impl RootTileCache {
+    /// Adopt fully initialized witness-produced BLAKE3 root tiles.
+    ///
+    /// # Safety
+    /// The aligned live span must contain this proof's canonical root bits
+    /// in tile / root group / octa stripe / root column order: 64-compression
+    /// tiles, 177 groups, eight 64-byte stripes. The last 15 columns are zero.
+    /// Every producer must have joined and executed SFENCE before this call.
+    /// The later RootFoldSource must use the same witness and root ordering.
+    pub unsafe fn from_witness_storage(storage: Vec<F128>, compressions: usize) -> Self {
+        let storage = PooledStorage(storage);
+        assert!(compressions > 0 && compressions.is_multiple_of(64));
+        let tiles = compressions / 64;
+        let blocks = 177;
+        let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
+        let offset = storage.0.as_ptr().align_offset(64);
+        assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
+        Self { storage, offset, tiles, blocks }
+    }
+
+    pub(super) fn matches_geometry(&self, compressions: usize, root_bits: usize) -> bool {
+        root_bits == 11313 && self.blocks == 177 && self.tiles.checked_mul(64) == Some(compressions)
+    }
+
+    /// Expensive diagnostic oracle: compare every cache byte, including tail
+    /// padding, with canonical-witness capture at the same root geometry.
+    pub fn assert_matches_witness(&self, z: &[F128], k_log: usize, plan: &LinearFoldPlan) {
+        let splice = RootSplicePlan::new(plan, 1 << k_log).expect("root splice geometry");
+        let (reference, _) = prepare(&splice, z, 1 << k_log, &|_| [F128::ZERO; 8]);
+        assert_eq!(self.tiles, reference.tiles);
+        assert_eq!(self.blocks, reference.blocks);
+        for block in 0..self.tiles * self.blocks {
+            assert_eq!(self.block(block).0, reference.block(block).0, "root cache block {block}");
+        }
+    }
+
     #[inline(always)]
     fn block(&self, index: usize) -> &Block {
         assert!(index < self.tiles * self.blocks);
-        // SAFETY: prepare initialized every block before publishing Self;
-        // the live span is64-byte aligned and fits within the owned vector.
+        // SAFETY: prepare initializes every block, and from_witness_storage
+        // requires the same initialization before publication. The live
+        // span is 64-byte aligned and fits within the owned vector.
         unsafe {
             &*self
                 .storage

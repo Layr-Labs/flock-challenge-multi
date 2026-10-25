@@ -32,6 +32,16 @@ use flock_core::zerocheck::univariate_skip_optimized::{
     round1_ab_inner_window30_k0, round1_ab_table_images,
 };
 
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[path = "blake3_witgen8_root.rs"]
+pub(crate) mod root_emit;
+
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
@@ -1649,6 +1659,14 @@ struct Drain8<'t> {
     ranked_fast: bool,
     #[allow(dead_code)]
     ranked_preps: Option<&'t RankedClosedWindowPreps>,
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    roots: Option<root_emit::RootOctaWriter<'t>>,
 }
 
 /// Convert one low-aligned prior bit to the representation used by [`W8`].
@@ -2258,6 +2276,16 @@ impl Drain8<'_> {
         words: usize,
     ) {
         unsafe {
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            if RANKED_CLOSED && let Some(roots) = self.roots.as_mut() {
+                roots.emit_range(base_word, ring_word, words, self.ast, self.bs);
+            }
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             if RANKED_CLOSED {
                 if base_word >= 32 && base_word <= 448 {
@@ -2959,6 +2987,14 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
     elide: [bool; 3],
     ranked_static: bool,
     ranked_preps: Option<&RankedClosedWindowPreps>,
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    roots: Option<root_emit::RootOctaWriter<'_>>,
 ) {
     unsafe {
         #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -3011,6 +3047,14 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             ranked_static,
             ranked_fast,
             ranked_preps,
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            roots,
         };
         let maxv = dup_u32(u32::MAX);
         let one = dup_u32(1);
@@ -3287,6 +3331,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             elide,
             ranked_static,
             None,
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            None,
         );
     }
 }
@@ -3313,6 +3365,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     proj: StreamProj<'_>,
     preps: &RankedClosedWindowPreps,
     elide: [bool; 3],
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    roots: Option<root_emit::RootOctaWriter<'_>>,
 ) {
     unsafe {
         debug_assert_eq!(elide, [true; 3]);
@@ -3332,6 +3392,14 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
             elide,
             ranked_static,
             Some(preps),
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            roots,
         );
     }
 }
@@ -4149,6 +4217,25 @@ mod tests {
             let mut a_new = a_seed.clone();
             let mut b_new = b_seed.clone();
             let mut ab_new = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let fold = super::super::Blake3AdjointPlan::build().linear_fold_plan();
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let roots = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
+            #[repr(align(64))]
+            struct RootTile([u8; 177 * 512]);
+            let mut root_tile = Box::new(RootTile([0xa5; 177 * 512]));
 
             unsafe {
                 build_octa_witness_ab_stream_elide(
@@ -4186,7 +4273,34 @@ mod tests {
                     },
                     &preps,
                     [true; 3],
+                    #[cfg(all(
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vbmi",
+                        target_feature = "gfni",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
                 );
+                _mm_sfence();
+            }
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            for group in 0..177 {
+                for column in 0..64 {
+                    let expected = fold.roots.get(group * 64 + column).map_or(0, |&wire| {
+                        (0..8).fold(0u8, |bits, lane| bits |
+                            (((z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1) as u8) << lane)
+                    });
+                    assert_eq!(root_tile.0[group * 512 + column], expected,
+                        "live drain base={base}, group={group}, column={column}");
+                }
+                assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");
             assert_eq!(a_ref, a_new, "a mismatch at base={base}");

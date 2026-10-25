@@ -900,7 +900,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             padding.useful_bits_per_block,
         ),
     );
-    let ((commitment, prover_data), ab_inner) = if let Some(ab_inner) = ab_inner {
+    let ((commitment, prover_data), mut ab_inner) = if let Some(ab_inner) = ab_inner {
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = match prefaulted_codeword {
@@ -937,7 +937,19 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         lincheck_circuit.root_fold_plan().map(|plan| {
-            std::sync::Arc::new(lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan))
+            let source = lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            if let Some(tiles) = ab_inner.take_witness_root_tiles() {
+                source.install_witness_root_tiles(&z_packed, tiles);
+            }
+            std::sync::Arc::new(source)
         })
     } else {
         None
@@ -1197,7 +1209,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
-    let ((commitment, prover_data), ab_inner) = in_commit_phase_pool(r1cs.m, || {
+    let ((commitment, prover_data), mut ab_inner) = in_commit_phase_pool(r1cs.m, || {
         commit_with_round1_ab_precompute(
             &z_packed,
             &a_packed_f128,
@@ -1212,7 +1224,19 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         lincheck_circuit.root_fold_plan().map(|plan| {
-            std::sync::Arc::new(lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan))
+            let source = lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            if let Some(tiles) = ab_inner.take_witness_root_tiles() {
+                source.install_witness_root_tiles(&z_packed, tiles);
+            }
+            std::sync::Arc::new(source)
         })
     } else {
         None

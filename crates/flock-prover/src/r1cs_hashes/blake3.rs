@@ -2812,17 +2812,42 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
         _ => None,
     };
-    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     if let (Some(preps), Some(init)) = (ranked_closed_preps.as_ref(), ranked_closed_init)
         && w30_elided
         && blake3_witgen8::ranked_static01_direct_enabled()
     {
+        // One task owns a full root-cache tile. Each octa publishes one
+        // complete 64-byte stripe per group from its live word vectors.
+        const GROUP: usize = 64;
+        let group_f128 = GROUP * F128_PER_BLOCK;
+        let group_bytes = GROUP * ab_block_bytes;
+        const ROOT_FIELDS_PER_TILE: usize = GROUP * 177 * 8 / 16;
+        let root_fields = z.len() / F128_PER_BLOCK * 177 * 8 / 16;
+        let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
+        let root_offset = root_storage.as_ptr().align_offset(64);
+        assert!(root_offset <= 3);
+        let root_enabled = linear_fold_enabled()
+            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
+        static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
+            std::sync::LazyLock::new(|| {
+                let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                blake3_witgen8::root_emit::RootEmitPlan::new(&plan.roots)
+            });
+        let root_plan = &*ROOT_PLAN;
         z.par_chunks_mut(group_f128)
             .zip(a.par_chunks_mut(group_f128))
             .zip(b.par_chunks_mut(group_f128))
             .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+            .zip(root_storage[root_offset..root_offset + root_fields].par_chunks_mut(ROOT_FIELDS_PER_TILE))
             .enumerate()
-            .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
+            .for_each(|(g, ((((z_out, a_out), b_out), ab_out), root_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 unsafe {
                     for half in 0..(n_here / SIMD) {
@@ -2847,11 +2872,25 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             proj,
                             &preps.0,
                             [true; 3],
+                            if root_enabled {
+                                root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
+                                    plan, root_out.as_mut_ptr().cast::<u8>().add(half * 64)))
+                            } else { None },
                         );
                     }
                 }
                 flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
             });
+        if root_enabled && root_plan.is_some() {
+            // SAFETY: each task owns one complete tile; its eight octas
+            // overwrite disjoint full cache lines, including tail padding.
+            // Rayon joins every producer and its SFENCE before publication.
+            let tiles = unsafe { flock_core::lincheck::WitnessRootTiles::from_witness_storage(
+                root_storage, z.len() / F128_PER_BLOCK) };
+            ab_inner.set_witness_root_tiles(tiles);
+        } else {
+            flock_core::scratch::give_f128(root_storage);
+        }
         return;
     }
     z.par_chunks_mut(group_f128)
@@ -2939,6 +2978,14 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                                 proj,
                                 &preps.0,
                                 elide,
+                                #[cfg(all(
+                                    target_feature = "avx512f",
+                                    target_feature = "avx512bw",
+                                    target_feature = "avx512vbmi",
+                                    target_feature = "gfni",
+                                    target_feature = "vpclmulqdq"
+                                ))]
+                                None,
                             );
                         } else {
                             // Lead 2: a full closed-form octa carries only
@@ -6539,4 +6586,41 @@ mod chain_e2e_tests {
                 .is_err()
         );
     }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    #[ignore = "ranked full-cache oracle uses >2 GiB; run serially on benchmark host"]
+    fn ranked_witness_root_cache_matches_capture_and_reweights() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        pool.install(|| {
+            for pass in 0..3 {
+                let blocks = crate::seed_pipe::BlockSource::closed(18, 0x953a_81c7 + pass);
+                let (z, a, b, mut ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
+                let tiles = ab.take_witness_root_tiles();
+                if pass != 0 {
+                    let tiles = tiles.expect("warm ranked witness must publish root tiles");
+                    let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                    tiles.assert_matches_witness(&z, K_LOG, plan);
+                    let source = flock_core::lincheck::RootFoldSource::new(&z, K_LOG, plan);
+                    assert!(source.install_witness_root_tiles(&z, tiles));
+                    for challenge in [17u64, 283] {
+                        let point: Vec<F128> = (0..18).map(|i| F128::new(challenge + i, (challenge * 51 + i).rotate_left(23))).collect();
+                        let eq = flock_core::lincheck::build_eq_table(&point);
+                        let reference = flock_core::lincheck::partial_fold_packed_z_block_major_padded(&z, K_LOG + 18, K_LOG, USEFUL_BITS, &eq);
+                        assert_eq!(source.fold(&z, K_LOG + 18, &point), reference, "pass={pass}, challenge={challenge}");
+                    }
+                }
+                flock_core::scratch::give_f128(z);
+                flock_core::scratch::give_f128(a);
+                flock_core::scratch::give_f128(b);
+            }
+        });
+    }
+
 }

@@ -577,12 +577,48 @@ pub struct Round1AbInner {
     /// constant, so round one adds the exact contribution from the identity-C
     /// inner fold instead ([`round1_w30_delta_ab`]).
     ranked_w30_elided: bool,
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    /// Completed optional witness-root stripes, moved to RootFoldSource
+    /// before round one. Kept here solely for proof-local ownership transfer.
+    witness_root_tiles: Option<crate::lincheck::WitnessRootTiles>,
 }
 
 const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
 const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
 
 impl Round1AbInner {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn take_witness_root_tiles(&mut self) -> Option<crate::lincheck::WitnessRootTiles> {
+        self.witness_root_tiles.take()
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn set_witness_root_tiles(&mut self, tiles: crate::lincheck::WitnessRootTiles) {
+        assert!(self.witness_root_tiles.is_none());
+        self.witness_root_tiles = Some(tiles);
+    }
+
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         unsafe {
@@ -603,6 +639,15 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: false,
             ranked_w30_elided: false,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            witness_root_tiles: None,
         }
     }
 
@@ -622,6 +667,15 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: true,
             ranked_w30_elided: false,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            witness_root_tiles: None,
         }
     }
 
@@ -908,6 +962,15 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_one_rows_elided: false,
         ranked_compact: false,
         ranked_w30_elided: false,
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        witness_root_tiles: None,
     }
 }
 
