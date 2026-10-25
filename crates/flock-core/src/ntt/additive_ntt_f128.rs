@@ -909,6 +909,7 @@ pub struct AdditiveNttF128 {
     /// Shared rather than owned so [`AdditiveNttF128::standard`] can hand out
     /// a cached table (see [`cached_standard_evals`]) instead of rebuilding it.
     evals: Arc<Vec<Vec<F128>>>,
+    standard_dim: Option<usize>,
     /// Breadth-first layer table used by production-size transforms. Keeping
     /// this separate preserves the compact fallback for unusually large
     /// domains while making every hot-path twiddle lookup O(1).
@@ -1512,6 +1513,39 @@ unsafe fn st_fmp_fold4(
 }
 
 impl AdditiveNttF128 {
+
+    fn cached_four187(&self, layer: usize, block: usize) -> Option<&'static kernels::FourBlock> {
+        let dim = self.standard_dim?;
+        if dim > 20 || layer + 4 > dim { return None; }
+        type Cell = OnceLock<Box<[kernels::FourBlock]>>;
+        static TABLES: std::sync::LazyLock<Vec<Vec<Cell>>> = std::sync::LazyLock::new(||
+            (0..=20).map(|_| (0..=20).map(|_| OnceLock::new()).collect()).collect());
+        let table = TABLES[dim][layer].get_or_init(|| (0..1usize<<layer).map(|b| {
+            let mut tw = [F128::ZERO;15];
+            for l in 0..4 { for j in 0..1usize<<l {
+                tw[(1usize<<l)-1+j] = self.twiddle(layer+l,(b<<l)+j);
+            }}
+            kernels::FourBlock::new(tw)
+        }).collect());
+        Some(&table[block])
+    }
+
+    fn four_rows187(&self, block: &mut [F128], layer: usize, idx: usize,
+        stride: usize, lanes: usize, tail: usize, hint: u8) {
+        if let Some(t) = self.cached_four187(layer,idx) {
+            let ptr = block.as_mut_ptr();
+            for r in 0..stride {
+                unsafe { kernels::rows_cached187(ptr,stride,lanes,row_lanes(r,lanes,tail),r,t,hint); }
+            }
+            return;
+        }
+        let mut tw = [F128::ZERO;15];
+        for l in 0..4 { for j in 0..1usize<<l {
+            tw[(1usize<<l)-1+j] = self.twiddle(layer+l,(idx<<l)+j);
+        }}
+        butterfly_interleaved_fused_4layer_rows(block,&tw,stride,lanes,tail,hint);
+    }
+
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
         let evals = Arc::new(generate_evals_from_subspace(basis));
@@ -1519,6 +1553,7 @@ impl AdditiveNttF128 {
         Self {
             evals,
             precomputed_twiddles,
+            standard_dim: None,
         }
     }
 
@@ -1541,6 +1576,7 @@ impl AdditiveNttF128 {
         Self {
             evals,
             precomputed_twiddles,
+            standard_dim: Some(dim),
         }
     }
 
@@ -3552,30 +3588,10 @@ impl AdditiveNttF128 {
                         let sixteenth = block_size >> 4;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-                            tw[0] = self.twiddle(layer, global_block);
-                            for s in 0..2 {
-                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-                            }
-                            for s in 0..4 {
-                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-                            }
-                            for s in 0..8 {
-                                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-                            }
                             let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_fused_4layer_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                &tw,
-                                sixteenth,
-                                num_ntts,
-                                if sixteenth.is_multiple_of(2) {
-                                    odd_tail
-                                } else {
-                                    0
-                                },
-                                hint,
-                            );
+                            self.four_rows187(&mut sub_data[block_start..block_start+block_bytes],
+                                layer,global_block,sixteenth,num_ntts,
+                                if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },hint);
                         }
                         layer += 4;
                     } else if layer + 3 == log_d && !ntt_fused3_disabled() {
@@ -4287,29 +4303,8 @@ impl AdditiveNttF128 {
             let block_size = 1usize << (log_d - layer);
             let sixteenth = block_size >> 4;
             let global_block = sub_idx;
-            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-            tw[0] = self.twiddle(layer, global_block);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-            }
-            for s in 0..8 {
-                tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
-            }
-            butterfly_interleaved_fused_4layer_rows(
-                sub_data,
-                &tw,
-                sixteenth,
-                num_ntts,
-                if sixteenth.is_multiple_of(2) {
-                    odd_tail
-                } else {
-                    0
-                },
-                hint,
-            );
+            self.four_rows187(sub_data,layer,global_block,sixteenth,num_ntts,
+                if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },hint);
         }
         // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
         // (n_top+8..n_top+11), then the leaf callback, all while the
@@ -4324,30 +4319,9 @@ impl AdditiveNttF128 {
         FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for b in 0..16usize {
             let g4 = sub_idx * 16 + b;
-            let mut tw = [F128 { lo: 0, hi: 0 }; 15];
-            tw[0] = self.twiddle(layer4, g4);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
-            }
-            for s in 0..8 {
-                tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
-            }
             let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-            butterfly_interleaved_fused_4layer_rows(
-                blk,
-                &tw,
-                sixteenth4,
-                num_ntts,
-                if sixteenth4.is_multiple_of(2) {
-                    odd_tail
-                } else {
-                    0
-                },
-                hint,
-            );
+            self.four_rows187(blk,layer4,g4,sixteenth4,num_ntts,
+                if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },hint);
             for j in 0..16usize {
                 let g8 = g4 * 16 + j;
                 let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
@@ -7230,4 +7204,49 @@ mod prepared_four_composition_tests {
             "{cases} complete prepared-four block and owned-table cases matched raw rows with guards"
         );
     }
+}
+
+#[cfg(test)]
+mod cache187_tests {
+ use super::*;
+ #[test]
+ fn cache187_matches_scalar_and_explicit_basis() {
+  let mut seed=0x187c0ffeebadu64;
+  let mut next=|| {seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;seed};
+  let mut cases=0;let mut compared=0;
+  for dim in [4usize,8,12,16,20] {
+   let standard=AdditiveNttF128::standard(dim);
+   let basis:Vec<_>=(0..dim).map(|i| F128::new(1u64<<i,0)).collect();
+   let explicit=AdditiveNttF128::new(&basis);
+   for layer in [0,dim-4] {
+    for idx in [0,((1usize<<layer)-1)/2,(1usize<<layer)-1] {
+     let cached=standard.cached_four187(layer,idx).unwrap();
+     assert!(core::ptr::eq(cached,standard.cached_four187(layer,idx).unwrap()));
+     assert!(explicit.cached_four187(layer,idx).is_none());
+     for l in 0..4 { for j in 0..1usize<<l {
+      assert_eq!(cached[(1usize<<l)-1+j],explicit.twiddle(layer+l,(idx<<l)+j));
+     }}
+     for lanes in [1usize,5,64] { for stride in [1usize,2,8] { for hint in [0u8,1,2] {
+      let tail=if lanes==64 && stride%2==0 {7} else {0};
+      let n=16*stride*lanes;let offset=5;
+      let orig:Vec<_>=(0..n+offset+9).map(|_|F128::new(next(),next())).collect();
+      let mut got=orig.clone();let mut want=orig.clone();let mut fallback=orig.clone();
+      standard.four_rows187(&mut got[offset..offset+n],layer,idx,stride,lanes,tail,hint);
+      explicit.four_rows187(&mut fallback[offset..offset+n],layer,idx,stride,lanes,tail,hint);
+      for l in 0..4 { let half=8>>l;let base=(1<<l)-1;
+       for group in 0..1usize<<l { for i in 0..half { for r in 0..stride {
+        for lane in 0..row_lanes(r,lanes,tail) {
+         let a=offset+((2*group*half+i)*stride+r)*lanes+lane;let b=a+half*stride*lanes;
+         let x=want[a]+cached[base+group]*want[b];want[b]+=x;want[a]=x;
+        }
+       }}}
+      }
+      assert_eq!(got,want,"cached dim={dim} layer={layer} idx={idx}");
+      assert_eq!(fallback,want,"explicit dim={dim}");cases+=1;compared+=want.len();
+     }}}
+    }
+   }
+  }
+  println!("PASS cache187 {cases} cases {compared} scalar comparisons; stable immutable identity; explicit-basis fallback; tails and guards");
+ }
 }

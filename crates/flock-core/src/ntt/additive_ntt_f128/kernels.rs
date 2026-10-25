@@ -1153,3 +1153,21 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+#[inline]
+pub(super) unsafe fn rows_cached187(ptr: *mut F128, stride: usize, lanes: usize,
+    active: usize, r: usize, t: &FourBlock, hint: u8) {
+    unsafe {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+        if let Some(p) = t.cache.as_ref() {
+            if hint == 0 || r+1 >= stride {
+                return x86_64::row_prepared::<0>(ptr,stride,lanes,active,r,&t.raw,0,p);
+            } else if hint == 1 {
+                return x86_64::row_prepared::<1>(ptr,stride,lanes,active,r,&t.raw,r+1,p);
+            } else {
+                return x86_64::row_prepared::<2>(ptr,stride,lanes,active,r,&t.raw,r+1,p);
+            }
+        }
+        butterfly_fused_4layer_row(ptr,stride,lanes,active,r,&t.raw);
+    }
+}
