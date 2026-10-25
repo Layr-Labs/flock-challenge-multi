@@ -1528,13 +1528,16 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_karatsuba;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_karatsuba(r, _mm512_xor_si512(even, odd)),
+            )
         }
     }
 
@@ -2011,13 +2014,16 @@ unsafe fn fold2_and_message_lookahead_general_x86_avx512(
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_karatsuba;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_karatsuba(r, _mm512_xor_si512(even, odd)),
+            )
         }
     }
 
@@ -3471,7 +3477,7 @@ unsafe fn fold2_from_packed_lookahead_general_x86_avx512(
     c4_lm: bool,
     out_lm: bool,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::ghash_mul_x4_karatsuba;
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -3490,13 +3496,16 @@ unsafe fn fold2_from_packed_lookahead_general_x86_avx512(
         even_idx: __m512i,
         odd_idx: __m512i,
     ) -> __m512i {
-        use crate::field::gf2_128::x86_64::ghash_mul_x4;
+        use crate::field::gf2_128::x86_64::ghash_mul_x4_karatsuba;
         use core::arch::x86_64::*;
         // SAFETY: register-only; features cfg-gated.
         unsafe {
             let even = _mm512_permutex2var_epi64(lo, even_idx, hi);
             let odd = _mm512_permutex2var_epi64(lo, odd_idx, hi);
-            _mm512_xor_si512(even, ghash_mul_x4(r, _mm512_xor_si512(even, odd)))
+            _mm512_xor_si512(
+                even,
+                ghash_mul_x4_karatsuba(r, _mm512_xor_si512(even, odd)),
+            )
         }
     }
 
@@ -3595,14 +3604,26 @@ unsafe fn fold2_from_packed_lookahead_general_x86_avx512(
             let ao_lo = f128x4_loadu(ao.as_ptr());
             let ae_hi = f128x4_loadu(ae.as_ptr().add(4));
             let ao_hi = f128x4_loadu(ao.as_ptr().add(4));
-            let ta_lo = _mm512_xor_si512(ae_lo, ghash_mul_x4(r1, _mm512_xor_si512(ae_lo, ao_lo)));
-            let ta_hi = _mm512_xor_si512(ae_hi, ghash_mul_x4(r1, _mm512_xor_si512(ae_hi, ao_hi)));
+            let ta_lo = _mm512_xor_si512(
+                ae_lo,
+                ghash_mul_x4_karatsuba(r1, _mm512_xor_si512(ae_lo, ao_lo)),
+            );
+            let ta_hi = _mm512_xor_si512(
+                ae_hi,
+                ghash_mul_x4_karatsuba(r1, _mm512_xor_si512(ae_hi, ao_hi)),
+            );
             let be_lo = f128x4_loadu(be.as_ptr());
             let bo_lo = f128x4_loadu(bo.as_ptr());
             let be_hi = f128x4_loadu(be.as_ptr().add(4));
             let bo_hi = f128x4_loadu(bo.as_ptr().add(4));
-            let tb_lo = _mm512_xor_si512(be_lo, ghash_mul_x4(r1, _mm512_xor_si512(be_lo, bo_lo)));
-            let tb_hi = _mm512_xor_si512(be_hi, ghash_mul_x4(r1, _mm512_xor_si512(be_hi, bo_hi)));
+            let tb_lo = _mm512_xor_si512(
+                be_lo,
+                ghash_mul_x4_karatsuba(r1, _mm512_xor_si512(be_lo, bo_lo)),
+            );
+            let tb_hi = _mm512_xor_si512(
+                be_hi,
+                ghash_mul_x4_karatsuba(r1, _mm512_xor_si512(be_hi, bo_hi)),
+            );
             // Level 2 (ρ₂): eight → four outputs.
             (
                 fold_regs(ta_lo, ta_hi, r2, even_idx, odd_idx),
