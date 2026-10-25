@@ -3153,21 +3153,26 @@ unsafe fn inverse_ntt_layer_half1_avx512(
         let idx_bot = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let idx_zip0 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
         let idx_zip1 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-        let ptr = data.as_mut_ptr();
-        let base_block = global_base >> 1;
-        let mut off = 0usize;
-        while off < data.len() {
-            let v0 = _mm512_loadu_si512(ptr.add(off) as *const __m512i);
-            let v1 = _mm512_loadu_si512(ptr.add(off + 4) as *const __m512i);
-            let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
-            let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
-            let b = base_block + (off >> 1);
-            let vt = f128x4_set(
-                ntt.twiddle(layer, b),
-                ntt.twiddle(layer, b + 1),
-                ntt.twiddle(layer, b + 2),
-                ntt.twiddle(layer, b + 3),
-            );
+            let ptr = data.as_mut_ptr();
+            let base_block = global_base >> 1;
+            let tw_base = ntt.precomputed_twiddle_ptr(layer, base_block);
+            let mut off = 0usize;
+            while off < data.len() {
+                let v0 = _mm512_loadu_si512(ptr.add(off) as *const __m512i);
+                let v1 = _mm512_loadu_si512(ptr.add(off + 4) as *const __m512i);
+                let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
+                let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
+                let b = base_block + (off >> 1);
+                let vt = if let Some(tw) = tw_base {
+                    _mm512_loadu_si512(tw.add(off >> 1).cast::<__m512i>())
+                } else {
+                    f128x4_set(
+                        ntt.twiddle(layer, b),
+                        ntt.twiddle(layer, b + 1),
+                        ntt.twiddle(layer, b + 2),
+                        ntt.twiddle(layer, b + 3),
+                    )
+                };
             let vv = _mm512_xor_si512(y0, y1);
             let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
             let out0 = _mm512_permutex2var_epi64(vu, idx_zip0, vv);
@@ -3200,6 +3205,7 @@ unsafe fn inverse_ntt_layer_half2_avx512(
         let idx_bot = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
         let ptr = data.as_mut_ptr();
         let base_block = global_base >> 2;
+        let tw_base = ntt.precomputed_twiddle_ptr(layer, base_block);
         let mut off = 0usize;
         while off < data.len() {
             let v0 = _mm512_loadu_si512(ptr.add(off) as *const __m512i);
@@ -3207,9 +3213,16 @@ unsafe fn inverse_ntt_layer_half2_avx512(
             let y0 = _mm512_permutex2var_epi64(v0, idx_top, v1);
             let y1 = _mm512_permutex2var_epi64(v0, idx_bot, v1);
             let b = base_block + (off >> 2);
-            let t0 = ntt.twiddle(layer, b);
-            let t1 = ntt.twiddle(layer, b + 1);
-            let vt = f128x4_set(t0, t0, t1, t1);
+            let vt = if let Some(tw) = tw_base {
+                let p = tw.add(off >> 2);
+                let t0 = _mm512_broadcast_i32x4(_mm_loadu_si128(p.cast::<__m128i>()));
+                let t1 = _mm512_broadcast_i32x4(_mm_loadu_si128(p.add(1).cast::<__m128i>()));
+                _mm512_mask_blend_epi64(0xF0, t0, t1)
+            } else {
+                let t0 = ntt.twiddle(layer, b);
+                let t1 = ntt.twiddle(layer, b + 1);
+                f128x4_set(t0, t0, t1, t1)
+            };
             let vv = _mm512_xor_si512(y0, y1);
             let vu = _mm512_xor_si512(y0, ghash_mul_x4(vv, vt));
             let out0 = _mm512_permutex2var_epi64(vu, idx_top, vv);
