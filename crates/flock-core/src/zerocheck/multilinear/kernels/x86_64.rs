@@ -4782,6 +4782,14 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
 ///
 /// # Safety
 /// As [`gfni_fold64_rows_masked_tr`].
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+core::arch::global_asm!(include_str!("gfni_sigma_limited.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+unsafe extern "C" {
+    fn flock_sigma_limited1(rows: *const u8, mats: *const u64, out: *mut F128);
+    fn flock_sigma_limited4(rows: *const u8, mats: *const u64, out: *mut F128);
+}
+
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
 #[cfg_attr(
     target_feature = "avx512bw",
@@ -4791,7 +4799,68 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    // The dense kernel keeps exactly the incumbent map and transpose scratch.
+    // Its private assembly contract preserves every GPR and ZMM27..31.
+    unsafe {
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        if dead_lines == 0 {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_sigma_limited1,
+                in("rdi") rows,
+                in("rsi") mats.as_ptr(),
+                in("rdx") out,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+                out("zmm25") _,
+                out("zmm26") _,
+            );
+            return;
+        }
+        gfni_fold64_rows_masked_tr_bcast_fallback(rows, mats, out, dead_lines);
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_fallback(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
@@ -4834,7 +4903,57 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4(
+    rows: *const u8,
+    mats4: *const u64,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    // The dense kernel keeps exactly the incumbent map and transpose scratch.
+    // Its private assembly contract preserves every GPR and ZMM16..31.
+    unsafe {
+        #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        if dead_lines == 0 {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_sigma_limited4,
+                in("rdi") rows,
+                in("rsi") mats4,
+                in("rdx") out,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+            );
+            return;
+        }
+        gfni_fold64_rows_masked_tr_bcast4_fallback(rows, mats4, out, dead_lines);
+    }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast4_fallback(
     rows: *const u8,
     mats4: *const u64,
     out: *mut F128,
@@ -6280,6 +6399,117 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
 /// # Safety
 /// As [`gfni_fold64_rows_tr_bcast_b_canonical_impl`], and its raw guard must have
 /// succeeded for `group`, which must be zero or three.
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+core::arch::global_asm!(include_str!("gfni_canonical_cached.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+unsafe extern "C" {
+    fn flock_canonical_cached1(rows: *const u8, mats: *const u64, out: *mut F128);
+    fn flock_canonical_cached4(rows: *const u8, mats: *const u64, out: *mut F128);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
+    const WRITE_CANONICAL: bool,
+    const MULTI: bool,
+>(
+    rows: *const u8,
+    mats: *const u64,
+    out: *mut F128,
+    group: u8,
+    folded: F128,
+) {
+    unsafe {
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        if !WRITE_CANONICAL {
+            // The checked canonical group is 0 or 3. Read all six live
+            // input lines before writing any output, including aliasing rows.
+            // Single-map matrices cannot alias output under the caller contract.
+            let first = usize::from(group == 0);
+            let live_rows = rows.add(first * 128);
+            let live_out = out.add(first * 4);
+            if MULTI {
+                // ZMM0..15 are clobbered; all GPRs and ZMM16..31 survive.
+                core::arch::asm!(
+                    "call {kernel}",
+                    kernel = sym flock_canonical_cached4,
+                    in("rdi") live_rows,
+                    in("rsi") mats.add(first * 128),
+                    in("rdx") live_out,
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    out("zmm2") _,
+                    out("zmm3") _,
+                    out("zmm4") _,
+                    out("zmm5") _,
+                    out("zmm6") _,
+                    out("zmm7") _,
+                    out("zmm8") _,
+                    out("zmm9") _,
+                    out("zmm10") _,
+                    out("zmm11") _,
+                    out("zmm12") _,
+                    out("zmm13") _,
+                    out("zmm14") _,
+                    out("zmm15") _,
+                );
+            } else {
+                // Cache 16 matrix vectors; preserve all GPRs and ZMM27..31.
+                core::arch::asm!(
+                    "call {kernel}",
+                    kernel = sym flock_canonical_cached1,
+                    in("rdi") live_rows,
+                    in("rsi") mats,
+                    in("rdx") live_out,
+                    out("zmm0") _,
+                    out("zmm1") _,
+                    out("zmm2") _,
+                    out("zmm3") _,
+                    out("zmm4") _,
+                    out("zmm5") _,
+                    out("zmm6") _,
+                    out("zmm7") _,
+                    out("zmm8") _,
+                    out("zmm9") _,
+                    out("zmm10") _,
+                    out("zmm11") _,
+                    out("zmm12") _,
+                    out("zmm13") _,
+                    out("zmm14") _,
+                    out("zmm15") _,
+                    out("zmm16") _,
+                    out("zmm17") _,
+                    out("zmm18") _,
+                    out("zmm19") _,
+                    out("zmm20") _,
+                    out("zmm21") _,
+                    out("zmm22") _,
+                    out("zmm23") _,
+                    out("zmm24") _,
+                    out("zmm25") _,
+                    out("zmm26") _,
+                );
+            }
+            return;
+        }
+        gfni_fold64_rows_tr_bcast_b_canonical_leaf_fallback::<WRITE_CANONICAL, MULTI>(rows, mats, out, group, folded);
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -6296,7 +6526,7 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf_fallback<
     const WRITE_CANONICAL: bool,
     const MULTI: bool,
 >(
@@ -6447,4 +6677,57 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
             F128::ZERO,
         );
     }
+}
+
+#[cfg(all(test, target_os="linux", target_arch="x86_64", target_feature="avx512f", target_feature="avx512bw", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+mod canonical_bounded_tests {
+use super::*;
+#[inline(never)]unsafe fn production_0_0(rows:*const u8,mats:*const u64,out:*mut F128,group:u8,folded:F128){unsafe{gfni_fold64_rows_tr_bcast_b_canonical_leaf::<false,false>(rows,mats,out,group,folded);}}
+#[inline(never)]unsafe fn production_0_1(rows:*const u8,mats:*const u64,out:*mut F128,group:u8,folded:F128){unsafe{gfni_fold64_rows_tr_bcast_b_canonical_leaf::<false,true>(rows,mats,out,group,folded);}}
+#[inline(never)]unsafe fn production_1_0(rows:*const u8,mats:*const u64,out:*mut F128,group:u8,folded:F128){unsafe{gfni_fold64_rows_tr_bcast_b_canonical_leaf::<true,false>(rows,mats,out,group,folded);}}
+#[inline(never)]unsafe fn production_1_1(rows:*const u8,mats:*const u64,out:*mut F128,group:u8,folded:F128){unsafe{gfni_fold64_rows_tr_bcast_b_canonical_leaf::<true,true>(rows,mats,out,group,folded);}}
+fn rng(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+fn affine(x:u8,m:u64)->u8{let mut y=0;for b in 0..8{y|=(((x&((m>>(8*(7-b)))as u8)).count_ones()&1)as u8)<<b;}y}
+fn oracle(rows:&[u8],m:&[u64;512],multi:bool,write:bool,group:usize,folded:F128,guard:F128)->[F128;64]{
+ let mut out=[guard;64];for row in 0..64{let pos=16*(row%4)+row/4;
+ if row/16==group{if write{out[pos]=if group==0||row==48{folded}else{F128{lo:0,hi:0}};}continue;}
+ let matrix=if multi{row/16}else{0};let mut bytes=[0u8;16];for byte in 0..16{for j in 0..8{bytes[byte]^=affine(rows[row*8+j],m[matrix*128+j*16+byte]);}}
+ out[pos]=F128{lo:u64::from_le_bytes(bytes[..8].try_into().unwrap()),hi:u64::from_le_bytes(bytes[8..].try_into().unwrap())};}out
+}
+fn layout_tests(){let mut seed=0x94561737u64;let guard=F128{lo:0x123477765555aaa1,hi:0xfedcab9812345678};let mut checks=0;
+ type Func=unsafe fn(*const u8,*const u64,*mut F128,u8,F128);
+ let funcs:[[Func;1];4]=[[production_0_0],[production_0_1],[production_1_0],[production_1_1]];
+ for trial in 0..12{let mut mats=[0u64;512];for x in &mut mats{*x=match trial{0=>0,1=>u64::MAX,_=>rng(&mut seed)};}
+  let folded=F128{lo:rng(&mut seed),hi:rng(&mut seed)};
+  for offset in [0usize,1,7,31,63]{let mut input=vec![0u8;640];for(i,x)in input.iter_mut().enumerate(){*x=match trial{0=>0,1=>255,2=>(i%256)as u8,_=>rng(&mut seed)as u8};}
+   let rows=&input[offset..offset+512];for group in [0usize,3]{for mode in 0..4{
+    let expected=oracle(rows,&mats,mode&1!=0,mode&2!=0,group,folded,guard);
+    for dst_offset in [1usize,4,7]{for (variant,f)in funcs[mode].iter().enumerate(){let mut out=vec![guard;80];
+     unsafe{f(rows.as_ptr(),mats.as_ptr(),out.as_mut_ptr().add(dst_offset),group as u8,folded);}
+     assert_eq!(&out[dst_offset..dst_offset+64],&expected,"trial={trial} group={group} mode={mode} variant={variant}");
+     assert!(out[..dst_offset].iter().chain(out[dst_offset+64..].iter()).all(|x|*x==guard));checks+=1;
+    }}
+   }}
+  }
+ }
+ println!("PASS canonical checks={checks}; arbitrary matrices; groups 0/3; write/no-write; single/four matrices; guards and skipped lanes exact");
+}
+
+unsafe extern "C"{fn mmap(a:*mut core::ffi::c_void,n:usize,p:i32,f:i32,fd:i32,o:isize)->*mut core::ffi::c_void;fn mprotect(a:*mut core::ffi::c_void,n:usize,p:i32)->i32;fn munmap(a:*mut core::ffi::c_void,n:usize)->i32;}
+fn guard_pages(){unsafe{
+    let page=4096usize;let allocation=mmap(core::ptr::null_mut(),page*3,3,0x22,-1,0);assert_ne!(allocation as isize,-1);
+    let mem=allocation.cast::<u8>();assert_eq!(mprotect(mem.cast(),page,0),0);assert_eq!(mprotect(mem.add(page*2).cast(),page,0),0);
+    let mut seed=0x658a13ffu64;let rows:Vec<u8>=(0..512).map(|_|rng(&mut seed)as u8).collect();let mats=core::array::from_fn(|_|rng(&mut seed));let folded=F128{lo:0x1111222233334444,hi:0xaabbccdd1255eeff};let guard=F128{lo:0x0123456789abcdef,hi:0xfedcba9876543210};
+    type Func=unsafe fn(*const u8,*const u64,*mut F128,u8,F128);
+    let funcs:[[Func;1];4]=[[production_0_0],[production_0_1],[production_1_0],[production_1_1]];
+    for group in [0usize,3]{
+        let ptr=if group==0{mem.add(page-128)}else{mem.add(page*2-384)};
+        let start=if group==0{128}else{0};core::ptr::copy_nonoverlapping(rows.as_ptr().add(start),ptr.add(start),384);
+        for mode in 0..4{let expected=oracle(&rows,&mats,mode&1!=0,mode&2!=0,group,folded,guard);for f in funcs[mode]{let mut out=[guard;64];f(ptr,mats.as_ptr(),out.as_mut_ptr(),group as u8,folded);assert_eq!(out,expected);}}
+    }
+    assert_eq!(munmap(allocation,page*3),0);println!("PASS 8 actual production inaccessible-canonical-input guard cases");
+}}
+#[test]
+fn canonical_bounded_matches_scalar_and_skipped_pages(){layout_tests();guard_pages();}
+
 }

@@ -694,8 +694,11 @@ impl RootSplicePlan {
         .0
     }
 
-    /// Drain one canonical 128-column chunk in source order. A pair's first
-    /// half survives in 512 bytes of per-tile carry even across gather4 batches.
+    /// Drain one canonical 128-column chunk in source order. Borrow a pair's
+    /// first half from a live slab; copy only across a destructive gather.
+    /// Carry rows use the same 128-byte pitch as slabs (64 live bytes per row).
+    /// With GROUP4, q modulo 4 identifies the slab in the current four-chunk
+    /// gather. All earlier slabs remain readable until this batch is drained.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -712,14 +715,14 @@ impl RootSplicePlan {
         target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
     )]
     #[inline]
-    unsafe fn fold_chunk<const RAW: bool>(
+    unsafe fn fold_chunk<const RAW: bool, const GROUP4: bool>(
         &self,
         q: usize,
         tile: *const u8,
         mats: &[u64; 128],
         planes: *mut u8,
         seed_zero: bool,
-        carry: &mut [u8; 512],
+        carry: &mut [u8; 1024],
         pending: &mut bool,
         tile_index: usize,
     ) {
@@ -763,12 +766,16 @@ impl RootSplicePlan {
                         }
                         RootSpliceAction::Start => {
                             debug_assert!(!*pending);
+                            // Only the final half before a new gather needs a copy.
+                            // Other Ends can borrow an immutable slab of this batch.
+                            if half == 1 && (!GROUP4 || q % 4 == 3) {
                             for t in 0..8 {
                                 let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
                                 _mm512_storeu_si512(
-                                    carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                    carry.as_mut_ptr().add(t * 128) as *mut __m512i,
                                     row,
                                 );
+                            }
                             }
                             *pending = true;
                         }
@@ -790,10 +797,15 @@ impl RootSplicePlan {
                                 _mm512_set1_epi64(*low_mask as i64),
                                 _mm512_loadu_si512(REPEAT.as_ptr().cast()),
                             );
+                            let lo_input = if half == 1 {
+                                tile
+                            } else if GROUP4 && q % 4 != 0 {
+                                tile.sub(1024).add(64)
+                            } else {
+                                carry.as_ptr()
+                            };
                             let rows: [__m512i; 8] = core::array::from_fn(|t| {
-                                let lo = _mm512_loadu_si512(
-                                    carry.as_ptr().add(t * 64) as *const __m512i
-                                );
+                                let lo = _mm512_loadu_si512(lo_input.add(t * 128).cast());
                                 let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
                                 if RAW {
                                     finish(_mm512_ternarylogic_epi64::<0xca>(mask, lo, hi))
@@ -3019,7 +3031,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
     let mut transposed_store =
         core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
     #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
-    let mut splice_carry_store = core::mem::MaybeUninit::<[u8; 512]>::uninit();
+    let mut splice_carry_store = core::mem::MaybeUninit::<[u8; 1024]>::uninit();
     // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
     // u64s of `mats` at the start of every tile, and `gather_transpose_*`
     // / `splice.fold_chunk` unconditionally overwrite `transposed` and
@@ -3131,7 +3143,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                     unsafe {
                         #[cfg(target_feature = "avx512bw")]
                         if HAS_SPLICE && let Some(splice) = root_splice {
-                            splice.fold_chunk::<true>(
+                            splice.fold_chunk::<true, true>(
                                 q + c,
                                 transposed.as_ptr().add(c * 1024),
                                 mats,
@@ -3195,7 +3207,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                 #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
                 if HAS_SPLICE && let Some(splice) = root_splice {
                     if gather_tr_fused {
-                        splice.fold_chunk::<true>(
+                        splice.fold_chunk::<true, false>(
                             q,
                             transposed.as_ptr(),
                             mats,
@@ -3206,7 +3218,7 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             tile,
                         );
                     } else {
-                        splice.fold_chunk::<false>(
+                        splice.fold_chunk::<false, false>(
                             q,
                             transposed.as_ptr(),
                             mats,
@@ -6725,7 +6737,7 @@ fn root_preselect_matrix_domain_matches_scalar() {
                 for raw in [false, true] {
                     for fuse in [false, true] {
                         let mut got = initial.clone();
-                        let mut carry = [0u8; 512];
+                        let mut carry = [0u8; 1024];
                         let mut pending = false;
                         for q in 0..3 {
                             let mut tile = [0u8; 1024];
@@ -6757,7 +6769,7 @@ fn root_preselect_matrix_domain_matches_scalar() {
                                     }
                                 }
                                 if raw {
-                                    plan.fold_chunk::<true>(
+                                    plan.fold_chunk::<true, false>(
                                         q,
                                         tile.as_ptr(),
                                         &mats,
@@ -6768,7 +6780,7 @@ fn root_preselect_matrix_domain_matches_scalar() {
                                         0,
                                     );
                                 } else {
-                                    plan.fold_chunk::<false>(
+                                    plan.fold_chunk::<false, false>(
                                         q,
                                         tile.as_ptr(),
                                         &mats,
@@ -6791,4 +6803,194 @@ fn root_preselect_matrix_domain_matches_scalar() {
             }
         }
     }
+}
+
+#[cfg(all(test, target_arch="x86_64", target_feature="avx512f", target_feature="avx512bw", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+mod root_batch_borrow_tests {
+use super::*;
+use core::arch::x86_64::*;
+use RootSpliceAction as Action;
+#[derive(Clone,PartialEq,Eq,Debug)]struct Block([u8;512]);
+impl RootSplicePlan {
+unsafe fn fold_reference<const RAW: bool>(
+        &self,
+        q: usize,
+        tile: *const u8,
+        mats: &[u64; 128],
+        planes: *mut u8,
+        seed_zero: bool,
+        carry: &mut [u8; 512],
+        pending: &mut bool,
+        tile_index: usize,
+    ) {
+        use core::arch::x86_64::*;
+        unsafe {
+            // RAW tiles contain the byte-transposed matrices. Defer the GFNI
+            // bit transpose until the root halves have been selected.
+            let ident = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+            let finish = |row| {
+                if RAW {
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, row)
+                } else {
+                    row
+                }
+            };
+            // Expand the two source halves explicitly. A loop lets LLVM hoist
+            // all eight carry loads above the action dispatch, even on Full
+            // and Skip chunks. Each End now loads carry only where it is used.
+            macro_rules! half {
+                ($h:expr) => {{
+                    let half: usize = $h;
+                    let input = tile.add(half * 64);
+                    match &self.actions[2 * q + half] {
+                        RootSpliceAction::Skip => {}
+                        RootSpliceAction::Full(out) => {
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                finish(_mm512_loadu_si512(input.add(t * 128).cast()))
+                            });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
+                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                        }
+                        RootSpliceAction::Start => {
+                            debug_assert!(!*pending);
+                            for t in 0..8 {
+                                let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                _mm512_storeu_si512(
+                                    carry.as_mut_ptr().add(t * 64) as *mut __m512i,
+                                    row,
+                                );
+                            }
+                            *pending = true;
+                        }
+                        RootSpliceAction::End { out, low_mask } => {
+                            debug_assert!(*pending);
+                            // Each source bit position has the same position in the next
+                            // half. In matrix form, repeat its selector byte across
+                            // all eight witness rows of that byte group.
+                            const REPEAT: [u8; 64] = {
+                                let mut a = [0u8; 64];
+                                let mut i = 0;
+                                while i < 64 {
+                                    a[i] = (i / 8) as u8;
+                                    i += 1;
+                                }
+                                a
+                            };
+                            let mask = _mm512_shuffle_epi8(
+                                _mm512_set1_epi64(*low_mask as i64),
+                                _mm512_loadu_si512(REPEAT.as_ptr().cast()),
+                            );
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                let lo = _mm512_loadu_si512(
+                                    carry.as_ptr().add(t * 64) as *const __m512i
+                                );
+                                let hi = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                if RAW {
+                                    finish(_mm512_ternarylogic_epi64::<0xca>(mask, lo, hi))
+                                } else {
+                                    _mm512_mask_blend_epi8(*low_mask, hi, lo)
+                                }
+                            });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
+                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                            *pending = false;
+                        }
+                        RootSpliceAction::Tail { out, mask } => {
+                            debug_assert!(!*pending);
+                            let rows: [__m512i; 8] = core::array::from_fn(|t| {
+                                let row = _mm512_loadu_si512(input.add(t * 128) as *const __m512i);
+                                _mm512_maskz_mov_epi8(*mask, finish(row))
+                            });
+                            #[cfg(all(
+                                target_arch = "x86_64",
+                                target_feature = "avx512f",
+                                target_feature = "avx512bw",
+                                target_feature = "avx512vbmi",
+                                target_feature = "gfni",
+                                target_feature = "vpclmulqdq"
+                            ))]
+                            if let Some(capture) = self.capture {
+                                capture.publish(tile_index, *out, &rows);
+                            }
+                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                        }
+                    }
+                }};
+            }
+            half!(0);
+            half!(1);
+        }
+    }
+}
+fn real_actions()->Box<[Action]>{vec![Action::Full(0),Action::Full(1),Action::Full(2),Action::Full(3),Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Full(4),Action::Full(5),Action::Full(6),Action::Full(7),Action::Full(8),Action::Full(9),Action::Full(10),Action::Full(11),Action::Full(12),Action::Full(13),Action::Full(14),Action::Full(15),Action::Start,Action::End{out:16,low_mask:576460752303423487u64},Action::Full(17),Action::Full(18),Action::Start,Action::End{out:19,low_mask:9007199254740991u64},Action::Full(20),Action::Full(21),Action::Start,Action::End{out:22,low_mask:140737488355327u64},Action::Full(23),Action::Full(24),Action::Start,Action::End{out:25,low_mask:2199023255551u64},Action::Full(26),Action::Full(27),Action::Start,Action::End{out:28,low_mask:34359738367u64},Action::Full(29),Action::Full(30),Action::Start,Action::End{out:31,low_mask:536870911u64},Action::Full(32),Action::Full(33),Action::Start,Action::End{out:34,low_mask:8388607u64},Action::Full(35),Action::Full(36),Action::Start,Action::End{out:37,low_mask:131071u64},Action::Full(38),Action::Full(39),Action::Start,Action::End{out:40,low_mask:2047u64},Action::Full(41),Action::Full(42),Action::Start,Action::End{out:43,low_mask:31u64},Action::Full(44),Action::Start,Action::End{out:45,low_mask:9223372036854775807u64},Action::Full(46),Action::Full(47),Action::Start,Action::End{out:48,low_mask:144115188075855871u64},Action::Full(49),Action::Full(50),Action::Start,Action::End{out:51,low_mask:2251799813685247u64},Action::Full(52),Action::Full(53),Action::Start,Action::End{out:54,low_mask:35184372088831u64},Action::Full(55),Action::Full(56),Action::Start,Action::End{out:57,low_mask:549755813887u64},Action::Full(58),Action::Full(59),Action::Start,Action::End{out:60,low_mask:8589934591u64},Action::Full(61),Action::Full(62),Action::Start,Action::End{out:63,low_mask:134217727u64},Action::Full(64),Action::Full(65),Action::Start,Action::End{out:66,low_mask:2097151u64},Action::Full(67),Action::Full(68),Action::Start,Action::End{out:69,low_mask:32767u64},Action::Full(70),Action::Full(71),Action::Start,Action::End{out:72,low_mask:511u64},Action::Full(73),Action::Full(74),Action::Start,Action::End{out:75,low_mask:7u64},Action::Full(76),Action::Start,Action::End{out:77,low_mask:2305843009213693951u64},Action::Full(78),Action::Full(79),Action::Start,Action::End{out:80,low_mask:36028797018963967u64},Action::Full(81),Action::Full(82),Action::Start,Action::End{out:83,low_mask:562949953421311u64},Action::Full(84),Action::Full(85),Action::Start,Action::End{out:86,low_mask:8796093022207u64},Action::Full(87),Action::Full(88),Action::Start,Action::End{out:89,low_mask:137438953471u64},Action::Full(90),Action::Full(91),Action::Start,Action::End{out:92,low_mask:2147483647u64},Action::Full(93),Action::Full(94),Action::Start,Action::End{out:95,low_mask:33554431u64},Action::Full(96),Action::Full(97),Action::Start,Action::End{out:98,low_mask:524287u64},Action::Full(99),Action::Full(100),Action::Start,Action::End{out:101,low_mask:8191u64},Action::Full(102),Action::Full(103),Action::Start,Action::End{out:104,low_mask:127u64},Action::Full(105),Action::Full(106),Action::Start,Action::End{out:107,low_mask:1u64},Action::Full(108),Action::Start,Action::End{out:109,low_mask:576460752303423487u64},Action::Full(110),Action::Full(111),Action::Start,Action::End{out:112,low_mask:9007199254740991u64},Action::Full(113),Action::Full(114),Action::Start,Action::End{out:115,low_mask:140737488355327u64},Action::Full(116),Action::Full(117),Action::Start,Action::End{out:118,low_mask:2199023255551u64},Action::Full(119),Action::Full(120),Action::Start,Action::End{out:121,low_mask:34359738367u64},Action::Full(122),Action::Full(123),Action::Start,Action::End{out:124,low_mask:536870911u64},Action::Full(125),Action::Full(126),Action::Start,Action::End{out:127,low_mask:8388607u64},Action::Full(128),Action::Full(129),Action::Start,Action::End{out:130,low_mask:131071u64},Action::Full(131),Action::Full(132),Action::Start,Action::End{out:133,low_mask:2047u64},Action::Full(134),Action::Full(135),Action::Start,Action::End{out:136,low_mask:31u64},Action::Full(137),Action::Start,Action::End{out:138,low_mask:9223372036854775807u64},Action::Full(139),Action::Full(140),Action::Start,Action::End{out:141,low_mask:144115188075855871u64},Action::Full(142),Action::Full(143),Action::Start,Action::End{out:144,low_mask:2251799813685247u64},Action::Full(145),Action::Full(146),Action::Start,Action::End{out:147,low_mask:35184372088831u64},Action::Full(148),Action::Full(149),Action::Start,Action::End{out:150,low_mask:549755813887u64},Action::Full(151),Action::Full(152),Action::Start,Action::End{out:153,low_mask:8589934591u64},Action::Full(154),Action::Full(155),Action::Start,Action::End{out:156,low_mask:134217727u64},Action::Full(157),Action::Full(158),Action::Start,Action::End{out:159,low_mask:2097151u64},Action::Full(160),Action::Full(161),Action::Start,Action::End{out:162,low_mask:32767u64},Action::Full(163),Action::Full(164),Action::Start,Action::End{out:165,low_mask:511u64},Action::Full(166),Action::Full(167),Action::Start,Action::End{out:168,low_mask:7u64},Action::Full(169),Action::Start,Action::End{out:170,low_mask:2305843009213693951u64},Action::Full(171),Action::Full(172),Action::Start,Action::End{out:173,low_mask:36028797018963967u64},Action::Full(174),Action::Full(175),Action::Tail{out:176,mask:562949953421311u64},Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip,Action::Skip].into_boxed_slice()}
+
+fn next(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+fn scalar_finish(raw:bool,src:&[u8;64])->[u8;64]{
+    if !raw{return *src}let mut dst=[0u8;64];
+    for g in 0..8{for j in 0..8{for b in 0..8{dst[8*g+j]|=((src[8*g+7-b]>>j)&1)<<b;}}}dst
+}
+fn affine(x:u8,m:u64)->u8{let mut y=0;for b in 0..8{y|=((((m>>(8*(7-b)))as u8&x).count_ones()&1)as u8)<<b;}y}
+fn scalar(raw:bool,a:&[Action],input:&[u8],mats:&[u64;128],initial:&[u8],seed:bool,blocks:usize)->(Vec<u8>,Vec<Block>){
+    let mut out=if seed{vec![0u8;blocks*1024]}else{initial.to_vec()};let mut cap=vec![Block([0u8;512]);blocks];let mut carry=[[0u8;64];8];
+    for (i,act) in a.iter().enumerate(){
+        if matches!(act,Action::Skip){continue}
+        let q=i/2;let half=i%2;let mut rows=[[0u8;64];8];
+        for t in 0..8{rows[t].copy_from_slice(&input[q*1024+t*128+half*64..q*1024+t*128+half*64+64]);}
+        if matches!(act,Action::Start){carry=rows;continue}
+        let block=match act{Action::Full(n)=>*n,Action::End{out,low_mask}=>{
+            for t in 0..8{for c in 0..64{if raw{let mask=(low_mask>>(8*(c/8)))as u8;rows[t][c]=(carry[t][c]&mask)|(rows[t][c]&!mask);}else if (low_mask>>c)&1!=0{rows[t][c]=carry[t][c];}}}*out
+        },Action::Tail{out,..}=>*out,_=>unreachable!()};
+        for t in 0..8{rows[t]=scalar_finish(raw,&rows[t]);if let Action::Tail{mask,..}=act{for c in 0..64{if(mask>>c)&1==0{rows[t][c]=0;}}}cap[block].0[t*64..t*64+64].copy_from_slice(&rows[t]);}
+        for b in 0..16{for c in 0..64{for t in 0..8{out[block*1024+b*64+c]^=affine(rows[t][c],mats[t*16+b]);}}}
+    }(out,cap)
+}
+fn compare<const RAW:bool,const GROUP4:bool>(actions:Box<[Action]>,chunks:usize,blocks:usize,case:usize,seed_zero:bool,_capture:bool,oracle:bool){
+    let mut rng=0x6abbbeef_u64+case as u64;let mut input:Vec<u8>=(0..chunks*1024).map(|_|next(&mut rng)as u8).collect();
+    if case==0{input.fill(0)}if case==1{input.fill(255)}
+    let mats=core::array::from_fn(|_|next(&mut rng));let initial:Vec<u8>=(0..blocks*1024).map(|_|next(&mut rng)as u8).collect();
+    let mut out_old=initial.clone();let mut out_new=initial.clone();
+    let old=RootSplicePlan{actions:actions.clone(),source_bits:chunks*128,root_bits:blocks*64,capture:None};
+    let new=RootSplicePlan{actions,source_bits:chunks*128,root_bits:blocks*64,capture:None};
+    let mut c0=[0x1bu8;512];let mut c1=[0x72u8;1024];let mut p0=false;let mut p1=false;
+    let mut slab=[0u8;4096];let mut q=0;
+    while q<chunks{
+        let batch=if GROUP4 && q+4<=chunks{4}else{1};
+        slab.fill((q as u8).wrapping_mul(13));slab[..batch*1024].copy_from_slice(&input[q*1024..(q+batch)*1024]);
+        for c in 0..batch{unsafe{
+            old.fold_reference::<RAW>(q+c,slab.as_ptr().add(c*1024),&mats,out_old.as_mut_ptr(),seed_zero,&mut c0,&mut p0,0);
+            if batch==4{new.fold_chunk::<RAW,true>(q+c,slab.as_ptr().add(c*1024),&mats,out_new.as_mut_ptr(),seed_zero,&mut c1,&mut p1,0);}else{new.fold_chunk::<RAW,false>(q+c,slab.as_ptr(),&mats,out_new.as_mut_ptr(),seed_zero,&mut c1,&mut p1,0);}
+        }assert_eq!(p0,p1);}
+        if p0{for t in 0..8{assert_eq!(&c0[t*64..t*64+64],&c1[t*128..t*128+64],"cross-batch carry must survive overwrite");}}q+=batch;
+    }
+    unsafe{_mm_sfence();}assert!(!p0);assert_eq!(out_old,out_new,"raw={RAW} grouped={GROUP4} case={case} seed={seed_zero}");
+    if oracle{let (expected,cap)=scalar(RAW,&old.actions,&input,&mats,&initial,seed_zero,blocks);assert_eq!(out_new,expected);let _ = cap;}
+}
+fn real<const RAW:bool,const GROUP4:bool>(){for case in 0..4{for seed in [false,true]{for cap in [true]{compare::<RAW,GROUP4>(real_actions(),118,177,case,seed,cap,case==3&&cap);}}}}
+fn boundaries<const RAW:bool,const GROUP4:bool>(){for pos in 0..8{for split in [1,7,8,15,16,31,32,49,56,63]{for seed in [false,true]{
+    let mut a=vec![Action::Skip;16];a[pos]=Action::Start;a[pos+1]=Action::End{out:0,low_mask:(1u64<<split)-1};
+    compare::<RAW,GROUP4>(a.into_boxed_slice(),8,1,pos+2,seed,true,true);
+}}}}
+#[test]fn real_plan(){real::<true,true>();real::<true,false>();real::<false,true>();real::<false,false>();println!("32 complete 118-chunk production plans; both RAW, seed and grouping modes; capture tested separately through RootTileCache");}
+#[test]fn all_boundaries(){boundaries::<true,true>();boundaries::<true,false>();boundaries::<false,true>();boundaries::<false,false>();println!("640 scalar-verified boundary plans; all 8 batch positions, 10 masks, both RAW, seed and grouping modes");}
+
 }

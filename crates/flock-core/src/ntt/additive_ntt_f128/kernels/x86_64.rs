@@ -3689,9 +3689,31 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
     };
-    for i in 0..15 {
-        // x^64 multiplication is a field operation, not a value assumption.
-        result.pairs[i] = [t[i], t[i] * F128::new(0, 1)];
+    // Multiplication by x^64 is (t.lo << 64) XOR clmul(t.hi, 0x87).
+    // The final masked load reads exactly three fields; each result pair
+    // is written once, avoiding an overlapping output materialization.
+    unsafe {
+        use core::arch::x86_64::*;
+        let out = result.pairs.as_mut_ptr().cast::<F128>();
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        let low = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        let high = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+        for i in [0, 4, 8] {
+            let a = _mm512_loadu_si512(t.as_ptr().add(i).cast());
+            let shifted = _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, a);
+            let b = _mm512_xor_si512(shifted, _mm512_clmulepi64_epi128::<0x01>(a, poly));
+            _mm512_storeu_si512(out.add(2 * i).cast(), _mm512_permutex2var_epi64(a, low, b));
+            _mm512_storeu_si512(out.add(2 * i + 4).cast(), _mm512_permutex2var_epi64(a, high, b));
+        }
+        // Six live qwords occupy t[12..15]; masked-off qwords are not read.
+        let a = _mm512_maskz_loadu_epi64(0x3f, t.as_ptr().add(12).cast());
+        let shifted = _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, a);
+        let b = _mm512_xor_si512(shifted, _mm512_clmulepi64_epi128::<0x01>(a, poly));
+        _mm512_storeu_si512(out.add(24).cast(), _mm512_permutex2var_epi64(a, low, b));
+        _mm256_storeu_si256(
+            out.add(28).cast(),
+            _mm512_castsi512_si256(_mm512_permutex2var_epi64(a, high, b)),
+        );
     }
     Some(result)
 }
@@ -3783,5 +3805,105 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
         butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
         )
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod prepared_companion_tests {
+    use super::*;
+    use core::arch::x86_64::*;
+    use std::hint::black_box;
+    type Prep = unsafe fn(&[F128; 15], *mut F128);
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    unsafe fn prepared_companion_production(t: &[F128; 15], out: *mut F128) {
+        let p = unsafe { prepare_four(t) }.expect("probe requires the default preparation path");
+        unsafe { core::ptr::copy_nonoverlapping(p.pairs.as_ptr().cast::<F128>(), out, 30); }
+    }
+
+
+    fn variants() -> [(&'static str, Prep); 1] { [("production", prepared_companion_production)] }
+    fn scalar_x64(a: F128) -> F128 {
+        let mut x = (a.hi as u128) << 64 | a.lo as u128;
+        for _ in 0..64 { let carry=x >> 127; x <<= 1; if carry!=0 { x ^= 0x87; } }
+        F128::new(x as u64, (x>>64) as u64)
+    }
+    fn inputs(k: usize) -> [F128; 15] {
+        let mut state=(k as u64).wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(0x123456789abcdef);
+        core::array::from_fn(|i| match k {
+            0 => F128::ZERO,
+            1 => F128::new(u64::MAX,u64::MAX),
+            2 => F128::new(u64::MAX,0),
+            3 => F128::new(0,u64::MAX),
+            4 => F128::new(0x5555555555555555,0xaaaaaaaaaaaaaaaa),
+            5..=132 => { let x=1u128 << ((k-5+13*i)%128); F128::new(x as u64,(x>>64)as u64) },
+            _ => { state^=state<<13;state^=state>>7;state^=state<<17;let lo=state;
+                   state^=state<<13;state^=state>>7;state^=state<<17;F128::new(lo,state) }
+        })
+    }
+    fn expected(input: &[F128;15]) -> [F128;30] {
+        core::array::from_fn(|i| if i%2==0 {input[i/2]} else {scalar_x64(input[i/2])})
+    }
+    const GUARD: F128=F128::new(0x1122334455667788,0xa5a55a5adeadbeef);
+    #[repr(C,align(64))] struct In([F128;24]);
+    #[repr(C,align(64))] struct Out([F128;40]);
+
+    #[test]
+    fn prepared_companions_match_scalar_and_halos() {
+        for k in 0..165 {
+            let values=inputs(k);let want=expected(&values);
+            for si in 0..4 { for oi in 1..5 {
+                let mut input=In([GUARD;24]);input.0[si..si+15].copy_from_slice(&values);
+                let saved=input.0;
+                let t: &[F128;15]=input.0[si..si+15].try_into().unwrap();
+                for (name,f) in variants() {
+                    let mut output=Out([GUARD;40]);
+                    unsafe { black_box(f)(black_box(t),black_box(output.0.as_mut_ptr().add(oi))); }
+                    assert_eq!(&output.0[oi..oi+30],&want,"{name}, dataset={k}, in={si}, out={oi}");
+                    assert!(output.0[..oi].iter().chain(output.0[oi+30..].iter()).all(|x|*x==GUARD));
+                    assert_eq!(input.0,saved);
+                }
+            } }
+        }
+        println!("2640 actual production input/alignment cases matched scalar and halos");
+    }
+
+    unsafe extern "C" {
+        fn mmap(addr:*mut core::ffi::c_void,len:usize,prot:i32,flags:i32,fd:i32,off:isize)->*mut core::ffi::c_void;
+        fn mprotect(addr:*mut core::ffi::c_void,len:usize,prot:i32)->i32;
+        fn munmap(addr:*mut core::ffi::c_void,len:usize)->i32;
+    }
+    struct GuardPage(*mut core::ffi::c_void);
+    impl GuardPage {
+        fn new()->Self { unsafe {
+            let p=mmap(core::ptr::null_mut(),12288,0,0x22,-1,0);assert_ne!(p as isize,-1);
+            assert_eq!(mprotect(p.cast::<u8>().add(4096).cast(),4096,3),0);Self(p)
+        } }
+        fn fields(&mut self)->&mut [F128] { unsafe { core::slice::from_raw_parts_mut(self.0.cast::<u8>().add(4096).cast(),256) } }
+    }
+    impl Drop for GuardPage { fn drop(&mut self) { unsafe { assert_eq!(munmap(self.0,12288),0); } } }
+    #[test]
+    fn prepared_companions_exact_extent_guard_pages() {
+        let mut source=GuardPage::new();let mut destination=GuardPage::new();
+        for k in 0..165 {
+            let values=inputs(k);let want=expected(&values);
+            let src=source.fields();src.fill(GUARD);src[241..].copy_from_slice(&values);let snapshot=src.to_vec();
+            let t: &[F128;15]=src[241..].try_into().unwrap();
+            for (name,f) in variants() {
+                let dst=destination.fields();dst.fill(GUARD);
+                unsafe { black_box(f)(black_box(t),black_box(dst.as_mut_ptr().add(226))); }
+                assert_eq!(&dst[226..],&want,"guarded {name}, dataset={k}");
+                assert!(dst[..226].iter().all(|x|*x==GUARD));assert_eq!(src,&snapshot[..]);
+            }
+        }
+        println!("165 actual production exact-extent cases with inaccessible adjacent pages matched scalar");
+    }
+
+    #[test]
+    fn prepared_companions_respect_disable_controls() {
+        let disabled = std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some()
+            || std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some();
+        assert_eq!(unsafe { prepare_four(&inputs(164)) }.is_none(), disabled);
     }
 }
