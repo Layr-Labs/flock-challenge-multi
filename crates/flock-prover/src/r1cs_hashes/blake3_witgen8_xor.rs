@@ -139,34 +139,26 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
-unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_conv<const PRE: bool>(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
     unsafe {
         // For sparse complement inputs keep the direct projection: <=3*8 products.
-        if known(mode_value).count_ones() >= 5 {
+        if !PRE && known(mode_value).count_ones() >= 5 {
             return affine(p, m, mode_value);
         }
-        let mut x: [u64; 8] = [
-            if known(mode_value) & (1 << 0) != 0 { 0 } else if mode_value == 0 { *p.add(0) } else { !*p.add(0) },
-            if known(mode_value) & (1 << 1) != 0 { 0 } else if mode_value == 0 { *p.add(1) } else { !*p.add(1) },
-            if known(mode_value) & (1 << 2) != 0 { 0 } else if mode_value == 0 { *p.add(2) } else { !*p.add(2) },
-            if known(mode_value) & (1 << 3) != 0 { 0 } else if mode_value == 0 { *p.add(3) } else { !*p.add(3) },
-            if known(mode_value) & (1 << 4) != 0 { 0 } else if mode_value == 0 { *p.add(4) } else { !*p.add(4) },
-            if known(mode_value) & (1 << 5) != 0 { 0 } else if mode_value == 0 { *p.add(5) } else { !*p.add(5) },
-            if known(mode_value) & (1 << 6) != 0 { 0 } else if mode_value == 0 { *p.add(6) } else { !*p.add(6) },
-            if known(mode_value) & (1 << 7) != 0 { 0 } else if mode_value == 0 { *p.add(7) } else { !*p.add(7) }
-        ];
-        x[0] ^= x[1];
-        x[2] ^= x[3];
-        x[4] ^= x[5];
-        x[6] ^= x[7];
-        x[0] ^= x[2];
-        x[1] ^= x[3];
-        x[4] ^= x[6];
-        x[5] ^= x[7];
-        x[0] ^= x[4];
-        x[1] ^= x[5];
-        x[2] ^= x[6];
-        x[3] ^= x[7];
+        let x: [u64; 8] = if PRE {
+            [*p.add(0), *p.add(1), *p.add(2), *p.add(3), *p.add(4), *p.add(5), *p.add(6), *p.add(7)]
+        } else {
+            let v = _mm512_loadu_si512(p.cast());
+            let v = if mode_value == 0 {
+                v
+            } else {
+                _mm512_maskz_xor_epi64(!known(mode_value), v, _mm512_set1_epi64(-1))
+            };
+            let v = _mm512_mask_xor_epi64(v, 0x55, v, _mm512_unpackhi_epi64(v, v));
+            let v = _mm512_mask_xor_epi64(v, 0x33, v, _mm512_shuffle_i64x2::<0xF5>(v, v));
+            let v = _mm512_mask_xor_epi64(v, 0x0F, v, _mm512_shuffle_i64x2::<0xEE>(v, v));
+            core::mem::transmute::<__m512i, [u64; 8]>(v)
+        };
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
             _mm512_set1_epi64(x[0] as i64),
@@ -361,7 +353,7 @@ const BYTE_TR: [u8; 64] = [
     14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
 ];
 #[inline(always)]
-unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn pretranspose_ring<const SUPERSET: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -374,22 +366,18 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
         let p = out.as_mut_ptr().cast::<u64>();
-        let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
-        _mm512_storeu_si512(p.add(0).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
-        _mm512_storeu_si512(p.add(8).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
-        _mm512_storeu_si512(p.add(16).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
-        _mm512_storeu_si512(p.add(24).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
-        _mm512_storeu_si512(p.add(32).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
-        _mm512_storeu_si512(p.add(40).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
-        _mm512_storeu_si512(p.add(48).cast(), _mm512_permutexvar_epi8(ix, v));
-        let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
-        _mm512_storeu_si512(p.add(56).cast(), _mm512_permutexvar_epi8(ix, v));
+        let mut r = 0;
+        while r < 8 {
+            let v = _mm512_loadu_si512(ring.add(rw + 2 * r).cast());
+            let mut w = _mm512_permutexvar_epi8(ix, v);
+            if SUPERSET {
+                w = _mm512_mask_xor_epi64(w, 0x55, w, _mm512_unpackhi_epi64(w, w));
+                w = _mm512_mask_xor_epi64(w, 0x33, w, _mm512_shuffle_i64x2::<0xF5>(w, w));
+                w = _mm512_mask_xor_epi64(w, 0x0F, w, _mm512_shuffle_i64x2::<0xEE>(w, w));
+            }
+            _mm512_storeu_si512(p.add(8 * r).cast(), w);
+            r += 1;
+        }
         out.assume_init()
     }
 }
@@ -416,8 +404,8 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
     acc: &mut [__m512i; 8], acc0: __m512i,
 ) -> __m512i {
     unsafe {
-        let av = affine_conv(ap, ma, 0);
-        let bv = affine_conv(bp, mb, MODE);
+        let av = affine_conv::<true>(ap, ma, 0);
+        let bv = affine_conv::<false>(bp, mb, MODE);
         let mut result = _mm512_setzero_si512();
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
@@ -749,8 +737,8 @@ pub(super) unsafe fn project(
     t: &Tables,
 ) {
     unsafe {
-        let ap = pretranspose_ring(ar, rw);
-        let bp = pretranspose_ring(br, rw);
+        let ap = pretranspose_ring::<true>(ar, rw);
+        let bp = pretranspose_ring::<false>(br, rw);
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
