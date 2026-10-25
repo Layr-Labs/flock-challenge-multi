@@ -2269,18 +2269,31 @@ fn transpose_pass_b_block_zero_xor(
             // SAFETY: avx512f is cfg-guaranteed and both slices have equal
             // length. F128 addition is bitwise XOR.
             unsafe {
-                let lanes = top.len() & !3;
+                let dst = top.as_mut_ptr();
+                let src = bot.as_ptr();
+                let n = top.len();
+                let pair_lanes = n & !7;
                 let mut i = 0;
-                while i < lanes {
-                    let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
-                    let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                while i < pair_lanes {
+                    let a0 = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
+                    let a1 = _mm512_loadu_si512(dst.add(i + 4).cast::<__m512i>());
+                    let b0 = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
+                    let b1 = _mm512_loadu_si512(src.add(i + 4).cast::<__m512i>());
+                    _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a0, b0));
                     _mm512_storeu_si512(
-                        top.as_mut_ptr().add(i).cast::<__m512i>(),
-                        _mm512_xor_si512(a, b),
+                        dst.add(i + 4).cast::<__m512i>(),
+                        _mm512_xor_si512(a1, b1),
                     );
+                    i += 8;
+                }
+                let lanes = n & !3;
+                while i < lanes {
+                    let a = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
+                    let b = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
+                    _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a, b));
                     i += 4;
                 }
-                while i < top.len() {
+                while i < n {
                     top[i] += bot[i];
                     i += 1;
                 }
@@ -2439,18 +2452,31 @@ fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
         // SAFETY: avx512f is cfg-guaranteed and both slices have equal
         // length. F128 addition is bitwise XOR.
         unsafe {
-            let lanes = top.len() & !3;
+            let dst = top.as_mut_ptr();
+            let src = bot.as_ptr();
+            let n = top.len();
+            let pair_lanes = n & !7;
             let mut i = 0;
-            while i < lanes {
-                let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
-                let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+            while i < pair_lanes {
+                let a0 = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
+                let a1 = _mm512_loadu_si512(dst.add(i + 4).cast::<__m512i>());
+                let b0 = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
+                let b1 = _mm512_loadu_si512(src.add(i + 4).cast::<__m512i>());
+                _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a0, b0));
                 _mm512_storeu_si512(
-                    top.as_mut_ptr().add(i).cast::<__m512i>(),
-                    _mm512_xor_si512(a, b),
+                    dst.add(i + 4).cast::<__m512i>(),
+                    _mm512_xor_si512(a1, b1),
                 );
+                i += 8;
+            }
+            let lanes = n & !3;
+            while i < lanes {
+                let a = _mm512_loadu_si512(dst.add(i).cast::<__m512i>());
+                let b = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
+                _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a, b));
                 i += 4;
             }
-            while i < top.len() {
+            while i < n {
                 top[i] += bot[i];
                 i += 1;
             }
