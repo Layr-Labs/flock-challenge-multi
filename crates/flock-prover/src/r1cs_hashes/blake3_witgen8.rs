@@ -526,20 +526,36 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 /// `stage[w..w+16]` contains sixteen initialized `V8`s. AVX-512F is enabled.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
-unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+unsafe fn load_ring8(stage: *const V8, w: usize) -> [__m512i; 8] {
     unsafe {
         debug_assert!(w + STEP_WORDS <= RING_WORDS);
         debug_assert!(w.is_multiple_of(STEP_WORDS));
-
         // Each unaligned ZMM is [word 2k lanes 0..7 | word 2k+1 lanes 0..7].
-        let x0 = _mm512_loadu_si512(stage.add(w).cast::<__m512i>());
-        let x1 = _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>());
-        let x2 = _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>());
-        let x3 = _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>());
-        let x4 = _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>());
-        let x5 = _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>());
-        let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
-        let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
+        [
+            _mm512_loadu_si512(stage.add(w).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>()),
+            _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>()),
+        ]
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_loaded(x: [__m512i; 8]) -> [__m512i; 8] {
+    unsafe {
+        let x0 = x[0];
+        let x1 = x[1];
+        let x2 = x[2];
+        let x3 = x[3];
+        let x4 = x[4];
+        let x5 = x[5];
+        let x6 = x[6];
+        let x7 = x[7];
 
         let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
         let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
@@ -576,6 +592,12 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
             _mm512_permutex2var_epi32(q03, i31, q13),
         ]
     }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe { tr8x16_loaded(load_ring8(stage, w)) }
 }
 
 /// Transpose one fully-live ranked side and widen its offsets while the

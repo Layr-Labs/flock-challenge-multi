@@ -534,7 +534,7 @@ unsafe fn ring_prepared_pack(v:__m512i)->__m512i{
 }
 
 #[inline(always)]
-unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(raw: &[__m512i; 8]) -> [u64; 64] {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -547,56 +547,56 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
         let p = out.as_mut_ptr().cast::<u64>();
-        let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
+        let v = raw[0];
         let v = if PREPARE_A || mode(BLK, 0) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(0).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
+        let v = raw[1];
         let v = if PREPARE_A || mode(BLK, 1) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(8).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
+        let v = raw[2];
         let v = if PREPARE_A || mode(BLK, 2) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(16).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
+        let v = raw[3];
         let v = if PREPARE_A || mode(BLK, 3) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(24).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
+        let v = raw[4];
         let v = if PREPARE_A || mode(BLK, 4) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(32).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
+        let v = raw[5];
         let v = if PREPARE_A || mode(BLK, 5) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(40).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
+        let v = raw[6];
         let v = if PREPARE_A || mode(BLK, 6) == 0 {
             ring_prepared_pack(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(48).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
+        let v = raw[7];
         let v = if PREPARE_A || mode(BLK, 7) == 0 {
             ring_prepared_pack(v)
         } else {
@@ -655,12 +655,11 @@ unsafe fn project_const<const BLK: usize>(
     a: [__m512i; 8],
     b: [__m512i; 8],
     ap: &[u64; 64],
-    br: *const V8,
-    rw: usize,
+    b_raw: &[__m512i; 8],
     m: *const u64,
 ) {
     unsafe {
-        let bp = pretranspose_ring::<BLK, false>(br, rw);
+        let bp = pretranspose_ring::<BLK, false>(b_raw);
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         if residual_row_live(BLK, 7) {
@@ -964,38 +963,40 @@ pub(super) unsafe fn project(
     t: &Tables,
 ) {
     unsafe {
-        let ap = pretranspose_ring::<0, true>(ar, rw);
-        let a = tr8x16_zmm(ar, rw);
-        let b = tr8x16_zmm(br, rw);
+        let a_raw = load_ring8(ar, rw);
+        let b_raw = load_ring8(br, rw);
+        let ap = pretranspose_ring::<0, true>(&a_raw);
+        let a = tr8x16_loaded(a_raw);
+        let b = tr8x16_loaded(b_raw);
         match blk {
-            2 => project_const::<2>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            3 => project_const::<3>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            4 => project_const::<4>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            5 => project_const::<5>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            6 => project_const::<6>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            7 => project_const::<7>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            8 => project_const::<8>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            9 => project_const::<9>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            10 => project_const::<10>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            11 => project_const::<11>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            12 => project_const::<12>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            13 => project_const::<13>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            14 => project_const::<14>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            15 => project_const::<15>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            16 => project_const::<16>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            17 => project_const::<17>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            18 => project_const::<18>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            19 => project_const::<19>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            20 => project_const::<20>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            21 => project_const::<21>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            22 => project_const::<22>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            23 => project_const::<23>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            24 => project_const::<24>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            25 => project_const::<25>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            26 => project_const::<26>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            27 => project_const::<27>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            28 => project_const::<28>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
+            29 => project_const::<29>(proj, rows, a, b, &ap, &b_raw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
