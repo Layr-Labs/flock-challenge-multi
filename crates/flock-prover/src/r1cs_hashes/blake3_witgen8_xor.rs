@@ -547,62 +547,29 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
         let p = out.as_mut_ptr().cast::<u64>();
-        let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
-        let v = if PREPARE_A || mode(BLK, 0) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(0).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
-        let v = if PREPARE_A || mode(BLK, 1) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(8).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
-        let v = if PREPARE_A || mode(BLK, 2) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(16).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
-        let v = if PREPARE_A || mode(BLK, 3) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(24).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
-        let v = if PREPARE_A || mode(BLK, 4) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(32).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
-        let v = if PREPARE_A || mode(BLK, 5) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(40).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
-        let v = if PREPARE_A || mode(BLK, 6) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(48).cast(), v);
-        let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
-        let v = if PREPARE_A || mode(BLK, 7) == 0 {
-            ring_prepared_pack(v)
-        } else {
-            _mm512_permutexvar_epi8(ix, v)
-        };
-        _mm512_storeu_si512(p.add(56).cast(), v);
+        macro_rules! row {
+            ($k:literal) => {{
+                let v = if !PREPARE_A && (mode(BLK, $k) == 15 || !residual_row_live(BLK, $k)) {
+                    _mm512_setzero_si512()
+                } else {
+                    let v = _mm512_loadu_si512(ring.add(rw + 2 * $k).cast());
+                    if PREPARE_A || mode(BLK, $k) == 0 {
+                        ring_prepared_pack(v)
+                    } else {
+                        _mm512_permutexvar_epi8(ix, v)
+                    }
+                };
+                _mm512_storeu_si512(p.add(8 * $k).cast(), v);
+            }};
+        }
+        row!(0);
+        row!(1);
+        row!(2);
+        row!(3);
+        row!(4);
+        row!(5);
+        row!(6);
+        row!(7);
         out.assume_init()
     }
 }
