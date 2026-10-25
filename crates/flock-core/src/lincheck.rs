@@ -711,7 +711,7 @@ impl RootSplicePlan {
         not(target_feature = "vpclmulqdq"),
         target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
     )]
-    #[inline]
+    #[inline(never)]
     unsafe fn fold_chunk<const RAW: bool>(
         &self,
         q: usize,
@@ -742,8 +742,8 @@ impl RootSplicePlan {
                 ($h:expr) => {{
                     let half: usize = $h;
                     let input = tile.add(half * 64);
-                    match &self.actions[2 * q + half] {
-                        RootSpliceAction::Skip => {}
+                    let folded: Option<(usize, [__m512i; 8])> = match &self.actions[2 * q + half] {
+                        RootSpliceAction::Skip => None,
                         RootSpliceAction::Full(out) => {
                             let rows: [__m512i; 8] = core::array::from_fn(|t| {
                                 finish(_mm512_loadu_si512(input.add(t * 128).cast()))
@@ -759,7 +759,7 @@ impl RootSplicePlan {
                             if let Some(capture) = self.capture {
                                 capture.publish(tile_index, *out, &rows);
                             }
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                            Some((*out, rows))
                         }
                         RootSpliceAction::Start => {
                             debug_assert!(!*pending);
@@ -771,6 +771,7 @@ impl RootSplicePlan {
                                 );
                             }
                             *pending = true;
+                            None
                         }
                         RootSpliceAction::End { out, low_mask } => {
                             debug_assert!(*pending);
@@ -812,8 +813,8 @@ impl RootSplicePlan {
                             if let Some(capture) = self.capture {
                                 capture.publish(tile_index, *out, &rows);
                             }
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                             *pending = false;
+                            Some((*out, rows))
                         }
                         RootSpliceAction::Tail { out, mask } => {
                             debug_assert!(!*pending);
@@ -832,8 +833,11 @@ impl RootSplicePlan {
                             if let Some(capture) = self.capture {
                                 capture.publish(tile_index, *out, &rows);
                             }
-                            kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
+                            Some((*out, rows))
                         }
+                    };
+                    if let Some((out, rows)) = folded {
+                        kernels::gfni_fold_rows(&rows, mats, planes.add(out * 1024), seed_zero);
                     }
                 }};
             }
