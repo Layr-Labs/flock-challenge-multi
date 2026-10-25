@@ -368,9 +368,7 @@ pub(super) unsafe fn fold64_banked_nested(
         let pf_ahead = fold16_pf_ahead();
         let pf_limit = src.len().saturating_sub(64);
         let quads = dst.len() & !3;
-        let wb: [__m512i; 16] = core::array::from_fn(|b| {
-            _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64))
-        });
+        let wg:[__m512i;4]=core::array::from_fn(|g|_mm512_loadu_si512(w.as_ptr().add(4*g).cast()));
         let r0_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r0.hi as i64, r0.lo as i64));
         let r0_x64 = ghash_shift64_x4(r0_bcast);
         let r1_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r1.hi as i64, r1.lo as i64));
@@ -402,27 +400,16 @@ pub(super) unsafe fn fold64_banked_nested(
                         }
                     }
                 }
-                let mut acc = WideGhashX4::zero();
-                for g in 0..4 {
-                    let base = base_elem + 4 * g;
-                    let a0 = _mm512_loadu_si512(src.as_ptr().add(base) as *const __m512i);
-                    let a1 = _mm512_loadu_si512(src.as_ptr().add(base + 16) as *const __m512i);
-                    let a2 = _mm512_loadu_si512(src.as_ptr().add(base + 32) as *const __m512i);
-                    let a3 = _mm512_loadu_si512(src.as_ptr().add(base + 48) as *const __m512i);
-                    let t0 = _mm512_permutex2var_epi64(a0, s1_lo, a1);
-                    let t1 = _mm512_permutex2var_epi64(a0, s1_hi, a1);
-                    let t2 = _mm512_permutex2var_epi64(a2, s1_lo, a3);
-                    let t3 = _mm512_permutex2var_epi64(a2, s1_hi, a3);
-                    let u0 = _mm512_permutex2var_epi64(t0, s2_lo, t2);
-                    let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
-                    let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
-                    let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
-                    acc.mul_acc(u0, wb[4 * g]);
-                    acc.mul_acc(u1, wb[4 * g + 1]);
-                    acc.mul_acc(u2, wb[4 * g + 2]);
-                    acc.mul_acc(u3, wb[4 * g + 3]);
-                }
-                _mm512_store_si512(m4_ptr.add(slot_idx), acc.reduce_lanes());
+                macro_rules! segment193 { ($s:expr)=>{{
+                    let mut acc=WideGhashX4::zero();
+                    for g in 0..4 {
+                        let u=_mm512_loadu_si512(src.as_ptr().add(base_elem+16*$s+4*g).cast());
+                        acc.mul_acc(u,wg[g]);
+                    }
+                    acc
+                }} }
+                let v=WideGhashX4::fold4_and_reduce(segment193!(0),segment193!(1),segment193!(2),segment193!(3));
+                _mm512_store_si512(m4_ptr.add(slot_idx),v);
                 slot_idx += 1;
             }
 
