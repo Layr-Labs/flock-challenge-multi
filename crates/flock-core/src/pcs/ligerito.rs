@@ -4129,6 +4129,48 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
     data
 }
 
+///
+///
+///
+/// # Safety
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn transpose_window_packed_stage<const S0: bool>(
+    tw: core::arch::x86_64::__m512i,
+    buf: &mut [F128],
+    base: usize,
+) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    unsafe {
+        let v0 = _mm512_loadu_si512(buf.as_ptr().add(base) as *const __m512i);
+        let v1 = _mm512_loadu_si512(buf.as_ptr().add(base + 4) as *const __m512i);
+        let (tops, bots, pack0, pack1) = if S0 {
+            (
+                _mm512_permutex2var_epi64(v0, _mm512_setr_epi64(0, 1, 4, 5, 8, 9, 12, 13), v1),
+                _mm512_permutex2var_epi64(v0, _mm512_setr_epi64(2, 3, 6, 7, 10, 11, 14, 15), v1),
+                _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11),
+                _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15),
+            )
+        } else {
+            (
+                _mm512_permutex2var_epi64(v0, _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11), v1),
+                _mm512_permutex2var_epi64(v0, _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15), v1),
+                _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11),
+                _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15),
+            )
+        };
+        let sum = _mm512_xor_si512(tops, bots);
+        let nb = _mm512_xor_si512(bots, ghash_mul_x4_split(sum, tw, ghash_shift64_x4(tw)));
+        let o0 = _mm512_permutex2var_epi64(sum, pack0, nb);
+        let o1 = _mm512_permutex2var_epi64(sum, pack1, nb);
+        _mm512_storeu_si512(buf.as_mut_ptr().add(base) as *mut __m512i, o0);
+        _mm512_storeu_si512(buf.as_mut_ptr().add(base + 4) as *mut __m512i, o1);
+    }
+}
+
 /// Dense `2^k` transpose in place on a `2^k`-slot window slice.
 #[inline]
 fn transpose_forward_ntt_window_dense_slice(
@@ -4144,8 +4186,42 @@ fn transpose_forward_ntt_window_dense_slice(
         let bsh = 1usize << s;
         let block_size = bsh << 1;
         let nblocks = (1usize << k) / block_size;
-        for jb in 0..nblocks {
-            let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+        let block0 = w << (k - s - 1);
+        let mut done = 0usize;
+        #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        if s == 0 {
+            while done + 4 <= nblocks {
+                let t0 = ntt.twiddle(layer, block0 + done);
+                let t1 = ntt.twiddle(layer, block0 + done + 1);
+                let t2 = ntt.twiddle(layer, block0 + done + 2);
+                let t3 = ntt.twiddle(layer, block0 + done + 3);
+                unsafe {
+                    use crate::field::gf2_128::x86_64::f128x4_set;
+                    transpose_window_packed_stage::<true>(
+                        f128x4_set(t0, t1, t2, t3),
+                        buf,
+                        done * block_size,
+                    );
+                }
+                done += 4;
+            }
+        } else if s == 1 {
+            while done + 2 <= nblocks {
+                let a = ntt.twiddle(layer, block0 + done);
+                let b = ntt.twiddle(layer, block0 + done + 1);
+                unsafe {
+                    use crate::field::gf2_128::x86_64::f128x4_set;
+                    transpose_window_packed_stage::<false>(
+                        f128x4_set(a, a, b, b),
+                        buf,
+                        done * block_size,
+                    );
+                }
+                done += 2;
+            }
+        }
+        for jb in done..nblocks {
+            let t = ntt.twiddle(layer, block0 + jb);
             let base = jb * block_size;
             let (top_h, bot) = buf[base..base + block_size].split_at_mut(bsh);
             transpose_butterfly(top_h, bot, t);
