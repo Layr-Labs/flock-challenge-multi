@@ -526,7 +526,31 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
 /// `stage[w..w+16]` contains sixteen initialized `V8`s. AVX-512F is enabled.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
-unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+unsafe fn tr8x16_indices() -> (__m512i, __m512i, __m512i, __m512i, __m512i, __m512i) {
+    unsafe {
+        (
+            _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27),
+            _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31),
+            _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23),
+            _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31),
+            _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23),
+            _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31),
+        )
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_zmm_ix(
+    stage: *const V8,
+    w: usize,
+    i10: __m512i,
+    i11: __m512i,
+    i20: __m512i,
+    i21: __m512i,
+    i30: __m512i,
+    i31: __m512i,
+) -> [__m512i; 8] {
     unsafe {
         debug_assert!(w + STEP_WORDS <= RING_WORDS);
         debug_assert!(w.is_multiple_of(STEP_WORDS));
@@ -541,8 +565,6 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let x6 = _mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>());
         let x7 = _mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>());
 
-        let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
-        let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
         let p00 = _mm512_permutex2var_epi32(x0, i10, x1);
         let p01 = _mm512_permutex2var_epi32(x0, i11, x1);
         let p10 = _mm512_permutex2var_epi32(x2, i10, x3);
@@ -552,8 +574,6 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let p30 = _mm512_permutex2var_epi32(x6, i10, x7);
         let p31 = _mm512_permutex2var_epi32(x6, i11, x7);
 
-        let i20 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
-        let i21 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
         let q00 = _mm512_permutex2var_epi32(p00, i20, p10);
         let q01 = _mm512_permutex2var_epi32(p00, i21, p10);
         let q02 = _mm512_permutex2var_epi32(p01, i20, p11);
@@ -563,8 +583,6 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let q12 = _mm512_permutex2var_epi32(p21, i20, p31);
         let q13 = _mm512_permutex2var_epi32(p21, i21, p31);
 
-        let i30 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
-        let i31 = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
         [
             _mm512_permutex2var_epi32(q00, i30, q10),
             _mm512_permutex2var_epi32(q00, i31, q10),
@@ -575,6 +593,15 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
             _mm512_permutex2var_epi32(q03, i30, q13),
             _mm512_permutex2var_epi32(q03, i31, q13),
         ]
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe {
+        let (i10, i11, i20, i21, i30, i31) = tr8x16_indices();
+        tr8x16_zmm_ix(stage, w, i10, i11, i20, i21, i30, i31)
     }
 }
 
@@ -707,9 +734,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
     unsafe {
         debug_assert!(blk > 1 && blk < 30);
         debug_assert!(proj.one_rows_elided);
-        let a_rows = tr8x16_zmm(a_ring, rw);
+        let (i10, i11, i20, i21, i30, i31) = tr8x16_indices();
+        let a_rows = tr8x16_zmm_ix(a_ring, rw, i10, i11, i20, i21, i30, i31);
         widen_ranked_dense_rows::<P>(&a_rows, off, c);
-        let b_rows = tr8x16_zmm(b_ring, rw);
+        let b_rows = tr8x16_zmm_ix(b_ring, rw, i10, i11, i20, i21, i30, i31);
         widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
 
         if blk == 2 {
@@ -946,9 +974,10 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
 ) {
     unsafe {
         debug_assert!(blk > 1 && blk < 30);
-        let a_rows = tr8x16_zmm(a_ring, rw);
+        let (i10, i11, i20, i21, i30, i31) = tr8x16_indices();
+        let a_rows = tr8x16_zmm_ix(a_ring, rw, i10, i11, i20, i21, i30, i31);
         widen_ranked_dense_rows::<P>(&a_rows, off, c);
-        let b_rows = tr8x16_zmm(b_ring, rw);
+        let b_rows = tr8x16_zmm_ix(b_ring, rw, i10, i11, i20, i21, i30, i31);
         widen_ranked_dense_rows::<P>(&b_rows, off.add(64), c);
 
         if proj.one_rows_elided && blk == 2 {
