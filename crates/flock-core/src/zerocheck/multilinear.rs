@@ -6717,6 +6717,56 @@ mod tests {
         }
     }
 
+    /// Compare the private preserving-ABI path to an independent output
+    /// layout across random maps, unaligned inputs and non-ZMM-aligned output.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_c4_preserving_boundary_matches_rust() {
+        #[repr(align(64))]
+        struct AlignedOutput([F128; 20]);
+        let mut rng = Rng::new(0xF128_C4AB_1C64_0020);
+        for case in 0..64 {
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            let coeffs = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+            let mats = kernels::x86_64::build_cfold_mats_ext(&table.data, coeffs, true);
+            let offset = [0, 1, 7, 31][case % 4];
+            let mut input = vec![0u8; 512 + offset];
+            for b in &mut input {
+                *b = rng.next_u64() as u8;
+            }
+            let guard = rng.f128();
+            let mut output = AlignedOutput([guard; 20]);
+            let got = &mut output.0;
+            let mut want = [F128::ZERO; 16];
+            // SAFETY: both get exactly 512 readable bytes; the composed map
+            // writes sixteen fields. The extra got slots detect overstores.
+            unsafe {
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast(
+                    input.as_ptr().add(offset),
+                    &mats,
+                    want.as_mut_ptr(),
+                    0,
+                );
+                kernels::x86_64::gfni_fold64_rows_masked_c4_bcast_lm(
+                    input.as_ptr().add(offset),
+                    &mats,
+                    got.as_mut_ptr().add(1),
+                    0,
+                );
+            }
+            assert_eq!(got[1..17], lane_major_tiles(&want)[..], "case {case}");
+            assert_eq!(got[0], guard);
+            assert_eq!(got[17..], [guard; 3]);
+        }
+    }
+
     /// Byte-identity of the predicated prefold against the unpredicated
     /// kernel, on hardware. Compiles wherever the AVX-512/GFNI arms compile
     /// (e.g. `-C target-cpu=sapphirerapids`); on hosts without those features

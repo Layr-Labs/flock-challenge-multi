@@ -8214,12 +8214,15 @@ fn materialize_direct_fold8_f_for_precommit(
 ) {
     use rayon::prelude::*;
 
+    // Keep the concurrently streamed source chunks below private L2 size.
+    // Each output still consumes its original 64 contiguous witness values.
+    let chunk_len = block_len.min(512);
     folded_f
-        .par_chunks_mut(block_len)
+        .par_chunks_mut(chunk_len)
         .enumerate()
         .for_each(|(block, f_out)| {
-            let start = 64 * block * block_len;
-            let f_in = &packed_witness[start..start + 64 * block_len];
+            let start = 64 * block * chunk_len;
+            let f_in = &packed_witness[start..start + 64 * f_out.len()];
             crate::field::f128_slice::fold64_banked_nested(f_in, f_out, fold16_weight, r4, r5);
         });
 }

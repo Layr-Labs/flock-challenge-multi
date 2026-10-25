@@ -394,24 +394,46 @@ unsafe fn pretranspose_ring(ring: *const V8, rw: usize) -> [u64; 64] {
     }
 }
 
-// Share the expensive arithmetic by structural row mode. The eight Horner
-// weights remain selected by the caller's matrix-bank pointer.
-#[inline(never)]
+// Keep one accumulator vector live across the outlined call. A vector ABI
+// argument and return avoid clearing the upper lanes at this AVX-512 seam.
+#[inline(always)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
     unsafe {
+        let acc0 = acc[0];
+        acc[0] = row_product_vector_abi::<MODE, FIRST>(ap, bp, ma, mb, acc, acc0);
+    }
+}
+
+// Share the expensive arithmetic by structural row mode. The eight Horner
+// weights remain selected by the caller's matrix-bank pointer.
+#[inline(never)]
+#[allow(improper_ctypes_definitions)]
+unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8], acc0: __m512i,
+) -> __m512i {
+    unsafe {
         let av = affine_conv(ap, ma, 0);
         let bv = affine_conv(bp, mb, MODE);
+        let mut result = _mm512_setzero_si512();
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
                 let value = _mm512_gf2p8mul_epi8(av[i], bv[i]);
                 if MODE == 0 { value } else { _mm512_xor_si512(value, av[i]) }
             };
-            acc[i] = if FIRST { value } else { _mm512_xor_si512(acc[i], value) };
+            let previous = if i == 0 { acc0 } else { acc[i] };
+            let value = if FIRST { value } else { _mm512_xor_si512(previous, value) };
+            if i == 0 { result = value; } else { acc[i] = value; }
         }
+        result
     }
+}
+#[inline(always)]
+const fn residual_row_live(blk: usize, k: usize) -> bool {
+    (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
 unsafe fn project_const<const BLK: usize>(
@@ -426,6 +448,7 @@ unsafe fn project_const<const BLK: usize>(
     unsafe {
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
+        if residual_row_live(BLK, 7) {
         match mode(BLK, 7) {
 0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
 1 => row_product::<1, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
@@ -445,13 +468,13 @@ unsafe fn project_const<const BLK: usize>(
 15 => row_product::<15, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(1, a[1], b[1]);
+        if residual_row_live(BLK, 6) {
         match mode(BLK, 6) {
 0 => row_product::<0, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
@@ -471,13 +494,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(2, a[2], b[2]);
+        if residual_row_live(BLK, 5) {
         match mode(BLK, 5) {
 0 => row_product::<0, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
@@ -497,13 +520,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(3, a[3], b[3]);
+        if residual_row_live(BLK, 4) {
         match mode(BLK, 4) {
 0 => row_product::<0, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
@@ -523,13 +546,33 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(4, a[4], b[4]);
+        if BLK == 29 {
+        match mode(BLK, 3) {
+0 => row_product::<0, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+1 => row_product::<1, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+2 => row_product::<2, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+3 => row_product::<3, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+4 => row_product::<4, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+5 => row_product::<5, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+6 => row_product::<6, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+7 => row_product::<7, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+8 => row_product::<8, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+9 => row_product::<9, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+10 => row_product::<10, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+11 => row_product::<11, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+12 => row_product::<12, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+13 => row_product::<13, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+14 => row_product::<14, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+15 => row_product::<15, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
+_ => unreachable!(),
+}
+        } else {
         match mode(BLK, 3) {
 0 => row_product::<0, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
@@ -549,13 +592,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(5, a[5], b[5]);
+        if residual_row_live(BLK, 2) {
         match mode(BLK, 2) {
 0 => row_product::<0, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
@@ -575,13 +618,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(6, a[6], b[6]);
+        if residual_row_live(BLK, 1) {
         match mode(BLK, 1) {
 0 => row_product::<0, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
@@ -601,13 +644,13 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(7, a[7], b[7]);
+        if residual_row_live(BLK, 0) {
         match mode(BLK, 0) {
 0 => row_product::<0, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
@@ -627,11 +670,10 @@ s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout
 15 => row_product::<15, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
 _ => unreachable!(),
 }
-        // Keep the completed Horner state and this row's NT stores before the
-        // next row's publication. The compiler barrier has no machine instruction;
-        // its memory clobber prevents combining all 24 witness stores into a burst.
-        core::arch::asm!("/* Horner NT publication boundary: {s0} {s1} {s2} {s3} {s4} {s5} {s6} {s7} */",
-s0=inout(zmm_reg)acc[0],s1=inout(zmm_reg)acc[1],s2=inout(zmm_reg)acc[2],s3=inout(zmm_reg)acc[3],s4=inout(zmm_reg)acc[4],s5=inout(zmm_reg)acc[5],s6=inout(zmm_reg)acc[6],s7=inout(zmm_reg)acc[7],options(nostack,preserves_flags));
+        }
+        // Keep this row's NT stores before the next row's publication without
+        // forcing accumulator vectors through asm register operands.
+        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
@@ -712,6 +754,7 @@ pub(super) unsafe fn project(
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
+            2 => project_const::<2>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             3 => project_const::<3>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             4 => project_const::<4>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             5 => project_const::<5>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
@@ -738,7 +781,8 @@ pub(super) unsafe fn project(
             26 => project_const::<26>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             27 => project_const::<27>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
             28 => project_const::<28>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
-            _ => unreachable!("only fully-live ranked mixed windows reach XOR projection"),
+            29 => project_const::<29>(proj, rows, a, b, &ap, &bp, t.0.as_ptr()),
+            _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
 }
@@ -789,7 +833,15 @@ mod tests {
             };
             for rw in [0, 16] {
                 for case in 0..5 {
-                    for blk in 3..29 {
+                    for blk in 2..30 {
+                        // Independent residual oracle: preserve all powers of two,
+                        // but omit the complete B=1 terms already elided by the plan.
+                        let keep: u8 = match blk { 2 => 0xfc, 29 => 0x0f, _ => 0xff };
+                        for k in 0..8 {
+                            if keep & (1 << k) == 0 {
+                                assert_eq!(known(mode(blk, k)), 255);
+                            }
+                        }
                         let mut aa = [[0u8; 64]; 8];
                         let mut bb = [[0u8; 64]; 8];
                         let mut ar = Ring([[0xdeadbeef; 8]; 32]);
@@ -874,7 +926,10 @@ mod tests {
                                 table.apply_scalar(&aa[row][k * 8..k * 8 + 8], &mut av);
                                 table.apply_scalar(&bb[row][k * 8..k * 8 + 8], &mut bv);
                                 for i in 0..64 {
-                                    acc[i] = acc[i] * F8(2) + av[i] * bv[i];
+                                    acc[i] = acc[i] * F8(2);
+                                    if keep & (1 << k) != 0 {
+                                        acc[i] += av[i] * bv[i];
+                                    }
                                 }
                             }
                             for i in 0..64 {
@@ -889,7 +944,7 @@ mod tests {
                 }
             }
             println!(
-                "260 complete ring-to-published-window cases, including A/B/Z, compact output stride, both ring halves and untouched bytes"
+                "280 complete ring-to-published-window cases, including A/B/Z, compact output stride, both ring halves and untouched bytes"
             );
         }
     }

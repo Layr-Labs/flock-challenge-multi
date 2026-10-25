@@ -5578,6 +5578,29 @@ const C4_LM_OUT_EVEN: [i8; 64] = c4_lm_output_index(0);
 ))]
 const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+core::arch::global_asm!(include_str!("gfni_c4_lm.S"));
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+unsafe extern "C" {
+    // Symbol only: calls must use the private ABI declared by the wrapper.
+    fn flock_gfni_c4_lm_preserving();
+}
+
 /// [`gfni_fold64_rows_masked_c4_bcast`] with the sixteen composed outputs
 /// emitted **lane-major**: output ZMM `k` holds `out[k], out[4+k], out[8+k],
 /// out[12+k]` — element `k` of every group of four — i.e. `transpose4` of the
@@ -5605,7 +5628,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[inline(never)]
+#[inline]
 #[cfg_attr(
     target_feature = "avx512bw",
     target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
@@ -5615,6 +5638,62 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
+    rows: *const u8,
+    m: &CFoldMats,
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    #[cfg(target_os = "linux")]
+    if dead_lines == 0 {
+        // The private assembly ABI preserves ZMM12..31 and every GPR other
+        // than RAX, so live message accumulators can stay in those registers.
+        // Unlike a C call, this declares exactly the registers it overwrites.
+        // No nostack: the call and the callee's aligned scratch use the stack.
+        unsafe {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_preserving,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+            );
+        }
+        return;
+    }
+    // Keep the masked implementation and non-ELF targets on the Rust path.
+    unsafe { gfni_fold64_rows_masked_c4_bcast_lm_rust(rows, m, out, dead_lines) }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_rust(
     rows: *const u8,
     m: &CFoldMats,
     out: *mut F128,

@@ -2423,11 +2423,6 @@ impl Drain8<'_> {
                     32,
                 );
             }
-            let wc = WidenConsts::new();
-            #[repr(align(64))]
-            struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
-            let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
-            let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
             for step in 0..2usize {
                 let rw = step * STEP_WORDS;
                 let abs_word = base_word + rw;
@@ -2437,25 +2432,63 @@ impl Drain8<'_> {
                     self.a.add(abs_word),
                     self.b.add(abs_word),
                 );
-                let (plan, imgs) = *preps.get_unchecked(blk);
+                let plan = preps.get_unchecked(blk).0;
 #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
-                if (3..=28).contains(&blk) && plan.bcomplement_static_eligible(){
+                if (2..=29).contains(&blk) && plan.bcomplement_static_eligible(){
                     xor_projection::project(proj,blk,rows,self.ast,self.bs,rw,&preps.tables);
                     continue;
                 }
-                project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
-                    proj,
-                    blk,
-                    plan,
-                    imgs,
-                    rows,
-                    self.ast,
-                    self.bs,
-                    rw,
-                    op,
-                    wc,
-                );
+                self.drain_ranked_offset_window(abs_word, rw);
             }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[cfg_attr(
+        all(
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi",
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512dq",
+            target_feature = "gfni"
+        ),
+        target_feature(
+            enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni"
+        )
+    )]
+    #[rustfmt::skip]
+    #[inline(never)]
+    unsafe fn drain_ranked_offset_window(&self, abs_word: usize, rw: usize) {
+        // Offset windows need a large inlined table kernel and its constants.
+        // Keep that setup local to this path so the common XOR projection
+        // caller does not carry those values across each projection call.
+        unsafe {
+            let proj = &self.proj;
+            let preps = self.ranked_preps.unwrap_unchecked();
+            let blk = abs_word / STEP_WORDS;
+            let rows = RankedRows::new(
+                self.z.add(abs_word),
+                self.a.add(abs_word),
+                self.b.add(abs_word),
+            );
+            let (plan, imgs) = *preps.get_unchecked(blk);
+            let wc = WidenConsts::new();
+            #[repr(align(64))]
+            struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
+            let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
+            let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
+            project_blocks_ranked_hot_offsets_direct_inline_fast::<true>(
+                proj,
+                blk,
+                plan,
+                imgs,
+                rows,
+                self.ast,
+                self.bs,
+                rw,
+                op,
+                wc,
+            );
         }
     }
 
