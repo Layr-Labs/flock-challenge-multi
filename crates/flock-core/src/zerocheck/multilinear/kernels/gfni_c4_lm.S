@@ -2,6 +2,7 @@
 // Exact composed GFNI fold, lane-major output, with a private register ABI.
 // Inputs: RDI = 512 input bytes, RSI = CFoldMats.1, RDX = 256 output bytes.
 // Clobbers: RAX, flags, ZMM0..11. Preserves every other GPR and ZMM12..31.
+// ZMM12/13 are explicitly saved/restored while reusing each matrix across passes.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
 // No vzeroupper: the upper lanes of ZMM12..15 belong to the caller.
 .text
@@ -12,7 +13,10 @@
 flock_gfni_c4_lm_preserving:
     mov rax, rsp
     and rsp, -64
-    sub rsp, 512
+    sub rsp, 640
+    // Borrow two additional vector registers without changing the private ABI.
+    vmovdqa64 [rsp + 512], zmm12
+    vmovdqa64 [rsp + 576], zmm13
     vmovdqa64 zmm10, [rip + .Lflock_c4_g1_lo]
     vmovdqa64 zmm11, [rip + .Lflock_c4_g1_hi]
     vmovdqa64 zmm8, [rip + .Lflock_c4_oct_even]
@@ -44,65 +48,69 @@ flock_gfni_c4_lm_preserving:
     flock_c4_gather 0
     flock_c4_gather 1
 
-// One octet contributes to both halves of the output field element. Keeping
-// the matrices as memory operands bounds the entire body to twelve ZMMs.
-.macro flock_c4_pair lo, hi, j, a, p
-    vpbroadcastq zmm\lo, [rsp + 256*\p + 64*\a + 8*\j]
-    vgf2p8affineqb zmm\hi, zmm\lo, [rsi + 2048 + 512*\a + 64*\j], 0
-    vgf2p8affineqb zmm\lo, zmm\lo, [rsi + 512*\a + 64*\j], 0
+// Octet k = 8a + j of pass p sits at [rsp + 256*p + 8*k]; it multiplies the
+// low matrix [rsi + 64*k] and the high matrix [rsi + 2048 + 64*k]. Each pair
+// is loaded once into ZMM12/13 and applied to both independent passes.
+.macro flock_c4_shared l0, h0, l1, h1, k
+    vmovdqu64 zmm12, [rsi + 64*\k]
+    vmovdqu64 zmm13, [rsi + 2048 + 64*\k]
+    vpbroadcastq zmm\l0, [rsp + 8*\k]
+    vgf2p8affineqb zmm\h0, zmm\l0, zmm13, 0
+    vgf2p8affineqb zmm\l0, zmm\l0, zmm12, 0
+    vpbroadcastq zmm\l1, [rsp + 256 + 8*\k]
+    vgf2p8affineqb zmm\h1, zmm\l1, zmm13, 0
+    vgf2p8affineqb zmm\l1, zmm\l1, zmm12, 0
 .endm
-.macro flock_c4_residue a, p
-    flock_c4_pair 0, 4, 0, \a, \p
-    flock_c4_pair 1, 5, 1, \a, \p
-    flock_c4_pair 2, 6, 2, \a, \p
-    vpternlogq zmm0, zmm1, zmm2, 0x96
-    vpternlogq zmm4, zmm5, zmm6, 0x96
-    flock_c4_pair 1, 5, 3, \a, \p
-    flock_c4_pair 2, 6, 4, \a, \p
-    flock_c4_pair 3, 7, 5, \a, \p
-    vpternlogq zmm1, zmm2, zmm3, 0x96
-    vpternlogq zmm5, zmm6, zmm7, 0x96
-    flock_c4_pair 2, 6, 6, \a, \p
-    flock_c4_pair 3, 7, 7, \a, \p
-    vpternlogq zmm2, zmm3, zmm0, 0x96
-    vpternlogq zmm6, zmm7, zmm4, 0x96
-.if \a == 0
-    vmovdqa64 zmm8, zmm1
+// ZMM0/1 accumulate pass 0 low/high, ZMM2/3 pass 1 low/high.
+.macro flock_c4_shared_fold k0, k1
+    flock_c4_shared 4, 5, 6, 7, \k0
+    flock_c4_shared 8, 9, 10, 11, \k1
+    vpternlogq zmm0, zmm4, zmm8, 0x96
+    vpternlogq zmm1, zmm5, zmm9, 0x96
+    vpternlogq zmm2, zmm6, zmm10, 0x96
+    vpternlogq zmm3, zmm7, zmm11, 0x96
+.endm
+    flock_c4_shared 0, 1, 2, 3, 0
+    flock_c4_shared_fold 1, 2
+    flock_c4_shared_fold 3, 4
+    flock_c4_shared_fold 5, 6
+    flock_c4_shared_fold 7, 8
+    flock_c4_shared_fold 9, 10
+    flock_c4_shared_fold 11, 12
+    flock_c4_shared_fold 13, 14
+    flock_c4_shared_fold 15, 16
+    flock_c4_shared_fold 17, 18
+    flock_c4_shared_fold 19, 20
+    flock_c4_shared_fold 21, 22
+    flock_c4_shared_fold 23, 24
+    flock_c4_shared_fold 25, 26
+    flock_c4_shared_fold 27, 28
+    flock_c4_shared_fold 29, 30
+    flock_c4_shared 4, 5, 6, 7, 31
+    vpxorq zmm0, zmm0, zmm4
+    vpxorq zmm1, zmm1, zmm5
+    vpxorq zmm2, zmm2, zmm6
+    vpxorq zmm3, zmm3, zmm7
+    vmovdqa64 zmm4, [rip + .Lflock_c4_out_even]
+    vmovdqa64 zmm5, [rip + .Lflock_c4_out_odd]
+    vmovdqa64 zmm8, zmm0
+    vpermt2b zmm8, zmm4, zmm1
+    vpermt2b zmm0, zmm5, zmm1
+    vmovdqu64 [rdx], zmm8
+    vmovdqu64 [rdx + 64], zmm0
     vmovdqa64 zmm9, zmm2
-    vmovdqa64 zmm10, zmm5
-    vmovdqa64 zmm11, zmm6
-.else
-    vpternlogq zmm8, zmm9, zmm1, 0x96
-    vmovdqa64 zmm9, zmm2
-    vpternlogq zmm10, zmm11, zmm5, 0x96
-    vmovdqa64 zmm11, zmm6
-.endif
-.endm
-.macro flock_c4_pass p
-    flock_c4_residue 0, \p
-    flock_c4_residue 1, \p
-    flock_c4_residue 2, \p
-    flock_c4_residue 3, \p
-    vpxorq zmm8, zmm8, zmm9
-    vpxorq zmm10, zmm10, zmm11
-    // The XOR halves are dead now: reuse them for the output indices.
-    vmovdqa64 zmm9, [rip + .Lflock_c4_out_even]
-    vmovdqa64 zmm11, [rip + .Lflock_c4_out_odd]
-    vmovdqa64 zmm0, zmm8
-    vpermt2b zmm0, zmm9, zmm10
-    vpermt2b zmm8, zmm11, zmm10
-    vmovdqu64 [rdx + 128*\p], zmm0
-    vmovdqu64 [rdx + 128*\p + 64], zmm8
-.endm
-    flock_c4_pass 0
-    flock_c4_pass 1
+    vpermt2b zmm9, zmm4, zmm3
+    vpermt2b zmm2, zmm5, zmm3
+    vmovdqu64 [rdx + 128], zmm9
+    vmovdqu64 [rdx + 192], zmm2
+    vmovdqa64 zmm12, [rsp + 512]
+    vmovdqa64 zmm13, [rsp + 576]
     mov rsp, rax
     ret
 .size flock_gfni_c4_lm_preserving, .-flock_gfni_c4_lm_preserving
 .purgem flock_c4_gather
-.purgem flock_c4_pair
-.purgem flock_c4_residue
-.purgem flock_c4_pass
+.purgem flock_c4_shared
+.purgem flock_c4_shared_fold
 
 .section .rodata
 

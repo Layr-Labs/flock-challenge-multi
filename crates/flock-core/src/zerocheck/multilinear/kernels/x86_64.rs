@@ -5599,7 +5599,6 @@ unsafe extern "C" {
 
 
 /// Return the unmasked lane-major C4 tile directly in four vector values.
-/// The private ELF leaf preserves ZMM12..31 and every GPR except RAX.
 /// The fallback uses the same unmasked Rust fold and output ordering.
 ///
 /// # Safety
@@ -5632,6 +5631,7 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            out("zmm12") _, out("zmm13") _,
         );
         [a, b, c, d]
     }
