@@ -1642,6 +1642,7 @@ struct Drain8<'t> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_temporal: bool,
     proj: StreamProj<'t>,
     elide: [bool; 3],
     ranked_static: bool,
@@ -2047,6 +2048,7 @@ struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_temporal: bool,
     /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
     /// bit 6 z non-temporal, bit 7 wide streaming stores.
     flags: u8,
@@ -2093,7 +2095,7 @@ impl StepRows {
                 b_hi,
                 f & 0x10 != 0,
                 f & 0x20 != 0,
-                true,
+                !self.b_temporal,
                 wide,
             );
         }
@@ -2115,6 +2117,7 @@ struct RankedRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    b_temporal: bool,
 }
 
 impl RankedRows {
@@ -2126,7 +2129,24 @@ impl RankedRows {
             debug_assert!((a as usize).is_multiple_of(64));
             debug_assert!((b as usize).is_multiple_of(64));
         }
-        Self { z, a, b }
+        Self { z, a, b, b_temporal: false }
+    }
+
+    #[inline(always)]
+    fn new_with_b_policy(z: *mut u32, a: *mut u32, b: *mut u32, b_temporal: bool) -> Self {
+        Self { b_temporal, ..Self::new(z, a, b) }
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_b_line(&self, p: *mut u32, v: __m512i) {
+        unsafe {
+            if self.b_temporal {
+                _mm512_store_si512(p.cast::<__m512i>(), v);
+            } else {
+                stream_ranked_line(p, v);
+            }
+        }
     }
 
     /// Dense ranked windows 2..29: z, a, and b are all fully live.
@@ -2142,7 +2162,7 @@ impl RankedRows {
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
                 stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
                 stream_ranked_line(self.a.add(o), av);
-                stream_ranked_line(self.b.add(o), bv);
+                self.publish_b_line(self.b.add(o), bv);
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
@@ -2152,7 +2172,7 @@ impl RankedRows {
                 let b_hi = load_v8(bp.add(8));
                 stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
-                stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
+                emit_pair(self.b.add(o), b_lo, b_hi, true, true, !self.b_temporal, true);
             }
         }
     }
@@ -2166,7 +2186,7 @@ impl RankedRows {
             let o = j * U32_PER_BLOCK;
             stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
             stream_ranked_line(self.a.add(o), av);
-            stream_ranked_line(self.b.add(o), bv);
+            self.publish_b_line(self.b.add(o), bv);
         }
     }
 
@@ -2369,7 +2389,7 @@ impl Drain8<'_> {
                 let mut q = [0u64; 8];
                 store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
                 store_v8(q.as_mut_ptr().cast::<u32>().add(8), _mm256_permute2x128_si256::<0x31>(l, h));
-                let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480));
+                let rows = RankedRows::new_with_b_policy(self.z.add(480), self.a.add(480), self.b.add(480), self.b_temporal);
                 let qp = q.as_ptr();
                 let mut j = 0usize;
                 while j != 8 {
@@ -2379,11 +2399,9 @@ impl Drain8<'_> {
             } else {
                 debug_assert!(base_word == 0 || base_word == 16);
                 let a_rows = tr8x16_zmm(self.ast, base_word);
-                let rows = RankedRows::new(
-                    self.z.add(base_word),
+                let rows = RankedRows::new_with_b_policy(self.z.add(base_word),
                     self.a.add(base_word),
-                    self.b.add(base_word),
-                );
+                    self.b.add(base_word), self.b_temporal);
                 let mut j = 0usize;
                 while j != 8 {
                     rows.publish_static_values(j, a_rows[j]);
@@ -2427,11 +2445,9 @@ impl Drain8<'_> {
                 let rw = step * STEP_WORDS;
                 let abs_word = base_word + rw;
                 let blk = abs_word / STEP_WORDS;
-                let rows = RankedRows::new(
-                    self.z.add(abs_word),
+                let rows = RankedRows::new_with_b_policy(self.z.add(abs_word),
                     self.a.add(abs_word),
-                    self.b.add(abs_word),
-                );
+                    self.b.add(abs_word), self.b_temporal);
                 let plan = preps.get_unchecked(blk).0;
 #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
                 if (2..=29).contains(&blk) && plan.bcomplement_static_eligible(){
@@ -2466,11 +2482,9 @@ impl Drain8<'_> {
             let proj = &self.proj;
             let preps = self.ranked_preps.unwrap_unchecked();
             let blk = abs_word / STEP_WORDS;
-            let rows = RankedRows::new(
-                self.z.add(abs_word),
+            let rows = RankedRows::new_with_b_policy(self.z.add(abs_word),
                 self.a.add(abs_word),
-                self.b.add(abs_word),
-            );
+                self.b.add(abs_word), self.b_temporal);
             let (plan, imgs) = *preps.get_unchecked(blk);
             let wc = WidenConsts::new();
             #[repr(align(64))]
@@ -2513,7 +2527,7 @@ impl Drain8<'_> {
                 match blk {
                     0 | 1 if static01_direct => {
                         let a_rows = tr8x16_zmm(self.ast, rw);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static_values(j, a_rows[j]);
@@ -2529,7 +2543,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<0>(j, sa);
@@ -2545,7 +2559,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<1>(j, sa);
@@ -2563,7 +2577,7 @@ impl Drain8<'_> {
                         let z = _mm256_setzero_si256();
                         store_v8(sa.add(16), z);
                         store_v8(sa.add(24), z);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         let (plan, imgs) = preps[30];
                         proj.project_blocks_ranked_30(plan, imgs, rows);
                     }
@@ -2573,7 +2587,7 @@ impl Drain8<'_> {
                         struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                         let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                         let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         let (plan, imgs) = preps[blk];
                         project_blocks_ranked_hot_offsets_direct_inline::<true>(
                             proj,
@@ -2647,7 +2661,7 @@ impl Drain8<'_> {
                 }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -2714,7 +2728,7 @@ impl Drain8<'_> {
                     // z/a/b.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
                                 if maddubs {
@@ -2760,7 +2774,7 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new_with_b_policy(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word), self.b_temporal);
                         proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                     }
                 } else {
@@ -2810,7 +2824,7 @@ impl Drain8<'_> {
                     if g + 1 >= b_g0 && g + 1 < b_g1 {
                         flags |= 0x20;
                     }
-                    let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), flags };
+                    let rows=StepRows { z:self.z.add(abs_word), a:self.a.add(abs_word), b:self.b.add(abs_word), b_temporal:self.b_temporal, flags };
                     proj.project_blocks_ranked(blk,plan,imgs,rows,op as *const u16,use_off);
                 }
             }
@@ -2959,6 +2973,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
     elide: [bool; 3],
     ranked_static: bool,
     ranked_preps: Option<&RankedClosedWindowPreps>,
+    b_temporal: bool,
 ) {
     unsafe {
         #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -3006,6 +3021,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             z,
             a,
             b,
+            b_temporal,
             proj,
             elide,
             ranked_static,
@@ -3172,6 +3188,12 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide(inputs: OctaInputs<'_>, z: *mut u32, a: *mut u32, b: *mut u32, proj: StreamProj<'_>, elide: [bool; 3]) {
+    unsafe { build_octa_witness_ab_stream_elide_with_b_policy(inputs, z, a, b, proj, elide, false) }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(
     all(
         target_feature = "avx512f",
@@ -3184,18 +3206,25 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
     ),
     target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
-pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
+pub(crate) unsafe fn build_octa_witness_ab_stream_elide_with_b_policy(
     inputs: OctaInputs<'_>,
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
     proj: StreamProj<'_>,
     elide: [bool; 3],
+    b_temporal: bool
 ) {
     unsafe {
-        // Only the all-elide provenance state selects the ranked static
-        // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        // The ranked static publishers require full-line NT output and
+        // 64-byte destination rows. A small/general allocation or temporal
+        // plan keeps the original complete generic arithmetic instead.
+        let ranked_static = elide == [true; 3]
+            && proj.plan.offsets_eligible(2)
+            && proj.plan.nt2_eligible()
+            && (proj.out as usize).is_multiple_of(64)
+            && (proj.out_stride | proj.out_bias).is_multiple_of(64)
+            && ((z as usize) | (a as usize) | (b as usize)).is_multiple_of(64);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -3287,8 +3316,15 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             elide,
             ranked_static,
             None,
+            b_temporal,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(init: u64, base: usize, z: *mut u32, a: *mut u32, b: *mut u32, proj: StreamProj<'_>, preps: &RankedClosedWindowPreps, elide: [bool; 3]) {
+    unsafe { build_octa_witness_ab_stream_ranked_closed_with_b_policy(init, base, z, a, b, proj, preps, elide, false) }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3304,7 +3340,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     ),
     target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512dq,gfni")
 )]
-pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed_with_b_policy(
     init: u64,
     base: usize,
     z: *mut u32,
@@ -3313,6 +3349,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
     proj: StreamProj<'_>,
     preps: &RankedClosedWindowPreps,
     elide: [bool; 3],
+    b_temporal: bool
 ) {
     unsafe {
         debug_assert_eq!(elide, [true; 3]);
@@ -3332,6 +3369,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
             elide,
             ranked_static,
             Some(preps),
+            b_temporal,
         );
     }
 }
@@ -4139,7 +4177,9 @@ mod tests {
             );
         }
 
-        for base in [0usize, 8, 240, 131_064] {
+        for (base, b_temporal) in [0usize, 8, 240, 131_064].into_iter()
+            .flat_map(|base| [false, true].map(|policy| (base, policy)))
+        {
             let mut z_ref = z_seed.clone();
             let mut a_ref = a_seed.clone();
             let mut b_ref = b_seed.clone();
@@ -4148,6 +4188,13 @@ mod tests {
             let mut z_new = z_seed.clone();
             let mut a_new = a_seed.clone();
             let mut b_new = b_seed.clone();
+            if b_temporal {
+                b_new.0.fill(0xa5a5_a5a5);
+                for block in b_new.0.chunks_exact_mut(U32_PER_BLOCK) {
+                    let dense = unsafe { &mut *block.as_mut_ptr().cast::<[u8; 2048]>() };
+                    flock_core::zerocheck::b_residual::fill_dense_constants(dense);
+                }
+            }
             let mut ab_new = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
 
             unsafe {
@@ -4168,7 +4215,7 @@ mod tests {
                     },
                     [true; 3],
                 );
-                build_octa_witness_ab_stream_ranked_closed(
+                build_octa_witness_ab_stream_ranked_closed_with_b_policy(
                     init,
                     base,
                     z_new.0.as_mut_ptr(),
@@ -4186,6 +4233,7 @@ mod tests {
                     },
                     &preps,
                     [true; 3],
+                    b_temporal,
                 );
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");

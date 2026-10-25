@@ -1214,6 +1214,14 @@ pub struct Round1AbWindowPlan {
 }
 
 impl Round1AbWindowPlan {
+    /// Whether this plan selected complete 64-byte non-temporal output stores.
+    /// Callers using a fixed-width leaf must also check their actual output
+    /// pointer; offset-kernel eligibility alone does not imply this mode.
+    #[inline]
+    pub fn nt2_eligible(&self) -> bool {
+        self.nt == 2
+    }
+
     /// True when the caller has independently established the ranked BLAKE3
     /// static-B geometry and may use the checked-table complement leaf.
     #[inline]
@@ -4159,16 +4167,44 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Vec<F128> {
+    round1_shift_reduce_ab_packed_padded_with_precomputed_storage(
+        ab_inner,
+        a_packed,
+        super::b_storage::PackedB::Dense(b_packed),
+        m,
+        k_skip,
+        r,
+        inv_table,
+        padding,
+    )
+}
+
+pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed_storage(
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: super::b_storage::PackedB<'_>,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Vec<F128> {
     use rayon::prelude::*;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(b_packed.logical_bytes(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
-    ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    if ab_inner.invalid_prefix_bytes() != 0 {
+        ab_inner.fill_invalid_prefix(
+            a_packed,
+            b_packed.dense().expect("prefix repair needs dense B"),
+            inv_table,
+        );
+    }
     let r_outer = &r[k_skip + N_INNER..];
     let n_hi = r_outer.len().min(SplitEqGhash::MAX_N_HI);
     let n_lo = r_outer.len() - n_hi;

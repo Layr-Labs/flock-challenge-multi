@@ -20,7 +20,10 @@ use crate::field::{F8, F128};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
 
+pub mod b_residual;
+pub mod b_storage;
 pub mod multilinear;
+use b_storage::PackedB;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;
 pub mod univariate_skip_deg4_optimized;
@@ -28,13 +31,11 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
-    fold2_from_packed_and_round_pair_lookahead_into_with_eq,
     fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
     packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
-    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
-    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq, zc_lane_major_handoff_on,
+    uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead, zc_lane_major_handoff_on,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -341,7 +342,15 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed,
+        PackedB::Dense(b_packed),
+        c_packed,
+        m,
+        padding,
+        false,
+        None,
+        None,
+        challenger,
     );
     (proof, claim)
 }
@@ -362,7 +371,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed,
+        PackedB::Dense(b_packed),
+        c_packed,
+        m,
+        padding,
+        true,
+        None,
+        None,
+        challenger,
     );
     (
         proof,
@@ -400,7 +417,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
-        b_packed,
+        PackedB::Dense(b_packed),
         c_packed,
         m,
         padding,
@@ -462,6 +479,39 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
+        PackedB::Dense(b_packed),
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some((c_identity_z, roots)),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Typed packed-B sibling; residual storage is decoded only by B-aware consumers.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots_storage<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_packed: PackedB<'_>,
+    c_packed: &[u8],
+    c_identity_z: &[F128],
+    roots: Option<&crate::lincheck::RootFoldSource>,
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
         b_packed,
         c_packed,
         m,
@@ -489,7 +539,7 @@ fn w30_elide_debug() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
-    b_packed: &[u8],
+    b_input: PackedB<'_>,
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
@@ -498,6 +548,17 @@ fn prove_packed_padded_inner<C: Challenger>(
     c_identity_z: Option<(&[F128], Option<&crate::lincheck::RootFoldSource>)>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
+    // Non-identity/precompute routes retain their complete dense oracle.
+    let dense_entry = (b_input.residual().is_some()
+        && (precomputed_ab
+            .as_ref()
+            .is_none_or(|ab| ab.invalid_prefix_bytes() != 0)
+            || c_identity_z.is_none()))
+    .then(|| b_input.to_dense_bytes());
+    let mut b_packed = dense_entry
+        .as_deref()
+        .map(PackedB::Dense)
+        .unwrap_or(b_input);
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -507,7 +568,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     );
     let expected_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    assert_eq!(b_packed.logical_bytes(), expected_bytes);
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -562,7 +623,11 @@ fn prove_packed_padded_inner<C: Challenger>(
             // Fold4/quad fallback consumers require dense AB. In particular,
             // disabling identity-C must not expose the producer's omitted
             // one-row windows as though they had been initialized.
-            ab_inner.restore_full_if_ranked_one_rows_elided(a_packed, b_packed, inv_table);
+            ab_inner.restore_full_if_ranked_one_rows_elided(
+                a_packed,
+                b_packed.dense().expect("dense round-one fallback"),
+                inv_table,
+            );
         }
         if let Some((c_identity_z, roots)) = c_identity_z {
             // Ranked identity-C: AB completes without touching `c_packed`, and
@@ -595,7 +660,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             let t_r1 = std::time::Instant::now();
             let ab_closure = || {
                 let t = std::time::Instant::now();
-                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_storage(
                     ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
                 );
                 (ab, t.elapsed().as_secs_f64() * 1e3)
@@ -687,7 +752,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                    ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                    ab_inner, a_packed, b_packed.dense().expect("dense round-one fallback"), c_packed, m, k_skip, &r, inv_table, padding,
                 );
             (
                 ab,
@@ -702,7 +767,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         } else {
             let (ab, c, s_hat_v_c, quad) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
-                    ab_inner, a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                    ab_inner, a_packed, b_packed.dense().expect("dense round-one fallback"), c_packed, m, k_skip, &r, inv_table, padding,
                 );
             (
                 ab,
@@ -718,7 +783,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else if capture_s_hat_v_c {
         let (ab, c, s_hat_v_c, quad) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
-                a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+                a_packed, b_packed.dense().expect("dense round-one fallback"), c_packed, m, k_skip, &r, inv_table, padding,
             );
         (
             ab,
@@ -732,7 +797,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         )
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
-            a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
+            a_packed,
+            b_packed.dense().expect("dense round-one fallback"),
+            c_packed,
+            m,
+            k_skip,
+            &r,
+            inv_table,
+            padding,
         );
         (ab, c, None)
     };
@@ -808,6 +880,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // round-five lookahead too, so it needs `r[k_skip+3] ≠ 0` (β₀ at the
     // ranked shape). Kill switch: FLOCK_NO_ZC_SWEEP_NOMAT.
     let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
+    // A rare zero challenge or an explicit diagnostic rollback can select a
+    // materializing tail. Allocate real dense storage before that fallback.
+    let dense_tail =
+        (!use_nomat && b_packed.residual().is_some()).then(|| b_packed.to_dense_bytes());
+    if let Some(bytes) = dense_tail.as_deref() {
+        b_packed = PackedB::Dense(bytes);
+    }
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
@@ -822,22 +901,23 @@ fn prove_packed_padded_inner<C: Challenger>(
         .filter(|eq| eq.n_lo >= 3);
 
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
-        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-            packed_eq.as_ref(),
-            r2_canon_rows.as_deref(),
-        );
+        let (m1, mi, la) =
+            multilinear::uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_storage(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+                packed_eq.as_ref(),
+                r2_canon_rows.as_deref(),
+            );
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
         let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
             a_packed,
-            b_packed,
+            b_packed.dense().expect("dense lookahead fallback"),
             m,
             k_skip,
             &fold_table,
@@ -848,7 +928,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else {
         let (a, b, m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded(
             a_packed,
-            b_packed,
+            b_packed.dense().expect("dense fold fallback"),
             m,
             k_skip,
             &fold_table,
@@ -1034,21 +1114,22 @@ fn prove_packed_padded_inner<C: Challenger>(
                 _ => None,
             };
             let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
-            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-                a_packed,
-                b_packed,
-                m,
-                k_skip,
-                &fold_table,
-                padding,
-                &mut a4,
-                &mut b4,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next,
-                eq_override,
-                lm_out,
-            );
+            let (m1, mi, la_next) =
+                multilinear::fold2_from_packed_and_round_pair_lookahead_into_with_eq_storage(
+                    a_packed,
+                    b_packed,
+                    m,
+                    k_skip,
+                    &fold_table,
+                    padding,
+                    &mut a4,
+                    &mut b4,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next,
+                    eq_override,
+                    lm_out,
+                );
             a_mlv = a4;
             b_mlv = b4;
             if level + 1 < n_levels {

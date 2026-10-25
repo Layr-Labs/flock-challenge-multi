@@ -32,6 +32,7 @@ use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
+use flock_core::zerocheck::b_storage::BStorage;
 
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
@@ -109,7 +110,7 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
 /// because this gate runs *before* round one produces one; the stripe path
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
 #[inline]
-fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
+pub(crate) fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_ab_precompute_enabled(r1cs)
         && pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
@@ -491,12 +492,12 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_inner(
+    prove_fast_ligerito_from_storage_inner(
         r1cs,
         pcs_params,
         z_packed,
         a_packed_f128,
-        b_packed_f128,
+        BStorage::Dense(b_packed_f128),
         None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
@@ -519,12 +520,12 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_inner(
+    prove_fast_ligerito_from_storage_inner(
         r1cs,
         pcs_params,
         z_packed,
         a_packed_f128,
-        b_packed_f128,
+        BStorage::Dense(b_packed_f128),
         None,
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
@@ -548,7 +549,35 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_inner(
+    prove_fast_ligerito_from_storage_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        BStorage::Dense(b_packed_f128),
+        Some(ab_inner),
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab_storage<
+    Ch: Challenger,
+>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: BStorage,
+    ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_storage_inner(
         r1cs,
         pcs_params,
         z_packed,
@@ -563,12 +592,12 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
+fn prove_fast_ligerito_from_storage_inner<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    b_packed_f128: BStorage,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
@@ -848,7 +877,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         pcs_params,
         z_packed,
         a_packed_f128,
-        b_packed_f128,
+        BStorage::Dense(b_packed_f128),
         None,
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
@@ -863,7 +892,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    b_packed_f128: BStorage,
     ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
@@ -879,12 +908,24 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     }
     let padding = r1cs.padding_spec();
     flock_core::gaptime::mark("core: padding built");
-    gpu_prewire_round1_inputs(
-        &a_packed_f128,
-        &b_packed_f128,
-        &z_packed,
-        prefaulted_codeword.as_deref(),
-    );
+    let b_packed_f128 = if ranked_identity_c_fold_enabled(r1cs) {
+        b_packed_f128
+    } else {
+        b_packed_f128.into_dense()
+    };
+    if let Some(dense_b) = b_packed_f128.dense_f128() {
+        gpu_prewire_round1_inputs(
+            &a_packed_f128,
+            dense_b,
+            &z_packed,
+            prefaulted_codeword.as_deref(),
+        );
+    } else {
+        assert!(
+            ab_inner.is_some(),
+            "residual B requires complete streamed AB projection"
+        );
+    }
     flock_core::gaptime::mark("core: gpu prewire spawned");
     // The BLAKE3 padding rows force every block's tail words to zero, which in
     // the SoA codeword is a static all-zero pattern on the top lanes of every
@@ -918,7 +959,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             let r = commit_with_round1_ab_precompute(
                 &z_packed,
                 &a_packed_f128,
-                &b_packed_f128,
+                b_packed_f128
+                    .dense_f128()
+                    .expect("dense precompute fallback"),
                 pcs_params,
                 &padding,
                 prefaulted_codeword,
@@ -969,12 +1012,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     a_packed_f128.len() * core::mem::size_of::<F128>(),
                 )
             };
-            let b_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    b_packed_f128.as_ptr() as *const u8,
-                    b_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
+            let b_packed = b_packed_f128.view();
             let c_packed: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     z_packed.as_ptr() as *const u8,
@@ -984,13 +1022,13 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             flock_core::gaptime::mark("zerocheck: views built");
             let r = match c_identity_z {
             Some(c_identity_z) => {
-                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots(
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_roots_storage(
                     a_packed, b_packed, c_packed, c_identity_z, roots.as_deref(), r1cs.m, &padding, ab_inner,
                     challenger,
                 )
             }
             None => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+                a_packed, b_packed.dense().expect("non-identity route requires dense B"), c_packed, r1cs.m, &padding, ab_inner, challenger,
             ),
         };
             flock_core::gaptime::mark("zerocheck: work done");
@@ -1002,7 +1040,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    b_packed_f128.recycle();
     flock_core::gaptime::mark("a/b recycled to scratch pool");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);

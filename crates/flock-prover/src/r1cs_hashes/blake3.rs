@@ -2260,6 +2260,36 @@ pub fn generate_witness_with_ab_packed_and_round1_inner_from(
     generate_witness_with_ab_packed_and_round1_inner_impl(blocks, n_blocks_log, use_nt)
 }
 
+/// Typed internal witness path. Residual B owns only its physical bytes;
+/// every proof reconstructs the structural constants and writes fresh payloads.
+pub(crate) fn generate_witness_with_ab_packed_and_round1_inner_storage_from(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::b_storage::BStorage,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+              target_feature = "avx512f", target_feature = "avx512bw",
+              target_feature = "avx512vbmi2"))]
+    if n_blocks_log >= 3
+        && live_witgen_simd_enabled()
+        && witgen_simd::witgen_ab_nt_enabled()
+        && witgen_simd::witgen_ab_winstream_enabled()
+        && flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        ) == 0
+    {
+        return generate_witness_with_ab_packed_and_round1_inner_residual_impl(
+            blocks, n_blocks_log,
+        );
+    }
+    let (z, a, b, ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, n_blocks_log);
+    (z, a, flock_core::zerocheck::b_storage::BStorage::Dense(b), ab)
+}
+
 /// Ranked 8-wide AVX2 witness builder. Default ON (`env is none`);
 /// `FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop.
 fn live_witgen_simd_enabled() -> bool {
@@ -2413,6 +2443,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             && n_total == 1 << 18
             && ranked_static
             && ranked_plan.offsets_eligible(2)
+            && flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled()
             && blake3_witgen8::ey_dead_w31_enabled()
             && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
             && flock_core::pcs::ranked_direct_fold8_enabled()
@@ -2625,6 +2656,135 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     (z, a, b, ab_inner)
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+          target_feature = "avx512f", target_feature = "avx512bw",
+          target_feature = "avx512vbmi2"))]
+fn generate_witness_with_ab_packed_and_round1_inner_residual_impl(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    n_blocks_log: usize,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    flock_core::zerocheck::b_storage::BStorage,
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let use_nt = false;
+    let use_simd = true;
+    let ab_nt = true;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+
+    let n_total = 1usize << n_blocks_log;
+    assert!(blocks.len() <= n_total);
+    // Round 1's GPU URM share (x_hi ∈ [0, g)) recomputes its windows from
+    // the raw a/b buffers, so the ab_inner prefix it covers is never read —
+    // skip its projection here and mark the prefix invalid; round 1
+    // recomputes it on CPU only if the GPU share fails to materialize.
+    // `FLOCK_NO_AB_INNER_SKIP=1` kills the skip.
+    let skip_bytes =
+        flock_core::zerocheck::univariate_skip_optimized::planned_round1_gpu_prefix_bytes(
+            K_LOG + n_blocks_log,
+        );
+    assert_eq!(skip_bytes % BYTES_PER_BLOCK, 0);
+    let skip_blocks = skip_bytes / BYTES_PER_BLOCK;
+    let n_f128 = n_total * F128_PER_BLOCK;
+    // a/b come back from the pool with witgen provenance when the previous
+    // prove released them untouched (zerocheck reads them through shared
+    // slices only); a token hit lets the octa dump skip re-storing the
+    // content-independent constant regions (see the elision block in
+    // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
+    // the incumbent full writes. Tagged takes go FIRST so z's untagged take
+    // cannot consume a provenance-carrying buffer of the same size class.
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    let mut b = flock_core::zerocheck::b_residual::Builder::new(n_total)
+        .expect("valid B residual witness shape");
+    // A newly initialized constant scratch template supplies every elided B
+    // byte. No previous proof or recycled dense contents are consulted.
+    let b_tok = true;
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    const {
+        assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
+    }
+    let inv_table_owned;
+    let inv_table: &flock_core::ntt::InvNttTableByteSingleGf8 = if witgen_urm_share_enabled() {
+        flock_core::zerocheck::shared_urm_inv_table()
+    } else {
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l =
+            flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        &inv_table_owned
+    };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let ranked_compact = {
+        // Compact storage is valid only when this exact prove selects the
+        // ranked-static drain. Cold/provenance-miss drains still project rows
+        // 0, 1 and 31 even though the downstream ranked consumer ignores
+        // them, so those runs retain the dense allocation. The plan check
+        // mirrors `build_octa_witness_ab_stream_elide`'s second half of the
+        // `ranked_static` brand, including its same-binary offsets rollback.
+        let elide_on = witgen_simd::const_elide_enabled();
+        let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+        let ranked_static = z_tok && elide_on && a_tok && ab_elide && b_tok && ab_elide;
+        let ranked_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                inv_table,
+                &[],
+                false,
+            );
+        use_simd
+            && !use_nt
+            && n_total >= 8
+            && ab_nt
+            && witgen_simd::witgen_ab_winstream_enabled()
+            && skip_blocks == 0
+            && n_total == 1 << 18
+            && ranked_static
+            && ranked_plan.offsets_eligible(2)
+            && flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled()
+            && blake3_witgen8::ey_dead_w31_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::pcs::ranked_direct_fold8_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled()
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let ranked_compact = false;
+    let mut ab_inner = if ranked_compact {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    } else {
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            n_total * BYTES_PER_BLOCK,
+        )
+    };
+    ab_inner.set_invalid_prefix_bytes(skip_bytes);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+
+    let elide_on = witgen_simd::const_elide_enabled();
+    let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
+    generate_round1_inner_octa_residual(
+        blocks, skip_blocks, &mut z, &mut a, &mut b, &mut ab_inner,
+        inv_table, &padding, [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
+        ab_nt, RankedClosedDispatch::Auto,
+    );
+    flock_core::scratch::register_pending_tag(
+        a.as_ptr(), witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+    );
+    flock_core::scratch::register_pending_tag(
+        z.as_ptr(), witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    let b = b.finish().expect("every B residual block published");
+    (z, a, flock_core::zerocheck::b_storage::BStorage::Residual(b), ab_inner)
+}
+
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
 /// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
 /// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
@@ -2728,6 +2888,24 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     // 64-byte lines backing one task's streaming projection staging pair.
     const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
     let group_f128 = GROUP * F128_PER_BLOCK;
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    let ranked_inputs_aligned = ((z.as_ptr() as usize)
+        | (a.as_ptr() as usize)
+        | (b.as_ptr() as usize))
+        .is_multiple_of(64);
+    // Compact ownership is valid only for the complete ranked-static
+    // publisher. A generic fallback writes all 32 logical windows, so it
+    // must receive a real dense allocation, not merely a cleared brand.
+    if ab_inner.ranked_compact()
+        && (!abinner_nt
+            || !ranked_inputs_aligned
+            || !(ab_inner.as_bytes_mut().as_ptr() as usize).is_multiple_of(64))
+    {
+        *ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            core::mem::size_of_val(z),
+        );
+        ab_inner.set_invalid_prefix_bytes(skip_blocks * BYTES_PER_BLOCK);
+    }
     let compact = ab_inner.ranked_compact();
     let ab_block_bytes = if compact {
         COMPACT_BYTES_PER_BLOCK
@@ -2735,7 +2913,6 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         BYTES_PER_BLOCK
     };
     let group_bytes = GROUP * ab_block_bytes;
-    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
     let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
         inv_table,
         ab_inner.as_bytes_mut(),
@@ -2750,6 +2927,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         // in windows 2 and 29. The generic drain must keep dense AB.
         && elide == [true; 3]
         && win_plan.offsets_eligible(2)
+        && win_plan.nt2_eligible()
+        && ranked_inputs_aligned
         && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
         && flock_core::pcs::ranked_direct_fold8_enabled();
     if one_rows_elided {
@@ -3040,6 +3219,400 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                         );
                     }
                 }
+                // Last NT store of the task in every arm — a/b's streams included.
+                if abinner_nt || z_nt || ab_nt {
+                    flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                }
+            },
+        );
+}
+
+/// L1 staging used only for fresh B witness bytes, never across proofs.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+          target_feature = "avx512f", target_feature = "avx512bw",
+          target_feature = "avx512vbmi2"))]
+#[repr(C, align(64))]
+struct ResidualBStage([core::mem::MaybeUninit<u8>; 8 * 2048]);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+          target_feature = "avx512f", target_feature = "avx512bw",
+          target_feature = "avx512vbmi2"))]
+impl ResidualBStage {
+    fn new() -> Box<Self> {
+        let mut stage = Box::new(Self([core::mem::MaybeUninit::uninit(); 8 * 2048]));
+        // A nonzero test sentinel catches a missed payload write. Production
+        // avoids a redundant full scratch clear; no initialized byte view is
+        // formed until the completed original writer has supplied all payload.
+        #[cfg(test)]
+        for byte in &mut stage.0 { byte.write(0xa5); }
+        stage.reset_constants();
+        stage
+    }
+    fn reset_constants(&mut self) {
+        use core::arch::x86_64::*;
+        for block in 0..8 {
+            for (line, plan) in flock_core::zerocheck::b_residual::PLAN.iter().enumerate() {
+                // Masked stores write only the wholly constant bytes. They
+                // neither read the uninitialized target nor initialize any
+                // variable/mixed byte that the original drain must produce.
+                unsafe {
+                    let constants = _mm512_loadu_si512(plan.constants.as_ptr().cast());
+                    let dst = self.0.as_mut_ptr().add(block * 2048 + line * 64);
+                    _mm512_mask_storeu_epi8(dst.cast(), !plan.variable_mask, constants);
+                }
+            }
+        }
+    }
+    unsafe fn publish(
+        &self,
+        out: &mut flock_core::zerocheck::b_residual::ChunkWriter<'_>,
+        first: usize,
+    ) {
+        // The original packed B drain writes every variable/mixed byte in
+        // logical lines 2..29; new() initialized all wholly constant bytes.
+        // Each full octa therefore initializes this entire physical L1 stage.
+        let dense = unsafe { &*self.0.as_ptr().cast::<[u8; 8 * 2048]>() };
+        unsafe {
+            out.encode_dense_octa_native(first, dense, true)
+                .expect("fresh complete B octa and structural constants");
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+          target_feature = "avx512f", target_feature = "avx512bw",
+          target_feature = "avx512vbmi2"))]
+#[allow(clippy::too_many_arguments)]
+fn generate_round1_inner_octa_residual(
+    blocks: crate::seed_pipe::BlockSource<'_>,
+    skip_blocks: usize,
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut flock_core::zerocheck::b_residual::Builder,
+    ab_inner: &mut flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
+    padding: &Compression,
+    elide: [bool; 3],
+    ab_nt: bool,
+    ranked_closed_dispatch: RankedClosedDispatch,
+) {
+    use rayon::prelude::*;
+    const F128_PER_BLOCK: usize = K / 128;
+    const BYTES_PER_BLOCK: usize = K / 8;
+    const U32_PER_BLOCK: usize = K / 32;
+    const SIMD: usize = 8;
+    const GROUP: usize = 16;
+    const COMPACT_BYTES_PER_BLOCK: usize = 29 * 64;
+    // 64-byte lines backing one task's two 8-block a/b windows (32 KiB).
+    const WIN_LINES: usize = 2 * SIMD * BYTES_PER_BLOCK / 64;
+    // 64-byte lines backing one task's streaming projection staging pair.
+    const STAGE_LINES: usize = blake3_witgen8::STREAM_STAGE_WORDS * 4 / 64;
+    let group_f128 = GROUP * F128_PER_BLOCK;
+    assert!(ab_nt && witgen_simd::witgen_ab_winstream_enabled());
+    assert_eq!(skip_blocks, 0);
+    let abinner_nt = flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled();
+    // ResidualBStage owns 64-byte-aligned B rows independently of the
+    // allocator. The remaining actual destinations must satisfy the same
+    // full-line contract as the dense ranked-static publisher.
+    let ranked_inputs_aligned =
+        ((z.as_ptr() as usize) | (a.as_ptr() as usize)).is_multiple_of(64);
+    if ab_inner.ranked_compact()
+        && (!abinner_nt
+            || !ranked_inputs_aligned
+            || !(ab_inner.as_bytes_mut().as_ptr() as usize).is_multiple_of(64))
+    {
+        *ab_inner = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(
+            core::mem::size_of_val(z),
+        );
+    }
+    let compact = ab_inner.ranked_compact();
+    let ab_block_bytes = if compact {
+        COMPACT_BYTES_PER_BLOCK
+    } else {
+        BYTES_PER_BLOCK
+    };
+    let group_bytes = GROUP * ab_block_bytes;
+    let win_plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+        inv_table,
+        ab_inner.as_bytes_mut(),
+        abinner_nt,
+    );
+    // Streaming form of the fused projection: no whole-block window buffer.
+    let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    let one_rows_elided = ab_stream
+        && skip_blocks == 0
+        && z.len() / F128_PER_BLOCK == 1 << 18
+        // Only the ranked static offset drain removes the partial one rows
+        // in windows 2 and 29. The generic drain must keep dense AB.
+        && elide == [true; 3]
+        && win_plan.offsets_eligible(2)
+        && win_plan.nt2_eligible()
+        && ranked_inputs_aligned
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+        && flock_core::pcs::ranked_direct_fold8_enabled();
+    if one_rows_elided {
+        ab_inner.set_ranked_one_rows_elided();
+    }
+    assert!(!compact || one_rows_elided);
+    // Window 30's round-one AB transform is dead under the one-row brand:
+    // round one adds its exact contribution from the identity-C fold.
+    let w30_elided = one_rows_elided
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_w30_elide_enabled();
+    if w30_elided {
+        ab_inner.set_ranked_w30_elided();
+    }
+
+    // ab_inner's next reader is zerocheck round 1 — after the whole commit
+    // phase, DRAM-cold at the ranked shape — so the streamed transform
+    // publishes it non-temporally (deletes the 512 MiB write-allocate RFO).
+    // z's next reader is the commit encode — the next phase, DRAM-class
+    // either way at 512 MiB — so its dump streams too. Under `ab_nt` a/b
+    // stream as well: their only in-task reader, the window projection, now
+    // reads the L1 window buffers instead of the 512 MiB buffers themselves.
+    // Contract: one sfence per rayon task, below, before the task's release.
+    let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ab_inner_bytes = ab_inner.as_bytes_mut();
+    // Exact ranked-closed specialisation: only the crown worker's committed
+    // shape reaches it, and only when the current binary still selects the
+    // direct-dense inline + maddubs chain the helper reuses.
+    let ranked_closed_exact_eligible = matches!(
+        blocks,
+        crate::seed_pipe::BlockSource::Closed { len, .. } if len == 1 << 18
+    ) && compact
+        && ab_stream
+        && one_rows_elided
+        && elide == [true; 3]
+        && abinner_nt
+        && win_plan.offsets_eligible(2)
+        && blake3_witgen8::ranked_direct_dense_publish_enabled()
+        && blake3_witgen8::ranked_direct_dense_inline_enabled()
+        && blake3_witgen8::widen_maddubs_enabled()
+        && blake3_witgen8::ey_dead_w31_enabled()
+        && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
+    let ranked_closed_preps = match ranked_closed_dispatch {
+        RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
+        }
+        RankedClosedDispatch::Auto | RankedClosedDispatch::ForceGeneric => None,
+        RankedClosedDispatch::ForceExact => {
+            assert!(
+                ranked_closed_exact_eligible,
+                "ranked closed exact dispatch requires the committed compact closed-form stream path"
+            );
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
+        }
+    };
+    let ranked_closed_init = match (ranked_closed_preps.as_ref(), blocks) {
+        (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
+        _ => None,
+    };
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
+    if let (Some(preps), Some(init)) = (ranked_closed_preps.as_ref(), ranked_closed_init)
+        && w30_elided
+        && blake3_witgen8::ranked_static01_direct_enabled()
+    {
+        z.par_chunks_mut(group_f128)
+            .zip(a.par_chunks_mut(group_f128))
+            .zip(b.chunks_mut(GROUP).collect::<Vec<_>>().into_par_iter())
+            .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+            .enumerate()
+            .for_each_init(ResidualBStage::new, |b_stage, (g, (((z_out, a_out), mut b_out), ab_out))| {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        let proj = blake3_witgen8::StreamProj {
+                            stage: core::ptr::null_mut(),
+                            out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                            out_stride: ab_block_bytes,
+                            out_bias: 2 * 64,
+                            inv_table,
+                            plan: win_plan,
+                            one_rows_elided: true,
+                            w30_elided: true,
+                        };
+                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed_with_b_policy(
+                            init,
+                            base,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_stage.0.as_mut_ptr().cast::<u32>(),
+                            proj,
+                            &preps.0,
+                            [true; 3],
+                            true,
+                        );
+                        b_stage.publish(&mut b_out, half * SIMD);
+                    }
+                }
+                flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+            });
+        return;
+    }
+    z.par_chunks_mut(group_f128)
+        .zip(a.par_chunks_mut(group_f128))
+        .zip(b.chunks_mut(GROUP).collect::<Vec<_>>().into_par_iter())
+        .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
+        .enumerate()
+        .for_each_init(
+            || {
+                // Rayon splits this down to one bout per GROUP under stealing
+                // pressure, so the init runs about as often as the dump does —
+                // it must not zero the 32 KiB. `MaybeUninit` keeps the raw
+                // allocation (64-aligned via `AbWinLine`) and skips the fill;
+                // the dump writes every window byte before the projection
+                // reads any.
+                let mut v: Vec<core::mem::MaybeUninit<AbWinLine>> = Vec::new();
+                let want = if ab_stream {
+                    STAGE_LINES
+                } else if ab_nt {
+                    WIN_LINES
+                } else {
+                    0
+                };
+                if want != 0 {
+                    v.reserve_exact(want);
+                    // SAFETY: `MaybeUninit<T>` needs no initialization, and
+                    // `reserve_exact` guaranteed the capacity.
+                    unsafe { v.set_len(want) };
+                }
+                (v, ResidualBStage::new())
+            },
+            |(win, b_stage), (g, (((z_out, a_out), mut b_out), ab_out))| {
+                let n_here = z_out.len() / F128_PER_BLOCK;
+                // The two window sides live back-to-back in one 64-aligned
+                // allocation: `[a windows | b windows]`, each 8 blocks of
+                // U32_PER_BLOCK words in the same row-major geometry as a/b.
+                let win_ab = if ab_nt && !ab_stream {
+                    debug_assert_eq!(win.len(), WIN_LINES);
+                    let wa = win.as_mut_ptr().cast::<u32>();
+                    // SAFETY: `win` owns 2 * SIMD * U32_PER_BLOCK u32s.
+                    Some((wa, unsafe { wa.add(SIMD * U32_PER_BLOCK) }))
+                } else {
+                    None
+                };
+                let stage = if ab_stream {
+                    debug_assert_eq!(win.len(), STAGE_LINES);
+                    Some(win.as_mut_ptr().cast::<u32>())
+                } else {
+                    None
+                };
+                // SAFETY: crate compiled with AVX2; each half owns 8 contiguous
+                // 512-word blocks in z/a/b, and `win_ab`'s two halves are 8
+                // contiguous 512-word blocks disjoint from every witness buffer.
+                // Last rayon chunk may be 8-wide. `elide` skips only
+                // token-verified constant chunks of a/b/z; the windows are
+                // always written in full.
+                unsafe {
+                    for half in 0..(n_here / SIMD) {
+                        let base = GROUP * g + half * SIMD;
+                        let off = half * SIMD * F128_PER_BLOCK;
+                        // Streaming arm: the drain transforms each 64-byte
+                        // round-1 window as it is produced, straight into
+                        // this octa's ab_inner blocks.
+                        let proj = stage.map(|st| {
+                            blake3_witgen8::StreamProj {
+                                stage: st,
+                                out: ab_out
+                                    .as_mut_ptr()
+                                    .add(half * SIMD * ab_block_bytes),
+                                out_stride: ab_block_bytes,
+                                out_bias: if compact { 2 * 64 } else { 0 },
+                                inv_table,
+                                plan: win_plan,
+                                one_rows_elided,
+                                w30_elided,
+                            }
+                        }).unwrap_unchecked();
+                        if let Some(preps) = ranked_closed_preps.as_ref() {
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed_with_b_policy(
+                                ranked_closed_init.unwrap_unchecked(),
+                                base,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                                b_stage.0.as_mut_ptr().cast::<u32>(),
+                                proj,
+                                &preps.0,
+                                elide,
+                                true,
+                            );
+                        } else {
+                            // Lead 2: a full closed-form octa carries only
+                            // init/base into the witness kernel, which
+                            // generates all 25 draws directly in word-major
+                            // SIMD lanes. Slice input still borrows in place;
+                            // only a ragged closed octa uses the scalar
+                            // staging needed to preserve padding semantics.
+                            let staged: [Compression; SIMD];
+                            let octa = match blocks {
+                                crate::seed_pipe::BlockSource::Slice(s) => {
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        s.get(base + j).unwrap_or(padding)
+                                    }))
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len }
+                                    if base + SIMD <= len =>
+                                {
+                                    blake3_witgen8::OctaInputs::Closed { init, base }
+                                }
+                                crate::seed_pipe::BlockSource::Closed { init, len } => {
+                                    staged = std::array::from_fn(|j| {
+                                        let idx = base + j;
+                                        if idx < len {
+                                            crate::seed_pipe::gen_block(init, idx)
+                                        } else {
+                                            *padding
+                                        }
+                                    });
+                                    blake3_witgen8::OctaInputs::Blocks(std::array::from_fn(|j| {
+                                        &staged[j]
+                                    }))
+                                }
+                            };
+                            blake3_witgen8::build_octa_witness_ab_stream_elide_with_b_policy(
+                                octa,
+                                z_out.as_mut_ptr().add(off).cast::<u32>(),
+                                a_out.as_mut_ptr().add(off).cast::<u32>(),
+                                b_stage.0.as_mut_ptr().cast::<u32>(),
+                                proj,
+                                elide,
+                                true,
+                            );
+                        }
+                        b_stage.publish(&mut b_out, half * SIMD);
+                        // Fused arm: project THIS octa's eight blocks now, off
+                        // the just-written windows, while they are L1-hot. Same
+                        // ascending block order as the incumbent loop below, so
+                        // ab_inner's NT stream stays sequential per thread.
+                        if let Some((win_a, win_b)) = win_ab {
+                            for j in 0..SIMD {
+                                if base + j < skip_blocks {
+                                    continue;
+                                }
+                                let a_bytes = std::slice::from_raw_parts(
+                                    win_a.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                );
+                                let b_bytes = std::slice::from_raw_parts(
+                                    win_b.add(j * U32_PER_BLOCK).cast::<u8>(),
+                                    BYTES_PER_BLOCK,
+                                );
+                                let blk = half * SIMD + j;
+                                let ab_blk =
+                                    &mut ab_out[blk * BYTES_PER_BLOCK..(blk + 1) * BYTES_PER_BLOCK];
+                                flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                    a_bytes, b_bytes, ab_blk, inv_table, abinner_nt,
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(n_here % SIMD, 0, "residual producer requires full octa groups");
                 // Last NT store of the task in every arm — a/b's streams included.
                 if abinner_nt || z_nt || ab_nt {
                     flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
@@ -4451,10 +5024,17 @@ impl Blake3Setup {
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                            generate_witness_with_ab_packed_and_round1_inner_from(
-                                blocks,
-                                self.n_blocks_log(),
-                            )
+                            if crate::prover::ranked_identity_c_fold_enabled(&self.r1cs) {
+                                generate_witness_with_ab_packed_and_round1_inner_storage_from(
+                                    blocks, self.n_blocks_log(),
+                                )
+                            } else {
+                                let (z, a, b, ab) =
+                                    generate_witness_with_ab_packed_and_round1_inner_from(
+                                        blocks, self.n_blocks_log(),
+                                    );
+                                (z, a, flock_core::zerocheck::b_storage::BStorage::Dense(b), ab)
+                            }
                         });
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
@@ -4462,7 +5042,7 @@ impl Blake3Setup {
                 flock_core::gaptime::mark("witness: pool exited");
                 let lc_circuit = self.lincheck_circuit();
                 flock_core::gaptime::mark("lc_circuit built");
-                crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab(
+                crate::prover::prove_fast_ligerito_from_block_major_witness_with_precomputed_ab_storage(
                     &self.r1cs,
                     &self.pcs_params,
                     z_packed,
@@ -5321,6 +5901,144 @@ mod tests {
                 "ab_inner mismatch, n_blocks={n_blocks}"
             );
         }
+    }
+
+    /// Exercise the actual residual producer, including a recycled scratch
+    /// octa, padding and mixed provenance. ResidualBStage uses a nonzero
+    /// sentinel in tests, so any variable byte the drain misses is exposed.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+              target_feature = "avx512f", target_feature = "avx512bw",
+              target_feature = "avx512vbmi2"))]
+    #[test]
+    fn round1_inner_residual_producer_matches_dense() {
+        use crate::seed_pipe::BlockSource;
+        #[repr(C, align(64))]
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct AlignedLine([F128; 4]);
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct AlignedFields(Vec<AlignedLine>);
+        impl AlignedFields {
+            fn zeroed(fields: usize) -> Self {
+                assert_eq!(fields % 4, 0);
+                assert_eq!(core::mem::size_of::<AlignedLine>(), 4 * core::mem::size_of::<F128>());
+                Self(vec![AlignedLine([F128::ZERO; 4]); fields / 4])
+            }
+        }
+        impl core::ops::Deref for AlignedFields {
+            type Target = [F128];
+            fn deref(&self) -> &[F128] {
+                // Each 64-byte owner line is exactly four initialized F128s
+                // with no intervening padding. Ownership and deallocation
+                // stay with Vec<AlignedLine>, preserving its true alignment.
+                unsafe { core::slice::from_raw_parts(self.0.as_ptr().cast(), self.0.len() * 4) }
+            }
+        }
+        impl core::ops::DerefMut for AlignedFields {
+            fn deref_mut(&mut self) -> &mut [F128] {
+                unsafe { core::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast(), self.0.len() * 4) }
+            }
+        }
+        const FIELDS: usize = K / 128;
+        const BYTES: usize = K / 8;
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        for (n, len) in [(8usize, 8usize), (16, 13), (32, 32)] {
+            let source = BlockSource::Closed { init: 0x91e8_3c01_ef65_0a71 ^ n as u64, len };
+            let materialized = source.to_vec();
+            let mut z_ref = AlignedFields::zeroed(n * FIELDS);
+            let mut a_ref = AlignedFields::zeroed(n * FIELDS);
+            let mut b_ref = AlignedFields::zeroed(n * FIELDS);
+            let mut ab_ref = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(n * BYTES);
+            generate_round1_inner_octa(source, 0, &mut z_ref, &mut a_ref, &mut b_ref,
+                &mut ab_ref, &inv, &padding, [false; 3], true);
+            let b_bytes = unsafe {
+                core::slice::from_raw_parts(b_ref.as_ptr().cast::<u8>(), n * BYTES)
+            };
+            for block_source in [source, BlockSource::Slice(&materialized)] {
+                for elide in [[false; 3], [false, false, true], [true; 3]] {
+                    let mut z = z_ref.clone();
+                    let mut a = a_ref.clone();
+                    let mut b = flock_core::zerocheck::b_residual::Builder::new(n).unwrap();
+                    let mut ab = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(n * BYTES);
+                    generate_round1_inner_octa_residual(block_source, 0, &mut z, &mut a,
+                        &mut b, &mut ab, &inv, &padding, elide, true,
+                        RankedClosedDispatch::ForceGeneric);
+                    let b = b.finish().unwrap();
+                    assert_eq!(z, z_ref, "z n={n} len={len} elide={elide:?}");
+                    assert_eq!(a, a_ref, "A n={n} len={len} elide={elide:?}");
+                    assert_eq!(b.view().to_dense_bytes(), b_bytes, "B n={n} len={len} elide={elide:?}");
+                    assert_eq!(ab.as_bytes_mut(), ab_ref.as_bytes_mut(), "AB n={n} len={len} elide={elide:?}");
+                }
+            }
+        }
+    }
+
+    /// A compact owner must become a real dense owner before a generic
+    /// publisher sees it. Offset A by one valid F128 to force the complete
+    /// line-store gate to miss, without changing allocation/deallocation
+    /// alignment. Also run this test in a fresh process with
+    /// FLOCK_NO_ABINNER_NT=1 to cover the temporal-plan rollback.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2",
+              target_feature = "avx512f", target_feature = "avx512bw",
+              target_feature = "avx512vbmi2"))]
+    #[test]
+    fn round1_inner_compact_alignment_miss_uses_dense_storage() {
+        const N: usize = 8;
+        const FIELDS: usize = N * K / 128;
+        const BYTES: usize = N * K / 8;
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct Aligned([F128; FIELDS + 4]);
+        let source = crate::seed_pipe::BlockSource::Closed {
+            init: 0x6e74_325f_6761_7465, len: N,
+        };
+        let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
+        let ntt_s = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(K_SKIP, flock_core::field::F8(1u8 << K_SKIP));
+        let inv = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut z_ref = Box::new(Aligned([F128::ZERO; FIELDS + 4]));
+        let mut a_ref = z_ref.clone();
+        let mut b_ref = z_ref.clone();
+        let mut ab_ref = flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_uninit(BYTES);
+        generate_round1_inner_octa(source, 0, &mut z_ref.0[..FIELDS],
+            &mut a_ref.0[1..FIELDS + 1], &mut b_ref.0[..FIELDS],
+            &mut ab_ref, &inv, &padding, [false; 3], true);
+        assert_eq!((a_ref.0[1..].as_ptr() as usize) % 64, 16);
+
+        // The compact owner is a genuine full-capacity allocation; no fake
+        // slice is constructed and no uninitialized payload is read. A miss
+        // discards it before selecting any per-block stride or output bias.
+        let compact = || flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(1usize << 29);
+        let mut z = z_ref.clone();
+        let mut a = a_ref.clone();
+        let mut b = b_ref.clone();
+        let mut ab = compact();
+        generate_round1_inner_octa(source, 0, &mut z.0[..FIELDS],
+            &mut a.0[1..FIELDS + 1], &mut b.0[..FIELDS],
+            &mut ab, &inv, &padding, [true; 3], true);
+        assert!(!ab.ranked_compact() && !ab.ranked_one_rows_elided() && !ab.ranked_w30_elided());
+        assert_eq!(ab.len_bytes(), BYTES);
+        assert_eq!(ab.as_bytes_mut(), ab_ref.as_bytes_mut());
+        assert_eq!((&z.0[..FIELDS], &a.0[1..FIELDS + 1], &b.0[..FIELDS]),
+            (&z_ref.0[..FIELDS], &a_ref.0[1..FIELDS + 1], &b_ref.0[..FIELDS]));
+
+        let mut z = z_ref.clone();
+        let mut a = a_ref.clone();
+        let mut encoded = flock_core::zerocheck::b_residual::Builder::new(N).unwrap();
+        let mut ab = compact();
+        generate_round1_inner_octa_residual(source, 0, &mut z.0[..FIELDS],
+            &mut a.0[1..FIELDS + 1], &mut encoded, &mut ab, &inv, &padding,
+            [true; 3], true, RankedClosedDispatch::ForceGeneric);
+        let encoded = encoded.finish().unwrap();
+        let b_bytes = unsafe { core::slice::from_raw_parts(b_ref.0.as_ptr().cast::<u8>(), BYTES) };
+        assert_eq!(encoded.view().to_dense_bytes(), b_bytes);
+        assert!(!ab.ranked_compact() && !ab.ranked_one_rows_elided() && !ab.ranked_w30_elided());
+        assert_eq!(ab.len_bytes(), BYTES);
+        assert_eq!(ab.as_bytes_mut(), ab_ref.as_bytes_mut());
+        assert_eq!((&z.0[..FIELDS], &a.0[1..FIELDS + 1]),
+            (&z_ref.0[..FIELDS], &a_ref.0[1..FIELDS + 1]));
     }
 
     /// **Fused a/b-NT oracle, at the octa generator's own seams.** Drives

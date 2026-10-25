@@ -4979,7 +4979,9 @@ pub(crate) fn build_cfold_mats_ext(
             } else {
                 std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]))
             };
-            let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+            // A typed integer matrix must be initialized before it exists,
+            // including the optional plane which some consumers leave unused.
+            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
             if include_plane {
                 for idx in 0..128 {
                     for i in 0..8 {
@@ -5030,7 +5032,7 @@ pub(crate) fn build_cfold_mats_ext(
         // SAFETY: `out.1` is 100% overwritten below; `out.0` is overwritten when
         // `include_plane` is true (and never read when `include_plane` is false,
         // which holds whenever `zc_r34_bcast_enabled()` selects the broadcast kernels).
-        let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
         if include_plane {
             for idx in 0..128 {
                 for i in 0..8 {
@@ -6448,3 +6450,23 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
         );
     }
 }
+
+// Residual-only loader siblings. Dense entry points above retain their ABI.
+#[cfg(all(
+    target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[path = "x86_64_b_residual.rs"]
+mod b_residual;
+#[cfg(all(
+    target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) use b_residual::{
+    fold2_from_packed_lookahead_c4_lm_wtab_residual_x86,
+    round2_lookahead_chunk_baked_elide_residual_x86,
+};
