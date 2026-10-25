@@ -879,12 +879,18 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     }
     let padding = r1cs.padding_spec();
     flock_core::gaptime::mark("core: padding built");
+    // Prepared A/B are CPU-private. A later generic route obtains canonical
+    // views in zerocheck before any raw reader; never prewire these bytes.
+    if ab_inner.as_ref().is_none_or(|ab|
+        ab.packed_ab_layout() == zerocheck::prepared_octa::PackedAbLayout::Canonical)
+    {
     gpu_prewire_round1_inputs(
         &a_packed_f128,
         &b_packed_f128,
         &z_packed,
         prefaulted_codeword.as_deref(),
     );
+    }
     flock_core::gaptime::mark("core: gpu prewire spawned");
     // The BLAKE3 padding rows force every block's tail words to zero, which in
     // the SoA codeword is a static all-zero pattern on the top lanes of every
