@@ -2269,9 +2269,24 @@ fn transpose_pass_b_block_zero_xor(
             // SAFETY: avx512f is cfg-guaranteed and both slices have equal
             // length. F128 addition is bitwise XOR.
             unsafe {
-                let lanes = top.len() & !3;
+                let lanes8 = top.len() & !7;
                 let mut i = 0;
-                while i < lanes {
+                while i < lanes8 {
+                    let a0 = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+                    let a1 = _mm512_loadu_si512(top.as_ptr().add(i + 4).cast::<__m512i>());
+                    let b0 = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                    let b1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4).cast::<__m512i>());
+                    _mm512_storeu_si512(
+                        top.as_mut_ptr().add(i).cast::<__m512i>(),
+                        _mm512_xor_si512(a0, b0),
+                    );
+                    _mm512_storeu_si512(
+                        top.as_mut_ptr().add(i + 4).cast::<__m512i>(),
+                        _mm512_xor_si512(a1, b1),
+                    );
+                    i += 8;
+                }
+                while i + 4 <= top.len() {
                     let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
                     let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
                     _mm512_storeu_si512(
@@ -2439,9 +2454,24 @@ fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
         // SAFETY: avx512f is cfg-guaranteed and both slices have equal
         // length. F128 addition is bitwise XOR.
         unsafe {
-            let lanes = top.len() & !3;
+            let lanes8 = top.len() & !7;
             let mut i = 0;
-            while i < lanes {
+            while i < lanes8 {
+                let a0 = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
+                let a1 = _mm512_loadu_si512(top.as_ptr().add(i + 4).cast::<__m512i>());
+                let b0 = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
+                let b1 = _mm512_loadu_si512(bot.as_ptr().add(i + 4).cast::<__m512i>());
+                _mm512_storeu_si512(
+                    top.as_mut_ptr().add(i).cast::<__m512i>(),
+                    _mm512_xor_si512(a0, b0),
+                );
+                _mm512_storeu_si512(
+                    top.as_mut_ptr().add(i + 4).cast::<__m512i>(),
+                    _mm512_xor_si512(a1, b1),
+                );
+                i += 8;
+            }
+            while i + 4 <= top.len() {
                 let a = _mm512_loadu_si512(top.as_ptr().add(i).cast::<__m512i>());
                 let b = _mm512_loadu_si512(bot.as_ptr().add(i).cast::<__m512i>());
                 _mm512_storeu_si512(
