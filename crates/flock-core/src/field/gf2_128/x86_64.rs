@@ -585,6 +585,29 @@ pub struct WideGhashX4 {
     pub(crate) mid: __m512i,
 }
 
+/// Three-CLMUL Karatsuba product in the original schoolbook limb layout.
+/// Material source: public submission b15f803c-1f06-40f6-8646-6d699a74268d,
+/// commit1101f1f00b4eeaddc2feeb177dd8939b945bcf3e. Its illegal
+/// inline(always)+target_feature combination is replaced by ordinary inline.
+/// `mid` remains x.lo*y.hi XOR x.hi*y.lo, so unit operands, limb XOR and all
+/// existing reducers retain their exact representation and compatibility.
+///
+/// # Safety
+/// The caller guarantees AVX-512F and VPCLMULQDQ.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn karatsuba_unreduced_x4(x: __m512i, y: __m512i) -> (__m512i, __m512i, __m512i) {
+    let x_sum = _mm512_xor_si512(x, _mm512_unpackhi_epi64(x, x));
+    let y_sum = _mm512_xor_si512(y, _mm512_unpackhi_epi64(y, y));
+    let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+    let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+    let mid = _mm512_ternarylogic_epi64::<0x96>(
+        _mm512_clmulepi64_epi128::<0x00>(x_sum, y_sum), lo, hi,
+    );
+    (lo, hi, mid)
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 impl WideGhashX4 {
     /// Empty accumulator.
@@ -622,28 +645,18 @@ impl WideGhashX4 {
     /// `avx512f` + `vpclmulqdq` available (cfg-gated).
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
-    #[inline]
-    #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn from_mul(x: __m512i, y: __m512i) -> Self {
-        Self {
-            lo: _mm512_clmulepi64_epi128::<0x00>(x, y),
-            hi: _mm512_clmulepi64_epi128::<0x11>(x, y),
-            mid: _mm512_xor_si512(
-                _mm512_clmulepi64_epi128::<0x01>(x, y),
-                _mm512_clmulepi64_epi128::<0x10>(x, y),
-            ),
-        }
+        let (lo, hi, mid) = unsafe { karatsuba_unreduced_x4(x, y) };
+        Self { lo, hi, mid }
     }
 
+    #[inline]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        let (lo, hi, mid) = unsafe { karatsuba_unreduced_x4(x, y) };
+        self.lo = _mm512_xor_si512(self.lo, lo);
+        self.hi = _mm512_xor_si512(self.hi, hi);
+        self.mid = _mm512_xor_si512(self.mid, mid);
     }
 
     /// XOR-accumulate two 4-lane unreduced products, `x0[i]·y0[i]` and
@@ -652,7 +665,7 @@ impl WideGhashX4 {
     /// Bit-identical to `mul_acc(x0, y0); mul_acc(x1, y1)` (XOR is
     /// associative and commutative), but the two products are folded into
     /// each limb with one three-input `vpternlogq` instead of two lone
-    /// `vpxorq`: four accumulate uops per pair of products instead of six,
+    /// `vpxorq`: three accumulate uops per pair of products instead of six,
     /// and each limb is read and written once instead of twice.
     ///
     /// # Safety
@@ -660,20 +673,13 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc2(&mut self, x0: __m512i, y0: __m512i, x1: __m512i, y1: __m512i) {
-        // Register-only widen (8 CLMULs) + ternlog-accumulate; cfg-gated.
-        let c00_0 = _mm512_clmulepi64_epi128::<0x00>(x0, y0);
-        let c00_1 = _mm512_clmulepi64_epi128::<0x00>(x1, y1);
-        let c11_0 = _mm512_clmulepi64_epi128::<0x11>(x0, y0);
-        let c11_1 = _mm512_clmulepi64_epi128::<0x11>(x1, y1);
-        let c01_0 = _mm512_clmulepi64_epi128::<0x01>(x0, y0);
-        let c10_0 = _mm512_clmulepi64_epi128::<0x10>(x0, y0);
-        let c01_1 = _mm512_clmulepi64_epi128::<0x01>(x1, y1);
-        let c10_1 = _mm512_clmulepi64_epi128::<0x10>(x1, y1);
-        // 0x96 = a ^ b ^ c.
-        self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, c00_0, c00_1);
-        self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, c11_0, c11_1);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_0, c10_0);
-        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, c01_1, c10_1);
+        // Six CLMULs for two products; each result is restored to the exact
+        // lo/hi/cross limbs before the paired three-input XOR update.
+        let (lo0, hi0, mid0) = unsafe { karatsuba_unreduced_x4(x0, y0) };
+        let (lo1, hi1, mid1) = unsafe { karatsuba_unreduced_x4(x1, y1) };
+        self.lo = _mm512_ternarylogic_epi64::<0x96>(self.lo, lo0, lo1);
+        self.hi = _mm512_ternarylogic_epi64::<0x96>(self.hi, hi0, hi1);
+        self.mid = _mm512_ternarylogic_epi64::<0x96>(self.mid, mid0, mid1);
     }
 
     /// XOR-accumulate the 4 unreduced products `x[i] * 1` -- the identity
@@ -776,6 +782,127 @@ impl WideGhashX4 {
                 r1: lo_hi ^ mid_lo,
                 r2: hi_lo ^ mid_hi,
                 r3: hi_hi,
+            }
+        }
+    }
+}
+
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+mod karatsuba_wide_tests {
+    use super::*;
+    type Limbs = [(u128, u128, u128); 4];
+    fn xor(a: F128, b: F128) -> F128 { F128::new(a.lo ^ b.lo, a.hi ^ b.hi) }
+    fn clmul(a: u64, b: u64) -> u128 {
+        let mut z = 0;
+        for i in 0..64 { if (b >> i) & 1 != 0 { z ^= u128::from(a) << i; } }
+        z
+    }
+    fn polynomial(a: F128, b: F128) -> F128 {
+        let mut x = u128::from(a.lo) | (u128::from(a.hi) << 64);
+        let mut y = u128::from(b.lo) | (u128::from(b.hi) << 64);
+        let mut z = 0;
+        for _ in 0..128 {
+            if y & 1 != 0 { z ^= x; }
+            let carry = x >> 127;
+            x = (x << 1) ^ (0x87 & 0u128.wrapping_sub(carry));
+            y >>= 1;
+        }
+        F128::new(z as u64, (z >> 64) as u64)
+    }
+    fn raw(a: &[F128; 4], b: &[F128; 4]) -> Limbs {
+        core::array::from_fn(|i| (clmul(a[i].lo,b[i].lo),clmul(a[i].hi,b[i].hi),
+            clmul(a[i].lo,b[i].hi) ^ clmul(a[i].hi,b[i].lo)))
+    }
+    fn add_raw(a: Limbs, b: Limbs) -> Limbs {
+        core::array::from_fn(|i| (a[i].0 ^ b[i].0,a[i].1 ^ b[i].1,a[i].2 ^ b[i].2))
+    }
+    fn products(a: &[F128; 4], b: &[F128; 4]) -> [F128; 4] {
+        core::array::from_fn(|i| polynomial(a[i],b[i]))
+    }
+    fn next(s: &mut u64) -> F128 {
+        let mut word = || { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s };
+        F128::new(word(),word())
+    }
+    unsafe fn load(v: &[F128; 4]) -> __m512i { unsafe { _mm512_loadu_si512(v.as_ptr().cast()) } }
+    unsafe fn lanes(v: __m512i) -> [F128; 4] {
+        let mut out = [F128::ZERO; 4];
+        unsafe { _mm512_storeu_si512(out.as_mut_ptr().cast(),v); }
+        out
+    }
+    fn sum(v: [F128; 4]) -> F128 { v.into_iter().fold(F128::ZERO,xor) }
+    unsafe fn check(a: WideGhashX4, expected: Limbs, reduced: [F128; 4]) {
+        unsafe {
+            let lo=lanes(a.lo);let hi=lanes(a.hi);let mid=lanes(a.mid);
+            for i in 0..4 {
+                let u=|v:F128|u128::from(v.lo)|(u128::from(v.hi)<<64);
+                assert_eq!((u(lo[i]),u(hi[i]),u(mid[i])),expected[i],"raw limb lane={i}");
+            }
+            let guard=F128::new(0x91a55a19,0xbad5eed);
+            let mut out=[guard;8];
+            _mm512_storeu_si512(out.as_mut_ptr().add(2).cast(),a.reduce_lanes());
+            assert_eq!(&out[2..6],&reduced);
+            assert_eq!([out[0],out[1],out[6],out[7]],[guard;4]);
+            assert_eq!(a.fold().reduce(),sum(reduced));
+        }
+    }
+    #[test]
+    fn karatsuba_all_basis_products_match_true_cross_limbs() {
+        // The product is bilinear: exhaustive input-basis pairs cover every
+        // coefficient, with different basis rotations in all four SIMD lanes.
+        for i in 0..128 { for j in 0..128 {
+            let bit=|b:usize| F128::new((1u128<<b) as u64,((1u128<<b)>>64) as u64);
+            let a=core::array::from_fn(|lane|bit((i+17*lane)%128));
+            let b=core::array::from_fn(|lane|bit((j+31*lane)%128));
+            unsafe { check(WideGhashX4::from_mul(load(&a),load(&b)),raw(&a,&b),products(&a,&b)); }
+        }}
+    }
+    #[test]
+    fn karatsuba_mixed_unit_paired_xor_fold_reduce_match_polynomial() {
+        let mut seed=0xc13_b807_3c1a_55aa;
+        let one=[F128::ONE;4];
+        for case in 0..256 {
+            let mut accum=unsafe{[WideGhashX4::zero();4]};
+            let mut limbs=[[(0u128,0u128,0u128);4];4];
+            let mut expected=[[F128::ZERO;4];4];
+            for step in 0..16 {
+                for bank in 0..4 {
+                    let mut a=core::array::from_fn(|_|next(&mut seed));
+                    let mut b=core::array::from_fn(|_|next(&mut seed));
+                    if case%8==0 {a=[F128::ZERO;4];}
+                    if case%8==1 {b=one;}
+                    if case%8==2 {a=[F128::new(u64::MAX,u64::MAX);4];}
+                    unsafe {
+                        match step%4 {
+                            0=>{accum[bank]=WideGhashX4::from_mul(load(&a),load(&b));limbs[bank]=raw(&a,&b);expected[bank]=products(&a,&b);}
+                            1=>{accum[bank].mul_acc(load(&a),load(&b));limbs[bank]=add_raw(limbs[bank],raw(&a,&b));
+                                let p=products(&a,&b);expected[bank]=core::array::from_fn(|i|xor(expected[bank][i],p[i]));}
+                            2=>{let c=core::array::from_fn(|_|next(&mut seed));let d=core::array::from_fn(|_|next(&mut seed));
+                                accum[bank].mul_acc2(load(&a),load(&b),load(&c),load(&d));
+                                limbs[bank]=add_raw(add_raw(limbs[bank],raw(&a,&b)),raw(&c,&d));
+                                let p=products(&a,&b);let q=products(&c,&d);
+                                expected[bank]=core::array::from_fn(|i|xor(expected[bank][i],xor(p[i],q[i])));}
+                            _=>{accum[bank].mul_acc_one(load(&a));limbs[bank]=add_raw(limbs[bank],raw(&a,&one));
+                                expected[bank]=core::array::from_fn(|i|xor(expected[bank][i],a[i]));
+                                let mut identity=WideGhashX4::zero();identity.mul_acc_one(load(&a));
+                                let direct=WideGhashX4::from_mul(load(&a),load(&one));
+                                check(identity,raw(&a,&one),a);check(direct,raw(&a,&one),a);}
+                        }
+                        check(accum[bank],limbs[bank],expected[bank]);
+                    }
+                }
+                if step%3==2 {
+                    accum[0]=unsafe{accum[0].xor(accum[3])};
+                    limbs[0]=add_raw(limbs[0],limbs[3]);
+                    expected[0]=core::array::from_fn(|i|xor(expected[0][i],expected[3][i]));
+                }
+                unsafe {
+                    let joined=lanes(WideGhashX4::fold4_and_reduce(accum[0],accum[1],accum[2],accum[3]));
+                    assert_eq!(joined,expected.map(sum));
+                    let x=next(&mut seed);let y=next(&mut seed);
+                    let wide_plus_tail=accum[0].fold() ^ x.mul_unreduced(y);
+                    assert_eq!(wide_plus_tail.reduce(),xor(sum(expected[0]),polynomial(x,y)));
+                }
             }
         }
     }
