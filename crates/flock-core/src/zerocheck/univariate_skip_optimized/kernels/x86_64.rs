@@ -1945,11 +1945,15 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     // The fixed output array covers all sixteen 64-byte plane stores. The
     // prefetch pointer is only used by nonfaulting hints via wrapping_add.
     unsafe {
+        // Membership in [first,end), clipped to the sixteen demand rows.
+        // Tail hints beyond the clipped range keep the existing loop.
+        let pf_mask: u32 = if prefetch.first >= 16 { 0 } else {
+            ((1u32 << prefetch.end.min(16)) - 1) & !((1u32 << prefetch.first) - 1)
+        };
+        let pf_origin = prefetch.next_window.wrapping_sub(prefetch.first.wrapping_mul(ELL));
         let pf_one = |bm: usize| {
             _mm_prefetch(
-                prefetch
-                    .next_window
-                    .wrapping_add((bm - prefetch.first) * ELL)
+                pf_origin.wrapping_add(bm.wrapping_mul(ELL))
                     .cast::<i8>(),
                 _MM_HINT_T0,
             );
@@ -1963,7 +1967,7 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
         for bm in FIRST..N {
             // Preserve the old copy-loop hint/load interleave, now beside
             // the first and only demand load of the original input line.
-            if prefetch.spread && bm >= prefetch.first && bm < prefetch.end {
+            if prefetch.spread && (pf_mask & (1u32 << bm)) != 0 {
                 pf_one(bm);
             }
             rows[bm] =
@@ -2569,3 +2573,83 @@ pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
     }
 }
 
+
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod ab_prefetch_plan_tests {
+    use super::convert_ab_nomul_x86_gfni_direct;
+    use super::super::AbDirectPrefetch;
+    use std::hint::black_box;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn check<const FIRST: usize, const N: usize, const WRITE: bool>(seed: &mut u64) -> usize {
+        let plans = [(0, 0, false), (0, 0, true), (0, 14, true), (2, 16, true),
+                     (0, 15, true), (0, 16, true), (0, 16, false), (2, 16, false),
+                     (5, 3, true), (16, 20, true), (1, 19, true), (19, 20, false)];
+        for case in 0..24 {
+            let off = [0, 1, 7, 31][case % 4];
+            let mut input = [0u8; 1088];
+            let next = [0u8; 2048];
+            let mut mats = [0u64; 256];
+            let mut guarded = [0xceu8; 1152];
+            let mut expected = [0u8; 1024];
+            for x in &mut input {
+                *x = match case { 0 => 0, 1 => 255, _ => rng(seed) as u8 };
+            }
+            for x in &mut mats { *x = rng(seed); }
+            for x in &mut expected { *x = rng(seed) as u8; }
+            guarded[off..off + 1024].copy_from_slice(&expected);
+            let original_input = input;
+            let original_mats = mats;
+            if WRITE { expected.fill(0); }
+            for k in 0..16 {
+                for lane in 0..64 {
+                    let mut value = 0u8;
+                    for row in FIRST..N {
+                        let x = input[off + (row - FIRST) * 64 + lane];
+                        let matrix = mats[row * 16 + k];
+                        for bit in 0..8 {
+                            value ^= (((x & (matrix >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit;
+                        }
+                    }
+                    expected[k * 64 + lane] ^= value;
+                }
+            }
+            let (first, end, spread) = plans[case % plans.len()];
+            let prefetch = AbDirectPrefetch {
+                next_window: if first >= end { core::ptr::null() } else { next.as_ptr() },
+                first, end, spread,
+            };
+            let out: &mut [u8; 1024] = (&mut guarded[off..off + 1024]).try_into().unwrap();
+            // SAFETY: exact live-row extent, full matrix/output buffers, and
+            // this test's cfg supplies the same features as the production caller.
+            unsafe {
+                convert_ab_nomul_x86_gfni_direct::<FIRST, N, WRITE>(
+                    black_box(&input[off..off + (N - FIRST) * 64]),
+                    black_box(&mats), out, black_box(&prefetch));
+            }
+            assert_eq!(*out, expected, "shape={FIRST},{N},{WRITE} case={case}");
+            assert_eq!(input, original_input);
+            assert_eq!(mats, original_mats);
+            assert!(guarded[..off].iter().chain(guarded[off + 1024..].iter()).all(|&x| x == 0xce));
+        }
+        24
+    }
+
+    #[test]
+    fn actual_direct_ab_prefetch_plan_matches_scalar() {
+        let mut seed = 0x4273158b99u64;
+        let count = check::<2, 16, false>(&mut seed) + check::<2, 16, true>(&mut seed)
+            + check::<0, 14, false>(&mut seed) + check::<0, 14, true>(&mut seed)
+            + check::<0, 15, false>(&mut seed) + check::<0, 15, true>(&mut seed);
+        assert_eq!(count, 144);
+        println!("144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards");
+    }
+}
