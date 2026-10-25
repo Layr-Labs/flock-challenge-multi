@@ -3789,18 +3789,16 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
         // padding skip leaves live.
         #[cfg(target_arch = "x86_64")]
         let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            let x_next_outer = x_next | (x_hi << n_lo);
-            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_first =
-                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
-                    2
-                } else {
-                    0
-                };
+            let x_ahead = x_outer.wrapping_add(pf_windows);
+            let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+                2
+            } else {
+                0
+            };
             (
                 n_next,
-                live_row_base(x_next_outer, next_first, ranked_compact),
+                live_row_base(x_ahead, next_first, ranked_compact),
                 next_first,
             )
         } else {
@@ -4117,18 +4115,16 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         };
         let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
         let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
-            let x_next = x_outer_lo + pf_windows;
-            let x_next_outer = x_next | (x_hi << n_lo);
-            let n_next = b_med_counts[(x_outer + pf_windows) & within_outer_mask] as usize;
-            let next_first =
-                if ranked_one_rows_elided && ((x_outer + pf_windows) & within_outer_mask) == 0 {
-                    2
-                } else {
-                    0
-                };
+            let x_ahead = x_outer.wrapping_add(pf_windows);
+            let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
+            let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+                2
+            } else {
+                0
+            };
             (
                 n_next,
-                live_row_base(x_next_outer, next_first, ranked_compact),
+                live_row_base(x_ahead, next_first, ranked_compact),
                 next_first,
             )
         } else {
