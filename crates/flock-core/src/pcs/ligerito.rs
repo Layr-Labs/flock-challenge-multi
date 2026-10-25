@@ -5654,6 +5654,29 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     deferred: Option<(&[F128], F128)>,
     ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
+    unsafe {
+        if stream {
+            fold_and_msg_chunk_x86_mode::<CORR, true>(f, b, base, fc, bc, r, r_x4, r_x64, deferred, ood)
+        } else {
+            fold_and_msg_chunk_x86_mode::<CORR, false>(f, b, base, fc, bc, r, r_x4, r_x64, deferred, ood)
+        }
+    }
+}
+
+#[cfg(all(target_arch="x86_64", target_feature="avx512f", target_feature="vpclmulqdq"))]
+#[inline(always)]
+unsafe fn fold_and_msg_chunk_x86_mode<const CORR: bool, const STREAM: bool>(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+    r_x4: core::arch::x86_64::__m512i,
+    r_x64: core::arch::x86_64::__m512i,
+    deferred: Option<(&[F128], F128)>,
+    ood: Option<(&[F128], F128)>,
+) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
     use core::arch::x86_64::*;
 
@@ -5713,7 +5736,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             )
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
-            if stream && dst_aligned {
+            if STREAM && dst_aligned {
                 _mm_stream_si128(
                     ptr.cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<0>(value),
@@ -5841,7 +5864,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             u2 += (f0 + f1) * (b0 + b1);
             t += 2;
         }
-        if stream && dst_aligned {
+        if STREAM && dst_aligned {
             _mm_sfence();
         }
         (u0, u2)
