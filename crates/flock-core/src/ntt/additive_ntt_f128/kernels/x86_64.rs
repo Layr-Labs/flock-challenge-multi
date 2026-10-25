@@ -102,6 +102,126 @@ unsafe fn mul_x4_high_one(t: TwX4, v: core::arch::x86_64::__m512i) -> core::arch
     }
 }
 
+/// Unreduced split product for the diet forms: returns `(lo, hi)` with
+/// `mul_x4::<LOW, true>(t, v) == lo ^ fold_x64(hi)`. `hi` is the
+/// x^64-position half; callers may XOR several of them together and fold
+/// the sum once, because [`fold_x64`] is linear.
+///
+/// # Safety
+/// Same preconditions as `mul_x4::<LOW, true>`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_parts<const LOW: bool>(
+    t: TwX4,
+    v: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    if LOW {
+        (
+            _mm512_clmulepi64_epi128::<0x00>(t.0, v),
+            _mm512_clmulepi64_epi128::<0x10>(t.0, v),
+        )
+    } else {
+        (
+            _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x00>(v, t.0),
+                _mm512_clmulepi64_epi128::<0x01>(v, t.1),
+            ),
+            _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x10>(v, t.0),
+                _mm512_clmulepi64_epi128::<0x11>(v, t.1),
+            ),
+        )
+    }
+}
+
+/// `x^64 * hi mod p` for four lanes: `(hi << 64) ^ clmul(hi.hi, 0x87)`.
+/// Linear in `hi` and canonical on output.
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_x64(hi: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+    _mm512_xor_si512(
+        _mm512_bslli_epi128::<8>(hi),
+        _mm512_clmulepi64_epi128::<0x01>(hi, poly),
+    )
+}
+
+/// Unreduced form of [`mul_x4_high_one`]: `(lo, hi)` with the product equal
+/// to `lo ^ fold_x64(hi)`.
+///
+/// # Safety
+/// Same preconditions as [`mul_x4_high_one`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_high_one_parts(
+    t: TwX4,
+    v: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    (
+        _mm512_clmulepi64_epi128::<0x00>(t.0, v),
+        _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x10>(t.0, v), v),
+    )
+}
+
+/// Diet two-layer butterfly on rows `(a, b, c, d)` with lazy x^64 folds:
+/// three folds instead of four. Row `a` keeps its outer-layer x^64 half
+/// unreduced into the inner layer, and `c = c ^ a` shares that pending half,
+/// so `a` and `c` each fold once at the end; `b` folds before it becomes the
+/// inner multiplicand. Same field elements as the eager form.
+///
+/// # Safety
+/// Same preconditions as `mul_x4::<OUTER_LOW, true>` for `outer` and
+/// `mul_x4::<INNER_LOW, true>` for `inner_a` and `inner_b`.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+unsafe fn fused2_lazy<const OUTER_LOW: bool, const INNER_LOW: bool>(
+    va: core::arch::x86_64::__m512i,
+    vb: core::arch::x86_64::__m512i,
+    vc: core::arch::x86_64::__m512i,
+    vd: core::arch::x86_64::__m512i,
+    outer: TwX4,
+    inner_a: TwX4,
+    inner_b: TwX4,
+) -> (
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+    core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let (lo, pending_a) = mul_x4_parts::<OUTER_LOW>(outer, vc);
+        let a = _mm512_xor_si512(va, lo);
+        let c = _mm512_xor_si512(vc, a);
+        let (lo, hi) = mul_x4_parts::<OUTER_LOW>(outer, vd);
+        let b = _mm512_ternarylogic_epi64::<0x96>(vb, lo, fold_x64(hi));
+        let d = _mm512_xor_si512(vd, b);
+
+        let (lo, hi) = mul_x4_parts::<INNER_LOW>(inner_a, b);
+        let a = _mm512_ternarylogic_epi64::<0x96>(
+            a,
+            lo,
+            fold_x64(_mm512_xor_si512(pending_a, hi)),
+        );
+        let b = _mm512_xor_si512(b, a);
+        let (lo, hi) = mul_x4_parts::<INNER_LOW>(inner_b, d);
+        let c = _mm512_ternarylogic_epi64::<0x96>(
+            c,
+            lo,
+            fold_x64(_mm512_xor_si512(pending_a, hi)),
+        );
+        let d = _mm512_xor_si512(d, c);
+        (a, b, c, d)
+    }
+}
+
 /// Store four F128 lanes. `NT` uses XMM `MOVNTDQ` so a cold codeword publish
 /// skips write-allocate; dest must be 16-byte aligned. Temporal `storeu`
 /// otherwise. Scalar twin: [`store_f128`].
@@ -523,6 +643,54 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
         let inner_b = tw_x4::<INNER_LOW, DIET>(t_inner_b);
 
         let mut i = 0;
+        if DIET {
+            while i + 8 <= lanes {
+                let (va0, vb0, vc0, vd0) = fused2_lazy::<OUTER_LOW, INNER_LOW>(
+                    _mm512_loadu_si512(a.add(i) as *const __m512i),
+                    _mm512_loadu_si512(b.add(i) as *const __m512i),
+                    _mm512_loadu_si512(c.add(i) as *const __m512i),
+                    _mm512_loadu_si512(d.add(i) as *const __m512i),
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                let (va1, vb1, vc1, vd1) = fused2_lazy::<OUTER_LOW, INNER_LOW>(
+                    _mm512_loadu_si512(a.add(i + 4) as *const __m512i),
+                    _mm512_loadu_si512(b.add(i + 4) as *const __m512i),
+                    _mm512_loadu_si512(c.add(i + 4) as *const __m512i),
+                    _mm512_loadu_si512(d.add(i + 4) as *const __m512i),
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+                i += 8;
+            }
+            while i < lanes {
+                let (va, vb, vc, vd) = fused2_lazy::<OUTER_LOW, INNER_LOW>(
+                    _mm512_loadu_si512(a.add(i) as *const __m512i),
+                    _mm512_loadu_si512(b.add(i) as *const __m512i),
+                    _mm512_loadu_si512(c.add(i) as *const __m512i),
+                    _mm512_loadu_si512(d.add(i) as *const __m512i),
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+                i += 4;
+            }
+        }
         while i + 8 <= lanes {
             let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
             let mut vb0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
@@ -1780,10 +1948,15 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 }
 
 /// Fixed-register version of the prepared, shaped four-layer butterfly.
-/// Six upper twiddle vectors stay in zmm16..21 and the sixteen rows in
-/// zmm0..15. Four independent upper products are interleaved using eight
-/// temporary registers; lower layers use compact pair broadcasts. Every
-/// product uses the existing five-CLMUL split formula and full reduction.
+/// The top twiddle pair stays in zmm16..17 and the sixteen rows in zmm0..15;
+/// the other pairs are broadcast from the prepared table. Each product adds
+/// its low-position half to the row at once, but its x^64-position half `m`
+/// is reduced lazily: `m -> (m << 64) ^ clmul(m.hi, 0x87)` is linear, so a
+/// row keeps the sum of its pending `m` terms (a row that took `v ^= u` from
+/// a pending row shares that row's sum) and reduces it once, just before the
+/// row is a multiplicand or is stored. That is 20 reductions per lane step
+/// instead of 32, the same canonical field elements, and 24 fewer port-5
+/// uops (byte shift and CLMUL) on cores where both run only there.
 ///
 /// # Safety
 /// Requires AVX-512F, AVX-512BW and VPCLMULQDQ. The caller provides the
@@ -1807,10 +1980,6 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "jz 3f",
             "vbroadcasti32x4 zmm16, [rsi+0]",
             "vbroadcasti32x4 zmm17, [rsi+16]",
-            "vbroadcasti32x4 zmm18, [rsi+32]",
-            "vbroadcasti32x4 zmm19, [rsi+48]",
-            "vbroadcasti32x4 zmm20, [rsi+64]",
-            "vbroadcasti32x4 zmm21, [rsi+80]",
             "mov eax, 0x87",
             "vmovq xmm30, rax",
             "vshufi32x4 zmm30, zmm30, zmm30, 0",
@@ -1853,86 +2022,74 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*3]",
             ".endif",
-            "vpclmulqdq zmm22, zmm8, zmm16, 0",
-            "vpclmulqdq zmm23, zmm8, zmm17, 1",
-            "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm9, zmm16, 0",
-            "vpclmulqdq zmm23, zmm9, zmm17, 1",
-            "vpternlogd zmm1, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm10, zmm16, 0",
-            "vpclmulqdq zmm23, zmm10, zmm17, 1",
-            "vpternlogd zmm2, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm11, zmm16, 0",
-            "vpclmulqdq zmm23, zmm11, zmm17, 1",
-            "vpternlogd zmm3, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm8, zmm16, 16",
-            "vpclmulqdq zmm23, zmm8, zmm17, 17",
-            "vpclmulqdq zmm24, zmm9, zmm16, 16",
-            "vpclmulqdq zmm25, zmm9, zmm17, 17",
-            "vpclmulqdq zmm26, zmm10, zmm16, 16",
-            "vpclmulqdq zmm27, zmm10, zmm17, 17",
-            "vpclmulqdq zmm28, zmm11, zmm16, 16",
-            "vpclmulqdq zmm29, zmm11, zmm17, 17",
+            "vpclmulqdq zmm18, zmm12, zmm16, 0",
+            "vpclmulqdq zmm19, zmm12, zmm17, 1",
+            "vpternlogd zmm4, zmm18, zmm19, 0x96",
+            "vpclmulqdq zmm18, zmm13, zmm16, 0",
+            "vpclmulqdq zmm19, zmm13, zmm17, 1",
+            "vpternlogd zmm5, zmm18, zmm19, 0x96",
+            "vpclmulqdq zmm18, zmm14, zmm16, 0",
+            "vpclmulqdq zmm19, zmm14, zmm17, 1",
+            "vpternlogd zmm6, zmm18, zmm19, 0x96",
+            "vpclmulqdq zmm18, zmm15, zmm16, 0",
+            "vpclmulqdq zmm19, zmm15, zmm17, 1",
+            "vpternlogd zmm7, zmm18, zmm19, 0x96",
+            "vpclmulqdq zmm18, zmm12, zmm16, 16",
+            "vpclmulqdq zmm19, zmm12, zmm17, 17",
+            "vpclmulqdq zmm20, zmm13, zmm16, 16",
+            "vpclmulqdq zmm21, zmm13, zmm17, 17",
+            "vpclmulqdq zmm22, zmm14, zmm16, 16",
+            "vpclmulqdq zmm23, zmm14, zmm17, 17",
+            "vpclmulqdq zmm24, zmm15, zmm16, 16",
+            "vpclmulqdq zmm25, zmm15, zmm17, 17",
+            "vpxorq zmm18, zmm18, zmm19",
+            "vpxorq zmm20, zmm20, zmm21",
             "vpxorq zmm22, zmm22, zmm23",
             "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpxorq zmm28, zmm28, zmm29",
-            "vpslldq zmm23, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpslldq zmm29, zmm28, 8",
-            "vpclmulqdq zmm28, zmm28, zmm30, 1",
-            "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpxorq zmm8, zmm8, zmm0",
-            "vpternlogd zmm1, zmm24, zmm25, 0x96",
-            "vpxorq zmm9, zmm9, zmm1",
-            "vpternlogd zmm2, zmm26, zmm27, 0x96",
-            "vpxorq zmm10, zmm10, zmm2",
-            "vpternlogd zmm3, zmm28, zmm29, 0x96",
-            "vpxorq zmm11, zmm11, zmm3",
-            "vpclmulqdq zmm22, zmm12, zmm16, 0",
-            "vpclmulqdq zmm23, zmm12, zmm17, 1",
-            "vpternlogd zmm4, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm13, zmm16, 0",
-            "vpclmulqdq zmm23, zmm13, zmm17, 1",
-            "vpternlogd zmm5, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm14, zmm16, 0",
-            "vpclmulqdq zmm23, zmm14, zmm17, 1",
-            "vpternlogd zmm6, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm15, zmm16, 0",
-            "vpclmulqdq zmm23, zmm15, zmm17, 1",
-            "vpternlogd zmm7, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm12, zmm16, 16",
-            "vpclmulqdq zmm23, zmm12, zmm17, 17",
-            "vpclmulqdq zmm24, zmm13, zmm16, 16",
-            "vpclmulqdq zmm25, zmm13, zmm17, 17",
-            "vpclmulqdq zmm26, zmm14, zmm16, 16",
-            "vpclmulqdq zmm27, zmm14, zmm17, 17",
-            "vpclmulqdq zmm28, zmm15, zmm16, 16",
-            "vpclmulqdq zmm29, zmm15, zmm17, 17",
-            "vpxorq zmm22, zmm22, zmm23",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpxorq zmm28, zmm28, zmm29",
-            "vpslldq zmm23, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpslldq zmm29, zmm28, 8",
-            "vpclmulqdq zmm28, zmm28, zmm30, 1",
-            "vpternlogd zmm4, zmm22, zmm23, 0x96",
+            "vpslldq zmm19, zmm18, 8",
+            "vpclmulqdq zmm18, zmm18, zmm30, 1",
+            "vpternlogd zmm4, zmm18, zmm19, 0x96",
             "vpxorq zmm12, zmm12, zmm4",
-            "vpternlogd zmm5, zmm24, zmm25, 0x96",
+            "vpslldq zmm21, zmm20, 8",
+            "vpclmulqdq zmm20, zmm20, zmm30, 1",
+            "vpternlogd zmm5, zmm20, zmm21, 0x96",
             "vpxorq zmm13, zmm13, zmm5",
-            "vpternlogd zmm6, zmm26, zmm27, 0x96",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm6, zmm22, zmm23, 0x96",
             "vpxorq zmm14, zmm14, zmm6",
-            "vpternlogd zmm7, zmm28, zmm29, 0x96",
+            "vpslldq zmm25, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm7, zmm24, zmm25, 0x96",
             "vpxorq zmm15, zmm15, zmm7",
+            "vpclmulqdq zmm25, zmm8, zmm16, 0",
+            "vpclmulqdq zmm24, zmm8, zmm17, 1",
+            "vpternlogd zmm0, zmm25, zmm24, 0x96",
+            "vpclmulqdq zmm25, zmm9, zmm16, 0",
+            "vpclmulqdq zmm24, zmm9, zmm17, 1",
+            "vpternlogd zmm1, zmm25, zmm24, 0x96",
+            "vpclmulqdq zmm25, zmm10, zmm16, 0",
+            "vpclmulqdq zmm24, zmm10, zmm17, 1",
+            "vpternlogd zmm2, zmm25, zmm24, 0x96",
+            "vpclmulqdq zmm25, zmm11, zmm16, 0",
+            "vpclmulqdq zmm24, zmm11, zmm17, 1",
+            "vpternlogd zmm3, zmm25, zmm24, 0x96",
+            "vpclmulqdq zmm25, zmm8, zmm16, 16",
+            "vpclmulqdq zmm24, zmm8, zmm17, 17",
+            "vpclmulqdq zmm23, zmm9, zmm16, 16",
+            "vpclmulqdq zmm22, zmm9, zmm17, 17",
+            "vpclmulqdq zmm21, zmm10, zmm16, 16",
+            "vpclmulqdq zmm20, zmm10, zmm17, 17",
+            "vpclmulqdq zmm19, zmm11, zmm16, 16",
+            "vpclmulqdq zmm18, zmm11, zmm17, 17",
+            "vpxorq zmm25, zmm25, zmm24",
+            "vpxorq zmm23, zmm23, zmm22",
+            "vpxorq zmm21, zmm21, zmm20",
+            "vpxorq zmm19, zmm19, zmm18",
+            "vpxorq zmm8, zmm8, zmm0",
+            "vpxorq zmm9, zmm9, zmm1",
+            "vpxorq zmm10, zmm10, zmm2",
+            "vpxorq zmm11, zmm11, zmm3",
             ".if {hint} == 1",
             "prefetcht0 [rcx+rax+{stride}*4]",
             ".elseif {hint} == 2",
@@ -1953,326 +2110,270 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*7]",
             ".endif",
-            "vpclmulqdq zmm22, zmm4, zmm18, 0",
-            "vpclmulqdq zmm23, zmm4, zmm19, 1",
-            "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm5, zmm18, 0",
-            "vpclmulqdq zmm23, zmm5, zmm19, 1",
-            "vpternlogd zmm1, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm6, zmm18, 0",
-            "vpclmulqdq zmm23, zmm6, zmm19, 1",
-            "vpternlogd zmm2, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm7, zmm18, 0",
-            "vpclmulqdq zmm23, zmm7, zmm19, 1",
-            "vpternlogd zmm3, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm4, zmm18, 16",
-            "vpclmulqdq zmm23, zmm4, zmm19, 17",
-            "vpclmulqdq zmm24, zmm5, zmm18, 16",
-            "vpclmulqdq zmm25, zmm5, zmm19, 17",
-            "vpclmulqdq zmm26, zmm6, zmm18, 16",
-            "vpclmulqdq zmm27, zmm6, zmm19, 17",
-            "vpclmulqdq zmm28, zmm7, zmm18, 16",
-            "vpclmulqdq zmm29, zmm7, zmm19, 17",
-            "vpxorq zmm22, zmm22, zmm23",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpxorq zmm28, zmm28, zmm29",
-            "vpslldq zmm23, zmm22, 8",
+            "vbroadcasti32x4 zmm18, [rsi+64]",
+            "vbroadcasti32x4 zmm20, [rsi+80]",
+            "vpclmulqdq zmm22, zmm14, zmm18, 0",
+            "vpclmulqdq zmm24, zmm14, zmm20, 1",
+            "vpternlogd zmm10, zmm22, zmm24, 0x96",
+            "vpclmulqdq zmm22, zmm15, zmm18, 0",
+            "vpclmulqdq zmm24, zmm15, zmm20, 1",
+            "vpternlogd zmm11, zmm22, zmm24, 0x96",
+            "vpclmulqdq zmm22, zmm14, zmm18, 16",
+            "vpclmulqdq zmm24, zmm14, zmm20, 17",
+            "vpclmulqdq zmm26, zmm15, zmm18, 16",
+            "vpclmulqdq zmm27, zmm15, zmm20, 17",
+            "vpternlogd zmm22, zmm24, zmm21, 0x96",
+            "vpternlogd zmm26, zmm27, zmm19, 0x96",
+            "vpslldq zmm24, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpslldq zmm29, zmm28, 8",
-            "vpclmulqdq zmm28, zmm28, zmm30, 1",
-            "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpxorq zmm4, zmm4, zmm0",
-            "vpternlogd zmm1, zmm24, zmm25, 0x96",
-            "vpxorq zmm5, zmm5, zmm1",
-            "vpternlogd zmm2, zmm26, zmm27, 0x96",
-            "vpxorq zmm6, zmm6, zmm2",
-            "vpternlogd zmm3, zmm28, zmm29, 0x96",
-            "vpxorq zmm7, zmm7, zmm3",
-            "vpclmulqdq zmm22, zmm12, zmm20, 0",
-            "vpclmulqdq zmm23, zmm12, zmm21, 1",
-            "vpternlogd zmm8, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm13, zmm20, 0",
-            "vpclmulqdq zmm23, zmm13, zmm21, 1",
-            "vpternlogd zmm9, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm14, zmm20, 0",
-            "vpclmulqdq zmm23, zmm14, zmm21, 1",
-            "vpternlogd zmm10, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm15, zmm20, 0",
-            "vpclmulqdq zmm23, zmm15, zmm21, 1",
-            "vpternlogd zmm11, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm12, zmm20, 16",
-            "vpclmulqdq zmm23, zmm12, zmm21, 17",
-            "vpclmulqdq zmm24, zmm13, zmm20, 16",
-            "vpclmulqdq zmm25, zmm13, zmm21, 17",
-            "vpclmulqdq zmm26, zmm14, zmm20, 16",
-            "vpclmulqdq zmm27, zmm14, zmm21, 17",
-            "vpclmulqdq zmm28, zmm15, zmm20, 16",
-            "vpclmulqdq zmm29, zmm15, zmm21, 17",
-            "vpxorq zmm22, zmm22, zmm23",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpxorq zmm28, zmm28, zmm29",
-            "vpslldq zmm23, zmm22, 8",
-            "vpclmulqdq zmm22, zmm22, zmm30, 1",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpslldq zmm29, zmm28, 8",
-            "vpclmulqdq zmm28, zmm28, zmm30, 1",
-            "vpternlogd zmm8, zmm22, zmm23, 0x96",
-            "vpxorq zmm12, zmm12, zmm8",
-            "vpternlogd zmm9, zmm24, zmm25, 0x96",
-            "vpxorq zmm13, zmm13, zmm9",
-            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpternlogd zmm10, zmm22, zmm24, 0x96",
             "vpxorq zmm14, zmm14, zmm10",
-            "vpternlogd zmm11, zmm28, zmm29, 0x96",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm11, zmm26, zmm27, 0x96",
             "vpxorq zmm15, zmm15, zmm11",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*8]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*8]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*9]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*9]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*10]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*10]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*11]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*11]",
-            ".endif",
-            "vbroadcasti32x4 zmm22, [rsi+96]",
-            "vbroadcasti32x4 zmm23, [rsi+112]",
-            "vpclmulqdq zmm24, zmm2, zmm22, 0",
-            "vpclmulqdq zmm25, zmm2, zmm23, 1",
-            "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm3, zmm22, 0",
-            "vpclmulqdq zmm25, zmm3, zmm23, 1",
-            "vpternlogd zmm1, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm2, zmm22, 16",
-            "vpclmulqdq zmm25, zmm2, zmm23, 17",
-            "vpclmulqdq zmm26, zmm3, zmm22, 16",
-            "vpclmulqdq zmm27, zmm3, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpxorq zmm2, zmm2, zmm0",
-            "vpternlogd zmm1, zmm26, zmm27, 0x96",
-            "vpxorq zmm3, zmm3, zmm1",
-            "vbroadcasti32x4 zmm22, [rsi+128]",
-            "vbroadcasti32x4 zmm23, [rsi+144]",
-            "vpclmulqdq zmm24, zmm6, zmm22, 0",
-            "vpclmulqdq zmm25, zmm6, zmm23, 1",
-            "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm7, zmm22, 0",
-            "vpclmulqdq zmm25, zmm7, zmm23, 1",
-            "vpternlogd zmm5, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm6, zmm22, 16",
-            "vpclmulqdq zmm25, zmm6, zmm23, 17",
-            "vpclmulqdq zmm26, zmm7, zmm22, 16",
-            "vpclmulqdq zmm27, zmm7, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpxorq zmm6, zmm6, zmm4",
-            "vpternlogd zmm5, zmm26, zmm27, 0x96",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm20, [rsi+48]",
+            "vpclmulqdq zmm27, zmm6, zmm18, 0",
+            "vpclmulqdq zmm26, zmm6, zmm20, 1",
+            "vpternlogd zmm2, zmm27, zmm26, 0x96",
+            "vpclmulqdq zmm27, zmm7, zmm18, 0",
+            "vpclmulqdq zmm26, zmm7, zmm20, 1",
+            "vpternlogd zmm3, zmm27, zmm26, 0x96",
+            "vpclmulqdq zmm27, zmm6, zmm18, 16",
+            "vpclmulqdq zmm26, zmm6, zmm20, 17",
+            "vpclmulqdq zmm24, zmm7, zmm18, 16",
+            "vpclmulqdq zmm22, zmm7, zmm20, 17",
+            "vpternlogd zmm21, zmm27, zmm26, 0x96",
+            "vpternlogd zmm19, zmm24, zmm22, 0x96",
+            "vpslldq zmm26, zmm21, 8",
+            "vpclmulqdq zmm21, zmm21, zmm30, 1",
+            "vpternlogd zmm2, zmm21, zmm26, 0x96",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpslldq zmm22, zmm19, 8",
+            "vpclmulqdq zmm19, zmm19, zmm30, 1",
+            "vpternlogd zmm3, zmm19, zmm22, 0x96",
+            "vpxorq zmm7, zmm7, zmm3",
+            "vbroadcasti32x4 zmm18, [rsi+64]",
+            "vbroadcasti32x4 zmm20, [rsi+80]",
+            "vpclmulqdq zmm22, zmm12, zmm18, 0",
+            "vpclmulqdq zmm19, zmm12, zmm20, 1",
+            "vpternlogd zmm8, zmm22, zmm19, 0x96",
+            "vpclmulqdq zmm22, zmm13, zmm18, 0",
+            "vpclmulqdq zmm19, zmm13, zmm20, 1",
+            "vpternlogd zmm9, zmm22, zmm19, 0x96",
+            "vpclmulqdq zmm22, zmm12, zmm18, 16",
+            "vpclmulqdq zmm19, zmm12, zmm20, 17",
+            "vpclmulqdq zmm26, zmm13, zmm18, 16",
+            "vpclmulqdq zmm21, zmm13, zmm20, 17",
+            "vpternlogd zmm22, zmm19, zmm25, 0x96",
+            "vpternlogd zmm26, zmm21, zmm23, 0x96",
+            "vpxorq zmm12, zmm12, zmm8",
+            "vpxorq zmm13, zmm13, zmm9",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm20, [rsi+48]",
+            "vpclmulqdq zmm21, zmm4, zmm18, 0",
+            "vpclmulqdq zmm19, zmm4, zmm20, 1",
+            "vpternlogd zmm0, zmm21, zmm19, 0x96",
+            "vpclmulqdq zmm21, zmm5, zmm18, 0",
+            "vpclmulqdq zmm19, zmm5, zmm20, 1",
+            "vpternlogd zmm1, zmm21, zmm19, 0x96",
+            "vpclmulqdq zmm21, zmm4, zmm18, 16",
+            "vpclmulqdq zmm19, zmm4, zmm20, 17",
+            "vpclmulqdq zmm24, zmm5, zmm18, 16",
+            "vpclmulqdq zmm27, zmm5, zmm20, 17",
+            "vpternlogd zmm25, zmm21, zmm19, 0x96",
+            "vpternlogd zmm23, zmm24, zmm27, 0x96",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpxorq zmm5, zmm5, zmm1",
+            "vbroadcasti32x4 zmm18, [rsi+128]",
+            "vbroadcasti32x4 zmm20, [rsi+144]",
+            "vpclmulqdq zmm27, zmm7, zmm18, 0",
+            "vpclmulqdq zmm19, zmm7, zmm20, 1",
+            "vpternlogd zmm5, zmm27, zmm19, 0x96",
+            "vpclmulqdq zmm27, zmm6, zmm18, 0",
+            "vpclmulqdq zmm19, zmm6, zmm20, 1",
+            "vpternlogd zmm4, zmm27, zmm19, 0x96",
+            "vpclmulqdq zmm27, zmm7, zmm18, 16",
+            "vpclmulqdq zmm19, zmm7, zmm20, 17",
+            "vpclmulqdq zmm24, zmm6, zmm18, 16",
+            "vpclmulqdq zmm21, zmm6, zmm20, 17",
+            "vpternlogd zmm27, zmm19, zmm23, 0x96",
+            "vpternlogd zmm24, zmm21, zmm25, 0x96",
+            "vpslldq zmm19, zmm27, 8",
+            "vpclmulqdq zmm27, zmm27, zmm30, 1",
+            "vpternlogd zmm5, zmm27, zmm19, 0x96",
             "vpxorq zmm7, zmm7, zmm5",
-            "vbroadcasti32x4 zmm22, [rsi+160]",
-            "vbroadcasti32x4 zmm23, [rsi+176]",
-            "vpclmulqdq zmm24, zmm10, zmm22, 0",
-            "vpclmulqdq zmm25, zmm10, zmm23, 1",
-            "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm11, zmm22, 0",
-            "vpclmulqdq zmm25, zmm11, zmm23, 1",
-            "vpternlogd zmm9, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm10, zmm22, 16",
-            "vpclmulqdq zmm25, zmm10, zmm23, 17",
-            "vpclmulqdq zmm26, zmm11, zmm22, 16",
-            "vpclmulqdq zmm27, zmm11, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpxorq zmm10, zmm10, zmm8",
-            "vpternlogd zmm9, zmm26, zmm27, 0x96",
-            "vpxorq zmm11, zmm11, zmm9",
-            "vbroadcasti32x4 zmm22, [rsi+192]",
-            "vbroadcasti32x4 zmm23, [rsi+208]",
-            "vpclmulqdq zmm24, zmm14, zmm22, 0",
-            "vpclmulqdq zmm25, zmm14, zmm23, 1",
-            "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm15, zmm22, 0",
-            "vpclmulqdq zmm25, zmm15, zmm23, 1",
-            "vpternlogd zmm13, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm14, zmm22, 16",
-            "vpclmulqdq zmm25, zmm14, zmm23, 17",
-            "vpclmulqdq zmm26, zmm15, zmm22, 16",
-            "vpclmulqdq zmm27, zmm15, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpxorq zmm26, zmm26, zmm27",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpslldq zmm27, zmm26, 8",
-            "vpclmulqdq zmm26, zmm26, zmm30, 1",
-            "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpxorq zmm14, zmm14, zmm12",
-            "vpternlogd zmm13, zmm26, zmm27, 0x96",
+            "vpxorq zmm6, zmm6, zmm4",
+            "vbroadcasti32x4 zmm18, [rsi+96]",
+            "vbroadcasti32x4 zmm20, [rsi+112]",
+            "vpclmulqdq zmm21, zmm3, zmm18, 0",
+            "vpclmulqdq zmm19, zmm3, zmm20, 1",
+            "vpternlogd zmm1, zmm21, zmm19, 0x96",
+            "vpclmulqdq zmm21, zmm2, zmm18, 0",
+            "vpclmulqdq zmm19, zmm2, zmm20, 1",
+            "vpternlogd zmm0, zmm21, zmm19, 0x96",
+            "vpclmulqdq zmm21, zmm3, zmm18, 16",
+            "vpclmulqdq zmm19, zmm3, zmm20, 17",
+            "vpclmulqdq zmm27, zmm2, zmm18, 16",
+            "vpclmulqdq zmm28, zmm2, zmm20, 17",
+            "vpternlogd zmm23, zmm21, zmm19, 0x96",
+            "vpternlogd zmm25, zmm27, zmm28, 0x96",
+            "vpslldq zmm19, zmm23, 8",
+            "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            "vpternlogd zmm1, zmm23, zmm19, 0x96",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vpxorq zmm2, zmm2, zmm0",
+            "vbroadcasti32x4 zmm18, [rsi+192]",
+            "vbroadcasti32x4 zmm20, [rsi+208]",
+            "vpclmulqdq zmm28, zmm15, zmm18, 0",
+            "vpclmulqdq zmm19, zmm15, zmm20, 1",
+            "vpternlogd zmm13, zmm28, zmm19, 0x96",
+            "vpclmulqdq zmm28, zmm14, zmm18, 0",
+            "vpclmulqdq zmm19, zmm14, zmm20, 1",
+            "vpternlogd zmm12, zmm28, zmm19, 0x96",
+            "vpclmulqdq zmm28, zmm15, zmm18, 16",
+            "vpclmulqdq zmm19, zmm15, zmm20, 17",
+            "vpclmulqdq zmm23, zmm14, zmm18, 16",
+            "vpclmulqdq zmm27, zmm14, zmm20, 17",
+            "vpternlogd zmm28, zmm19, zmm26, 0x96",
+            "vpternlogd zmm23, zmm27, zmm22, 0x96",
+            "vpslldq zmm19, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm13, zmm28, zmm19, 0x96",
             "vpxorq zmm15, zmm15, zmm13",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*12]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*12]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*13]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*13]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*14]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*14]",
-            ".endif",
-            ".if {hint} == 1",
-            "prefetcht0 [rcx+rax+{stride}*15]",
-            ".elseif {hint} == 2",
-            "prefetcht1 [rcx+rax+{stride}*15]",
-            ".endif",
-            "vbroadcasti32x4 zmm22, [rsi+224]",
-            "vbroadcasti32x4 zmm23, [rsi+240]",
-            "vpclmulqdq zmm24, zmm1, zmm22, 0",
-            "vpclmulqdq zmm25, zmm1, zmm23, 1",
-            "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm1, zmm22, 16",
-            "vpclmulqdq zmm25, zmm1, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpxorq zmm1, zmm1, zmm0",
-            "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
-            "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
-            "vbroadcasti32x4 zmm22, [rsi+256]",
-            "vbroadcasti32x4 zmm23, [rsi+272]",
-            "vpclmulqdq zmm24, zmm3, zmm22, 0",
-            "vpclmulqdq zmm25, zmm3, zmm23, 1",
-            "vpternlogd zmm2, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm3, zmm22, 16",
-            "vpclmulqdq zmm25, zmm3, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm2, zmm24, zmm25, 0x96",
+            "vpxorq zmm14, zmm14, zmm12",
+            "vbroadcasti32x4 zmm18, [rsi+160]",
+            "vbroadcasti32x4 zmm20, [rsi+176]",
+            "vpclmulqdq zmm27, zmm11, zmm18, 0",
+            "vpclmulqdq zmm19, zmm11, zmm20, 1",
+            "vpternlogd zmm9, zmm27, zmm19, 0x96",
+            "vpclmulqdq zmm27, zmm10, zmm18, 0",
+            "vpclmulqdq zmm19, zmm10, zmm20, 1",
+            "vpternlogd zmm8, zmm27, zmm19, 0x96",
+            "vpclmulqdq zmm27, zmm11, zmm18, 16",
+            "vpclmulqdq zmm19, zmm11, zmm20, 17",
+            "vpclmulqdq zmm28, zmm10, zmm18, 16",
+            "vpclmulqdq zmm21, zmm10, zmm20, 17",
+            "vpternlogd zmm26, zmm27, zmm19, 0x96",
+            "vpternlogd zmm22, zmm28, zmm21, 0x96",
+            "vpslldq zmm19, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm9, zmm26, zmm19, 0x96",
+            "vpxorq zmm11, zmm11, zmm9",
+            "vpxorq zmm10, zmm10, zmm8",
+            "vbroadcasti32x4 zmm18, [rsi+256]",
+            "vbroadcasti32x4 zmm20, [rsi+272]",
+            "vbroadcasti32x4 zmm21, [rsi+224]",
+            "vbroadcasti32x4 zmm19, [rsi+240]",
+            "vpclmulqdq zmm26, zmm3, zmm18, 0",
+            "vpclmulqdq zmm28, zmm3, zmm20, 1",
+            "vpternlogd zmm2, zmm26, zmm28, 0x96",
+            "vpclmulqdq zmm26, zmm1, zmm21, 0",
+            "vpclmulqdq zmm28, zmm1, zmm19, 1",
+            "vpternlogd zmm0, zmm26, zmm28, 0x96",
+            "vpclmulqdq zmm26, zmm3, zmm18, 16",
+            "vpclmulqdq zmm28, zmm3, zmm20, 17",
+            "vpclmulqdq zmm27, zmm1, zmm21, 16",
+            "vpclmulqdq zmm29, zmm1, zmm19, 17",
+            "vpternlogd zmm26, zmm28, zmm25, 0x96",
+            "vpternlogd zmm25, zmm27, zmm29, 0x96",
+            "vpslldq zmm28, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm2, zmm26, zmm28, 0x96",
             "vpxorq zmm3, zmm3, zmm2",
             "vmovdqu64 [rdi+rax+{stride}*2], zmm2",
             "vmovdqu64 [rdi+rax+{stride}*3], zmm3",
-            "vbroadcasti32x4 zmm22, [rsi+288]",
-            "vbroadcasti32x4 zmm23, [rsi+304]",
-            "vpclmulqdq zmm24, zmm5, zmm22, 0",
-            "vpclmulqdq zmm25, zmm5, zmm23, 1",
-            "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm5, zmm22, 16",
-            "vpclmulqdq zmm25, zmm5, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpxorq zmm5, zmm5, zmm4",
-            "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
-            "vmovdqu64 [rdi+rax+{stride}*5], zmm5",
-            "vbroadcasti32x4 zmm22, [rsi+320]",
-            "vbroadcasti32x4 zmm23, [rsi+336]",
-            "vpclmulqdq zmm24, zmm7, zmm22, 0",
-            "vpclmulqdq zmm25, zmm7, zmm23, 1",
-            "vpternlogd zmm6, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm7, zmm22, 16",
-            "vpclmulqdq zmm25, zmm7, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm6, zmm24, zmm25, 0x96",
+            "vpslldq zmm29, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm30, 1",
+            "vpternlogd zmm0, zmm25, zmm29, 0x96",
+            "vpxorq zmm1, zmm1, zmm0",
+            "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
+            "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
+            "vbroadcasti32x4 zmm21, [rsi+320]",
+            "vbroadcasti32x4 zmm19, [rsi+336]",
+            "vbroadcasti32x4 zmm18, [rsi+288]",
+            "vbroadcasti32x4 zmm20, [rsi+304]",
+            "vpclmulqdq zmm29, zmm7, zmm21, 0",
+            "vpclmulqdq zmm25, zmm7, zmm19, 1",
+            "vpternlogd zmm6, zmm29, zmm25, 0x96",
+            "vpclmulqdq zmm29, zmm5, zmm18, 0",
+            "vpclmulqdq zmm25, zmm5, zmm20, 1",
+            "vpternlogd zmm4, zmm29, zmm25, 0x96",
+            "vpclmulqdq zmm29, zmm7, zmm21, 16",
+            "vpclmulqdq zmm25, zmm7, zmm19, 17",
+            "vpclmulqdq zmm28, zmm5, zmm18, 16",
+            "vpclmulqdq zmm26, zmm5, zmm20, 17",
+            "vpternlogd zmm29, zmm25, zmm24, 0x96",
+            "vpternlogd zmm24, zmm28, zmm26, 0x96",
+            "vpslldq zmm25, zmm29, 8",
+            "vpclmulqdq zmm29, zmm29, zmm30, 1",
+            "vpternlogd zmm6, zmm29, zmm25, 0x96",
             "vpxorq zmm7, zmm7, zmm6",
             "vmovdqu64 [rdi+rax+{stride}*6], zmm6",
             "vmovdqu64 [rdi+rax+{stride}*7], zmm7",
-            "vbroadcasti32x4 zmm22, [rsi+352]",
-            "vbroadcasti32x4 zmm23, [rsi+368]",
-            "vpclmulqdq zmm24, zmm9, zmm22, 0",
-            "vpclmulqdq zmm25, zmm9, zmm23, 1",
-            "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm9, zmm22, 16",
-            "vpclmulqdq zmm25, zmm9, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
+            "vpslldq zmm26, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpxorq zmm9, zmm9, zmm8",
-            "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
-            "vmovdqu64 [rdi+rax+{stride}*9], zmm9",
-            "vbroadcasti32x4 zmm22, [rsi+384]",
-            "vbroadcasti32x4 zmm23, [rsi+400]",
-            "vpclmulqdq zmm24, zmm11, zmm22, 0",
-            "vpclmulqdq zmm25, zmm11, zmm23, 1",
-            "vpternlogd zmm10, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm11, zmm22, 16",
-            "vpclmulqdq zmm25, zmm11, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm10, zmm24, zmm25, 0x96",
+            "vpternlogd zmm4, zmm24, zmm26, 0x96",
+            "vpxorq zmm5, zmm5, zmm4",
+            "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
+            "vmovdqu64 [rdi+rax+{stride}*5], zmm5",
+            "vbroadcasti32x4 zmm18, [rsi+384]",
+            "vbroadcasti32x4 zmm20, [rsi+400]",
+            "vbroadcasti32x4 zmm21, [rsi+352]",
+            "vbroadcasti32x4 zmm19, [rsi+368]",
+            "vpclmulqdq zmm26, zmm11, zmm18, 0",
+            "vpclmulqdq zmm24, zmm11, zmm20, 1",
+            "vpternlogd zmm10, zmm26, zmm24, 0x96",
+            "vpclmulqdq zmm26, zmm9, zmm21, 0",
+            "vpclmulqdq zmm24, zmm9, zmm19, 1",
+            "vpternlogd zmm8, zmm26, zmm24, 0x96",
+            "vpclmulqdq zmm26, zmm11, zmm18, 16",
+            "vpclmulqdq zmm24, zmm11, zmm20, 17",
+            "vpclmulqdq zmm25, zmm9, zmm21, 16",
+            "vpclmulqdq zmm29, zmm9, zmm19, 17",
+            "vpternlogd zmm26, zmm24, zmm22, 0x96",
+            "vpternlogd zmm22, zmm25, zmm29, 0x96",
+            "vpslldq zmm24, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm10, zmm26, zmm24, 0x96",
             "vpxorq zmm11, zmm11, zmm10",
             "vmovdqu64 [rdi+rax+{stride}*10], zmm10",
             "vmovdqu64 [rdi+rax+{stride}*11], zmm11",
-            "vbroadcasti32x4 zmm22, [rsi+416]",
-            "vbroadcasti32x4 zmm23, [rsi+432]",
-            "vpclmulqdq zmm24, zmm13, zmm22, 0",
-            "vpclmulqdq zmm25, zmm13, zmm23, 1",
-            "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm13, zmm22, 16",
-            "vpclmulqdq zmm25, zmm13, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpxorq zmm13, zmm13, zmm12",
-            "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
-            "vmovdqu64 [rdi+rax+{stride}*13], zmm13",
-            "vbroadcasti32x4 zmm22, [rsi+448]",
-            "vbroadcasti32x4 zmm23, [rsi+464]",
-            "vpclmulqdq zmm24, zmm15, zmm22, 0",
-            "vpclmulqdq zmm25, zmm15, zmm23, 1",
-            "vpternlogd zmm14, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm15, zmm22, 16",
-            "vpclmulqdq zmm25, zmm15, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm14, zmm24, zmm25, 0x96",
+            "vpslldq zmm29, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm8, zmm22, zmm29, 0x96",
+            "vpxorq zmm9, zmm9, zmm8",
+            "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
+            "vmovdqu64 [rdi+rax+{stride}*9], zmm9",
+            "vbroadcasti32x4 zmm21, [rsi+448]",
+            "vbroadcasti32x4 zmm19, [rsi+464]",
+            "vbroadcasti32x4 zmm18, [rsi+416]",
+            "vbroadcasti32x4 zmm20, [rsi+432]",
+            "vpclmulqdq zmm29, zmm15, zmm21, 0",
+            "vpclmulqdq zmm22, zmm15, zmm19, 1",
+            "vpternlogd zmm14, zmm29, zmm22, 0x96",
+            "vpclmulqdq zmm29, zmm13, zmm18, 0",
+            "vpclmulqdq zmm22, zmm13, zmm20, 1",
+            "vpternlogd zmm12, zmm29, zmm22, 0x96",
+            "vpclmulqdq zmm29, zmm15, zmm21, 16",
+            "vpclmulqdq zmm22, zmm15, zmm19, 17",
+            "vpclmulqdq zmm24, zmm13, zmm18, 16",
+            "vpclmulqdq zmm26, zmm13, zmm20, 17",
+            "vpternlogd zmm29, zmm22, zmm23, 0x96",
+            "vpternlogd zmm23, zmm24, zmm26, 0x96",
+            "vpslldq zmm22, zmm29, 8",
+            "vpclmulqdq zmm29, zmm29, zmm30, 1",
+            "vpternlogd zmm14, zmm29, zmm22, 0x96",
             "vpxorq zmm15, zmm15, zmm14",
             "vmovdqu64 [rdi+rax+{stride}*14], zmm14",
             "vmovdqu64 [rdi+rax+{stride}*15], zmm15",
+            "vpslldq zmm26, zmm23, 8",
+            "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            "vpternlogd zmm12, zmm23, zmm26, 0x96",
+            "vpxorq zmm13, zmm13, zmm12",
+            "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
+            "vmovdqu64 [rdi+rax+{stride}*13], zmm13",
             "add rax, 64",
             "cmp rax, rdx",
             "jb 2b",
@@ -2848,20 +2949,37 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // registers still fit the 32 zmm file, and doubling the independent
         // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
         // the outstanding row misses.
-        macro_rules! butterfly2 {
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
-                butterfly2!($values, $u, $v, $twiddle, $low, false);
-            }};
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr) => {{
-                for c in 0..2 {
-                    let product = if $high_one {
-                        mul_x4_high_one($twiddle, $values[c][$v])
+        // Dense-loop butterfly with lazy x^64 folds (diet forms only): the
+        // product's x^64-position half accumulates in `$m[$u]`, `v ^= u`
+        // shares it, and it is folded when `$fold` (the row is a multiplicand
+        // in the next layer, or this is the last layer). Eight folds per four
+        // lanes instead of twelve; same field elements.
+        macro_rules! lazy_butterfly {
+            ($p:expr, $m:expr, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr, $fold:expr) => {{
+                if DIET {
+                    let (lo, hi) = if $high_one {
+                        mul_x4_high_one_parts($twiddle, $p[$v])
                     } else {
-                        mul_x4::<$low, DIET>($twiddle, $values[c][$v])
+                        mul_x4_parts::<$low>($twiddle, $p[$v])
                     };
-                    let new_u = _mm512_xor_si512($values[c][$u], product);
-                    $values[c][$v] = _mm512_xor_si512($values[c][$v], new_u);
-                    $values[c][$u] = new_u;
+                    $m[$u] = _mm512_xor_si512($m[$u], hi);
+                    let mut new_u = _mm512_xor_si512($p[$u], lo);
+                    if $fold {
+                        new_u = _mm512_xor_si512(new_u, fold_x64($m[$u]));
+                        $m[$u] = zero;
+                    }
+                    $p[$v] = _mm512_xor_si512($p[$v], new_u);
+                    $m[$v] = _mm512_xor_si512($m[$v], $m[$u]);
+                    $p[$u] = new_u;
+                } else {
+                    let product = if $high_one {
+                        mul_x4_high_one($twiddle, $p[$v])
+                    } else {
+                        mul_x4::<$low, DIET>($twiddle, $p[$v])
+                    };
+                    let new_u = _mm512_xor_si512($p[$u], product);
+                    $p[$v] = _mm512_xor_si512($p[$v], new_u);
+                    $p[$u] = new_u;
                 }
             }};
         }
@@ -2875,17 +2993,24 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
 
             let outer = tw[0];
+            let mut pending = [[zero; 8]; 2];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+                for c in 0..2 {
+                    lazy_butterfly!(values[c], pending[c], i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER, i & 2 != 0);
+                }
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    for c in 0..2 {
+                        lazy_butterfly!(values[c], pending[c], 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER, false, i & 1 != 0);
+                    }
                 }
             }
             for s in 0..4 {
-                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                for c in 0..2 {
+                    lazy_butterfly!(values[c], pending[c], 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER, false, true);
+                }
             }
 
             for (c, chunk) in values.iter().enumerate() {
@@ -2902,17 +3027,18 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
 
             let outer = tw[0];
+            let mut pending = [zero; 8];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+                lazy_butterfly!(values, pending, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER, i & 2 != 0);
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    lazy_butterfly!(values, pending, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER, false, i & 1 != 0);
                 }
             }
             for s in 0..4 {
-                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                lazy_butterfly!(values, pending, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER, false, true);
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -3388,6 +3514,124 @@ mod diet_tests {
                         },
                     ],
                 );
+            }
+        }
+    }
+
+    /// The diet fused-3 dense loops fold x^64 halves lazily; every outer and
+    /// inner product form must still equal the eager (non-diet) kernel bit for
+    /// bit, in the 8-lane and 4-lane loops and the zero-odd remainder.
+    #[test]
+    fn fused3_lazy_matches_eager() {
+        let mut next = rng(0xF3_1A2E);
+        let num_ntts = 64;
+        for dense_lanes in [64usize, 60, 12, 8, 4] {
+            for form in 0..6 {
+                let (low_inner, outer_form) = (form & 1 == 1, form >> 1);
+                let mut tw: [F128; 7] = core::array::from_fn(|_| next());
+                match outer_form {
+                    1 => tw[0].hi = 0,
+                    2 => tw[0].hi = 1,
+                    _ => {}
+                }
+                if low_inner {
+                    for t in &mut tw[1..] {
+                        t.hi = 0;
+                    }
+                }
+                let base: Vec<F128> = (0..8 * num_ntts).map(|_| next()).collect();
+                let run = |diet: bool| {
+                    let mut got = base.clone();
+                    macro_rules! go {
+                        ($d:expr, $li:expr, $lo:expr, $ho:expr) => {
+                            butterfly_fused_3layer_rows_impl::<$d, $li, 0, $lo, $ho>(
+                                got.as_mut_ptr(),
+                                num_ntts,
+                                dense_lanes,
+                                &tw,
+                            )
+                        };
+                    }
+                    // SAFETY: AVX-512F + VPCLMULQDQ test host; eight full rows;
+                    // each specialization's twiddle-limb precondition is set above.
+                    unsafe {
+                        match (diet, low_inner, outer_form) {
+                            (true, false, 0) => go!(true, false, false, false),
+                            (true, false, 1) => go!(true, false, true, false),
+                            (true, false, _) => go!(true, false, false, true),
+                            (true, true, 0) => go!(true, true, false, false),
+                            (true, true, 1) => go!(true, true, true, false),
+                            (true, true, _) => go!(true, true, false, true),
+                            (false, false, 0) => go!(false, false, false, false),
+                            (false, false, 1) => go!(false, false, true, false),
+                            (false, false, _) => go!(false, false, false, true),
+                            (false, true, 0) => go!(false, true, false, false),
+                            (false, true, 1) => go!(false, true, true, false),
+                            (false, true, _) => go!(false, true, false, true),
+                        }
+                    }
+                    got
+                };
+                let want = run(false);
+                assert!(want != base);
+                assert!(run(true) == want, "dense_lanes={dense_lanes} form={form}");
+            }
+        }
+    }
+
+    /// The prepared four-layer path (the fixed-register kernel with lazy
+    /// x^64-term reduction on every shaped geometry) must equal the
+    /// unprepared kernel bit for bit, with and without a scalar tail.
+    #[test]
+    fn prepared_four_layer_matches_unprepared() {
+        let mut next = rng(0x4A11_5EED);
+        let shapes = [
+            (128usize, 64usize),
+            (8, 64),
+            (4, 64),
+            (1, 64),
+            (1024, 8),
+            (128, 8),
+            (64, 8),
+            (16, 8),
+            (8, 8),
+            (4, 8),
+            (2, 8),
+            (1, 8),
+        ];
+        for (sixteenth, num_ntts) in shapes {
+            for lanes in [num_ntts, num_ntts - 3] {
+                for r in [0, sixteenth - 1] {
+                    let tw: [F128; 15] = core::array::from_fn(|_| next());
+                    let data: Vec<F128> = (0..16 * sixteenth * num_ntts).map(|_| next()).collect();
+                    let mut want = data.clone();
+                    let mut got = data.clone();
+                    // SAFETY: the test binary runs on hosts with AVX-512F and
+                    // VPCLMULQDQ; both buffers hold the full 16-row block.
+                    unsafe {
+                        butterfly_fused_4layer_row(
+                            want.as_mut_ptr(),
+                            sixteenth,
+                            num_ntts,
+                            lanes,
+                            r,
+                            &tw,
+                        );
+                        let p = prepare_four(&tw).expect("prepared twiddles");
+                        row_prepared::<1>(
+                            got.as_mut_ptr(),
+                            sixteenth,
+                            num_ntts,
+                            lanes,
+                            r,
+                            &tw,
+                            r,
+                            &p,
+                        );
+                    }
+                    assert!(want == got, "shape {sixteenth}x{num_ntts} lanes={lanes} r={r}");
+                    assert!(want != data);
+                }
             }
         }
     }
