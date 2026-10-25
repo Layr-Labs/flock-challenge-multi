@@ -3168,10 +3168,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
         let wt_ptr = wt.as_ptr();
@@ -3181,8 +3177,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                gfni_fold64_rows_masked_c4_bcast_lm(a_pkt.add(4 * xg * 8), cfold, fa, 0);
-                gfni_fold64_rows_masked_c4_bcast_lm(b_pkt.add(4 * xg * 8), cfold, fb, 0);
+                let [a0, a1, a2, a3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
+                let [b0, b1, b2, b3] =
+                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -3194,14 +3192,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                         core::arch::x86_64::_MM_HINT_T0,
                     );
                 }
-                let a0 = _mm512_loadu_si512(fa.cast::<__m512i>());
-                let b0 = _mm512_loadu_si512(fb.cast::<__m512i>());
-                let a1 = _mm512_loadu_si512(fa.add(4).cast::<__m512i>());
-                let b1 = _mm512_loadu_si512(fb.add(4).cast::<__m512i>());
-                let a2 = _mm512_loadu_si512(fa.add(8).cast::<__m512i>());
-                let b2 = _mm512_loadu_si512(fb.add(8).cast::<__m512i>());
-                let a3 = _mm512_loadu_si512(fa.add(12).cast::<__m512i>());
-                let b3 = _mm512_loadu_si512(fb.add(12).cast::<__m512i>());
                 for l in 2..4 {
                     _mm_prefetch(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
@@ -5586,7 +5576,10 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-core::arch::global_asm!(include_str!("gfni_c4_lm.S"));
+core::arch::global_asm!(
+    include_str!("gfni_c4_lm.S"),
+    include_str!("gfni_c4_register_result.S"),
+);
 
 #[cfg(all(
     target_os = "linux",
@@ -5599,6 +5592,53 @@ core::arch::global_asm!(include_str!("gfni_c4_lm.S"));
 unsafe extern "C" {
     // Symbol only: calls must use the private ABI declared by the wrapper.
     fn flock_gfni_c4_lm_preserving();
+    fn flock_gfni_c4_lm_register_result();
+}
+
+
+/// Return the unmasked lane-major C4 tile directly in four vector values.
+/// The private ELF leaf preserves ZMM12..31 and every GPR except RAX.
+/// The fallback uses the same unmasked Rust fold and output ordering.
+///
+/// # Safety
+/// The rows pointer names 512 initialized readable bytes and m is valid.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_lm_registers(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let a: __m512i;
+        let b: __m512i;
+        let c: __m512i;
+        let d: __m512i;
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_lm_register_result,
+            in("rdi") rows,
+            in("rsi") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+        );
+        [a, b, c, d]
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut result = [_mm512_setzero_si512(); 4];
+        gfni_fold64_rows_masked_c4_bcast_lm_rust(rows, m, result.as_mut_ptr().cast(), 0);
+        result
+    }
 }
 
 /// [`gfni_fold64_rows_masked_c4_bcast`] with the sixteen composed outputs

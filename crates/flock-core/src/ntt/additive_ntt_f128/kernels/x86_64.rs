@@ -1817,14 +1817,6 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "xor eax, eax",
             ".p2align 5",
             "2:",
-            "vmovdqu64 zmm0, [rdi+rax+{stride}*0]",
-            "vmovdqu64 zmm1, [rdi+rax+{stride}*1]",
-            "vmovdqu64 zmm2, [rdi+rax+{stride}*2]",
-            "vmovdqu64 zmm3, [rdi+rax+{stride}*3]",
-            "vmovdqu64 zmm4, [rdi+rax+{stride}*4]",
-            "vmovdqu64 zmm5, [rdi+rax+{stride}*5]",
-            "vmovdqu64 zmm6, [rdi+rax+{stride}*6]",
-            "vmovdqu64 zmm7, [rdi+rax+{stride}*7]",
             "vmovdqu64 zmm8, [rdi+rax+{stride}*8]",
             "vmovdqu64 zmm9, [rdi+rax+{stride}*9]",
             "vmovdqu64 zmm10, [rdi+rax+{stride}*10]",
@@ -1833,6 +1825,22 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vmovdqu64 zmm13, [rdi+rax+{stride}*13]",
             "vmovdqu64 zmm14, [rdi+rax+{stride}*14]",
             "vmovdqu64 zmm15, [rdi+rax+{stride}*15]",
+            "vpclmulqdq zmm22, zmm8, zmm16, 0",
+            "vpclmulqdq zmm23, zmm8, zmm17, 1",
+            "vpclmulqdq zmm24, zmm9, zmm16, 0",
+            "vpclmulqdq zmm25, zmm9, zmm17, 1",
+            "vpclmulqdq zmm26, zmm10, zmm16, 0",
+            "vpclmulqdq zmm27, zmm10, zmm17, 1",
+            "vpclmulqdq zmm28, zmm11, zmm16, 0",
+            "vpclmulqdq zmm29, zmm11, zmm17, 1",
+            "vmovdqu64 zmm0, [rdi+rax+{stride}*0]",
+            "vmovdqu64 zmm1, [rdi+rax+{stride}*1]",
+            "vmovdqu64 zmm2, [rdi+rax+{stride}*2]",
+            "vmovdqu64 zmm3, [rdi+rax+{stride}*3]",
+            "vmovdqu64 zmm4, [rdi+rax+{stride}*4]",
+            "vmovdqu64 zmm5, [rdi+rax+{stride}*5]",
+            "vmovdqu64 zmm6, [rdi+rax+{stride}*6]",
+            "vmovdqu64 zmm7, [rdi+rax+{stride}*7]",
             ".if {hint} == 1",
             "prefetcht0 [rcx+rax+{stride}*0]",
             ".elseif {hint} == 2",
@@ -1853,18 +1861,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*3]",
             ".endif",
-            "vpclmulqdq zmm22, zmm8, zmm16, 0",
-            "vpclmulqdq zmm23, zmm8, zmm17, 1",
             "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm9, zmm16, 0",
-            "vpclmulqdq zmm23, zmm9, zmm17, 1",
-            "vpternlogd zmm1, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm10, zmm16, 0",
-            "vpclmulqdq zmm23, zmm10, zmm17, 1",
-            "vpternlogd zmm2, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm11, zmm16, 0",
-            "vpclmulqdq zmm23, zmm11, zmm17, 1",
-            "vpternlogd zmm3, zmm22, zmm23, 0x96",
+            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpternlogd zmm2, zmm26, zmm27, 0x96",
+            "vpternlogd zmm3, zmm28, zmm29, 0x96",
             "vpclmulqdq zmm22, zmm8, zmm16, 16",
             "vpclmulqdq zmm23, zmm8, zmm17, 17",
             "vpclmulqdq zmm24, zmm9, zmm16, 16",
@@ -1895,16 +1895,16 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpxorq zmm11, zmm11, zmm3",
             "vpclmulqdq zmm22, zmm12, zmm16, 0",
             "vpclmulqdq zmm23, zmm12, zmm17, 1",
+            "vpclmulqdq zmm24, zmm13, zmm16, 0",
+            "vpclmulqdq zmm25, zmm13, zmm17, 1",
+            "vpclmulqdq zmm26, zmm14, zmm16, 0",
+            "vpclmulqdq zmm27, zmm14, zmm17, 1",
+            "vpclmulqdq zmm28, zmm15, zmm16, 0",
+            "vpclmulqdq zmm29, zmm15, zmm17, 1",
             "vpternlogd zmm4, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm13, zmm16, 0",
-            "vpclmulqdq zmm23, zmm13, zmm17, 1",
-            "vpternlogd zmm5, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm14, zmm16, 0",
-            "vpclmulqdq zmm23, zmm14, zmm17, 1",
-            "vpternlogd zmm6, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm15, zmm16, 0",
-            "vpclmulqdq zmm23, zmm15, zmm17, 1",
-            "vpternlogd zmm7, zmm22, zmm23, 0x96",
+            "vpternlogd zmm5, zmm24, zmm25, 0x96",
+            "vpternlogd zmm6, zmm26, zmm27, 0x96",
+            "vpternlogd zmm7, zmm28, zmm29, 0x96",
             "vpclmulqdq zmm22, zmm12, zmm16, 16",
             "vpclmulqdq zmm23, zmm12, zmm17, 17",
             "vpclmulqdq zmm24, zmm13, zmm16, 16",
@@ -1955,16 +1955,16 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".endif",
             "vpclmulqdq zmm22, zmm4, zmm18, 0",
             "vpclmulqdq zmm23, zmm4, zmm19, 1",
+            "vpclmulqdq zmm24, zmm5, zmm18, 0",
+            "vpclmulqdq zmm25, zmm5, zmm19, 1",
+            "vpclmulqdq zmm26, zmm6, zmm18, 0",
+            "vpclmulqdq zmm27, zmm6, zmm19, 1",
+            "vpclmulqdq zmm28, zmm7, zmm18, 0",
+            "vpclmulqdq zmm29, zmm7, zmm19, 1",
             "vpternlogd zmm0, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm5, zmm18, 0",
-            "vpclmulqdq zmm23, zmm5, zmm19, 1",
-            "vpternlogd zmm1, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm6, zmm18, 0",
-            "vpclmulqdq zmm23, zmm6, zmm19, 1",
-            "vpternlogd zmm2, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm7, zmm18, 0",
-            "vpclmulqdq zmm23, zmm7, zmm19, 1",
-            "vpternlogd zmm3, zmm22, zmm23, 0x96",
+            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpternlogd zmm2, zmm26, zmm27, 0x96",
+            "vpternlogd zmm3, zmm28, zmm29, 0x96",
             "vpclmulqdq zmm22, zmm4, zmm18, 16",
             "vpclmulqdq zmm23, zmm4, zmm19, 17",
             "vpclmulqdq zmm24, zmm5, zmm18, 16",
@@ -1995,16 +1995,16 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpxorq zmm7, zmm7, zmm3",
             "vpclmulqdq zmm22, zmm12, zmm20, 0",
             "vpclmulqdq zmm23, zmm12, zmm21, 1",
+            "vpclmulqdq zmm24, zmm13, zmm20, 0",
+            "vpclmulqdq zmm25, zmm13, zmm21, 1",
+            "vpclmulqdq zmm26, zmm14, zmm20, 0",
+            "vpclmulqdq zmm27, zmm14, zmm21, 1",
+            "vpclmulqdq zmm28, zmm15, zmm20, 0",
+            "vpclmulqdq zmm29, zmm15, zmm21, 1",
             "vpternlogd zmm8, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm13, zmm20, 0",
-            "vpclmulqdq zmm23, zmm13, zmm21, 1",
-            "vpternlogd zmm9, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm14, zmm20, 0",
-            "vpclmulqdq zmm23, zmm14, zmm21, 1",
-            "vpternlogd zmm10, zmm22, zmm23, 0x96",
-            "vpclmulqdq zmm22, zmm15, zmm20, 0",
-            "vpclmulqdq zmm23, zmm15, zmm21, 1",
-            "vpternlogd zmm11, zmm22, zmm23, 0x96",
+            "vpternlogd zmm9, zmm24, zmm25, 0x96",
+            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpternlogd zmm11, zmm28, zmm29, 0x96",
             "vpclmulqdq zmm22, zmm12, zmm20, 16",
             "vpclmulqdq zmm23, zmm12, zmm21, 17",
             "vpclmulqdq zmm24, zmm13, zmm20, 16",
@@ -2057,10 +2057,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm23, [rsi+112]",
             "vpclmulqdq zmm24, zmm2, zmm22, 0",
             "vpclmulqdq zmm25, zmm2, zmm23, 1",
+            "vpclmulqdq zmm26, zmm3, zmm22, 0",
+            "vpclmulqdq zmm27, zmm3, zmm23, 1",
             "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm3, zmm22, 0",
-            "vpclmulqdq zmm25, zmm3, zmm23, 1",
-            "vpternlogd zmm1, zmm24, zmm25, 0x96",
+            "vpternlogd zmm1, zmm26, zmm27, 0x96",
             "vpclmulqdq zmm24, zmm2, zmm22, 16",
             "vpclmulqdq zmm25, zmm2, zmm23, 17",
             "vpclmulqdq zmm26, zmm3, zmm22, 16",
@@ -2079,10 +2079,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm23, [rsi+144]",
             "vpclmulqdq zmm24, zmm6, zmm22, 0",
             "vpclmulqdq zmm25, zmm6, zmm23, 1",
+            "vpclmulqdq zmm26, zmm7, zmm22, 0",
+            "vpclmulqdq zmm27, zmm7, zmm23, 1",
             "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm7, zmm22, 0",
-            "vpclmulqdq zmm25, zmm7, zmm23, 1",
-            "vpternlogd zmm5, zmm24, zmm25, 0x96",
+            "vpternlogd zmm5, zmm26, zmm27, 0x96",
             "vpclmulqdq zmm24, zmm6, zmm22, 16",
             "vpclmulqdq zmm25, zmm6, zmm23, 17",
             "vpclmulqdq zmm26, zmm7, zmm22, 16",
@@ -2101,10 +2101,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm23, [rsi+176]",
             "vpclmulqdq zmm24, zmm10, zmm22, 0",
             "vpclmulqdq zmm25, zmm10, zmm23, 1",
+            "vpclmulqdq zmm26, zmm11, zmm22, 0",
+            "vpclmulqdq zmm27, zmm11, zmm23, 1",
             "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm11, zmm22, 0",
-            "vpclmulqdq zmm25, zmm11, zmm23, 1",
-            "vpternlogd zmm9, zmm24, zmm25, 0x96",
+            "vpternlogd zmm9, zmm26, zmm27, 0x96",
             "vpclmulqdq zmm24, zmm10, zmm22, 16",
             "vpclmulqdq zmm25, zmm10, zmm23, 17",
             "vpclmulqdq zmm26, zmm11, zmm22, 16",
@@ -2123,10 +2123,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm23, [rsi+208]",
             "vpclmulqdq zmm24, zmm14, zmm22, 0",
             "vpclmulqdq zmm25, zmm14, zmm23, 1",
+            "vpclmulqdq zmm26, zmm15, zmm22, 0",
+            "vpclmulqdq zmm27, zmm15, zmm23, 1",
             "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm15, zmm22, 0",
-            "vpclmulqdq zmm25, zmm15, zmm23, 1",
-            "vpternlogd zmm13, zmm24, zmm25, 0x96",
+            "vpternlogd zmm13, zmm26, zmm27, 0x96",
             "vpclmulqdq zmm24, zmm14, zmm22, 16",
             "vpclmulqdq zmm25, zmm14, zmm23, 17",
             "vpclmulqdq zmm26, zmm15, zmm22, 16",
@@ -2163,114 +2163,114 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".endif",
             "vbroadcasti32x4 zmm22, [rsi+224]",
             "vbroadcasti32x4 zmm23, [rsi+240]",
+            "vbroadcasti32x4 zmm28, [rsi+256]",
+            "vbroadcasti32x4 zmm29, [rsi+272]",
             "vpclmulqdq zmm24, zmm1, zmm22, 0",
             "vpclmulqdq zmm25, zmm1, zmm23, 1",
+            "vpclmulqdq zmm26, zmm1, zmm22, 16",
+            "vpclmulqdq zmm27, zmm1, zmm23, 17",
+            "vpclmulqdq zmm31, zmm3, zmm28, 0",
+            "vpclmulqdq zmm22, zmm3, zmm29, 1",
+            "vpclmulqdq zmm23, zmm3, zmm28, 16",
+            "vpclmulqdq zmm28, zmm3, zmm29, 17",
             "vpternlogd zmm0, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm1, zmm22, 16",
-            "vpclmulqdq zmm25, zmm1, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpternlogd zmm2, zmm31, zmm22, 0x96",
+            "vpxorq zmm31, zmm23, zmm28",
             "vpslldq zmm25, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm22, zmm31, 8",
+            "vpclmulqdq zmm31, zmm31, zmm30, 1",
             "vpternlogd zmm0, zmm24, zmm25, 0x96",
             "vpxorq zmm1, zmm1, zmm0",
+            "vpternlogd zmm2, zmm31, zmm22, 0x96",
+            "vpxorq zmm3, zmm3, zmm2",
             "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
             "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
-            "vbroadcasti32x4 zmm22, [rsi+256]",
-            "vbroadcasti32x4 zmm23, [rsi+272]",
-            "vpclmulqdq zmm24, zmm3, zmm22, 0",
-            "vpclmulqdq zmm25, zmm3, zmm23, 1",
-            "vpternlogd zmm2, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm3, zmm22, 16",
-            "vpclmulqdq zmm25, zmm3, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm2, zmm24, zmm25, 0x96",
-            "vpxorq zmm3, zmm3, zmm2",
             "vmovdqu64 [rdi+rax+{stride}*2], zmm2",
             "vmovdqu64 [rdi+rax+{stride}*3], zmm3",
             "vbroadcasti32x4 zmm22, [rsi+288]",
             "vbroadcasti32x4 zmm23, [rsi+304]",
+            "vbroadcasti32x4 zmm28, [rsi+320]",
+            "vbroadcasti32x4 zmm29, [rsi+336]",
             "vpclmulqdq zmm24, zmm5, zmm22, 0",
             "vpclmulqdq zmm25, zmm5, zmm23, 1",
+            "vpclmulqdq zmm26, zmm5, zmm22, 16",
+            "vpclmulqdq zmm27, zmm5, zmm23, 17",
+            "vpclmulqdq zmm31, zmm7, zmm28, 0",
+            "vpclmulqdq zmm22, zmm7, zmm29, 1",
+            "vpclmulqdq zmm23, zmm7, zmm28, 16",
+            "vpclmulqdq zmm28, zmm7, zmm29, 17",
             "vpternlogd zmm4, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm5, zmm22, 16",
-            "vpclmulqdq zmm25, zmm5, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpternlogd zmm6, zmm31, zmm22, 0x96",
+            "vpxorq zmm31, zmm23, zmm28",
             "vpslldq zmm25, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm22, zmm31, 8",
+            "vpclmulqdq zmm31, zmm31, zmm30, 1",
             "vpternlogd zmm4, zmm24, zmm25, 0x96",
             "vpxorq zmm5, zmm5, zmm4",
+            "vpternlogd zmm6, zmm31, zmm22, 0x96",
+            "vpxorq zmm7, zmm7, zmm6",
             "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
             "vmovdqu64 [rdi+rax+{stride}*5], zmm5",
-            "vbroadcasti32x4 zmm22, [rsi+320]",
-            "vbroadcasti32x4 zmm23, [rsi+336]",
-            "vpclmulqdq zmm24, zmm7, zmm22, 0",
-            "vpclmulqdq zmm25, zmm7, zmm23, 1",
-            "vpternlogd zmm6, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm7, zmm22, 16",
-            "vpclmulqdq zmm25, zmm7, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm6, zmm24, zmm25, 0x96",
-            "vpxorq zmm7, zmm7, zmm6",
             "vmovdqu64 [rdi+rax+{stride}*6], zmm6",
             "vmovdqu64 [rdi+rax+{stride}*7], zmm7",
             "vbroadcasti32x4 zmm22, [rsi+352]",
             "vbroadcasti32x4 zmm23, [rsi+368]",
+            "vbroadcasti32x4 zmm28, [rsi+384]",
+            "vbroadcasti32x4 zmm29, [rsi+400]",
             "vpclmulqdq zmm24, zmm9, zmm22, 0",
             "vpclmulqdq zmm25, zmm9, zmm23, 1",
+            "vpclmulqdq zmm26, zmm9, zmm22, 16",
+            "vpclmulqdq zmm27, zmm9, zmm23, 17",
+            "vpclmulqdq zmm31, zmm11, zmm28, 0",
+            "vpclmulqdq zmm22, zmm11, zmm29, 1",
+            "vpclmulqdq zmm23, zmm11, zmm28, 16",
+            "vpclmulqdq zmm28, zmm11, zmm29, 17",
             "vpternlogd zmm8, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm9, zmm22, 16",
-            "vpclmulqdq zmm25, zmm9, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpternlogd zmm10, zmm31, zmm22, 0x96",
+            "vpxorq zmm31, zmm23, zmm28",
             "vpslldq zmm25, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm22, zmm31, 8",
+            "vpclmulqdq zmm31, zmm31, zmm30, 1",
             "vpternlogd zmm8, zmm24, zmm25, 0x96",
             "vpxorq zmm9, zmm9, zmm8",
+            "vpternlogd zmm10, zmm31, zmm22, 0x96",
+            "vpxorq zmm11, zmm11, zmm10",
             "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
             "vmovdqu64 [rdi+rax+{stride}*9], zmm9",
-            "vbroadcasti32x4 zmm22, [rsi+384]",
-            "vbroadcasti32x4 zmm23, [rsi+400]",
-            "vpclmulqdq zmm24, zmm11, zmm22, 0",
-            "vpclmulqdq zmm25, zmm11, zmm23, 1",
-            "vpternlogd zmm10, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm11, zmm22, 16",
-            "vpclmulqdq zmm25, zmm11, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm10, zmm24, zmm25, 0x96",
-            "vpxorq zmm11, zmm11, zmm10",
             "vmovdqu64 [rdi+rax+{stride}*10], zmm10",
             "vmovdqu64 [rdi+rax+{stride}*11], zmm11",
             "vbroadcasti32x4 zmm22, [rsi+416]",
             "vbroadcasti32x4 zmm23, [rsi+432]",
+            "vbroadcasti32x4 zmm28, [rsi+448]",
+            "vbroadcasti32x4 zmm29, [rsi+464]",
             "vpclmulqdq zmm24, zmm13, zmm22, 0",
             "vpclmulqdq zmm25, zmm13, zmm23, 1",
+            "vpclmulqdq zmm26, zmm13, zmm22, 16",
+            "vpclmulqdq zmm27, zmm13, zmm23, 17",
+            "vpclmulqdq zmm31, zmm15, zmm28, 0",
+            "vpclmulqdq zmm22, zmm15, zmm29, 1",
+            "vpclmulqdq zmm23, zmm15, zmm28, 16",
+            "vpclmulqdq zmm28, zmm15, zmm29, 17",
             "vpternlogd zmm12, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm13, zmm22, 16",
-            "vpclmulqdq zmm25, zmm13, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpternlogd zmm14, zmm31, zmm22, 0x96",
+            "vpxorq zmm31, zmm23, zmm28",
             "vpslldq zmm25, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpslldq zmm22, zmm31, 8",
+            "vpclmulqdq zmm31, zmm31, zmm30, 1",
             "vpternlogd zmm12, zmm24, zmm25, 0x96",
             "vpxorq zmm13, zmm13, zmm12",
+            "vpternlogd zmm14, zmm31, zmm22, 0x96",
+            "vpxorq zmm15, zmm15, zmm14",
             "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
             "vmovdqu64 [rdi+rax+{stride}*13], zmm13",
-            "vbroadcasti32x4 zmm22, [rsi+448]",
-            "vbroadcasti32x4 zmm23, [rsi+464]",
-            "vpclmulqdq zmm24, zmm15, zmm22, 0",
-            "vpclmulqdq zmm25, zmm15, zmm23, 1",
-            "vpternlogd zmm14, zmm24, zmm25, 0x96",
-            "vpclmulqdq zmm24, zmm15, zmm22, 16",
-            "vpclmulqdq zmm25, zmm15, zmm23, 17",
-            "vpxorq zmm24, zmm24, zmm25",
-            "vpslldq zmm25, zmm24, 8",
-            "vpclmulqdq zmm24, zmm24, zmm30, 1",
-            "vpternlogd zmm14, zmm24, zmm25, 0x96",
-            "vpxorq zmm15, zmm15, zmm14",
             "vmovdqu64 [rdi+rax+{stride}*14], zmm14",
             "vmovdqu64 [rdi+rax+{stride}*15], zmm15",
             "add rax, 64",
@@ -2315,6 +2315,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             out("zmm28") _,
             out("zmm29") _,
             out("zmm30") _,
+            out("zmm31") _,
             options(nostack),
         );
     }
@@ -3689,9 +3690,34 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
     };
-    for i in 0..15 {
+    for i in (0..12).step_by(4) {
+        unsafe {
+            use core::arch::x86_64::*;
+            let v = _mm512_loadu_si512(t.as_ptr().add(i) as *const __m512i);
+            let shifted = _mm512_xor_si512(
+                _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, v),
+                _mm512_clmulepi64_epi128::<0x01>(v, _mm512_set1_epi64(0x87)),
+            );
+            let first = _mm512_permutex2var_epi64(v,
+                _mm512_setr_epi64(0,1,8,9,2,3,10,11), shifted);
+            let last = _mm512_permutex2var_epi64(v,
+                _mm512_setr_epi64(4,5,12,13,6,7,14,15), shifted);
+            let out = result.pairs.as_mut_ptr().add(i) as *mut __m512i;
+            _mm512_storeu_si512(out, first);
+            _mm512_storeu_si512(out.add(1), last);
+        }
+    }
+    for i in 12..15 {
         // x^64 multiplication is a field operation, not a value assumption.
-        result.pairs[i] = [t[i], t[i] * F128::new(0, 1)];
+        use core::arch::x86_64::*;
+        let companion = unsafe {
+            let v = _mm_set_epi64x(t[i].hi as i64, t[i].lo as i64);
+            let reduction = _mm_clmulepi64_si128::<0x01>(v, _mm_set_epi64x(0, 0x87));
+            let folded = _mm_xor_si128(_mm_slli_si128::<8>(v), reduction);
+            F128::new(_mm_cvtsi128_si64(folded) as u64,
+                      _mm_extract_epi64::<1>(folded) as u64)
+        };
+        result.pairs[i] = [t[i], companion];
     }
     Some(result)
 }
@@ -3783,5 +3809,148 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
         butterfly_fused_4layer_row_impl::<true, true, H, 0, 0>(
             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
         )
+    }
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod ab_ntt_tail_composition_tests {
+    use super::{prepare_four, row_prepared, F128};
+    use std::hint::black_box;
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    // Independent polynomial-basis reference: one bit at a time, with no
+    // field multiplication, SIMD intrinsic, or prepared-table operation.
+    fn multiply(a: F128, b: F128) -> F128 {
+        let mut x = (u128::from(a.hi) << 64) | u128::from(a.lo);
+        let mut y = (u128::from(b.hi) << 64) | u128::from(b.lo);
+        let mut result = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                result ^= x;
+            }
+            let carry = x >> 127;
+            x <<= 1;
+            if carry != 0 {
+                x ^= 0x87;
+            }
+            y >>= 1;
+        }
+        F128::new(result as u64, (result >> 64) as u64)
+    }
+
+    fn xor(a: F128, b: F128) -> F128 {
+        F128::new(a.lo ^ b.lo, a.hi ^ b.hi)
+    }
+
+    #[test]
+    fn ntt_companions_match_bitwise_oracle() {
+        let mut seed = 0xc7a4_8be2_51d6_90f3;
+        for case in 0..260 {
+            let offset = case % 4;
+            let mut input = [F128::new(0xceda, 0xbabe); 19];
+            for i in 0..15 {
+                input[offset + i] = match case {
+                    0 => F128::ZERO,
+                    1 => F128::new(u64::MAX, u64::MAX),
+                    2..=129 => {
+                        let bit = (case - 2 + i) % 128;
+                        let v = 1u128 << bit;
+                        F128::new(v as u64, (v >> 64) as u64)
+                    }
+                    _ => F128::new(next(&mut seed), next(&mut seed)),
+                };
+            }
+            let original = input;
+            let t: &[F128; 15] = input[offset..offset + 15].try_into().unwrap();
+            // SAFETY: this module has the production ISA requirements and
+            // supplies the exact fifteen-element initialized input.
+            let prepared = unsafe { prepare_four(black_box(t)) }.unwrap();
+            for i in 0..15 {
+                assert_eq!(prepared.pairs[i][0], t[i], "case={case} i={i}");
+                assert_eq!(
+                    prepared.pairs[i][1],
+                    multiply(t[i], F128::new(0, 1)),
+                    "case={case} i={i}"
+                );
+            }
+            assert_eq!(input, original);
+        }
+        println!("3900 production companions match the independent bitwise oracle");
+    }
+
+    fn rows<const H: u8>() -> usize {
+        let shapes = [
+            (128, 64), (8, 64), (4, 64), (1, 64),
+            (1024, 8), (128, 8), (64, 8), (16, 8),
+            (8, 8), (4, 8), (2, 8), (1, 8),
+            (3, 7), (2, 13), (5, 16),
+        ];
+        let mut seed = 0xc751_8234_daf3_981b;
+        let guard = F128::new(0x3ca9_8546_b721_936d, 0xcaa9_d173_985e_4693);
+        let mut cases = 0;
+        for (s, n) in shapes {
+            for (case, lanes) in [0, 1, 3, 4, n - 1, n].into_iter().enumerate() {
+                let offset = 4 + case % 4;
+                let count = 16 * s * n;
+                let r = if case % 2 == 0 { 0 } else { s - 1 };
+                let pf_r = (r + 1) % s;
+                let mut data = vec![guard; offset + count + 4];
+                for row in 0..16 {
+                    for lane in 0..n {
+                        data[offset + (row * s + r) * n + lane] =
+                            F128::new(next(&mut seed), next(&mut seed));
+                    }
+                }
+                let tw: [F128; 15] = std::array::from_fn(|_| match case {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    2 => F128::new(u64::MAX, u64::MAX),
+                    _ => F128::new(next(&mut seed), next(&mut seed)),
+                });
+                let original_tw = tw;
+                let mut expected = data.clone();
+                for lane in 0..lanes {
+                    for layer in 0..4 {
+                        let distance = 8 >> layer;
+                        for group in 0..(1 << layer) {
+                            let t = tw[(1 << layer) - 1 + group];
+                            for j in 0..distance {
+                                let u = offset + ((group * 2 * distance + j) * s + r) * n + lane;
+                                let v = u + distance * s * n;
+                                expected[u] = xor(expected[u], multiply(expected[v], t));
+                                expected[v] = xor(expected[v], expected[u]);
+                            }
+                        }
+                    }
+                }
+                // SAFETY: the initialized block contains sixteen disjoint
+                // rows with lanes <= n, valid row and prefetch indices, and
+                // the table is produced by the actual production producer.
+                unsafe {
+                    let prepared = prepare_four(black_box(&tw)).unwrap();
+                    row_prepared::<H>(
+                        black_box(data.as_mut_ptr().add(offset)), s, n, lanes,
+                        r, black_box(&tw), pf_r, black_box(&prepared),
+                    );
+                }
+                assert_eq!(tw, original_tw);
+                assert_eq!(data, expected, "H={H} s={s} n={n} lanes={lanes} r={r}");
+                cases += 1;
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn ntt_tail_rows_match_bitwise_oracle() {
+        let cases = rows::<0>() + rows::<1>() + rows::<2>();
+        assert_eq!(cases, 270);
+        println!("270 production NTT row cases match the independent bitwise oracle and guards");
     }
 }
