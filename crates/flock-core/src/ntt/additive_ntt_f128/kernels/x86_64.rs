@@ -3675,6 +3675,12 @@ mod diet_tests {
 pub(crate) struct PreparedFour {
     pairs: [[F128; 2]; 15],
 }
+impl PreparedFour {
+    pub(super) fn raw188(&self) -> [F128;15] {
+        std::array::from_fn(|i| self.pairs[i][0])
+    }
+}
+
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
@@ -3689,9 +3695,34 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
     };
-    for i in 0..15 {
+    for i in (0..12).step_by(4) {
+        unsafe {
+            use core::arch::x86_64::*;
+            let v = _mm512_loadu_si512(t.as_ptr().add(i) as *const __m512i);
+            let shifted = _mm512_xor_si512(
+                _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, v),
+                _mm512_clmulepi64_epi128::<0x01>(v, _mm512_set1_epi64(0x87)),
+            );
+            let first = _mm512_permutex2var_epi64(v,
+                _mm512_setr_epi64(0,1,8,9,2,3,10,11), shifted);
+            let last = _mm512_permutex2var_epi64(v,
+                _mm512_setr_epi64(4,5,12,13,6,7,14,15), shifted);
+            let out = result.pairs.as_mut_ptr().add(i) as *mut __m512i;
+            _mm512_storeu_si512(out, first);
+            _mm512_storeu_si512(out.add(1), last);
+        }
+    }
+    for i in 12..15 {
         // x^64 multiplication is a field operation, not a value assumption.
-        result.pairs[i] = [t[i], t[i] * F128::new(0, 1)];
+        use core::arch::x86_64::*;
+        let companion = unsafe {
+            let v = _mm_set_epi64x(t[i].hi as i64, t[i].lo as i64);
+            let reduction = _mm_clmulepi64_si128::<0x01>(v, _mm_set_epi64x(0, 0x87));
+            let folded = _mm_xor_si128(_mm_slli_si128::<8>(v), reduction);
+            F128::new(_mm_cvtsi128_si64(folded) as u64,
+                      _mm_extract_epi64::<1>(folded) as u64)
+        };
+        result.pairs[i] = [t[i], companion];
     }
     Some(result)
 }
