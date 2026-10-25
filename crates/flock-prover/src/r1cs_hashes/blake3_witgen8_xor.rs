@@ -139,6 +139,22 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
+unsafe fn affine_subset_rows(m: *const u64) -> [__m512i; 8] {
+    unsafe {
+        [
+            _mm512_loadu_si512(m.add(64).cast()),
+            _mm512_loadu_si512(m.add(72).cast()),
+            _mm512_loadu_si512(m.add(80).cast()),
+            _mm512_loadu_si512(m.add(88).cast()),
+            _mm512_loadu_si512(m.add(96).cast()),
+            _mm512_loadu_si512(m.add(104).cast()),
+            _mm512_loadu_si512(m.add(112).cast()),
+            _mm512_loadu_si512(m.add(120).cast()),
+        ]
+    }
+}
+
+#[inline(always)]
 unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
     unsafe {
         // For sparse complement inputs keep the direct projection: <=3*8 products.
@@ -167,99 +183,100 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
         x[1] ^= x[5];
         x[2] ^= x[6];
         x[3] ^= x[7];
+        let rows = affine_subset_rows(m);
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
             _mm512_set1_epi64(x[0] as i64),
-            _mm512_loadu_si512(m.add(64).cast()),
+            rows[0],
         );
         c[1] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(72).cast()),
+                rows[1],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[1] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[2] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(80).cast()),
+                rows[2],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[2] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[3] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(88).cast()),
+                    rows[3],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[3] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[4] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(96).cast()),
+                rows[4],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[4] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[5] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(104).cast()),
+                    rows[5],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
+                    rows[4],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[5] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[6] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(112).cast()),
+                    rows[6],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
+                    rows[4],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[6] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[7] = _mm512_xor_si512(
@@ -268,38 +285,38 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
                     _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[0] as i64),
-                            _mm512_loadu_si512(m.add(120).cast()),
+                            rows[7],
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[1] as i64),
-                            _mm512_loadu_si512(m.add(112).cast()),
+                            rows[6],
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[2] as i64),
-                            _mm512_loadu_si512(m.add(104).cast()),
+                            rows[5],
                         ),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
                         _mm512_set1_epi64(x[3] as i64),
-                        _mm512_loadu_si512(m.add(96).cast()),
+                        rows[4],
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
                         _mm512_set1_epi64(x[4] as i64),
-                        _mm512_loadu_si512(m.add(88).cast()),
+                        rows[3],
                     ),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[5] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[6] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[7] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[0] = _mm512_xor_si512(c[0], c[1]);
@@ -322,99 +339,100 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
 unsafe fn affine_prepared(p: *const u64, m: *const u64) -> [__m512i; 8] {
     unsafe {
         let x = core::ptr::read_unaligned(p.cast::<[u64;8]>());
+        let rows = affine_subset_rows(m);
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
             _mm512_set1_epi64(x[0] as i64),
-            _mm512_loadu_si512(m.add(64).cast()),
+            rows[0],
         );
         c[1] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(72).cast()),
+                rows[1],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[1] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[2] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(80).cast()),
+                rows[2],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[2] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[3] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(88).cast()),
+                    rows[3],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[3] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[4] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[0] as i64),
-                _mm512_loadu_si512(m.add(96).cast()),
+                rows[4],
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[4] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[5] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(104).cast()),
+                    rows[5],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[1] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
+                    rows[4],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[5] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[6] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[0] as i64),
-                    _mm512_loadu_si512(m.add(112).cast()),
+                    rows[6],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[2] as i64),
-                    _mm512_loadu_si512(m.add(96).cast()),
+                    rows[4],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[4] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[6] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[7] = _mm512_xor_si512(
@@ -423,38 +441,38 @@ unsafe fn affine_prepared(p: *const u64, m: *const u64) -> [__m512i; 8] {
                     _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[0] as i64),
-                            _mm512_loadu_si512(m.add(120).cast()),
+                            rows[7],
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[1] as i64),
-                            _mm512_loadu_si512(m.add(112).cast()),
+                            rows[6],
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
                             _mm512_set1_epi64(x[2] as i64),
-                            _mm512_loadu_si512(m.add(104).cast()),
+                            rows[5],
                         ),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
                         _mm512_set1_epi64(x[3] as i64),
-                        _mm512_loadu_si512(m.add(96).cast()),
+                        rows[4],
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
                         _mm512_set1_epi64(x[4] as i64),
-                        _mm512_loadu_si512(m.add(88).cast()),
+                        rows[3],
                     ),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[5] as i64),
-                    _mm512_loadu_si512(m.add(80).cast()),
+                    rows[2],
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
                     _mm512_set1_epi64(x[6] as i64),
-                    _mm512_loadu_si512(m.add(72).cast()),
+                    rows[1],
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
                 _mm512_set1_epi64(x[7] as i64),
-                _mm512_loadu_si512(m.add(64).cast()),
+                rows[0],
             ),
         );
         c[0] = _mm512_xor_si512(c[0], c[1]);
