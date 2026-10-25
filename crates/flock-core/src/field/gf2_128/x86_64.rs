@@ -585,6 +585,29 @@ pub struct WideGhashX4 {
     pub(crate) mid: __m512i,
 }
 
+///
+///
+///
+/// # Safety
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn karatsuba_unreduced_x4(x: __m512i, y: __m512i) -> (__m512i, __m512i, __m512i) {
+    // SAFETY: caller carries avx512f+vpclmulqdq.
+    unsafe {
+        let x_sum = _mm512_xor_si512(x, _mm512_unpackhi_epi64(x, x));
+        let y_sum = _mm512_xor_si512(y, _mm512_unpackhi_epi64(y, y));
+        let lo = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let hi = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let mid = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_clmulepi64_epi128::<0x00>(x_sum, y_sum),
+            lo,
+            hi,
+        );
+        (lo, hi, mid)
+    }
+}
+
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 impl WideGhashX4 {
     /// Empty accumulator.
@@ -625,25 +648,15 @@ impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn from_mul(x: __m512i, y: __m512i) -> Self {
-        Self {
-            lo: _mm512_clmulepi64_epi128::<0x00>(x, y),
-            hi: _mm512_clmulepi64_epi128::<0x11>(x, y),
-            mid: _mm512_xor_si512(
-                _mm512_clmulepi64_epi128::<0x01>(x, y),
-                _mm512_clmulepi64_epi128::<0x10>(x, y),
-            ),
-        }
+        let (lo, hi, mid) = unsafe { karatsuba_unreduced_x4(x, y) };
+        Self { lo, hi, mid }
     }
 
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
-        // Register-only widen (4 CLMULs) + XOR-accumulate; cfg-gated.
-        self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
-        self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
-        let m = _mm512_xor_si512(
-            _mm512_clmulepi64_epi128::<0x01>(x, y),
-            _mm512_clmulepi64_epi128::<0x10>(x, y),
-        );
-        self.mid = _mm512_xor_si512(self.mid, m);
+        let (lo, hi, mid) = unsafe { karatsuba_unreduced_x4(x, y) };
+        self.lo = _mm512_xor_si512(self.lo, lo);
+        self.hi = _mm512_xor_si512(self.hi, hi);
+        self.mid = _mm512_xor_si512(self.mid, mid);
     }
 
     /// XOR-accumulate two 4-lane unreduced products, `x0[i]·y0[i]` and
