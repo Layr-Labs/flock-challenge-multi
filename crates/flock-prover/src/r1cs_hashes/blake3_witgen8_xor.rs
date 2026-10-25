@@ -520,17 +520,45 @@ const BYTE_TR: [u8; 64] = [
 // superset byte XORs with a second GFNI. The final byte permutation produces
 // the private prepared qwords consumed by the unchanged row projection.
 #[inline(always)]
-unsafe fn ring_prepared_pack(v:__m512i)->__m512i{
- const ROW:[u8;64]=[0, 1, 2, 3, 32, 33, 34, 35, 4, 5, 6, 7, 36, 37, 38, 39, 8, 9, 10, 11, 40, 41, 42, 43, 12, 13, 14, 15, 44, 45, 46, 47, 16, 17, 18, 19, 48, 49, 50, 51, 20, 21, 22, 23, 52, 53, 54, 55, 24, 25, 26, 27, 56, 57, 58, 59, 28, 29, 30, 31, 60, 61, 62, 63];
- const COLUMN:[u8;64]=[0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
- let row=_mm512_permutexvar_epi8(_mm512_loadu_si512(ROW.as_ptr().cast()),v);
- // First return the reversed-column/reversed-bit transpose of each row's
- // eight-byte bit matrix. The second affine selects the superset byte XORs.
- let basis=_mm512_set1_epi64(0x0102040810204080u64 as i64);
- let transpose=_mm512_gf2p8affine_epi64_epi8::<0>(basis,row);
- let subsets=_mm512_set1_epi64(0x0103050f113355ffu64 as i64);
- let prepared=_mm512_gf2p8affine_epi64_epi8::<0>(subsets,transpose);
- _mm512_permutexvar_epi8(_mm512_loadu_si512(COLUMN.as_ptr().cast()),prepared)
+const PREPARED_ROW: [u8; 64] = [0, 1, 2, 3, 32, 33, 34, 35, 4, 5, 6, 7, 36, 37, 38, 39, 8, 9, 10, 11, 40, 41, 42, 43, 12, 13, 14, 15, 44, 45, 46, 47, 16, 17, 18, 19, 48, 49, 50, 51, 20, 21, 22, 23, 52, 53, 54, 55, 24, 25, 26, 27, 56, 57, 58, 59, 28, 29, 30, 31, 60, 61, 62, 63];
+const PREPARED_COLUMN: [u8; 64] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+
+#[inline(always)]
+unsafe fn prepared_pack_controls() -> (__m512i, __m512i, __m512i, __m512i) {
+    unsafe {
+        (
+            _mm512_loadu_si512(PREPARED_ROW.as_ptr().cast()),
+            _mm512_loadu_si512(PREPARED_COLUMN.as_ptr().cast()),
+            _mm512_set1_epi64(0x0102040810204080u64 as i64),
+            _mm512_set1_epi64(0x0103050f113355ffu64 as i64),
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn ring_prepared_pack_loaded(
+    v: __m512i,
+    row_ix: __m512i,
+    column_ix: __m512i,
+    basis: __m512i,
+    subsets: __m512i,
+) -> __m512i {
+    unsafe {
+        let row = _mm512_permutexvar_epi8(row_ix, v);
+        // First return the reversed-column/reversed-bit transpose of each row's
+        // eight-byte bit matrix. The second affine selects the superset byte XORs.
+        let transpose = _mm512_gf2p8affine_epi64_epi8::<0>(basis, row);
+        let prepared = _mm512_gf2p8affine_epi64_epi8::<0>(subsets, transpose);
+        _mm512_permutexvar_epi8(column_ix, prepared)
+    }
+}
+
+#[inline(always)]
+unsafe fn ring_prepared_pack(v: __m512i) -> __m512i {
+    unsafe {
+        let (row_ix, column_ix, basis, subsets) = prepared_pack_controls();
+        ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
+    }
 }
 
 #[inline(always)]
@@ -545,60 +573,61 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
             57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
         ];
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
+        let (row_ix, column_ix, basis, subsets) = prepared_pack_controls();
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
         let p = out.as_mut_ptr().cast::<u64>();
         let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
         let v = if PREPARE_A || mode(BLK, 0) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(0).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
         let v = if PREPARE_A || mode(BLK, 1) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(8).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
         let v = if PREPARE_A || mode(BLK, 2) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(16).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
         let v = if PREPARE_A || mode(BLK, 3) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(24).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
         let v = if PREPARE_A || mode(BLK, 4) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(32).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
         let v = if PREPARE_A || mode(BLK, 5) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(40).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
         let v = if PREPARE_A || mode(BLK, 6) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(48).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
         let v = if PREPARE_A || mode(BLK, 7) == 0 {
-            ring_prepared_pack(v)
+            ring_prepared_pack_loaded(v, row_ix, column_ix, basis, subsets)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -965,8 +994,9 @@ pub(super) unsafe fn project(
 ) {
     unsafe {
         let ap = pretranspose_ring::<0, true>(ar, rw);
-        let a = tr8x16_zmm(ar, rw);
-        let b = tr8x16_zmm(br, rw);
+        let (i10, i11, i20, i21, i30, i31) = tr8x16_indices();
+        let a = tr8x16_zmm_ix(ar, rw, i10, i11, i20, i21, i30, i31);
+        let b = tr8x16_zmm_ix(br, rw, i10, i11, i20, i21, i30, i31);
         match blk {
             2 => project_const::<2>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
             3 => project_const::<3>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),

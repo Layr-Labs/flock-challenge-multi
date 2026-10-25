@@ -104,7 +104,7 @@ impl<'a> RootOctaWriter<'a> {
                     low = _mm256_and_si256(low, _mm256_loadu_si256(b.add(rw)));
                     high = _mm256_and_si256(high, _mm256_loadu_si256(b.add(rw + 1)));
                 }
-                let (out, mask) = match action {
+                let out = match action {
                     Action::Skip => unreachable!(),
                     Action::Start => {
                         debug_assert!(!self.pending);
@@ -121,16 +121,19 @@ impl<'a> RootOctaWriter<'a> {
                         high = _mm256_xor_si256(high, _mm256_and_si256(hi_mask,
                             _mm256_xor_si256(high, self.carry[1])));
                         self.pending = false;
-                        (out, u64::MAX)
+                        out
                     }
-                    Action::Full(out) => (out, u64::MAX),
-                    Action::Tail(out, mask) => (out, mask),
+                    Action::Full(out) | Action::Tail(out, _) => out,
                 };
                 let words = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low), high);
                 let matrices = _mm512_permutexvar_epi8(indices, words);
                 let bits = _mm512_gf2p8affine_epi64_epi8::<0>(identity, matrices);
-                _mm512_stream_si512(self.out.add(out * 512).cast(),
-                    _mm512_maskz_mov_epi8(mask, bits));
+                let published = match action {
+                    Action::Tail(_, mask) => _mm512_maskz_mov_epi8(mask, bits),
+                    Action::Full(_) | Action::End(_, _) => bits,
+                    Action::Skip | Action::Start => unreachable!(),
+                };
+                _mm512_stream_si512(self.out.add(out * 512).cast(), published);
             }
         }
     }
