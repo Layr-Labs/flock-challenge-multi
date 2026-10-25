@@ -1319,8 +1319,21 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
     debug_assert_eq!(active_lanes % 4, 0);
     unsafe {
         let diet_disabled = mul_diet_disabled();
+        // This caller geometry fixes only physical strides. The active
+        // prefix, source quarter/row and prefetch address remain dynamic.
+        // Keep the eight-lane body and its four-lane tail unchanged.
+        if !diet_disabled && dst_quarter == 64 {
+            if num_ntts == 64 {
+                butterfly_fused_2layer_row_from_sparse_dense_geo_shaped::<64>(src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts, active_lanes, right_twiddle, dense_tw, pf_src);
+                return;
+            }
+            if num_ntts == 8 {
+                butterfly_fused_2layer_row_from_sparse_dense_geo_shaped::<8>(src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts, active_lanes, right_twiddle, dense_tw, pf_src);
+                return;
+            }
+        }
         if !diet_disabled && dense_tw[0].hi == 0 {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -1348,7 +1361,7 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 pf_src,
             )
         } else {
-            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true, 0, 0>(
                 src,
                 src_quarter,
                 src_r,
@@ -1361,6 +1374,36 @@ pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
                 dense_tw,
                 pf_src,
             )
+        }
+    }
+}
+
+/// Fixed destination-quarter and row-width entry; the public wrapper proves
+/// these constants match the supplied geometry before reaching this helper.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_shaped<const NN: usize>(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src: *const F128,
+) {
+    debug_assert!(NN == 8 || NN == 64);
+    debug_assert_eq!(num_ntts, NN);
+    debug_assert_eq!(dst_quarter, 64);
+    unsafe {
+        if dense_tw[0].hi == 0 {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true, NN, 64>(src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts, active_lanes, right_twiddle, dense_tw, pf_src);
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true, NN, 64>(src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter, num_ntts, active_lanes, right_twiddle, dense_tw, pf_src);
         }
     }
 }
@@ -1383,7 +1426,7 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_cold(
     pf_src: *const F128,
 ) {
     unsafe {
-        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false>(
+        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, false, 0, 0>(
             src,
             src_quarter,
             src_r,
@@ -1409,6 +1452,8 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_cold(
 unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
     const OUTER_LOW: bool,
     const DIET: bool,
+    const NNC: usize,
+    const DQC: usize,
 >(
     src: *const F128,
     src_quarter: usize,
@@ -1423,6 +1468,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
     pf_src: *const F128,
 ) {
     use core::arch::x86_64::*;
+    // Nonzero constants are supplied only by the guarded shaped entry.
+    let num_ntts = if NNC != 0 { NNC } else { num_ntts };
+    let dst_quarter = if DQC != 0 { DQC } else { dst_quarter };
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     let pf = !pf_src.is_null();
     unsafe {
@@ -3556,7 +3604,7 @@ mod diet_tests {
                 // disjoint, and low_tw3[0].hi == 0 in the OUTER_LOW arm.
                 unsafe {
                     if outer_low {
-                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true>(
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<true, true, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -3570,7 +3618,7 @@ mod diet_tests {
                             core::ptr::null(),
                         );
                     } else {
-                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true>(
+                        butterfly_fused_2layer_row_from_sparse_dense_geo_impl::<false, true, 0, 0>(
                             src.as_ptr(),
                             1,
                             0,
@@ -3916,5 +3964,85 @@ mod ab_ntt_tail_composition_tests {
         let cases = rows::<0>() + rows::<1>() + rows::<2>();
         assert_eq!(cases, 270);
         println!("270 production NTT row cases match the independent bitwise oracle and guards");
+    }
+}
+
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod seed_geometry_oracle_tests {
+    use super::*;
+    use std::hint::black_box;
+    fn bits(x: F128) -> u128 { u128::from(x.lo) | (u128::from(x.hi) << 64) }
+    fn field(x: u128) -> F128 { F128::new(x as u64, (x >> 64) as u64) }
+    fn multiply(mut a: u128, mut b: u128) -> u128 {
+        let mut z = 0;
+        for _ in 0..128 {
+            if b & 1 != 0 { z ^= a; }
+            b >>= 1;
+            let high = a >> 127;
+            a <<= 1;
+            if high != 0 { a ^= 0x87; }
+        }
+        z
+    }
+    #[test]
+    fn seed_geometry_rows_match_bitwise_oracle() {
+        let mut state = 0x71f8_8cf0_3391_d22au64;
+        let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            F128::new(state, state.rotate_left(27) ^ 0x94d0_49bb_1331_11eb) };
+        let guard = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+        let mut cases = 0;
+        for low in [false, true] { for n in [4usize,8,12,16,60,64,68,128] {
+            for dq in [1usize,5,64] { for case in 0..12 {
+                let sq = [1usize,3,7][case%3];
+                let sr = if case%2 == 0 { 0 } else { sq-1 };
+                let active = [0,4,n-4,n][case%4];
+                let start = 4 + case%4;
+                let src_len = start + (3*sq+sr+1)*n + 5;
+                let dst_len = start + (3*dq+1)*n + 5;
+                let mut input: Vec<F128> = (0..src_len).map(|_| next()).collect();
+                if case == 0 { input.fill(F128::ZERO); }
+                if case == 1 { input.fill(F128::new(u64::MAX,u64::MAX)); }
+                let mut right = next();
+                let mut tw = [next(),next(),next()];
+                if low { tw[0].hi = 0; }
+                if case%6 == 0 { right = F128::ZERO; }
+                if case%6 == 1 { right = F128::new(1,0); }
+                let saved_input = input.clone(); let saved_tw = tw;
+                let mut expected_s = vec![guard;dst_len]; let mut expected_d = vec![guard;dst_len];
+                for lane in 0..active {
+                    let a = bits(input[start+sr*n+lane]); let b = bits(input[start+(sq+sr)*n+lane]);
+                    let c = bits(input[start+(2*sq+sr)*n+lane]); let z = bits(input[start+(3*sq+sr)*n+lane]);
+                    let sc = c ^ a ^ multiply(z ^ b,bits(right));
+                    let sparse = [a,b ^ a,sc,z ^ b ^ sc];
+                    let aa = a ^ multiply(c,bits(tw[0])); let bb = b ^ multiply(z,bits(tw[0]));
+                    let cc = c ^ aa; let dd = z ^ bb;
+                    let oa = aa ^ multiply(bb,bits(tw[1])); let oc = cc ^ multiply(dd,bits(tw[2]));
+                    let dense = [oa,bb ^ oa,oc,dd ^ oc];
+                    for row in 0..4 {
+                        expected_s[start+row*dq*n+lane] = field(sparse[row]);
+                        expected_d[start+row*dq*n+lane] = field(dense[row]);
+                    }
+                }
+                let mut sparse = vec![guard;dst_len]; let mut dense = vec![guard;dst_len];
+                // SAFETY: all source/destination rows are allocated and disjoint;
+                // active is a multiple of four and does not exceed n. The optional
+                // prefetch row is within the same source allocation.
+                unsafe {
+                    let src = input.as_ptr().add(start);
+                    let pf = if case%2 == 0 { core::ptr::null() } else { src.add(sr*n) };
+                    butterfly_fused_2layer_row_from_sparse_dense_geo(
+                        black_box(src),black_box(sq),black_box(sr),black_box(sparse.as_mut_ptr().add(start)),
+                        black_box(dense.as_mut_ptr().add(start)),black_box(dq),black_box(n),black_box(active),
+                        black_box(right),black_box(&tw),black_box(pf));
+                }
+                assert_eq!(sparse,expected_s,"sparse low={low} n={n} dq={dq} case={case}");
+                assert_eq!(dense,expected_d,"dense low={low} n={n} dq={dq} case={case}");
+                assert_eq!(input,saved_input); assert_eq!(tw,saved_tw);
+                cases += 1;
+            }}
+        }}
+        assert_eq!(cases,576);
+        println!("576 production seed-geometry cases match independent bitwise products, guards, source and twiddle immutability");
     }
 }
