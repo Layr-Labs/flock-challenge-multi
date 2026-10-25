@@ -4979,7 +4979,7 @@ pub(crate) fn build_cfold_mats_ext(
             } else {
                 std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]))
             };
-            let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
             if include_plane {
                 for idx in 0..128 {
                     for i in 0..8 {
@@ -5030,7 +5030,7 @@ pub(crate) fn build_cfold_mats_ext(
         // SAFETY: `out.1` is 100% overwritten below; `out.0` is overwritten when
         // `include_plane` is true (and never read when `include_plane` is false,
         // which holds whenever `zc_r34_bcast_enabled()` selects the broadcast kernels).
-        let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
         if include_plane {
             for idx in 0..128 {
                 for i in 0..8 {
