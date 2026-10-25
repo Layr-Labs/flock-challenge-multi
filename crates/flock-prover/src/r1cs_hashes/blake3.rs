@@ -2825,6 +2825,20 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             .for_each(|(g, (((z_out, a_out), b_out), ab_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 unsafe {
+                    #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512dq",target_feature="avx512vbmi2",target_feature="avx512vl",target_feature="avx512vbmi",target_feature="gfni"))]
+                    if n_here == 16 && blake3_witgen8::ranked_witness16_enabled() {
+                        let projs=std::array::from_fn(|half| blake3_witgen8::StreamProj {
+                            stage:core::ptr::null_mut(),out:ab_out.as_mut_ptr().add(half*SIMD*ab_block_bytes),
+                            out_stride:ab_block_bytes,out_bias:2*64,inv_table,plan:win_plan,
+                            one_rows_elided:true,w30_elided:true,
+                        });
+                        blake3_witgen8::build_hexa_witness_ab_stream_ranked_closed(
+                            init,GROUP*g,z_out.as_mut_ptr().cast(),a_out.as_mut_ptr().cast(),
+                            b_out.as_mut_ptr().cast(),projs,&preps.0,
+                        );
+                        flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
+                        return;
+                    }
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
                         let off = half * SIMD * F128_PER_BLOCK;

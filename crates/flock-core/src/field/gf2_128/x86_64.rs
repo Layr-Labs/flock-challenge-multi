@@ -28,6 +28,187 @@ unsafe fn lane1(v: __m128i) -> u64 {
     _mm_extract_epi64::<1>(v) as u64
 }
 
+/// Frobenius square with no mixed-limb products.
+///
+/// In characteristic two `(lo + x^64 hi)^2 = lo^2 + x^128 hi^2`.
+/// Two independent product CLMULs and two vector reduction CLMULs replace
+/// the general Karatsuba product's three product and two reduction CLMULs.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1` as declared by the target features.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_square(a: F128) -> F128 {
+    // SAFETY: all instructions are covered by this function's target features.
+    unsafe {
+        let av = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let low = _mm_clmulepi64_si128::<0x00>(av, av);
+        let high = _mm_clmulepi64_si128::<0x11>(av, av);
+        let poly = _mm_set_epi64x(0, 0x87);
+        let middle = _mm_xor_si128(
+            _mm_slli_si128::<8>(high),
+            _mm_clmulepi64_si128::<0x01>(high, poly),
+        );
+        let out = _mm_xor_si128(
+            _mm_xor_si128(low, _mm_slli_si128::<8>(middle)),
+            _mm_clmulepi64_si128::<0x01>(middle, poly),
+        );
+        F128::new(lane0(out), lane1(out))
+    }
+}
+
+/// Fixed-address Frobenius power maps for the inversion addition chain.
+/// Matrix addresses, loop bounds and packing permutations depend only on the
+/// public power step, never on the field element's bytes or nonzero bits.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+pub(crate) mod frobenius {
+    use super::*;
+    use std::sync::LazyLock;
+
+    pub(crate) const POWER_STEPS: [usize; 5] = [3, 7, 14, 28, 63];
+
+    /// One 8x8 GFNI matrix per input-byte/output-byte pair. All sixteen
+    /// output matrices for an input byte are contiguous (two ZMM loads).
+    #[repr(C, align(64))]
+    pub(crate) struct PowerMap {
+        matrices: [[u64; 16]; 16],
+    }
+
+    impl PowerMap {
+        fn new(n: usize) -> Self {
+            let mut map = Self { matrices: [[0; 16]; 16] };
+            for byte in 0..16 {
+                let basis: [F128; 8] = std::array::from_fn(|bit| {
+                    let position = byte * 8 + bit;
+                    let mut x = if position < 64 {
+                        F128::new(1u64 << position, 0)
+                    } else {
+                        F128::new(0, 1u64 << (position - 64))
+                    };
+                    // Direct CLMUL square only: initialization must never
+                    // call inv() or re-enter the LazyLock being constructed.
+                    for _ in 0..n {
+                        x = x.square();
+                    }
+                    x
+                });
+                // SAFETY: this module's complete cfg gate guarantees the
+                // helper's ISA. Eight initialized columns become sixteen
+                // reversed-row matrices in the helper's validated layout.
+                unsafe {
+                    crate::bits::transpose_8_f128_to_16_mats_swapped_gfni(
+                        &basis,
+                        &mut map.matrices[byte],
+                    );
+                }
+            }
+            map
+        }
+
+        /// Apply `x -> x^(2^n)` using all sixteen input bytes in fixed order.
+        ///
+        /// # Safety
+        /// Requires AVX-512F/BW/VBMI and GFNI.
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+        pub(crate) unsafe fn apply(&self, x: F128) -> F128 {
+            // Every qword's eight output bytes are replicas because every
+            // source byte is broadcast. Extract each qword's byte zero;
+            // indices >=64 select from the second accumulator.
+            const PACK: [u8; 64] = {
+                let mut indices = [0; 64];
+                let mut i = 0;
+                while i < 16 {
+                    indices[i] = (8 * i) as u8;
+                    i += 1;
+                }
+                indices
+            };
+            unsafe {
+                let bytes = [x.lo.to_le_bytes(), x.hi.to_le_bytes()];
+                let mut lo = _mm512_setzero_si512();
+                let mut hi = _mm512_setzero_si512();
+                for byte in 0..16 {
+                    let value = _mm512_set1_epi8(bytes[byte / 8][byte % 8] as i8);
+                    let p = self.matrices[byte].as_ptr().cast::<__m512i>();
+                    lo = _mm512_xor_si512(
+                        lo,
+                        _mm512_gf2p8affine_epi64_epi8::<0>(value, _mm512_loadu_si512(p)),
+                    );
+                    hi = _mm512_xor_si512(
+                        hi,
+                        _mm512_gf2p8affine_epi64_epi8::<0>(value, _mm512_loadu_si512(p.add(1))),
+                    );
+                }
+                let packed = _mm512_permutex2var_epi8(
+                    lo,
+                    _mm512_loadu_si512(PACK.as_ptr().cast()),
+                    hi,
+                );
+                let scalar = _mm512_castsi512_si128(packed);
+                F128::new(
+                    _mm_cvtsi128_si64(scalar) as u64,
+                    _mm_extract_epi64::<1>(scalar) as u64,
+                )
+            }
+        }
+    }
+
+    static MAPS: LazyLock<[PowerMap; 5]> =
+        LazyLock::new(|| POWER_STEPS.map(PowerMap::new));
+
+    #[inline]
+    pub(crate) fn maps() -> &'static [PowerMap; 5] {
+        &MAPS
+    }
+
+    #[inline]
+    unsafe fn power<const N: usize, const INDEX: usize, const MIN_MAP: usize>(
+        mut x: F128,
+        maps: &[PowerMap; 5],
+    ) -> F128 {
+        if N >= MIN_MAP {
+            // SAFETY: forwarded from inverse's ISA contract. INDEX and N
+            // are public chain constants, not derived from x.
+            unsafe { maps[INDEX].apply(x) }
+        } else {
+            for _ in 0..N {
+                x = x.square();
+            }
+            x
+        }
+    }
+
+    /// Same ten-multiply inversion chain with fixed-address long powers.
+    /// MIN_MAP is a compile-time policy for same-binary short-power probes.
+    ///
+    /// # Safety
+    /// Requires AVX-512F/BW/VBMI, GFNI and PCLMULQDQ.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,pclmulqdq,sse4.1")]
+    pub(crate) unsafe fn inverse<const MIN_MAP: usize>(x: F128) -> F128 {
+        let tables = maps();
+        unsafe {
+            let t2 = x.square() * x;
+            let t3 = t2.square() * x;
+            let t6 = power::<3, 0, MIN_MAP>(t3, tables) * t3;
+            let t7 = t6.square() * x;
+            let t14 = power::<7, 1, MIN_MAP>(t7, tables) * t7;
+            let t28 = power::<14, 2, MIN_MAP>(t14, tables) * t14;
+            let t56 = power::<28, 3, MIN_MAP>(t28, tables) * t28;
+            let t63 = power::<7, 1, MIN_MAP>(t56, tables) * t7;
+            let t126 = power::<63, 4, MIN_MAP>(t63, tables) * t63;
+            let t127 = t126.square() * x;
+            t127.square()
+        }
+    }
+}
+
 /// `a · b` for a multiplier whose high limb is zero.
 ///
 /// With `b.hi == 0` both limb products that involve `b.hi` vanish, so the

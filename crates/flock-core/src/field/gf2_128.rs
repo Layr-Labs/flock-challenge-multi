@@ -54,17 +54,78 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
-    pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
-        let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
-        for _ in 1..128 {
-            r *= cur;
-            cur = cur * cur;
+    /// Frobenius square in the canonical GHASH field representation.
+    #[inline]
+    pub fn square(self) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq is enabled at compile time.
+            unsafe { x86_64::ghash_square(self) }
         }
-        r
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            self * self
+        }
+    }
+
+    /// Multiplicative inverse via an Itoh--Tsujii addition chain for 127.
+    ///
+    /// If t_k = x^(2^k - 1), then t_(a+b) = t_a^(2^b) * t_b.
+    /// The chain 1,2,3,6,7,14,28,56,63,126,127 needs ten ordinary
+    /// multiplications and 127 Frobenius squares including the final square.
+    /// It computes the same x^(2^128 - 2) as the direct Fermat product,
+    /// including that product's established inv(0) = 0 behavior.
+    pub fn inv(self) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        {
+            // SAFETY: the complete ISA gate covers the fixed-address maps.
+            // The five multi-square runs use the same exact F2-linear maps
+            // with a fixed input-independent schedule. Single squares keep
+            // the direct CLMUL implementation.
+            return unsafe { x86_64::frobenius::inverse::<3>(self) };
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        self.inv_chain()
+    }
+
+    /// Direct-square addition chain, retained as the portable path and as an
+    /// independent same-binary baseline for the fixed-address Frobenius maps.
+    #[inline]
+    #[allow(dead_code)] // Native GFNI production uses maps; probes retain this exact oracle.
+    pub(crate) fn inv_chain(self) -> Self {
+        #[inline]
+        fn square_n(mut x: F128, n: usize) -> F128 {
+            for _ in 0..n {
+                x = x.square();
+            }
+            x
+        }
+
+        let t2 = self.square() * self;
+        let t3 = t2.square() * self;
+        let t6 = square_n(t3, 3) * t3;
+        let t7 = t6.square() * self;
+        let t14 = square_n(t7, 7) * t7;
+        let t28 = square_n(t14, 14) * t14;
+        let t56 = square_n(t28, 28) * t28;
+        let t63 = square_n(t56, 7) * t7;
+        let t126 = square_n(t63, 63) * t63;
+        let t127 = t126.square() * self;
+        t127.square()
     }
 }
 
@@ -368,6 +429,93 @@ mod tests {
                 continue;
             }
             assert_eq!(a * a.inv(), F128::ONE);
+        }
+    }
+
+    #[test]
+    fn frobenius_square_matches_product() {
+        let mut rng = Rng::new(0xF20B_5A12);
+        for a in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+            assert_eq!(a.square(), a * a);
+        }
+        for bit in 0..128 {
+            let a = if bit < 64 {
+                F128::new(1u64 << bit, 0)
+            } else {
+                F128::new(0, 1u64 << (bit - 64))
+            };
+            assert_eq!(a.square(), a * a);
+        }
+        for _ in 0..4096 {
+            let a = rng.next_f128();
+            assert_eq!(a.square(), a * a);
+        }
+    }
+
+    #[test]
+    fn inverse_chain_matches_fermat_product() {
+        fn reference(a: F128) -> F128 {
+            let mut r = F128::ONE;
+            let mut cur = a * a;
+            for _ in 1..128 {
+                r *= cur;
+                cur = cur * cur;
+            }
+            r
+        }
+
+        let mut rng = Rng::new(0x17_0A_75_11);
+        for a in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+            assert_eq!(a.inv(), reference(a));
+        }
+        for bit in 0..128 {
+            let a = if bit < 64 {
+                F128::new(1u64 << bit, 0)
+            } else {
+                F128::new(0, 1u64 << (bit - 64))
+            };
+            assert_eq!(a.inv(), reference(a));
+        }
+        for _ in 0..256 {
+            let a = rng.next_f128();
+            assert_eq!(a.inv(), reference(a));
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "pclmulqdq",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fixed_address_frobenius_matches_repeated_square() {
+        use super::x86_64::frobenius::{POWER_STEPS, maps};
+        let mut rng = Rng::new(0xF20B_6314_2807);
+        for (map, &n) in maps().iter().zip(&POWER_STEPS) {
+            let repeated = |mut x: F128| {
+                for _ in 0..n {
+                    x = x.square();
+                }
+                x
+            };
+            for bit in 0..128 {
+                let x = if bit < 64 {
+                    F128::new(1u64 << bit, 0)
+                } else {
+                    F128::new(0, 1u64 << (bit - 64))
+                };
+                assert_eq!(unsafe { map.apply(x) }, repeated(x), "n={n} bit={bit}");
+            }
+            for x in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+                assert_eq!(unsafe { map.apply(x) }, repeated(x), "n={n}");
+            }
+            for _ in 0..1024 {
+                let x = rng.next_f128();
+                assert_eq!(unsafe { map.apply(x) }, repeated(x), "n={n}");
+            }
         }
     }
 
