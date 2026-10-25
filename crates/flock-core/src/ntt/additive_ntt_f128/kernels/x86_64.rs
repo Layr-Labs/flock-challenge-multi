@@ -1784,7 +1784,6 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 /// are stored. Linearity combines those halves into 20 reductions instead of
 /// 32. The top three prepared pairs remain in zmm16..21 across the loop;
 /// terminal pairs shorten temporary lifetimes so all work fits without spills.
-/// Every original row load, store and prefetch hint remains present.
 ///
 /// # Safety
 /// Requires AVX-512F, AVX-512BW and VPCLMULQDQ. The caller provides valid,
@@ -2006,6 +2005,8 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm28, zmm5, zmm18, 16",
             "vpclmulqdq zmm29, zmm5, zmm19, 17",
             "vpternlogd zmm22, zmm25, zmm27, 0x96",
+            "vbroadcasti32x4 zmm25, [rsi+128]",
+            "vbroadcasti32x4 zmm27, [rsi+144]",
             "vpternlogd zmm23, zmm28, zmm29, 0x96",
             "vpxorq zmm4, zmm4, zmm0",
             "vpxorq zmm5, zmm5, zmm1",
@@ -2029,8 +2030,6 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*11]",
             ".endif",
-            "vbroadcasti32x4 zmm25, [rsi+128]",
-            "vbroadcasti32x4 zmm27, [rsi+144]",
             "vpclmulqdq zmm28, zmm7, zmm25, 0",
             "vpclmulqdq zmm29, zmm7, zmm27, 1",
             "vpternlogd zmm5, zmm28, zmm29, 0x96",
@@ -2103,6 +2102,8 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpslldq zmm27, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
             "vpternlogd zmm9, zmm26, zmm27, 0x96",
+            "vbroadcasti32x4 zmm26, [rsi+256]",
+            "vbroadcasti32x4 zmm27, [rsi+272]",
             "vpxorq zmm11, zmm11, zmm9",
             "vpxorq zmm10, zmm10, zmm8",
             ".if {hint} == 1",
@@ -2125,8 +2126,6 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*15]",
             ".endif",
-            "vbroadcasti32x4 zmm26, [rsi+256]",
-            "vbroadcasti32x4 zmm27, [rsi+272]",
             "vpclmulqdq zmm28, zmm3, zmm26, 0",
             "vpclmulqdq zmm29, zmm3, zmm27, 1",
             "vpternlogd zmm2, zmm28, zmm29, 0x96",

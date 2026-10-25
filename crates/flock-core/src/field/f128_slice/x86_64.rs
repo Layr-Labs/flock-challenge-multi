@@ -320,10 +320,8 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
                 let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
                 let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
@@ -381,13 +379,12 @@ pub(super) unsafe fn fold64_banked_nested(
         let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
         let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
 
-        #[repr(align(64))]
-        struct AlignedM4(core::mem::MaybeUninit<[__m512i; 4]>);
-        let mut m4_buf = AlignedM4(core::mem::MaybeUninit::uninit());
-        let m4_ptr = core::hint::black_box(m4_buf.0.as_mut_ptr() as *mut __m512i);
-
         let mut t = 0usize;
         while t < quads {
+            let mut v0 = _mm512_setzero_si512();
+            let mut v1 = _mm512_setzero_si512();
+            let mut v2 = _mm512_setzero_si512();
+            let mut v3 = _mm512_setzero_si512();
             let mut slot_idx = 0usize;
             while slot_idx < 4 {
                 let base_elem = 64 * (t + slot_idx);
@@ -417,17 +414,19 @@ pub(super) unsafe fn fold64_banked_nested(
                     let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
                     let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
                     let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
-                    acc.mul_acc(u0, wb[4 * g]);
-                    acc.mul_acc(u1, wb[4 * g + 1]);
-                    acc.mul_acc(u2, wb[4 * g + 2]);
-                    acc.mul_acc(u3, wb[4 * g + 3]);
+                    acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                    acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
                 }
-                _mm512_store_si512(m4_ptr.add(slot_idx), acc.reduce_lanes());
+                let red = acc.reduce_lanes();
+                match slot_idx {
+                    0 => v0 = red,
+                    1 => v1 = red,
+                    2 => v2 = red,
+                    _ => v3 = red,
+                }
                 slot_idx += 1;
             }
 
-            let v0 = _mm512_load_si512(m4_ptr);
-            let v1 = _mm512_load_si512(m4_ptr.add(1));
             let even01 = _mm512_shuffle_i32x4::<0x88>(v0, v1);
             let odd01 = _mm512_shuffle_i32x4::<0xDD>(v0, v1);
             let mid01 = _mm512_xor_si512(
@@ -435,8 +434,6 @@ pub(super) unsafe fn fold64_banked_nested(
                 ghash_mul_x4_split(_mm512_xor_si512(even01, odd01), r0_bcast, r0_x64),
             );
 
-            let v2 = _mm512_load_si512(m4_ptr.add(2));
-            let v3 = _mm512_load_si512(m4_ptr.add(3));
             let even23 = _mm512_shuffle_i32x4::<0x88>(v2, v3);
             let odd23 = _mm512_shuffle_i32x4::<0xDD>(v2, v3);
             let mid23 = _mm512_xor_si512(
