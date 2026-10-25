@@ -1320,8 +1320,7 @@ fn build_r2_eq_bake_checked(
     // Scaling a fold table's 64 basis columns scales every XOR-composed image
     // by the same factor, so the matrices of `c · fold` are the matrices of
     // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
-    let cols: [F128; 64] =
-        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
     let scaled = |c: F128| {
         let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
@@ -1663,8 +1662,7 @@ pub(crate) fn round2_canonical_window_deltas(
     assert_eq!(table.n_chunks, 8);
     assert_eq!(rows.len(), CANON_ROWS * 64);
     assert!(mlv_challenges.len() >= 8);
-    let cols: [F128; 64] =
-        std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
     let fold = |slot: usize| -> F128 {
         crate::pcs::ring_switch::inner_product(&cols, &rows[slot * 64..(slot + 1) * 64])
     };
@@ -1778,13 +1776,38 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     eq_override: Option<&SplitEqGhash>,
     canon: Option<&[F128]>,
 ) -> (F128, F128, Round3Lookahead) {
+    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_storage(
+        a_packed,
+        super::b_storage::PackedB::Dense(b_packed),
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        eq_override,
+        canon,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_storage(
+    a_packed: &[u8],
+    b_packed: super::b_storage::PackedB<'_>,
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    eq_override: Option<&SplitEqGhash>,
+    canon: Option<&[F128]>,
+) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
     assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.logical_bytes(), n_out * n_chunks);
     assert_eq!(mlv_challenges.len(), m - k_skip);
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
@@ -1938,6 +1961,30 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     ))]
     #[allow(unused_variables)]
     let r2_mats_arg = r2_mats.as_ref();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let residual_fast = fast_r2 && lo_size.is_multiple_of(128) && chunk_size.is_multiple_of(256);
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    let residual_fast = false;
+    let decoded_b =
+        (b_packed.residual().is_some() && !residual_fast).then(|| b_packed.to_dense_bytes());
+    let b_dense = decoded_b.as_deref().or_else(|| b_packed.dense());
+
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     let (sum1_even, sum_inf_even, agg) = (0..hi_size)
@@ -1964,9 +2011,28 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && (row_base & 255) == 0
                     && let Some(bk) = bake_arg
                 {
+                    #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
+                    if let Some(b) = b_packed.residual().filter(|_| residual_fast) {
+                        kernels::x86_64::round2_lookahead_chunk_baked_elide_residual_x86(
+                            a_packed.as_ptr(),
+                            b,
+                            row_base,
+                            lo_size,
+                            bk,
+                        )
+                    } else {
+                        kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
+                            a_packed.as_ptr(),
+                            b_dense.expect("dense fallback B").as_ptr(),
+                            row_base,
+                            lo_size,
+                            bk,
+                        )
+                    }
+                    #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vbmi2")))]
                     kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         row_base,
                         lo_size,
                         bk,
@@ -1976,7 +2042,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         table.data.as_ptr(),
                         r2_mats_arg,
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         row_base,
                         &mut none_a,
                         &mut none_b,
@@ -1992,7 +2058,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         table.data.as_ptr(),
                         r2_mats_arg,
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         row_base,
                         &mut none_a,
                         &mut none_b,
@@ -2010,7 +2076,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         table.data.as_ptr(),
                         r2_mats_arg,
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         row_base,
                         &mut none_a,
                         &mut none_b,
@@ -2026,7 +2092,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         table.data.as_ptr(),
                         r2_mats_arg,
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         row_base,
                         &mut none_a,
                         &mut none_b,
@@ -2046,7 +2112,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             )))]
             let out = round2_lookahead_chunk_scalar::<false>(
                 a_packed,
-                b_packed,
+                b_dense.expect("scalar fallback B"),
                 table,
                 &mut none_a,
                 &mut none_b,
@@ -2150,6 +2216,39 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    fold2_from_packed_and_round_pair_lookahead_into_with_eq_storage(
+        a_packed,
+        super::b_storage::PackedB::Dense(b_packed),
+        m,
+        k_skip,
+        table,
+        padding,
+        a_out,
+        b_out,
+        rho1,
+        rho2,
+        r_next4,
+        eq_override,
+        out_lm,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq_storage(
+    a_packed: &[u8],
+    b_packed: super::b_storage::PackedB<'_>,
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    padding: &PaddingSpec,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    eq_override: Option<(&[F128], &[F128])>,
+    out_lm: bool,
+) -> (F128, F128, Round3Lookahead) {
     // Composed-fold coefficients: expanding the two pair-fold levels (char 2)
     // gives `out = Σ_k c_k · fold(row 4x+k)` with
     //   c₀=(1+ρ₁)(1+ρ₂)  c₁=ρ₁(1+ρ₂)  c₂=(1+ρ₁)ρ₂  c₃=ρ₁ρ₂,
@@ -2223,7 +2322,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let n = 1usize << (m - k_skip);
     assert!(n >= 16);
     assert_eq!(a_packed.len(), n * n_chunks);
-    assert_eq!(b_packed.len(), n * n_chunks);
+    assert_eq!(b_packed.logical_bytes(), n * n_chunks);
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
     assert_eq!(b_out.len(), quarter);
@@ -2311,6 +2410,30 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         wtab_arg.is_some(),
     );
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let residual_fast = fast_r34 && lo_size.is_multiple_of(8);
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    let residual_fast = false;
+    let decoded_b =
+        (b_packed.residual().is_some() && !residual_fast).then(|| b_packed.to_dense_bytes());
+    let b_dense = decoded_b.as_deref().or_else(|| b_packed.dense());
+
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -2333,35 +2456,33 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg)
                 {
                     let ap = a_packed.as_ptr();
-                    let bp = b_packed.as_ptr();
-                    match (nt_out, out_lm) {
-                        (true, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (true, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (false, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (false, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
+                    macro_rules! run_fast {
+                        ($nt:literal, $lm:literal) => {{
+                            #[cfg(all(target_feature="avx512bw", target_feature="avx512vbmi2"))]
+                            if let Some(b) = b_packed.residual().filter(|_| residual_fast) {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_residual_x86::<$nt,$lm>(
+                                    ap,b,out_base,a_out,b_out,lo_size,c,wt)
+                            } else {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<$nt,$lm>(
+                                    ap,b_dense.expect("dense C4 B").as_ptr(),out_base,a_out,b_out,lo_size,c,wt)
+                            }
+                            #[cfg(not(all(target_feature="avx512bw", target_feature="avx512vbmi2")))]
+                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<$nt,$lm>(
+                                ap,b_dense.expect("dense C4 B").as_ptr(),out_base,a_out,b_out,lo_size,c,wt)
+                        }};
+                    }
+                    match (nt_out,out_lm) {
+                        (true,true)=>run_fast!(true,true),
+                        (true,false)=>run_fast!(true,false),
+                        (false,true)=>run_fast!(false,true),
+                        (false,false)=>run_fast!(false,false),
                     }
                 } else {
                     kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                         table.data.as_ptr(),
                         r2_mats_arg,
                         a_packed.as_ptr(),
-                        b_packed.as_ptr(),
+                        b_dense.expect("dense fallback B").as_ptr(),
                         out_base,
                         a_out,
                         b_out,
@@ -2382,7 +2503,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     table.data.as_ptr(),
                     r2_mats_arg,
                     a_packed.as_ptr(),
-                    b_packed.as_ptr(),
+                    b_dense.expect("dense fallback B").as_ptr(),
                     out_base,
                     a_out,
                     b_out,
@@ -2405,7 +2526,7 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
             )))]
             let out = fold2_from_packed_lookahead_scalar(
                 a_packed,
-                b_packed,
+                b_dense.expect("scalar fallback B"),
                 table,
                 out_base,
                 a_out,
@@ -3337,11 +3458,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let fast_plain = kernels::x86_64::fold2_plain_defer_wtab_route_ok(
-        split,
-        lo_size,
-        wtab_arg.is_some(),
-    );
+    let fast_plain =
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(split, lo_size, wtab_arg.is_some());
 
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -3370,56 +3488,72 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
                                 false,
                                 true,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, false, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 false,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, true, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 true,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (false, false, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 false,
                                 false,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, true, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 true,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, false, true) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 false,
                                 true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, true, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 true,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                         (true, false, false) => {
                             kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
                                 true,
                                 false,
                                 false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                            >(
+                                ap, bp, aop, bop, rho_a, rho_b, lo_size, wt
+                            )
                         }
                     }
                 } else {
@@ -4963,9 +5097,7 @@ mod tests {
             (64, true),
             (128, true),
         ];
-        for (&(lo_size, canon), unroll16) in
-            shapes.iter().flat_map(|s| [(s, true), (s, false)])
-        {
+        for (&(lo_size, canon), unroll16) in shapes.iter().flat_map(|s| [(s, true), (s, false)]) {
             let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
@@ -4987,8 +5119,7 @@ mod tests {
                         .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
                 }
             }
-            let bake =
-                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let bake = build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
             let mut a_s: [F128; 0] = [];
             let mut b_s: [F128; 0] = [];
             let out_s = round2_lookahead_chunk_scalar::<false>(
@@ -5114,10 +5245,18 @@ mod tests {
                 &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
             );
             let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
-            assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
+            assert_eq!(
+                full.0,
+                rest.0 + mlv[0] * d_g1,
+                "G(1) blocks_log={blocks_log}"
+            );
             assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
             for i in 0..6 {
-                assert_eq!(full.2.c[i], rest.2.c[i] + d_c[i], "c[{i}] blocks_log={blocks_log}");
+                assert_eq!(
+                    full.2.c[i],
+                    rest.2.c[i] + d_c[i],
+                    "c[{i}] blocks_log={blocks_log}"
+                );
             }
         }
     }
@@ -5162,15 +5301,32 @@ mod tests {
                     let eq = SplitEqGhash::with_n_hi(&mlv[1..], n_hi);
                     assert!((1usize << eq.n_lo) >= 32 && eq.n_lo < mlv.len());
                     let incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None,
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        None,
                     );
                     let hits = kernels::x86_64::R2_CANON_ELIDE_HITS
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let elided = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows),
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &mlv,
+                        &padding,
+                        Some(&eq),
+                        Some(&rows),
                     );
                     assert!(
-                        kernels::x86_64::R2_CANON_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                        kernels::x86_64::R2_CANON_ELIDE_HITS
+                            .load(std::sync::atomic::Ordering::Relaxed)
                             > hits,
                         "elision never engaged"
                     );
@@ -5361,7 +5517,10 @@ mod tests {
             let mut rng = Rng::new(0x1A00 + log_n as u64);
             let n = 1usize << log_n;
             assert!(plain_cascade_lo_size(n).is_multiple_of(8), "log_n={log_n}");
-            assert!(plain_cascade_lo_size(n / 4).is_multiple_of(8), "log_n={log_n}");
+            assert!(
+                plain_cascade_lo_size(n / 4).is_multiple_of(8),
+                "log_n={log_n}"
+            );
             let a = rng.f128_vec(n);
             let b = rng.f128_vec(n);
             let (rho_a, rho_b, rho_c, rho_d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
@@ -5377,8 +5536,9 @@ mod tests {
 
             let mut a1 = vec![F128::ZERO; n / 4];
             let mut b1 = vec![F128::ZERO; n / 4];
-            let (m1, mi1, la1) =
-                fold2_plain_and_round_pair_lookahead_into(&a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1);
+            let (m1, mi1, la1) = fold2_plain_and_round_pair_lookahead_into(
+                &a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1,
+            );
             let mut a1l = vec![F128::ZERO; n / 4];
             let mut b1l = vec![F128::ZERO; n / 4];
             let (m1l, mi1l, la1l) = fold2_plain_and_round_pair_lookahead_into_lm(
@@ -5409,7 +5569,11 @@ mod tests {
                 } else {
                     (a2.clone(), b2.clone())
                 };
-                assert_eq!((m2, mi2), (m2l, mi2l), "reader msg log_n={log_n} out_lm={out_lm}");
+                assert_eq!(
+                    (m2, mi2),
+                    (m2l, mi2l),
+                    "reader msg log_n={log_n} out_lm={out_lm}"
+                );
                 assert_eq!(a_want, a2l, "reader a log_n={log_n} out_lm={out_lm}");
                 assert_eq!(b_want, b2l, "reader b log_n={log_n} out_lm={out_lm}");
                 assert_eq!(

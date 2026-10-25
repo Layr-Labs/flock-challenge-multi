@@ -6578,3 +6578,23 @@ mod cfold_initialized_checks {
         println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
     }
 }
+
+// Residual-only loader siblings. Dense entry points above retain their ABI.
+#[cfg(all(
+    target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[path = "x86_64_b_residual.rs"]
+mod b_residual;
+#[cfg(all(
+    target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) use b_residual::{
+    fold2_from_packed_lookahead_c4_lm_wtab_residual_x86,
+    round2_lookahead_chunk_baked_elide_residual_x86,
+};
