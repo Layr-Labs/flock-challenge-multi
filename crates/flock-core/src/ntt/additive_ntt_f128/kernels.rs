@@ -1153,3 +1153,81 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+/// Exact short-product predicates, computed only from public twiddles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub(super) struct FinalThreeClass(u8);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn classify_final_three(twiddles: &[F128; 7]) -> FinalThreeClass {
+    let low_inner = twiddles[1..].iter().all(|t| t.hi == 0);
+    let outer = match twiddles[0].hi { 0 => 1, 1 => 2, _ => 0 };
+    FinalThreeClass((low_inner as u8) | (outer << 1))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[derive(Clone, Copy)]
+pub(super) struct FinalThreePolicy {
+    diet: bool,
+    low_inner: bool,
+    low_outer: bool,
+    high_one_outer: bool,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) fn final_three_policy(num_ntts: usize) -> Option<FinalThreePolicy> {
+    if super::ntt_shaped_enabled() && matches!(num_ntts, 64 | 8) {
+        Some(x86_64::final_three_policy())
+    } else {
+        None
+    }
+}
+
+/// Execute the existing shaped arithmetic with a prevalidated class.
+///
+/// # Safety
+/// Same row/ISA contract as `butterfly_fused_3layer_rows`. `class` must have
+/// been derived from `twiddles`; `policy` must come from `final_three_policy`
+/// for this width. These values are private to the immutable plan producer.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_rows_planned(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+    class: FinalThreeClass,
+    policy: FinalThreePolicy,
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    debug_assert!(matches!(num_ntts, 64 | 8));
+    unsafe {
+        if num_ntts == 64 {
+            x86_64::butterfly_fused_3layer_rows_planned::<64>(ptr, dense_lanes, twiddles, class, policy);
+        } else {
+            x86_64::butterfly_fused_3layer_rows_planned::<8>(ptr, dense_lanes, twiddles, class, policy);
+        }
+    }
+}

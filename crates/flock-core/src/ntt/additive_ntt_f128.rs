@@ -179,6 +179,84 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+/// A terminal-three execution plan over public standard-basis twiddles.
+/// Only constants are retained: no input, witness, transcript or proof data.
+/// Separate arrays avoid padding each 112-byte twiddle block to 128 bytes.
+#[derive(Debug)]
+struct FinalThreePlan {
+    log_d: usize,
+    twiddles: Box<[[F128; 7]]>,
+    classes: Box<[kernels::FinalThreeClass]>,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl FinalThreePlan {
+    fn new(log_d: usize, breadth_first: &[F128]) -> Self {
+        assert!((3..=MAX_PRECOMPUTED_TWIDDLE_LOG).contains(&log_d));
+        assert_eq!(breadth_first.len(), (1usize << log_d) - 1);
+        let layer = log_d - 3;
+        let blocks = 1usize << layer;
+        let twiddles: Box<[[F128; 7]]> = (0..blocks).map(|block| {
+            core::array::from_fn(|i| {
+                let (relative_layer, child) = if i == 0 {
+                    (0, 0)
+                } else if i < 3 {
+                    (1, i - 1)
+                } else {
+                    (2, i - 3)
+                };
+                let l = layer + relative_layer;
+                breadth_first[(1usize << l) - 1 + (block << relative_layer) + child]
+            })
+        }).collect();
+        let classes = twiddles.iter().map(kernels::classify_final_three).collect();
+        Self { log_d, twiddles, classes }
+    }
+
+    #[inline]
+    fn get(&self, block: usize) -> (&[F128; 7], kernels::FinalThreeClass) {
+        (&self.twiddles[block], self.classes[block])
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn final_three_plan_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_FINAL_THREE_PLAN").is_none()
+    });
+    *ENABLED
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn cached_standard_final_three(dim: usize, twiddles: Option<&[F128]>) -> Option<Arc<FinalThreePlan>> {
+    // The block-fused schedule requires at least eleven terminal layers.
+    // Smaller transforms keep the incumbent lightweight constructor.
+    if !(11..=MAX_PRECOMPUTED_TWIDDLE_LOG).contains(&dim) || !final_three_plan_enabled() {
+        return None;
+    }
+    let twiddles = twiddles?;
+    static PLANS: OnceLock<[OnceLock<Arc<FinalThreePlan>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> = OnceLock::new();
+    let plans = PLANS.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    Some(Arc::clone(plans[dim].get_or_init(|| Arc::new(FinalThreePlan::new(dim, twiddles)))))
+}
+
 /// Interleaved lane count of the ranked production commitment.
 const ZERO_TAIL_NUM_NTTS: usize = 64;
 
@@ -913,6 +991,14 @@ pub struct AdditiveNttF128 {
     /// this separate preserves the compact fallback for unusually large
     /// domains while making every hot-path twiddle lookup O(1).
     precomputed_twiddles: Option<Arc<[F128]>>,
+    /// Reusable terminal-three constants for standard-basis native transforms.
+    /// Custom bases deliberately retain the original lookup path.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    final_three_plan: Option<Arc<FinalThreePlan>>,
 }
 
 /// Prefetch schedule for the seed-fused top pass's message gather.
@@ -1519,6 +1605,12 @@ impl AdditiveNttF128 {
         Self {
             evals,
             precomputed_twiddles,
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            final_three_plan: None,
         }
     }
 
@@ -1539,6 +1631,12 @@ impl AdditiveNttF128 {
         let evals = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            final_three_plan: cached_standard_final_three(dim, precomputed_twiddles.as_deref()),
             evals,
             precomputed_twiddles,
         }
@@ -4320,6 +4418,16 @@ impl AdditiveNttF128 {
         let sixteenth4 = block_size4 >> 4;
         let layer3 = n_top + 8;
         let dense_lanes = num_ntts - odd_tail;
+        // Resolve process policy once per deep subgroup, rather than once
+        // per terminal block. The plan index is global, exactly like g8 below.
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let planned = self.final_three_plan.as_deref()
+            .filter(|plan| plan.log_d == log_d && final_three_plan_enabled())
+            .and_then(|plan| kernels::final_three_policy(num_ntts).map(|policy| (plan, policy)));
         #[cfg(test)]
         FUSED3_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for b in 0..16usize {
@@ -4350,6 +4458,24 @@ impl AdditiveNttF128 {
             );
             for j in 0..16usize {
                 let g8 = g4 * 16 + j;
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if let Some((plan, policy)) = planned {
+                    let (tw3, class) = plan.get(g8);
+                    let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+                    // SAFETY: identical eight-row ownership and zero-odd-tail
+                    // geometry as the fallback below. The immutable class was
+                    // derived from these exact seven twiddles at plan creation.
+                    unsafe {
+                        kernels::butterfly_fused_3layer_rows_planned(
+                            eight.as_mut_ptr(), num_ntts, dense_lanes, tw3, class, policy,
+                        );
+                    }
+                    continue;
+                }
                 let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
                 tw3[0] = self.twiddle(layer3, g8);
                 for s in 0..2 {
@@ -7229,5 +7355,102 @@ mod prepared_four_composition_tests {
         eprintln!(
             "{cases} complete prepared-four block and owned-table cases matched raw rows with guards"
         );
+    }
+}
+
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod final_three_plan_tests {
+    use super::*;
+
+    #[test]
+    fn final_three_plan_matches_all_original_twiddles() {
+        let mut checked = 0usize;
+        for dim in [11usize, 12, 16, 20] {
+            let ntt = AdditiveNttF128::standard(dim);
+            let plan = FinalThreePlan::new(dim, ntt.precomputed_twiddles.as_deref().unwrap());
+            assert_eq!(plan.twiddles.len(), 1usize << (dim - 3));
+            assert_eq!(plan.classes.len(), plan.twiddles.len());
+            for block in 0..plan.twiddles.len() {
+                let want = [
+                    ntt.twiddle(dim - 3, block),
+                    ntt.twiddle(dim - 2, 2 * block),
+                    ntt.twiddle(dim - 2, 2 * block + 1),
+                    ntt.twiddle(dim - 1, 4 * block),
+                    ntt.twiddle(dim - 1, 4 * block + 1),
+                    ntt.twiddle(dim - 1, 4 * block + 2),
+                    ntt.twiddle(dim - 1, 4 * block + 3),
+                ];
+                let (got, class) = plan.get(block);
+                assert_eq!(*got, want, "dim={dim} block={block}");
+                assert_eq!(class, kernels::classify_final_three(&want));
+                checked += 7;
+            }
+            if final_three_plan_enabled() {
+                let cached_a = cached_standard_final_three(dim, ntt.precomputed_twiddles.as_deref()).unwrap();
+                let cached_b = cached_standard_final_three(dim, ntt.precomputed_twiddles.as_deref()).unwrap();
+                assert!(Arc::ptr_eq(&cached_a, &cached_b));
+            } else {
+                assert!(cached_standard_final_three(dim, ntt.precomputed_twiddles.as_deref()).is_none());
+            }
+        }
+        assert_eq!(checked, 980_224);
+        // Custom bases cannot accidentally borrow a standard-basis plan.
+        let custom = AdditiveNttF128::new(&(0..11).map(|i| F128::new(2u64 << i, 0)).collect::<Vec<_>>());
+        assert!(custom.final_three_plan.is_none());
+        assert!(cached_standard_final_three(10, None).is_none());
+        assert!(cached_standard_final_three(MAX_PRECOMPUTED_TWIDDLE_LOG + 1, None).is_none());
+    }
+
+    #[test]
+    fn final_three_plan_preserves_deep_blocks_and_callback_order() {
+        let mut seed = 0xC14_2048_5EEDu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (dim, sub_idx) in [(11usize, 0usize), (14, 7), (16, 11)] {
+            let ntt = AdditiveNttF128::standard(dim);
+            // Install explicitly so this oracle also works in an independent
+            // process running the rollback environment switch.
+            let mut planned = ntt.clone();
+            planned.final_three_plan = Some(Arc::new(FinalThreePlan::new(dim,
+                ntt.precomputed_twiddles.as_deref().unwrap())));
+            let mut incumbent = ntt;
+            incumbent.final_three_plan = None;
+            for num_ntts in [8usize, 64] {
+                for odd_tail in [0usize, 4] {
+                    let mut input: Vec<F128> = (0..2048 * num_ntts)
+                        .map(|_| F128::new(next(), next())).collect();
+                    if odd_tail != 0 {
+                        for row in (1..2048).step_by(2) {
+                            input[row * num_ntts + num_ntts - odd_tail..(row + 1) * num_ntts]
+                                .fill(F128::ZERO);
+                        }
+                    }
+                    let run = |engine: &AdditiveNttF128| {
+                        let mut data = input.clone();
+                        let seen = std::sync::Mutex::new(Vec::new());
+                        let cb = |range: core::ops::Range<usize>, values: &[F128]| {
+                            seen.lock().unwrap().push((range, values.to_vec()));
+                        };
+                        assert!(engine.deep_sub_fused_blocks_fallback(
+                            sub_idx, &mut data, &cb, dim - 11, dim, num_ntts,
+                            odd_tail, 2048, 0,
+                        ));
+                        (data, seen.into_inner().unwrap())
+                    };
+                    let got = run(&planned);
+                    let want = run(&incumbent);
+                    assert_eq!(got, want, "dim={dim} sub={sub_idx} n={num_ntts} tail={odd_tail}");
+                    assert_eq!(got.1.len(), 16);
+                    for (i, (range, _)) in got.1.iter().enumerate() {
+                        assert_eq!(*range, (sub_idx * 2048 + i * 128)..(sub_idx * 2048 + (i + 1) * 128));
+                    }
+                }
+            }
+        }
     }
 }

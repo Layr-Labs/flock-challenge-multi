@@ -3918,3 +3918,197 @@ mod ab_ntt_tail_composition_tests {
         println!("270 production NTT row cases match the independent bitwise oracle and guards");
     }
 }
+
+/// Snapshot arithmetic rollback policy once per deep subgroup.
+pub(super) fn final_three_policy() -> super::FinalThreePolicy {
+    let short = !low_twiddle_fused3_disabled();
+    super::FinalThreePolicy {
+        diet: !mul_diet_disabled(),
+        low_inner: short,
+        low_outer: short && !low_outer_fused3_disabled(),
+        high_one_outer: short && !high_one_fused3_disabled(),
+    }
+}
+
+/// Planned entry into the unmodified incumbent shaped implementation.
+///
+/// # Safety
+/// Caller guarantees the original shaped row/ISA contract and exact class.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_3layer_rows_planned<const NN: usize>(
+    ptr: *mut F128,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+    class: super::FinalThreeClass,
+    policy: super::FinalThreePolicy,
+) {
+    let low_inner = policy.low_inner && (class.0 & 1) != 0;
+    let low_outer = policy.low_outer && (class.0 >> 1) == 1;
+    let high_one_outer = policy.high_one_outer && (class.0 >> 1) == 2;
+    // SAFETY: forwarded caller contract; `low_inner` proves the LOW
+    // precondition for `twiddles[1..]`; low_outer/high_one_outer establish
+    // their respective outer preconditions. NN equals the runtime stride.
+    unsafe {
+        // Inspect the value, rather than assuming a particular standard
+        // basis or domain size. Every other high limb keeps its prior path.
+        if high_one_outer {
+            match (!policy.diet, low_inner) {
+                (true, false) => butterfly_fused_3layer_rows_impl::<false, false, NN, false, true>(
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
+                ),
+                (true, true) => butterfly_fused_3layer_rows_impl::<false, true, NN, false, true>(
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
+                ),
+                (false, false) => butterfly_fused_3layer_rows_impl::<true, false, NN, false, true>(
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
+                ),
+                (false, true) => butterfly_fused_3layer_rows_impl::<true, true, NN, false, true>(
+                    ptr,
+                    NN,
+                    dense_lanes,
+                    twiddles,
+                ),
+            }
+            return;
+        }
+        match (!policy.diet, low_inner) {
+            (true, false) => {
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                } else {
+                    butterfly_fused_3layer_rows_impl::<false, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                }
+            }
+            (true, true) => {
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                } else {
+                    butterfly_fused_3layer_rows_impl::<false, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                }
+            }
+            (false, false) => {
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                } else {
+                    butterfly_fused_3layer_rows_impl::<true, false, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                }
+            }
+            (false, true) => {
+                if low_outer {
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, true, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                } else {
+                    butterfly_fused_3layer_rows_impl::<true, true, NN, false, false>(
+                        ptr,
+                        NN,
+                        dense_lanes,
+                        twiddles,
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod final_three_planned_dispatch_tests {
+    use super::*;
+
+    unsafe fn cases<const NN: usize>() -> usize {
+        let mut seed = 0xC14_1280_A11Cu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let guard = F128::new(0xA11C_A11C, 0xBAD0_BAD0);
+        let mut checked = 0;
+        for dense_lanes in [0usize, 4, NN - 1, NN] {
+            for outer in [0u64, 1, 22, 23, u64::MAX] {
+                for inner_low in [false, true] {
+                    let mut tw: [F128; 7] = core::array::from_fn(|_| F128::new(next(), next()));
+                    tw[0].hi = outer;
+                    if inner_low { for t in &mut tw[1..] { t.hi = 0; } }
+                    let class = super::super::classify_final_three(&tw);
+                    let mut input = vec![guard; 4 + 8 * NN + 4];
+                    for v in &mut input[4..4 + 8 * NN] { *v = F128::new(next(), next()); }
+                    for row in [1usize, 3, 5, 7] {
+                        input[4 + row * NN + dense_lanes..4 + (row + 1) * NN].fill(F128::ZERO);
+                    }
+                    let mut want = input.clone();
+                    unsafe { butterfly_fused_3layer_rows_shaped::<NN>(want.as_mut_ptr().add(4), dense_lanes, &tw); }
+                    for flags in 0..16u8 {
+                        let policy = super::super::FinalThreePolicy {
+                            diet: flags & 1 != 0,
+                            low_inner: flags & 2 != 0,
+                            low_outer: flags & 4 != 0,
+                            high_one_outer: flags & 8 != 0,
+                        };
+                        let mut got = input.clone();
+                        unsafe { butterfly_fused_3layer_rows_planned::<NN>(
+                            got.as_mut_ptr().add(4), dense_lanes, &tw, class, policy,
+                        ); }
+                        assert_eq!(got, want,
+                            "n={NN} dense={dense_lanes} outer={outer} inner_low={inner_low} flags={flags}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        checked
+    }
+
+    #[test]
+    fn planned_three_dispatch_preserves_all_policies_and_guards() {
+        // SAFETY: same target-feature module and initialized row geometry as
+        // the incumbent native kernel tests. Zero-odd suffixes are explicit.
+        let checked = unsafe { cases::<8>() + cases::<64>() };
+        assert_eq!(checked, 1280);
+    }
+}
