@@ -736,6 +736,8 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
             && lo_size.is_multiple_of(8)
             && zc_regfold_enabled()
             && zc_r2_tr_enabled();
+        #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+        let tr_emit = false;
         // Resolved once per worker chunk, never inside the refill loop.
         #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
         let tr_bcast = tr_emit && zc_r2_bcast_enabled();
@@ -3168,10 +3170,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
         let wt_ptr = wt.as_ptr();
@@ -3181,8 +3179,10 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                gfni_fold64_rows_masked_c4_bcast_lm(a_pkt.add(4 * xg * 8), cfold, fa, 0);
-                gfni_fold64_rows_masked_c4_bcast_lm(b_pkt.add(4 * xg * 8), cfold, fb, 0);
+                let [a0, a1, a2, a3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
+                let [b0, b1, b2, b3] =
+                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -3194,14 +3194,6 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                         core::arch::x86_64::_MM_HINT_T0,
                     );
                 }
-                let a0 = _mm512_loadu_si512(fa.cast::<__m512i>());
-                let b0 = _mm512_loadu_si512(fb.cast::<__m512i>());
-                let a1 = _mm512_loadu_si512(fa.add(4).cast::<__m512i>());
-                let b1 = _mm512_loadu_si512(fb.add(4).cast::<__m512i>());
-                let a2 = _mm512_loadu_si512(fa.add(8).cast::<__m512i>());
-                let b2 = _mm512_loadu_si512(fb.add(8).cast::<__m512i>());
-                let a3 = _mm512_loadu_si512(fa.add(12).cast::<__m512i>());
-                let b3 = _mm512_loadu_si512(fb.add(12).cast::<__m512i>());
                 for l in 2..4 {
                     _mm_prefetch(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
@@ -4979,7 +4971,7 @@ pub(crate) fn build_cfold_mats_ext(
             } else {
                 std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]))
             };
-            let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
             if include_plane {
                 for idx in 0..128 {
                     for i in 0..8 {
@@ -5030,7 +5022,7 @@ pub(crate) fn build_cfold_mats_ext(
         // SAFETY: `out.1` is 100% overwritten below; `out.0` is overwritten when
         // `include_plane` is true (and never read when `include_plane` is false,
         // which holds whenever `zc_r34_bcast_enabled()` selects the broadcast kernels).
-        let mut out = unsafe { core::mem::MaybeUninit::<CFoldMats>::uninit().assume_init() };
+        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
         if include_plane {
             for idx in 0..128 {
                 for i in 0..8 {
@@ -5586,7 +5578,10 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-core::arch::global_asm!(include_str!("gfni_c4_lm.S"));
+core::arch::global_asm!(
+    include_str!("gfni_c4_lm.S"),
+    include_str!("gfni_c4_register_result.S"),
+);
 
 #[cfg(all(
     target_os = "linux",
@@ -5599,6 +5594,53 @@ core::arch::global_asm!(include_str!("gfni_c4_lm.S"));
 unsafe extern "C" {
     // Symbol only: calls must use the private ABI declared by the wrapper.
     fn flock_gfni_c4_lm_preserving();
+    fn flock_gfni_c4_lm_register_result();
+}
+
+
+/// Return the unmasked lane-major C4 tile directly in four vector values.
+/// The private ELF leaf preserves ZMM12..31 and every GPR except RAX.
+/// The fallback uses the same unmasked Rust fold and output ordering.
+///
+/// # Safety
+/// The rows pointer names 512 initialized readable bytes and m is valid.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_lm_registers(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let a: __m512i;
+        let b: __m512i;
+        let c: __m512i;
+        let d: __m512i;
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_lm_register_result,
+            in("rdi") rows,
+            in("rsi") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+        );
+        [a, b, c, d]
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut result = [_mm512_setzero_si512(); 4];
+        gfni_fold64_rows_masked_c4_bcast_lm_rust(rows, m, result.as_mut_ptr().cast(), 0);
+        result
+    }
 }
 
 /// [`gfni_fold64_rows_masked_c4_bcast`] with the sixteen composed outputs
@@ -6446,5 +6488,93 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
             group,
             F128::ZERO,
         );
+    }
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod cfold_initialized_checks {
+    use super::*;
+
+    fn bitwise_mul(a: F128, b: F128) -> F128 {
+        let mut x = (a.lo as u128) | ((a.hi as u128) << 64);
+        let mut y = (b.lo as u128) | ((b.hi as u128) << 64);
+        let mut z = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 { z ^= x; }
+            let carry = x >> 127;
+            x <<= 1;
+            if carry != 0 { x ^= 0x87; }
+            y >>= 1;
+        }
+        F128 { lo: z as u64, hi: (z >> 64) as u64 }
+    }
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn cfold_initialized_matrices_match_bitwise() {
+        let mut rng = 0x6b5c_92ae_830d_712fu64;
+        let mut checks = 0;
+        for case in 0..16 {
+            let data: Vec<F128> = (0..2048).map(|_| F128 {
+                lo: next(&mut rng), hi: next(&mut rng),
+            }).collect();
+            let saved = data.clone();
+            let coeffs: [F128; 4] = std::array::from_fn(|i| {
+                match (case + i) % 8 {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    2 => F128 { lo: u64::MAX, hi: u64::MAX },
+                    3 => F128 { lo: 0, hi: 1 << 63 },
+                    4 => F128 { lo: 1 << ((case + i) % 64), hi: 0 },
+                    _ => F128 { lo: next(&mut rng), hi: next(&mut rng) },
+                }
+            });
+            let mut expected = [[0u64; 128]; 4];
+            for a in 0..4 {
+                for chunk in 0..8 {
+                    for input_bit in 0..8 {
+                        let scaled = bitwise_mul(coeffs[a], data[256 * chunk + (1 << input_bit)]);
+                        let bits = scaled.lo as u128 | ((scaled.hi as u128) << 64);
+                        for byte in 0..16 {
+                            for output_bit in 0..8 {
+                                let value = ((bits >> (8 * byte + output_bit)) & 1) as u64;
+                                expected[a][16 * chunk + byte] |= value << (8 * (7 - output_bit) + input_bit);
+                            }
+                        }
+                    }
+                }
+            }
+            for include_plane in [false, true] {
+                let got = build_cfold_mats_ext(std::hint::black_box(&data), coeffs, include_plane);
+                for idx in 0..128 {
+                    for lane in 0..8 {
+                        assert_eq!(got.0[idx][lane],
+                            if include_plane { expected[lane / 2][idx] } else { 0 },
+                            "plane case={case} include={include_plane} index={idx} lane={lane}");
+                    }
+                }
+                for half in 0..2 {
+                    for a in 0..4 {
+                        for chunk in 0..8 {
+                            for byte in 0..8 {
+                                assert_eq!(got.1[32 * half + 8 * a + chunk][byte],
+                                    expected[a][16 * chunk + 8 * half + byte],
+                                    "broadcast case={case} include={include_plane}");
+                            }
+                        }
+                    }
+                }
+                assert_eq!(data, saved);
+                checks += 1;
+            }
+        }
+        assert_eq!(checks, 32);
+        println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
     }
 }
