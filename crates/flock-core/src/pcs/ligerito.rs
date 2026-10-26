@@ -4148,18 +4148,22 @@ fn densify_windows_fused(n: usize, k: usize, slots: Vec<Option<Vec<F128>>>) -> V
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh1(p: *mut F128, t0: F128, t1: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+unsafe fn transpose_butterfly_blocks_bsh1<const LOW: bool>(p: *mut F128, t0: F128, t1: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_lhs, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     unsafe {
         let ta = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
         let tv = _mm512_mask_blend_epi64(0xF0, ta, tb);
-        let tv_x64 = ghash_shift64_x4(tv);
         let v = _mm512_loadu_si512(p as *const __m512i);
         let sw = _mm512_shuffle_i64x2::<0xB1>(v, v);
         let s = _mm512_xor_si512(v, sw);
-        let nb = _mm512_xor_si512(v, ghash_mul_x4_split(s, tv, tv_x64));
+        let prod = if LOW {
+            ghash_mul_x4_low_lhs(tv, s)
+        } else {
+            ghash_mul_x4_split(s, tv, ghash_shift64_x4(tv))
+        };
+        let nb = _mm512_xor_si512(v, prod);
         _mm512_storeu_si512(p as *mut __m512i, _mm512_mask_blend_epi64(0x33, nb, s));
     }
 }
@@ -4170,16 +4174,20 @@ unsafe fn transpose_butterfly_blocks_bsh1(p: *mut F128, t0: F128, t1: F128) {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh2(p: *mut F128, t: F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+unsafe fn transpose_butterfly_blocks_bsh2<const LOW: bool>(p: *mut F128, t: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_lhs, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     unsafe {
         let tb = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
-        let tb_x64 = ghash_shift64_x4(tb);
         let v = _mm512_loadu_si512(p as *const __m512i);
         let sw = _mm512_shuffle_i64x2::<0x4E>(v, v);
         let s = _mm512_xor_si512(v, sw);
-        let nb = _mm512_xor_si512(v, ghash_mul_x4_split(s, tb, tb_x64));
+        let prod = if LOW {
+            ghash_mul_x4_low_lhs(tb, s)
+        } else {
+            ghash_mul_x4_split(s, tb, ghash_shift64_x4(tb))
+        };
+        let nb = _mm512_xor_si512(v, prod);
         _mm512_storeu_si512(p as *mut __m512i, _mm512_mask_blend_epi64(0x0F, nb, s));
     }
 }
@@ -4189,14 +4197,14 @@ unsafe fn transpose_butterfly_blocks_bsh2(p: *mut F128, t: F128) {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh1_pair(
+unsafe fn transpose_butterfly_blocks_bsh1_pair<const LOW: bool>(
     p: *mut F128,
     t0: F128,
     t1: F128,
     t2: F128,
     t3: F128,
 ) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_lhs, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     unsafe {
         let ta = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
@@ -4205,14 +4213,18 @@ unsafe fn transpose_butterfly_blocks_bsh1_pair(
         let td = _mm512_broadcast_i32x4(_mm_set_epi64x(t3.hi as i64, t3.lo as i64));
         let tv = _mm512_mask_blend_epi64(0xF0, ta, tb);
         let tw = _mm512_mask_blend_epi64(0xF0, tc, td);
-        let tv_x64 = ghash_shift64_x4(tv);
-        let tw_x64 = ghash_shift64_x4(tw);
         let v0 = _mm512_loadu_si512(p as *const __m512i);
         let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
         let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0xB1>(v0, v0));
         let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0xB1>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tv, tv_x64);
-        let m1 = ghash_mul_x4_split(s1, tw, tw_x64);
+        let (m0, m1) = if LOW {
+            (ghash_mul_x4_low_lhs(tv, s0), ghash_mul_x4_low_lhs(tw, s1))
+        } else {
+            (
+                ghash_mul_x4_split(s0, tv, ghash_shift64_x4(tv)),
+                ghash_mul_x4_split(s1, tw, ghash_shift64_x4(tw)),
+            )
+        };
         _mm512_storeu_si512(
             p as *mut __m512i,
             _mm512_mask_blend_epi64(0x33, _mm512_xor_si512(v0, m0), s0),
@@ -4225,11 +4237,12 @@ unsafe fn transpose_butterfly_blocks_bsh1_pair(
 }
 
 ///
+///
 /// # Safety
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn transpose_butterfly_blocks_bsh2_pair(p: *mut F128, t0: F128, t1: F128) {
+unsafe fn transpose_butterfly_blocks_bsh4_pair(p: *mut F128, t0: F128, t1: F128) {
     use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     unsafe {
@@ -4237,12 +4250,44 @@ unsafe fn transpose_butterfly_blocks_bsh2_pair(p: *mut F128, t0: F128, t1: F128)
         let tb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
         let tb0_x64 = ghash_shift64_x4(tb0);
         let tb1_x64 = ghash_shift64_x4(tb1);
+        let a0 = _mm512_loadu_si512(p as *const __m512i);
+        let b0 = _mm512_loadu_si512(p.add(4) as *const __m512i);
+        let a1 = _mm512_loadu_si512(p.add(8) as *const __m512i);
+        let b1 = _mm512_loadu_si512(p.add(12) as *const __m512i);
+        let s0 = _mm512_xor_si512(a0, b0);
+        let s1 = _mm512_xor_si512(a1, b1);
+        let m0 = ghash_mul_x4_split(s0, tb0, tb0_x64);
+        let m1 = ghash_mul_x4_split(s1, tb1, tb1_x64);
+        _mm512_storeu_si512(p as *mut __m512i, s0);
+        _mm512_storeu_si512(p.add(4) as *mut __m512i, _mm512_xor_si512(b0, m0));
+        _mm512_storeu_si512(p.add(8) as *mut __m512i, s1);
+        _mm512_storeu_si512(p.add(12) as *mut __m512i, _mm512_xor_si512(b1, m1));
+    }
+}
+
+///
+/// # Safety
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn transpose_butterfly_blocks_bsh2_pair<const LOW: bool>(p: *mut F128, t0: F128, t1: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_low_lhs, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+    unsafe {
+        let tb0 = _mm512_broadcast_i32x4(_mm_set_epi64x(t0.hi as i64, t0.lo as i64));
+        let tb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(t1.hi as i64, t1.lo as i64));
         let v0 = _mm512_loadu_si512(p as *const __m512i);
         let v1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
         let s0 = _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0x4E>(v0, v0));
         let s1 = _mm512_xor_si512(v1, _mm512_shuffle_i64x2::<0x4E>(v1, v1));
-        let m0 = ghash_mul_x4_split(s0, tb0, tb0_x64);
-        let m1 = ghash_mul_x4_split(s1, tb1, tb1_x64);
+        let (m0, m1) = if LOW {
+            (ghash_mul_x4_low_lhs(tb0, s0), ghash_mul_x4_low_lhs(tb1, s1))
+        } else {
+            (
+                ghash_mul_x4_split(s0, tb0, ghash_shift64_x4(tb0)),
+                ghash_mul_x4_split(s1, tb1, ghash_shift64_x4(tb1)),
+            )
+        };
         _mm512_storeu_si512(
             p as *mut __m512i,
             _mm512_mask_blend_epi64(0x0F, _mm512_xor_si512(v0, m0), s0),
@@ -4280,13 +4325,23 @@ fn transpose_forward_ntt_window_dense_slice(
                     let t2 = ntt.twiddle(layer, block_base + jb + 2);
                     let t3 = ntt.twiddle(layer, block_base + jb + 3);
                     unsafe {
-                        transpose_butterfly_blocks_bsh1_pair(
-                            buf.as_mut_ptr().add(jb * 2),
-                            t0,
-                            t1,
-                            t2,
-                            t3,
-                        )
+                        if (t0.hi | t1.hi | t2.hi | t3.hi) == 0 {
+                            transpose_butterfly_blocks_bsh1_pair::<true>(
+                                buf.as_mut_ptr().add(jb * 2),
+                                t0,
+                                t1,
+                                t2,
+                                t3,
+                            )
+                        } else {
+                            transpose_butterfly_blocks_bsh1_pair::<false>(
+                                buf.as_mut_ptr().add(jb * 2),
+                                t0,
+                                t1,
+                                t2,
+                                t3,
+                            )
+                        }
                     };
                     jb += 4;
                 }
@@ -4294,7 +4349,19 @@ fn transpose_forward_ntt_window_dense_slice(
                     let t0 = ntt.twiddle(layer, block_base + jb);
                     let t1 = ntt.twiddle(layer, block_base + jb + 1);
                     unsafe {
-                        transpose_butterfly_blocks_bsh1(buf.as_mut_ptr().add(jb * 2), t0, t1)
+                        if (t0.hi | t1.hi) == 0 {
+                            transpose_butterfly_blocks_bsh1::<true>(
+                                buf.as_mut_ptr().add(jb * 2),
+                                t0,
+                                t1,
+                            )
+                        } else {
+                            transpose_butterfly_blocks_bsh1::<false>(
+                                buf.as_mut_ptr().add(jb * 2),
+                                t0,
+                                t1,
+                            )
+                        }
                     };
                     jb += 2;
                 }
@@ -4312,8 +4379,45 @@ fn transpose_forward_ntt_window_dense_slice(
                     let t0 = ntt.twiddle(layer, block_base + jb);
                     let t1 = ntt.twiddle(layer, block_base + jb + 1);
                     unsafe {
-                        transpose_butterfly_blocks_bsh2_pair(
-                            buf.as_mut_ptr().add(jb * 4),
+                        if (t0.hi | t1.hi) == 0 {
+                            transpose_butterfly_blocks_bsh2_pair::<true>(
+                                buf.as_mut_ptr().add(jb * 4),
+                                t0,
+                                t1,
+                            )
+                        } else {
+                            transpose_butterfly_blocks_bsh2_pair::<false>(
+                                buf.as_mut_ptr().add(jb * 4),
+                                t0,
+                                t1,
+                            )
+                        }
+                    };
+                    jb += 2;
+                }
+                if jb < nblocks {
+                    let t = ntt.twiddle(layer, block_base + jb);
+                    unsafe {
+                        if t.hi == 0 {
+                            transpose_butterfly_blocks_bsh2::<true>(buf.as_mut_ptr().add(jb * 4), t)
+                        } else {
+                            transpose_butterfly_blocks_bsh2::<false>(
+                                buf.as_mut_ptr().add(jb * 4),
+                                t,
+                            )
+                        }
+                    };
+                }
+                continue;
+            }
+            if bsh == 4 {
+                let mut jb = 0;
+                while jb + 1 < nblocks {
+                    let t0 = ntt.twiddle(layer, block_base + jb);
+                    let t1 = ntt.twiddle(layer, block_base + jb + 1);
+                    unsafe {
+                        transpose_butterfly_blocks_bsh4_pair(
+                            buf.as_mut_ptr().add(jb * 8),
                             t0,
                             t1,
                         )
@@ -4322,7 +4426,9 @@ fn transpose_forward_ntt_window_dense_slice(
                 }
                 if jb < nblocks {
                     let t = ntt.twiddle(layer, block_base + jb);
-                    unsafe { transpose_butterfly_blocks_bsh2(buf.as_mut_ptr().add(jb * 4), t) };
+                    let base = jb * 8;
+                    let (top_h, bot) = buf[base..base + 8].split_at_mut(4);
+                    transpose_butterfly(top_h, bot, t);
                 }
                 continue;
             }
