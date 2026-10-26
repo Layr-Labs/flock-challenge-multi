@@ -82,6 +82,39 @@ pub(crate) unsafe fn reduce_worker_plane_block_to_f128(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn reduce_worker_plane_blocks2_to_f128(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base_a: usize,
+    base_b: usize,
+    out_a: &mut [F128; 64],
+    out_b: &mut [F128; 64],
+) {
+    unsafe {
+        kernels::reduce_worker_plane_blocks2_to_f128(
+            planes_ptr,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base_a,
+            base_b,
+            out_a,
+            out_b,
+        )
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
@@ -1773,6 +1806,66 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const<
                 out,
                 (imgs.0, imgs.1),
             ),
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    )))]
+    unreachable!("ranked-static B-complement is x86 AVX-512+GFNI only");
+}
+
+///
+/// # Safety
+#[inline(always)]
+#[allow(unused_variables)]
+pub unsafe fn round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const_x2<
+    const BLK: usize,
+    const P: bool,
+>(
+    off0: &[u16; ROUND1_AB_OFF_WORDS],
+    off1: &[u16; ROUND1_AB_OFF_WORDS],
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    plan: Round1AbWindowPlan,
+    imgs: Round1AbTableImages,
+) {
+    debug_assert!(plan.bcomplement_static);
+    debug_assert_eq!(plan.nt, 2);
+    debug_assert_eq!(out0.as_ptr() as usize & 63, 0);
+    debug_assert_eq!(out1.as_ptr() as usize & 63, 0);
+    debug_assert!((3..=28).contains(&BLK));
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "gfni",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    unsafe {
+        let op0 = off0.as_ptr();
+        let op1 = off1.as_ptr();
+        let im = (imgs.0, imgs.1);
+        match plan.table_images {
+            8 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img_x2::<
+                BLK,
+                P,
+                8,
+            >(op0, op1, out0, out1, im),
+            4 => kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const_img_x2::<
+                BLK,
+                P,
+                4,
+            >(op0, op1, out0, out1, im),
+            _ => {
+                kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+                    op0, out0, im,
+                );
+                kernels::x86_64_bcomplement::shift_reduce_bcomplement_offw_nt2_const::<BLK, P>(
+                    op1, out1, im,
+                );
+            }
         }
     }
     #[cfg(not(all(

@@ -718,6 +718,39 @@ pub(super) unsafe fn reduce_worker_plane_block_to_f128(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn reduce_worker_plane_blocks2_to_f128(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base_a: usize,
+    base_b: usize,
+    out_a: &mut [super::F128; 64],
+    out_b: &mut [super::F128; 64],
+) {
+    unsafe {
+        x86_64::reduce_worker_plane_blocks2_x86_avx512(
+            planes_ptr,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base_a,
+            base_b,
+            out_a,
+            out_b,
+        );
+    }
+}
+
 /// Ascending bulk fetch of one four-window C group into the worker staging
 /// buffer; see the kernel.
 #[cfg(all(

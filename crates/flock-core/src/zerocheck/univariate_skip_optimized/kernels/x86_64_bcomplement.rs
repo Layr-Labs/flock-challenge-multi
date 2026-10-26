@@ -209,6 +209,76 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     }
 }
 
+///
+/// # Safety
+#[inline(always)]
+pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img_x2<
+    const BLK: usize,
+    const P: bool,
+    const I: u8,
+>(
+    op0: *const u16,
+    op1: *const u16,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    imgs: (*const u8, *const u8),
+) {
+    debug_assert!((3..=28).contains(&BLK));
+    unsafe {
+        let plan = WINDOW_PLANS[BLK - 2];
+        let apply = |p: *const u16| {
+            apply_x86_avx512_register_img_krow_at::<I, P>(imgs.0, imgs.1, p)
+        };
+        let x = _mm512_set1_epi8(2);
+        let av0 = apply(op0.add(offw_krow_words::<P>(7)));
+        let av1 = apply(op1.add(offw_krow_words::<P>(7)));
+        let (bv0, c0) = apply_b_mode_img::<P, I>(
+            imgs,
+            op0.add(64 + offw_krow_words::<P>(7)),
+            plan.modes as u8,
+            av0,
+        );
+        let (bv1, c1) = apply_b_mode_img::<P, I>(
+            imgs,
+            op1.add(64 + offw_krow_words::<P>(7)),
+            plan.modes as u8,
+            av1,
+        );
+        let mut acc0 = krow_seed(av0, bv0, c0, plan.modes as u8);
+        let mut acc1 = krow_seed(av1, bv1, c1, plan.modes as u8);
+        macro_rules! step {
+            ($k:expr, $shift:expr) => {{
+                let mode = (plan.modes >> $shift) as u8;
+                let a0 = apply(op0.add(offw_krow_words::<P>($k)));
+                let a1 = apply(op1.add(offw_krow_words::<P>($k)));
+                let (b0, corr0) = apply_b_mode_img::<P, I>(
+                    imgs,
+                    op0.add(64 + offw_krow_words::<P>($k)),
+                    mode,
+                    a0,
+                );
+                let (b1, corr1) = apply_b_mode_img::<P, I>(
+                    imgs,
+                    op1.add(64 + offw_krow_words::<P>($k)),
+                    mode,
+                    a1,
+                );
+                acc0 = krow_horner(acc0, x, a0, b0, corr0, mode);
+                acc1 = krow_horner(acc1, x, a1, b1, corr1, mode);
+            }};
+        }
+        step!(6, 8);
+        step!(5, 16);
+        step!(4, 24);
+        step!(3, 32);
+        step!(2, 40);
+        step!(1, 48);
+        step!(0, 56);
+        _mm512_stream_si512(out0.as_mut_ptr().cast::<__m512i>(), acc0);
+        _mm512_stream_si512(out1.as_mut_ptr().cast::<__m512i>(), acc1);
+    }
+}
+
 /// K-row modes of the two residual windows: block 2 (K2..K7 live) and block
 /// 29 (K0..K3 live). Mode layout as in [`WindowPlan`].
 const RESIDUAL_MODES_2: u64 = WINDOW_PLANS[0].modes;

@@ -361,7 +361,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
     lo_size: usize,
     bk: &R2EqBake,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
     debug_assert_eq!(row_base & 255, 0);
@@ -537,8 +537,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
 
         let mut out = [F128::ZERO; 8];
         let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let lane_x64 = ghash_shift64_x4(lane_w);
         for i in 0..8 {
-            let scaled = ghash_mul_x4(lane_w, acc[i].reduce_lanes());
+            let scaled = ghash_mul_x4_split(acc[i].reduce_lanes(), lane_w, lane_x64);
             let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
             out[i] = l[0] + l[1] + l[2] + l[3];
         }
@@ -649,7 +650,7 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
     wtab: Option<&[F128]>,
     bake: Option<&R2EqBake>,
 ) -> [F128; 8] {
-    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4, ghash_mul_x4_split, ghash_shift64_x4};
     use core::arch::x86_64::*;
 
     let lo_size = eq_lo.len();
@@ -1455,11 +1456,11 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
             // is `LV(l)`. `ghash_reduce` is F2-linear, so reducing each lane,
             // scaling it, and XORing the four gives the same field sum the
             // incumbent gets by folding the lanes of pre-weighted products
-            // and reducing once. Eight `ghash_mul_x4` per worker chunk
             // replace four per four-group iteration.
             let lane_w = f128x4_loadu(bake.unwrap().lane.as_ptr());
+            let lane_x64 = ghash_shift64_x4(lane_w);
             for i in 0..8 {
-                let scaled = ghash_mul_x4(lane_w, acc[i].reduce_lanes());
+                let scaled = ghash_mul_x4_split(acc[i].reduce_lanes(), lane_w, lane_x64);
                 let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
                 out[i] = tail[i].reduce() + (l[0] + l[1] + l[2] + l[3]);
             }
