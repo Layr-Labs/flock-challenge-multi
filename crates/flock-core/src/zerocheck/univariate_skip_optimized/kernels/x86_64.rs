@@ -2432,6 +2432,121 @@ pub(crate) unsafe fn reduce_worker_plane_block_x86_avx512(
     }
 }
 
+///
+/// # Safety
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "gfni",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")
+)]
+unsafe fn store_reduced_plane_rows(
+    lo_rows: [core::arch::x86_64::__m512i; 8],
+    hi_rows: [core::arch::x86_64::__m512i; 8],
+    out: &mut [F128; ELL],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let los = byte_transpose_8x64::<false>(lo_rows);
+        let his = byte_transpose_8x64::<false>(hi_rows);
+        let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
+        let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
+        let dst = out.as_mut_ptr() as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(
+                dst.add(2 * k),
+                _mm512_permutex2var_epi64(los[k], idx0, his[k]),
+            );
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
+        }
+    }
+}
+
+///
+///
+/// # Safety
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "gfni",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "gfni"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")
+)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn reduce_worker_plane_blocks2_x86_avx512(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base_a: usize,
+    base_b: usize,
+    out_a: &mut [F128; ELL],
+    out_b: &mut [F128; ELL],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let first_a = planes_ptr.add(first_worker * worker_stride + base_a);
+        let first_b = planes_ptr.add(first_worker * worker_stride + base_b);
+        let mut a_lo: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(first_a.add(k * ELL) as *const __m512i));
+        let mut a_hi: [__m512i; 8] = std::array::from_fn(|k| {
+            _mm512_loadu_si512(first_a.add((8 + k) * ELL) as *const __m512i)
+        });
+        let mut b_lo: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(first_b.add(k * ELL) as *const __m512i));
+        let mut b_hi: [__m512i; 8] = std::array::from_fn(|k| {
+            _mm512_loadu_si512(first_b.add((8 + k) * ELL) as *const __m512i)
+        });
+        for &w in rest_workers {
+            let src = planes_ptr.add(w * worker_stride);
+            let src_a = src.add(base_a);
+            let src_b = src.add(base_b);
+            for k in 0..8usize {
+                a_lo[k] = _mm512_xor_si512(
+                    a_lo[k],
+                    _mm512_loadu_si512(src_a.add(k * ELL) as *const __m512i),
+                );
+                a_hi[k] = _mm512_xor_si512(
+                    a_hi[k],
+                    _mm512_loadu_si512(src_a.add((8 + k) * ELL) as *const __m512i),
+                );
+                b_lo[k] = _mm512_xor_si512(
+                    b_lo[k],
+                    _mm512_loadu_si512(src_b.add(k * ELL) as *const __m512i),
+                );
+                b_hi[k] = _mm512_xor_si512(
+                    b_hi[k],
+                    _mm512_loadu_si512(src_b.add((8 + k) * ELL) as *const __m512i),
+                );
+            }
+        }
+        store_reduced_plane_rows(a_lo, a_hi, out_a);
+        store_reduced_plane_rows(b_lo, b_hi, out_b);
+    }
+}
+
 #[inline(never)]
 #[cfg(all(
     target_arch = "x86_64",
