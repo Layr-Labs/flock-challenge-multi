@@ -3169,6 +3169,13 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
     debug_assert_eq!(b_out.len(), 2 * lo_size);
 
     unsafe {
+
+        // Full eight-block groups have exactly 512 output fields. The new
+        // consumer checks actual bytes and otherwise evaluates the full map.
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+        if out_base.is_multiple_of(512) && lo_size>=256 && lo_size.is_multiple_of(256) {
+            return c4_raw_strided::fold::<NT_OUT,OUT_LM>(a_pkt,b_pkt,out_base,a_out,b_out,lo_size,cfold,wt);
+        }
         let mut acc = [WideGhashX4::zero(); 8];
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
@@ -4882,7 +4889,7 @@ struct FoldCache([F128; 64]);
     target_feature = "vpclmulqdq"
 ))]
 #[repr(C, align(64))]
-pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128], pub(crate) [[u64; 8]; 64]);
+pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128], pub(crate) [[u64; 8]; 64], pub(crate) [[F128;2];32]);
 
 /// [`build_row_fold_mats`] for the table scaled by `c`.
 ///
@@ -4971,7 +4978,7 @@ pub(crate) fn build_cfold_mats_ext(
             } else {
                 std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]))
             };
-            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
+            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64], build_raw_c4_constants(data,coeffs));
             if include_plane {
                 for idx in 0..128 {
                     for i in 0..8 {
@@ -5022,7 +5029,7 @@ pub(crate) fn build_cfold_mats_ext(
         // SAFETY: `out.1` is 100% overwritten below; `out.0` is overwritten when
         // `include_plane` is true (and never read when `include_plane` is false,
         // which holds whenever `zc_r34_bcast_enabled()` selects the broadcast kernels).
-        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
+        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64], build_raw_c4_constants(data,coeffs));
         if include_plane {
             for idx in 0..128 {
                 for i in 0..8 {
@@ -6576,5 +6583,751 @@ mod cfold_initialized_checks {
         }
         assert_eq!(checks, 32);
         println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+/// B-only window batching over the original packed layout. Every candidate
+/// constant is checked against all eight live input blocks by the leaf.
+pub(crate) mod c4_raw_strided {
+    use super::*;
+    use core::arch::x86_64::*;
+    #[repr(C, align(64))]
+    struct RawBStage([F128; 512]);
+    #[repr(C, align(64))]
+    struct RawWindow([u8; 512]);
+    pub(crate) const EXPECTED: [[u64; 8]; 32] = [
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [
+            18446744073709551615,
+            18446744073709551615,
+            0,
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+        ],
+        [
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+        ],
+        [
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+        ],
+        [
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+        ],
+        [
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+        ],
+        [18446744073709551360, 0, 0, 0, 72057594037927935, 0, 0, 0],
+        [
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+        ],
+        [
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446742974197923840,
+        ],
+        [
+            4294967295,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+        ],
+        [
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709486080,
+        ],
+        [255, 0, 0, 18446744073709551360, 0, 0, 0, 72057594037927935],
+        [
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+        ],
+        [
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+        ],
+        [
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+        ],
+        [
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+        ],
+        [0, 0, 18446744073709551360, 0, 0, 0, 18446744073709551360, 0],
+        [
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+        ],
+        [
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+        ],
+        [
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+        ],
+        [
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+        ],
+        [
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709551360,
+            0,
+            0,
+        ],
+        [0, 72057594037927935, 0, 0, 0, 72057594037927935, 0, 0],
+        [
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+        ],
+        [
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+        ],
+        [
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+        ],
+        [
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+        ],
+        [
+            18446744073709551360,
+            0,
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+        ],
+        [
+            281474976710655,
+            0,
+            0,
+            18374686479671623680,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [562949953421311, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ];
+    pub(crate) const KNOWN: [[u8; 8]; 32] = [
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 0, 0, 0, 127, 0, 0],
+        [128, 63, 0, 0, 192, 31, 0, 0],
+        [192, 31, 0, 0, 224, 15, 0, 0],
+        [240, 7, 0, 0, 248, 3, 0, 0],
+        [248, 3, 0, 0, 252, 1, 0, 0],
+        [254, 0, 0, 0, 127, 0, 0, 0],
+        [127, 0, 0, 128, 63, 0, 0, 192],
+        [31, 0, 0, 224, 15, 0, 0, 224],
+        [15, 0, 0, 240, 7, 0, 0, 248],
+        [3, 0, 0, 252, 1, 0, 0, 252],
+        [1, 0, 0, 254, 0, 0, 0, 127],
+        [0, 0, 128, 63, 0, 0, 128, 63],
+        [0, 0, 192, 31, 0, 0, 224, 15],
+        [0, 0, 240, 7, 0, 0, 240, 7],
+        [0, 0, 248, 3, 0, 0, 252, 1],
+        [0, 0, 254, 0, 0, 0, 254, 0],
+        [0, 0, 127, 0, 0, 128, 63, 0],
+        [0, 192, 31, 0, 0, 192, 31, 0],
+        [0, 224, 15, 0, 0, 240, 7, 0],
+        [0, 248, 3, 0, 0, 248, 3, 0],
+        [0, 252, 1, 0, 0, 254, 0, 0],
+        [0, 127, 0, 0, 0, 127, 0, 0],
+        [128, 63, 0, 0, 192, 31, 0, 0],
+        [224, 15, 0, 0, 224, 15, 0, 0],
+        [240, 7, 0, 0, 248, 3, 0, 0],
+        [252, 1, 0, 0, 252, 1, 0, 0],
+        [254, 0, 0, 0, 127, 0, 0, 128],
+        [63, 0, 0, 128, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+    ];
+    unsafe extern "C" {
+        fn flock_c4_raw_known_w0();
+        fn flock_c4_raw_known_w1();
+        fn flock_c4_raw_known_w2();
+        fn flock_c4_raw_known_w3();
+        fn flock_c4_raw_known_w4();
+        fn flock_c4_raw_known_w5();
+        fn flock_c4_raw_known_w6();
+        fn flock_c4_raw_known_w7();
+        fn flock_c4_raw_known_w8();
+        fn flock_c4_raw_known_w9();
+        fn flock_c4_raw_known_w10();
+        fn flock_c4_raw_known_w11();
+        fn flock_c4_raw_known_w12();
+        fn flock_c4_raw_known_w13();
+        fn flock_c4_raw_known_w14();
+        fn flock_c4_raw_known_w15();
+        fn flock_c4_raw_known_w16();
+        fn flock_c4_raw_known_w17();
+        fn flock_c4_raw_known_w18();
+        fn flock_c4_raw_known_w19();
+        fn flock_c4_raw_known_w20();
+        fn flock_c4_raw_known_w21();
+        fn flock_c4_raw_known_w22();
+        fn flock_c4_raw_known_w23();
+        fn flock_c4_raw_known_w24();
+        fn flock_c4_raw_known_w25();
+        fn flock_c4_raw_known_w26();
+        fn flock_c4_raw_known_w27();
+        fn flock_c4_raw_known_w28();
+        fn flock_c4_raw_known_w29();
+        fn flock_c4_raw_known_w30();
+        fn flock_c4_raw_known_w31();
+    }
+    static C4_KNOWN_LEAVES: [unsafe extern "C" fn(); 32] = [
+        flock_c4_raw_known_w0,
+        flock_c4_raw_known_w1,
+        flock_c4_raw_known_w2,
+        flock_c4_raw_known_w3,
+        flock_c4_raw_known_w4,
+        flock_c4_raw_known_w5,
+        flock_c4_raw_known_w6,
+        flock_c4_raw_known_w7,
+        flock_c4_raw_known_w8,
+        flock_c4_raw_known_w9,
+        flock_c4_raw_known_w10,
+        flock_c4_raw_known_w11,
+        flock_c4_raw_known_w12,
+        flock_c4_raw_known_w13,
+        flock_c4_raw_known_w14,
+        flock_c4_raw_known_w15,
+        flock_c4_raw_known_w16,
+        flock_c4_raw_known_w17,
+        flock_c4_raw_known_w18,
+        flock_c4_raw_known_w19,
+        flock_c4_raw_known_w20,
+        flock_c4_raw_known_w21,
+        flock_c4_raw_known_w22,
+        flock_c4_raw_known_w23,
+        flock_c4_raw_known_w24,
+        flock_c4_raw_known_w25,
+        flock_c4_raw_known_w26,
+        flock_c4_raw_known_w27,
+        flock_c4_raw_known_w28,
+        flock_c4_raw_known_w29,
+        flock_c4_raw_known_w30,
+        flock_c4_raw_known_w31,
+    ];
+
+    /// Reconstruct the same linear map used to build CFoldMats from basis
+    /// entries, even for a caller whose other table entries are not linear.
+    /// These 64 field values are built once with the pass-owned matrix bank.
+    pub(super) fn constants(data: &[F128], coeffs: [F128; 4]) -> [[F128; 2]; 32] {
+        std::array::from_fn(|w| {
+            std::array::from_fn(|g| {
+                let mut acc = F128::ZERO;
+                for row in 4 * g..4 * g + 4 {
+                    let mut bits = EXPECTED[w][row];
+                    let mut value = F128::ZERO;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        value += data[(bit / 8) * 256 + (1usize << (bit % 8))];
+                    }
+                    acc += coeffs[row % 4] * value;
+                }
+                acc
+            })
+        })
+    }
+    #[inline(always)]
+    unsafe fn known_leaf(
+        input: *const u8,
+        m0: *const u64,
+        m1: *const u64,
+        constants: *const F128,
+        w: usize,
+    ) -> [__m512i; 4] {
+        let a: __m512i;
+        let b: __m512i;
+        let c: __m512i;
+        let d: __m512i;
+        core::arch::asm!("call r8",in("r8")C4_KNOWN_LEAVES[w],in("rcx")constants,out("k1")_,in("rdi")input,in("rsi")m0,in("rdx")m1,lateout("rax")_,
+ out("zmm8")a,out("zmm9")b,out("zmm10")c,out("zmm11")d,
+out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_);
+        [a, b, c, d]
+    }
+    #[inline(always)]
+    unsafe fn raw_window12(input: *const u8, out: *mut u8) {
+        const IX: [u8; 64] = {
+            let mut a = [0; 64];
+            let mut i = 0;
+            while i < 64 {
+                a[i] = (8 * (i % 8) + i / 8) as u8;
+                i += 1;
+            }
+            a
+        };
+        core::arch::asm!(
+"vmovdqu64 zmm0, [rdi + 0]",
+"vmovdqu64 zmm1, [rdi + 2048]",
+"vmovdqu64 zmm2, [rdi + 4096]",
+"vmovdqu64 zmm3, [rdi + 6144]",
+"vmovdqu64 zmm4, [rdi + 8192]",
+"vmovdqu64 zmm5, [rdi + 10240]",
+"vmovdqu64 zmm6, [rdi + 12288]",
+"vmovdqu64 zmm7, [rdi + 14336]",
+"vpunpcklqdq zmm8, zmm0, zmm1",
+"vpunpckhqdq zmm9, zmm0, zmm1",
+"vpunpcklqdq zmm0, zmm2, zmm3",
+"vpunpckhqdq zmm1, zmm2, zmm3",
+"vpunpcklqdq zmm2, zmm4, zmm5",
+"vpunpckhqdq zmm3, zmm4, zmm5",
+"vpunpcklqdq zmm4, zmm6, zmm7",
+"vpunpckhqdq zmm5, zmm6, zmm7",
+"vshufi64x2 zmm6, zmm8, zmm0, 0x88",
+"vshufi64x2 zmm7, zmm8, zmm0, 0xdd",
+"vshufi64x2 zmm0, zmm9, zmm1, 0x88",
+"vshufi64x2 zmm8, zmm9, zmm1, 0xdd",
+"vshufi64x2 zmm1, zmm2, zmm4, 0x88",
+"vshufi64x2 zmm9, zmm2, zmm4, 0xdd",
+"vshufi64x2 zmm2, zmm3, zmm5, 0x88",
+"vshufi64x2 zmm4, zmm3, zmm5, 0xdd",
+"vshufi64x2 zmm3, zmm6, zmm1, 0x88",
+"vshufi64x2 zmm5, zmm6, zmm1, 0xdd",
+"vshufi64x2 zmm1, zmm0, zmm2, 0x88",
+"vshufi64x2 zmm6, zmm0, zmm2, 0xdd",
+"vshufi64x2 zmm0, zmm7, zmm9, 0x88",
+"vshufi64x2 zmm2, zmm7, zmm9, 0xdd",
+"vshufi64x2 zmm7, zmm8, zmm4, 0x88",
+"vshufi64x2 zmm9, zmm8, zmm4, 0xdd",
+"vmovdqu64 zmm11, [rdx]",
+"vpermb zmm3, zmm11, zmm3",
+"vmovdqa64 [rsi + 0], zmm3",
+"vpermb zmm1, zmm11, zmm1",
+"vmovdqa64 [rsi + 64], zmm1",
+"vpermb zmm0, zmm11, zmm0",
+"vmovdqa64 [rsi + 128], zmm0",
+"vpermb zmm7, zmm11, zmm7",
+"vmovdqa64 [rsi + 192], zmm7",
+"vpermb zmm5, zmm11, zmm5",
+"vmovdqa64 [rsi + 256], zmm5",
+"vpermb zmm6, zmm11, zmm6",
+"vmovdqa64 [rsi + 320], zmm6",
+"vpermb zmm2, zmm11, zmm2",
+"vmovdqa64 [rsi + 384], zmm2",
+"vpermb zmm9, zmm11, zmm9",
+"vmovdqa64 [rsi + 448], zmm9",
+in("rdi")input,in("rsi")out,in("rdx")IX.as_ptr(),
+out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")_,out("zmm9")_,out("zmm10")_,out("zmm11")_,options(nostack));
+    }
+    // The 49-instruction pack preserves ZMM12..31. All 512 scratch bytes
+    // are written before the leaf reads them; each B-stage field is assigned once.
+    #[inline(never)]
+    unsafe fn raw_b_stage(
+        input: *const u8,
+        m: *const u64,
+        constants: &[[F128; 2]; 32],
+        out: *mut F128,
+    ) {
+        let mut window = core::mem::MaybeUninit::<RawWindow>::uninit();
+        let wp = window.as_mut_ptr().cast::<u8>();
+        for group in (0..32usize).step_by(8) {
+            for parity in 0..2usize {
+                let w0 = group + parity + 0;
+                raw_window12(input.add(64 * w0), wp);
+                let v0 = known_leaf(wp, m, m, constants[w0].as_ptr(), w0);
+                let w1 = group + parity + 2;
+                raw_window12(input.add(64 * w1), wp);
+                let v1 = known_leaf(wp, m, m, constants[w1].as_ptr(), w1);
+                let w2 = group + parity + 4;
+                raw_window12(input.add(64 * w2), wp);
+                let v2 = known_leaf(wp, m, m, constants[w2].as_ptr(), w2);
+                let w3 = group + parity + 6;
+                raw_window12(input.add(64 * w3), wp);
+                let v3 = known_leaf(wp, m, m, constants[w3].as_ptr(), w3);
+                let block = transpose4_lanes(v0[0], v1[0], v2[0], v3[0]);
+                _mm512_storeu_si512(out.add(0 + 2 * group + 8 * parity + 0).cast(), block[0]);
+                _mm512_storeu_si512(out.add(64 + 2 * group + 8 * parity + 0).cast(), block[1]);
+                _mm512_storeu_si512(out.add(128 + 2 * group + 8 * parity + 0).cast(), block[2]);
+                _mm512_storeu_si512(out.add(192 + 2 * group + 8 * parity + 0).cast(), block[3]);
+                let block = transpose4_lanes(v0[1], v1[1], v2[1], v3[1]);
+                _mm512_storeu_si512(out.add(256 + 2 * group + 8 * parity + 0).cast(), block[0]);
+                _mm512_storeu_si512(out.add(320 + 2 * group + 8 * parity + 0).cast(), block[1]);
+                _mm512_storeu_si512(out.add(384 + 2 * group + 8 * parity + 0).cast(), block[2]);
+                _mm512_storeu_si512(out.add(448 + 2 * group + 8 * parity + 0).cast(), block[3]);
+                let block = transpose4_lanes(v0[2], v1[2], v2[2], v3[2]);
+                _mm512_storeu_si512(out.add(0 + 2 * group + 8 * parity + 4).cast(), block[0]);
+                _mm512_storeu_si512(out.add(64 + 2 * group + 8 * parity + 4).cast(), block[1]);
+                _mm512_storeu_si512(out.add(128 + 2 * group + 8 * parity + 4).cast(), block[2]);
+                _mm512_storeu_si512(out.add(192 + 2 * group + 8 * parity + 4).cast(), block[3]);
+                let block = transpose4_lanes(v0[3], v1[3], v2[3], v3[3]);
+                _mm512_storeu_si512(out.add(256 + 2 * group + 8 * parity + 4).cast(), block[0]);
+                _mm512_storeu_si512(out.add(320 + 2 * group + 8 * parity + 4).cast(), block[1]);
+                _mm512_storeu_si512(out.add(384 + 2 * group + 8 * parity + 4).cast(), block[2]);
+                _mm512_storeu_si512(out.add(448 + 2 * group + 8 * parity + 4).cast(), block[3]);
+            }
+        }
+    }
+    #[inline(never)]
+    pub(super) unsafe fn fold<const NT_OUT: bool, const OUT_LM: bool>(
+        a_pkt: *const u8,
+        b_pkt: *const u8,
+        out_base: usize,
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+        lo_size: usize,
+        cfold: &CFoldMats,
+        wt: &[F128],
+    ) -> [F128; 8] {
+        use core::arch::x86_64::*;
+        debug_assert!(lo_size.is_multiple_of(16));
+        debug_assert_eq!(a_out.len(), 2 * lo_size);
+        debug_assert_eq!(b_out.len(), 2 * lo_size);
+
+        let constants = &cfold.2;
+        unsafe {
+            let mut b_stage = core::mem::MaybeUninit::<RawBStage>::uninit();
+
+            let mut acc = [WideGhashX4::zero(); 8];
+            let a_out_ptr = a_out.as_mut_ptr();
+            let b_out_ptr = b_out.as_mut_ptr();
+            let wt_ptr = wt.as_ptr();
+
+            macro_rules! step8_fast {
+                ($x_expr:expr) => {{
+                    let x = $x_expr;
+                    let ol = 2 * x;
+                    let xg = out_base + ol;
+                    let [a0, a1, a2, a3] =
+                        gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
+                    let bp_stage = if OUT_LM {
+                        b_out_ptr.add(ol)
+                    } else {
+                        b_stage.as_ptr().cast::<F128>().add(ol % 512)
+                    };
+                    let b0 = _mm512_loadu_si512(bp_stage.cast());
+                    let b1 = _mm512_loadu_si512(bp_stage.add(4).cast());
+                    let b2 = _mm512_loadu_si512(bp_stage.add(8).cast());
+                    let b3 = _mm512_loadu_si512(bp_stage.add(12).cast());
+                    let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
+                    for l in 0..2 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    for l in 2..4 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let ap = a_out_ptr.add(ol);
+                    let bp = b_out_ptr.add(ol);
+                    let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                        (a0, a1, a2, a3, b0, b1, b2, b3)
+                    } else {
+                        let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                        let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                        (s0, s1, s2, s3, t0, t1, t2, t3)
+                    };
+                    if NT_OUT {
+                        stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                        if !OUT_LM {
+                            stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                        }
+                    } else {
+                        _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                        _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                        _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                        _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                        if !OUT_LM {
+                            _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                            _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                            _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                            _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                        }
+                    }
+                    for l in 4..8 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let wp = wt_ptr.add(x) as *const __m512i;
+                    let w = _mm512_loadu_si512(wp);
+                    let w64 = _mm512_loadu_si512(wp.add(1));
+                    let a0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64);
+                    let a1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64);
+                    let a2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64);
+                    let a3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64);
+                    (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+                }};
+            }
+
+            // Lane-major B writes go directly to the exclusively owned output.
+            // Each tile is fully initialized before the A/B message loop reads it.
+            // Other layouts retain private staging and their original publication.
+            for tile in (0..lo_size).step_by(256) {
+                raw_b_stage(
+                    b_pkt.add(32 * (out_base + 2 * tile)),
+                    cfold.1.as_ptr().cast(),
+                    constants,
+                    if OUT_LM {
+                        b_out_ptr.add(2 * tile)
+                    } else {
+                        b_stage.as_mut_ptr().cast::<F128>()
+                    },
+                );
+                let mut x_lo = tile;
+                while x_lo < tile + 256 {
+                    let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step8_fast!(x_lo);
+                    let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step8_fast!(x_lo + 8);
+                    acc[0].mul_acc2(a1w, b1, c1w, d1);
+                    acc[1].mul_acc2(
+                        _mm512_xor_si512(a0w, a1w),
+                        _mm512_xor_si512(b0, b1),
+                        _mm512_xor_si512(c0w, c1w),
+                        _mm512_xor_si512(d0, d1),
+                    );
+                    acc[2].mul_acc2(a3w, b3, c3w, d3);
+                    acc[3].mul_acc2(
+                        _mm512_xor_si512(a2w, a3w),
+                        _mm512_xor_si512(b2, b3),
+                        _mm512_xor_si512(c2w, c3w),
+                        _mm512_xor_si512(d2, d3),
+                    );
+                    acc[4].mul_acc2(a2w, b2, c2w, d2);
+                    let e_aw = _mm512_xor_si512(a0w, a2w);
+                    let e_b = _mm512_xor_si512(b0, b2);
+                    let o_aw = _mm512_xor_si512(a1w, a3w);
+                    let o_b = _mm512_xor_si512(b1, b3);
+                    let e_cw = _mm512_xor_si512(c0w, c2w);
+                    let e_d = _mm512_xor_si512(d0, d2);
+                    let o_cw = _mm512_xor_si512(c1w, c3w);
+                    let o_d = _mm512_xor_si512(d1, d3);
+                    acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                    acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                    acc[7].mul_acc2(
+                        _mm512_xor_si512(e_aw, o_aw),
+                        _mm512_xor_si512(e_b, o_b),
+                        _mm512_xor_si512(e_cw, o_cw),
+                        _mm512_xor_si512(e_d, o_d),
+                    );
+                    x_lo += 16;
+                }
+            }
+
+            if NT_OUT {
+                _mm_sfence();
+            }
+            let mut out = [F128::ZERO; 8];
+            for i in 0..8 {
+                out[i] = acc[i].fold().reduce();
+            }
+            out
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_raw_c4_constants(data: &[F128], coeffs: [F128; 4]) -> [[F128; 2]; 32] {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        return c4_raw_strided::constants(data, coeffs);
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = (data, coeffs);
+        [[F128::ZERO; 2]; 32]
     }
 }
