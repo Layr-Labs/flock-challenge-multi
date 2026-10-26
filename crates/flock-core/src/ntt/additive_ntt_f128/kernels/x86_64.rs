@@ -3671,17 +3671,29 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
             _mm512_storeu_si512(out.add(1), last);
         }
     }
-    for i in 12..15 {
-        // x^64 multiplication is a field operation, not a value assumption.
+    unsafe {
         use core::arch::x86_64::*;
-        let companion = unsafe {
-            let v = _mm_set_epi64x(t[i].hi as i64, t[i].lo as i64);
-            let reduction = _mm_clmulepi64_si128::<0x01>(v, _mm_set_epi64x(0, 0x87));
-            let folded = _mm_xor_si128(_mm_slli_si128::<8>(v), reduction);
-            F128::new(_mm_cvtsi128_si64(folded) as u64,
-                      _mm_extract_epi64::<1>(folded) as u64)
-        };
-        result.pairs[i] = [t[i], companion];
+        let v = _mm512_maskz_loadu_epi64(0x3f, t.as_ptr().add(12).cast());
+        let shifted = _mm512_xor_si512(
+            _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, v),
+            _mm512_clmulepi64_epi128::<0x01>(v, _mm512_set1_epi64(0x87)),
+        );
+        let first = _mm512_permutex2var_epi64(
+            v,
+            _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11),
+            shifted,
+        );
+        let last = _mm512_permutex2var_epi64(
+            v,
+            _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15),
+            shifted,
+        );
+        let dst = result.pairs.as_mut_ptr().add(12).cast::<__m512i>();
+        _mm512_storeu_si512(dst, first);
+        _mm256_storeu_si256(
+            dst.add(1).cast(),
+            _mm512_castsi512_si256(last),
+        );
     }
     Some(result)
 }
