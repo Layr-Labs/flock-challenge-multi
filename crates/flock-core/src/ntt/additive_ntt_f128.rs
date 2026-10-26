@@ -2732,6 +2732,33 @@ impl AdditiveNttF128 {
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
+
+        // Half-row tasks preserve both scheduler paths. A task's source and
+        // output pitch remains 64 while its private 512-row stage has pitch 32.
+        // The existing FMP scheduler owns the same handoff/exception protocol.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+        if direct_publish && stage_perm && seed_odd_tail
+            && !ntt_seed_hold4_disabled() && pf_spread && pf_lines<=16
+        {
+            if let Some(plan)=kernels::SeedSplit32Plan::new(seed_right,&seed_dense,&tw4,&tw2) {
+                let seed32=|bufp:*mut F128,task:usize| unsafe {
+                    kernels::seed_split32_seed(src_addr as *const F128,bufp,task,block_size,sub_stride,&plan,pf_dist,pf_lines);
+                };
+                let fold32=|bufp:*mut F128,task:usize| unsafe { kernels::seed_split32_fold(bufp,task,&plan); };
+                let publish32=|bufp:*mut F128,task:usize| unsafe {
+                    if direct_publish_zmm { kernels::seed_split32_publish::<true>(bufp,base_addr as *mut F128,task,block_size,sub_stride,&plan); }
+                    else { kernels::seed_split32_publish::<false>(bufp,base_addr as *mut F128,task,block_size,sub_stride,&plan); }
+                };
+                #[cfg(target_os = "linux")]
+                if st_fmp_run(2*sub_stride,32,&seed32,&fold32,&publish32) { return; }
+                (0..2*sub_stride).into_par_iter().for_each_init(
+                    || staging_block(512,32),
+                    |buf,task| {let ptr=buf.as_mut_ptr();seed32(ptr,task);fold32(ptr,task);publish32(ptr,task);}
+                );
+                return;
+            }
+        }
+
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);

@@ -1153,3 +1153,26 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+/// Coefficients owned by one seed pass; the existing four-layer plans are borrowed.
+pub(super) struct SeedSplit32Plan<'a> {
+    seed: [F128; 8],
+    publish: [[[F128; 6]; 16]; 8],
+    four: [&'a x86_64::PreparedFour; 8],
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+impl<'a> SeedSplit32Plan<'a> {
+    pub(super) fn new(right: F128, dense: &[F128;3], four: &'a [FourBlock], publish: &[[[F128;3];16]]) -> Option<Self> {
+        if !super::ntt_shaped_enabled() { return None; }
+        if four.len()!=8 || publish.len()!=8 { return None; }
+        let borrowed=[four[0].cache.as_ref()?,four[1].cache.as_ref()?,four[2].cache.as_ref()?,four[3].cache.as_ref()?,four[4].cache.as_ref()?,four[5].cache.as_ref()?,four[6].cache.as_ref()?,four[7].cache.as_ref()?];
+        let mut plan=Self { seed:[F128::ZERO;8],publish:[[[F128::ZERO;6];16];8],four:borrowed };
+        // PreparedFour availability also proves that both preparation and
+        // diet arithmetic are enabled; this owner is outside all task loops.
+        unsafe { x86_64::seed_split32_prepare(&[right,dense[0],dense[1],dense[2]],publish,&mut plan.seed,&mut plan.publish); }
+        Some(plan)
+    }
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+pub(super) use x86_64::{seed_split32_seed,seed_split32_fold,seed_split32_publish};

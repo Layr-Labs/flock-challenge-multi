@@ -4268,3 +4268,909 @@ mod ab_ntt_tail_composition_tests {
         println!("270 production NTT row cases match the independent bitwise oracle and guards");
     }
 }
+
+// The containing x86 module is already gated by AVX-512F and VPCLMULQDQ.
+#[cfg(target_feature = "avx512bw")]
+mod seed_split32 {
+    use super::super::SeedSplit32Plan;
+    use super::*;
+    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    fn stage(k: usize) -> usize {
+        (k & 3) * 16 + (k >> 2)
+    }
+    #[inline(always)]
+    fn decode(task: usize) -> (usize, usize, usize) {
+        let r = task / 2;
+        let first = (task % 2) * 32;
+        (
+            r,
+            first,
+            32.min((if r & 1 == 1 { 60usize } else { 64usize }) - first),
+        )
+    }
+    #[inline]
+    pub(crate) unsafe fn seed_split32_prepare(
+        seed: &[F128; 4],
+        tw: &[[[F128; 3]; 16]],
+        seed_out: &mut [F128; 8],
+        out: &mut [[[F128; 6]; 16]; 8],
+    ) {
+        unsafe {
+            seed_out[..4].copy_from_slice(seed);
+            let value = _mm512_loadu_si512(seed.as_ptr().cast());
+            _mm512_storeu_si512(seed_out.as_mut_ptr().add(4).cast(), ghash_shift64_x4(value));
+            let flat = tw.as_ptr().cast::<F128>();
+            let mut companions = [F128::ZERO; 384];
+            for n in (0..384).step_by(4) {
+                let value = _mm512_loadu_si512(flat.add(n).cast());
+                _mm512_storeu_si512(
+                    companions.as_mut_ptr().add(n).cast(),
+                    ghash_shift64_x4(value),
+                );
+            }
+            for b in 0..8 {
+                for q in 0..16 {
+                    for i in 0..3 {
+                        out[b][q][i] = tw[b][q][i];
+                        out[b][q][3 + i] = companions[(b * 16 + q) * 3 + i];
+                    }
+                }
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn load_seed_plan<const LOW: bool>(value: F128, companion: F128) -> TwX4 {
+        unsafe {
+            let a = _mm512_broadcast_i32x4(_mm_set_epi64x(value.hi as i64, value.lo as i64));
+            let b = if LOW {
+                a
+            } else {
+                _mm512_broadcast_i32x4(_mm_set_epi64x(companion.hi as i64, companion.lo as i64))
+            };
+            (a, b)
+        }
+    }
+    #[inline(always)]
+    unsafe fn seed_row<const OUTER_LOW: bool>(
+        src: *const F128,
+        scratch: *mut F128,
+        r: usize,
+        k: usize,
+        first: usize,
+        active_lanes: usize,
+        block_size: usize,
+        sub_stride: usize,
+        plan: &SeedSplit32Plan<'_>,
+        pf_src: *const F128,
+    ) {
+        use core::arch::x86_64::*;
+        let [right_twiddle, t_outer, t_inner_a, t_inner_b, rc, tc, sc, ic] = plan.seed;
+        let pf = !pf_src.is_null();
+        unsafe {
+            debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+            let sparse_b = load_seed_plan::<false>(right_twiddle, rc);
+            let outer = load_seed_plan::<OUTER_LOW>(t_outer, tc);
+            let inner_a = load_seed_plan::<false>(t_inner_a, sc);
+            let inner_b = load_seed_plan::<false>(t_inner_b, ic);
+            let src_row = |i: usize| src.add((i * block_size + r + k * sub_stride) * 64 + first);
+            let sp_row = |i: usize| scratch.add((i * 64 + stage(k)) * 32);
+            let dn_row = |i: usize| scratch.add(((i + 4) * 64 + stage(k)) * 32);
+            let pf_row = |i: usize| pf_src.add(i * block_size * 64) as *const i8;
+            let lanes = active_lanes & !3;
+            let mut lane = 0;
+            while lane + 8 <= lanes {
+                if pf {
+                    let off0 = lane * core::mem::size_of::<F128>();
+                    let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                    for i in 0..4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                    }
+                }
+                let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+                let vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+                let vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+                let vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+                let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+                let vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+                let vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+                let vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+                let mut sb0 = vb0;
+                let mut sc0 = _mm512_xor_si512(vc0, va0);
+                let mut sd0 = _mm512_xor_si512(vd0, vb0);
+                sb0 = _mm512_xor_si512(sb0, va0);
+
+                let mut sb1 = vb1;
+                let mut sc1 = _mm512_xor_si512(vc1, va1);
+                let mut sd1 = _mm512_xor_si512(vd1, vb1);
+                sb1 = _mm512_xor_si512(sb1, va1);
+
+                let new_sc0 = _mm512_xor_si512(sc0, mul_x4::<false, true>(sparse_b, sd0));
+                let new_sc1 = _mm512_xor_si512(sc1, mul_x4::<false, true>(sparse_b, sd1));
+                sd0 = _mm512_xor_si512(sd0, new_sc0);
+                sd1 = _mm512_xor_si512(sd1, new_sc1);
+                sc0 = new_sc0;
+                sc1 = new_sc1;
+
+                _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, va0);
+                _mm512_storeu_si512(sp_row(1).add(lane) as *mut __m512i, sb0);
+                _mm512_storeu_si512(sp_row(2).add(lane) as *mut __m512i, sc0);
+                _mm512_storeu_si512(sp_row(3).add(lane) as *mut __m512i, sd0);
+
+                _mm512_storeu_si512(sp_row(0).add(lane + 4) as *mut __m512i, va1);
+                _mm512_storeu_si512(sp_row(1).add(lane + 4) as *mut __m512i, sb1);
+                _mm512_storeu_si512(sp_row(2).add(lane + 4) as *mut __m512i, sc1);
+                _mm512_storeu_si512(sp_row(3).add(lane + 4) as *mut __m512i, sd1);
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, true>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, true>(outer, vc1));
+                let vc0 = _mm512_xor_si512(vc0, new_a0);
+                let vc1 = _mm512_xor_si512(vc1, new_a1);
+                let va0 = new_a0;
+                let va1 = new_a1;
+
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, true>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, true>(outer, vd1));
+                let vd0 = _mm512_xor_si512(vd0, new_b0);
+                let vd1 = _mm512_xor_si512(vd1, new_b1);
+                let vb0 = new_b0;
+                let vb1 = new_b1;
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<false, true>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<false, true>(inner_a, vb1));
+                let vb0 = _mm512_xor_si512(vb0, new_a0);
+                let vb1 = _mm512_xor_si512(vb1, new_a1);
+                let va0 = new_a0;
+                let va1 = new_a1;
+
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, true>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, true>(inner_b, vd1));
+                let vd0 = _mm512_xor_si512(vd0, new_c0);
+                let vd1 = _mm512_xor_si512(vd1, new_c1);
+                let vc0 = new_c0;
+                let vc1 = new_c1;
+
+                _mm512_storeu_si512(dn_row(0).add(lane) as *mut __m512i, va0);
+                _mm512_storeu_si512(dn_row(1).add(lane) as *mut __m512i, vb0);
+                _mm512_storeu_si512(dn_row(2).add(lane) as *mut __m512i, vc0);
+                _mm512_storeu_si512(dn_row(3).add(lane) as *mut __m512i, vd0);
+
+                _mm512_storeu_si512(dn_row(0).add(lane + 4) as *mut __m512i, va1);
+                _mm512_storeu_si512(dn_row(1).add(lane + 4) as *mut __m512i, vb1);
+                _mm512_storeu_si512(dn_row(2).add(lane + 4) as *mut __m512i, vc1);
+                _mm512_storeu_si512(dn_row(3).add(lane + 4) as *mut __m512i, vd1);
+                lane += 8;
+            }
+            while lane < lanes {
+                if pf {
+                    let off = lane * core::mem::size_of::<F128>();
+                    for i in 0..4 {
+                        _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                    }
+                }
+                let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+                let vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+                let vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+                let vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+                let mut sb = vb;
+                let mut sc = _mm512_xor_si512(vc, va);
+                let mut sd = _mm512_xor_si512(vd, vb);
+                sb = _mm512_xor_si512(sb, va);
+                let new_c = _mm512_xor_si512(sc, mul_x4::<false, true>(sparse_b, sd));
+                sd = _mm512_xor_si512(sd, new_c);
+                sc = new_c;
+                _mm512_storeu_si512(sp_row(0).add(lane) as *mut __m512i, va);
+                _mm512_storeu_si512(sp_row(1).add(lane) as *mut __m512i, sb);
+                _mm512_storeu_si512(sp_row(2).add(lane) as *mut __m512i, sc);
+                _mm512_storeu_si512(sp_row(3).add(lane) as *mut __m512i, sd);
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, true>(outer, vc));
+                let vc = _mm512_xor_si512(vc, new_a);
+                let va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, true>(outer, vd));
+                let vd = _mm512_xor_si512(vd, new_b);
+                let vb = new_b;
+                let new_a = _mm512_xor_si512(va, mul_x4::<false, true>(inner_a, vb));
+                let vb = _mm512_xor_si512(vb, new_a);
+                let va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<false, true>(inner_b, vd));
+                let vd = _mm512_xor_si512(vd, new_c);
+                let vc = new_c;
+                _mm512_storeu_si512(dn_row(0).add(lane) as *mut __m512i, va);
+                _mm512_storeu_si512(dn_row(1).add(lane) as *mut __m512i, vb);
+                _mm512_storeu_si512(dn_row(2).add(lane) as *mut __m512i, vc);
+                _mm512_storeu_si512(dn_row(3).add(lane) as *mut __m512i, vd);
+                lane += 4;
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn publish_prepared_impl<
+        const OUTER_LOW: bool,
+        const INNER_LOW: bool,
+        const DIET: bool,
+        const ALIGNED_ZMM: bool,
+    >(
+        src: *const F128,
+        src_step: usize,
+        dst_a: *mut F128,
+        dst_b: *mut F128,
+        dst_c: *mut F128,
+        dst_d: *mut F128,
+        lanes: usize,
+        t_outer: F128,
+        t_inner_a: F128,
+        t_inner_b: F128,
+        companions: &[F128; 3],
+    ) {
+        use core::arch::x86_64::*;
+
+        // SAFETY: the caller guarantees four readable scratch rows, four disjoint
+        // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
+        unsafe {
+            debug_assert!(lanes <= 64 && lanes % 4 == 0);
+            debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+            debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
+            let a = src;
+            let b = src.add(src_step);
+            let c = src.add(2 * src_step);
+            let d = src.add(3 * src_step);
+            let outer = load_seed_plan::<OUTER_LOW>(t_outer, companions[0]);
+            let inner_a = load_seed_plan::<INNER_LOW>(t_inner_a, companions[1]);
+            let inner_b = load_seed_plan::<INNER_LOW>(t_inner_b, companions[2]);
+
+            let mut i = 0;
+            while i + 8 <= lanes {
+                let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
+                let mut vb0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
+                let mut vc0 = _mm512_loadu_si512(c.add(i) as *const __m512i);
+                let mut vd0 = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+                let mut va1 = _mm512_loadu_si512(a.add(i + 4) as *const __m512i);
+                let mut vb1 = _mm512_loadu_si512(b.add(i + 4) as *const __m512i);
+                let mut vc1 = _mm512_loadu_si512(c.add(i + 4) as *const __m512i);
+                let mut vd1 = _mm512_loadu_si512(d.add(i + 4) as *const __m512i);
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, DIET>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, DIET>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, DIET>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, DIET>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+                i += 8;
+            }
+            while i < lanes {
+                let mut va = _mm512_loadu_si512(a.add(i) as *const __m512i);
+                let mut vb = _mm512_loadu_si512(b.add(i) as *const __m512i);
+                let mut vc = _mm512_loadu_si512(c.add(i) as *const __m512i);
+                let mut vd = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, DIET>(outer, vc));
+                vc = _mm512_xor_si512(vc, new_a);
+                va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, DIET>(outer, vd));
+                vd = _mm512_xor_si512(vd, new_b);
+                vb = new_b;
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, DIET>(inner_a, vb));
+                vb = _mm512_xor_si512(vb, new_a);
+                va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, DIET>(inner_b, vd));
+                vd = _mm512_xor_si512(vd, new_c);
+                vc = new_c;
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+                i += 4;
+            }
+        }
+    }
+
+    /// Seed exactly one 32-lane half; source and prefetch rows retain pitch 64.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_split32_seed(
+        src: *const F128,
+        scratch: *mut F128,
+        task: usize,
+        block_size: usize,
+        sub_stride: usize,
+        plan: &SeedSplit32Plan<'_>,
+        pf_dist: usize,
+        pf_lines: usize,
+    ) {
+        unsafe {
+            let (r, first, lanes) = decode(task);
+            if pf_dist != 0 {
+                // Partition the parent's initial prefix hints between the two halves.
+                // The normal entry requires pf_lines<=16, so every address is in-row.
+                for k in 0..pf_dist.min(64) {
+                    for q in 0..4 {
+                        let row = src.add((q * block_size + r + k * sub_stride) * 64);
+                        for line in first / 4..(first / 4 + 8).min(pf_lines) {
+                            _mm_prefetch::<_MM_HINT_T0>(row.add(line * 4).cast());
+                        }
+                    }
+                }
+            }
+            for k in 0..64 {
+                let pf = if pf_dist != 0 && pf_dist < 64 - k {
+                    src.add((r + (k + pf_dist) * sub_stride) * 64 + first)
+                } else {
+                    core::ptr::null()
+                };
+                if plan.seed[1].hi == 0 {
+                    seed_row::<true>(
+                        src, scratch, r, k, first, lanes, block_size, sub_stride, plan, pf,
+                    );
+                } else {
+                    seed_row::<false>(
+                        src, scratch, r, k, first, lanes, block_size, sub_stride, plan, pf,
+                    );
+                }
+            }
+        }
+    }
+    #[inline(never)]
+    pub(crate) unsafe fn seed_split32_fold(
+        scratch: *mut F128,
+        task: usize,
+        plan: &SeedSplit32Plan<'_>,
+    ) {
+        unsafe {
+            let (_, _, lanes) = decode(task);
+            for b in 0..8 {
+                for j in 0..4 {
+                    let ptr = scratch.add((b * 64 + j * 16) * 32);
+                    butterfly_four_fixed_registers::<1, 32, 0>(ptr, plan.four[b], lanes * 16, ptr);
+                }
+            }
+        }
+    }
+    /// The caller owns distinct halves of every destination row. The second half
+    /// alone synthesizes odd-row zeros; every callback drains its NT stores.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_split32_publish<const ALIGNED_ZMM: bool>(
+        scratch: *const F128,
+        output: *mut F128,
+        task: usize,
+        block_size: usize,
+        sub_stride: usize,
+        plan: &SeedSplit32Plan<'_>,
+    ) {
+        unsafe {
+            let (r, first, lanes) = decode(task);
+            for b in 0..8 {
+                for q in 0..16 {
+                    let src = scratch.add((b * 64 + stage(q * 4)) * 32);
+                    let dst = |i: usize| {
+                        output.add((b * block_size + r + (4 * q + i) * sub_stride) * 64 + first)
+                    };
+                    let [t, s, rr, tc, sc, rc] = plan.publish[b][q];
+                    publish_prepared_impl::<false, false, true, ALIGNED_ZMM>(
+                        src,
+                        16 * 32,
+                        dst(0),
+                        dst(1),
+                        dst(2),
+                        dst(3),
+                        lanes,
+                        t,
+                        s,
+                        rr,
+                        &[tc, sc, rc],
+                    );
+                }
+            }
+            if r & 1 == 1 && first == 32 {
+                let zero = _mm512_setzero_si512();
+                for b in 0..8 {
+                    for k in 0..64 {
+                        stream_f128x4::<ALIGNED_ZMM>(
+                            output.add((b * block_size + r + k * sub_stride) * 64 + 60),
+                            zero,
+                        );
+                    }
+                }
+            }
+            _mm_sfence();
+        }
+    }
+}
+#[cfg(target_feature = "avx512bw")]
+pub(crate) use seed_split32::{
+    seed_split32_fold, seed_split32_prepare, seed_split32_publish, seed_split32_seed,
+};
+
+#[cfg(all(test, target_os = "linux", target_feature = "avx512bw"))]
+mod seed_split32_production_tests {
+    use super::super::{FourBlock, SeedSplit32Plan};
+    use super::*;
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Scalar {
+        pub lo: u64,
+        pub hi: u64,
+    }
+    impl std::ops::Add for Scalar {
+        type Output = Self;
+        fn add(self, b: Self) -> Self {
+            Self {
+                lo: self.lo ^ b.lo,
+                hi: self.hi ^ b.hi,
+            }
+        }
+    }
+    impl std::ops::AddAssign for Scalar {
+        fn add_assign(&mut self, b: Self) {
+            *self = *self + b;
+        }
+    }
+    impl std::ops::Mul for Scalar {
+        type Output = Self;
+        fn mul(self, b: Self) -> Self {
+            let mut a = (self.lo as u128) | ((self.hi as u128) << 64);
+            let mut b = (b.lo as u128) | ((b.hi as u128) << 64);
+            let mut z = 0u128;
+            for _ in 0..128 {
+                if b & 1 != 0 {
+                    z ^= a;
+                }
+                b >>= 1;
+                let carry = a >> 127;
+                a <<= 1;
+                if carry != 0 {
+                    a ^= 0x87;
+                }
+            }
+            Self {
+                lo: z as u64,
+                hi: (z >> 64) as u64,
+            }
+        }
+    }
+
+    impl Scalar {
+        const ZERO: Self = Self { lo: 0, hi: 0 };
+    }
+    fn scalar(x: F128) -> Scalar {
+        Scalar { lo: x.lo, hi: x.hi }
+    }
+    fn reference(
+        input: &[Scalar],
+        active: usize,
+        t: &[Scalar; 5],
+        t4: &[[Scalar; 15]; 8],
+        t2: &[[[Scalar; 3]; 16]; 8],
+    ) -> Vec<Scalar> {
+        let mut out = vec![Scalar::ZERO; 512 * 64];
+        for k in 0..64 {
+            for lane in 0..active {
+                let a = input[k * 64 + lane];
+                let b = input[(64 + k) * 64 + lane];
+                let c = input[(128 + k) * 64 + lane];
+                let d = input[(192 + k) * 64 + lane];
+                let sc = a + c + (d + b) * t[0];
+                let aa = a + c * t[1];
+                let bb = b + d * t[1];
+                let cc = c + aa;
+                let dd = d + bb;
+                let oa = aa + bb * t[2];
+                let oc = cc + dd * t[3];
+                for (block, value) in [a, a + b, sc, d + b + sc, oa, bb + oa, oc, dd + oc]
+                    .into_iter()
+                    .enumerate()
+                {
+                    out[(block * 64 + k) * 64 + lane] = value;
+                }
+            }
+        }
+        for b in 0..8 {
+            for j in 0..4 {
+                for lane in 0..active {
+                    let mut v: [Scalar; 16] =
+                        core::array::from_fn(|i| out[(b * 64 + 4 * i + j) * 64 + lane]);
+                    for depth in 0..4 {
+                        let half = 8 >> depth;
+                        for group in 0..1 << depth {
+                            let tw = t4[b][(1 << depth) - 1 + group];
+                            for i in 0..half {
+                                let x = group * 2 * half + i;
+                                let y = x + half;
+                                let a = v[x] + v[y] * tw;
+                                v[y] += a;
+                                v[x] = a;
+                            }
+                        }
+                    }
+                    for i in 0..16 {
+                        out[(b * 64 + 4 * i + j) * 64 + lane] = v[i];
+                    }
+                }
+            }
+        }
+        for b in 0..8 {
+            for q in 0..16 {
+                let [t, s, r] = t2[b][q];
+                for lane in 0..active {
+                    let idx = |i: usize| (b * 64 + 4 * q + i) * 64 + lane;
+                    let a = out[idx(0)] + out[idx(2)] * t;
+                    let bb = out[idx(1)] + out[idx(3)] * t;
+                    let c = out[idx(2)] + a;
+                    let d = out[idx(3)] + bb;
+                    let oa = a + bb * s;
+                    let oc = c + d * r;
+                    for (i, v) in [oa, bb + oa, oc, d + oc].into_iter().enumerate() {
+                        out[idx(i)] = v;
+                    }
+                }
+            }
+        }
+        out
+    }
+    fn next(s: &mut u64) -> F128 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        let lo = *s;
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        F128 { lo, hi: *s }
+    }
+    const BS: usize = 1 << 17;
+    const SS: usize = 1 << 11;
+    const W: usize = 32;
+    fn decode(task: usize) -> (usize, usize, usize) {
+        let r = task / 2;
+        let first = (task % 2) * W;
+        let active = if r & 1 == 1 { 60usize } else { 64usize };
+        (r, first, W.min(active - first))
+    }
+    unsafe extern "C" {
+        fn mmap(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut core::ffi::c_void;
+        fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+    }
+    struct Mapping {
+        ptr: *mut F128,
+        bytes: usize,
+    }
+    impl Mapping {
+        fn new(fields: usize) -> Self {
+            let bytes = fields * 16;
+            let ptr = unsafe { mmap(core::ptr::null_mut(), bytes, 3, 0x22, -1, 0) };
+            assert_ne!(ptr as isize, -1);
+            assert_eq!(ptr as usize % 4096, 0);
+            Self {
+                ptr: ptr.cast(),
+                bytes,
+            }
+        }
+    }
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { munmap(self.ptr.cast(), self.bytes) }, 0);
+        }
+    }
+    #[test]
+    fn seed_split32_callbacks_match_bitwise_ranked_geometry() {
+        let input = Mapping::new(4 * BS * 64);
+        let output = Mapping::new(8 * BS * 64 + 4);
+        let rs = [0usize, 1, SS - 2, SS - 1];
+        let guard = F128 {
+            lo: 0xa5a5a5a5a5a5a5a5,
+            hi: 0x5a5a5a5a5a5a5a5a,
+        };
+        let mut state = 0xa356cf56890342d7;
+        let mut transforms = 0;
+        let mut publications = 0;
+        for case in 0..2 {
+            let mut seed = core::array::from_fn(|_| next(&mut state));
+            let mut t4: [[F128; 15]; 8] =
+                core::array::from_fn(|_| core::array::from_fn(|_| next(&mut state)));
+            let mut t2: [[[F128; 3]; 16]; 8] = core::array::from_fn(|_| {
+                core::array::from_fn(|_| core::array::from_fn(|_| next(&mut state)))
+            });
+            if case == 1 {
+                seed[0] = F128::ZERO;
+                // Cover the actual low-outer production specialization too.
+                seed[1].hi = 0;
+                for b in 0..8 {
+                    t4[b][0] = F128::ZERO;
+                    t4[b][1] = F128 { lo: 1, hi: 0 };
+                    t2[b][0][0] = F128::ZERO;
+                }
+            }
+            let four: Vec<FourBlock> = t4.iter().copied().map(FourBlock::new).collect();
+            let plan = SeedSplit32Plan::new(seed[0], &[seed[1], seed[2], seed[3]], &four, &t2)
+                .expect("default preparation enabled");
+            let st = seed.map(scalar);
+            let st4 = t4.map(|row| row.map(scalar));
+            let st2 = t2.map(|block| block.map(|row| row.map(scalar)));
+            let compact: Vec<Vec<F128>> = rs
+                .iter()
+                .map(|_| {
+                    (0..256 * 64)
+                        .map(|i| {
+                            if case == 1 && i % 7 == 0 {
+                                F128::ZERO
+                            } else if case == 1 && i % 7 == 1 {
+                                F128 { lo: !0, hi: !0 }
+                            } else {
+                                next(&mut state)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<Vec<F128>> = rs
+                .iter()
+                .enumerate()
+                .map(|(ri, &r)| {
+                    reference(
+                        &compact[ri].iter().copied().map(scalar).collect::<Vec<_>>(),
+                        if r & 1 == 1 { 60 } else { 64 },
+                        &st,
+                        &st4,
+                        &st2,
+                    )
+                    .into_iter()
+                    .map(|x| F128::new(x.lo, x.hi))
+                    .collect()
+                })
+                .collect();
+            for (ri, &r) in rs.iter().enumerate() {
+                for b in 0..4 {
+                    for k in 0..64 {
+                        for lane in 0..64 {
+                            unsafe {
+                                *input.ptr.add((b * BS + r + k * SS) * 64 + lane) =
+                                    compact[ri][(b * 64 + k) * 64 + lane];
+                            }
+                        }
+                    }
+                }
+            }
+            for off in [0usize, 1] {
+                for output_offset in [0usize, 1] {
+                    let outp = unsafe { output.ptr.add(output_offset) };
+                    for order in 0..4 {
+                        let mut published = [[false; 2]; 4];
+                        let mut tasks: Vec<usize> =
+                            rs.iter().flat_map(|&r| [2 * r, 2 * r + 1]).collect();
+                        if order == 1 {
+                            tasks.reverse()
+                        } else if order == 2 {
+                            tasks.sort_by_key(|t| t % 2)
+                        }
+                        // Neighbouring unselected rows at both ends of each r range are sentinels.
+                        for r in [0usize, 1, 2, SS - 3, SS - 2, SS - 1] {
+                            for b in 0..8 {
+                                for k in 0..64 {
+                                    for lane in 0..64 {
+                                        unsafe {
+                                            *outp.add((b * BS + r + k * SS) * 64 + lane) = guard;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let mut buffers = [vec![guard; 512 * W + 16], vec![guard; 512 * W + 16]];
+                        let si = core::array::from_fn::<_, 2, _>(|i| {
+                            4 + (64 - buffers[i].as_ptr() as usize % 64) % 64 / 16 + off
+                        });
+                        // Two occupied slots: seed both, fold in reverse, then publish in reverse.
+                        // This checks split-stage lifetimes and reuse, not actual SMT concurrency.
+                        for pair in tasks.chunks(2) {
+                            if order == 3 {
+                                std::thread::scope(|scope| {
+                                    let (tx, rx) =
+                                        std::sync::mpsc::sync_channel::<(usize, usize)>(2);
+                                    let shared = &plan;
+                                    let fold = scope.spawn(move || {
+                                        for _ in 0..2 {
+                                            let (ptr, task) = rx.recv().unwrap();
+                                            unsafe {
+                                                seed_split32_fold(ptr as *mut F128, task, shared);
+                                            }
+                                        }
+                                    });
+                                    for slot in 0..2 {
+                                        buffers[slot].fill(guard);
+                                        let ptr =
+                                            unsafe { buffers[slot].as_mut_ptr().add(si[slot]) };
+                                        unsafe {
+                                            seed_split32_seed(
+                                                input.ptr, ptr, pair[slot], BS, SS, &plan, 1, 8,
+                                            );
+                                        }
+                                        tx.send((ptr as usize, pair[slot])).unwrap();
+                                    }
+                                    fold.join().unwrap();
+                                });
+                            } else {
+                                for slot in 0..2 {
+                                    buffers[slot].fill(guard);
+                                    unsafe {
+                                        seed_split32_seed(
+                                            input.ptr,
+                                            buffers[slot].as_mut_ptr().add(si[slot]),
+                                            pair[slot],
+                                            BS,
+                                            SS,
+                                            &plan,
+                                            1,
+                                            8,
+                                        );
+                                    }
+                                }
+                                for slot in (0..2).rev() {
+                                    unsafe {
+                                        seed_split32_fold(
+                                            buffers[slot].as_mut_ptr().add(si[slot]),
+                                            pair[slot],
+                                            &plan,
+                                        );
+                                    }
+                                }
+                            }
+                            for slot in (0..2).rev() {
+                                let task = pair[slot];
+                                unsafe {
+                                    if output_offset == 0 {
+                                        seed_split32_publish::<true>(
+                                            buffers[slot].as_ptr().add(si[slot]),
+                                            outp,
+                                            task,
+                                            BS,
+                                            SS,
+                                            &plan,
+                                        )
+                                    } else {
+                                        seed_split32_publish::<false>(
+                                            buffers[slot].as_ptr().add(si[slot]),
+                                            outp,
+                                            task,
+                                            BS,
+                                            SS,
+                                            &plan,
+                                        )
+                                    };
+                                }
+                                let (r, first, lanes) = decode(task);
+                                let ri = rs.iter().position(|&x| x == r).unwrap();
+                                assert!(!published[ri][first / 32]);
+                                published[ri][first / 32] = true;
+                                assert!(
+                                    buffers[slot][..si[slot]]
+                                        .iter()
+                                        .chain(buffers[slot][si[slot] + 512 * W..].iter())
+                                        .all(|&v| v == guard)
+                                );
+                                for row in 0..512 {
+                                    for lane in lanes..W {
+                                        assert_eq!(buffers[slot][si[slot] + row * W + lane], guard);
+                                    }
+                                }
+                                for (oi, &rr) in rs.iter().enumerate() {
+                                    for b in 0..8 {
+                                        for k in 0..64 {
+                                            for lane in 0..64 {
+                                                let want = if published[oi][lane / 32] {
+                                                    expected[oi][(b * 64 + k) * 64 + lane]
+                                                } else {
+                                                    guard
+                                                };
+                                                assert_eq!(
+                                                    unsafe {
+                                                        *outp
+                                                            .add((b * BS + rr + k * SS) * 64 + lane)
+                                                    },
+                                                    want,
+                                                    "case={case} off={off} order={order} task={task} r={rr} b={b} k={k} lane={lane}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                publications += 1;
+                            }
+                        }
+                        assert!(published.iter().flatten().all(|&x| x));
+                        for rr in [2usize, SS - 3] {
+                            for b in 0..8 {
+                                for k in 0..64 {
+                                    for lane in 0..64 {
+                                        assert_eq!(
+                                            unsafe {
+                                                *outp.add((b * BS + rr + k * SS) * 64 + lane)
+                                            },
+                                            guard
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for (ri, &rr) in rs.iter().enumerate() {
+                            for b in 0..4 {
+                                for k in 0..64 {
+                                    for lane in 0..64 {
+                                        assert_eq!(
+                                            unsafe {
+                                                *input.ptr.add((b * BS + rr + k * SS) * 64 + lane)
+                                            },
+                                            compact[ri][(b * 64 + k) * 64 + lane]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        transforms += 4;
+                    }
+                }
+            }
+        }
+        assert_eq!(transforms, 128);
+        assert_eq!(publications, 256);
+        println!(
+            "PASS 128 complete production ranked-pitch transforms, 256 split-stage tasks, 33554432 intermediate output/ownership comparisons, 4194304 final field outputs, real B=131072 S=2048 pitch=64, forward/reverse/half-major/cross-thread orders, two reused slots, aligned/misaligned scratch and output, independent bitwise arithmetic, odd suffix only once."
+        );
+    }
+
+    #[test]
+    fn seed_split32_plan_respects_disabled_preparation() {
+        let disabled=std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some()
+            || std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some()
+            || std::env::var_os("FLOCK_NO_NTT_SHAPED").is_some();
+        // The validator runs each disabled mode in a fresh process. The
+        // ordinary all-tests invocation need not set a diagnostic switch.
+        if !disabled { return; }
+        let four:Vec<FourBlock>=(0..8).map(|_|FourBlock::new([F128::ZERO;15])).collect();
+        assert!(SeedSplit32Plan::new(F128::ZERO,&[F128::ZERO;3],&four,&[[[F128::ZERO;3];16];8]).is_none());
+    }
+}
