@@ -2943,23 +2943,100 @@ fn fold_block_major_gfni(
             // Unbound inner fold of rows 0..16 and 240 for the round-two
             // canonical-window elision, written directly into the reserved
             // tail behind the one-row slots.
-            for (slot, row) in (0..16).chain([240usize]).enumerate() {
-                let dst = &mut one_canon[slot * 64..(slot + 1) * 64];
-                if row < live_blocks {
-                    // SAFETY: as in `reduce_block`: `row < live_blocks`, every
-                    // active worker's first tile stored this block, and the
-                    // producer iterator joined before the reduction.
+            #[cfg(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let pair_canon = lc_plane_f128_enabled();
+            #[cfg(not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let pair_canon = false;
+            if pair_canon {
+                let mut pair = 0usize;
+                while pair < 16 {
+                    let row_b = pair + 1;
+                    if row_b < live_blocks {
+                        #[cfg(all(
+                            target_feature = "avx512bw",
+                            target_feature = "avx512vbmi",
+                            target_feature = "vpclmulqdq",
+                            target_feature = "gfni"
+                        ))]
+                        {
+                            let (left, right) = one_canon.split_at_mut(row_b * 64);
+                            let dst_a = &mut left[pair * 64..];
+                            let dst_b = &mut right[..64];
+                            unsafe {
+                                reduce_worker_plane_blocks2(
+                                    &planes,
+                                    worker_stride,
+                                    &active_workers,
+                                    pair,
+                                    row_b,
+                                    dst_a,
+                                    dst_b,
+                                );
+                            }
+                        }
+                    } else {
+                        for row in pair..=row_b {
+                            let dst = &mut one_canon[row * 64..(row + 1) * 64];
+                            if row < live_blocks {
+                                unsafe {
+                                    reduce_worker_plane_block(
+                                        &planes,
+                                        worker_stride,
+                                        &active_workers,
+                                        row,
+                                        dst,
+                                    );
+                                }
+                            } else {
+                                dst.fill(F128::ZERO);
+                            }
+                        }
+                    }
+                    pair += 2;
+                }
+                let dst = &mut one_canon[16 * 64..17 * 64];
+                if 240 < live_blocks {
                     unsafe {
                         reduce_worker_plane_block(
                             &planes,
                             worker_stride,
                             &active_workers,
-                            row,
+                            240,
                             dst,
                         );
                     }
                 } else {
                     dst.fill(F128::ZERO);
+                }
+            } else {
+                for (slot, row) in (0..16).chain([240usize]).enumerate() {
+                    let dst = &mut one_canon[slot * 64..(slot + 1) * 64];
+                    if row < live_blocks {
+                        // SAFETY: as in `reduce_block`: `row < live_blocks`, every
+                        // active worker's first tile stored this block, and the
+                        // producer iterator joined before the reduction.
+                        unsafe {
+                            reduce_worker_plane_block(
+                                &planes,
+                                worker_stride,
+                                &active_workers,
+                                row,
+                                dst,
+                            );
+                        }
+                    } else {
+                        dst.fill(F128::ZERO);
+                    }
                 }
             }
         }
@@ -3048,6 +3125,9 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
     // column c at slab c; the single-column arms use slab 0 only.
     let mut transposed_store =
         core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
+    #[cfg(target_feature = "avx512vbmi")]
+    let mut transposed_alt =
+        core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
     #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
     let mut splice_carry_store = core::mem::MaybeUninit::<[u8; 512]>::uninit();
     // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
@@ -3115,43 +3195,48 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
         #[cfg(target_feature = "avx512vbmi")]
         if gather_tr_fused && lc_gather4_enabled() {
             let full_chunks = useful_bits / 128;
-            while q + 4 <= full_chunks {
+            let alt = unsafe { &mut *transposed_alt.as_mut_ptr() };
+            let gather_group = |buf: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+                                qq: usize| {
                 unsafe {
                     if gather_tr_vpermt2b {
                         gather_transpose_group4_x86::<true, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
-                            q,
+                            qq,
                             full_chunks,
                             pf_far,
                             pf_spread,
                             pf_chunks,
-                            transposed,
+                            buf,
                         );
                     } else {
                         gather_transpose_group4_x86::<false, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
-                            q,
+                            qq,
                             full_chunks,
                             pf_far,
                             pf_spread,
                             pf_chunks,
-                            transposed,
+                            buf,
                         );
                     }
                 }
+            };
+            let mut fold_group = |buf: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+                                  qq: usize| {
                 for c in 0..4 {
                     if pf_far && pf_spread {
-                        let qn = q + pf_chunks;
+                        let qn = qq + pf_chunks;
                         if qn <= full_chunks && qn < chunks_per_block {
                             unsafe {
                                 lc_prefetch_rows16(
-                                    z_packed
-                                        .as_ptr()
-                                        .add((8 * stripe_base + 16 * c) * chunks_per_block + qn),
+                                    z_packed.as_ptr().add(
+                                        (8 * stripe_base + 16 * c) * chunks_per_block + qn,
+                                    ),
                                     chunks_per_block,
                                     cpb_ranked,
                                 );
@@ -3162,8 +3247,8 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                         #[cfg(target_feature = "avx512bw")]
                         if HAS_SPLICE && let Some(splice) = root_splice {
                             splice.fold_chunk::<true>(
-                                q + c,
-                                transposed.as_ptr().add(c * 1024),
+                                qq + c,
+                                buf.as_ptr().add(c * 1024),
                                 mats,
                                 wplanes.as_mut_ptr().cast::<u8>(),
                                 first_tile,
@@ -3174,16 +3259,41 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             continue;
                         }
                         kernels::gfni_fold_tile(
-                            transposed.as_ptr().add(c * 1024),
+                            buf.as_ptr().add(c * 1024),
                             128,
                             2,
                             mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                            wplanes.as_mut_ptr().cast::<u8>().add(2 * (qq + c) * 1024),
                             first_tile,
                         );
                     }
                 }
+            };
+            let mut flip = false;
+            let mut have = false;
+            while q + 4 <= full_chunks {
+                if flip {
+                    gather_group(alt, q);
+                } else {
+                    gather_group(transposed, q);
+                }
+                if have {
+                    if flip {
+                        fold_group(transposed, q - 4);
+                    } else {
+                        fold_group(alt, q - 4);
+                    }
+                }
+                have = true;
+                flip = !flip;
                 q += 4;
+            }
+            if have {
+                if flip {
+                    fold_group(transposed, q - 4);
+                } else {
+                    fold_group(alt, q - 4);
+                }
             }
         }
         while q < useful_chunks {
@@ -3320,6 +3430,48 @@ unsafe fn fold_block_major_gfni_reduce_block(
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn reduce_worker_plane_blocks2(
+    planes: &[core::mem::MaybeUninit<u8>],
+    worker_stride: usize,
+    active_workers: &[usize],
+    blk_a: usize,
+    blk_b: usize,
+    out_a: &mut [F128],
+    out_b: &mut [F128],
+) {
+    debug_assert_eq!(out_a.len(), 64);
+    debug_assert_eq!(out_b.len(), 64);
+    let Some((&first_worker, rest_workers)) = active_workers.split_first() else {
+        out_a.fill(F128::ZERO);
+        out_b.fill(F128::ZERO);
+        return;
+    };
+    let out_a64: &mut [F128; 64] = out_a.try_into().expect("64-column plane block");
+    let out_b64: &mut [F128; 64] = out_b.try_into().expect("64-column plane block");
+    unsafe {
+        crate::zerocheck::univariate_skip_optimized::reduce_worker_plane_blocks2_to_f128(
+            planes.as_ptr().cast::<u8>(),
+            worker_stride,
+            first_worker,
+            rest_workers,
+            blk_a * 1024,
+            blk_b * 1024,
+            out_a64,
+            out_b64,
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
     target_feature = "gfni"
 ))]
 #[inline(always)]
@@ -3335,27 +3487,59 @@ fn fold_block_major_gfni_reduce_block_fallback(
     o: &mut [F128],
     one_o: Option<&mut [F128]>,
 ) {
-    if blk < live_blocks {
-        // SAFETY: `active_workers` contains exactly producer chunks that
-        // claimed a tile. Their first tile used `seed_zero=true` and
-        // stored every byte of each `blk < live_blocks`; the producer
-        // parallel iterator joined before this reduction starts.
-        unsafe {
-            reduce_worker_plane_block(planes, worker_stride, active_workers, blk, o);
+    #[cfg(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    ))]
+    let both_live = top_bind.is_some()
+        && blk < live_blocks
+        && blk + k / 128 < live_blocks
+        && lc_plane_f128_enabled();
+    #[cfg(not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq"
+    )))]
+    let both_live = false;
+
+    if !both_live {
+        if blk < live_blocks {
+            // SAFETY: `active_workers` contains exactly producer chunks that
+            // claimed a tile. Their first tile used `seed_zero=true` and
+            // stored every byte of each `blk < live_blocks`; the producer
+            // parallel iterator joined before this reduction starts.
+            unsafe {
+                reduce_worker_plane_block(planes, worker_stride, active_workers, blk, o);
+            }
+        } else {
+            // Padding has no backing worker-plane writes in the uninitialized
+            // allocation, but its canonical folded value is algebraic zero.
+            o.fill(F128::ZERO);
         }
-    } else {
-        // Padding has no backing worker-plane writes in the uninitialized
-        // allocation, but its canonical folded value is algebraic zero.
-        o.fill(F128::ZERO);
     }
     if let Some(r) = top_bind {
         let hi_blk = blk + k / 128;
         let mut hi_store = core::mem::MaybeUninit::<[F128; 64]>::uninit();
-        // SAFETY: when `hi_blk < live_blocks`, `reduce_worker_plane_block`
-        // unconditionally writes all 64 `F128` elements of `hi` before reading;
-        // when `hi_blk >= live_blocks`, `hi` is explicitly zero-filled below.
         let hi = unsafe { &mut *hi_store.as_mut_ptr() };
-        if hi_blk < live_blocks {
+        if both_live {
+            #[cfg(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq"
+            ))]
+            unsafe {
+                reduce_worker_plane_blocks2(
+                    planes,
+                    worker_stride,
+                    active_workers,
+                    blk,
+                    hi_blk,
+                    o,
+                    hi,
+                );
+            }
+        } else if hi_blk < live_blocks {
             unsafe {
                 reduce_worker_plane_block(planes, worker_stride, active_workers, hi_blk, hi);
             }

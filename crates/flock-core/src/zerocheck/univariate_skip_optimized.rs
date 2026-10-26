@@ -82,6 +82,39 @@ pub(crate) unsafe fn reduce_worker_plane_block_to_f128(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn reduce_worker_plane_blocks2_to_f128(
+    planes_ptr: *const u8,
+    worker_stride: usize,
+    first_worker: usize,
+    rest_workers: &[usize],
+    base_a: usize,
+    base_b: usize,
+    out_a: &mut [F128; 64],
+    out_b: &mut [F128; 64],
+) {
+    unsafe {
+        kernels::reduce_worker_plane_blocks2_to_f128(
+            planes_ptr,
+            worker_stride,
+            first_worker,
+            rest_workers,
+            base_a,
+            base_b,
+            out_a,
+            out_b,
+        )
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
