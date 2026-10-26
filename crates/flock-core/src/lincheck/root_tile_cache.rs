@@ -120,7 +120,48 @@ pub(super) fn fold(
     }
 }
 
+// Fold two independently weighted cache tiles into each output plane before
+// publication. Inputs are immutable and the caller exclusively owns dst.
+// FIRST initializes every plane without reading its prior bytes.
+#[inline(always)] unsafe fn fold_paired_rows<const FIRST:bool>(a:&[__m512i;8], b:&[__m512i;8], ma:&[u64;128], mb:&[u64;128], dst:*mut u8){
+unsafe {
+
+    for k in 0..16 {
+        let out=dst.add(k*64).cast::<__m512i>();
+        let prior=if FIRST{_mm512_setzero_si512()}else{_mm512_loadu_si512(out)};
+let mut acc=prior;
+        for t in (0..8).step_by(2) {
+            let g0=_mm512_gf2p8affine_epi64_epi8::<0>(a[t],_mm512_set1_epi64(ma[t*16+k] as i64));
+            let g1=_mm512_gf2p8affine_epi64_epi8::<0>(a[t+1],_mm512_set1_epi64(ma[(t+1)*16+k] as i64));
+            acc=_mm512_ternarylogic_epi64::<0x96>(acc,g0,g1);
+        }
+        for t in (0..8).step_by(2) {
+            let g0=_mm512_gf2p8affine_epi64_epi8::<0>(b[t],_mm512_set1_epi64(mb[t*16+k] as i64));
+            let g1=_mm512_gf2p8affine_epi64_epi8::<0>(b[t+1],_mm512_set1_epi64(mb[(t+1)*16+k] as i64));
+            acc=_mm512_ternarylogic_epi64::<0x96>(acc,g0,g1);
+        }
+        _mm512_storeu_si512(out,acc);
+}
+}
+}
+
 impl RootTileCache {
+    #[inline(always)]
+    unsafe fn fold_tile_pair<const FIRST: bool>(
+        &self, tile: usize, ma: &[u64; 128], mb: &[u64; 128], dst: *mut u8,
+    ) {
+        unsafe {
+            for block in 0..self.blocks {
+                let a = self.block(tile * self.blocks + block).0.as_ptr().cast::<__m512i>();
+                let b = self.block((tile + 1) * self.blocks + block).0.as_ptr().cast::<__m512i>();
+                let aa = core::array::from_fn(|i| _mm512_load_si512(a.add(i)));
+                let bb = core::array::from_fn(|i| _mm512_load_si512(b.add(i)));
+                fold_paired_rows::<FIRST>(&aa, &bb, ma, mb, dst.add(block * 1024));
+            }
+        }
+    }
+
+
     /// Adopt fully initialized witness-produced BLAKE3 root tiles.
     ///
     /// # Safety
@@ -187,6 +228,7 @@ impl RootTileCache {
             .enumerate()
             .for_each(|(worker, (dst, active))| {
                 let mut mats = [0u64; 128];
+                let mut next_mats = [0u64; 128];
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -208,29 +250,49 @@ impl RootTileCache {
                         hi = (lo + 4).min(self.tiles);
                     }
                     let tile = lo;
-                    lo += 1;
+                    // Consume only this worker's already claimed range. Odd
+                    // tails retain the original one-tile path.
+                    let paired = hi - lo >= 2;
+                    lo += if paired { 2 } else { 1 };
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
                         let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
                         kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                     }
-                    for block in 0..self.blocks {
-                        // SAFETY: the fully initialized immutable cache is
-                        // 64-byte aligned; this worker owns every dst plane.
-                        // Its first tile initializes all live planes before
-                        // subsequent tiles load their accumulators.
+                    if paired {
+                        for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                            let eq8 = eq8_at(8 * ((tile + 1) * DIRECT_FOLD_TILE_STRIPES + t));
+                            kernels::fold_mats_from_basis(&eq8, &mut next_mats[t * 16..(t + 1) * 16]);
+                        }
+                        // Both tiles are fully initialized, immutable and
+                        // inside this worker's claimed [lo, hi) range.
+                        // FIRST writes every live output plane before use.
                         unsafe {
-                            let src = self
-                                .block(tile * self.blocks + block)
-                                .0
-                                .as_ptr()
-                                .cast::<__m512i>();
-                            let rows = core::array::from_fn(|i| _mm512_load_si512(src.add(i)));
-                            kernels::gfni_fold_rows(
-                                &rows,
-                                &mats,
-                                dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                first,
-                            );
+                            if first {
+                                self.fold_tile_pair::<true>(tile, &mats, &next_mats, dst.as_mut_ptr().cast());
+                            } else {
+                                self.fold_tile_pair::<false>(tile, &mats, &next_mats, dst.as_mut_ptr().cast());
+                            }
+                        }
+                    } else {
+                        for block in 0..self.blocks {
+                            // SAFETY: the fully initialized immutable cache is
+                            // 64-byte aligned; this worker owns every dst plane.
+                            // Its first tile initializes all live planes before
+                            // subsequent tiles load their accumulators.
+                            unsafe {
+                                let src = self
+                                    .block(tile * self.blocks + block)
+                                    .0
+                                    .as_ptr()
+                                    .cast::<__m512i>();
+                                let rows = core::array::from_fn(|i| _mm512_load_si512(src.add(i)));
+                                kernels::gfni_fold_rows(
+                                    &rows,
+                                    &mats,
+                                    dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                    first,
+                                );
+                            }
                         }
                     }
                     first = false;
@@ -344,5 +406,68 @@ mod tests {
             assert_eq!(fresh_cache.fold(&eq1), fresh_reference);
             assert_eq!(fresh_cache.fold(&eq2), plan.fold(&fresh_z, 384, &eq2));
         });
+    }
+
+
+    #[test]
+    fn root_cache_tile_pair_matches_scalar_and_odd_ranges() {
+        fn basis(index: usize, salt: u64) -> [F128; 8] {
+            core::array::from_fn(|j| {
+                let mut x = (index + j + 1) as u64 ^ salt;
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                F128 { lo: x, hi: x.rotate_left(31).wrapping_mul(0x219315711) }
+            })
+        }
+        fn oracle(cache: &RootTileCache, salt: u64) -> Vec<F128> {
+            let mut out = vec![F128::ZERO; cache.blocks * 64];
+            for tile in 0..cache.tiles {
+                for t in 0..8 {
+                    let eq = basis(8 * (tile * 8 + t), salt);
+                    for block in 0..cache.blocks {
+                        for col in 0..64 {
+                            let bits = cache.block(tile * cache.blocks + block).0[t * 64 + col];
+                            for bit in 0..8 {
+                                if bits & (1 << bit) != 0 {
+                                    out[block * 64 + col].lo ^= eq[bit].lo;
+                                    out[block * 64 + col].hi ^= eq[bit].hi;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+        let mut cases = 0usize;
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                for tiles in [1usize, 2, 3, 4, 5, 7, 8, 9, 17] {
+                    for blocks in [1usize, 3, 177] {
+                        let fields = tiles * blocks * 32;
+                        let mut storage = PooledStorage(vec![F128::ZERO; fields + 3]);
+                        let offset = storage.0.as_ptr().align_offset(64);
+                        assert!(offset <= 3);
+                        let bytes = unsafe { core::slice::from_raw_parts_mut(storage.0.as_mut_ptr().add(offset).cast::<u8>(), fields * 16) };
+                        let mut state = (tiles as u64) * 0x12345 + blocks as u64 + 0x912354;
+                        for value in bytes {
+                            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                            *value = state as u8;
+                        }
+                        let cache = RootTileCache { storage, offset, tiles, blocks };
+                        let first = oracle(&cache, 0x351ac);
+                        let second = oracle(&cache, 0x17a98);
+                        assert_ne!(first, second);
+                        assert_eq!(cache.fold(&|i| basis(i, 0x351ac)), first, "threads={threads} tiles={tiles} blocks={blocks}");
+                        let (a, b) = rayon::join(|| cache.fold(&|i| basis(i, 0x351ac)), || cache.fold(&|i| basis(i, 0x17a98)));
+                        assert_eq!(a, first);
+                        assert_eq!(b, second);
+                        cases += 1;
+                    }
+                }
+            });
+        }
+        assert_eq!(cases, 81);
+        println!("PASS {cases} root-cache geometries, 243 folds, dynamic={}", dynamic_tiles_enabled());
     }
 }
