@@ -4120,6 +4120,324 @@ mod ab_ntt_tail_composition_tests {
         three_rows::<true, false, true>();
     }
 
+#[cfg(target_feature = "avx512bw")]
+fn prepared64_rows<const OUTER_LOW: bool, const INNER_LOW: bool, const ALIGNED: bool>(
+    residue: usize,
+) {
+    let mut seed = 0xf21a_2e85_b736_094d;
+    let guard = F128::new(0xfeed_cafe, 0xdead_beef);
+    for lanes in [60, 64] {
+        for case in 0..4 {
+            let mut src: Vec<F128> = (0..4 * 1024)
+                .map(|_| F128::new(next(&mut seed), next(&mut seed)))
+                .collect();
+            let mut tw: [F128; 3] = std::array::from_fn(|_| match case {
+                0 => F128::ZERO,
+                1 => F128::ONE,
+                2 => F128::new(u64::MAX, u64::MAX),
+                _ => F128::new(next(&mut seed), next(&mut seed)),
+            });
+            if OUTER_LOW {
+                tw[0].hi = 0;
+            }
+            if INNER_LOW {
+                tw[1].hi = 0;
+                tw[2].hi = 0;
+            }
+            let original_src = src.clone();
+            let original_tw = tw;
+            let raw = [[[tw[0], tw[1], tw[2]]; 16]; 8];
+            let mut prepared = [super::super::SeedPublish64Block {
+                quads: [[F128::ZERO; 6]; 16],
+                low_modes: [0; 16],
+            }; 8];
+            unsafe {
+                seed_publish64_prepare(&raw, &mut prepared);
+            }
+            assert_eq!(raw, [[tw; 16]; 8]);
+            for block in &prepared {
+                for q in &block.quads {
+                    assert_eq!(&q[..3], &tw);
+                }
+            }
+
+            let mut expected = vec![guard; 4 * 80 + 12];
+            let mut got = expected.clone();
+            let offset = 4
+                + (0..4)
+                    .find(|&i| (got.as_ptr() as usize + (4 + i) * 16) % 64 == residue)
+                    .unwrap();
+            for row in 0..4 {
+                expected[offset + row * 80..offset + row * 80 + lanes]
+                    .copy_from_slice(&src[row * 1024..row * 1024 + lanes]);
+                expected[offset + row * 80 + lanes..offset + row * 80 + 64].fill(F128::ZERO);
+            }
+            oracle_rows(&mut expected, offset, 80, lanes, &tw, 2);
+            // SAFETY: readable source rows, disjoint aligned destinations
+            // with space for 64 lanes, and const twiddle forms set above.
+            unsafe {
+                let dst = got.as_mut_ptr().add(offset);
+                seed_publish64_quad::<OUTER_LOW, INNER_LOW, ALIGNED>(
+                    black_box(src.as_mut_ptr()),
+                    dst,
+                    80,
+                    lanes,
+                    black_box(&prepared[7].quads[15]),
+                );
+                core::arch::x86_64::_mm_sfence();
+            }
+            assert_eq!(
+                got, expected,
+                "lanes={lanes} case={case} ol={OUTER_LOW} il={INNER_LOW} aligned={ALIGNED} residue={residue}"
+            );
+            assert_eq!(src, original_src);
+            assert_eq!(tw, original_tw);
+        }
+    }
+}
+
+#[cfg(target_feature = "avx512bw")]
+#[test]
+fn seed_publish64_prepared_rows_match_bitwise_oracle() {
+    for residue in [0, 16, 32, 48] {
+        prepared64_rows::<false, false, false>(residue);
+        prepared64_rows::<false, true, false>(residue);
+        prepared64_rows::<true, false, false>(residue);
+        prepared64_rows::<true, true, false>(residue);
+    }
+    prepared64_rows::<false, false, true>(0);
+    prepared64_rows::<false, true, true>(0);
+    prepared64_rows::<true, false, true>(0);
+    prepared64_rows::<true, true, true>(0);
+    println!(
+        "PASS 160 compact publication quads: widths 60/64, all four low-coefficient modes, all 16-byte alignment residues, independent bitwise reference, untouched source and guarded destinations."
+    );
+}
+
+#[cfg(target_feature = "avx512bw")]
+fn publish64_raw(case: usize) -> [[[F128; 3]; 16]; 8] {
+    let mut seed = 0xda71_86c3_0159_77e1u64;
+    core::array::from_fn(|b| {
+        core::array::from_fn(|q| {
+            core::array::from_fn(|i| {
+                let n = (b * 16 + q) * 3 + i;
+                let mut value = match case {
+                    0 => F128::new(next(&mut seed), next(&mut seed) | 1),
+                    1 => F128::new(if n & 1 == 0 { 0 } else { u64::MAX }, 1u64 << (n % 64)),
+                    _ => {
+                        let bit = 1u128 << (n % 128);
+                        F128::new(bit as u64, (bit >> 64) as u64)
+                    }
+                };
+                if (i == 0 && q & 1 != 0) || (i != 0 && q & 2 != 0) {
+                    value.hi = 0;
+                }
+                value
+            })
+        })
+    })
+}
+#[cfg(target_feature = "avx512bw")]
+fn publish64_plan(raw: &[[[F128; 3]; 16]; 8]) -> super::super::SeedPublish64Plan {
+    use super::super::{FourBlock, SeedPublish64Plan};
+    let four: Vec<FourBlock> = (0..8).map(|_| FourBlock::new([F128::ZERO; 15])).collect();
+    SeedPublish64Plan::new(&four, raw).expect("default preparation enabled")
+}
+#[cfg(target_feature = "avx512bw")]
+#[test]
+fn seed_publish64_owner_matches_distinct_bitwise_companions() {
+    use super::super::{FourBlock, SeedPublish64Plan};
+    for case in 0..3 {
+        let raw = publish64_raw(case);
+        let original = raw;
+        let plan = publish64_plan(&raw);
+        for b in 0..8 {
+            for q in 0..16 {
+                for i in 0..3 {
+                    assert_eq!(plan.blocks[b].quads[q][i], raw[b][q][i]);
+                    assert_eq!(
+                        plan.blocks[b].quads[q][i + 3],
+                        multiply(raw[b][q][i], F128::new(0, 1)),
+                        "case={case} b={b} q={q} i={i}"
+                    );
+                }
+                let t = raw[b][q];
+                let low = !super::super::low_twiddle_disabled();
+                let mode = u8::from(low && t[0].hi == 0)
+                    | (u8::from(low && t[1].hi == 0 && t[2].hi == 0) << 1);
+                assert_eq!(plan.blocks[b].low_modes[q], mode);
+            }
+        }
+        assert_eq!(raw, original);
+        let four: Vec<FourBlock> = (0..8).map(|_| FourBlock::new([F128::ZERO; 15])).collect();
+        assert!(SeedPublish64Plan::new(&four[..7], &raw).is_none());
+        assert!(SeedPublish64Plan::new(&four, &raw[..7]).is_none());
+    }
+    println!(
+        "PASS 1152 independently verified distinct prepared coefficient positions and 384 low-mode positions; original inputs unchanged."
+    );
+}
+#[cfg(target_feature = "avx512bw")]
+#[test]
+fn seed_publish64_disabled_preparation_declines() {
+    use super::super::{FourBlock, SeedPublish64Plan};
+    assert!(
+        std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some()
+            || std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some()
+    );
+    let four: Vec<FourBlock> = (0..8).map(|_| FourBlock::new([F128::ZERO; 15])).collect();
+    assert!(SeedPublish64Plan::new(&four, &publish64_raw(0)).is_none());
+}
+#[cfg(target_feature = "avx512bw")]
+#[test]
+fn seed_publish64_low_disabled_uses_general_modes() {
+    assert!(std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some());
+    let raw = publish64_raw(0);
+    let plan = publish64_plan(&raw);
+    for block in &plan.blocks {
+        assert_eq!(block.low_modes, [0u8; 16]);
+    }
+    seed_publish64_owner_matches_distinct_bitwise_companions();
+}
+
+#[cfg(all(target_feature = "avx512bw", target_os = "linux"))]
+struct Publish64Mapping {
+    ptr: *mut F128,
+    len: usize,
+}
+#[cfg(all(target_feature = "avx512bw", target_os = "linux"))]
+impl Publish64Mapping {
+    fn new(fields: usize) -> Self {
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: isize,
+            ) -> *mut core::ffi::c_void;
+        }
+        let len = fields.checked_mul(16).unwrap();
+        let ptr = unsafe { mmap(core::ptr::null_mut(), len, 3, 2 | 0x20 | 0x4000, -1, 0) };
+        assert_ne!(ptr as isize, -1);
+        Self {
+            ptr: ptr.cast(),
+            len,
+        }
+    }
+}
+#[cfg(all(target_feature = "avx512bw", target_os = "linux"))]
+impl Drop for Publish64Mapping {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+        }
+        assert_eq!(unsafe { munmap(self.ptr.cast(), self.len) }, 0);
+    }
+}
+#[cfg(all(target_feature = "avx512bw", target_os = "linux"))]
+#[test]
+fn seed_publish64_blocks_match_ranked_bitwise_geometry() {
+    const B: usize = 1 << 17;
+    const S: usize = 1 << 11;
+    let output = Publish64Mapping::new(8 * B * 64 + 16);
+    let guard = F128::new(0x36f6_3d74_abcd_aa55, 0xfe65_9293_6381_d101);
+    let mut seed = 0x4cc2_5a84_1732_bdf1u64;
+    let mut cases = 0usize;
+    let mut values = 0usize;
+    for fixture in 0..2 {
+        let raw = publish64_raw(fixture);
+        let original_raw = raw;
+        let plan = publish64_plan(&raw);
+        for src_residue in [0usize, 16] {
+            for out_residue in [0usize, 16] {
+                for r in [0usize, 1, S - 2, S - 1] {
+                    let lanes = if r & 1 == 0 { 64 } else { 60 };
+                    let mut storage = vec![guard; 512 * 64 + 12];
+                    let off = 4
+                        + (0..4)
+                            .find(|&i| {
+                                (storage.as_ptr() as usize + (4 + i) * 16) % 64 == src_residue
+                            })
+                            .unwrap();
+                    for x in &mut storage[off..off + 512 * 64] {
+                        *x = F128::new(next(&mut seed), next(&mut seed));
+                    }
+                    let original = storage.clone();
+                    let src = unsafe { storage.as_ptr().add(off) };
+                    let dst = unsafe { output.ptr.add(4 + out_residue / 16) };
+                    for b in 0..8 {
+                        for k in 0..64 {
+                            let row = (b * B + r + k * S) * 64;
+                            unsafe {
+                                core::slice::from_raw_parts_mut(dst.add(row), 64).fill(guard);
+                                dst.add(row).sub(1).write(guard);
+                                dst.add(row + 64).write(guard);
+                            }
+                        }
+                    }
+                    for b in (0..8).rev() {
+                        unsafe {
+                            if out_residue == 0 {
+                                seed_publish64_block::<true>(
+                                    src.add(b * 64 * 64),
+                                    dst.add((b * B + r) * 64),
+                                    S * 64,
+                                    lanes,
+                                    &plan.blocks[b],
+                                );
+                            } else {
+                                seed_publish64_block::<false>(
+                                    src.add(b * 64 * 64),
+                                    dst.add((b * B + r) * 64),
+                                    S * 64,
+                                    lanes,
+                                    &plan.blocks[b],
+                                );
+                            }
+                        }
+                    }
+                    unsafe {
+                        core::arch::x86_64::_mm_sfence();
+                    }
+                    for b in 0..8 {
+                        for q in 0..16 {
+                            let mut expected = vec![F128::ZERO; 4 * 64];
+                            for i in 0..4 {
+                                let start = off + (b * 64 + q + i * 16) * 64;
+                                expected[i * 64..i * 64 + lanes]
+                                    .copy_from_slice(&original[start..start + lanes]);
+                            }
+                            oracle_rows(&mut expected, 0, 64, lanes, &raw[b][q], 2);
+                            for i in 0..4 {
+                                let row = (b * B + r + (4 * q + i) * S) * 64;
+                                let got = unsafe { core::slice::from_raw_parts(dst.add(row), 64) };
+                                assert_eq!(
+                                    got,
+                                    &expected[i * 64..(i + 1) * 64],
+                                    "fixture={fixture} r={r} b={b} q={q} row={i} src_residue={src_residue} out_residue={out_residue}"
+                                );
+                                assert_eq!(unsafe { dst.add(row).sub(1).read() }, guard);
+                                assert_eq!(unsafe { dst.add(row + 64).read() }, guard);
+                                values += 64;
+                            }
+                        }
+                    }
+                    assert_eq!(storage, original);
+                    assert_eq!(raw, original_raw);
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 32);
+    assert_eq!(values, 1048576);
+    println!(
+        "PASS 32 original-width ranked publication tasks, 256 blocks, 4096 quads and 1048576 bitwise-reference outputs; both source/output alignments, odd zero tails, boundary rows, distinct coefficients and unchanged input guards."
+    );
+}
+
     fn two_rows<const OUTER_LOW: bool, const INNER_LOW: bool, const ALIGNED: bool>(residue: usize) {
         let mut seed = 0xf21a_2e85_b736_094d;
         let guard = F128::new(0xfeed_cafe, 0xdead_beef);
@@ -4268,3 +4586,232 @@ mod ab_ntt_tail_composition_tests {
         println!("270 production NTT row cases match the independent bitwise oracle and guards");
     }
 }
+
+#[cfg(target_feature = "avx512bw")]
+mod seed_publish64_prepared {
+    use super::super::SeedPublish64Block;
+    use super::*;
+    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+    use core::arch::x86_64::*;
+
+    #[inline(never)]
+    pub(crate) unsafe fn seed_publish64_prepare(
+        input: &[[[F128; 3]; 16]; 8],
+        out: &mut [SeedPublish64Block; 8],
+    ) {
+        unsafe {
+            let flat = input.as_ptr().cast::<F128>();
+            let mut companions = [F128::ZERO; 384];
+            for i in (0..384).step_by(4) {
+                let value = _mm512_loadu_si512(flat.add(i).cast());
+                _mm512_storeu_si512(
+                    companions.as_mut_ptr().add(i).cast(),
+                    ghash_shift64_x4(value),
+                );
+            }
+            for b in 0..8 {
+                for q in 0..16 {
+                    for i in 0..3 {
+                        out[b].quads[q][i] = input[b][q][i];
+                        out[b].quads[q][3 + i] = companions[(b * 16 + q) * 3 + i];
+                    }
+                }
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn prepared_tw<const LOW: bool>(value: F128, companion: F128) -> TwX4 {
+        unsafe {
+            let a = _mm512_broadcast_i32x4(_mm_set_epi64x(value.hi as i64, value.lo as i64));
+            let b = if LOW {
+                a
+            } else {
+                _mm512_broadcast_i32x4(_mm_set_epi64x(companion.hi as i64, companion.lo as i64))
+            };
+            (a, b)
+        }
+    }
+    /// Four source rows with pitch 1024 fields; four disjoint output rows.
+    /// lanes is 60 or 64; the suffix is zeroed by the same parent body.
+    /// The caller provides matching prepared companions and drains NT stores.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_publish64_quad<
+        const OUTER_LOW: bool,
+        const INNER_LOW: bool,
+        const ALIGNED_ZMM: bool,
+    >(
+        src: *const F128,
+        dst: *mut F128,
+        dst_step: usize,
+        lanes: usize,
+        coefficients: &[F128; 6],
+    ) {
+        let [t_outer, t_inner_a, t_inner_b, tc, sc, rc] = *coefficients;
+        let src_step = 16 * 64;
+        let dst_a = dst;
+        let dst_b = unsafe { dst.add(dst_step) };
+        let dst_c = unsafe { dst.add(2 * dst_step) };
+        let dst_d = unsafe { dst.add(3 * dst_step) };
+
+        // SAFETY: the caller guarantees four readable scratch rows, four disjoint
+        // 16-byte-aligned destinations, target features, and lanes in {60, 64}.
+        unsafe {
+            debug_assert!(lanes == 60 || lanes == 64);
+            debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+            debug_assert!(!INNER_LOW || (t_inner_a.hi == 0 && t_inner_b.hi == 0));
+            let a = src;
+            let b = src.add(src_step);
+            let c = src.add(2 * src_step);
+            let d = src.add(3 * src_step);
+            let outer = prepared_tw::<OUTER_LOW>(t_outer, tc);
+            let inner_a = prepared_tw::<INNER_LOW>(t_inner_a, sc);
+            let inner_b = prepared_tw::<INNER_LOW>(t_inner_b, rc);
+
+            let mut i = 0;
+            while i + 8 <= lanes {
+                let mut va0 = _mm512_loadu_si512(a.add(i) as *const __m512i);
+                let mut vb0 = _mm512_loadu_si512(b.add(i) as *const __m512i);
+                let mut vc0 = _mm512_loadu_si512(c.add(i) as *const __m512i);
+                let mut vd0 = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+                let mut va1 = _mm512_loadu_si512(a.add(i + 4) as *const __m512i);
+                let mut vb1 = _mm512_loadu_si512(b.add(i + 4) as *const __m512i);
+                let mut vc1 = _mm512_loadu_si512(c.add(i + 4) as *const __m512i);
+                let mut vd1 = _mm512_loadu_si512(d.add(i + 4) as *const __m512i);
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, true>(outer, vc0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, true>(outer, vc1));
+                vc0 = _mm512_xor_si512(vc0, new_a0);
+                vc1 = _mm512_xor_si512(vc1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+
+                let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, true>(outer, vd0));
+                let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, true>(outer, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_b0);
+                vd1 = _mm512_xor_si512(vd1, new_b1);
+                vb0 = new_b0;
+                vb1 = new_b1;
+
+                let new_a0 = _mm512_xor_si512(va0, mul_x4::<INNER_LOW, true>(inner_a, vb0));
+                let new_a1 = _mm512_xor_si512(va1, mul_x4::<INNER_LOW, true>(inner_a, vb1));
+                vb0 = _mm512_xor_si512(vb0, new_a0);
+                vb1 = _mm512_xor_si512(vb1, new_a1);
+                va0 = new_a0;
+                va1 = new_a1;
+
+                let new_c0 = _mm512_xor_si512(vc0, mul_x4::<INNER_LOW, true>(inner_b, vd0));
+                let new_c1 = _mm512_xor_si512(vc1, mul_x4::<INNER_LOW, true>(inner_b, vd1));
+                vd0 = _mm512_xor_si512(vd0, new_c0);
+                vd1 = _mm512_xor_si512(vd1, new_c1);
+                vc0 = new_c0;
+                vc1 = new_c1;
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc0);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd0);
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i + 4), va1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i + 4), vb1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i + 4), vc1);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i + 4), vd1);
+                i += 8;
+            }
+            while i < lanes {
+                let mut va = _mm512_loadu_si512(a.add(i) as *const __m512i);
+                let mut vb = _mm512_loadu_si512(b.add(i) as *const __m512i);
+                let mut vc = _mm512_loadu_si512(c.add(i) as *const __m512i);
+                let mut vd = _mm512_loadu_si512(d.add(i) as *const __m512i);
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<OUTER_LOW, true>(outer, vc));
+                vc = _mm512_xor_si512(vc, new_a);
+                va = new_a;
+                let new_b = _mm512_xor_si512(vb, mul_x4::<OUTER_LOW, true>(outer, vd));
+                vd = _mm512_xor_si512(vd, new_b);
+                vb = new_b;
+
+                let new_a = _mm512_xor_si512(va, mul_x4::<INNER_LOW, true>(inner_a, vb));
+                vb = _mm512_xor_si512(vb, new_a);
+                va = new_a;
+                let new_c = _mm512_xor_si512(vc, mul_x4::<INNER_LOW, true>(inner_b, vd));
+                vd = _mm512_xor_si512(vd, new_c);
+                vc = new_c;
+
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), va);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), vb);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), vc);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), vd);
+                i += 4;
+            }
+
+            // The exact-shape caller reaches i=60 only for odd_tail=4. That value is
+            // published from the R1CS padding descriptor, so lanes 60..64 are
+            // contractually zero. Publish a zero register: every destination byte
+            // is initialized, with no dependency or reload from the scratch suffix.
+            if i < 64 {
+                debug_assert_eq!(i, 60);
+                let zero = _mm512_setzero_si512();
+                stream_f128x4::<ALIGNED_ZMM>(dst_a.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_b.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_c.add(i), zero);
+                stream_f128x4::<ALIGNED_ZMM>(dst_d.add(i), zero);
+            }
+        }
+    }
+
+    /// Publish one original 64-row permuted block. The owner drains stores.
+    /// region holds 64*64 readable fields; dst selects four-row quads with
+    /// the supplied row step. The immutable plan owns valid low-mode flags.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_publish64_block<const ALIGNED_ZMM: bool>(
+        region: *const F128,
+        dst: *mut F128,
+        dst_step: usize,
+        lanes: usize,
+        plan: &SeedPublish64Block,
+    ) {
+        unsafe {
+            for q in 0..16 {
+                let src = region.add(q * 64);
+                let out = dst.add(4 * q * dst_step);
+                let coefficients = &plan.quads[q];
+                match plan.low_modes[q] {
+                    0 => seed_publish64_quad::<false, false, ALIGNED_ZMM>(
+                        src,
+                        out,
+                        dst_step,
+                        lanes,
+                        coefficients,
+                    ),
+                    1 => seed_publish64_quad::<true, false, ALIGNED_ZMM>(
+                        src,
+                        out,
+                        dst_step,
+                        lanes,
+                        coefficients,
+                    ),
+                    2 => seed_publish64_quad::<false, true, ALIGNED_ZMM>(
+                        src,
+                        out,
+                        dst_step,
+                        lanes,
+                        coefficients,
+                    ),
+                    3 => seed_publish64_quad::<true, true, ALIGNED_ZMM>(
+                        src,
+                        out,
+                        dst_step,
+                        lanes,
+                        coefficients,
+                    ),
+                    _ => unreachable!("prepared publication mode"),
+                }
+            }
+        }
+    }
+}
+#[cfg(target_feature = "avx512bw")]
+pub(crate) use seed_publish64_prepared::{
+    seed_publish64_block, seed_publish64_prepare, seed_publish64_quad,
+};
