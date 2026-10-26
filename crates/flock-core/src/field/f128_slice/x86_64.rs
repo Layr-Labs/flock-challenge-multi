@@ -48,6 +48,24 @@ pub(super) unsafe fn add_scaled(dst: &mut [F128], addend: &[F128], scale: F128) 
         let scale_x64 = ghash_shift64_x4(scale_x4);
         let lanes = dst.len() & !3;
         let mut i = 0usize;
+        let paired = dst.len() & !7;
+        while i < paired {
+            let current0 = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
+            let extra0 = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
+            let current1 = _mm512_loadu_si512(dst.as_ptr().add(i + 4) as *const __m512i);
+            let extra1 = _mm512_loadu_si512(addend.as_ptr().add(i + 4) as *const __m512i);
+            let prod0 = ghash_mul_x4_split(extra0, scale_x4, scale_x64);
+            let prod1 = ghash_mul_x4_split(extra1, scale_x4, scale_x64);
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(i) as *mut __m512i,
+                _mm512_xor_si512(current0, prod0),
+            );
+            _mm512_storeu_si512(
+                dst.as_mut_ptr().add(i + 4) as *mut __m512i,
+                _mm512_xor_si512(current1, prod1),
+            );
+            i += 8;
+        }
         while i < lanes {
             let current = _mm512_loadu_si512(dst.as_ptr().add(i) as *const __m512i);
             let extra = _mm512_loadu_si512(addend.as_ptr().add(i) as *const __m512i);
@@ -80,6 +98,16 @@ pub(super) unsafe fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
         let scale_x64 = ghash_shift64_x4(scale_x4);
         let lanes = dst.len() & !3;
         let mut i = 0usize;
+        let paired = dst.len() & !7;
+        while i < paired {
+            let extra0 = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
+            let extra1 = _mm512_loadu_si512(src.as_ptr().add(i + 4) as *const __m512i);
+            let scaled0 = ghash_mul_x4_split(extra0, scale_x4, scale_x64);
+            let scaled1 = ghash_mul_x4_split(extra1, scale_x4, scale_x64);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i) as *mut __m512i, scaled0);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(i + 4) as *mut __m512i, scaled1);
+            i += 8;
+        }
         while i < lanes {
             let extra = _mm512_loadu_si512(src.as_ptr().add(i) as *const __m512i);
             let scaled = ghash_mul_x4_split(extra, scale_x4, scale_x64);
@@ -583,6 +611,26 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
         let r_x64 = ghash_shift64_x4(r_bcast);
         let lanes = lo.len() & !3;
         let mut i = 0usize;
+        let paired = lo.len() & !7;
+        while i < paired {
+            let a0 = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            let b0 = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);
+            let a1 = _mm512_loadu_si512(lo.as_ptr().add(i + 4) as *const __m512i);
+            let b1 = _mm512_loadu_si512(hi.as_ptr().add(i + 4) as *const __m512i);
+            let s0 = _mm512_xor_si512(a0, b0);
+            let s1 = _mm512_xor_si512(a1, b1);
+            let p0 = ghash_mul_x4_split(s0, r_bcast, r_x64);
+            let p1 = ghash_mul_x4_split(s1, r_bcast, r_x64);
+            _mm512_storeu_si512(
+                lo.as_mut_ptr().add(i) as *mut __m512i,
+                _mm512_xor_si512(a0, p0),
+            );
+            _mm512_storeu_si512(
+                lo.as_mut_ptr().add(i + 4) as *mut __m512i,
+                _mm512_xor_si512(a1, p1),
+            );
+            i += 8;
+        }
         while i < lanes {
             let a = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
             let b = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);

@@ -101,13 +101,29 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
             apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(7)), modes as u8, av);
         let mut acc = krow_seed(av, bv, correction, modes as u8);
         let x = _mm512_set1_epi8(2);
-        for k in (0..7usize).rev() {
+        let mut k = 6isize;
+        while k >= 1 {
+            let k0 = k as usize;
+            let k1 = (k - 1) as usize;
             modes >>= 8;
-            let av = apply(op.add(offw_krow_words::<P>(k)));
-            let (bv, correction) =
-                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k)), modes as u8, av);
-            acc = krow_horner(acc, x, av, bv, correction, modes as u8);
+            let mode0 = modes as u8;
+            let av0 = apply(op.add(offw_krow_words::<P>(k0)));
+            modes >>= 8;
+            let mode1 = modes as u8;
+            let av1 = apply(op.add(offw_krow_words::<P>(k1)));
+            let (bv0, c0) =
+                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k0)), mode0, av0);
+            let (bv1, c1) =
+                apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(k1)), mode1, av1);
+            acc = krow_horner(acc, x, av0, bv0, c0, mode0);
+            acc = krow_horner(acc, x, av1, bv1, c1, mode1);
+            k -= 2;
         }
+        modes >>= 8;
+        let av = apply(op.add(offw_krow_words::<P>(0)));
+        let (bv, correction) =
+            apply_b_mode::<P>(imgs, op.add(64 + offw_krow_words::<P>(0)), modes as u8, av);
+        acc = krow_horner(acc, x, av, bv, correction, modes as u8);
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
 }
@@ -143,12 +159,31 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
                 acc = krow_horner(acc, x, av, bv, correction, (plan.modes >> $shift) as u8);
             }};
         }
-        step!(6, 8);
-        step!(5, 16);
-        step!(4, 24);
-        step!(3, 32);
-        step!(2, 40);
-        step!(1, 48);
+        macro_rules! step2 {
+            ($k0:expr, $s0:expr, $k1:expr, $s1:expr) => {{
+                let av0 = apply(op.add(offw_krow_words::<P>($k0)));
+                let av1 = apply(op.add(offw_krow_words::<P>($k1)));
+                let mode0 = (plan.modes >> $s0) as u8;
+                let mode1 = (plan.modes >> $s1) as u8;
+                let (bv0, c0) = apply_b_mode::<P>(
+                    imgs,
+                    op.add(64 + offw_krow_words::<P>($k0)),
+                    mode0,
+                    av0,
+                );
+                let (bv1, c1) = apply_b_mode::<P>(
+                    imgs,
+                    op.add(64 + offw_krow_words::<P>($k1)),
+                    mode1,
+                    av1,
+                );
+                acc = krow_horner(acc, x, av0, bv0, c0, mode0);
+                acc = krow_horner(acc, x, av1, bv1, c1, mode1);
+            }};
+        }
+        step2!(6, 8, 5, 16);
+        step2!(4, 24, 3, 32);
+        step2!(2, 40, 1, 48);
         step!(0, 56);
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }
@@ -198,12 +233,31 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
                 acc = krow_horner(acc, x, av, bv, correction, (plan.modes >> $shift) as u8);
             }};
         }
-        step!(6, 8);
-        step!(5, 16);
-        step!(4, 24);
-        step!(3, 32);
-        step!(2, 40);
-        step!(1, 48);
+        macro_rules! step2 {
+            ($k0:expr, $s0:expr, $k1:expr, $s1:expr) => {{
+                let av0 = apply(op.add(offw_krow_words::<P>($k0)));
+                let av1 = apply(op.add(offw_krow_words::<P>($k1)));
+                let mode0 = (plan.modes >> $s0) as u8;
+                let mode1 = (plan.modes >> $s1) as u8;
+                let (bv0, c0) = apply_b_mode_img::<P, I>(
+                    imgs,
+                    op.add(64 + offw_krow_words::<P>($k0)),
+                    mode0,
+                    av0,
+                );
+                let (bv1, c1) = apply_b_mode_img::<P, I>(
+                    imgs,
+                    op.add(64 + offw_krow_words::<P>($k1)),
+                    mode1,
+                    av1,
+                );
+                acc = krow_horner(acc, x, av0, bv0, c0, mode0);
+                acc = krow_horner(acc, x, av1, bv1, c1, mode1);
+            }};
+        }
+        step2!(6, 8, 5, 16);
+        step2!(4, 24, 3, 32);
+        step2!(2, 40, 1, 48);
         step!(0, 56);
         _mm512_stream_si512(out.as_mut_ptr().cast::<__m512i>(), acc);
     }

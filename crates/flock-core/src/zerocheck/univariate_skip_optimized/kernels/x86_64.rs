@@ -430,16 +430,22 @@ unsafe fn horner_2img_offw<const P: bool>(
     unsafe {
         let apply = |o: *const u16| apply_x86_avx512_register_2img_krow_at::<P>(imgs.0, imgs.1, o);
         let xb = _mm512_set1_epi8(2);
-        let mut acc = _mm512_gf2p8mul_epi8(
-            apply(op.add(offw_krow_words::<P>(7))),
-            apply(op.add(64 + offw_krow_words::<P>(7))),
-        );
-        for k in (0..7usize).rev() {
-            let av = apply(op.add(offw_krow_words::<P>(k)));
-            let bv = apply(op.add(64 + offw_krow_words::<P>(k)));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product);
+        let product = |k: usize| {
+            _mm512_gf2p8mul_epi8(
+                apply(op.add(offw_krow_words::<P>(k))),
+                apply(op.add(64 + offw_krow_words::<P>(k))),
+            )
+        };
+        let mut acc = product(7);
+        let mut k = 6isize;
+        while k >= 1 {
+            let p0 = product(k as usize);
+            let p1 = product((k - 1) as usize);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), p0);
+            acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), p1);
+            k -= 2;
         }
+        acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, xb), product(0));
         acc
     }
 }
