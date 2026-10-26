@@ -5878,6 +5878,506 @@ mod tests {
     }
 
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[test]
+fn c4_raw_strided_callers_match_scalar() {
+    #[repr(C, align(64))]
+    struct Aligned([F128; 4]);
+    for (case, (lo_size, out_base, input_offset, output_offset, corrupt)) in [
+        (256usize, 0usize, 0usize, 0usize, false),
+        (1024, 1024, 1, 1, false),
+        (256, 512, 7, 0, false),
+        (256, 0, 0, 1, true),
+        (256, 16, 0, 0, false),
+        (272, 0, 0, 1, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rng = Rng::new(0x7c4011 + lo_size as u64);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+
+        let n_rows = 8 * (out_base + 2 * lo_size);
+        let ap_storage: Vec<u8> = (0..input_offset + n_rows * 8)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        let ap = &ap_storage[input_offset..];
+        let mut bp_storage: Vec<u8> = (0..input_offset + n_rows * 8)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        if out_base % 512 == 0 && lo_size % 256 == 0 {
+            let expected = RAW_C4_EXPECTED;
+            let known = RAW_C4_KNOWN;
+            for block in 0..lo_size / 32 {
+                for w in 0..32 {
+                    for row in 0..8 {
+                        for byte in 0..8 {
+                            if known[w][row] & (1 << byte) != 0 {
+                                bp_storage[input_offset
+                                    + 32 * out_base
+                                    + 2048 * block
+                                    + 64 * w
+                                    + 8 * row
+                                    + byte] = (expected[w][row] >> (8 * byte)) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            if corrupt {
+                let (w, row) = (0..32)
+                    .flat_map(|w| (0..8).map(move |row| (w, row)))
+                    .find(|&(w, row)| known[w][row] != 0)
+                    .unwrap();
+                bp_storage[input_offset
+                    + 32 * out_base
+                    + 64 * w
+                    + 8 * row
+                    + known[w][row].trailing_zeros() as usize] ^= 1;
+            }
+        }
+        let bp = &bp_storage[input_offset..];
+        let unchanged_b = bp.to_vec();
+        let rho1 = rng.f128();
+        let rho2 = rng.f128();
+        let one = F128::ONE;
+        let eq = rng.f128_vec(lo_size);
+        let wt = build_w_pair_table(&eq);
+        let cfold = kernels::x86_64::build_cfold_mats(
+            &table.data,
+            [
+                (one + rho1) * (one + rho2),
+                rho1 * (one + rho2),
+                (one + rho1) * rho2,
+                rho1 * rho2,
+            ],
+        );
+        let mut a_s = vec![F128::ZERO; 2 * lo_size];
+        let mut b_s = a_s.clone();
+        let want = fold2_from_packed_lookahead_scalar(
+            &ap,
+            &bp,
+            &table,
+            out_base,
+            &mut a_s,
+            &mut b_s,
+            rho1,
+            rho2,
+            &eq,
+            0,
+            usize::MAX,
+        );
+        macro_rules! check {
+            ($nt:literal,$lm:literal) => {{
+                let mut aa: Vec<Aligned> =
+                    (0..lo_size / 2 + 3).map(|_| Aligned([one; 4])).collect();
+                let mut bb: Vec<Aligned> =
+                    (0..lo_size / 2 + 3).map(|_| Aligned([one; 4])).collect();
+                let a = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        aa.as_mut_ptr().add(1).cast::<F128>().add(output_offset),
+                        2 * lo_size,
+                    )
+                };
+                let b = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        bb.as_mut_ptr().add(1).cast::<F128>().add(output_offset),
+                        2 * lo_size,
+                    )
+                };
+                assert_eq!(a.as_ptr() as usize % 64, 16 * output_offset);
+                assert_eq!(b.as_ptr() as usize % 64, 16 * output_offset);
+                let got = unsafe {
+                    kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<$nt, $lm>(
+                        ap.as_ptr(),
+                        bp.as_ptr(),
+                        out_base,
+                        a,
+                        b,
+                        lo_size,
+                        &cfold,
+                        &wt,
+                    )
+                };
+                assert_eq!(got, want, "message lo={lo_size}");
+                assert_eq!(
+                    a,
+                    if $lm {
+                        lane_major_tiles(&a_s)
+                    } else {
+                        a_s.clone()
+                    }
+                );
+                assert_eq!(
+                    b,
+                    if $lm {
+                        lane_major_tiles(&b_s)
+                    } else {
+                        b_s.clone()
+                    }
+                );
+                for buf in [&aa, &bb] {
+                    let all = unsafe {
+                        core::slice::from_raw_parts(buf.as_ptr().cast::<F128>(), buf.len() * 4)
+                    };
+                    assert!(
+                        all[..4 + output_offset]
+                            .iter()
+                            .chain(all[4 + output_offset + 2 * lo_size..].iter())
+                            .all(|&x| x == one),
+                        "case={case} output halo"
+                    );
+                }
+                assert_eq!(bp, unchanged_b, "immutable packed B");
+                assert_eq!(aa.first().unwrap().0, [one; 4]);
+                assert_eq!(aa.last().unwrap().0, [one; 4]);
+                assert_eq!(bb.first().unwrap().0, [one; 4]);
+                assert_eq!(bb.last().unwrap().0, [one; 4]);
+            }};
+        }
+        check!(false, false);
+        check!(false, true);
+        check!(true, false);
+        check!(true, true);
+    }
+    println!(
+        "16 actual C4 caller size/layout/publication cases match scalar messages and outputs with guards"
+    );
+    println!(
+        "PASS 24 actual raw-strided C4 caller cases: scalar outputs, eight messages, alignments, guarded bytes and shape fallbacks"
+    );
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+const RAW_C4_EXPECTED: [[u64; 8]; 32] = [
+    [
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+    ],
+    [
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+    ],
+    [
+        18446744073709551615,
+        18446744073709551615,
+        0,
+        0,
+        0,
+        72057594037927935,
+        0,
+        0,
+    ],
+    [
+        18374686479671623680,
+        281474976710655,
+        0,
+        0,
+        18446462598732840960,
+        1099511627775,
+        0,
+        0,
+    ],
+    [
+        18446462598732840960,
+        1099511627775,
+        0,
+        0,
+        18446742974197923840,
+        4294967295,
+        0,
+        0,
+    ],
+    [
+        18446744069414584320,
+        16777215,
+        0,
+        0,
+        18446744073692774400,
+        65535,
+        0,
+        0,
+    ],
+    [
+        18446744073692774400,
+        65535,
+        0,
+        0,
+        18446744073709486080,
+        255,
+        0,
+        0,
+    ],
+    [18446744073709551360, 0, 0, 0, 72057594037927935, 0, 0, 0],
+    [
+        72057594037927935,
+        0,
+        0,
+        18374686479671623680,
+        281474976710655,
+        0,
+        0,
+        18446462598732840960,
+    ],
+    [
+        1099511627775,
+        0,
+        0,
+        18446742974197923840,
+        4294967295,
+        0,
+        0,
+        18446742974197923840,
+    ],
+    [
+        4294967295,
+        0,
+        0,
+        18446744069414584320,
+        16777215,
+        0,
+        0,
+        18446744073692774400,
+    ],
+    [
+        65535,
+        0,
+        0,
+        18446744073709486080,
+        255,
+        0,
+        0,
+        18446744073709486080,
+    ],
+    [255, 0, 0, 18446744073709551360, 0, 0, 0, 72057594037927935],
+    [
+        0,
+        0,
+        18374686479671623680,
+        281474976710655,
+        0,
+        0,
+        18374686479671623680,
+        281474976710655,
+    ],
+    [
+        0,
+        0,
+        18446462598732840960,
+        1099511627775,
+        0,
+        0,
+        18446742974197923840,
+        4294967295,
+    ],
+    [
+        0,
+        0,
+        18446744069414584320,
+        16777215,
+        0,
+        0,
+        18446744069414584320,
+        16777215,
+    ],
+    [
+        0,
+        0,
+        18446744073692774400,
+        65535,
+        0,
+        0,
+        18446744073709486080,
+        255,
+    ],
+    [0, 0, 18446744073709551360, 0, 0, 0, 18446744073709551360, 0],
+    [
+        0,
+        0,
+        72057594037927935,
+        0,
+        0,
+        18374686479671623680,
+        281474976710655,
+        0,
+    ],
+    [
+        0,
+        18446462598732840960,
+        1099511627775,
+        0,
+        0,
+        18446462598732840960,
+        1099511627775,
+        0,
+    ],
+    [
+        0,
+        18446742974197923840,
+        4294967295,
+        0,
+        0,
+        18446744069414584320,
+        16777215,
+        0,
+    ],
+    [
+        0,
+        18446744073692774400,
+        65535,
+        0,
+        0,
+        18446744073692774400,
+        65535,
+        0,
+    ],
+    [
+        0,
+        18446744073709486080,
+        255,
+        0,
+        0,
+        18446744073709551360,
+        0,
+        0,
+    ],
+    [0, 72057594037927935, 0, 0, 0, 72057594037927935, 0, 0],
+    [
+        18374686479671623680,
+        281474976710655,
+        0,
+        0,
+        18446462598732840960,
+        1099511627775,
+        0,
+        0,
+    ],
+    [
+        18446742974197923840,
+        4294967295,
+        0,
+        0,
+        18446742974197923840,
+        4294967295,
+        0,
+        0,
+    ],
+    [
+        18446744069414584320,
+        16777215,
+        0,
+        0,
+        18446744073692774400,
+        65535,
+        0,
+        0,
+    ],
+    [
+        18446744073709486080,
+        255,
+        0,
+        0,
+        18446744073709486080,
+        255,
+        0,
+        0,
+    ],
+    [
+        18446744073709551360,
+        0,
+        0,
+        0,
+        72057594037927935,
+        0,
+        0,
+        18374686479671623680,
+    ],
+    [
+        281474976710655,
+        0,
+        0,
+        18374686479671623680,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+        18446744073709551615,
+    ],
+    [562949953421311, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0],
+];
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+const RAW_C4_KNOWN: [[u8; 8]; 32] = [
+    [255, 255, 255, 255, 255, 255, 255, 255],
+    [255, 255, 255, 255, 255, 255, 255, 255],
+    [255, 255, 0, 0, 0, 127, 0, 0],
+    [128, 63, 0, 0, 192, 31, 0, 0],
+    [192, 31, 0, 0, 224, 15, 0, 0],
+    [240, 7, 0, 0, 248, 3, 0, 0],
+    [248, 3, 0, 0, 252, 1, 0, 0],
+    [254, 0, 0, 0, 127, 0, 0, 0],
+    [127, 0, 0, 128, 63, 0, 0, 192],
+    [31, 0, 0, 224, 15, 0, 0, 224],
+    [15, 0, 0, 240, 7, 0, 0, 248],
+    [3, 0, 0, 252, 1, 0, 0, 252],
+    [1, 0, 0, 254, 0, 0, 0, 127],
+    [0, 0, 128, 63, 0, 0, 128, 63],
+    [0, 0, 192, 31, 0, 0, 224, 15],
+    [0, 0, 240, 7, 0, 0, 240, 7],
+    [0, 0, 248, 3, 0, 0, 252, 1],
+    [0, 0, 254, 0, 0, 0, 254, 0],
+    [0, 0, 127, 0, 0, 128, 63, 0],
+    [0, 192, 31, 0, 0, 192, 31, 0],
+    [0, 224, 15, 0, 0, 240, 7, 0],
+    [0, 248, 3, 0, 0, 248, 3, 0],
+    [0, 252, 1, 0, 0, 254, 0, 0],
+    [0, 127, 0, 0, 0, 127, 0, 0],
+    [128, 63, 0, 0, 192, 31, 0, 0],
+    [224, 15, 0, 0, 224, 15, 0, 0],
+    [240, 7, 0, 0, 248, 3, 0, 0],
+    [252, 1, 0, 0, 252, 1, 0, 0],
+    [254, 0, 0, 0, 127, 0, 0, 128],
+    [63, 0, 0, 128, 255, 255, 255, 255],
+    [255, 255, 255, 255, 255, 255, 255, 255],
+    [255, 255, 255, 255, 255, 255, 255, 255],
+];
+
     /// Pins the active NT/lane-major route and 64-byte output alignment.
     #[cfg(all(
         target_arch = "x86_64",
