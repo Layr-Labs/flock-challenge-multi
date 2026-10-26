@@ -247,7 +247,7 @@ impl RootTileCache {
     }
 
     fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
-        // Retain each output plane across four tiles. The kill switch keeps
+        // Retain each output plane across eight tiles. The kill switch keeps
         // the original per-tile reader available for diagnostic comparisons.
         static BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_BATCH4").is_none()
@@ -303,7 +303,8 @@ impl RootTileCache {
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
-                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 8]);
+                let claim = if BATCH_WORD_TILES { 8 } else { 4 };
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -318,15 +319,15 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        lo = next.fetch_add(claim, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + 4).min(self.tiles);
+                        hi = (lo + claim).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;
-                        let count = (hi - lo).min(4);
+                        let count = (hi - lo).min(8);
                         lo += count;
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
@@ -347,7 +348,7 @@ impl RootTileCache {
                             // batch the leaf initializes all sixteen planes
                             // without reading dst; later calls load them once.
                             unsafe {
-                                kernels::gfni_fold_word_tiles4(
+                                kernels::gfni_fold_word_tiles8(
                                     self.storage.0.as_ptr().add(self.offset).cast::<u8>()
                                         .add((tile * self.blocks + block) * 512),
                                     matrices.as_ptr().cast::<u64>(),
@@ -436,13 +437,13 @@ mod tests {
     /// The oracle reads the selected-word wire bits directly. It neither uses
     /// WORD_TO_COLUMNS nor derives its expected planes from a SIMD transpose.
     #[test]
-    fn selected_word_fold4_matches_byte_plane_oracle() {
+    fn selected_word_batch8_matches_byte_plane_oracle() {
         const STRIDE: usize = 176 * 512;
-        let mut source = vec![0xa7u8; 4 * STRIDE];
+        let mut source = vec![0xa7u8; 8 * STRIDE];
         for group in [13usize, 175] {
-            let mut mats = [[0u64; 128]; 4];
-            let mut oracle_tiles = [[0u8; 1024]; 4];
-            for tile in 0..4 {
+            let mut mats = [[0u64; 128]; 8];
+            let mut oracle_tiles = [[0u8; 1024]; 8];
+            for tile in 0..8 {
                 for stripe in 0..8 {
                     let weights = core::array::from_fn::<_, 8, _>(|lane| {
                         let n = (tile * 64 + stripe * 8 + lane + 31) as u64;
@@ -474,7 +475,7 @@ mod tests {
                     }
                 }
             }
-            for count in 1..=4 {
+            for count in 1..=8 {
                 for seed_zero in [true, false] {
                     // Deliberately stale output, with untouched sentinels on
                     // both sides. Source group 175 ends at a true tile edge.
@@ -500,7 +501,7 @@ mod tests {
                             kernels::gfni_fold_rows(&rows, &mats[tile], old.as_mut_ptr().add(64),
                                 seed_zero && tile == 0);
                         }
-                        kernels::gfni_fold_word_tiles4(
+                        kernels::gfni_fold_word_tiles8(
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
                             new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
                             WORD_TO_COLUMNS.as_ptr());
@@ -508,7 +509,7 @@ mod tests {
                     assert_eq!(&old[64..1088], &expected,
                         "old oracle, group={group}, count={count}, first={seed_zero}");
                     assert_eq!(&new[64..1088], &expected,
-                        "fold4 oracle, group={group}, count={count}, first={seed_zero}");
+                        "batch8 oracle, group={group}, count={count}, first={seed_zero}");
                     assert!(new[..64].iter().chain(new[1088..].iter()).all(|&b| b == 0x5d));
                     assert!(old[..64].iter().chain(old[1088..].iter()).all(|&b| b == 0x5d));
                 }
@@ -546,18 +547,18 @@ mod tests {
     }
 
     #[test]
-    fn selected_word_fold4_cache_ranges_and_worker_reduction() {
+    fn selected_word_batch8_cache_ranges_and_worker_reduction() {
         let weights = |i: usize| core::array::from_fn(|lane| {
             let n = (i + lane + 997) as u64;
             F128::new(n.rotate_left(17).wrapping_mul(0x9e3779b97f4a7c15),
                 n.wrapping_mul(0xbf58476d1ce4e5b9))
         });
-        for threads in [9, 7] {
+        for threads in [1, 2, 7, 9, 16] {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             pool.install(|| {
-                // Includes fewer tiles than workers, full four-tile ranges,
-                // and ranges requiring both a full batch and a 1..3 tile tail.
-                for tiles in [1, 3, 4, 5, 17, 29, 33, 43] {
+                // Includes fewer tiles than workers, full eight-tile ranges,
+                // and ranges requiring both a full batch and a 1..7 tile tail.
+                for tiles in [1, 7, 8, 9, 15, 16, 17, 33, 43] {
                     let cache = selected_word_cache_fixture(tiles);
                     let expected = cache.fold_with_mode(&weights, false);
                     let actual = cache.fold_with_mode(&weights, true);
