@@ -2434,6 +2434,7 @@ impl AdditiveNttF128 {
         stage_perm: bool,
         tw4: &[kernels::FourBlock],
         tw2: &[[[F128; 3]; 16]],
+        prepared: Option<&kernels::SeedPublish64Plan>,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2473,6 +2474,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    prepared.map(|p| &p.blocks[block]),
                 );
             }
         }
@@ -2515,6 +2517,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2: &[[[F128; 3]; 16]],
+        prepared: Option<&kernels::SeedPublish64Plan>,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2539,6 +2542,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    prepared.map(|p| &p.blocks[block]),
                 );
             }
         }
@@ -2582,7 +2586,19 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2_block: &[[F128; 3]; 16],
+        prepared: Option<&kernels::SeedPublish64Block>,
     ) {
+        #[cfg(target_feature="avx512bw")]
+        if let Some(plan)=prepared {
+            debug_assert!(stage_perm);
+            debug_assert_eq!(row_len,64);
+            unsafe {
+                kernels::seed_publish64_block::<ALIGNED_ZMM>(
+                    region,base.add((block*block_size+r)*row_len),sub_stride*row_len,lanes2,plan,
+                );
+            }
+            return;
+        }
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
@@ -2729,6 +2745,11 @@ impl AdditiveNttF128 {
         // the same order as before, so the transform is byte-identical; only
         // the scratch address it lives at changes.
         let stage_perm = Self::stage_perm_enabled();
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+        let prepared_publish=if direct_publish && stage_perm {
+            kernels::SeedPublish64Plan::new(&tw4,&tw2)
+        } else {None};
+
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
@@ -2929,6 +2950,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            prepared_publish.as_ref(),
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -2943,6 +2965,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            prepared_publish.as_ref(),
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -3039,10 +3062,12 @@ impl AdditiveNttF128 {
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        prepared_publish.as_ref(),
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        prepared_publish.as_ref(),
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
