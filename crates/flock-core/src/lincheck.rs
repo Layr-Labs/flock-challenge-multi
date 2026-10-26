@@ -3048,6 +3048,9 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
     // column c at slab c; the single-column arms use slab 0 only.
     let mut transposed_store =
         core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
+    #[cfg(target_feature = "avx512vbmi")]
+    let mut transposed_alt =
+        core::mem::MaybeUninit::<[u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128]>::uninit();
     #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))]
     let mut splice_carry_store = core::mem::MaybeUninit::<[u8; 512]>::uninit();
     // SAFETY: `fold_mats_from_basis` unconditionally overwrites all 128
@@ -3115,43 +3118,48 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
         #[cfg(target_feature = "avx512vbmi")]
         if gather_tr_fused && lc_gather4_enabled() {
             let full_chunks = useful_bits / 128;
-            while q + 4 <= full_chunks {
+            let alt = unsafe { &mut *transposed_alt.as_mut_ptr() };
+            let gather_group = |buf: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+                                qq: usize| {
                 unsafe {
                     if gather_tr_vpermt2b {
                         gather_transpose_group4_x86::<true, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
-                            q,
+                            qq,
                             full_chunks,
                             pf_far,
                             pf_spread,
                             pf_chunks,
-                            transposed,
+                            buf,
                         );
                     } else {
                         gather_transpose_group4_x86::<false, HAS_SPLICE>(
                             z_packed,
                             chunks_per_block,
                             stripe_base,
-                            q,
+                            qq,
                             full_chunks,
                             pf_far,
                             pf_spread,
                             pf_chunks,
-                            transposed,
+                            buf,
                         );
                     }
                 }
+            };
+            let mut fold_group = |buf: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+                                  qq: usize| {
                 for c in 0..4 {
                     if pf_far && pf_spread {
-                        let qn = q + pf_chunks;
+                        let qn = qq + pf_chunks;
                         if qn <= full_chunks && qn < chunks_per_block {
                             unsafe {
                                 lc_prefetch_rows16(
-                                    z_packed
-                                        .as_ptr()
-                                        .add((8 * stripe_base + 16 * c) * chunks_per_block + qn),
+                                    z_packed.as_ptr().add(
+                                        (8 * stripe_base + 16 * c) * chunks_per_block + qn,
+                                    ),
                                     chunks_per_block,
                                     cpb_ranked,
                                 );
@@ -3162,8 +3170,8 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                         #[cfg(target_feature = "avx512bw")]
                         if HAS_SPLICE && let Some(splice) = root_splice {
                             splice.fold_chunk::<true>(
-                                q + c,
-                                transposed.as_ptr().add(c * 1024),
+                                qq + c,
+                                buf.as_ptr().add(c * 1024),
                                 mats,
                                 wplanes.as_mut_ptr().cast::<u8>(),
                                 first_tile,
@@ -3174,16 +3182,41 @@ fn fold_block_major_gfni_worker_fallback<const TILE_GRAB: usize, const HAS_SPLIC
                             continue;
                         }
                         kernels::gfni_fold_tile(
-                            transposed.as_ptr().add(c * 1024),
+                            buf.as_ptr().add(c * 1024),
                             128,
                             2,
                             mats,
-                            wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                            wplanes.as_mut_ptr().cast::<u8>().add(2 * (qq + c) * 1024),
                             first_tile,
                         );
                     }
                 }
+            };
+            let mut flip = false;
+            let mut have = false;
+            while q + 4 <= full_chunks {
+                if flip {
+                    gather_group(alt, q);
+                } else {
+                    gather_group(transposed, q);
+                }
+                if have {
+                    if flip {
+                        fold_group(transposed, q - 4);
+                    } else {
+                        fold_group(alt, q - 4);
+                    }
+                }
+                have = true;
+                flip = !flip;
                 q += 4;
+            }
+            if have {
+                if flip {
+                    fold_group(transposed, q - 4);
+                } else {
+                    fold_group(alt, q - 4);
+                }
             }
         }
         while q < useful_chunks {
