@@ -3101,39 +3101,60 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         let mut wb =
             W8::<true, RANKED_CLOSED>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
-        macro_rules! g {
-            ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+        let mut carry: [V8; 56] = [dup_u32(0); 56];
+        macro_rules! gcalc {
+            ($slot:literal, $la:literal, $lb:literal, $lc:literal, $ld:literal,
              $mx:literal, $my:literal) => {{
+                let b = $slot * 14;
                 let (t0, l0, r0) = add_carry_parts_v8(state[$la], state[$lb]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                carry[b] = l0;
+                carry[b + 1] = r0;
                 let (a1, l1, r1) = add_carry_parts_v8(t0, m[$mx]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                carry[b + 2] = l1;
+                carry[b + 3] = r1;
                 let d1 = xor_rotr8::<16, 16>(state[$ld], a1);
                 let (c1s, l2, r2) = add_carry_parts_v8(state[$lc], d1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                carry[b + 4] = l2;
+                carry[b + 5] = r2;
                 let b1 = xor_rotr8::<12, 20>(state[$lb], c1s);
                 let (t1, l3, r3) = add_carry_parts_v8(a1, b1);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                carry[b + 6] = l3;
+                carry[b + 7] = r3;
                 let (a2, l4, r4) = add_carry_parts_v8(t1, m[$my]);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                carry[b + 8] = l4;
+                carry[b + 9] = r4;
                 let d2 = xor_rotr8::<8, 24>(d1, a2);
                 let (c2s, l5, r5) = add_carry_parts_v8(c1s, d2);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                carry[b + 10] = l5;
+                carry[b + 11] = r5;
                 let bn = xor_rotr8::<7, 25>(b1, c2s);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                carry[b + 12] = bn;
+                carry[b + 13] = d2;
                 state[$la] = a2;
                 state[$lb] = bn;
                 state[$lc] = c2s;
                 state[$ld] = d2;
+            }};
+        }
+        macro_rules! gpush {
+            ($slot:literal, $g:expr) => {{
+                let b = $slot * 14;
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, carry[b]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, carry[b + 1]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, carry[b + 2]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, carry[b + 3]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, carry[b + 4]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, carry[b + 5]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, carry[b + 6]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, carry[b + 7]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, carry[b + 8]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, carry[b + 9]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, carry[b + 10]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, carry[b + 11]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, carry[b + 12]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, carry[b + 13]);
+                pushf8!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
             }};
         }
         macro_rules! round {
@@ -3141,14 +3162,22 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
              $m4:literal, $m5:literal, $m6:literal, $m7:literal,
              $m8:literal, $m9:literal, $m10:literal, $m11:literal,
              $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-                g!($gb, 0, 4, 8, 12, $m0, $m1);
-                g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
-                g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
-                g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
-                g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
-                g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
-                g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
-                g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                gcalc!(0, 0, 4, 8, 12, $m0, $m1);
+                gcalc!(1, 1, 5, 9, 13, $m2, $m3);
+                gcalc!(2, 2, 6, 10, 14, $m4, $m5);
+                gcalc!(3, 3, 7, 11, 15, $m6, $m7);
+                gpush!(0, $gb);
+                gpush!(1, $gb + 1);
+                gpush!(2, $gb + 2);
+                gpush!(3, $gb + 3);
+                gcalc!(0, 0, 5, 10, 15, $m8, $m9);
+                gcalc!(1, 1, 6, 11, 12, $m10, $m11);
+                gcalc!(2, 2, 7, 8, 13, $m12, $m13);
+                gcalc!(3, 3, 4, 9, 14, $m14, $m15);
+                gpush!(0, $gb + 4);
+                gpush!(1, $gb + 5);
+                gpush!(2, $gb + 6);
+                gpush!(3, $gb + 7);
             }};
         }
         round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
