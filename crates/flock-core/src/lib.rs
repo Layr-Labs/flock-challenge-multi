@@ -184,6 +184,7 @@ pub(crate) mod topology_pool {
             let o2 = order.clone();
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
+                .stack_size(super::RANKED_WORKER_STACK)
                 .start_handler(move |i| {
                     crate::hot_pool::record_top();
                     if let Some(&cpu) = o2.get(i) {
@@ -192,11 +193,54 @@ pub(crate) mod topology_pool {
                 })
                 .build_global()
             {
-                Ok(()) => Some(n),
+                Ok(()) => {
+                    super::RANKED_POOL_BUILT.store(true, std::sync::atomic::Ordering::Release);
+                    Some(n)
+                }
                 Err(_) => None,
             }
         }
     }
+}
+
+/// Stack size of the ranked topology pool's workers. Large enough that a
+/// whole prove may run on a worker (the ranked seed-pipe body does, see
+/// `flock-prover/src/seed_pipe.rs`); the main thread that runs the untimed
+/// warm-up proves has 8 MiB. Virtual reservation only.
+pub const RANKED_WORKER_STACK: usize = 32 << 20;
+
+static RANKED_POOL_BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+std::thread_local! {
+    static POOL_OWNER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Mark the calling pool worker as the *owner* of the global pool: it runs a
+/// whole prove at the top of its stack with no enclosing parallel region, so
+/// the whole-pool `rayon::broadcast` pipelines (which otherwise require a
+/// caller outside the pool) may engage from it. Set and cleared by the ranked
+/// seed-pipe body only.
+pub fn set_pool_owner(on: bool) {
+    POOL_OWNER.with(|c| c.set(on));
+}
+
+/// Is the caller the designated pool owner (see [`set_pool_owner`])?
+#[inline]
+pub fn is_pool_owner() -> bool {
+    POOL_OWNER.with(|c| c.get())
+}
+
+/// Is the caller outside the pool, or its designated owner (see
+/// [`set_pool_owner`])?
+#[inline]
+pub fn owns_whole_pool() -> bool {
+    rayon::current_thread_index().is_none() || POOL_OWNER.with(|c| c.get())
+}
+
+/// True once the ranked topology pool (workers with [`RANKED_WORKER_STACK`]
+/// stacks) is the global pool.
+pub fn ranked_pool_built() -> bool {
+    RANKED_POOL_BUILT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Per-core SMT arm partition for zerocheck round 1 (Linux/x86-64).

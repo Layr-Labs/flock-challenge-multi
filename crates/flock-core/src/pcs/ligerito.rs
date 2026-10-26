@@ -8331,6 +8331,14 @@ struct DirectFold8L1Precommit {
 /// single fused f+b pass.
 #[inline]
 #[allow(dead_code)] // Selector is consumed only by the ranked AVX-512 route.
+/// `FLOCK_NO_F8B_OVERLAP=1` restores the basis build inside the L1-commit
+/// join (after the witness fold). Read once.
+fn direct_fold8_b_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_F8B_OVERLAP").is_none());
+    *ON
+}
+
 fn direct_fold8_l1_precommit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none());
@@ -8437,7 +8445,7 @@ unsafe fn materialize_direct_fold8_b_gfni_block_x86(
     e_hi1: F128,
     block_len: usize,
     b_out: &mut [F128],
-    f_out: &[F128],
+    f_out: Option<&[F128]>,
     gfni_tmp: &mut [F128],
 ) -> (F128, F128) {
     use crate::pcs::ring_switch::compose_block_mats_gfni_into;
@@ -8475,7 +8483,10 @@ unsafe fn materialize_direct_fold8_b_gfni_block_x86(
                 gfni_tmp.as_mut_ptr().cast(),
             );
         }
-        msg_reduce_avx512(f_out, b_out)
+        match f_out {
+            Some(f_out) => msg_reduce_avx512(f_out, b_out),
+            None => (F128::ZERO, F128::ZERO),
+        }
     }
 }
 
@@ -8488,6 +8499,29 @@ unsafe fn materialize_direct_fold8_b_gfni_block_x86(
 ))]
 fn materialize_direct_fold8_b_gfni_for_precommit(
     folded_f: &[F128],
+    folded_b: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    block_len: usize,
+) -> (Vec<F128>, SumcheckMessage) {
+    materialize_direct_fold8_b_gfni_impl(Some(folded_f), folded_b, claims, challenges, block_len)
+}
+
+/// [`materialize_direct_fold8_b_gfni_for_precommit`] with the round-5
+/// message reduction optional: `folded_f = None` materializes only the
+/// basis (which never reads `f`) and returns a zero message, so the basis
+/// can be built while `folded_f` is still being folded; the message is then
+/// [`direct_fold8_msg_par`] -- the same XOR sum of the same per-slot
+/// products, so the bytes cannot depend on the split.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn materialize_direct_fold8_b_gfni_impl(
+    folded_f: Option<&[F128]>,
     mut folded_b: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
@@ -8497,9 +8531,11 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
 
     assert_eq!(claims.len(), 2);
     assert!(block_len.is_multiple_of(64));
-    assert_eq!(folded_b.len(), folded_f.len());
+    if let Some(folded_f) = folded_f {
+        assert_eq!(folded_b.len(), folded_f.len());
+    }
     assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_f.len()
+        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == folded_b.len()
     }));
 
     let direct_gfni_mats = [
@@ -8518,7 +8554,6 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
     const ALIGN64_MIN_F128: usize = (32 * 1024) / core::mem::size_of::<F128>();
     let stats = folded_b
         .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks(block_len))
         .enumerate()
         .map_init(
             || {
@@ -8527,7 +8562,8 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
                     crate::scratch::fold_buf_pool_enabled(),
                 )
             },
-            |gfni_tmp, (block, (b_out, f_out))| unsafe {
+            |gfni_tmp, (block, b_out)| unsafe {
+                let f_out = folded_f.map(|f| &f[block * block_len..(block + 1) * block_len]);
                 materialize_direct_fold8_b_gfni_block_x86(
                     &direct_gfni_mats,
                     &direct_gfni_rows,
@@ -8553,6 +8589,33 @@ fn materialize_direct_fold8_b_gfni_for_precommit(
         },
     )
 }
+/// The round-5 message of the folded state: per-block
+/// [`msg_reduce_avx512`] XOR-summed, exactly the reduction the fused basis
+/// pass performs (GF(2^128) addition is XOR, so the grouping is immaterial).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn direct_fold8_msg_par(folded_f: &[F128], folded_b: &[F128], block_len: usize) -> SumcheckMessage {
+    use rayon::prelude::*;
+    assert_eq!(folded_f.len(), folded_b.len());
+    let stats = folded_f
+        .par_chunks(block_len)
+        .zip(folded_b.par_chunks(block_len))
+        .map(|(f, b)| unsafe { msg_reduce_avx512(f, b) })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
+    SumcheckMessage {
+        u_0: stats.0,
+        u_2: stats.1,
+    }
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -8630,7 +8693,63 @@ fn materialize_direct_fold8(
                 out_len,
                 (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
             );
+            if direct_fold8_b_overlap_enabled() {
+                // The basis half of the join below never reads `folded_f`:
+                // build it UNDER the DRAM-bound 512 MiB witness fold (its
+                // GFNI work fills the issue slots the streaming fold leaves
+                // idle), then run the L1 commit beside the cheap message
+                // reduction. Same buffers in the same custody order.
+                let t_f8 = std::time::Instant::now();
+                let mut folded_f = crate::scratch::take_f128(out_len);
+                let folded_b = crate::scratch::take_f128(out_len);
+                let ((), (folded_b, _)) = rayon::join(
+                    || {
+                        materialize_direct_fold8_f_for_precommit(
+                            &packed_witness,
+                            &mut folded_f,
+                            block_len,
+                            &fold16_weight,
+                            r4,
+                            r5,
+                        )
+                    },
+                    || {
+                        materialize_direct_fold8_b_gfni_impl(
+                            None, folded_b, claims, challenges, block_len,
+                        )
+                    },
+                );
+                let t_f8a = t_f8.elapsed();
+                crate::scratch::give_f128(packed_witness);
+                crate::scratch::give_f128(ordinary_basis);
+                let (precommitted, msg) = rayon::join(
+                    || {
+                        let ntt = AdditiveNttF128::standard(
+                            precommit.log_msg_cols + precommit.log_inv_rate,
+                        );
+                        ligero_commit(
+                            &folded_f,
+                            precommit.log_msg_cols,
+                            precommit.log_num_interleaved,
+                            precommit.log_inv_rate,
+                            &ntt,
+                            precommit.kind,
+                        )
+                    },
+                    || direct_fold8_msg_par(&folded_f, &folded_b, block_len),
+                );
+                if open_timing() {
+                    eprintln!(
+                        "[f8] overlap: f-fold+basis {:.3} ms, commit+msg {:.3} ms",
+                        t_f8a.as_secs_f64() * 1e3,
+                        (t_f8.elapsed() - t_f8a).as_secs_f64() * 1e3
+                    );
+                }
+                return (folded_f, folded_b, msg, Some(precommitted));
+            }
+            let t_f8 = std::time::Instant::now();
             let mut folded_f = crate::scratch::take_f128(out_len);
+            let t_f8a = t_f8.elapsed();
             materialize_direct_fold8_f_for_precommit(
                 &packed_witness,
                 &mut folded_f,
@@ -8639,6 +8758,11 @@ fn materialize_direct_fold8(
                 r4,
                 r5,
             );
+            if open_timing() {
+                eprintln!("[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
+                    t_f8a.as_secs_f64()*1e3, (t_f8.elapsed()-t_f8a).as_secs_f64()*1e3, packed_witness.len()*16>>20);
+            }
+            let t_f8 = std::time::Instant::now();
             // Preserve incumbent buffer custody: acquire both folded outputs
             // before returning the much larger input to the shared pool.
             let folded_b = crate::scratch::take_f128(out_len);
@@ -8664,6 +8788,9 @@ fn materialize_direct_fold8(
                     )
                 },
             );
+            if open_timing() {
+                eprintln!("[f8] give+join {:.3} ms", t_f8.elapsed().as_secs_f64()*1e3);
+            }
             return (folded_f, folded_b, msg, Some(precommitted));
         }
     }

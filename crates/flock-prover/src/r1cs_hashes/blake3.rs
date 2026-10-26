@@ -1051,6 +1051,7 @@ impl Blake3AdjointPlan {
             roots: roots.into_boxed_slice(),
             children: builder.children.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
+            level_sched: Default::default(),
         }
     }
 
@@ -4491,11 +4492,13 @@ impl Blake3Setup {
         blocks: crate::seed_pipe::BlockSource<'_>,
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        flock_core::gaptime::abs("inner begin");
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 let (codeword, (z_packed, a_packed_f128, b_packed_f128, ab_inner)) =
                     crate::prover::in_witness_phase_pool(self.r1cs.m, || {
+                        flock_core::gaptime::abs("witness pool entered");
                         flock_core::gaptime::mark("witness: pool entered");
                         let r = flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                             generate_witness_with_ab_packed_and_round1_inner_from(
@@ -4503,6 +4506,9 @@ impl Blake3Setup {
                                 self.n_blocks_log(),
                             )
                         });
+                        // Witness jobs are all retired: release the pre-seed
+                        // spinners (no-op unless the hot seed wait started them).
+                        flock_core::gaptime::abs("witness done");
                         flock_core::gaptime::mark("witness: work done (incl. prefault)");
                         r
                     });

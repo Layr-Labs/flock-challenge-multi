@@ -166,6 +166,7 @@ impl R1csProofBundleLigerito {
         // last field reproduces the single-shot encode byte-for-byte; the
         // fingerprint gate below guarantees the stash is for THIS bundle.
         if let Some(mut out) = take_matching_pre_encoded(self) {
+            flock_core::gaptime::abs("stash taken");
             encode_pcs_open_into(&mut out, &self.proof.pcs_open);
             return out;
         }
@@ -194,6 +195,21 @@ impl R1csProofBundleLigerito {
         }
         out
     }
+    /// The stashed-prefix fast path of [`Self::to_bytes`], split for writing
+    /// straight into a destination of known size. `None` (stash absent or
+    /// not this bundle's, or the fast encoder disabled) leaves the stash
+    /// untouched only in the disabled case; callers fall back to
+    /// [`Self::to_bytes`], whose full encode needs no stash.
+    pub(crate) fn raw_encoding(&self) -> Option<RawEncoding> {
+        if !fast_pcs_open_encode_enabled() {
+            return None;
+        }
+        let prefix = take_matching_pre_encoded(self)?;
+        let mut count = CountSink(prefix.len());
+        encode_pcs_open_flat(&mut count, &self.proof.pcs_open);
+        Some(RawEncoding { prefix, total: count.0 })
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
@@ -494,6 +510,172 @@ fn fast_pcs_open_encode_enabled() -> bool {
         && *ON.get_or_init(|| std::env::var("FLOCK_NO_FAST_ENCODE").map_or(true, |v| v != "1"))
 }
 
+/// Destination of the flat encoder.
+pub(crate) trait ByteSink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// Counts the bytes the flat encoder would emit.
+pub(crate) struct CountSink(pub(crate) usize);
+
+impl ByteSink for CountSink {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.0 += bytes.len();
+    }
+}
+
+/// Writes into a caller-owned raw region of `cap` bytes.
+struct RawSink {
+    ptr: *mut u8,
+    pos: usize,
+    cap: usize,
+}
+
+impl ByteSink for RawSink {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        assert!(bytes.len() <= self.cap - self.pos, "raw sink overflow");
+        // SAFETY: `ptr..ptr+cap` is writable (see `RawEncoding::write`), the
+        // bound is checked above, and the source is a live borrow that cannot
+        // alias the destination.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.pos), bytes.len()) };
+        self.pos += bytes.len();
+    }
+}
+
+/// Plans the encoding as a list of `(dst offset, src address, len)` copies
+/// without touching the destination. Large fields are referenced in place
+/// (borrows of the bundle / prefix that outlive the plan); small ones are
+/// staged into fixed-capacity side buffers -- never reallocated, so their
+/// addresses stay valid -- and runs of them merge into single copies.
+struct PlanSink {
+    pos: usize,
+    small: Vec<Vec<u8>>,
+    jobs: Vec<(usize, usize, usize)>,
+}
+
+const PLAN_SMALL_MAX: usize = 64;
+const PLAN_SMALL_CHUNK: usize = 16 << 10;
+
+impl ByteSink for PlanSink {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        let src = if len > PLAN_SMALL_MAX {
+            bytes.as_ptr() as usize
+        } else {
+            if self
+                .small
+                .last()
+                .is_none_or(|cur| cur.capacity() - cur.len() < len)
+            {
+                self.small.push(Vec::with_capacity(PLAN_SMALL_CHUNK));
+            }
+            let cur = self.small.last_mut().expect("chunk pushed above");
+            let at = cur.len();
+            cur.extend_from_slice(bytes); // within capacity: no reallocation
+            cur.as_ptr() as usize + at
+        };
+        match self.jobs.last_mut() {
+            Some(last) if last.0 + last.2 == self.pos && last.1 + last.2 == src => last.2 += len,
+            _ => self.jobs.push((self.pos, src, len)),
+        }
+        self.pos += len;
+    }
+}
+
+/// A bundle's publish encoding, split so the caller can size or pick its
+/// destination before writing: the stashed `header ‖ commitment ‖ zerocheck
+/// ‖ lincheck` prefix plus the exact total length.
+pub(crate) struct RawEncoding {
+    prefix: Vec<u8>,
+    total: usize,
+}
+
+impl RawEncoding {
+    pub(crate) fn len(&self) -> usize {
+        self.total
+    }
+
+    /// The bytes `to_bytes()` returns (its stashed-prefix fast path).
+    pub(crate) fn into_bytes(self, bundle: &R1csProofBundleLigerito) -> Vec<u8> {
+        let mut out = self.prefix;
+        encode_pcs_open_into(&mut out, &bundle.proof.pcs_open);
+        out
+    }
+
+    /// Write exactly `self.len()` bytes -- byte-identical to `to_bytes()` --
+    /// to `dst`, serially.
+    ///
+    /// # Safety
+    /// `dst..dst + self.len()` writable and not aliasing `bundle`.
+    pub(crate) unsafe fn write(self, bundle: &R1csProofBundleLigerito, dst: *mut u8) {
+        let mut sink = RawSink { ptr: dst, pos: 0, cap: self.total };
+        sink.put(&self.prefix);
+        encode_pcs_open_flat(&mut sink, &bundle.proof.pcs_open);
+        assert_eq!(sink.pos, self.total);
+    }
+
+    /// [`Self::write`] spread over the Rayon pool: one serial pass plans every
+    /// copy (without touching `dst`), then the copies run in ~32 KiB tasks.
+    /// Offsets are fixed by the plan, so the bytes cannot depend on the
+    /// schedule.
+    ///
+    /// # Safety
+    /// As [`Self::write`].
+    pub(crate) unsafe fn write_par(self, bundle: &R1csProofBundleLigerito, dst: *mut u8) {
+        use rayon::prelude::*;
+        const PIECE: usize = 32 << 10;
+        let mut plan = PlanSink {
+            pos: 0,
+            small: Vec::new(),
+            jobs: Vec::with_capacity(1024),
+        };
+        plan.put(&self.prefix);
+        encode_pcs_open_flat(&mut plan, &bundle.proof.pcs_open);
+        assert_eq!(plan.pos, self.total);
+        let mut tasks: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(self.total / PIECE + 2);
+        let mut cur: Vec<(usize, usize, usize)> = Vec::new();
+        let mut cur_len = 0usize;
+        for &(mut d, mut s, mut len) in &plan.jobs {
+            while len > 0 {
+                let take = len.min(PIECE - cur_len);
+                cur.push((d, s, take));
+                cur_len += take;
+                d += take;
+                s += take;
+                len -= take;
+                if cur_len == PIECE {
+                    tasks.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            tasks.push(cur);
+        }
+        let base = dst as usize;
+        tasks.par_iter().for_each(|task| {
+            for &(d, s, len) in task {
+                // SAFETY: the plan's ranges tile `0..total` disjointly; each
+                // source is a live borrow of `bundle`, `self.prefix` or
+                // `plan.small`, all alive until this loop ends.
+                unsafe { std::ptr::copy_nonoverlapping(s as *const u8, (base + d) as *mut u8, len) };
+            }
+        });
+        drop(plan);
+        drop(self.prefix);
+    }
+}
+
 /// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
@@ -502,6 +684,12 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
         return;
     }
+    encode_pcs_open_flat(out, p);
+}
+
+/// The flat encoder body, generic over where the bytes go (a `Vec`, a raw
+/// destination, or a byte counter). Same field order for every sink.
+fn encode_pcs_open_flat<S: ByteSink>(out: &mut S, p: &BatchOpeningProofLigerito) {
     let BatchOpeningProofLigerito {
         ring_switches,
         ligerito,
@@ -522,7 +710,7 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ood_values,
         fold_grinding_nonces,
     } = ligerito;
-    out.extend_from_slice(initial_root);
+    out.put(initial_root);
     put_recursive_proof(out, initial_proof);
     put_hash_vec(out, recursive_roots);
     put_u64(out, recursive_proofs.len() as u64);
@@ -548,7 +736,7 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
     put_u64_vec(out, fold_grinding_nonces);
 }
 
-fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
+fn put_recursive_proof<S: ByteSink>(out: &mut S, rp: &RecursiveProof) {
     let RecursiveProof {
         opened_rows,
         merkle_proof,
@@ -558,18 +746,18 @@ fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
 }
 
 #[inline]
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+fn put_u64<S: ByteSink>(out: &mut S, v: u64) {
+    out.put(&v.to_le_bytes());
 }
 
 #[inline]
-fn put_f128(out: &mut Vec<u8>, v: F128) {
+fn put_f128<S: ByteSink>(out: &mut S, v: F128) {
     put_u64(out, v.lo);
     put_u64(out, v.hi);
 }
 
 #[inline]
-fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
+fn put_f128_vec<S: ByteSink>(out: &mut S, v: &[F128]) {
     put_u64(out, v.len() as u64);
     // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
     // (size 16, no padding), so on a little-endian target the in-memory bytes
@@ -577,24 +765,24 @@ fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
     // The fast path is compile-time gated to little-endian above.
     let bytes =
         unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
-    out.extend_from_slice(bytes);
+    out.put(bytes);
 }
 
 #[inline]
-fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
+fn put_hash_vec<S: ByteSink>(out: &mut S, v: &[MerkleHash]) {
     put_u64(out, v.len() as u64);
-    out.extend_from_slice(v.as_flattened());
+    out.put(v.as_flattened());
 }
 
 #[inline]
-fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
+fn put_u64_vec<S: ByteSink>(out: &mut S, v: &[u64]) {
     put_u64(out, v.len() as u64);
     for &x in v {
         put_u64(out, x);
     }
 }
 
-fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
+fn put_rows<S: ByteSink>(out: &mut S, rows: &[Vec<F128>]) {
     put_u64(out, rows.len() as u64);
     for row in rows {
         put_f128_vec(out, row);

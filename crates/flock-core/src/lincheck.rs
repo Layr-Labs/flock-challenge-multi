@@ -207,6 +207,86 @@ pub struct LinearFoldPlan {
     pub roots: Box<[usize]>,
     pub children: Box<[[u32; 2]]>,
     pub outputs: Box<[(usize, u32)]>,
+    /// Level-ordered copy of `children`/`outputs` (see [`LevelSched`]),
+    /// derived on first use from the fields above; never part of the plan's
+    /// meaning. Construct with `Default::default()`.
+    pub level_sched: std::sync::OnceLock<LevelSched>,
+}
+
+/// The same XOR DAG with its internal nodes renumbered by depth (leaves and
+/// zero are depth 0; a node is one deeper than its deeper child), ties in
+/// original order. `children` is emitted child-before-parent by a DFS, so in
+/// the original numbering most nodes consume the node stored just before
+/// them and the evaluation loop runs at store-forwarding latency per node.
+/// In depth order every node of a level is independent of the others, so
+/// consecutive iterations overlap. Each node is still the XOR of the same two
+/// values, hence every reconstructed wire is bit-identical.
+pub struct LevelSched {
+    k: usize,
+    children: Box<[[u32; 2]]>,
+    outputs: Box<[(u32, u32)]>,
+}
+
+impl LevelSched {
+    fn build(plan: &LinearFoldPlan, k: usize) -> Option<Self> {
+        let n = plan.children.len();
+        let base = k + 1;
+        if base + n > u32::MAX as usize {
+            return None;
+        }
+        let mut level = vec![0u32; n];
+        for (i, &[a, b]) in plan.children.iter().enumerate() {
+            let depth = |x: u32| -> Option<u32> {
+                let x = x as usize;
+                if x < base {
+                    Some(0)
+                } else if x - base < i {
+                    Some(level[x - base])
+                } else {
+                    None
+                }
+            };
+            level[i] = 1 + depth(a)?.max(depth(b)?);
+        }
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(|&i| (level[i as usize], i));
+        let mut pos = vec![0u32; n];
+        for (new, &old) in order.iter().enumerate() {
+            pos[old as usize] = (base + new) as u32;
+        }
+        let map = |x: u32| -> u32 {
+            if (x as usize) < base {
+                x
+            } else {
+                pos[x as usize - base]
+            }
+        };
+        let children = order
+            .iter()
+            .map(|&old| {
+                let [a, b] = plan.children[old as usize];
+                [map(a), map(b)]
+            })
+            .collect();
+        let mut outputs = Vec::with_capacity(plan.outputs.len());
+        for &(col, node) in plan.outputs.iter() {
+            if col >= k || node as usize >= base + n {
+                return None;
+            }
+            outputs.push((col as u32, map(node)));
+        }
+        Some(Self {
+            k,
+            children,
+            outputs: outputs.into_boxed_slice(),
+        })
+    }
+}
+
+fn level_sched_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_LEVEL_SCHED").is_none());
+    *ON
 }
 
 impl LinearFoldPlan {
@@ -246,6 +326,18 @@ impl LinearFoldPlan {
 
     #[inline(always)]
     fn reconstruct_fallback(&self, folded: &[F128], k: usize) -> Vec<F128> {
+        if level_sched_enabled() {
+            let sched = self.level_sched.get_or_init(|| {
+                LevelSched::build(self, k).unwrap_or(LevelSched {
+                    k: usize::MAX,
+                    children: Box::new([]),
+                    outputs: Box::new([]),
+                })
+            });
+            if sched.k == k {
+                return self.reconstruct_level(sched, folded, k);
+            }
+        }
         let total = k + 1 + self.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
         let mut nodes = if live_cols <= k {
@@ -274,6 +366,45 @@ impl LinearFoldPlan {
         }
         for &(col, node) in self.outputs.iter() {
             let node = node as usize;
+            debug_assert!(col < k && node < total);
+            unsafe {
+                *nodes.get_unchecked_mut(col) = *nodes.get_unchecked(node);
+            }
+        }
+        nodes.truncate(k);
+        nodes
+    }
+
+    #[inline(always)]
+    fn reconstruct_level(&self, sched: &LevelSched, folded: &[F128], k: usize) -> Vec<F128> {
+        let total = k + 1 + sched.children.len();
+        let live_cols = self.roots.len() + self.outputs.len();
+        let mut nodes = if live_cols <= k {
+            let mut v = crate::alloc_uninit_vec::<F128>(total);
+            v[live_cols..=k].fill(F128::ZERO);
+            v
+        } else {
+            vec![F128::ZERO; total]
+        };
+        debug_assert!(folded.len() >= self.roots.len());
+        for (&col, &value) in self.roots.iter().zip(folded) {
+            debug_assert!(col < k);
+            unsafe {
+                *nodes.get_unchecked_mut(col) = value;
+            }
+        }
+        let base = k + 1;
+        for (i, &[a, b]) in sched.children.iter().enumerate() {
+            let a = a as usize;
+            let b = b as usize;
+            debug_assert!(a < base + i && b < base + i);
+            unsafe {
+                let sum = *nodes.get_unchecked(a) + *nodes.get_unchecked(b);
+                *nodes.get_unchecked_mut(base + i) = sum;
+            }
+        }
+        for &(col, node) in sched.outputs.iter() {
+            let (col, node) = (col as usize, node as usize);
             debug_assert!(col < k && node < total);
             unsafe {
                 *nodes.get_unchecked_mut(col) = *nodes.get_unchecked(node);
@@ -2235,6 +2366,14 @@ fn lc_gather4_enabled() -> bool {
 /// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
 /// kicked z-fold before `fold_alpha_batched` instead of after (exact
 /// same-binary A/B; the overlap changes scheduling only).
+/// `FLOCK_NO_LC_COMB_ZFOLD_JOIN=1` runs the comb build before the z fold
+/// (same values, same transcript order) instead of beside it.
+fn lc_comb_zfold_join_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_COMB_ZFOLD_JOIN").is_none());
+    *ON
+}
+
 fn lc_alpha_overlap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ALPHA_OVERLAP").is_none());
@@ -4856,99 +4995,127 @@ fn prove_padded_inner<Ch: Challenger>(
     // caller merely queues a second pool-wide job instead of parking.
     // `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order.
     let overlap = lc_alpha_overlap_enabled();
-    let mut kicked_z_vec = None;
-    if !overlap {
-        let t_wait = if trace {
+    // Partial fold of z at the shared outer half (length-k F128 vector). A
+    // last-ρ kick already produced the same one-shot ẑ; reuse it.
+    let fold_z = |kicked: Option<Vec<F128>>| -> Vec<F128> {
+        let t = if trace {
             Some(std::time::Instant::now())
         } else {
             None
         };
-        kicked_z_vec = wait_last_rho_z_fold();
-        if let Some(t) = t_wait {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "wait kicked z-fold",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-    }
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "fold_alpha_batched",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    if overlap {
-        let t_wait = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        kicked_z_vec = wait_last_rho_z_fold();
-        if let Some(t) = t_wait {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "wait kicked z-fold (overlapped)",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-    }
-
-    // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
-    //     also proves z_vec[j*] = 1 (the all-ones constant column). Since j* is a
-    //     boolean index, eq(j*, ·) is the one-hot vector and this is a single
-    //     entry update. β is sampled after α; the verifier mirrors both. See
-    //     docs/const-wire-pin.md.
-    if let Some(col) = circuit.const_pin_col() {
-        let beta = challenger.sample_f128();
-        comb_vec[col] += beta;
-    }
-
-    // 3. Partial fold of z at the shared outer half (length-k F128 vector).
-    //    A last-ρ kick already produced the same one-shot ẑ; reuse it.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let mut z_vec = match (kicked_z_vec, z_packed) {
-        (Some(z), PackedZ::BlockMajor(_, _)) => z,
-        (kicked, z_packed) => {
-            debug_assert!(
-                kicked.is_none(),
-                "last-ρ kick is BlockMajor-only; stripe path must not be prepared"
-            );
-            match z_packed {
-                PackedZ::LincheckStripe(z) => {
-                    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-                    partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
-                }
-                PackedZ::BlockMajor(z, roots) => {
-                    if let Some(roots) = roots {
-                        roots.fold(z, m, &x_ab.x_outer)
-                    } else if let Some(plan) = circuit.root_fold_plan() {
-                        RootFoldSource::new(z, k_log, plan).fold(z, m, &x_ab.x_outer)
-                    } else {
-                        fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+        let z_vec = match (kicked, z_packed) {
+            (Some(z), PackedZ::BlockMajor(_, _)) => z,
+            (kicked, z_packed) => {
+                debug_assert!(
+                    kicked.is_none(),
+                    "last-ρ kick is BlockMajor-only; stripe path must not be prepared"
+                );
+                match z_packed {
+                    PackedZ::LincheckStripe(z) => {
+                        let eq_x_outer = build_eq_table(&x_ab.x_outer);
+                        partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
+                    }
+                    PackedZ::BlockMajor(z, roots) => {
+                        if let Some(roots) = roots {
+                            roots.fold(z, m, &x_ab.x_outer)
+                        } else if let Some(plan) = circuit.root_fold_plan() {
+                            RootFoldSource::new(z, k_log, plan).fold(z, m, &x_ab.x_outer)
+                        } else {
+                            fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                        }
                     }
                 }
             }
+        };
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "partial_fold_z",
+                t.elapsed().as_secs_f64() * 1e3
+            );
         }
+        z_vec
     };
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "partial_fold_z",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
+    // 2. Build the α-batched comb_vec via the circuit's per-block fold, plus
+    //    the constant-wire pin (2b): β·eq(j*, ·) folded into the comb so the
+    //    same sumcheck also proves z_vec[j*] = 1. β is sampled right after α
+    //    with no transcript operation in between, exactly as the verifier
+    //    does (see docs/const-wire-pin.md).
+    let fold_comb = |beta: Option<(usize, F128)>| -> Vec<F128> {
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "fold_alpha_batched",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if let Some((col, beta)) = beta {
+            comb_vec[col] += beta;
+        }
+        comb_vec
+    };
+    let (mut comb_vec, mut z_vec) = if overlap && lc_comb_zfold_join_enabled() {
+        // The z fold needs only the zerocheck point and the witness; the comb
+        // needs only α, β and the circuit. Neither reads the other, nor the
+        // transcript, so they run side by side: the serial adjoint walk of
+        // `fold_alpha_batched` hides under the pool-wide GFNI fold instead of
+        // preceding it. The challenger sees α then β, as before.
+        let kicked = wait_last_rho_z_fold();
+        let beta = circuit
+            .const_pin_col()
+            .map(|col| (col, challenger.sample_f128()));
+        if kicked.is_some() {
+            let comb_vec = fold_comb(beta);
+            (comb_vec, fold_z(kicked))
+        } else {
+            rayon::join(|| fold_comb(beta), || fold_z(None))
+        }
+    } else {
+        let mut kicked_z_vec = None;
+        if !overlap {
+            let t_wait = if trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            kicked_z_vec = wait_last_rho_z_fold();
+            if let Some(t) = t_wait {
+                eprintln!(
+                    "[lc] {:<26} {:>7.2} ms",
+                    "wait kicked z-fold",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        let mut comb_vec = fold_comb(None);
+        if overlap {
+            let t_wait = if trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            kicked_z_vec = wait_last_rho_z_fold();
+            if let Some(t) = t_wait {
+                eprintln!(
+                    "[lc] {:<26} {:>7.2} ms",
+                    "wait kicked z-fold (overlapped)",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        if let Some(col) = circuit.const_pin_col() {
+            let beta = challenger.sample_f128();
+            comb_vec[col] += beta;
+        }
+        let z_vec = fold_z(kicked_z_vec);
+        (comb_vec, z_vec)
+    };
     // At the ranked shape, the first lincheck bind and the downstream Fold8
     // map use the same halves and challenge. Capture that output directly.
     let fold8_ready = capture == ZCaptureMode::RankedFold8Tail

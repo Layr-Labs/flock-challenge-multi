@@ -53,3 +53,29 @@ pub fn mark(label: &str) {
     let t_ms = now.saturating_sub(begin) as f64 / 1e6;
     eprintln!("[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}");
 }
+
+// TEMP-ABS-TRACE
+#[repr(C)]
+struct Ts { s: i64, ns: i64 }
+unsafe extern "C" { fn clock_gettime(clk: i32, ts: *mut Ts) -> i32; }
+pub fn abs_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_ABS_TRACE").is_some());
+    *ON
+}
+static ABS_BUF: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
+pub fn abs(label: &'static str) {
+    if !abs_enabled() { return; }
+    let mut t = Ts { s: 0, ns: 0 };
+    unsafe { clock_gettime(1, &mut t) };
+    let ns = t.s as u64 * 1_000_000_000 + t.ns as u64;
+    ABS_BUF.lock().unwrap().push((ns, label));
+}
+pub fn abs_flush() {
+    if !abs_enabled() { return; }
+    let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+    let minflt = f.get(7).copied().unwrap_or("?");
+    for (ns, l) in ABS_BUF.lock().unwrap().drain(..) {
+        eprintln!("[abs] {ns} {l} minflt={minflt}");
+    }
+}

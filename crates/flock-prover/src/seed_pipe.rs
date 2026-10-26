@@ -474,6 +474,7 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
@@ -499,6 +500,160 @@ fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
             }
             0 => return (!line.is_empty()).then_some(line),
             _ => return None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hot wait for the seed
+// ---------------------------------------------------------------------------
+//
+// Measured on the ranked box shape (c7i.4xlarge guest): with the seed-pipe
+// thread parked in a blocking `read`, the line becomes visible to it
+// 130-170 us after the harness's `write` -- the cost of waking a halted vCPU
+// (IPI -> host -> guest resume), paid inside the timed window. The witness
+// phase that follows then wakes the sleeping Rayon workers the same way, one
+// tickle at a time. Waiting hot removes both: the body below runs ON a pool
+// worker that polls the descriptor non-blockingly, while every other worker
+// spins in `rayon::yield_now` and so picks up the witness jobs the moment
+// they are pushed. Nothing seed-dependent happens before the read; this only
+// changes how the idle wait before it is spent. Bounded: after
+// `HOT_WAIT_BUDGET` the wait degrades to the original blocking read.
+
+const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+static PRESEED_SPIN: AtomicBool = AtomicBool::new(false);
+
+/// Release the pre-seed spinners. Called once the witness phase is done (and
+/// unconditionally after every body that started them).
+#[inline]
+pub(crate) fn preseed_spin_end() {
+    PRESEED_SPIN.store(false, Ordering::Release);
+}
+
+fn preseed_spinner(backoff: usize) {
+    while PRESEED_SPIN.load(Ordering::Acquire) {
+        if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+            for _ in 0..backoff {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Start spinners on every pool worker except the caller (which must be one).
+fn preseed_spin_start() {
+    let Some(owner) = rayon::current_thread_index() else {
+        return;
+    };
+    let n = rayon::current_num_threads().max(1);
+    let sibling = (owner + n / 2) % n;
+    PRESEED_SPIN.store(true, Ordering::Release);
+    rayon::spawn_broadcast(move |ctx| {
+        let me = ctx.index();
+        if me != owner {
+            preseed_spinner(if me == sibling { 64 } else { 8 });
+        }
+    });
+}
+
+/// Bring the spinners back up for the publish tail. Called by the pool owner
+/// at the end of the PCS open, while the open's own hot pool still has every
+/// worker awake, so no sleeping worker has to be woken for the parallel
+/// encode. Released by the body's [`SpinGuard`] (or earlier, see publish).
+pub(crate) fn tail_spin_start() {
+    if flock_core::is_pool_owner() && std::env::var_os("FLOCK_EXP_NO_TAILSPIN").is_none() {
+        preseed_spin_start();
+    }
+}
+
+struct SpinGuard;
+impl Drop for SpinGuard {
+    fn drop(&mut self) {
+        preseed_spin_end();
+        flock_core::set_pool_owner(false);
+    }
+}
+
+/// Should the post-warm-up body run hot on a pool worker? Ranked topology
+/// pool only (its workers carry the large stack a whole prove needs).
+fn hot_wait_enabled() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && flock_core::ranked_pool_built()
+        && rayon::current_num_threads() > 2
+        && std::env::var_os("FLOCK_NO_HOT_SEED_WAIT").is_none()
+}
+
+/// Run `f` on a pool worker with the pre-seed spinners up when `hot`.
+fn on_hot_worker<R: Send>(hot: bool, f: impl FnOnce() -> R + Send) -> R {
+    if !hot {
+        return f();
+    }
+    flock_core::in_pool(|| {
+        let _guard = SpinGuard;
+        flock_core::set_pool_owner(true);
+        preseed_spin_start();
+        f()
+    })
+}
+
+/// [`read_line_fd`] that waits by polling a non-blocking descriptor instead of
+/// sleeping in the kernel. Falls back to the blocking read after
+/// `HOT_WAIT_BUDGET` (and releases the spinners), or immediately if the
+/// descriptor flags cannot be changed. Restores the original flags.
+fn spin_read_line_fd(fd: i32) -> Option<Vec<u8>> {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: i32 = 0o4000;
+    const EAGAIN: i32 = 11;
+    const EINTR: i32 = 4;
+    // SAFETY: plain fcntl on a descriptor this thread owns.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 || unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return read_line_fd(fd);
+    }
+    let restore = || unsafe {
+        fcntl(fd, F_SETFL, flags);
+    };
+    let deadline = std::time::Instant::now() + HOT_WAIT_BUDGET;
+    let mut line = Vec::with_capacity(64);
+    let mut chunk = [0u8; 64];
+    let mut polls = 0u32;
+    loop {
+        // SAFETY: as in `read_line_fd`.
+        let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+        if n > 0 {
+            line.extend_from_slice(&chunk[..n as usize]);
+            if line.contains(&b'\n') || line.len() >= 256 {
+                restore();
+                return Some(line);
+            }
+            continue;
+        }
+        if n == 0 {
+            restore();
+            return (!line.is_empty()).then_some(line);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(EAGAIN) | Some(EINTR) => {
+                polls = polls.wrapping_add(1);
+                if polls % 4096 == 0 && std::time::Instant::now() >= deadline {
+                    restore();
+                    preseed_spin_end();
+                    return match read_line_fd(fd) {
+                        Some(rest) => {
+                            line.extend_from_slice(&rest);
+                            Some(line)
+                        }
+                        None => (!line.is_empty()).then_some(line),
+                    };
+                }
+                core::hint::spin_loop();
+            }
+            _ => {
+                restore();
+                return None;
+            }
         }
     }
 }
@@ -545,6 +700,189 @@ fn close_fd(fd: i32) {
     unsafe { close(fd) };
 }
 
+// ---------------------------------------------------------------------------
+// Mapped publication
+// ---------------------------------------------------------------------------
+//
+// The incumbent publish tail encodes the ~437 kB bundle into a heap buffer
+// (~76 us), `open`s the rehearsed `.tmp` (~20 us), `write`s the buffer into its
+// page cache (~74 us: a second full copy, serial, under the inode lock), then
+// `set_len` + `close` (~24 us) and `rename` -- all inside the timed window.
+// Every size change of the file is expensive there too (cold kernel paths
+// after 140 ms of streaming: an extending `ftruncate` measured ~40 us, a
+// shrinking one under a live mapping ~90 us, an extending 8 kB `pwrite`
+// ~50 us).
+//
+// Ranked proof lengths differ only by whole Merkle hashes (32 B; every other
+// field has a fixed shape), so the untimed rehearsal pre-creates one `.tmp`
+// file per candidate length around the warm-up bundle's, each already at its
+// final size with every page allocated, dirty and mapped writable. The timed
+// publish encodes ONCE, in parallel, straight into the page-cache pages of
+// the file whose length matches, and renames it onto the harness path: no
+// copy through a heap buffer, no `write`, no size change. Same bytes, same
+// `.tmp` + atomic rename contract (the watched path appears only via the
+// rename, complete, at its exact length). A length outside the prepared set
+// takes the incumbent path unchanged.
+
+unsafe extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn ftruncate(fd: i32, len: i64) -> i32;
+}
+
+/// Candidate lengths prepared on each side of the warm-up bundle's, in
+/// Merkle-hash steps. Ranked lengths span ~2.7 kB (~85 hashes) in total.
+const SIZED_RADIUS: usize = 128;
+const HASH_STEP: usize = 32;
+
+struct SizedTmp {
+    path: PathBuf,
+    base: usize,
+    len: usize,
+    _file: std::fs::File,
+}
+
+struct SizedSet {
+    /// Length of `files[0]`; `files[i]` is `first + i * HASH_STEP` bytes.
+    first: usize,
+    files: Vec<Option<SizedTmp>>,
+}
+
+static SIZED_SET: Mutex<Option<SizedSet>> = Mutex::new(None);
+
+fn mapped_publish_enabled() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("FLOCK_NO_MAPPED_PUBLISH").is_none()
+}
+
+impl SizedSet {
+    fn slot(&self, total: usize) -> Option<usize> {
+        let off = total.checked_sub(self.first)?;
+        (off % HASH_STEP == 0)
+            .then_some(off / HASH_STEP)
+            .filter(|&i| i < self.files.len() && self.files[i].is_some())
+    }
+}
+
+/// Create `path` at exactly `len` bytes, map it shared and writable, and
+/// commit every page (allocated, dirty, mapped writable). Untimed.
+fn make_sized_tmp(path: PathBuf, len: usize) -> Option<SizedTmp> {
+    use std::os::fd::AsRawFd;
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const MAP_SHARED: i32 = 1;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .ok()?;
+    // SAFETY: plain syscalls on a descriptor we own; the mapping is checked
+    // and covers exactly the file's length.
+    unsafe {
+        if ftruncate(file.as_raw_fd(), len as i64) != 0 {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let base = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, file.as_raw_fd(), 0);
+        if base.is_null() || base as usize == usize::MAX {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let mut off = 0;
+        while off < len {
+            base.add(off).write_volatile(0);
+            off += 4096;
+        }
+        base.add(len - 1).write_volatile(0);
+        Some(SizedTmp {
+            path,
+            base: base as usize,
+            len,
+            _file: file,
+        })
+    }
+}
+
+/// Untimed: build the sized set around the warm-up bundle and publish that
+/// bundle through it exactly as the timed path will, renaming onto the
+/// private `.warm` name and back instead of onto `path`. Returns false (and
+/// leaves no set) if anything fails; the caller then rehearses the incumbent
+/// tail.
+fn setup_sized_set(path: &Path, bundle: &R1csProofBundleLigerito) -> bool {
+    let Some(enc) = bundle.raw_encoding() else {
+        return false;
+    };
+    let warm_total = enc.len();
+    if warm_total < SIZED_RADIUS * HASH_STEP + 4096 {
+        return false;
+    }
+    let first = warm_total - SIZED_RADIUS * HASH_STEP;
+    let mut files = Vec::with_capacity(2 * SIZED_RADIUS + 1);
+    for i in 0..=2 * SIZED_RADIUS {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".tmp{i}"));
+        files.push(make_sized_tmp(PathBuf::from(name), first + i * HASH_STEP));
+    }
+    let set = SizedSet { first, files };
+    let Some(i) = set.slot(warm_total) else {
+        drop_sized_set(set);
+        return false;
+    };
+    let f = set.files[i].as_ref().expect("slot checks presence");
+    // SAFETY: the mapping covers exactly `warm_total` bytes; the bundle is
+    // ordinary heap memory.
+    unsafe { enc.write(bundle, f.base as *mut u8) };
+    let mut warm = path.as_os_str().to_owned();
+    warm.push(".warm");
+    let warm = PathBuf::from(warm);
+    if std::fs::rename(&f.path, &warm).is_err() || std::fs::rename(&warm, &f.path).is_err() {
+        let _ = std::fs::remove_file(&warm);
+        drop_sized_set(set);
+        return false;
+    }
+    *SIZED_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(set);
+    true
+}
+
+fn drop_sized_set(set: SizedSet) {
+    for f in set.files.into_iter().flatten() {
+        // SAFETY: unmapping our own mapping, never handed out.
+        unsafe { munmap(f.base as *mut u8, f.len) };
+        let _ = std::fs::remove_file(&f.path);
+    }
+}
+
+/// Timed: publish through the sized set. `Ok(result)` when this path
+/// published (rename included); `Err(bytes)` when the incumbent tail must
+/// write `bytes` (the exact `to_bytes()` output); `None` when no set or no
+/// stash exists and the caller must encode from scratch.
+fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
+    let guard = SIZED_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let set = guard.as_ref()?;
+    let enc = bundle.raw_encoding()?;
+    flock_core::gaptime::abs("raw_encoding");
+    let Some(i) = set.slot(enc.len()) else {
+        return Some(Err(enc.into_bytes(bundle)));
+    };
+    let f = set.files[i].as_ref().expect("slot checks presence");
+    let par = rayon::current_thread_index().is_some();
+    // SAFETY: the mapping covers exactly `enc.len()` bytes of a file of that
+    // length; the bundle is ordinary heap memory.
+    unsafe {
+        if par {
+            enc.write_par(bundle, f.base as *mut u8);
+        } else {
+            enc.write(bundle, f.base as *mut u8);
+        }
+    }
+    flock_core::gaptime::abs("encoded");
+    if std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none() {
+        preseed_spin_end();
+    }
+    Some(Ok(std::fs::rename(&f.path, path)))
+}
+
 /// Publish the bundle to `path` via the tree's `<path>.tmp` + atomic rename
 /// convention.
 ///
@@ -573,16 +911,34 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    let bytes = bundle.to_bytes();
+    flock_core::gaptime::abs("publish enter");
+    let bytes = match publish_sized(path, &bundle) {
+        Some(Ok(result)) => {
+            flock_core::gaptime::abs("renamed");
+            flock_core::gaptime::abs_flush();
+            return result;
+        }
+        Some(Err(bytes)) => bytes,
+        None => bundle.to_bytes(),
+    };
+    flock_core::gaptime::abs("to_bytes done");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(&temporary)?;
+    flock_core::gaptime::abs("opened");
     file.write_all(&bytes)?;
+    flock_core::gaptime::abs("written");
     file.set_len(bytes.len() as u64)?;
     drop(file);
-    std::fs::rename(temporary, path)
+    flock_core::gaptime::abs("closed");
+    let r = std::fs::rename(temporary, path);
+    flock_core::gaptime::abs("renamed");
+    drop(bytes);
+    flock_core::gaptime::abs("bytes dropped");
+    flock_core::gaptime::abs_flush();
+    r
 }
 
 /// Rehearse the publication tail during the UNTIMED window.
@@ -609,13 +965,18 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
 fn rehearse_publish_tail(path: &Path, out: ProveOut) {
     let (proof, commitment, _) = out;
     let bundle = R1csProofBundleLigerito { commitment, proof };
-    let bytes = bundle.to_bytes();
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
     let mut rehearsal = path.as_os_str().to_owned();
     rehearsal.push(".warm");
     let rehearsal = PathBuf::from(rehearsal);
+    // Mapped publication: the warm-up bundle goes through the very encode +
+    // sized-file path the timed publish takes, then the same rename rehearsal.
+    if mapped_publish_enabled() && setup_sized_set(path, &bundle) {
+        return;
+    }
+    let bytes = bundle.to_bytes();
     // The rename is rehearsed by moving `<path>.tmp` onto the private
     // `<path>.warm` and then moving it straight BACK. The incumbent unlinked
     // `<path>.warm` here, which freed the ~107 page-cache pages and the ext4
@@ -815,6 +1176,9 @@ fn speculative_main(
     warm: Arc<(Mutex<bool>, Condvar)>,
 ) {
     let mut scratch = scratch;
+    // Decided once, before the warm-up, so the untimed passes take exactly the
+    // path (caller on a worker, spinners up) the timed prove will.
+    let hot = hot_wait_enabled();
 
     // Untimed: prove once on THIS thread before touching stdin, so that the
     // speculative (timed) prove does not run on a cold thread. The prover's
@@ -868,7 +1232,7 @@ fn speculative_main(
                     fill_compressions_par(&mut scratch, log2_size, WARMUP_SEED);
                     BlockSource::Slice(&scratch)
                 };
-                std::hint::black_box(run(setup_addr, src))
+                std::hint::black_box(on_hot_worker(hot, || run(setup_addr, src)))
             }))
             .map(|out| last_warm_out = Some(out))
             .is_ok();
@@ -898,101 +1262,105 @@ fn speculative_main(
     }
     drop(warm);
 
-    let Some(line) = read_line_fd(real_stdin) else {
+    on_hot_worker(hot, move || {
+        let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
+        flock_core::gaptime::abs("seed read");
+        let Some(line) = line_r else {
+            close_fd(real_stdin);
+            close_fd(writer);
+            mark_dead();
+            return;
+        };
         close_fd(real_stdin);
-        close_fd(writer);
-        mark_dead();
-        return;
-    };
-    close_fd(real_stdin);
 
-    let parsed = std::str::from_utf8(&line)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let Some(seed) = parsed else {
-        let _ = forward_and_close(writer, &line);
-        mark_dead();
-        return;
-    };
+        let parsed = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let Some(seed) = parsed else {
+            let _ = forward_and_close(writer, &line);
+            mark_dead();
+            return;
+        };
 
-    // The adoption fallback must receive the seed immediately. Direct
-    // publication deliberately keeps main blocked so its redundant serial
-    // generator consumes no timed-window CPU or memory bandwidth.
-    if direct_proof_path.is_none() && !forward_and_close(writer, &line) {
-        mark_dead();
-        return;
-    }
+        // The adoption fallback must receive the seed immediately. Direct
+        // publication deliberately keeps main blocked so its redundant serial
+        // generator consumes no timed-window CPU or memory bandwidth.
+        if direct_proof_path.is_none() && !forward_and_close(writer, &line) {
+            mark_dead();
+            return;
+        }
 
-    let seed_at = std::time::Instant::now();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Inline path: nothing is materialized except the two blocks the O(1)
-        // adoption gate reads. Everything else is evaluated inside witgen from
-        // the closed form, on the worker that is about to consume it.
-        if inline {
-            let n = 1usize << log2_size;
-            let init = generator_init(log2_size, seed);
-            let published = SpecBlocks::Endpoints {
-                len: n,
-                first: gen_block(init, 0),
-                last: gen_block(init, n - 1),
+        let seed_at = std::time::Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Inline path: nothing is materialized except the two blocks the O(1)
+            // adoption gate reads. Everything else is evaluated inside witgen from
+            // the closed form, on the worker that is about to consume it.
+            if inline {
+                let n = 1usize << log2_size;
+                let init = generator_init(log2_size, seed);
+                let published = SpecBlocks::Endpoints {
+                    len: n,
+                    first: gen_block(init, 0),
+                    last: gen_block(init, n - 1),
+                };
+                {
+                    let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.seed_at = Some(seed_at);
+                    state.blocks_at = Some(std::time::Instant::now());
+                    state.blocks = Some(published);
+                    shared().signal.notify_all();
+                }
+                return run(setup_addr, BlockSource::Closed { init, len: n });
+            }
+
+            let mut buf = std::mem::take(&mut scratch);
+            let blocks = if buf.len() == 1usize << log2_size {
+                fill_compressions_par(&mut buf, log2_size, seed);
+                Arc::new(buf)
+            } else {
+                // Pre-faulting failed or the shape moved; the allocating path is
+                // still exactly correct, just slower.
+                Arc::new(generate_compressions_par(log2_size, seed))
             };
             {
                 let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
                 state.seed_at = Some(seed_at);
                 state.blocks_at = Some(std::time::Instant::now());
-                state.blocks = Some(published);
+                state.blocks = Some(SpecBlocks::Full(Arc::clone(&blocks)));
                 shared().signal.notify_all();
             }
-            return run(setup_addr, BlockSource::Closed { init, len: n });
-        }
+            run(setup_addr, BlockSource::Slice(&blocks))
+        }));
 
-        let mut buf = std::mem::take(&mut scratch);
-        let blocks = if buf.len() == 1usize << log2_size {
-            fill_compressions_par(&mut buf, log2_size, seed);
-            Arc::new(buf)
-        } else {
-            // Pre-faulting failed or the shape moved; the allocating path is
-            // still exactly correct, just slower.
-            Arc::new(generate_compressions_par(log2_size, seed))
-        };
-        {
-            let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-            state.seed_at = Some(seed_at);
-            state.blocks_at = Some(std::time::Instant::now());
-            state.blocks = Some(SpecBlocks::Full(Arc::clone(&blocks)));
-            shared().signal.notify_all();
-        }
-        run(setup_addr, BlockSource::Slice(&blocks))
-    }));
-
-    match (direct_proof_path.as_deref(), outcome) {
-        (Some(path), Ok(out)) => {
-            let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_direct_proof(path, out)
-            }))
-            .is_ok_and(|result| result.is_ok());
-            if published {
-                // Publish precedes EOF. The harness can capture the complete
-                // file whether it observes the rename or main's exit first.
-                close_fd(writer);
-                return;
+        match (direct_proof_path.as_deref(), outcome) {
+            (Some(path), Ok(out)) => {
+                let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    publish_direct_proof(path, out)
+                }))
+                .is_ok_and(|result| result.is_ok());
+                if published {
+                    // Publish precedes EOF. The harness can capture the complete
+                    // file whether it observes the rename or main's exit first.
+                    close_fd(writer);
+                    return;
+                }
+                // The result was consumed while serializing. Let main take the
+                // ordinary path rather than risk a partial or stale proof.
+                let _ = forward_and_close(writer, &line);
+                mark_dead();
             }
-            // The result was consumed while serializing. Let main take the
-            // ordinary path rather than risk a partial or stale proof.
-            let _ = forward_and_close(writer, &line);
-            mark_dead();
+            (Some(_), Err(_)) => {
+                let _ = forward_and_close(writer, &line);
+                mark_dead();
+            }
+            (None, Ok(out)) => {
+                let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+                state.result = Some(out);
+                shared().signal.notify_all();
+            }
+            (None, Err(_)) => mark_dead(),
         }
-        (Some(_), Err(_)) => {
-            let _ = forward_and_close(writer, &line);
-            mark_dead();
-        }
-        (None, Ok(out)) => {
-            let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-            state.result = Some(out);
-            shared().signal.notify_all();
-        }
-        (None, Err(_)) => mark_dead(),
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------

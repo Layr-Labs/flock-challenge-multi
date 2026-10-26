@@ -598,6 +598,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                     ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
                 );
+                crate::gaptime::mark("r1: AB closure end");
                 (ab, t.elapsed().as_secs_f64() * 1e3)
             };
             let c_closure = || {
@@ -615,6 +616,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         capture_canon,
                         roots,
                     );
+                crate::gaptime::mark("r1: C closure end");
                 (
                     c,
                     s_hat_v_c,
