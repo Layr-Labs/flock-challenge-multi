@@ -553,6 +553,9 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 /// allocation is intentional: round 2 still needs the original A and B tables
 /// after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
+    /// Representation of the original packed A/B owners. This does not
+    /// describe `storage`, whose dense/compact contract is independent.
+    packed_ab_layout: super::prepared_octa::PackedAbLayout,
     storage: Vec<F128>,
     /// Logical dense byte length. Ranked residual storage may physically omit
     /// the two structural-one rows and the dead padding row from every
@@ -594,6 +597,20 @@ const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
 const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
 
 impl Round1AbInner {
+    /// Layout of the original A/B buffers, never the AB projection storage.
+    #[inline]
+    pub fn packed_ab_layout(&self) -> super::prepared_octa::PackedAbLayout {
+        self.packed_ab_layout
+    }
+
+    /// Publish only after the complete ranked A/B owners have been written
+    /// in PreparedOctaV1 format. Partial GPU-prefix production is excluded.
+    pub fn set_packed_ab_layout_prepared_octa(&mut self) {
+        assert_eq!(self.dense_len_bytes, 1usize << 29);
+        assert_eq!(self.invalid_prefix_bytes, 0);
+        self.packed_ab_layout = super::prepared_octa::PackedAbLayout::PreparedOctaV1;
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -639,6 +656,7 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: false,
             ranked_w30_elided: false,
+            packed_ab_layout: super::prepared_octa::PackedAbLayout::Canonical,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -667,6 +685,7 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: true,
             ranked_w30_elided: false,
+            packed_ab_layout: super::prepared_octa::PackedAbLayout::Canonical,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -962,6 +981,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_one_rows_elided: false,
         ranked_compact: false,
         ranked_w30_elided: false,
+        packed_ab_layout: super::prepared_octa::PackedAbLayout::Canonical,
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -6654,4 +6674,44 @@ mod tests {
 /// Compile-time structural B mode for ranked eight-row projection.
 pub const fn round1_ranked_bcomplement_mode(blk: usize, k: usize) -> u8 {
     kernels::x86_64_bcomplement::window_mode(blk, k)
+}
+
+#[cfg(test)]
+mod prepared_octa_contract_tests {
+    use super::*;
+    use crate::zerocheck::prepared_octa::{OCTA_BYTES, PackedAbLayout};
+
+    #[test]
+    fn prepared_octa_round1_defaults_to_canonical() {
+        let inner = Round1AbInner::take_uninit(OCTA_BYTES);
+        assert_eq!(inner.packed_ab_layout(), PackedAbLayout::Canonical);
+    }
+
+    #[test]
+    #[should_panic]
+    fn prepared_octa_round1_rejects_unsupported_shape() {
+        Round1AbInner::take_uninit(OCTA_BYTES).set_packed_ab_layout_prepared_octa();
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn prepared_octa_masks_match_production_projection() {
+        use crate::zerocheck::prepared_octa::PREPARED_B_MASKS;
+        for w in 2..30 {
+            let expected = (0..8).fold(0u8, |mask, k| {
+                mask | (u8::from(kernels::x86_64_bcomplement::window_mode(w, k) == 0) << k)
+            });
+            assert_eq!(PREPARED_B_MASKS[w], expected, "window {w}");
+        }
+        for w in [0, 1, 30, 31] {
+            assert_eq!(PREPARED_B_MASKS[w], 0);
+        }
+    }
 }

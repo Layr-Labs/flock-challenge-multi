@@ -578,6 +578,61 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
     }
 }
 
+/// Transpose A & B directly for the canonical Z publication.
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+unsafe fn tr8x16_zmm_and(stage: *const V8, other: *const V8, w: usize) -> [__m512i; 8] {
+    unsafe {
+        debug_assert!(w + STEP_WORDS <= RING_WORDS);
+        debug_assert!(w.is_multiple_of(STEP_WORDS));
+
+        // Each unaligned ZMM is [word 2k lanes 0..7 | word 2k+1 lanes 0..7].
+        let x0 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w).cast::<__m512i>()), _mm512_loadu_si512(other.add(w).cast::<__m512i>()));
+        let x1 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 2).cast::<__m512i>()));
+        let x2 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 4).cast::<__m512i>()));
+        let x3 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 6).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 6).cast::<__m512i>()));
+        let x4 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 8).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 8).cast::<__m512i>()));
+        let x5 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 10).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 10).cast::<__m512i>()));
+        let x6 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 12).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 12).cast::<__m512i>()));
+        let x7 = _mm512_and_si512(_mm512_loadu_si512(stage.add(w + 14).cast::<__m512i>()), _mm512_loadu_si512(other.add(w + 14).cast::<__m512i>()));
+
+        let i10 = _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27);
+        let i11 = _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31);
+        let p00 = _mm512_permutex2var_epi32(x0, i10, x1);
+        let p01 = _mm512_permutex2var_epi32(x0, i11, x1);
+        let p10 = _mm512_permutex2var_epi32(x2, i10, x3);
+        let p11 = _mm512_permutex2var_epi32(x2, i11, x3);
+        let p20 = _mm512_permutex2var_epi32(x4, i10, x5);
+        let p21 = _mm512_permutex2var_epi32(x4, i11, x5);
+        let p30 = _mm512_permutex2var_epi32(x6, i10, x7);
+        let p31 = _mm512_permutex2var_epi32(x6, i11, x7);
+
+        let i20 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+        let i21 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
+        let q00 = _mm512_permutex2var_epi32(p00, i20, p10);
+        let q01 = _mm512_permutex2var_epi32(p00, i21, p10);
+        let q02 = _mm512_permutex2var_epi32(p01, i20, p11);
+        let q03 = _mm512_permutex2var_epi32(p01, i21, p11);
+        let q10 = _mm512_permutex2var_epi32(p20, i20, p30);
+        let q11 = _mm512_permutex2var_epi32(p20, i21, p30);
+        let q12 = _mm512_permutex2var_epi32(p21, i20, p31);
+        let q13 = _mm512_permutex2var_epi32(p21, i21, p31);
+
+        let i30 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
+        let i31 = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
+        [
+            _mm512_permutex2var_epi32(q00, i30, q10),
+            _mm512_permutex2var_epi32(q00, i31, q10),
+            _mm512_permutex2var_epi32(q01, i30, q11),
+            _mm512_permutex2var_epi32(q01, i31, q11),
+            _mm512_permutex2var_epi32(q02, i30, q12),
+            _mm512_permutex2var_epi32(q02, i31, q12),
+            _mm512_permutex2var_epi32(q03, i30, q13),
+            _mm512_permutex2var_epi32(q03, i31, q13),
+        ]
+    }
+}
+
 /// Transpose one fully-live ranked side and widen its offsets while the
 /// complete block-major rows are still live.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -635,7 +690,7 @@ pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
 /// Cache the rollback once and share it between the outlined and direct-inline
 /// publishers so the default ranked path cannot bypass the const-window leaf.
 #[inline(always)]
-fn ranked_b_constwin_enabled() -> bool {
+pub(crate) fn ranked_b_constwin_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_R1_B_CONSTWIN").as_deref() != Some(std::ffi::OsStr::new("1"))
     });
@@ -1256,6 +1311,9 @@ const _RING_GEOMETRY: () = {
 /// block rows each) and is 64-byte aligned. `out` owns this octa's eight
 /// `BYTES_PER_BLOCK` ab_inner blocks.
 pub(crate) struct StreamProj<'t> {
+    /// A/B owners use the private octa representation. Only the exact ranked
+    /// closed producer accepts this; Z and AB projection remain canonical.
+    pub(crate) prepared_ab: bool,
     pub(crate) stage: *mut u32,
     /// Physical start of this octa's output region. `out_bias` maps logical
     /// ranked row 2 to physical row 0 without ever forming a pointer before
@@ -2188,6 +2246,19 @@ impl RankedRows {
         }
     }
 
+    /// Publish one canonical Z line and one prepared A/B row. The two
+    /// axes are intentionally distinct: j selects a witness block, k a row.
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_prepared_values(&self, j: usize, zv: __m512i, ap: *const u64, bp: *const u64) {
+        unsafe {
+            let k = 7 - j;
+            stream_ranked_line(self.z.add(j * U32_PER_BLOCK), zv);
+            stream_ranked_line(self.a.add(k * STEP_WORDS), _mm512_loadu_si512(ap.add(k * 8).cast()));
+            stream_ranked_line(self.b.add(k * STEP_WORDS), _mm512_loadu_si512(bp.add(k * 8).cast()));
+        }
+    }
+
     /// Static-B ranked windows 0/1 sourced directly from the live transposed
     /// rows ([`tr8x16_zmm`]) instead of two YMM transposes, sixteen staging
     /// stores and a reload: the same line, streamed to z and a.
@@ -2397,6 +2468,11 @@ impl Drain8<'_> {
                 let mut q = [0u64; 8];
                 store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
                 store_v8(q.as_mut_ptr().cast::<u32>().add(8), _mm256_permute2x128_si256::<0x31>(l, h));
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+                if self.proj.prepared_ab {
+                    xor_projection::publish_prepared_sparse30(self.z.add(480), self.a.add(8 * 480), self.ast, q.as_ptr());
+                    return;
+                }
                 let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480));
                 let qp = q.as_ptr();
                 let mut j = 0usize;
@@ -2406,6 +2482,11 @@ impl Drain8<'_> {
                 }
             } else {
                 debug_assert!(base_word == 0 || base_word == 16);
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+                if self.proj.prepared_ab {
+                    xor_projection::publish_prepared_static01(self.z.add(base_word), self.a.add(8 * base_word), self.ast, base_word);
+                    return;
+                }
                 let a_rows = tr8x16_zmm(self.ast, base_word);
                 let rows = RankedRows::new(
                     self.z.add(base_word),
@@ -2463,9 +2544,15 @@ impl Drain8<'_> {
                 let plan = preps.get_unchecked(blk).0;
 #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
                 if (2..=29).contains(&blk) && plan.bcomplement_static_eligible(){
-                    xor_projection::project(proj,blk,rows,self.ast,self.bs,rw,&preps.tables);
+                    if proj.prepared_ab {
+                        let prepared_rows = RankedRows::new(self.z.add(abs_word), self.a.add(8 * abs_word), self.b.add(8 * abs_word));
+                        xor_projection::project_prepared(proj,blk,prepared_rows,self.ast,self.bs,rw,&preps.tables);
+                    } else {
+                        xor_projection::project(proj,blk,rows,self.ast,self.bs,rw,&preps.tables);
+                    }
                     continue;
                 }
+                assert!(!proj.prepared_ab, "prepared A/B cannot enter the canonical offset publisher");
                 self.drain_ranked_offset_window(abs_word, rw);
             }
         }
@@ -3004,6 +3091,10 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             && proj.w30_elided
             && ranked_static01_direct_enabled()
             && ranked_b_constwin_enabled();
+        assert!(!proj.prepared_ab || (RANKED_CLOSED && ranked_fast && ranked_preps.is_some()),
+            "prepared A/B requires the exact ranked closed producer");
+        #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni")))]
+        assert!(!proj.prepared_ab, "prepared A/B requires the projection ISA");
         let cv_v = &prepared.cv;
         let m = &prepared.message;
         let tlo = prepared.counter_lo;
@@ -4194,6 +4285,7 @@ mod tests {
                 a_seed.0.as_mut_ptr(),
                 b_seed.0.as_mut_ptr(),
                 StreamProj {
+                            prepared_ab: false,
                     stage: stage_ref.0.as_mut_ptr(),
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
@@ -4244,6 +4336,7 @@ mod tests {
                     a_ref.0.as_mut_ptr(),
                     b_ref.0.as_mut_ptr(),
                     StreamProj {
+                            prepared_ab: false,
                         stage: stage_ref.0.as_mut_ptr(),
                         out: ab_ref.0.as_mut_ptr(),
                         out_stride,
@@ -4262,6 +4355,7 @@ mod tests {
                     a_new.0.as_mut_ptr(),
                     b_new.0.as_mut_ptr(),
                     StreamProj {
+                            prepared_ab: false,
                         stage: stage_new.0.as_mut_ptr(),
                         out: ab_new.0.as_mut_ptr(),
                         out_stride,
@@ -4303,6 +4397,211 @@ mod tests {
                 assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");
+            assert_eq!(a_ref, a_new, "a mismatch at base={base}");
+            assert_eq!(b_ref, b_new, "b mismatch at base={base}");
+            let check_bytes = if compact { 28 * 64 } else { 31 * 64 };
+            for j in 0..8 {
+                let s = j * out_stride;
+                assert_eq!(
+                    &ab_ref.0[s..s + check_bytes],
+                    &ab_new.0[s..s + check_bytes],
+                    "ab mismatch at base={base} lane={j}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn prepared_ab_ranked_closed_matches_generic_octa() {
+        #[repr(C, align(64))]
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct AlignedWords([u32; 8 * U32_PER_BLOCK]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbCompact([u8; 8 * 29 * 64]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbFull([u8; 8 * 32 * 64]);
+        #[repr(C, align(64))]
+        struct AlignedStage([u32; STREAM_STAGE_WORDS]);
+
+        let ntt_s =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let dummy_ab = Box::new(AlignedAbCompact([0u8; 8 * 29 * 64]));
+        let win_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                &inv_table,
+                &dummy_ab.0,
+                true,
+            );
+        let preps = prepare_ranked_closed_window_preps(&inv_table, win_plan);
+        let crate::seed_pipe::BlockSource::Closed { init, .. } =
+            crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
+        else {
+            unreachable!()
+        };
+        let compact = win_plan.offsets_eligible(2);
+        let out_stride = if compact { 29 * 64 } else { 32 * 64 };
+        let out_bias = if compact { 2 * 64 } else { 0 };
+        let mut stage_ref = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+        let mut stage_new = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+
+        // First seed reference z/a/b with full writes (elide = [false; 3])
+        let mut z_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut a_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut b_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut ab_seed = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+        unsafe {
+            build_octa_witness_ab_stream_elide(
+                OctaInputs::Closed { init, base: 0 },
+                z_seed.0.as_mut_ptr(),
+                a_seed.0.as_mut_ptr(),
+                b_seed.0.as_mut_ptr(),
+                StreamProj {
+                            prepared_ab: false,
+                    stage: stage_ref.0.as_mut_ptr(),
+                    out: ab_seed.0.as_mut_ptr(),
+                    out_stride: 32 * 64,
+                    out_bias: 0,
+                    inv_table: &inv_table,
+                    plan: win_plan,
+                    one_rows_elided: false,
+                    w30_elided: false,
+                },
+                [false; 3],
+            );
+        }
+
+        for base in [0usize, 8, 240, 131_064, 262_136] {
+            let mut z_ref = z_seed.clone();
+            let mut a_ref = a_seed.clone();
+            let mut b_ref = b_seed.clone();
+            let mut ab_ref = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+
+            let mut z_new = z_seed.clone();
+            let mut a_new = a_seed.clone();
+            let mut b_new = b_seed.clone();
+            // Seed only the constants from a completed canonical witness.
+            // Poison every live prepared line, so skipped writes cannot pass
+            // by reading the previous witness's matching values.
+            use flock_core::zerocheck::prepared_octa::{PreparedAbSide, prepare_in_place, canonicalize_into};
+            unsafe {
+                let ap = core::slice::from_raw_parts_mut(a_new.0.as_mut_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK);
+                let bp = core::slice::from_raw_parts_mut(b_new.0.as_mut_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK);
+                prepare_in_place(PreparedAbSide::A, ap);
+                prepare_in_place(PreparedAbSide::B, bp);
+                ap[..30 * 512 + 64].fill(0xa5);
+                bp[2 * 512..30 * 512].fill(0x5a);
+            }
+            let mut ab_new = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let fold = super::super::Blake3AdjointPlan::build().linear_fold_plan();
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let roots = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
+            #[repr(align(64))]
+            struct RootTile([u8; 177 * 512]);
+            let mut root_tile = Box::new(RootTile([0xa5; 177 * 512]));
+
+            unsafe {
+                build_octa_witness_ab_stream_elide(
+                    OctaInputs::Closed { init, base },
+                    z_ref.0.as_mut_ptr(),
+                    a_ref.0.as_mut_ptr(),
+                    b_ref.0.as_mut_ptr(),
+                    StreamProj {
+                            prepared_ab: false,
+                        stage: stage_ref.0.as_mut_ptr(),
+                        out: ab_ref.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    [true; 3],
+                );
+                build_octa_witness_ab_stream_ranked_closed(
+                    init,
+                    base,
+                    z_new.0.as_mut_ptr(),
+                    a_new.0.as_mut_ptr(),
+                    b_new.0.as_mut_ptr(),
+                    StreamProj {
+                            prepared_ab: true,
+                        stage: stage_new.0.as_mut_ptr(),
+                        out: ab_new.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    &preps,
+                    [true; 3],
+                    #[cfg(all(
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vbmi",
+                        target_feature = "gfni",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
+                );
+                _mm_sfence();
+            }
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            for group in 0..177 {
+                for column in 0..64 {
+                    let expected = fold.roots.get(group * 64 + column).map_or(0, |&wire| {
+                        (0..8).fold(0u8, |bits, lane| bits |
+                            (((z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1) as u8) << lane)
+                    });
+                    assert_eq!(root_tile.0[group * 512 + column], expected,
+                        "live drain base={base}, group={group}, column={column}");
+                }
+                assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
+            }
+            assert_eq!(z_ref, z_new, "z mismatch at base={base}");
+            // Restore through the shared scalar adapter, which is independently
+            // checked against subset sums in the core crate's layout tests.
+            let mut decoded_a = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+            let mut decoded_b = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+            unsafe {
+                canonicalize_into(PreparedAbSide::A,
+                    core::slice::from_raw_parts(a_new.0.as_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK),
+                    core::slice::from_raw_parts_mut(decoded_a.0.as_mut_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK));
+                canonicalize_into(PreparedAbSide::B,
+                    core::slice::from_raw_parts(b_new.0.as_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK),
+                    core::slice::from_raw_parts_mut(decoded_b.0.as_mut_ptr().cast::<u8>(), 8 * BYTES_PER_BLOCK));
+            }
+            a_new = decoded_a;
+            b_new = decoded_b;
             assert_eq!(a_ref, a_new, "a mismatch at base={base}");
             assert_eq!(b_ref, b_new, "b mismatch at base={base}");
             let check_bytes = if compact { 28 * 64 } else { 31 * 64 };

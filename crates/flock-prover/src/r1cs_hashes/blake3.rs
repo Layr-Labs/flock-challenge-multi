@@ -2355,25 +2355,6 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     assert_eq!(skip_bytes % BYTES_PER_BLOCK, 0);
     let skip_blocks = skip_bytes / BYTES_PER_BLOCK;
     let n_f128 = n_total * F128_PER_BLOCK;
-    // a/b come back from the pool with witgen provenance when the previous
-    // prove released them untouched (zerocheck reads them through shared
-    // slices only); a token hit lets the octa dump skip re-storing the
-    // content-independent constant regions (see the elision block in
-    // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
-    // the incumbent full writes. Tagged takes go FIRST so z's untagged take
-    // cannot consume a provenance-carrying buffer of the same size class.
-    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
-    );
-    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
-    );
-    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
-        n_f128,
-        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
-    );
     const {
         assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
     }
@@ -2387,6 +2368,58 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         inv_table_owned = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
         &inv_table_owned
     };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    let prepared_ab = {
+        let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(inv_table, &[], false);
+        use_simd && !use_nt && ab_nt && skip_blocks == 0 && n_total == 1 << 18
+            && matches!(blocks, crate::seed_pipe::BlockSource::Closed { len, .. } if len == 1 << 18)
+            && flock_core::zerocheck::prepared_ab_layout_enabled()
+            && witgen_simd::const_elide_enabled() && witgen_simd::witgen_ab_const_elide_enabled()
+            && witgen_simd::witgen_ab_winstream_enabled()
+            && plan.offsets_eligible(2) && plan.bcomplement_static_eligible()
+            && blake3_witgen8::ey_dead_w31_enabled()
+            && blake3_witgen8::ranked_direct_dense_publish_enabled()
+            && blake3_witgen8::ranked_direct_dense_inline_enabled()
+            && blake3_witgen8::widen_maddubs_enabled()
+            && blake3_witgen8::ranked_static01_direct_enabled()
+            && blake3_witgen8::ranked_b_constwin_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::abinner_nt_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_one_rows_reuse_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_w30_elide_enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled()
+            && flock_core::pcs::ranked_direct_fold8_enabled()
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+    let prepared_ab = false;
+    use flock_core::zerocheck::prepared_octa::{PreparedAbSide, prepare_fields_in_place};
+    let a_tag = if prepared_ab { PreparedAbSide::A.scratch_tag(n_f128) }
+        else { witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128) };
+    let b_tag = if prepared_ab { PreparedAbSide::B.scratch_tag(n_f128) }
+        else { witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128) };
+    // a/b come back from the pool with witgen provenance when the previous
+    // prove released them untouched (zerocheck reads them through shared
+    // slices only); a token hit lets the octa dump skip re-storing the
+    // content-independent constant regions (see the elision block in
+    // `witgen_simd`). A miss — or `FLOCK_NO_SCRATCH_CONST_ELIDE=1` — keeps
+    // the incumbent full writes. Tagged takes go FIRST so z's untagged take
+    // cannot consume a provenance-carrying buffer of the same size class.
+    let (mut a, a_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        a_tag,
+    );
+    let (mut b, b_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        b_tag,
+    );
+    let (mut z, z_tok) = flock_core::scratch::take_f128_tagged(
+        n_f128,
+        witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
+    );
+    // A prepared hit cannot authorize canonical elision if any side or Z
+    // misses. That case writes both canonical A/B completely before conversion.
+    let prepared_publish = prepared_ab && a_tok && b_tok && z_tok;
+    let a_elide_tok = a_tok && (!prepared_ab || prepared_publish);
+    let b_elide_tok = b_tok && (!prepared_ab || prepared_publish);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let ranked_compact = {
         // Compact storage is valid only when this exact prove selects the
@@ -2397,7 +2430,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
         // `ranked_static` brand, including its same-binary offsets rollback.
         let elide_on = witgen_simd::const_elide_enabled();
         let ab_elide = ab_nt && elide_on && witgen_simd::witgen_ab_const_elide_enabled();
-        let ranked_static = z_tok && elide_on && a_tok && ab_elide && b_tok && ab_elide;
+        let ranked_static = z_tok && elide_on && a_elide_tok && ab_elide && b_elide_tok && ab_elide;
         let ranked_plan =
             flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
                 inv_table,
@@ -2464,20 +2497,30 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
             &mut ab_inner,
             &inv_table,
             &padding,
-            [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
+            [z_tok && elide_on, a_elide_tok && ab_elide, b_elide_tok && ab_elide],
             ab_nt,
+            prepared_publish,
         );
+        if prepared_ab {
+            if !prepared_publish {
+                prepare_fields_in_place(PreparedAbSide::A, &mut a);
+                prepare_fields_in_place(PreparedAbSide::B, &mut b);
+            }
+            // All task fences (and any cold conversion joins) precede the
+            // layout brand and pending provenance registration.
+            ab_inner.set_packed_ab_layout_prepared_octa();
+        }
         // a/b now hold a completed witgen of this layout (elided chunks are
         // token-verified to already match). Zerocheck reads them through
         // shared `&[u8]` views only, so the buffers reach their release
         // untouched — arm the provenance for the next prove's takes.
         flock_core::scratch::register_pending_tag(
             a.as_ptr(),
-            witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+            a_tag,
         );
         flock_core::scratch::register_pending_tag(
             b.as_ptr(),
-            witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+            b_tag,
         );
         // z is read-only from here to its release inside the open's
         // materialize (commit encode, zerocheck c-view, lincheck repack all
@@ -2612,11 +2655,11 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     // witgen of this layout here — arm the provenance for the next prove.
     flock_core::scratch::register_pending_tag(
         a.as_ptr(),
-        witgen_simd::scratch_tag(witgen_simd::ROLE_A, n_f128),
+        a_tag,
     );
     flock_core::scratch::register_pending_tag(
         b.as_ptr(),
-        witgen_simd::scratch_tag(witgen_simd::ROLE_B, n_f128),
+        b_tag,
     );
     flock_core::scratch::register_pending_tag(
         z.as_ptr(),
@@ -2685,6 +2728,7 @@ fn generate_round1_inner_octa(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    prepared_publish: bool,
 ) {
     generate_round1_inner_octa_with_ranked_closed_dispatch(
         blocks,
@@ -2697,6 +2741,7 @@ fn generate_round1_inner_octa(
         padding,
         elide,
         ab_nt,
+        prepared_publish,
         RankedClosedDispatch::Auto,
     )
 }
@@ -2714,6 +2759,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     padding: &Compression,
     elide: [bool; 3],
     ab_nt: bool,
+    prepared_publish: bool,
     ranked_closed_dispatch: RankedClosedDispatch,
 ) {
     use rayon::prelude::*;
@@ -2808,6 +2854,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             ))
         }
     };
+    assert!(!prepared_publish || (ranked_closed_exact_eligible && ranked_closed_preps.is_some()
+        && w30_elided && blake3_witgen8::ranked_static01_direct_enabled()
+        && blake3_witgen8::ranked_b_constwin_enabled() && win_plan.bcomplement_static_eligible()),
+        "prepared publication requires the exact complete ranked producer");
     let ranked_closed_init = match (ranked_closed_preps.as_ref(), blocks) {
         (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
         _ => None,
@@ -2854,6 +2904,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                         let base = GROUP * g + half * SIMD;
                         let off = half * SIMD * F128_PER_BLOCK;
                         let proj = blake3_witgen8::StreamProj {
+                            prepared_ab: prepared_publish,
                             stage: core::ptr::null_mut(),
                             out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                             out_stride: ab_block_bytes,
@@ -2956,6 +3007,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                         // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
+                            prepared_ab: prepared_publish,
                                 stage: st,
                                 out: ab_out
                                     .as_mut_ptr()
@@ -5448,6 +5500,7 @@ mod tests {
                     &padding,
                     elide,
                     ab_nt,
+                    false,
                 );
                 let ab = ab_inner.as_bytes_mut()[skip_bytes..].to_vec();
                 (z, a, b, ab)
@@ -5658,6 +5711,7 @@ mod tests {
                 &padding,
                 elide,
                 true,
+                false,
                 dispatch,
             );
             (z, a, b, ab_inner)
