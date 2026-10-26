@@ -1153,3 +1153,58 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+/// Borrow the incumbent plans; only the private stage's physical pitch changes.
+pub(super) struct SeedPad68Plan<'a> {
+    seed: [F128; 4],
+    four: [&'a x86_64::PreparedFour; 8],
+    publish: &'a [[[F128; 3]; 16]],
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+impl<'a> SeedPad68Plan<'a> {
+    pub(super) fn new(
+        right: F128,
+        dense: &[F128; 3],
+        four: &'a [FourBlock],
+        publish: &'a [[[F128; 3]; 16]],
+    ) -> Option<Self> {
+        if !super::ntt_shaped_enabled() || four.len() != 8 || publish.len() != 8 {
+            return None;
+        }
+        // PreparedFour availability also requires the existing diet and
+        // twiddle preparation switches. Unsupported modes retain the old path.
+        let four = [
+            four[0].cache.as_ref()?,
+            four[1].cache.as_ref()?,
+            four[2].cache.as_ref()?,
+            four[3].cache.as_ref()?,
+            four[4].cache.as_ref()?,
+            four[5].cache.as_ref()?,
+            four[6].cache.as_ref()?,
+            four[7].cache.as_ref()?,
+        ];
+        Some(Self {
+            seed: [right, dense[0], dense[1], dense[2]],
+            four,
+            publish,
+        })
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) use x86_64::{seed_pad68_fold, seed_pad68_publish, seed_pad68_seed};

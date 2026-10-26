@@ -2732,6 +2732,30 @@ impl AdditiveNttF128 {
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
+
+        // Keep the original tasks and ranked source/output geometry; add four
+        // fields of private padding so consecutive staging rows use 17 lines.
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+        if direct_publish && stage_perm && seed_odd_tail
+            && !ntt_seed_hold4_disabled() && pf_spread && pf_lines<=16
+        {
+            if let Some(plan)=kernels::SeedPad68Plan::new(seed_right,&seed_dense,&tw4,&tw2) {
+                let seed68=|bufp:*mut F128,r:usize| unsafe {kernels::seed_pad68_seed(src_addr as *const F128,bufp,r,block_size,sub_stride,&plan,pf_dist,pf_lines);};
+                let fold68=|bufp:*mut F128,r:usize| unsafe {kernels::seed_pad68_fold(bufp,r,&plan);};
+                let publish68=|bufp:*mut F128,r:usize| unsafe {
+                    if direct_publish_zmm {kernels::seed_pad68_publish::<true>(bufp,base_addr as *mut F128,r,block_size,sub_stride,&plan);}
+                    else {kernels::seed_pad68_publish::<false>(bufp,base_addr as *mut F128,r,block_size,sub_stride,&plan);}
+                };
+                #[cfg(target_os="linux")]
+                if st_fmp_run(sub_stride,68,&seed68,&fold68,&publish68) {return;}
+                (0..sub_stride).into_par_iter().for_each_init(
+                    ||staging_block(512,68),
+                    |buf,r| {let ptr=buf.as_mut_ptr();seed68(ptr,r);fold68(ptr,r);publish68(ptr,r);}
+                );
+                return;
+            }
+        }
+
         // Staging row for logical row `k` of a block, and the fused-four /
         // fused-two group geometry that matches it.
         let perm = |k: usize| seed_top_stage_row(k, stage_perm);
