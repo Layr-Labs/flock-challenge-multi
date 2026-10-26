@@ -102,6 +102,77 @@ unsafe fn mul_x4_high_one(t: TwX4, v: core::arch::x86_64::__m512i) -> core::arch
     }
 }
 
+/// Unreduced split product for the diet forms: returns `(lo, hi)` with
+/// `mul_x4::<LOW, true>(t, v) == lo ^ fold_x64(hi)`. `hi` is the
+/// x^64-position half; callers may XOR several of them together and fold
+/// the sum once, because [`fold_x64`] is linear.
+///
+/// # Safety
+/// Same preconditions as `mul_x4::<LOW, true>`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_parts<const LOW: bool>(
+    t: TwX4,
+    v: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    if LOW {
+        (
+            _mm512_clmulepi64_epi128::<0x00>(t.0, v),
+            _mm512_clmulepi64_epi128::<0x10>(t.0, v),
+        )
+    } else {
+        (
+            _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x00>(v, t.0),
+                _mm512_clmulepi64_epi128::<0x01>(v, t.1),
+            ),
+            _mm512_xor_si512(
+                _mm512_clmulepi64_epi128::<0x10>(v, t.0),
+                _mm512_clmulepi64_epi128::<0x11>(v, t.1),
+            ),
+        )
+    }
+}
+
+/// `x^64 * hi mod p` for four lanes: `(hi << 64) ^ clmul(hi.hi, 0x87)`.
+/// Linear in `hi` and canonical on output.
+///
+/// # Safety
+/// Requires `avx512f`, `avx512bw`, and `vpclmulqdq`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn fold_x64(hi: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller carries the AVX-512 byte-shift requirement.
+    unsafe {
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        _mm512_xor_si512(
+            _mm512_bslli_epi128::<8>(hi),
+            _mm512_clmulepi64_epi128::<0x01>(hi, poly),
+        )
+    }
+}
+
+/// Unreduced form of [`mul_x4_high_one`]: `(lo, hi)` with the product equal
+/// to `lo ^ fold_x64(hi)`.
+///
+/// # Safety
+/// Same preconditions as [`mul_x4_high_one`].
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_high_one_parts(
+    t: TwX4,
+    v: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use core::arch::x86_64::*;
+    (
+        _mm512_clmulepi64_epi128::<0x00>(t.0, v),
+        _mm512_xor_si512(_mm512_clmulepi64_epi128::<0x10>(t.0, v), v),
+    )
+}
+
+
 /// Store four F128 lanes. `NT` uses XMM `MOVNTDQ` so a cold codeword publish
 /// skips write-allocate; dest must be 16-byte aligned. Temporal `storeu`
 /// otherwise. Scalar twin: [`store_f128`].
@@ -2813,20 +2884,37 @@ unsafe fn butterfly_fused_3layer_rows_impl<
         // registers still fit the 32 zmm file, and doubling the independent
         // butterflies per layer (4 -> 8) covers the CLMUL latency and doubles
         // the outstanding row misses.
-        macro_rules! butterfly2 {
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr) => {{
-                butterfly2!($values, $u, $v, $twiddle, $low, false);
-            }};
-            ($values:ident, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr) => {{
-                for c in 0..2 {
-                    let product = if $high_one {
-                        mul_x4_high_one($twiddle, $values[c][$v])
+        // Dense-loop butterfly with lazy x^64 folds (diet forms only): the
+        // product's x^64-position half accumulates in `$m[$u]`, `v ^= u`
+        // shares it, and it is folded when `$fold` (the row is a multiplicand
+        // in the next layer, or this is the last layer). Eight folds per four
+        // lanes instead of twelve; same field elements.
+        macro_rules! lazy_butterfly {
+            ($p:expr, $m:expr, $u:expr, $v:expr, $twiddle:expr, $low:expr, $high_one:expr, $fold:expr) => {{
+                if DIET {
+                    let (lo, hi) = if $high_one {
+                        mul_x4_high_one_parts($twiddle, $p[$v])
                     } else {
-                        mul_x4::<$low, DIET>($twiddle, $values[c][$v])
+                        mul_x4_parts::<$low>($twiddle, $p[$v])
                     };
-                    let new_u = _mm512_xor_si512($values[c][$u], product);
-                    $values[c][$v] = _mm512_xor_si512($values[c][$v], new_u);
-                    $values[c][$u] = new_u;
+                    $m[$u] = _mm512_xor_si512($m[$u], hi);
+                    let mut new_u = _mm512_xor_si512($p[$u], lo);
+                    if $fold {
+                        new_u = _mm512_xor_si512(new_u, fold_x64($m[$u]));
+                        $m[$u] = zero;
+                    }
+                    $p[$v] = _mm512_xor_si512($p[$v], new_u);
+                    $m[$v] = _mm512_xor_si512($m[$v], $m[$u]);
+                    $p[$u] = new_u;
+                } else {
+                    let product = if $high_one {
+                        mul_x4_high_one($twiddle, $p[$v])
+                    } else {
+                        mul_x4::<$low, DIET>($twiddle, $p[$v])
+                    };
+                    let new_u = _mm512_xor_si512($p[$u], product);
+                    $p[$v] = _mm512_xor_si512($p[$v], new_u);
+                    $p[$u] = new_u;
                 }
             }};
         }
@@ -2840,17 +2928,51 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
 
             let outer = tw[0];
+            let mut pending = [[zero; 8]; 2];
             for i in 0..4 {
-                butterfly2!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+                for c in 0..2 {
+                    lazy_butterfly!(
+                        values[c],
+                        pending[c],
+                        i,
+                        i + 4,
+                        outer,
+                        LOW_OUTER,
+                        HIGH_ONE_OUTER,
+                        i & 2 != 0
+                    );
+                }
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly2!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    for c in 0..2 {
+                        lazy_butterfly!(
+                            values[c],
+                            pending[c],
+                            4 * s + i,
+                            4 * s + i + 2,
+                            twiddle,
+                            LOW_INNER,
+                            false,
+                            i & 1 != 0
+                        );
+                    }
                 }
             }
             for s in 0..4 {
-                butterfly2!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                for c in 0..2 {
+                    lazy_butterfly!(
+                        values[c],
+                        pending[c],
+                        2 * s,
+                        2 * s + 1,
+                        tw[3 + s],
+                        LOW_INNER,
+                        false,
+                        true
+                    );
+                }
             }
 
             for (c, chunk) in values.iter().enumerate() {
@@ -2867,17 +2989,45 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             }
 
             let outer = tw[0];
+            let mut pending = [zero; 8];
             for i in 0..4 {
-                butterfly!(values, i, i + 4, outer, LOW_OUTER, HIGH_ONE_OUTER);
+                lazy_butterfly!(
+                    values,
+                    pending,
+                    i,
+                    i + 4,
+                    outer,
+                    LOW_OUTER,
+                    HIGH_ONE_OUTER,
+                    i & 2 != 0
+                );
             }
             for s in 0..2 {
                 let twiddle = tw[1 + s];
                 for i in 0..2 {
-                    butterfly!(values, 4 * s + i, 4 * s + i + 2, twiddle, LOW_INNER);
+                    lazy_butterfly!(
+                        values,
+                        pending,
+                        4 * s + i,
+                        4 * s + i + 2,
+                        twiddle,
+                        LOW_INNER,
+                        false,
+                        i & 1 != 0
+                    );
                 }
             }
             for s in 0..4 {
-                butterfly!(values, 2 * s, 2 * s + 1, tw[3 + s], LOW_INNER);
+                lazy_butterfly!(
+                    values,
+                    pending,
+                    2 * s,
+                    2 * s + 1,
+                    tw[3 + s],
+                    LOW_INNER,
+                    false,
+                    true
+                );
             }
 
             for (i, value) in values.iter().enumerate() {
@@ -3778,7 +3928,7 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
 
 #[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 mod ab_ntt_tail_composition_tests {
-    use super::{prepare_four, row_prepared, F128};
+    use super::*;
     use std::hint::black_box;
 
     fn next(seed: &mut u64) -> u64 {
@@ -3847,6 +3997,206 @@ mod ab_ntt_tail_composition_tests {
         }
         println!("3900 production companions match the independent bitwise oracle");
     }
+
+
+    fn oracle_rows(
+        data: &mut [F128],
+        offset: usize,
+        stride: usize,
+        lanes: usize,
+        tw: &[F128],
+        layers: usize,
+    ) {
+        for lane in 0..lanes {
+            for layer in 0..layers {
+                let distance = 1 << (layers - layer - 1);
+                for group in 0..(1 << layer) {
+                    let t = tw[(1 << layer) - 1 + group];
+                    for j in 0..distance {
+                        let u = offset + (group * 2 * distance + j) * stride + lane;
+                        let v = u + distance * stride;
+                        data[u] = xor(data[u], multiply(data[v], t));
+                        data[v] = xor(data[v], data[u]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn three_rows<const LOW_INNER: bool, const LOW_OUTER: bool, const HIGH_ONE: bool>() {
+        let mut seed = 0xf31a_2e85_b736_094d;
+        let guard = F128::new(0xfeed_cafe, 0xdead_beef);
+        for n in [1usize, 3, 4, 7, 8, 12, 60, 64, 67] {
+            for dense in [0, 1.min(n), 3.min(n), 4.min(n), n - 1, n] {
+                for case in 0..4 {
+                    let offset = 4 + case;
+                    let mut data = vec![guard; offset + 8 * n + 4];
+                    for row in 0..8 {
+                        for lane in 0..n {
+                            data[offset + row * n + lane] = if row & 1 != 0 && lane >= dense {
+                                F128::ZERO
+                            } else {
+                                F128::new(next(&mut seed), next(&mut seed))
+                            };
+                        }
+                    }
+                    let mut tw: [F128; 7] = std::array::from_fn(|_| match case {
+                        0 => F128::ZERO,
+                        1 => F128::ONE,
+                        2 => F128::new(u64::MAX, u64::MAX),
+                        _ => F128::new(next(&mut seed), next(&mut seed)),
+                    });
+                    if LOW_INNER {
+                        for t in &mut tw[1..] {
+                            t.hi = 0;
+                        }
+                    }
+                    if LOW_OUTER {
+                        tw[0].hi = 0;
+                    }
+                    if HIGH_ONE {
+                        tw[0].hi = 1;
+                    }
+                    let original_tw = tw;
+                    let mut expected = data.clone();
+                    oracle_rows(&mut expected, offset, n, n, &tw, 3);
+                    // SAFETY: eight disjoint initialized rows, dense <= n,
+                    // zero odd-row suffix, and const twiddle forms set above.
+                    unsafe {
+                        butterfly_fused_3layer_rows_impl::<true, LOW_INNER, 0, LOW_OUTER, HIGH_ONE>(
+                            black_box(data.as_mut_ptr().add(offset)),
+                            n,
+                            dense,
+                            black_box(&tw),
+                        );
+                    }
+                    assert_eq!(
+                        data, expected,
+                        "n={n} dense={dense} case={case} li={LOW_INNER} lo={LOW_OUTER} ho={HIGH_ONE}"
+                    );
+                    assert_eq!(tw, original_tw);
+                    if n == 64 {
+                        // Also exercise the production shape specialization.
+                        let mut shaped = vec![guard; offset + 8 * n + 4];
+                        for row in 0..8 {
+                            for lane in 0..n {
+                                shaped[offset + row * n + lane] = if row & 1 != 0 && lane >= dense {
+                                    F128::ZERO
+                                } else {
+                                    F128::new(next(&mut seed), next(&mut seed))
+                                };
+                            }
+                        }
+                        let mut expected = shaped.clone();
+                        oracle_rows(&mut expected, offset, n, n, &tw, 3);
+                        unsafe {
+                            butterfly_fused_3layer_rows_impl::<
+                                true,
+                                LOW_INNER,
+                                64,
+                                LOW_OUTER,
+                                HIGH_ONE,
+                            >(
+                                black_box(shaped.as_mut_ptr().add(offset)),
+                                n,
+                                dense,
+                                black_box(&tw),
+                            );
+                        }
+                        assert_eq!(shaped, expected, "shaped dense={dense} case={case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ntt_three_layer_rows_match_bitwise_oracle() {
+        three_rows::<false, false, false>();
+        three_rows::<true, false, false>();
+        three_rows::<false, true, false>();
+        three_rows::<true, true, false>();
+        three_rows::<false, false, true>();
+        three_rows::<true, false, true>();
+    }
+
+    fn two_rows<const OUTER_LOW: bool, const INNER_LOW: bool, const ALIGNED: bool>(residue: usize) {
+        let mut seed = 0xf21a_2e85_b736_094d;
+        let guard = F128::new(0xfeed_cafe, 0xdead_beef);
+        for lanes in [60, 64] {
+            for case in 0..4 {
+                let mut src: Vec<F128> = (0..4 * 67)
+                    .map(|_| F128::new(next(&mut seed), next(&mut seed)))
+                    .collect();
+                let mut tw: [F128; 3] = std::array::from_fn(|_| match case {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    2 => F128::new(u64::MAX, u64::MAX),
+                    _ => F128::new(next(&mut seed), next(&mut seed)),
+                });
+                if OUTER_LOW {
+                    tw[0].hi = 0;
+                }
+                if INNER_LOW {
+                    tw[1].hi = 0;
+                    tw[2].hi = 0;
+                }
+                let original_src = src.clone();
+                let original_tw = tw;
+                let mut expected = vec![guard; 4 * 80 + 12];
+                let mut got = expected.clone();
+                let offset = 4
+                    + (0..4)
+                        .find(|&i| (got.as_ptr() as usize + (4 + i) * 16) % 64 == residue)
+                        .unwrap();
+                for row in 0..4 {
+                    expected[offset + row * 80..offset + row * 80 + lanes]
+                        .copy_from_slice(&src[row * 67..row * 67 + lanes]);
+                    expected[offset + row * 80 + lanes..offset + row * 80 + 64].fill(F128::ZERO);
+                }
+                oracle_rows(&mut expected, offset, 80, lanes, &tw, 2);
+                // SAFETY: readable source rows, disjoint aligned destinations
+                // with space for 64 lanes, and const twiddle forms set above.
+                unsafe {
+                    let dst = got.as_mut_ptr().add(offset);
+                    butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, true, ALIGNED>(
+                        black_box(src.as_mut_ptr()),
+                        67,
+                        dst,
+                        dst.add(80),
+                        dst.add(160),
+                        dst.add(240),
+                        lanes,
+                        tw[0],
+                        tw[1],
+                        tw[2],
+                    );
+                    core::arch::x86_64::_mm_sfence();
+                }
+                assert_eq!(
+                    got, expected,
+                    "lanes={lanes} case={case} ol={OUTER_LOW} il={INNER_LOW} aligned={ALIGNED} residue={residue}"
+                );
+                assert_eq!(src, original_src);
+                assert_eq!(tw, original_tw);
+            }
+        }
+    }
+
+    #[test]
+    fn ntt_two_layer_publish_rows_match_bitwise_oracle() {
+        for residue in [0, 16, 32, 48] {
+            two_rows::<false, false, false>(residue);
+            two_rows::<false, true, false>(residue);
+            two_rows::<true, false, false>(residue);
+            two_rows::<true, true, false>(residue);
+        }
+        two_rows::<false, false, true>(0);
+        two_rows::<false, true, true>(0);
+        two_rows::<true, false, true>(0);
+        two_rows::<true, true, true>(0);
+    }
+
 
     fn rows<const H: u8>() -> usize {
         let shapes = [

@@ -626,12 +626,12 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t.elapsed().as_secs_f64() * 1e3,
                 )
             };
-            // Per-core SMT arm partition. When the half-pools exist (ranked
-            // shape; built at process start in `crate::smt_split`), AB runs on
-            // sibling 0 of every physical core and C on sibling 1, so each core
-            // pairs one of each kernel instead of whatever the work-stealer
-            // happened to co-schedule. Schedule only: identical closures over
-            // identical inputs, so the proof bytes are unchanged. Falls back to
+            // SMT arm partition, built at process start in `crate::smt_split`.
+            // On the eight-core ranked host, seven cores pair AB with C and
+            // the final core serves AB on both siblings (9 AB / 7 C workers).
+            // Other topologies keep one worker per arm on each core. The
+            // closures and inputs are identical, so proof bytes are unchanged.
+            // Falls back to
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {

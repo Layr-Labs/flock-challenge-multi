@@ -232,7 +232,9 @@ pub(crate) mod topology_pool {
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
 /// restored and no extra thread is spawned. The two env vars are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split.
+/// default is the split. With the witness-born root cache, C finishes first:
+/// on the eight-core ranked host, assign its last sibling to AB (9/7).
+/// `FLOCK_NO_ZC_R1_AB_REBALANCE=1` restores 8/8 for local diagnostics.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -241,9 +243,47 @@ pub(crate) mod smt_split {
     /// builds no pools at all.
     pub(crate) const ZC_R1_SMT_SPLIT: bool = true;
 
+    /// Compile-time rollback of the eight-core 9/7 arm partition.
+    const ZC_R1_AB_REBALANCE: bool = true;
+
     static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
 
-    /// The two half-pools, or `None` when this process is not the ranked
+    // Separate topology planning from thread creation so disjointness and
+    // the eight-core rebalance can be checked without spawning a pool.
+    #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+    fn arm_cpus(groups: &[Vec<usize>], rebalance: bool) -> (Vec<usize>, Vec<usize>) {
+        let mut ab: Vec<usize> = groups.iter().map(|g| g[0]).collect();
+        let mut c: Vec<usize> = groups.iter().map(|g| g[1]).collect();
+        if rebalance && groups.len() == 8 {
+            // Keep heterogeneous pairs on seven cores. The last core's two
+            // siblings both serve the now-critical AB arm.
+            ab.push(c.pop().expect("eight sibling groups"));
+        }
+        (ab, c)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn arm_partition_rebalances_eight_cores_without_losing_or_sharing_cpus() {
+            for cores in [2usize, 4, 8, 16] {
+                let groups: Vec<Vec<usize>> = (0..cores).map(|i| vec![i, i + cores]).collect();
+                for rebalance in [false, true] {
+                    let (ab, c) = super::arm_cpus(&groups, rebalance);
+                    let moved = usize::from(rebalance && cores == 8);
+                    assert_eq!((ab.len(), c.len()), (cores + moved, cores - moved));
+                    let mut all: Vec<usize> = ab.iter().chain(&c).copied().collect();
+                    all.sort_unstable();
+                    assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
+                    assert_eq!(&ab[..cores], &(0..cores).collect::<Vec<_>>());
+                    assert_eq!(c, (cores..2 * cores - moved).collect::<Vec<_>>());
+                    if moved != 0 { assert_eq!(ab.last(), Some(&(2 * cores - 1))); }
+                }
+            }
+        }
+    }
+
+    /// The two arm pools, or `None` when this process is not the ranked
     /// shape (or the mechanism is off). Never builds anything: if [`init`]
     /// has not run, callers get the incumbent schedule.
     #[inline]
@@ -251,7 +291,7 @@ pub(crate) mod smt_split {
         POOLS.get().and_then(Option::as_ref)
     }
 
-    /// Build the half-pools. Call ONCE, at process start, from an UNPINNED
+    /// Build the arm pools. Call ONCE, at process start, from an UNPINNED
     /// thread, and only after the global rayon pool exists.
     pub(crate) fn init() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -412,8 +452,9 @@ pub(crate) mod smt_split {
                     }
                 }
             }
-            let s0: Vec<usize> = groups.iter().map(|g| g[0]).collect();
-            let s1: Vec<usize> = groups.iter().map(|g| g[1]).collect();
+            let rebalance = super::ZC_R1_AB_REBALANCE
+                && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
+            let (s0, s1) = super::arm_cpus(&groups, rebalance);
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {

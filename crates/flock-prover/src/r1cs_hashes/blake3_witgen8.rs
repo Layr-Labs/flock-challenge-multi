@@ -4234,8 +4234,8 @@ mod tests {
             ))]
             let roots = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
             #[repr(align(64))]
-            struct RootTile([u8; 177 * 512]);
-            let mut root_tile = Box::new(RootTile([0xa5; 177 * 512]));
+            struct RootTile([u8; 176 * 512]);
+            let mut root_tile = Box::new(RootTile([0xa5; 176 * 512]));
 
             unsafe {
                 build_octa_witness_ab_stream_elide(
@@ -4291,11 +4291,16 @@ mod tests {
                 target_feature = "gfni",
                 target_feature = "vpclmulqdq"
             ))]
-            for group in 0..177 {
+            for group in 0..176 {
                 for column in 0..64 {
-                    let expected = fold.roots.get(group * 64 + column).map_or(0, |&wire| {
-                        (0..8).fold(0u8, |bits, lane| bits |
-                            (((z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1) as u8) << lane)
+                    let lane = column % 32 / 4;
+                    let expected = (0..8).fold(0u8, |bits, bit| {
+                        let value = fold.roots.get({
+                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
+                                    index + if index >= 833 { 64 } else { 0 }
+                                })
+                            .map_or(0, |&wire| (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1);
+                        bits | (value as u8) << bit
                     });
                     assert_eq!(root_tile.0[group * 512 + column], expected,
                         "live drain base={base}, group={group}, column={column}");

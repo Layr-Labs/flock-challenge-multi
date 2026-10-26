@@ -2828,8 +2828,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         const GROUP: usize = 64;
         let group_f128 = GROUP * F128_PER_BLOCK;
         let group_bytes = GROUP * ab_block_bytes;
-        const ROOT_FIELDS_PER_TILE: usize = GROUP * 177 * 8 / 16;
-        let root_fields = z.len() / F128_PER_BLOCK * 177 * 8 / 16;
+        const ROOT_FIELDS_PER_TILE: usize = GROUP * 176 * 8 / 16;
+        let root_fields = z.len() / F128_PER_BLOCK * 176 * 8 / 16;
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
