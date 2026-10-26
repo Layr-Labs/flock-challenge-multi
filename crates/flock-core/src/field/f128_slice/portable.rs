@@ -1,25 +1,39 @@
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 
 #[inline]
+#[allow(dead_code)]
 pub(super) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    // Char-2: even*(1+r) + odd*r = even + r*(even+odd). One mul per pair.
     for (t, value) in dst.iter_mut().enumerate() {
         let s = 2 * (base + t);
-        let even = src[s];
-        *value = even + r * (even + src[s + 1]);
+        let v0 = src[s];
+        let v1 = src[s + 1];
+        *value = v0 + (v0 + v1) * r;
     }
 }
 
 #[inline]
-pub(super) fn fold4_nested(src: &[F128], dst: &mut [F128], r0: F128, r1: F128) {
-    // Nested pair-fold: r0 on (a0,a1) and (a2,a3), then r1 on (low, high).
-    for (t, value) in dst.iter_mut().enumerate() {
-        let a0 = src[4 * t];
-        let a1 = src[4 * t + 1];
-        let a2 = src[4 * t + 2];
-        let a3 = src[4 * t + 3];
-        let low = a0 + r0 * (a0 + a1);
-        let high = a2 + r0 * (a2 + a3);
-        *value = low + r1 * (low + high);
+#[allow(dead_code)]
+pub(super) fn fold_pairs_and_msg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    fold_pairs(f, base, fc, r);
+    fold_pairs(b, base, bc, r);
+    let mut u0 = F256Unreduced::ZERO;
+    let mut u2 = F256Unreduced::ZERO;
+    let mut k = 0;
+    while k + 1 < fc.len() {
+        let f0 = fc[k];
+        let f1 = fc[k + 1];
+        let b0 = bc[k];
+        let b1 = bc[k + 1];
+        u0 ^= f0.mul_unreduced(b0);
+        u2 ^= (f0 + f1).mul_unreduced(b0 + b1);
+        k += 2;
     }
+    (u0.reduce(), u2.reduce())
 }

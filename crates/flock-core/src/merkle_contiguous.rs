@@ -1,8 +1,5 @@
-//! Full AVX-512 groups of contiguous, fixed-size BLAKE3 Merkle messages.
-//! The assembly derives from BLAKE3 1.8.6's CC0 implementation; see the
 //! adjacent license. It preserves all seven compression rounds and the
-//! existing input/output transposes, but replaces the pointer-array loads
-//! with fixed-stride addresses and specializes the counter to zero.
+
 use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
 unsafe extern "C" {
@@ -70,9 +67,6 @@ unsafe extern "C" {
 type Kernel =
     unsafe extern "C" fn(*const u8, usize, usize, *const u32, u64, bool, u8, u8, u8, *mut u8);
 
-/// Hash only complete 16-message groups. The caller retains the ordinary
-/// platform implementation for its partial group, unsupported targets and
-/// non-contiguous indexed leaves.
 #[inline]
 pub(super) fn hash_many<const N: usize>(
     data: &[u8],
@@ -91,11 +85,7 @@ pub(super) fn hash_many<const N: usize>(
     };
     assert!(!out.is_empty() && out.len() % 16 == 0);
     assert_eq!(data.len(), out.len() * N);
-    // SAFETY: the compile-time module gate supplies AVX-512F/VL and the Linux
-    // SysV ABI. Each message has exactly N initialized readable bytes, every
-    // output has 32 writable bytes, and the slices cannot alias. The kernel
-    // handles one or more complete groups only. Key, flags, start and end have
-    // the same meanings as upstream hash_many; zero/no-increment is fixed.
+
     unsafe {
         kernel(
             data.as_ptr(),

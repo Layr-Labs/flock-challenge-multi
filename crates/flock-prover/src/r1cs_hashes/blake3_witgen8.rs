@@ -1,22 +1,3 @@
-//! 8-wide AVX2 lockstep BLAKE3 witness builder (`__m256i`, 8×u32).
-//!
-//! Same G-function / carry-bit / packed-row stream as the 4-wide SSE kernel,
-//! widened to one rayon group (8 compressions) per call. The z drain
-//! optionally publishes through streaming stores (`z_nt`): z's next reader is
-//! the commit encode, a later phase, so its write-allocate RFO is pure waste
-//! (see the caller's gate).
-//!
-//! The a/b drains have two shapes, selected by `win_ab`:
-//!  * `None` — the incumbent: temporal (`storeu`), because the caller re-reads
-//!    a/b L1-hot for the round-1 window precompute in the same task.
-//!  * `Some(..)` — FUSED: the very same `tr8` registers feed the main a/b
-//!    buffers non-temporally AND a compact per-octa window buffer that the
-//!    caller projects from instead. The main buffers are then never re-read,
-//!    so their write-allocate RFO (1 GiB at the ranked shape) is deleted too.
-//!
-//! Ranked live path: `generate_witness_with_ab_packed_and_round1_inner_impl`
-//! (`FLOCK_NO_WITGEN_LIVE_SIMD=1` restores the scalar 1-block loop).
-
 use super::{
     ADDS_PER_G, BLAKE3_IV, CARRY_BITS_PER_ADD, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE,
     USEFUL_BITS, WORD_BITS,
@@ -53,27 +34,13 @@ const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 const U32_PER_BLOCK: usize = K / 32;
 const BYTES_PER_BLOCK: usize = K / 8;
 const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
-/// Words a drain step publishes at once — sixteen, which is exactly one
-/// 64-byte round-1 medium window per block.
+
 const STEP_WORDS: usize = 16;
-/// u32s of the streaming projection's staging pair: one step's sixteen words
-/// for eight blocks, a side.
+
 pub(crate) const STREAM_STAGE_WORDS: usize = 2 * 8 * STEP_WORDS;
-// 62, not 61: an odd boundary leaves the z drain's paired NT loop with a
-// lone 32-byte tail chunk — one masked, partially-written NT line per block
-// (an ECC read-modify-write at the memory controller, 2^18 times per
-// proof). Chunk 61 is entirely inside the zero tail (LAST_WORD = 481), so
-// storing it is redundant-but-correct and the ragged tail branch vanishes.
+
 const ELIDE_ZERO_CHUNK: usize = 62;
-// 60, not 59, for the FUSED (`dump_range_nt_win`) drain, for exactly the reason
-// `ELIDE_ZERO_CHUNK` is 62: an odd first-elided chunk leaves chunk 58 as a lone
-// 32-byte NT store inside the 64-byte line (58, 59) — a partially-filled
-// write-combining buffer, i.e. a read-modify-write at the memory controller,
-// once per block per prove. Chunks 60..64 are entirely inside b's fixed
-// lin-id/out_hi ones + zero padding run (which starts at bit 15,089 < 256*60),
-// so storing chunk 59 is redundant-but-correct and the ragged line vanishes.
-// The temporal (`dump_range`) arm has no write-combining buffer to leave open,
-// so it keeps the tighter 59.
+
 const ELIDE_B_TAIL_CHUNK_WIN: usize = 60;
 const ELIDE_B_PREFIX_CHUNKS: usize = 4;
 const LAST_WORD: usize = (USEFUL_BITS - 1) / 32;
@@ -82,27 +49,16 @@ const _ELIDE_GEOMETRY: () = {
     assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
     assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
     assert!(LAST_WORD == 481);
-    // The fused drain walks chunk PAIRS from 0 while `dump_range_nt` walks
-    // pairs from `g0`; the two agree on which chunks share a 64-byte line
-    // only while every elided PREFIX is pair-aligned. (Elided tails need no
-    // such property: a half-covered trailing pair degrades to the same
-    // single-chunk stream in both.)
+
     assert!(DUMP_CHUNKS.is_multiple_of(2));
     assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
-    // The fused b tail is a pair-aligned SUBSET of the temporal one, so it
-    // stays strictly inside the same content-independent constant run.
+
     assert!(ELIDE_B_TAIL_CHUNK_WIN.is_multiple_of(2));
     assert!(ELIDE_B_TAIL_CHUNK_WIN < DUMP_CHUNKS);
 };
 
 type V8 = __m256i;
 
-/// Input form for one eight-compression witness kernel invocation.
-///
-/// The ranked speculative path carries the generator's closed form all the
-/// way here. Producing the 25 draws directly as eight SIMD lanes avoids
-/// materializing and immediately transposing an 896-byte `[Compression; 8]`.
-/// Slice callers retain the original borrowed-input route verbatim.
 pub(crate) enum OctaInputs<'a> {
     Blocks([&'a Compression; 8]),
     Closed { init: u64, base: usize },
@@ -117,23 +73,6 @@ struct PreparedInputs {
     flags: V8,
 }
 
-/// `FLOCK_NO_EY_DEAD_W31=1` restores the incumbent projection of ranked
-/// window 31. Default ON; the ranked worker's cleared environment never
-/// disables it.
-///
-/// Window 31 is `w = 1, b_med = 15`. Round one reads window `w * 16 + b_med`
-/// only for `b_med < n_b_med[w]`, and `build_b_med_counts` gives
-/// `n_b_med[1] = ceil((USEFUL_BITS - 8192) / 512) = 15` at the pinned BLAKE3
-/// shape (`K_LOG = 14`, `USEFUL_BITS = 15409`), so `b_med = 15` is past the
-/// last live window. Nothing else reads those bytes: every `ab_inner`
-/// consumer is one of the three `b_med < n_b_med` copy loops, and the cold
-/// `restore_full_if_ranked_one_rows_elided` fallback recomputes the whole
-/// buffer from raw a/b rather than reading it.
-///
-/// Same precedent as the elided one-rows: under `one_rows_elided` windows 0
-/// and 1 are already left unwritten because round one starts at
-/// `first_b_med = 2`. The elision is gated on that same brand, so the exact
-/// shape assumptions above are the ones already asserted for it.
 #[inline(always)]
 pub(crate) fn ey_dead_w31_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -141,10 +80,6 @@ pub(crate) fn ey_dead_w31_enabled() -> bool {
     *ON
 }
 
-/// AVX2 fallback for low-half 64-bit multiplication. `_mm256_mul_epu32`
-/// handles the low limbs; the two cross-products supply bits 32..63. The
-/// high×high term is above bit 63 and is discarded, exactly like
-/// `u64::wrapping_mul`.
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn mullo_u64x4(a: __m256i, b: u64) -> __m256i {
@@ -172,7 +107,6 @@ unsafe fn mix_u64x4(mut z: __m256i) -> __m256i {
     }
 }
 
-/// Pack the low u32 of eight u64 lanes into one `V8`, preserving block order.
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn pack_low_u32x8(lo: __m256i, hi: __m256i) -> V8 {
@@ -188,23 +122,18 @@ unsafe fn pack_low_u32x8(lo: __m256i, hi: __m256i) -> V8 {
 #[inline(always)]
 unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
     unsafe {
-        let golden = _mm256_set1_epi64x(crate::seed_pipe::GOLDEN as i64);
+        let golden = _mm256_set1_epi64x(crate::s1::GOLDEN as i64);
         states[0] = _mm256_add_epi64(states[0], golden);
         states[1] = _mm256_add_epi64(states[1], golden);
         pack_low_u32x8(mix_u64x4(states[0]), mix_u64x4(states[1]))
     }
 }
 
-/// Generate the exact protected-wrapper inputs for blocks `base..base+8`
-/// directly in the word-major form consumed by the witness kernel. AVX2
-/// targets use two four-lane SplitMix states and the low-limb multiplication
-/// above; Sapphire Rapids uses the eight-lane AVX-512DQ implementation below.
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride =
-            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride = crate::s1::GOLDEN.wrapping_mul(crate::s1::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut states = [
             _mm256_setr_epi64x(
@@ -250,7 +179,7 @@ unsafe fn mix_u64x8(mut z: __m512i) -> __m512i {
 #[inline(always)]
 unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
     unsafe {
-        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::seed_pipe::GOLDEN as i64));
+        *state = _mm512_add_epi64(*state, _mm512_set1_epi64(crate::s1::GOLDEN as i64));
         _mm512_cvtepi64_epi32(mix_u64x8(*state))
     }
 }
@@ -259,8 +188,7 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
     unsafe {
-        let stride =
-            crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
+        let stride = crate::s1::GOLDEN.wrapping_mul(crate::s1::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
@@ -296,19 +224,12 @@ unsafe fn store_v8(p: *mut u32, v: V8) {
     unsafe { _mm256_storeu_si256(p.cast::<__m256i>(), v) }
 }
 
-/// Store one complete ranked projection row. `StreamProj::stage` is backed by
-/// `AbWinLine`, and both its side stride and row stride are whole cache lines.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
 unsafe fn store_ranked_stage_line(p: *mut u32, v: __m512i) {
     unsafe { _mm512_store_si512(p.cast::<__m512i>(), v) }
 }
 
-/// Widen one staged 64-byte window side (its two transposed V8 rows, still in
-/// registers) to the pre-scaled `u16` offset half the split shift-reduce
-/// kernel consumes: `byte * 64` per lane, two ZMM stores. Identical values to
-/// the kernel's own prologue — the source is the register the staging store
-/// was made from instead of a reload of that store.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_off_half(lo: V8, hi: V8, op: *mut u16) {
@@ -319,9 +240,6 @@ unsafe fn widen_off_half(lo: V8, hi: V8, op: *mut u16) {
     }
 }
 
-/// ZMM-row twin of [`widen_off_half`]. The low cast is free; the one high-half
-/// extract lets the fused transpose keep its row whole for the aligned stage
-/// store while still feeding the two byte-to-word widening instructions.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_off_line(v: __m512i, op: *mut u16) {
@@ -334,9 +252,6 @@ unsafe fn widen_off_line(v: __m512i, op: *mut u16) {
     }
 }
 
-/// `FLOCK_NO_WIDEN_MADDUBS=1` restores the byte-order offset arena and its
-/// `vpmovzxbw` + `vpsllw` widen. Default ON; the ranked worker's cleared
-/// environment never disables it.
 #[inline(always)]
 pub(crate) fn widen_maddubs_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -351,9 +266,6 @@ pub(crate) fn widen_maddubs_enabled() -> bool {
     }
 }
 
-/// The two `vpmaddubsw` multipliers of [`widen_off_line_parity`], resolved
-/// once per drain call and carried in registers: byte pairs `{64, 0}` keep
-/// each even byte, `{0, 64}` each odd byte.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[derive(Clone, Copy)]
 struct WidenConsts {
@@ -374,17 +286,6 @@ impl WidenConsts {
     }
 }
 
-/// Parity-split twin of [`widen_off_line`]: the same `byte * 64` values, but
-/// produced by two `vpmaddubsw` (port 0) against the register-resident
-/// `{64, 0, …}` / `{0, 64, …}` multipliers instead of two `vpmovzxbw`, one
-/// `vextracti64x4` (all port 5) and two `vpsllw`. `255 * 64 = 16320` never
-/// saturates the signed word. The row is the UNSIGNED operand; the constant
-/// is the signed one.
-///
-/// Layout: the first ZMM holds the 32 even-byte offsets, the second the 32
-/// odd-byte offsets, so K-row `k`'s four even offsets are u64 lane `k` of the
-/// first store and its four odd offsets u64 lane `k` of the second — the
-/// `P = true` layout of every `round1_ab_inner_window_from_offsets*` consumer.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_off_line_parity(v: __m512i, op: *mut u16, c: WidenConsts) {
@@ -404,9 +305,6 @@ fn xor_v8(a: V8, b: V8) -> V8 {
     unsafe { _mm256_xor_si256(a, b) }
 }
 
-/// Three-way XOR `a ^ b ^ c`. On AVX-512VL this folds the two `vpxord`s of the
-/// carry-in chain into one `vpternlogd` with immediate `0x96` (the truth table
-/// of `a ^ b ^ c`, order-independent, bit-identical to the paired XORs).
 #[allow(dead_code)]
 #[inline(always)]
 fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
@@ -414,7 +312,7 @@ fn xor3_v8(a: V8, b: V8, c: V8) -> V8 {
     unsafe {
         _mm256_ternarylogic_epi32::<0x96>(a, b, c)
     }
-    // AVX2-only hosts (no AVX-512VL): the paired XORs this folds. Bit-identical.
+
     #[cfg(not(target_feature = "avx512vl"))]
     unsafe {
         _mm256_xor_si256(_mm256_xor_si256(a, b), c)
@@ -446,18 +344,10 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
     unsafe { _mm256_slli_epi32::<N>(v) }
 }
 
-/// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
-        // One VPTERNLOGD (AVX512F, EVEX.256) folds the AND+OR of the AVX2
-        // emulation: out = (b << N) | (a & mask) == ternlog<0xF8>(b<<N, a, mask).
-        // Bit-identical; the carry-packing is the hot half of the witness
-        // G-functions, and on the ranked runner the ternlog saves one op per
-        // push (~16 per G, ~900 per 8-block call). The mask is a compile-time
-        // constant here (N is literal), so it folds into the ternlog's memory
-        // operand or a constant broadcast; no register pressure change.
         unsafe {
             let mask = _mm256_set1_epi32(((1u64 << N) - 1) as u32 as i32);
             _mm256_ternarylogic_epi32::<0xF8>(_mm256_slli_epi32::<N>(b), a, mask)
@@ -470,7 +360,6 @@ fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
     }
 }
 
-/// 8×8 u32 transpose. `r[i]` lane `j` becomes `out[j]` lane `i`.
 #[inline(always)]
 fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8] {
     unsafe {
@@ -505,25 +394,6 @@ fn tr8(v0: V8, v1: V8, v2: V8, v3: V8, v4: V8, v5: V8, v6: V8, v7: V8) -> [V8; 8
     }
 }
 
-/// 16×8 u32 transpose specialized for one complete ranked projection side.
-/// `stage[w + i]` is word-major (lane `j` belongs to block `j`); the result
-/// is block-major: `out[j]` lane `i == stage[w + i]` lane `j`.
-///
-/// The eight ZMM loads each join two adjacent input words. Three binary
-/// `permutex2var` layers then grow each contiguous output group:
-///
-/// 1. four input rows × four columns,
-/// 2. eight input rows × two columns,
-/// 3. sixteen input rows × one column.
-///
-/// Formally, let `M[i][j]` denote lane `j` of input word `i`. After layer 1,
-/// `p[2g+h][4c+r] = M[4g+r][4h+c]`; after layer 2,
-/// `q[4g+h][8c+r] = M[8g+r][2h+c]`; the final two selectors therefore give
-/// `out[2h+c][r] = M[r][2h+c]`. The index vectors below are those equations
-/// written in `permutex2var_epi32`'s concatenated `[a|b]` lane numbering.
-///
-/// # Safety
-/// `stage[w..w+16]` contains sixteen initialized `V8`s. AVX-512F is enabled.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
 unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
@@ -531,7 +401,6 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         debug_assert!(w + STEP_WORDS <= RING_WORDS);
         debug_assert!(w.is_multiple_of(STEP_WORDS));
 
-        // Each unaligned ZMM is [word 2k lanes 0..7 | word 2k+1 lanes 0..7].
         let x0 = _mm512_loadu_si512(stage.add(w).cast::<__m512i>());
         let x1 = _mm512_loadu_si512(stage.add(w + 2).cast::<__m512i>());
         let x2 = _mm512_loadu_si512(stage.add(w + 4).cast::<__m512i>());
@@ -578,8 +447,6 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
     }
 }
 
-/// Transpose one fully-live ranked side and widen its offsets while the
-/// complete block-major rows are still live.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn ranked_dense_rows_and_offsets_rollback<const P: bool>(
@@ -595,9 +462,6 @@ unsafe fn ranked_dense_rows_and_offsets_rollback<const P: bool>(
     }
 }
 
-/// `FLOCK_NO_WITGEN_RANKED_DIRECT_PUBLISH=1` restores the ranked hot-window
-/// stage stores plus stage reload publication. Default ON; the ranked worker's
-/// cleared environment never disables it.
 #[inline(always)]
 pub(crate) fn ranked_direct_dense_publish_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -613,9 +477,6 @@ pub(crate) fn ranked_direct_dense_publish_enabled() -> bool {
     }
 }
 
-/// `FLOCK_NO_WITGEN_RANKED_DIRECT_INLINE=1` restores the original
-/// by-value-row + outlined-consumer ABI inside the direct-publish path while
-/// preserving its bytes and publication schedule.
 #[inline(always)]
 pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -631,9 +492,6 @@ pub(crate) fn ranked_direct_dense_inline_enabled() -> bool {
     }
 }
 
-/// `FLOCK_NO_R1_B_CONSTWIN=1` restores the runtime-block B-complement leaf.
-/// Cache the rollback once and share it between the outlined and direct-inline
-/// publishers so the default ranked path cannot bypass the const-window leaf.
 #[inline(always)]
 fn ranked_b_constwin_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -642,9 +500,6 @@ fn ranked_b_constwin_enabled() -> bool {
     *ON
 }
 
-/// Widen one side's eight transposed rows into the offset arena, in the
-/// byte-order layout (`P = false`, [`widen_off_line`]) or the parity split
-/// (`P = true`, [`widen_off_line_parity`]); `c` is only read by the latter.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn widen_ranked_dense_rows<const P: bool>(
@@ -665,8 +520,6 @@ unsafe fn widen_ranked_dense_rows<const P: bool>(
     }
 }
 
-/// Transpose and stage one fully-live ranked side, preserving each complete
-/// ZMM row long enough to build its two offset halves without a stage reload.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn stage_ranked_dense_side<const P: bool>(
@@ -687,9 +540,6 @@ unsafe fn stage_ranked_dense_side<const P: bool>(
     }
 }
 
-/// Caller-owned direct-publish path: keep the ranked rows in the caller's
-/// frame, widen their offsets there, and consume them without an outlined ABI
-/// boundary or a by-value `[__m512i; 8]` return.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
@@ -1181,9 +1031,6 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
     }
 }
 
-/// Direct-inline const-window leaf. The producer-owned transposed rows remain
-/// live across publication, while the block index is fixed for the corrected
-/// B-complement core wrapper.
 #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
@@ -1222,53 +1069,39 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
 }
 
 const RING_WORDS: usize = 32;
-/// Words the pre-round prologue fills, starting at word 16.
+
 const PROLOGUE_WORDS: usize = 20;
-/// Ranked static windows whose B side is supplied without reading the ring.
+
 const RANKED_STATIC_B_PREFIX_END: usize = 2 * STEP_WORDS;
 const RANKED_STATIC_B_TAIL_START: usize = 30 * STEP_WORDS;
 const _RING_GEOMETRY: () = {
     assert!(RING_WORDS >= 32);
     assert!(RING_WORDS <= U32_PER_BLOCK);
     assert!(RING_WORDS & (RING_WORDS - 1) == 0);
-    // Every epoch boundary is a whole number of drain steps.
+
     assert!(RING_WORDS.is_multiple_of(STEP_WORDS));
     assert!(STEP_WORDS == 16);
-    // One step row is exactly one cache line, and every witness-block stride
-    // preserves that alignment. The ranked publisher relies on both facts to
-    // issue aligned ZMM non-temporal stores without a per-line alignment test.
+
     assert!(STEP_WORDS * core::mem::size_of::<u32>() == 64);
     assert!((U32_PER_BLOCK * core::mem::size_of::<u32>()).is_multiple_of(64));
-    // blk30's packed qwords plus the sliding-reference guard occupy exactly
-    // the first 128 bytes of the A staging side.
+
     assert!(8 * STEP_WORDS >= 32);
     assert!(RANKED_STATIC_B_PREFIX_END == 32);
     assert!(RANKED_STATIC_B_TAIL_START == 480);
     assert!(LAST_WORD == RANKED_STATIC_B_TAIL_START + 1);
 };
 
-/// Streaming round-1 projection wired into the a/b drain: every 16-word drain
-/// step is one 64-byte round-1 medium window per block, so the transform runs
-/// off a `STREAM_STAGE_WORDS` staging pair as the words are produced instead
-/// of off two full-block window buffers.
-///
-/// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
-/// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
-    /// Physical start of this octa's output region. `out_bias` maps logical
-    /// ranked row 2 to physical row 0 without ever forming a pointer before
-    /// the allocation.
+
     pub(crate) out: *mut u8,
     pub(crate) out_stride: usize,
     pub(crate) out_bias: usize,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
-    /// Ranked residual representation; dense producers leave this off.
+
     pub(crate) one_rows_elided: bool,
-    /// Window 30's round-one AB transform is elided: round one adds its exact
-    /// contribution from the identity-C fold (the z/a publish stays).
+
     pub(crate) w30_elided: bool,
 }
 
@@ -1338,14 +1171,9 @@ static RANKED_ZERO: RankedStaticWindow = RankedStaticWindow([0u8; 64]);
 impl StreamProj<'_> {
     #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
-        // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
     }
 
-    /// The window's per-block invariants: its static-B eligibility and the
-    /// table images the kernel addresses. Both are the same for all eight
-    /// blocks, so a producer that walks the eight blocks in several pieces
-    /// resolves them ONCE and hands them to every piece.
     #[inline(always)]
     fn window_prep(&self, blk: usize) -> (Round1AbWindowPlan, Round1AbTableImages) {
         let p = self.plan.for_window(blk);
@@ -1377,10 +1205,10 @@ impl StreamProj<'_> {
         }
     }
 
-    /// Ranked all-elide windows 2..29 always consume producer-built offsets,
-    /// and every half-row is live with wide non-temporal publication. Keeping
-    /// that fixed policy out of [`Self::project_blocks_ranked`] removes its
-    /// policy branch and the generic row publisher from the measured path.
+
+
+
+
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked_hot_offsets<const P: bool>(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
@@ -1394,11 +1222,11 @@ impl StreamProj<'_> {
                 self.project_blocks_ranked_hot_offsets_residual::<29,0x0f,P>(plan,imgs,rows,off);
                 return;
             }
-            // E=true is selected only for the ranked all-elide witness
-            // geometry. Its structural B=1 bytes are proved by the
-            // b-complement mode-plan test; the core plan separately verifies
-            // the exact inverse-table identity. Keep the cold/dense fallback
-            // in this same outlined boundary behind its cached kill switch.
+
+
+
+
+
             if plan.bcomplement_static_eligible() {
                 self.project_blocks_ranked_hot_offsets_bcomplement::<P>(blk,plan,imgs,rows,off);
                 return;
@@ -1414,9 +1242,9 @@ impl StreamProj<'_> {
         }
     }
 
-    /// Ranked static-B complement projection for full windows. The producer's
-    /// publish-then-project pacing is intentionally identical to the generic
-    /// hot leaf; only B's table application is shortened.
+
+
+
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn project_blocks_ranked_hot_offsets_bcomplement<const P: bool>(&self, blk: usize, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows, off: *const u16) {
@@ -1621,12 +1449,12 @@ impl StreamProj<'_> {
     #[inline(never)]
     unsafe fn project_blocks_ranked_30(&self, plan: Round1AbWindowPlan, imgs: Round1AbTableImages, rows: RankedRows) {
         unsafe {
-            // The first eight qwords are the eight blocks' real row-0 A
-            // values. The following eight are initialized guard bytes. A
-            // sliding 64-byte reference starting at qword j is therefore
-            // valid even for j=7. Its later rows may belong to another block,
-            // but B30 rows 1..7 are exactly zero, so both the trusted kernel
-            // and its generic kill-switch fallback produce the same product.
+
+
+
+
+
+
             let q=self.stage.cast::<u64>();
             let mut j=0usize;
             while j!=8 {
@@ -1642,10 +1470,6 @@ impl StreamProj<'_> {
     }
 }
 
-/// Rolling drain state shared by the A/B packed writers. The witness uses two
-/// reusable `RING_WORDS`-word epochs instead of full 512-word stages; B's
-/// writer flushes after A has written the epoch, and Z is derived from the
-/// transposed A/B rows during that flush.
 struct Drain8<'t> {
     ast: *mut V8,
     bs: *mut V8,
@@ -1669,10 +1493,6 @@ struct Drain8<'t> {
     roots: Option<root_emit::RootOctaWriter<'t>>,
 }
 
-/// Convert one low-aligned prior bit to the representation used by [`W8`].
-/// Sapphire Rapids keeps pending bits at the high end of each lane so VBMI2
-/// can join them to the next field with one `vpshldd`; the portable AVX2
-/// fallback retains the incumbent low-aligned representation.
 #[inline(always)]
 fn packer_initial_bit(bit: V8) -> V8 {
     #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
@@ -1685,8 +1505,6 @@ fn packer_initial_bit(bit: V8) -> V8 {
     }
 }
 
-/// Recover low-aligned pending bits from the VBMI2 representation. `BACK` is
-/// `32 - used`; the ranked stream finishes with `used = 17`, hence `BACK=15`.
 #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
 #[inline(always)]
 fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
@@ -1696,13 +1514,6 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
     shr_v8::<BACK>(pending)
 }
 
-/// Lane-wise packed-word writer: 8 independent `PackedWordWriter`s.
-///
-/// On AVX-512VBMI2+VL targets `pending` is high-aligned: if `USED = u > 0`,
-/// its pending low bits occupy bits `32-u..31`.  This makes
-/// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
-/// Bits below that high-aligned range are don't-care. Other targets keep the
-/// incumbent low-aligned `pending` representation.
 struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false> {
     pending: V8,
     stage: *mut V8,
@@ -1724,10 +1535,6 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOS
     #[inline(always)]
     unsafe fn write_word<const WORD: usize>(&mut self, v: V8) {
         unsafe {
-            // In the ranked all-elide path, static windows provide B words
-            // 0..31 and 480..511 without touching this ring. Keep the flush
-            // check independent of the store: a skipped epoch-ending B word
-            // must still publish the completed A/B epoch.
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             let is_ranked_static = RANKED_CLOSED || self.ranked_static;
             #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
@@ -1739,9 +1546,6 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOS
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
-                // Words 0..15 cannot be published until the final chaining
-                // value is known.  The first rolling epoch therefore starts
-                // at word 16; later epochs cover their complete 128 words.
                 if WORD + 1 == RING_WORDS {
                     (*self.drain).drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
                 } else {
@@ -1770,23 +1574,17 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOS
         unsafe {
             #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
             {
-                // Every u>0 push crosses a word boundary because WIDTH is 31
-                // or 32.  VPSHLD supplies the old high-aligned pending bits
-                // from its second source while shifting the new field left.
                 if USED == 0 {
                     if WIDTH == 32 {
                         self.write_word::<WORD>(v);
                         self.pending = dup_u32(0);
                     } else {
-                        // 31 pending low bits, moved to bits 1..31.
                         self.pending = shl_v8::<1>(v);
                     }
                 } else {
                     let out = _mm256_shldi_epi32::<USED>(v, self.pending);
                     self.write_word::<WORD>(out);
-                    // A crossed 31-bit field leaves u-1 low bits; high-aligning
-                    // them is exactly v<<1.  A 32-bit field leaves u bits, so
-                    // v itself already is the high-aligned representation.
+
                     self.pending = if WIDTH == 31 { shl_v8::<1>(v) } else { v };
                 }
             }
@@ -1820,9 +1618,6 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool> W8<'t, FLUSH, RANKED_CLOS
             assert!(USEFUL_BITS % 32 == 17);
         }
         unsafe {
-            // The ranked stream finishes with 17 pending bits.  The VBMI2
-            // representation holds those bits in 15..31; the incumbent
-            // fallback is already low-aligned.
             #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
             let pending = packer_high_to_low::<15>(self.pending);
             #[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
@@ -1843,10 +1638,6 @@ macro_rules! pushf8 {
 
 #[inline(always)]
 fn add_carry_parts_v8(x: V8, y: V8) -> (V8, V8, V8) {
-    // `cin = sum ^ x ^ y` is never consumed directly: the pushed parts are
-    // `left = x ^ cin` and `right = y ^ cin`, and both collapse algebraically
-    // (`left = sum ^ y`, `right = sum ^ x`). Computing them off `sum` removes
-    // the carry-in XOR chain entirely — bit-identical outputs, one op less.
     let sum = add_v8(x, y);
     let left = xor_v8(sum, y);
     let right = xor_v8(sum, x);
@@ -1860,20 +1651,14 @@ fn xor_rotr8<const N: i32, const M: i32>(x: V8, y: V8) -> V8 {
     ror_v8::<N>(v)
 }
 
-/// Rotate-right by N on AVX-512 (single `vprold`, EVEX.256) -- three ops on
-/// AVX2. Bit-identical either way; the witness phase is ALU-bound so the
-/// uop cut matters on the ranked runner. The EVEX form needs `avx512f`.
 #[inline(always)]
 fn ror_v8<const N: i32>(v: V8) -> V8 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
-        // SAFETY: target feature checked at compile time.
         unsafe { _mm256_ror_epi32::<N>(v) }
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
     {
-        // N is a monomorphized literal (16/12/8/7 in the G-functions), so the
-        // match folds to the single shift+or pair at compile time.
         match N {
             16 => or_v8(shr_v8::<16>(v), shl_v8::<16>(v)),
             12 => or_v8(shr_v8::<12>(v), shl_v8::<20>(v)),
@@ -1884,8 +1669,6 @@ fn ror_v8<const N: i32>(v: V8) -> V8 {
     }
 }
 
-/// Drain 8 consecutive stage words (`dump` chunk `g`) to eight row-major
-/// 32-byte block runs. Temporal stores only.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
@@ -1913,17 +1696,6 @@ unsafe fn dump_range(stage: *const V8, dst: *mut u32, g0: usize, g1: usize) {
     }
 }
 
-/// Non-temporal twin of [`dump_range`]: identical bytes. Recyclable-class
-/// destinations are 64-aligned on this lineage, and `U32_PER_BLOCK = 512`
-/// keeps every row start 64-aligned too, so a pair of 32-byte V8s is one
-/// cache line. Publish that line with a single ZMM stream when `avx512f` is
-/// compiled in, otherwise one YMM stream per V8. `FLOCK_NO_WIDE_NT=1` keeps
-/// the historical two-XMM form. Chunks still drain in PAIRS so each line's
-/// write-combining buffer closes as soon as it fills.
-///
-/// Caller contract: destinations are not read again until after an
-/// `_mm_sfence()` on this thread (the witness task issues one per rayon
-/// task; same-thread reads are self-consistent regardless).
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, wide_nt: bool) {
@@ -1949,8 +1721,6 @@ unsafe fn dump_range_nt(stage: *const V8, dst: *mut u32, g0: usize, g1: usize, w
     }
 }
 
-/// Transpose the eight stage words at `w` (one `dump` chunk) into eight
-/// row-major 32-byte runs.
 #[inline(always)]
 unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
     unsafe {
@@ -1967,12 +1737,6 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
     }
 }
 
-/// Publish one 32-byte transposed run non-temporally.
-///
-/// # Safety
-/// Caller guarantees 16-byte alignment of `p`; the YMM arm additionally
-/// requires 32-byte alignment (true for every in-loop pointer when `dst` is
-/// 32-aligned and `w` is a multiple of 8).
 #[inline(always)]
 unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     unsafe {
@@ -1985,12 +1749,6 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
     }
 }
 
-/// Publish a chunk PAIR — two consecutive 32-byte runs, i.e. one 64-byte
-/// cache line when `p` is line-aligned — non-temporally, closing the line's
-/// write-combining buffer in one shot where the ISA allows it.
-///
-/// # Safety
-/// Same alignment contract as [`stream_v8`], for both `p` and `p.add(8)`.
 #[inline(always)]
 unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     unsafe {
@@ -2006,27 +1764,12 @@ unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     }
 }
 
-/// Fixed ranked publisher for one complete cache line.
-///
-/// Unlike [`stream_pair_v8`], this has no width policy, alignment branch, or
-/// YMM-to-ZMM assembly. The ranked caller supplies an already-complete ZMM and
-/// a line-aligned destination, so publication is exactly one `vmovntdq`.
-///
-/// # Safety
-/// `p` is 64-byte aligned and owns 64 writable bytes that are not observed
-/// before the task-level `_mm_sfence()`.
 #[cfg(target_feature = "avx512f")]
 #[inline(always)]
 unsafe fn stream_ranked_line(p: *mut u32, v: __m512i) {
     unsafe { _mm512_stream_si512(p.cast::<__m512i>(), v) }
 }
 
-/// Publish one row of a drain step to `p` (its low 32-byte run) and `p+8`
-/// (its high run), under the same `nt`/liveness policy — and therefore with
-/// the same bytes at the same addresses as the ranked drain publisher.
-///
-/// # Safety
-/// As for [`stream_pair_v8`] and [`store_v8`].
 #[inline(always)]
 unsafe fn emit_pair(
     p: *mut u32,
@@ -2053,28 +1796,16 @@ unsafe fn emit_pair(
     }
 }
 
-/// One drain step's three destination rows, staged for publication BETWEEN
-/// block transforms by [`StreamProj::project_blocks_ranked`].
-///
-/// Nothing here is kept in registers across the transform: a's and b's bytes
-/// are already in the projection's own staging (they are its input). The
-/// publisher loads each staged row once and derives z immediately, before the
-/// transform, so no separate z-row scratch has to survive the outlined call.
 #[derive(Clone, Copy)]
 struct StepRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
-    /// bit 0 z-lo, 1 z-hi, 2 a-lo, 3 a-hi, 4 b-lo, 5 b-hi live;
-    /// bit 6 z non-temporal, bit 7 wide streaming stores.
+
     flags: u8,
 }
 
 impl StepRows {
-    /// Publish block `j`'s three rows.
-    ///
-    /// # Safety
-    /// `self` describes one live drain step and `j < 8`.
     #[inline(always)]
     unsafe fn publish(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
@@ -2118,16 +1849,6 @@ impl StepRows {
     }
 }
 
-/// Fixed-policy row publisher for the measured all-elide path.
-///
-/// The ranked AVX-512 binary installs `RecycleAlloc` globally. Its cleared
-/// environment selects the allocator's 64-byte-aligned recyclable class for
-/// the large z/a/b vectors. Rayon group starts (32 KiB), octa-half starts
-/// (16 KiB), block rows (2 KiB), and step offsets (64 B) all preserve that
-/// base alignment. `StreamProj::stage` is backed by `AbWinLine`, also aligned
-/// to 64 bytes, and its side/row strides preserve it. Consequently no ranked
-/// store needs to carry the generic publisher's flags, width policy, or
-/// runtime alignment recovery.
 #[derive(Clone, Copy)]
 struct RankedRows {
     z: *mut u32,
@@ -2147,7 +1868,6 @@ impl RankedRows {
         Self { z, a, b }
     }
 
-    /// Dense ranked windows 2..29: z, a, and b are all fully live.
     #[inline(always)]
     unsafe fn publish_dense(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
@@ -2175,8 +1895,6 @@ impl RankedRows {
         }
     }
 
-    /// Dense ranked windows 2..29, sourced directly from the live transposed
-    /// rows instead of staging and immediately reloading them.
     #[cfg(target_feature = "avx512f")]
     #[inline(always)]
     unsafe fn publish_dense_values(&self, j: usize, av: __m512i, bv: __m512i) {
@@ -2188,9 +1906,6 @@ impl RankedRows {
         }
     }
 
-    /// Static-B ranked windows 0/1 sourced directly from the live transposed
-    /// rows ([`tr8x16_zmm`]) instead of two YMM transposes, sixteen staging
-    /// stores and a reload: the same line, streamed to z and a.
     #[cfg(target_feature = "avx512f")]
     #[inline(always)]
     unsafe fn publish_static_values(&self, j: usize, av: __m512i) {
@@ -2201,7 +1916,6 @@ impl RankedRows {
         }
     }
 
-    /// Static-B ranked windows 0/1: B=1, so the complete z and a lines match.
     #[inline(always)]
     unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
         unsafe {
@@ -2224,8 +1938,6 @@ impl RankedRows {
         }
     }
 
-    /// Sparse ranked window 30: only its first qword is live; publish the
-    /// complete line with the other seven qwords zeroed in the load itself.
     #[inline(always)]
     unsafe fn publish_sparse_30(&self, j: usize, p: *const u64) {
         unsafe {
@@ -2247,10 +1959,6 @@ impl RankedRows {
     }
 }
 
-/// Publishes the ranked closed drain's windows 0/1 straight from the
-/// transposed ring rows instead of the incumbent staging (two YMM transposes,
-/// sixteen stores and one reload per row). Default ON; set
-/// `FLOCK_NO_WITGEN_STATIC01_DIRECT=1` to restore staging.
 #[inline(always)]
 #[allow(dead_code)]
 pub(crate) fn ranked_static01_direct_enabled() -> bool {
@@ -2487,9 +2195,9 @@ impl Drain8<'_> {
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_ranked_offset_window(&self, abs_word: usize, rw: usize) {
-        // Offset windows need a large inlined table kernel and its constants.
-        // Keep that setup local to this path so the common XOR projection
-        // caller does not carry those values across each projection call.
+
+
+
         unsafe {
             let proj = &self.proj;
             let preps = self.ranked_preps.unwrap_unchecked();
@@ -2622,22 +2330,22 @@ impl Drain8<'_> {
         }
     }
 
-    /// Same bytes as the bunched arm of [`Self::drain_range`], published on a
-    /// different SCHEDULE.
-    ///
-    /// The bunched form emits all twenty-four of a step's 64-byte streaming
-    /// stores back to back — eight rows 2048 bytes apart, three destinations —
-    /// and then runs ~1000 core-cycles of projection with none. Twenty-four
-    /// lines in ~70 core-cycles is ~8x this core's sustained non-temporal
-    /// write rate, so the write-combining buffers saturate, the streaming
-    /// store at the head of the store buffer cannot retire, and allocation
-    /// stalls behind it (`resource_stalls.sb`).
-    ///
-    /// Here nothing is published until the staging is complete, and then the
-    /// window's eight block transforms publish their OWN three rows as they
-    /// go. Identical addresses, identical bytes, three lines per block instead
-    /// of twenty-four per step — and still exactly one call per step, so the
-    /// spread costs no extra call or spill traffic.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     #[rustfmt::skip]
     #[inline(never)]
     unsafe fn drain_range_spread<const E:bool>(
@@ -2653,15 +2361,15 @@ impl Drain8<'_> {
             let b_g0=if E||self.elide[2]{ELIDE_B_PREFIX_CHUNKS}else{0};
             let b_g1=if E||self.elide[2]{ELIDE_B_TAIL_CHUNK_WIN}else{DUMP_CHUNKS};
             let (sa, sb) = proj.sides();
-            // Window 31 is `w = 1, b_med = 15`, one past round one's last live
-            // b_med at the pinned BLAKE3 shape — its 64 output bytes are never
-            // read, exactly as windows 0 and 1 are never read under the same
-            // `one_rows_elided` brand. Resolved once per call, not per window.
+
+
+
+
             let dead_w31 = E && proj.one_rows_elided && ey_dead_w31_enabled();
-            // Parity-split offset widen (`vpmaddubsw`) and its two multiplier
-            // vectors, resolved once per call so the loop carries them in
-            // registers. `FLOCK_NO_WIDEN_MADDUBS=1` selects the byte-order
-            // arena and its incumbent widen through the same publishers.
+
+
+
+
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             let maddubs = E && widen_maddubs_enabled();
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -2677,10 +2385,10 @@ impl Drain8<'_> {
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
                     let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
                     if blk == 30 {
-                        // Only A words 480 and 481 are live. Pair those two
-                        // word-major ring vectors into eight block-major
-                        // qwords, followed by a fully initialized 64-byte
-                        // guard for the sliding synthetic A windows.
+
+
+
+
                         let x0=load_v8(self.ast.add(rw).cast::<u32>());
                         let x1=load_v8(self.ast.add(rw+1).cast::<u32>());
                         let l=_mm256_unpacklo_epi32(x0,x1);
@@ -2721,25 +2429,25 @@ impl Drain8<'_> {
                     }
                     continue;
                 }
-                // Fused offset arena: while the transposed rows are still in
-                // registers, also widen them to the split kernel's pre-scaled
-                // `u16` offsets. The kernel then consumes the arena and never
-                // reloads the staging, and no consuming load executes in the
-                // shadow of its own offset stores.
-                // The E=true static cases continued above, so its remaining
-                // windows are exactly 2..29 and offsets are unconditional.
-                // E=false retains the original per-window eligibility test.
+
+
+
+
+
+
+
+
                 #[repr(align(64))]
                 struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                 let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                 let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
 
                 if E {
-                    // Ranked dense path: each side's two AVX2 half-transposes
-                    // become one 16-word ZMM transpose, and the same live ZMM
-                    // rows feed offset widening. The incumbent fallback stages
-                    // those rows once; the direct arm streams them straight to
-                    // z/a/b.
+
+
+
+
+
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
                         let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
@@ -2769,9 +2477,9 @@ impl Drain8<'_> {
                             proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                         }
                     }
-                    // Portable builds cannot select E=true: the ranked gate
-                    // requires the AVX-512 offset plan. Retain the old staging
-                    // shape so this monomorphization remains well-formed.
+
+
+
                     #[cfg(not(all(target_feature = "avx512f", target_feature = "avx512bw")))]
                     {
                         let a_lo=tr8_chunk(self.ast,rw);
@@ -2792,8 +2500,8 @@ impl Drain8<'_> {
                         proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                     }
                 } else {
-                    // Cold/generic path stays on the two incumbent AVX2
-                    // transposes and its per-window offset eligibility gate.
+
+
                     let use_off=plan.offsets_eligible(blk);
                     let a_lo=tr8_chunk(self.ast,rw);
                     let a_hi=tr8_chunk(self.ast,rw+8);
@@ -2846,28 +2554,6 @@ impl Drain8<'_> {
     }
 }
 
-/// Dual-destination twin of [`dump_range_nt`] for the a/b sides: one
-/// transpose feeds BOTH
-///  * `dst` — the main witness buffer, published NON-TEMPORALLY over the
-///    un-elided chunk range `[g0, g1)`, in the same paired-chunk order (and
-///    with the same bytes) `dump_range_nt(stage, dst, g0, g1)` would use; and
-///  * `win` — a compact 8-block window buffer with the same row-major
-///    geometry (`U32_PER_BLOCK` row stride), written TEMPORALLY over ALL of
-///    `0..DUMP_CHUNKS`.
-///
-/// `win` deliberately ignores the elide range, so it always carries the FULL
-/// `U32_PER_BLOCK` words per block. The round-1 window projection reads a
-/// whole block; eliding a `dst` chunk is only legal because `dst` already
-/// holds those exact constant bytes from a previous witgen (pool provenance
-/// token), and those constants are *not* uniformly zero — b's elided prefix
-/// is all-ones. Rebuilding every chunk into `win` rather than zero-filling
-/// (or reading `dst` back) keeps the projection's input byte-identical to the
-/// incumbent's for every elide setting, by construction.
-///
-/// # Safety
-/// AVX2 required. `dst` owns 8 contiguous `U32_PER_BLOCK`-word blocks and is
-/// 16-byte aligned; `win` owns 8 contiguous `U32_PER_BLOCK`-word blocks and
-/// is disjoint from `dst` and from `stage`.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_range_nt_win(
@@ -2885,9 +2571,7 @@ unsafe fn dump_range_nt_win(
             let w = 8 * g;
             let ta = tr8_chunk(stage, w);
             let tb = tr8_chunk(stage, w + 8);
-            // Window first: plain stores to a 16 KiB L1-resident buffer, and
-            // grouping them ahead of the streams keeps each row's write-
-            // combining buffer open across consecutive NT stores.
+
             for r in 0..8 {
                 let p = win.add(r * U32_PER_BLOCK + w);
                 store_v8(p, ta[r]);
@@ -2939,8 +2623,6 @@ unsafe fn dump_elide(
     }
 }
 
-/// [`dump_elide`]'s dual-destination form: same elide range selection, always
-/// non-temporal into `dst`, always FULL into `win`. See [`dump_range_nt_win`].
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dump_elide_win(
@@ -2961,21 +2643,6 @@ unsafe fn dump_elide_win(
     unsafe { dump_range_nt_win(stage, dst, win, g0, g1, wide_nt) }
 }
 
-/// Build `(z, a, b)` for EIGHT compressions in u32-lane lockstep.
-/// Bit-exact with two 4-wide quads and with the scalar driver ×8.
-///
-/// `proj` selects the STREAMING form of the a/b fusion: a/b are
-/// published non-temporally, and each drain step's
-/// eight 64-byte round-1 medium windows are transformed straight into the
-/// caller's ab_inner blocks out of a small staging pair, so no full-block
-/// window buffer exists.
-///
-/// # Safety
-/// Caller must have AVX2. `z`/`a`/`b` each own 8 contiguous 512-word blocks.
-/// `proj`'s staging and `out` satisfy [`StreamProj`]'s contract. In every
-/// non-temporal arm the caller must `_mm_sfence()` on this thread after its
-/// last octa, before releasing a/b to another thread (same-thread reads are
-/// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>(
@@ -3062,9 +2729,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
             m[14], m[15], tlo, thi, blen, flags,
         ];
-        // Words 16..35 are available before the rounds. Retain them in the
-        // rolling epochs; the writer publishes each epoch when it completes
-        // that epoch's last word.
+
         for k in 0..20usize {
             let v = if k == 0 {
                 or_v8(one, shl_v8::<1>(chain[0]))
@@ -3074,8 +2739,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             let w = 16 + k;
             store_v8(ast.add(w & (RING_WORDS - 1)) as *mut u32, v);
         }
-        // Unswitch the static-prefix decision once per octa. Ranked blocks
-        // 0/1 source B from RANKED_B_MAX; block 2 still needs words 32..35.
+
         if !ranked_static {
             for w in 16..RANKED_STATIC_B_PREFIX_END {
                 store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
@@ -3085,10 +2749,6 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             store_v8(bs.add(w & (RING_WORDS - 1)) as *mut u32, maxv);
         }
 
-        // The round stream starts at word `PROLOGUE_WORDS + 16`, so a first
-        // epoch that ends inside the prologue never reaches the writers'
-        // epoch boundary — publish it here instead. Constant-folded away for
-        // every ring long enough to reach the round stream.
         if RING_WORDS <= PROLOGUE_WORDS + 16 {
             drain.drain_range_gen::<RANKED_CLOSED>(16, 16, RING_WORDS - 16);
         }
@@ -3096,8 +2756,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
         let mut wa = W8::<false, RANKED_CLOSED>::at(ast, pending_bit, drain_ptr, false);
-        // B is pushed after A at every site; it alone triggers a band drain
-        // once both rings contain the completed word. Z is derived there.
+
         let mut wb =
             W8::<true, RANKED_CLOSED>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
@@ -3184,9 +2843,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         const {
             assert!(U32_PER_BLOCK - ZF == 30);
         }
-        // finish() completed word 481. The ranked blk30 path reads only ring
-        // words 480/481 and constructs its zero tail directly; blk31 is a
-        // direct zero output. Cold/rollback paths retain the complete tail.
+
         if !ranked_static {
             for w in ZF..U32_PER_BLOCK {
                 let i = w & (RING_WORDS - 1);
@@ -3196,10 +2853,6 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         }
         drain.drain_range_gen::<RANKED_CLOSED>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
 
-        // Band 0 is the one intentional deferral: words 0..7 are the input
-        // CV, while words 8..15 depend on the final compression state. Build
-        // the complete cache line now, then publish it through the exact same
-        // elide/NT/window policy as every rolling band.
         for w in 0..8usize {
             let lo = xor_v8(state[w], state[w + 8]);
             store_v8(ast.add(w) as *mut u32, cv_v[w]);
@@ -3237,8 +2890,6 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     elide: [bool; 3],
 ) {
     unsafe {
-        // Only the all-elide provenance state selects the ranked static
-        // windows. Partial/cold states still read both rings in every window.
         let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
@@ -3414,11 +3065,6 @@ mod tests {
         out
     }
 
-    /// Compile every W8 offset/width specialization used by the witness and
-    /// compare its high-aligned VBMI2 state transition with an independent
-    /// scalar bitstream append.  Bit-basis inputs include the deliberately
-    /// dirty bit 31 of a width-31 field, so the oracle also proves that the
-    /// next field, rather than an eager mask, discards that irrelevant bit.
     #[cfg(all(target_feature = "avx512vbmi2", target_feature = "avx512vl"))]
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn check_vbmi2_push<const USED: i32, const WIDTH: i32, const BACK: i32>() {
@@ -3575,7 +3221,6 @@ mod tests {
                 "B prior flag must occupy bit 31"
             );
 
-            // Exercise the production finish itself at the ranked used=17.
             let pending_low = 0x1_5A5A;
             let mut stage = [dup_u32(0); RING_WORDS];
             let mut writer = W8::<false>::at(
@@ -3608,7 +3253,7 @@ mod tests {
                 let block_len = lanes(got.block_len);
                 let flags = lanes(got.flags);
                 for lane in 0..8 {
-                    let expected = crate::seed_pipe::gen_block(init, base + lane);
+                    let expected = crate::s1::gen_block(init, base + lane);
                     for word in 0..8 {
                         assert_eq!(cv[word][lane], expected.0[word]);
                     }
@@ -3624,9 +3269,6 @@ mod tests {
         }
     }
 
-    /// Independent algebra/codegen oracle for the production Z derivation.
-    /// The direct path packs `a & b` and then transposes; the new path
-    /// transposes A/B separately and ANDs corresponding row vectors.
     #[test]
     fn derived_z_after_tr8_matches_direct_z() {
         if !std::is_x86_feature_detected!("avx2") {
@@ -3675,7 +3317,6 @@ mod tests {
         unsafe { tr8_check() }
     }
 
-    /// Independent scalar-layout oracle for the ranked 16×8 ZMM network.
     #[cfg(target_feature = "avx512f")]
     #[test]
     fn witgen8_tr8x16_zmm_is_word_to_block_transpose() {
@@ -3696,9 +3337,6 @@ mod tests {
         }
     }
 
-    /// Ranked windows 0/1 published straight from `tr8x16_zmm` rows must be
-    /// the bytes of the staged `tr8_chunk` + `publish_static` path, for both
-    /// windows and for all-zero, all-one and patterned rings.
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     #[test]
     fn ranked_static01_direct_publish_matches_staged() {
@@ -3849,9 +3487,6 @@ mod tests {
                     wc,
                 );
 
-                // Parity-split widen of the same rows, through all three
-                // producers: the arena must be the byte-order arena permuted
-                // by `i -> (i & 1) * 32 + (i >> 1)` within each side.
                 let mut parity_off = Offsets([0u16; 8 * ROUND1_AB_OFF_WORDS]);
                 widen_ranked_dense_rows::<true>(&a_rows, parity_off.0.as_mut_ptr(), wc);
                 widen_ranked_dense_rows::<true>(&b_rows, parity_off.0.as_mut_ptr().add(64), wc);
@@ -3980,10 +3615,6 @@ mod tests {
         }
     }
 
-    /// Widen random transposed rows both ways and feed every ranked arena
-    /// consumer from each arena: the parity-split widen plus the `P = true`
-    /// consumers must produce exactly the bytes of the incumbent widen plus
-    /// the `P = false` consumers, window by window.
     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
     #[test]
     fn parity_widen_and_consumers_match_byte_order_arena() {
@@ -4171,8 +3802,8 @@ mod tests {
                 true,
             );
         let preps = prepare_ranked_closed_window_preps(&inv_table, win_plan);
-        let crate::seed_pipe::BlockSource::Closed { init, .. } =
-            crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
+        let crate::s1::BlockSource::Closed { init, .. } =
+            crate::s1::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
         else {
             unreachable!()
         };
@@ -4182,7 +3813,6 @@ mod tests {
         let mut stage_ref = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
         let mut stage_new = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
 
-        // First seed reference z/a/b with full writes (elide = [false; 3])
         let mut z_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
         let mut a_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
         let mut b_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
@@ -4280,7 +3910,10 @@ mod tests {
                         target_feature = "gfni",
                         target_feature = "vpclmulqdq"
                     ))]
-                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
+                    Some(root_emit::RootOctaWriter::new(
+                        &roots,
+                        root_tile.0.as_mut_ptr(),
+                    )),
                 );
                 _mm_sfence();
             }
@@ -4295,17 +3928,28 @@ mod tests {
                 for column in 0..64 {
                     let lane = column % 32 / 4;
                     let expected = (0..8).fold(0u8, |bits, bit| {
-                        let value = fold.roots.get({
-                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
-                                    index + if index >= 833 { 64 } else { 0 }
-                                })
-                            .map_or(0, |&wire| (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1);
+                        let value = fold
+                            .roots
+                            .get({
+                                let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
+                                index + if index >= 833 { 64 } else { 0 }
+                            })
+                            .map_or(0, |&wire| {
+                                (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1
+                            });
                         bits | (value as u8) << bit
                     });
-                    assert_eq!(root_tile.0[group * 512 + column], expected,
-                        "live drain base={base}, group={group}, column={column}");
+                    assert_eq!(
+                        root_tile.0[group * 512 + column],
+                        expected,
+                        "live drain base={base}, group={group}, column={column}"
+                    );
                 }
-                assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
+                assert!(
+                    root_tile.0[group * 512 + 64..(group + 1) * 512]
+                        .iter()
+                        .all(|&v| v == 0xa5)
+                );
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");
             assert_eq!(a_ref, a_new, "a mismatch at base={base}");
@@ -4322,10 +3966,3 @@ mod tests {
         }
     }
 }
-// witfire-7 draw marker 10514
-// witfire-16 draw marker 2194
-// fire51: fresh draw on new bar 3852475 (rival NTT promotion)
-
-// vbmi2draw-1: independent official timing sample of promoted fbc3001 VBMI2 W8 packer; no executable change.
-// rivaldraw-28 marker 76708 on 2758bc1
-// rivaldraw-37 marker 33507 on ca47b5d

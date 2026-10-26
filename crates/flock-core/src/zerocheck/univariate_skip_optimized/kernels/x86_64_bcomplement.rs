@@ -1,10 +1,3 @@
-//! Ranked-static B-complement projection for the two-image/offw round-1 path.
-//!
-//! For the caller/table-validated linear map T with T([0xff; 8]) = [ONE; 64],
-//! T(B) = T(!B) + ONE. A known-one byte therefore needs no table load in
-//! the complement. The caller must restrict this to the proven ranked BLAKE3
-//! geometry; ordinary rows retain the incumbent two-image apply.
-
 use core::arch::x86_64::*;
 
 use super::x86_64_bstatic_plan::{BSTATIC_PLAN, BstaticRow};
@@ -15,11 +8,9 @@ use crate::ntt::inv_table::{
 
 #[derive(Clone, Copy)]
 struct WindowPlan {
-    /// Dense modes 0..15, with the K7 mode in the least-significant byte.
     modes: u64,
 }
 
-/// Do not use BstaticRow::vary: the old plan clears it for seven varying bytes.
 const fn known_one_bytes(row: BstaticRow) -> u8 {
     let mut known = 0u8;
     let mut j = 0;
@@ -32,7 +23,6 @@ const fn known_one_bytes(row: BstaticRow) -> u8 {
     known
 }
 
-/// 0: dense; 1..7: low n bytes known; 8..14: high n bytes known; 15: all known.
 const fn mode_for_known_bytes(known: u8) -> u8 {
     if known == 0xff {
         return 15;
@@ -47,7 +37,7 @@ const fn mode_for_known_bytes(known: u8) -> u8 {
         }
         n += 1;
     }
-    // Any future non-prefix/suffix shape keeps the full original-B apply.
+
     0
 }
 
@@ -69,21 +59,6 @@ const fn build_window_plans() -> [WindowPlan; 28] {
 
 const WINDOW_PLANS: [WindowPlan; 28] = build_window_plans();
 
-/// Project a complete ranked-static mixed-B window without changing the
-/// producer's offset arena. The caller has established the ranked BLAKE3
-/// geometry, so every byte represented by a nonzero mode is a structural
-/// 0xff, not a sampled witness value.
-///
-/// `P` is the arena layout: byte order (`false`) or the `vpmaddubsw` parity
-/// split (`true`, see [`crate::ntt::inv_table::apply_x86_avx512_register_2img_offp_at`]).
-///
-/// # Safety
-/// - The CPU supports GFNI, AVX-512F and AVX-512BW.
-/// - imgs are the base and sigma-8 images of the exact checked inverse-NTT
-///   table, for which T([0xff; 8]) = [ONE; 64].
-/// - op holds the original 128 pre-scaled offsets in the `P` layout and out
-///   is 64-byte aligned. The caller performs the ordinary non-temporal
-///   publish fence.
 #[inline(always)]
 pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2<const P: bool>(
     op: *const u16,
@@ -154,15 +129,6 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const<const BLK: usize, c
     }
 }
 
-/// Multi-image twin of [`shift_reduce_bcomplement_offw_nt2_const`]: the same
-/// Horner projection, with every full apply and every pruned complement apply
-/// addressing `I` σ-images (`4` or `8`, see
-/// [`crate::ntt::inv_table::apply_x86_avx512_register_4img_krow_at`]). Same
-/// rows, same XORs, fewer 128-bit-lane shuffles, identical bytes.
-///
-/// # Safety
-/// As for [`shift_reduce_bcomplement_offw_nt2_const`], with `imgs.0` the base
-/// of a table carrying at least `I` images.
 #[inline(always)]
 pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     const BLK: usize,
@@ -209,15 +175,9 @@ pub(crate) unsafe fn shift_reduce_bcomplement_offw_nt2_const_img<
     }
 }
 
-/// K-row modes of the two residual windows: block 2 (K2..K7 live) and block
-/// 29 (K0..K3 live). Mode layout as in [`WindowPlan`].
 const RESIDUAL_MODES_2: u64 = WINDOW_PLANS[0].modes;
 const RESIDUAL_MODES_29: u64 = WINDOW_PLANS[27].modes;
 
-/// One residual K-row product `T(A_k)·T(B_k)` over `I` σ-images. With `BC`,
-/// a K-row whose B has structural 0xff bytes (`mode != 0`) uses the checked
-/// complement identity `T(A)·T(B) = T(A)·T(!B) ⊕ T(A)` through
-/// [`apply_b_mode_img`]; every other row keeps the full B apply.
 #[inline(always)]
 unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool>(
     imgs: (*const u8, *const u8),
@@ -244,16 +204,6 @@ unsafe fn residual_krow_product<const P: bool, const I: u8, const BC: bool>(
     }
 }
 
-/// Residual windows 2 (`keep = 0xfc`: K2..K7) and 29 (`keep = 0x0f`: K0..K3)
-/// over `I` σ-images, with the structural-B complement when `BC`. The same
-/// `Σ_k x^k·T(A_k)·T(B_k)` as
-/// [`super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual`],
-/// in its explicit-scaling form and XOR order.
-///
-/// # Safety
-/// As for that kernel. With `BC` the caller has also proved the ranked BLAKE3
-/// static-one byte geometry and the checked table identity, exactly as for
-/// [`shift_reduce_bcomplement_offw_nt2_const`]; `imgs.0` carries `I` images.
 #[inline(always)]
 pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
     const P: bool,
@@ -335,8 +285,6 @@ unsafe fn krow_horner(
     }
 }
 
-/// Shared dispatch inside the existing consumer, not one call per K-row.
-/// `op` addresses this K-row in the `P` layout.
 #[inline(always)]
 unsafe fn apply_b_mode<const P: bool>(
     imgs: (*const u8, *const u8),
@@ -369,8 +317,6 @@ unsafe fn apply_b_mode<const P: bool>(
     }
 }
 
-/// Multi-image twin of [`apply_b_mode`]: `I = 2` is exactly [`apply_b_mode`];
-/// `I = 4`/`8` return the same pair from the multi-image applies.
 #[inline(always)]
 unsafe fn apply_b_mode_img<const P: bool, const I: u8>(
     imgs: (*const u8, *const u8),
@@ -406,12 +352,6 @@ unsafe fn apply_b_mode_img<const P: bool, const I: u8>(
     }
 }
 
-/// Multi-image pruned complement apply: bytes `FIRST..END` of `!B` from `I`
-/// σ-images (`4` or `8`) laid out at `imgs.0 + m·IMAGE_STRIDE_64`. Byte `b`
-/// loads image `b` (`I = 8`, no shuffle) or image `b mod 4` with bytes 4..8
-/// folded through one σ₃₂ shuffle (`I = 4`). Word reads, complement and field
-/// extraction are [`apply_b_complement`]'s; absent rows and their XORs vanish
-/// at compile time the same way.
 #[inline(always)]
 unsafe fn apply_b_complement_img<
     const FIRST: usize,
@@ -517,15 +457,6 @@ unsafe fn apply_b_complement_img<
     }
 }
 
-/// Only bytes FIRST..END of !B vary. Retain the incumbent two-image butterfly
-/// but remove every absent row and its XOR at compile time. FIRST/END are
-/// literals in the fourteen prefix/suffix instantiations above.
-///
-/// Under the byte-order layout (`P = false`) the K-row is two words, bytes
-/// 0..4 and 4..8; under the parity split (`P = true`) it is the even word
-/// (bytes 0, 2, 4, 6) at `op` and the odd word (1, 3, 5, 7) at `op + 32`.
-/// Either way a word is read only when one of its bytes is live, and every
-/// byte is complemented, extracted and applied exactly as before.
 #[inline(always)]
 unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool>(
     imgs: (*const u8, *const u8),
@@ -533,10 +464,6 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
 ) -> __m512i {
     const COMPLEMENT_OFFSETS: u64 = 0x3fc0_3fc0_3fc0_3fc0;
     unsafe {
-        // An offset is byte << 6, so complementing a byte XORs exactly these
-        // eight bits. Do not complement the u16 itself or touch the arena.
-        // `wa`/`wb` are (bytes 0..4, bytes 4..8) in byte order and (even
-        // bytes, odd bytes) under the parity split.
         let (wa, wb) = if P {
             let has_even = FIRST == 0
                 || (FIRST <= 2 && END > 2)
@@ -572,8 +499,7 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
                 },
             )
         };
-        // Byte `b`'s complemented offset; `b` is a literal below, so the
-        // selection and shift fold to one constant field extraction.
+
         let field = |b: usize| -> usize {
             let (w, shift) = if P {
                 (if b & 1 == 0 { wa } else { wb }, 16 * (b >> 1))
@@ -583,8 +509,7 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
             (w >> shift) as u16 as usize
         };
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o).cast::<__m512i>());
-        // The conditions use only const parameters. Each surviving component
-        // is evaluated once, and a one-sided join has no XOR with zero.
+
         macro_rules! join {
             ($left:expr, $has_left:expr, $right:expr, $has_right:expr) => {
                 if $has_left {
@@ -656,8 +581,6 @@ mod tests {
     #[repr(align(64))]
     struct Output([u8; 64]);
 
-    /// Independent of the generated Bstatic table: these are the known-one
-    /// BLAKE3 bit ranges in the ranked 15,409-bit witness layout.
     fn static_one_bit(bit: usize) -> bool {
         bit < 1153
             || (15153..15409).contains(&bit)
@@ -687,10 +610,6 @@ mod tests {
         }
     }
 
-    /// The static mode map and the complete Horner projection must both agree
-    /// with the ordinary two-image offset kernel for every ranked mixed
-    /// window. This is deliberately a whole-window oracle, not merely a
-    /// test of an individual pruned table apply.
     #[test]
     fn ranked_static_bcomplement_matches_generic_offsets() {
         let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
@@ -747,8 +666,6 @@ mod tests {
         assert_eq!(seen_modes, 0xfffe, "all pruned prefix/suffix modes");
     }
 
-    /// Scalar definition of the parity-split arena: offset `i` of a side
-    /// lives at word `(i & 1) * 32 + (i >> 1)`.
     fn parity_layout(off: &[u16; 128]) -> [u16; 128] {
         let mut p = [0u16; 128];
         for side in 0..2 {
@@ -759,10 +676,6 @@ mod tests {
         p
     }
 
-    /// Every arena consumer must produce identical bytes from the byte-order
-    /// arena (`P = false`) and the parity-split arena (`P = true`) built from
-    /// the same window: generic Horner, both residual masks, the runtime- and
-    /// const-window B-complement leaves, and the temporal generic store.
     #[test]
     fn parity_split_arena_matches_byte_order_for_every_consumer() {
         use super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off as horner;
@@ -841,8 +754,7 @@ mod tests {
                     bcomp::<false>(pw, &mut got_w.0, imgs, blk),
                     bcomp::<true>(pp, &mut got_p.0, imgs, blk)
                 );
-                // The parity B-complement must also still equal the generic
-                // kernel (the structural-0xff bytes are set above).
+
                 check!(
                     "bcomplement parity vs generic",
                     blk,
@@ -870,10 +782,6 @@ mod tests {
         }
     }
 
-    /// Every multi-image leaf and the residual-window B complement must
-    /// reproduce the incumbent two-image bytes for every ranked window and
-    /// both arena layouts, with the structural 0xff B bytes set from the
-    /// independent BLAKE3 geometry.
     #[test]
     fn image_variants_and_residual_bcomplement_match_incumbent() {
         use super::super::x86_64::shift_reduce_inner_ab_x86_avx512_from_off_nt2_residual as residual;
@@ -888,8 +796,6 @@ mod tests {
         table.apply(&[u8::MAX; 8], &mut ones);
         assert_eq!(ones, [F8::ONE; 64]);
 
-        // The residual complement is not vacuous: some live residual K-row
-        // carries structural B bytes, and each mode matches the geometry.
         let mut complemented = 0;
         for (blk, modes, rows) in [
             (2usize, RESIDUAL_MODES_2, 2..8usize),
@@ -1029,7 +935,6 @@ mod tests {
     }
 }
 
-/// Structural mode shared by the eight-row projection.
 pub(crate) const fn window_mode(blk: usize, k: usize) -> u8 {
     (WINDOW_PLANS[blk - 2].modes >> (8 * (7 - k))) as u8
 }
