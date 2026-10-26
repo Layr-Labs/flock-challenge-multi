@@ -509,25 +509,35 @@ pub(crate) unsafe fn gfni_fold_rows(
 ) {
     use core::arch::x86_64::*;
     unsafe {
-        for byte_k in 0..16 {
-            let plane_ptr = planes.add(byte_k * 64) as *mut __m512i;
-            let mut acc = if seed_zero {
+        let mut byte_k = 0usize;
+        while byte_k < 16 {
+            let plane0 = planes.add(byte_k * 64) as *mut __m512i;
+            let plane1 = planes.add((byte_k + 1) * 64) as *mut __m512i;
+            let mut acc0 = if seed_zero {
                 _mm512_setzero_si512()
             } else {
-                _mm512_loadu_si512(plane_ptr as *const __m512i)
+                _mm512_loadu_si512(plane0 as *const __m512i)
+            };
+            let mut acc1 = if seed_zero {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(plane1 as *const __m512i)
             };
             for t in (0..8).step_by(2) {
-                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[t],
-                    _mm512_set1_epi64(mats[t * 16 + byte_k] as i64),
-                );
-                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(
-                    rows[t + 1],
-                    _mm512_set1_epi64(mats[(t + 1) * 16 + byte_k] as i64),
-                );
-                acc = _mm512_ternarylogic_epi64::<0x96>(acc, g0, g1);
+                let m0 = mats[t * 16 + byte_k] as i64;
+                let m1 = mats[(t + 1) * 16 + byte_k] as i64;
+                let n0 = mats[t * 16 + byte_k + 1] as i64;
+                let n1 = mats[(t + 1) * 16 + byte_k + 1] as i64;
+                let g0 = _mm512_gf2p8affine_epi64_epi8::<0>(rows[t], _mm512_set1_epi64(m0));
+                let h0 = _mm512_gf2p8affine_epi64_epi8::<0>(rows[t], _mm512_set1_epi64(n0));
+                let g1 = _mm512_gf2p8affine_epi64_epi8::<0>(rows[t + 1], _mm512_set1_epi64(m1));
+                let h1 = _mm512_gf2p8affine_epi64_epi8::<0>(rows[t + 1], _mm512_set1_epi64(n1));
+                acc0 = _mm512_ternarylogic_epi64::<0x96>(acc0, g0, g1);
+                acc1 = _mm512_ternarylogic_epi64::<0x96>(acc1, h0, h1);
             }
-            _mm512_storeu_si512(plane_ptr, acc);
+            _mm512_storeu_si512(plane0, acc0);
+            _mm512_storeu_si512(plane1, acc1);
+            byte_k += 2;
         }
     }
 }

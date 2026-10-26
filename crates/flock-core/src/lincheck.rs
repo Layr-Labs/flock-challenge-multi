@@ -1542,8 +1542,6 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     out
 }
 
-/// Expand four adjacent entries of an eq table with one four-lane GHASH
-/// multiply. The caller handles any short prefix/tail scalarly.
 ///
 /// # Safety
 /// Requires `avx512f` and `vpclmulqdq`; `out[0..2*len]` is initialized and
@@ -1566,6 +1564,26 @@ unsafe fn build_eq_table_x86_x4(out: &mut [F128], len: usize, r: F128) -> usize 
     // multiplier for every lane in this expansion step.
     let (multiplier, multiplier_x64) = unsafe { ghash_broadcast_split(r) };
     let mut i = 0;
+    let paired = len & !7;
+    while i < paired {
+        unsafe {
+            let old0 = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+            let old1 = _mm512_loadu_si512(out.as_ptr().add(i + 4) as *const __m512i);
+            let high0 = ghash_mul_x4_split(old0, multiplier, multiplier_x64);
+            let high1 = ghash_mul_x4_split(old1, multiplier, multiplier_x64);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + len) as *mut __m512i, high0);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 4 + len) as *mut __m512i, high1);
+            _mm512_storeu_si512(
+                out.as_mut_ptr().add(i) as *mut __m512i,
+                _mm512_xor_si512(old0, high0),
+            );
+            _mm512_storeu_si512(
+                out.as_mut_ptr().add(i + 4) as *mut __m512i,
+                _mm512_xor_si512(old1, high1),
+            );
+        }
+        i += 8;
+    }
     while i < vector_end {
         // SAFETY: four initialized F128 values fit in one ZMM; the matching
         // high-half range is within the resized output slice.
