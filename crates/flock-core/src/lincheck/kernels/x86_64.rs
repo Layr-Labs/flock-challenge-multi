@@ -607,9 +607,22 @@ pub(crate) unsafe fn xor_bytes_avx512(dst: *mut u8, src: *const u8, len: usize) 
     // SAFETY: caller guarantees `len` bytes at both pointers and 64-byte steps.
     unsafe {
         let mut i = 0;
-        // Two-ZMM unroll matches the Linux `xor_avx512_2` RAID xor_gen kernel
-        // (load pair / vpxor pair / store pair). Odd 64-byte tail is one more.
-        while i + 128 <= len {
+        while i + 256 <= len {
+            let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
+            let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
+            let a2 = _mm512_loadu_si512(dst.add(i + 128) as *const __m512i);
+            let a3 = _mm512_loadu_si512(dst.add(i + 192) as *const __m512i);
+            let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
+            let b1 = _mm512_loadu_si512(src.add(i + 64) as *const __m512i);
+            let b2 = _mm512_loadu_si512(src.add(i + 128) as *const __m512i);
+            let b3 = _mm512_loadu_si512(src.add(i + 192) as *const __m512i);
+            _mm512_storeu_si512(dst.add(i) as *mut __m512i, _mm512_xor_si512(a0, b0));
+            _mm512_storeu_si512(dst.add(i + 64) as *mut __m512i, _mm512_xor_si512(a1, b1));
+            _mm512_storeu_si512(dst.add(i + 128) as *mut __m512i, _mm512_xor_si512(a2, b2));
+            _mm512_storeu_si512(dst.add(i + 192) as *mut __m512i, _mm512_xor_si512(a3, b3));
+            i += 256;
+        }
+        if i + 128 <= len {
             let a0 = _mm512_loadu_si512(dst.add(i) as *const __m512i);
             let a1 = _mm512_loadu_si512(dst.add(i + 64) as *const __m512i);
             let b0 = _mm512_loadu_si512(src.add(i) as *const __m512i);
