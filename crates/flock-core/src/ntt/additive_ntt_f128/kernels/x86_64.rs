@@ -4268,3 +4268,326 @@ mod ab_ntt_tail_composition_tests {
         println!("270 production NTT row cases match the independent bitwise oracle and guards");
     }
 }
+
+// In characteristic two, r = s + delta and gamma = delta*T + s imply
+// dense_c = dense_a + sparse_c + original_a + original_d*gamma.
+// The gamma product starts from an original input, bypassing the second
+// dense inner multiply's dependence on the outer result. Pending high halves
+// are XORed before folding; only canonical bb enters a subsequent multiply.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn seed_cross_x4<const LOW:bool>(a:core::arch::x86_64::__m512i,b:core::arch::x86_64::__m512i,c:core::arch::x86_64::__m512i,d:core::arch::x86_64::__m512i,tr:(core::arch::x86_64::__m512i, core::arch::x86_64::__m512i),t:(core::arch::x86_64::__m512i, core::arch::x86_64::__m512i),s:(core::arch::x86_64::__m512i, core::arch::x86_64::__m512i),g:(core::arch::x86_64::__m512i, core::arch::x86_64::__m512i))->[core::arch::x86_64::__m512i;8]{
+ use core::arch::x86_64::*;
+ unsafe {
+
+ let(splo,sphi)=mul_x4_parts::<false>(tr,_mm512_xor_si512(d,b));
+ let(aclo,achi)=mul_x4_parts::<LOW>(t,c);
+ let(glo,ghi)=mul_x4_parts::<false>(g,d);
+ let bb=_mm512_xor_si512(b,mul_x4::<LOW,true>(t,d));let dd=_mm512_xor_si512(d,bb);
+ let(ablo,abhi)=mul_x4_parts::<false>(s,bb);
+ let sumlo=_mm512_ternarylogic_epi64::<0x96>(a,aclo,ablo);let sumhi=_mm512_xor_si512(achi,abhi);
+ let spc=_mm512_xor_si512(_mm512_ternarylogic_epi64::<0x96>(a,c,splo),fold_x64(sphi));
+ let oa=_mm512_xor_si512(sumlo,fold_x64(sumhi));
+ let oc=_mm512_xor_si512(_mm512_xor_si512(sumlo,_mm512_ternarylogic_epi64::<0x96>(c,splo,glo)),fold_x64(_mm512_ternarylogic_epi64::<0x96>(sumhi,sphi,ghi)));
+ [a,_mm512_xor_si512(a,b),spc,_mm512_xor_si512(_mm512_xor_si512(d,b),spc),oa,_mm512_xor_si512(bb,oa),oc,_mm512_xor_si512(dd,oc)]
+ }
+}
+
+/// # Safety
+/// Same geometry contract as the existing sparse/dense entry. The plan's
+/// private constructor owns and checks the cross-output coefficient relation.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_cross(
+    src: *const F128, src_quarter: usize, src_r: usize,
+    dst_sparse: *mut F128, dst_dense: *mut F128, dst_quarter: usize,
+    num_ntts: usize, active_lanes: usize, plan: &super::SparseDenseCrossPlan,
+    pf_src: *const F128,
+) {
+    debug_assert!(active_lanes <= num_ntts);
+    debug_assert_eq!(active_lanes % 4, 0);
+    unsafe {
+        if !plan.eligible || mul_diet_disabled() {
+            butterfly_fused_2layer_row_from_sparse_dense_geo(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
+                num_ntts, active_lanes, plan.right, &plan.dense, pf_src);
+        } else if plan.dense[0].hi == 0 {
+            butterfly_fused_2layer_row_from_sparse_dense_cross_impl::<true>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
+                num_ntts, active_lanes, plan, pf_src);
+        } else {
+            butterfly_fused_2layer_row_from_sparse_dense_cross_impl::<false>(
+                src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
+                num_ntts, active_lanes, plan, pf_src);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_2layer_row_from_sparse_dense_cross_impl<
+    const OUTER_LOW: bool,
+>(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    active_lanes: usize,
+    plan: &super::SparseDenseCrossPlan,
+    pf_src: *const F128,
+) {
+    use core::arch::x86_64::*;
+    let right_twiddle = plan.right;
+    let [t_outer, t_inner_a, t_inner_b] = plan.dense;
+    let pf = !pf_src.is_null();
+    unsafe {
+        debug_assert!(!OUTER_LOW || t_outer.hi == 0);
+        let sparse_b = seed_prepared_tw_x4::<false>(right_twiddle, plan.companions[0]);
+        let outer = seed_prepared_tw_x4::<OUTER_LOW>(t_outer, plan.companions[1]);
+        let inner_a = seed_prepared_tw_x4::<false>(t_inner_a, plan.companions[2]);
+        let gamma = seed_prepared_tw_x4::<false>(plan.gamma, plan.companions[3]);
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let sp_row = |i: usize| dst_sparse.add((i * dst_quarter) * num_ntts);
+        let dn_row = |i: usize| dst_dense.add((i * dst_quarter) * num_ntts);
+        let pf_row = |i: usize| pf_src.add(i * src_quarter * num_ntts) as *const i8;
+        let lanes = active_lanes & !3;
+        let mut lane = 0;
+        while lane + 8 <= lanes {
+            if pf {
+                let off0 = lane * core::mem::size_of::<F128>();
+                let off1 = (lane + 4) * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off0));
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off1));
+                }
+            }
+            let va0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let vb0 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let vc0 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let vd0 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            let va1 = _mm512_loadu_si512(src_row(0).add(lane + 4) as *const __m512i);
+            let vb1 = _mm512_loadu_si512(src_row(1).add(lane + 4) as *const __m512i);
+            let vc1 = _mm512_loadu_si512(src_row(2).add(lane + 4) as *const __m512i);
+            let vd1 = _mm512_loadu_si512(src_row(3).add(lane + 4) as *const __m512i);
+
+            let v0 = seed_cross_x4::<OUTER_LOW>(va0, vb0, vc0, vd0, sparse_b, outer, inner_a, gamma);
+            let v1 = seed_cross_x4::<OUTER_LOW>(va1, vb1, vc1, vd1, sparse_b, outer, inner_a, gamma);
+            _mm512_storeu_si512(sp_row(0).add(lane).cast(), v0[0]);
+            _mm512_storeu_si512(sp_row(1).add(lane).cast(), v0[1]);
+            _mm512_storeu_si512(sp_row(2).add(lane).cast(), v0[2]);
+            _mm512_storeu_si512(sp_row(3).add(lane).cast(), v0[3]);
+            _mm512_storeu_si512(dn_row(0).add(lane).cast(), v0[4]);
+            _mm512_storeu_si512(dn_row(1).add(lane).cast(), v0[5]);
+            _mm512_storeu_si512(dn_row(2).add(lane).cast(), v0[6]);
+            _mm512_storeu_si512(dn_row(3).add(lane).cast(), v0[7]);
+            _mm512_storeu_si512(sp_row(0).add(lane + 4).cast(), v1[0]);
+            _mm512_storeu_si512(sp_row(1).add(lane + 4).cast(), v1[1]);
+            _mm512_storeu_si512(sp_row(2).add(lane + 4).cast(), v1[2]);
+            _mm512_storeu_si512(sp_row(3).add(lane + 4).cast(), v1[3]);
+            _mm512_storeu_si512(dn_row(0).add(lane + 4).cast(), v1[4]);
+            _mm512_storeu_si512(dn_row(1).add(lane + 4).cast(), v1[5]);
+            _mm512_storeu_si512(dn_row(2).add(lane + 4).cast(), v1[6]);
+            _mm512_storeu_si512(dn_row(3).add(lane + 4).cast(), v1[7]);
+            lane += 8;
+        }
+        while lane < lanes {
+            if pf {
+                let off = lane * core::mem::size_of::<F128>();
+                for i in 0..4 {
+                    _mm_prefetch::<_MM_HINT_T0>(pf_row(i).add(off));
+                }
+            }
+            let va = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let vb = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let vc = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let vd = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+
+            let v = seed_cross_x4::<OUTER_LOW>(va, vb, vc, vd, sparse_b, outer, inner_a, gamma);
+            _mm512_storeu_si512(sp_row(0).add(lane).cast(), v[0]);
+            _mm512_storeu_si512(sp_row(1).add(lane).cast(), v[1]);
+            _mm512_storeu_si512(sp_row(2).add(lane).cast(), v[2]);
+            _mm512_storeu_si512(sp_row(3).add(lane).cast(), v[3]);
+            _mm512_storeu_si512(dn_row(0).add(lane).cast(), v[4]);
+            _mm512_storeu_si512(dn_row(1).add(lane).cast(), v[5]);
+            _mm512_storeu_si512(dn_row(2).add(lane).cast(), v[6]);
+            _mm512_storeu_si512(dn_row(3).add(lane).cast(), v[7]);
+            lane += 4;
+        }
+        // Ranked L0 / recursive seed pass `num_ntts ∈ {64, 8}`: this
+        // remainder is dead. Keep it out of the 4-wide leaf's I-cache; other
+        // geometries still enter the exact scalar remainder when needed.
+        if lane < active_lanes {
+            sparse_dense_geo_scalar_tail(
+                src_row,
+                sp_row,
+                dn_row,
+                right_twiddle,
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                lane,
+                active_lanes,
+            );
+        }
+    }
+}
+
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod seed_cross_output_oracle_tests {
+    use super::*;
+    use std::hint::black_box;
+    fn bits(x: F128) -> u128 { u128::from(x.lo) | (u128::from(x.hi) << 64) }
+    fn field(x: u128) -> F128 { F128::new(x as u64, (x >> 64) as u64) }
+    fn multiply(mut a: u128, mut b: u128) -> u128 {
+        let mut z = 0;
+        for _ in 0..128 {
+            if b & 1 != 0 { z ^= a; }
+            b >>= 1;
+            let high = a >> 127;
+            a <<= 1;
+            if high != 0 { a ^= 0x87; }
+        }
+        z
+    }
+    #[test]
+    fn seed_cross_output_rows_match_bitwise_oracle() {
+        let mut state = 0x71f8_8cf0_3391_d22au64;
+        let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            F128::new(state, state.rotate_left(27) ^ 0x94d0_49bb_1331_11eb) };
+        let guard = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+        let mut cases = 0;
+        for eligible in [false, true] { for low in [false, true] { for n in [4usize,8,12,16,60,64,68,128] {
+            for dq in [1usize,5,64] { for case in 0..12 {
+                let sq = [1usize,3,7][case%3];
+                let sr = if case%2 == 0 { 0 } else { sq-1 };
+                let active = [0,4,n-4,n][case%4];
+                let start = 4 + case%4;
+                let src_len = start + (3*sq+sr+1)*n + 5;
+                let dst_len = start + (3*dq+1)*n + 5;
+                let mut input: Vec<F128> = (0..src_len).map(|_| next()).collect();
+                if case == 0 { input.fill(F128::ZERO); }
+                if case == 1 { input.fill(F128::new(u64::MAX,u64::MAX)); }
+                let mut right = next();
+                let mut tw = [next(),next(),next()];
+                if low { tw[0].hi = 0; }
+                if case%6 == 0 { right = F128::ZERO; }
+                if case%6 == 1 { right = F128::new(1,0); }
+                tw[2] = tw[1] + right;
+                if !eligible { tw[2] += F128::new(1,0); }
+                let plan = super::super::SparseDenseCrossPlan::new(right, tw);
+                assert_eq!(plan.eligible, eligible);
+                if eligible { assert_eq!(bits(plan.gamma), multiply(bits(right),bits(tw[0])) ^ bits(tw[1])); }
+                if eligible {
+                    for (i, value) in [right, tw[0], tw[1], plan.gamma].into_iter().enumerate() {
+                        assert_eq!(bits(plan.companions[i]), multiply(bits(value),1u128<<64));
+                    }
+                }
+                let saved_input = input.clone(); let saved_tw = tw;
+                let mut expected_s = vec![guard;dst_len]; let mut expected_d = vec![guard;dst_len];
+                for lane in 0..active {
+                    let a = bits(input[start+sr*n+lane]); let b = bits(input[start+(sq+sr)*n+lane]);
+                    let c = bits(input[start+(2*sq+sr)*n+lane]); let z = bits(input[start+(3*sq+sr)*n+lane]);
+                    let sc = c ^ a ^ multiply(z ^ b,bits(right));
+                    let sparse = [a,b ^ a,sc,z ^ b ^ sc];
+                    let aa = a ^ multiply(c,bits(tw[0])); let bb = b ^ multiply(z,bits(tw[0]));
+                    let cc = c ^ aa; let dd = z ^ bb;
+                    let oa = aa ^ multiply(bb,bits(tw[1])); let oc = cc ^ multiply(dd,bits(tw[2]));
+                    let dense = [oa,bb ^ oa,oc,dd ^ oc];
+                    for row in 0..4 {
+                        expected_s[start+row*dq*n+lane] = field(sparse[row]);
+                        expected_d[start+row*dq*n+lane] = field(dense[row]);
+                    }
+                }
+                let mut sparse = vec![guard;dst_len]; let mut dense = vec![guard;dst_len];
+                // SAFETY: all source/destination rows are allocated and disjoint;
+                // active is a multiple of four and does not exceed n. The optional
+                // prefetch row is within the same source allocation.
+                unsafe {
+                    let src = input.as_ptr().add(start);
+                    let pf = if case%2 == 0 { core::ptr::null() } else { src.add(sr*n) };
+                    butterfly_fused_2layer_row_from_sparse_dense_cross(
+                        black_box(src),black_box(sq),black_box(sr),black_box(sparse.as_mut_ptr().add(start)),
+                        black_box(dense.as_mut_ptr().add(start)),black_box(dq),black_box(n),black_box(active),
+                        black_box(&plan),black_box(pf));
+                }
+                assert_eq!(sparse,expected_s,"sparse low={low} n={n} dq={dq} case={case}");
+                assert_eq!(dense,expected_d,"dense low={low} n={n} dq={dq} case={case}");
+                assert_eq!(input,saved_input); assert_eq!(tw,saved_tw);
+                cases += 1;
+            }}
+        }}
+        }
+        assert_eq!(cases,1152);
+        println!("1152 production seed-cross cases match independent bitwise products, coefficient preparation, guards and fallback");
+    }
+}
+
+
+/// Prepare exactly four coefficient companions, once at the seed-plan owner.
+/// # Safety
+/// Requires AVX-512F and VPCLMULQDQ. The fixed array contains four live values.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn seed_cross_companions(values: &[F128; 4]) -> [F128; 4] {
+    use core::arch::x86_64::*;
+    use crate::field::gf2_128::x86_64::ghash_shift64_x4;
+    let mut result = [F128::ZERO; 4];
+    unsafe {
+        let packed = _mm512_loadu_si512(values.as_ptr().cast());
+        _mm512_storeu_si512(result.as_mut_ptr().cast(), ghash_shift64_x4(packed));
+    }
+    result
+}
+
+/// # Safety
+/// `companion` is `value*x^64` in the field. LOW also requires value.hi == 0.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn seed_prepared_tw_x4<const LOW: bool>(value: F128, companion: F128) -> TwX4 {
+    use core::arch::x86_64::*;
+    let first = _mm512_broadcast_i32x4(_mm_set_epi64x(value.hi as i64, value.lo as i64));
+    let second = if LOW { first } else {
+        _mm512_broadcast_i32x4(_mm_set_epi64x(companion.hi as i64, companion.lo as i64))
+    };
+    (first, second)
+}
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod seed_companion_basis_tests {
+    use super::*;
+    #[test]
+    fn seed_companions_match_all_basis_bits() {
+        fn multiply(mut a: u128, mut b: u128) -> u128 {
+            let mut z=0;
+            for _ in 0..128 {
+                if b&1!=0 { z^=a; }
+                b>>=1; let top=a>>127; a<<=1; if top!=0 { a^=0x87; }
+            }
+            z
+        }
+        let mut checks=0;
+        for bit in 0..130 {
+            let values: [F128;4]=core::array::from_fn(|lane| {
+                let value=if bit==128 { 0 } else if bit==129 { u128::MAX } else { 1u128<<((bit+lane*31)%128) };
+                F128::new(value as u64,(value>>64)as u64)
+            });
+            let saved=values;
+            let result=unsafe { seed_cross_companions(std::hint::black_box(&values)) };
+            for lane in 0..4 {
+                let value=values[lane].lo as u128 | ((values[lane].hi as u128)<<64);
+                let actual=result[lane].lo as u128 | ((result[lane].hi as u128)<<64);
+                assert_eq!(actual,multiply(value,1u128<<64));checks+=1;
+            }
+            assert_eq!(values,saved);
+        }
+        assert_eq!(checks,520);
+        println!("520 production companion checks cover every basis bit in each position, zero, all ones and immutable input");
+    }
+}

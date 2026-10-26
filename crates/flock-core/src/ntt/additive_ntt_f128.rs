@@ -2659,6 +2659,10 @@ impl AdditiveNttF128 {
         let seed_right = seed_tw[0][2];
         let seed_dense = seed_tw[1];
 
+        // Prepared once here, before the parallel seed row-group closures.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let seed_cross = kernels::SparseDenseCrossPlan::new(seed_right, seed_dense);
+
         let tw4: Vec<kernels::FourBlock> = (0..8)
             .map(|block| {
                 let mut tw = [F128 { lo: 0, hi: 0 }; 15];
@@ -2796,7 +2800,7 @@ impl AdditiveNttF128 {
                         } else {
                             row_len
                         };
-                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_cross(
                             src,
                             block_size,
                             r_s,
@@ -2805,8 +2809,7 @@ impl AdditiveNttF128 {
                             64,
                             row_len,
                             seed_active_lanes,
-                            seed_right,
-                            &seed_dense,
+                            &seed_cross,
                             pf_next,
                         );
                     } else if pf_next.is_null() {

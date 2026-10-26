@@ -1153,3 +1153,51 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+/// Coefficients owned by one seed transform, shared by all of its row groups.
+/// The checked relation follows from the additive twiddle table; retaining it
+/// as a runtime guard also preserves arbitrary-twiddle callers.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub(super) struct SparseDenseCrossPlan {
+    right: F128,
+    dense: [F128; 3],
+    gamma: F128,
+    companions: [F128; 4],
+    eligible: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+impl SparseDenseCrossPlan {
+    #[inline]
+    pub(super) fn new(right: F128, dense: [F128; 3]) -> Self {
+        let eligible = dense[2] == dense[1] + right;
+        let gamma = if eligible { right * dense[0] + dense[1] } else { F128::ZERO };
+        // The seed plan is shared by every row group. Four x^64 companions
+        // cost one packed CLMUL here, instead of four per row-group call.
+        // SAFETY: this type and constructor have the AVX-512/VPCLMUL cfg gate.
+        let companions = if eligible {
+            unsafe { x86_64::seed_cross_companions(&[right, dense[0], dense[1], gamma]) }
+        } else { [F128::ZERO; 4] };
+        Self { right, dense, gamma, companions, eligible }
+    }
+}
+
+/// # Safety
+/// Same source, destination, active-prefix and prefetch contract as the
+/// existing sparse/dense seed entry. All eight output rows remain canonical.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_cross(
+    src: *const F128, src_quarter: usize, src_r: usize,
+    dst_sparse: *mut F128, dst_dense: *mut F128, dst_quarter: usize,
+    num_ntts: usize, active_lanes: usize, plan: &SparseDenseCrossPlan,
+    pf_src: *const F128,
+) {
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_cross(
+            src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
+            num_ntts, active_lanes, plan, pf_src);
+    }
+}
+
