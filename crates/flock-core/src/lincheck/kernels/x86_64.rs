@@ -553,6 +553,10 @@ pub(crate) unsafe fn gfni_fold_rows(
 ///   does not alias source, matrices, or permutation storage.
 /// - `permutation` covers the 64 initialized bytes of WORD_TO_COLUMNS, and
 ///   all readable inputs remain immutable for this call.
+/// - `prefetch_next_block` enables nonfaulting hints at source + 512 and
+///   planes + 1024. Hint addresses may exceed the demand spans above; no
+///   out-of-range demand load is introduced. Production disables hints at
+///   the final block so they stay inside the caller's source/plane arenas.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -570,6 +574,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     count: usize,
     seed_zero: bool,
     permutation: *const u8,
+    prefetch_next_block: bool,
 ) {
     debug_assert!((1..=4).contains(&count));
     debug_assert!(tile_stride >= 512);
@@ -581,8 +586,29 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     unsafe {
         core::arch::asm!(
             "vmovdqu64 zmm20, [r10]",
+            "mov r10, r11",
             "mov rax, 0x8040201008040201",
             "vpbroadcastq zmm21, rax",
+            // Read-only, nonfaulting hints for the next private plane bank.
+            "test r10, r10",
+            "jz 6f",
+            "prefetcht0 [rdx + 1024]",
+            "prefetcht0 [rdx + 1088]",
+            "prefetcht0 [rdx + 1152]",
+            "prefetcht0 [rdx + 1216]",
+            "prefetcht0 [rdx + 1280]",
+            "prefetcht0 [rdx + 1344]",
+            "prefetcht0 [rdx + 1408]",
+            "prefetcht0 [rdx + 1472]",
+            "prefetcht0 [rdx + 1536]",
+            "prefetcht0 [rdx + 1600]",
+            "prefetcht0 [rdx + 1664]",
+            "prefetcht0 [rdx + 1728]",
+            "prefetcht0 [rdx + 1792]",
+            "prefetcht0 [rdx + 1856]",
+            "prefetcht0 [rdx + 1920]",
+            "prefetcht0 [rdx + 1984]",
+            "6:",
             "test r9, r9",
             "jz 2f",
             "vpxord zmm0, zmm0, zmm0",
@@ -620,6 +646,18 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "vmovdqu64 zmm14, [rdx + 896]",
             "vmovdqu64 zmm15, [rdx + 960]",
             "3:",
+            // Each tile's next source block is 512 bytes ahead.
+            "test r10, r10",
+            "jz 7f",
+            "prefetcht0 [rdi + 512]",
+            "prefetcht0 [rdi + 576]",
+            "prefetcht0 [rdi + 640]",
+            "prefetcht0 [rdi + 704]",
+            "prefetcht0 [rdi + 768]",
+            "prefetcht0 [rdi + 832]",
+            "prefetcht0 [rdi + 896]",
+            "prefetcht0 [rdi + 960]",
+            "7:",
             "mov r11d, 4",
             "4:",
             "vpermb zmm16, zmm20, [rdi]",
@@ -710,9 +748,9 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             in("rcx") tile_stride,
             inout("r8") count => _,
             in("r9") usize::from(seed_zero),
-            in("r10") permutation,
+            inout("r10") permutation => _,
+            inout("r11") usize::from(prefetch_next_block) => _,
             out("rax") _,
-            out("r11") _,
             out("zmm0") _,
             out("zmm1") _,
             out("zmm2") _,

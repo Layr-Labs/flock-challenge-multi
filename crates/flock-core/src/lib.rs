@@ -276,9 +276,9 @@ pub fn ranked_pool_built() -> bool {
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
 /// restored and no extra thread is spawned. The two env vars are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split. With the witness-born root cache, C finishes first:
-/// on the eight-core ranked host, assign its last sibling to AB (9/7).
-/// `FLOCK_NO_ZC_R1_AB_REBALANCE=1` restores 8/8 for local diagnostics.
+/// default is the split. Four-w AB retention balances the arms on the
+/// eight-core ranked host with eight workers each. Local diagnostics can
+/// restore 9/7 with `FLOCK_ZC_R1_AB_REBALANCE=1`.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -288,7 +288,7 @@ pub(crate) mod smt_split {
     pub(crate) const ZC_R1_SMT_SPLIT: bool = true;
 
     /// Compile-time rollback of the eight-core 9/7 arm partition.
-    const ZC_R1_AB_REBALANCE: bool = true;
+    const ZC_R1_AB_REBALANCE: bool = false;
 
     static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
 
@@ -496,7 +496,8 @@ pub(crate) mod smt_split {
                     }
                 }
             }
-            let rebalance = super::ZC_R1_AB_REBALANCE
+            let rebalance = (super::ZC_R1_AB_REBALANCE
+                || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
             let p0 = half(0, s0, debug);
@@ -578,6 +579,7 @@ pub mod hot_pool {
 
     std::thread_local! {
         static TOP_SP: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        static CALLBACK_ACTIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     }
 
     const TOP_LEVEL_DEPTH: usize = 1024;
@@ -596,6 +598,30 @@ pub mod hot_pool {
         top != 0 && here <= top && top - here < TOP_LEVEL_DEPTH
     }
 
+    /// Admission shared by all warming callbacks, including preseed/tail work.
+    /// Stack distance alone can admit several optimized callback frames. Keep
+    /// this guard across scheduler yields so their finite budgets cannot nest
+    /// and multiply. Workers without a recorded ranked-pool stack are refused.
+    #[must_use = "keep the guard alive for the whole warming callback"]
+    pub struct CallbackGuard(core::marker::PhantomData<*mut ()>);
+
+    impl CallbackGuard {
+        pub fn enter() -> Option<Self> {
+            if CALLBACK_ACTIVE.with(|active| active.get()) || !at_top_level() {
+                return None;
+            }
+            CALLBACK_ACTIVE.with(|active| active.set(true));
+            // A thread-local guard must not move to another worker.
+            Some(Self(core::marker::PhantomData))
+        }
+    }
+
+    impl Drop for CallbackGuard {
+        fn drop(&mut self) {
+            CALLBACK_ACTIVE.with(|active| active.set(false));
+        }
+    }
+
     fn spins_per_job() -> usize {
         static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
             std::env::var("FLOCK_HOT_POOL_SPINS")
@@ -607,9 +633,12 @@ pub mod hot_pool {
     }
 
     fn spinner(run: Arc<AtomicBool>, owner: usize, backoff: usize) {
-        if rayon::current_thread_index() == Some(owner) || !at_top_level() {
+        if rayon::current_thread_index() == Some(owner) {
             return;
         }
+        let Some(_callback) = CallbackGuard::enter() else {
+            return;
+        };
         for _ in 0..spins_per_job() {
             if !run.load(Ordering::Acquire) {
                 return;
@@ -651,6 +680,31 @@ pub mod hot_pool {
     impl Drop for HotPool {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn callback_admission_requires_recorded_stack() {
+            assert!(CallbackGuard::enter().is_none());
+        }
+
+        #[test]
+        fn callback_admission_excludes_descendants_and_recovers_after_unwind() {
+            record_top();
+            {
+                let _callback = CallbackGuard::enter().expect("recorded stack");
+                assert!(CallbackGuard::enter().is_none(), "nested callback admitted");
+            }
+            let result = std::panic::catch_unwind(|| {
+                let _callback = CallbackGuard::enter().expect("previous callback returned");
+                panic!("exercise callback unwinding");
+            });
+            assert!(result.is_err());
+            let _callback = CallbackGuard::enter().expect("unwinding must release admission");
         }
     }
 }

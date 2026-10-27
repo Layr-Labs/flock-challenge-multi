@@ -274,6 +274,10 @@ impl RootTileCache {
         &self,
         eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     ) -> Vec<F128> {
+        static PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
+        });
+        let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -353,7 +357,8 @@ impl RootTileCache {
                                     matrices.as_ptr().cast::<u64>(),
                                     dst.as_mut_ptr().cast::<u8>().add(block * 1024),
                                     self.blocks * 512, count, first,
-                                    WORD_TO_COLUMNS.as_ptr());
+                                    WORD_TO_COLUMNS.as_ptr(),
+                                    prefetch_blocks && block + 1 < self.blocks);
                             }
                         }
                         first = false;
@@ -475,7 +480,7 @@ mod tests {
                 }
             }
             for count in 1..=4 {
-                for seed_zero in [true, false] {
+                for seed_zero in [true, false] { for prefetch in [false, true] {
                     // Deliberately stale output, with untouched sentinels on
                     // both sides. Source group 175 ends at a true tile edge.
                     let mut expected = [0u8; 1024];
@@ -503,7 +508,7 @@ mod tests {
                         kernels::gfni_fold_word_tiles4(
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
                             new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
-                            WORD_TO_COLUMNS.as_ptr());
+                            WORD_TO_COLUMNS.as_ptr(), prefetch);
                     }
                     assert_eq!(&old[64..1088], &expected,
                         "old oracle, group={group}, count={count}, first={seed_zero}");
@@ -511,7 +516,7 @@ mod tests {
                         "fold4 oracle, group={group}, count={count}, first={seed_zero}");
                     assert!(new[..64].iter().chain(new[1088..].iter()).all(|&b| b == 0x5d));
                     assert!(old[..64].iter().chain(old[1088..].iter()).all(|&b| b == 0x5d));
-                }
+                } }
             }
         }
     }
