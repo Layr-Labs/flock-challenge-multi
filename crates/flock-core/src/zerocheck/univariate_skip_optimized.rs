@@ -4101,72 +4101,89 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     };
     let ab_inner_ptr = ab_inner.as_ptr();
     let pf_spread = zc_r1ab_pf_spread_enabled();
-    let bank_mask = (1usize << bank_bits) - 1;
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
-            2
-        } else {
-            0
+    // Ranked direct bands contain complete even/odd pairs and power-of-two
+    // banks. Resolve their addresses and fixed row dispatch once per group.
+    let paired_eligible = ranked_one_rows_elided && within_outer_mask == 1
+        && (b_med_counts == [16,14] || b_med_counts == [16,15])
+        && bank_bits >= 1 && bank_bits <= n_lo && n_lo < usize::BITS as usize
+        && big_lo_size == (1usize << n_lo)
+        && eq_bot.len() == (1usize << bank_bits)
+        && (big_lo_size >> bank_bits).checked_mul(256) == Some(mats.len());
+    if paired_eligible {
+        let plan = kernels::AbPairedBandArgs {
+            x_hi, lo_bits:n_lo, bank_bits, odd_end:b_med_counts[1] as usize,
+            compact:ranked_compact, first_write:plane_first_write,
+            pf_windows, spread:pf_spread,
         };
-        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
-        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
-            let x_ahead = x_outer.wrapping_add(pf_windows);
-            let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
-            let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+        kernels::convert_ab_nomul_gfni_paired_band(&plan,ab_inner,mats,&mut state.plane_banks);
+    } else {
+        let bank_mask = (1usize << bank_bits) - 1;
+        for x_outer_lo in 0..big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
                 2
             } else {
                 0
             };
-            (
-                n_next,
-                live_row_base(x_ahead, next_first, ranked_compact),
-                next_first,
-            )
-        } else {
-            (0, 0, 0)
-        };
-        let w_idx = x_outer_lo >> bank_bits;
-        let u = x_outer_lo & bank_mask;
-        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
-            .try_into()
-            .expect("one 16x16 qword matrix block per w");
-        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
-            .try_into()
-            .expect("one plane bank per low index");
-        let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
-        let prefetch = kernels::AbDirectPrefetch {
-            next_window: if pf_windows == 0 {
-                core::ptr::null()
+            let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+            let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+                let x_ahead = x_outer.wrapping_add(pf_windows);
+                let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
+                let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                };
+                (
+                    n_next,
+                    live_row_base(x_ahead, next_first, ranked_compact),
+                    next_first,
+                )
             } else {
-                ab_inner_ptr.wrapping_add(next_live_base)
-            },
-            first: next_first_b_med,
-            end: n_next,
-            spread: pf_spread,
-        };
-        if plane_first_write && w_idx == 0 {
-            kernels::convert_ab_nomul_gfni_direct::<true>(
-                live_rows,
-                first_b_med,
-                n_b_med,
-                mats_w,
-                bank,
-                &prefetch,
-            );
-        } else {
-            kernels::convert_ab_nomul_gfni_direct::<false>(
-                live_rows,
-                first_b_med,
-                n_b_med,
-                mats_w,
-                bank,
-                &prefetch,
-            );
+                (0, 0, 0)
+            };
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & bank_mask;
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+            let prefetch = kernels::AbDirectPrefetch {
+                next_window: if pf_windows == 0 {
+                    core::ptr::null()
+                } else {
+                    ab_inner_ptr.wrapping_add(next_live_base)
+                },
+                first: next_first_b_med,
+                end: n_next,
+                spread: pf_spread,
+            };
+            if plane_first_write && w_idx == 0 {
+                kernels::convert_ab_nomul_gfni_direct::<true>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            } else {
+                kernels::convert_ab_nomul_gfni_direct::<false>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            }
         }
     }
     let wide = r1_eqfold_x4_enabled();
@@ -6699,4 +6716,31 @@ mod tests {
 /// Compile-time structural B mode for ranked eight-row projection.
 pub const fn round1_ranked_bcomplement_mode(blk: usize, k: usize) -> u8 {
     kernels::x86_64_bcomplement::window_mode(blk, k)
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod paired_ab_actual_driver_tests {
+    use super::*;
+    fn next(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+    #[test]
+    fn paired_ab_actual_driver_matches_generic() {
+        let mut seed=0x2938546u64;let mut cases=0;
+        for odd in [14,15]{for compact in [false,true]{for first in [false,true]{for bits in [0,1,2]{
+            let lo=16usize;let stride=if compact{1856}else{2048};
+            let mut input=vec![0u8;lo*stride];for v in &mut input{*v=next(&mut seed)as u8;}
+            let mut mats=vec![0u64;(lo>>bits)*256];for v in &mut mats{*v=next(&mut seed);}
+            let eq:Vec<F128>=(0..1usize<<bits).map(|_|F128{lo:next(&mut seed),hi:next(&mut seed)}).collect();
+            let mut direct=WorkerStateAbOnly::new();let mut generic=WorkerStateAbOnly::new();
+            let counts=[16u8,odd];
+            for hi in [1,0] {
+                let eq_hi=F128{lo:next(&mut seed),hi:next(&mut seed)};
+                process_one_x_hi_ab_only::<true>(hi,lo,4+N_INNER,1,&counts,&input,&[],eq_hi,&[],Some((&eq,&mats,bits)),first,false,true,compact,&mut direct);
+                process_one_x_hi_ab_only::<false>(hi,lo,4+N_INNER,1,&counts,&input,&[],eq_hi,&[],Some((&eq,&mats,bits)),first,false,true,compact,&mut generic);
+                assert_eq!(direct.plane_banks,generic.plane_banks,"band state {odd},{compact},{first},{bits},{hi}");
+                assert_eq!(direct.local_res_ab,generic.local_res_ab,"final fold {odd},{compact},{first},{bits},{hi}");
+            }
+            cases+=1;
+        }}}}
+        assert_eq!(cases,24);println!("PASS 24 actual driver cases, 48 complete band folds, paired and one-bank fallback");
+    }
 }
