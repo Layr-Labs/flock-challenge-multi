@@ -541,8 +541,10 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             t += 8;
         }
 
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
+        let [mut u0, mut u2, _, _] =
+            crate::field::gf2_128::x86_64::f128x4_extract(WideGhashX4::fold4_and_reduce(
+                u0_acc, u2_acc, WideGhashX4::zero(), WideGhashX4::zero(),
+            ));
         while t < half {
             let source = 2 * t;
             let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));

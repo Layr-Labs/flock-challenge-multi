@@ -5489,8 +5489,10 @@ unsafe fn factorized_eq_round0_avx512(f: &[F128], weights: &[F128]) -> (F128, F1
             s_acc.mul_acc(sum, w);
             j += 4;
         }
-        let mut a = a_acc.fold().reduce();
-        let mut s = s_acc.fold().reduce();
+        let [mut a, mut s, _, _] =
+            crate::field::gf2_128::x86_64::f128x4_extract(WideGhashX4::fold4_and_reduce(
+                a_acc, s_acc, WideGhashX4::zero(), WideGhashX4::zero(),
+            ));
         while j < weights.len() {
             a += f[2 * j] * weights[j];
             s += (f[2 * j] + f[2 * j + 1]) * weights[j];
@@ -5666,8 +5668,10 @@ pub(crate) unsafe fn msg_reduce_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128)
         }
 
         // Fold the 4-lane unreduced accumulators to scalar F128.
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
+        let [mut u0, mut u2, _, _] =
+            crate::field::gf2_128::x86_64::f128x4_extract(WideGhashX4::fold4_and_reduce(
+                u0_acc, u2_acc, WideGhashX4::zero(), WideGhashX4::zero(),
+            ));
 
         // Scalar tail for remaining pairs.
         while k + 1 < len {
@@ -5732,9 +5736,10 @@ unsafe fn msg_reduce_eval_avx512(fc: &[F128], bc: &[F128]) -> (F128, F128, F128)
             k += 8;
         }
 
-        let mut u0 = u0_acc.fold().reduce();
-        let mut u2 = u2_acc.fold().reduce();
-        let mut y = y_acc.fold().reduce();
+        let [mut u0, mut u2, mut y, _] =
+            crate::field::gf2_128::x86_64::f128x4_extract(WideGhashX4::fold4_and_reduce(
+                u0_acc, u2_acc, y_acc, WideGhashX4::zero(),
+            ));
 
         while k + 1 < len {
             let f0 = fc[k];

@@ -1830,9 +1830,14 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
             _mm_sfence();
         }
         let mut out = [F128::ZERO; 8];
-        for i in 0..8 {
-            out[i] = acc[i].fold().reduce();
-        }
+        _mm512_storeu_si512(
+            out.as_mut_ptr().cast(),
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        _mm512_storeu_si512(
+            out.as_mut_ptr().add(4).cast(),
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
         out
     }
 }
@@ -3289,9 +3294,14 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
             _mm_sfence();
         }
         let mut out = [F128::ZERO; 8];
-        for i in 0..8 {
-            out[i] = acc[i].fold().reduce();
-        }
+        _mm512_storeu_si512(
+            out.as_mut_ptr().cast(),
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        _mm512_storeu_si512(
+            out.as_mut_ptr().add(4).cast(),
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
         out
     }
 }

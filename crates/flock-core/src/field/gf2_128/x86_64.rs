@@ -712,24 +712,21 @@ impl WideGhashX4 {
         a2: Self,
         a3: Self,
     ) -> __m512i {
-        // SAFETY: caller carries avx512f+vpclmulqdq.
+        // Fold sample halves before combining outputs. This ordering lets
+        // every cross-lane selection use an immediate shuffle.
         unsafe {
-            let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-            let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-            let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
-            let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
-            let hfold4 = |v0: __m512i, v1: __m512i, v2: __m512i, v3: __m512i| -> __m512i {
-                let t0 = _mm512_xor_si512(
-                    _mm512_permutex2var_epi64(v0, s1_lo, v1),
-                    _mm512_permutex2var_epi64(v0, s1_hi, v1),
+            let hfold4 = |a: __m512i, b: __m512i, c: __m512i, d: __m512i| {
+                let ab = _mm512_xor_si512(
+                    _mm512_shuffle_i64x2::<0x44>(a, b),
+                    _mm512_shuffle_i64x2::<0xee>(a, b),
                 );
-                let t1 = _mm512_xor_si512(
-                    _mm512_permutex2var_epi64(v2, s1_lo, v3),
-                    _mm512_permutex2var_epi64(v2, s1_hi, v3),
+                let cd = _mm512_xor_si512(
+                    _mm512_shuffle_i64x2::<0x44>(c, d),
+                    _mm512_shuffle_i64x2::<0xee>(c, d),
                 );
                 _mm512_xor_si512(
-                    _mm512_permutex2var_epi64(t0, s2_lo, t1),
-                    _mm512_permutex2var_epi64(t0, s2_hi, t1),
+                    _mm512_shuffle_i64x2::<0x88>(ab, cd),
+                    _mm512_shuffle_i64x2::<0xdd>(ab, cd),
                 )
             };
             let lo = hfold4(a0.lo, a1.lo, a2.lo, a3.lo);
