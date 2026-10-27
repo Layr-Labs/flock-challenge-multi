@@ -2573,6 +2573,7 @@ impl AdditiveNttF128 {
         stage_perm: bool,
         tw4: &[kernels::FourBlock],
         tw2: &[[[F128; 3]; 16]],
+        prepared: Option<&kernels::SeedPublish64Plan>,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2612,6 +2613,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    prepared.map(|p| &p.blocks[block]),
                 );
             }
         }
@@ -2654,6 +2656,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2: &[[[F128; 3]; 16]],
+        prepared: Option<&kernels::SeedPublish64Plan>,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -2678,6 +2681,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    prepared.map(|p| &p.blocks[block]),
                 );
             }
         }
@@ -2721,7 +2725,19 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2_block: &[[F128; 3]; 16],
+        prepared: Option<&kernels::SeedPublish64Block>,
     ) {
+        #[cfg(target_feature="avx512bw")]
+        if let Some(plan)=prepared {
+            debug_assert!(stage_perm);
+            debug_assert_eq!(row_len,64);
+            unsafe {
+                kernels::seed_publish64_block::<ALIGNED_ZMM>(
+                    region,base.add((block*block_size+r)*row_len),sub_stride*row_len,lanes2,plan,
+                );
+            }
+            return;
+        }
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
         // final consumer of its four staging rows, and the 16 quads partition
@@ -2785,6 +2801,11 @@ impl AdditiveNttF128 {
             0
         };
         let row_len = num_ntts;
+        // Ranked L0 (m = 32) geometry: the seed's source quarter, destination
+        // quarter and interleave width are compile-time strides, so the
+        // per-row address arithmetic leaves the lane loop (see
+        // `butterfly_fused_2layer_row_from_sparse_dense_geo_shaped`).
+        let ranked_seed_shape = row_len == 64 && block_size == (1usize << 17);
 
         // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
         let mut seed_tw = [[F128::ZERO; 3]; 2];
@@ -2869,6 +2890,11 @@ impl AdditiveNttF128 {
         // the same order as before, so the transform is byte-identical; only
         // the scratch address it lives at changes.
         let stage_perm = Self::stage_perm_enabled();
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq"))]
+        let prepared_publish=if direct_publish && stage_perm {
+            kernels::SeedPublish64Plan::new(&tw4,&tw2)
+        } else {None};
+
         // Message-gather hints, decided once per pass (see `seed_pf_params`).
         #[cfg(target_arch = "x86_64")]
         let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
@@ -2955,19 +2981,36 @@ impl AdditiveNttF128 {
                         };
                         static NOREAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DIAG_NOREAD").is_some());
                         let (q_, rs_, pf_) = if *NOREAD { (1024usize, r_s & 1023, core::ptr::null()) } else { (block_size, r_s, pf_next) };
-                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
-                            src,
-                            q_,
-                            rs_,
-                            bufp.add(kp * row_len),
-                            bufp.add((256 + kp) * row_len),
-                            64,
-                            row_len,
-                            seed_active_lanes,
-                            seed_right,
-                            &seed_dense,
-                            pf_,
-                        );
+                        if ranked_seed_shape && !*NOREAD {
+                            kernels::butterfly_fused_2layer_row_from_sparse_dense_geo_shaped::<
+                                { 1usize << 17 },
+                                64,
+                                64,
+                            >(
+                                src,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                bufp.add((256 + kp) * row_len),
+                                seed_active_lanes,
+                                seed_right,
+                                &seed_dense,
+                                pf_next,
+                            );
+                        } else {
+                            kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                                src,
+                                q_,
+                                rs_,
+                                bufp.add(kp * row_len),
+                                bufp.add((256 + kp) * row_len),
+                                64,
+                                row_len,
+                                seed_active_lanes,
+                                seed_right,
+                                &seed_dense,
+                                pf_,
+                            );
+                        }
                     } else if pf_next.is_null() {
                         kernels::butterfly_fused_2layer_row_from_sparse_geo(
                             src,
@@ -3088,6 +3131,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            prepared_publish.as_ref(),
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -3102,6 +3146,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            prepared_publish.as_ref(),
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -3198,10 +3243,12 @@ impl AdditiveNttF128 {
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        prepared_publish.as_ref(),
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        prepared_publish.as_ref(),
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC

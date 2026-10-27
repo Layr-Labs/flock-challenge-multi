@@ -247,7 +247,7 @@ impl RootTileCache {
     }
 
     fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
-        // Retain each output plane across four tiles. The kill switch keeps
+        // Retain each output plane across eight tiles. The kill switch keeps
         // the original per-tile reader available for diagnostic comparisons.
         static BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_BATCH4").is_none()
@@ -303,7 +303,7 @@ impl RootTileCache {
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
-                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 8]);
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -318,15 +318,15 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        lo = next.fetch_add(8, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + 4).min(self.tiles);
+                        hi = (lo + 8).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;
-                        let count = (hi - lo).min(4);
+                        let count = (hi - lo).min(8);
                         lo += count;
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
@@ -336,25 +336,23 @@ impl RootTileCache {
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
                         }
-                        for block in 0..self.blocks {
-                            // SAFETY: tile + count <= hi <= self.tiles, each
-                            // source block has eight initialized 64-byte rows,
-                            // and actual tile stride is blocks*512. Arrays of
-                            // u64 have contiguous layout; every live matrix
-                            // slot was fully overwritten above, and the leaf
-                            // reads exactly count slots. Every dst byte is
-                            // exclusively owned by this worker. On its first
-                            // batch the leaf initializes all sixteen planes
-                            // without reading dst; later calls load them once.
-                            unsafe {
-                                kernels::gfni_fold_word_tiles4(
-                                    self.storage.0.as_ptr().add(self.offset).cast::<u8>()
-                                        .add((tile * self.blocks + block) * 512),
-                                    matrices.as_ptr().cast::<u64>(),
-                                    dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                    self.blocks * 512, count, first,
-                                    WORD_TO_COLUMNS.as_ptr());
-                            }
+                        // SAFETY: tile + count <= hi <= self.tiles, each
+                        // block has eight initialized 64-byte rows per tile,
+                        // and the true tile stride is blocks*512. Arrays of
+                        // u64 have contiguous layout; every live matrix slot
+                        // was fully overwritten above, and the leaf reads
+                        // exactly count slots. Every dst byte is exclusively
+                        // owned by this worker. On its first batch the leaf
+                        // initializes all sixteen planes without reading dst;
+                        // later calls load them once per block.
+                        unsafe {
+                            kernels::gfni_fold_word_tiles4(
+                                self.storage.0.as_ptr().add(self.offset).cast::<u8>()
+                                    .add(tile * self.blocks * 512),
+                                matrices.as_ptr().cast::<u64>(),
+                                dst.as_mut_ptr().cast::<u8>(),
+                                self.blocks * 512, count, self.blocks, first,
+                                WORD_TO_COLUMNS.as_ptr());
                         }
                         first = false;
                         continue;
@@ -502,7 +500,7 @@ mod tests {
                         }
                         kernels::gfni_fold_word_tiles4(
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
-                            new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
+                            new.as_mut_ptr().add(64), STRIDE, count, 1, seed_zero,
                             WORD_TO_COLUMNS.as_ptr());
                     }
                     assert_eq!(&old[64..1088], &expected,

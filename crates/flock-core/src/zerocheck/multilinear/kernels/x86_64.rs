@@ -368,10 +368,22 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        // One cache per (batch, operand): four 32-pair batches, A and B. Both
+        // fold calls of a batch write disjoint caches, so all eight packets
+        // can be folded before the first accumulation. Keeping the eight
+        // helper calls out of the accumulation's live range lets the 24
+        // accumulator ZMMs stay in registers instead of being spilled and
+        // reloaded around every call.
+        let mut cache_store = core::mem::MaybeUninit::<[FoldCache; 8]>::uninit();
+        let cache_base = cache_store.as_mut_ptr().cast::<FoldCache>();
+        let fa0 = core::ptr::addr_of_mut!((*cache_base.add(0)).0).cast::<F128>();
+        let fb0 = core::ptr::addr_of_mut!((*cache_base.add(4)).0).cast::<F128>();
+        let fa1 = core::ptr::addr_of_mut!((*cache_base.add(1)).0).cast::<F128>();
+        let fb1 = core::ptr::addr_of_mut!((*cache_base.add(5)).0).cast::<F128>();
+        let fa2 = core::ptr::addr_of_mut!((*cache_base.add(2)).0).cast::<F128>();
+        let fb2 = core::ptr::addr_of_mut!((*cache_base.add(6)).0).cast::<F128>();
+        let fa3 = core::ptr::addr_of_mut!((*cache_base.add(3)).0).cast::<F128>();
+        let fb3 = core::ptr::addr_of_mut!((*cache_base.add(7)).0).cast::<F128>();
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -393,29 +405,41 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
         }
 
         macro_rules! ld_group {
-            ($g:expr) => {{
+            ($fa:expr, $fb:expr, $g:expr) => {{
                 let g_off = 4 * ($g as usize);
                 (
-                    _mm512_loadu_si512(fa.add(g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(16 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(32 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(48 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(16 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(32 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(48 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fa.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fa.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fa.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fa.add(48 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fb.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fb.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fb.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512($fb.add(48 + g_off).cast::<__m512i>()),
                 )
             }};
         }
 
-        macro_rules! accum1 {
-            ($g0:expr, $grp:expr) => {{
+        // Products 0..3 and 4..7 are independent accumulations over the same
+        // group values, so they run as two passes. Each pass keeps only four
+        // `WideGhashX4` accumulators (12 ZMMs) live, which leaves room for the
+        // eight loaded operands and the XOR temporaries in the 32 ZMMs; the
+        // pass that would need all eight accumulators spilled every one of
+        // them around the eight fold calls and around each group.
+        macro_rules! accum1_lo {
+            ($fa:expr, $fb:expr, $g0:expr, $grp:expr) => {{
                 pf_quarter!($g0, $grp);
-                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($fa, $fb, $grp);
                 acc[0].mul_acc(a1w, b1);
                 acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
                 acc[2].mul_acc(a3w, b3);
                 acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+            }};
+        }
+
+        macro_rules! accum1_hi {
+            ($fa:expr, $fb:expr, $grp:expr) => {{
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($fa, $fb, $grp);
                 acc[4].mul_acc(a2w, b2);
                 let e_aw = _mm512_xor_si512(a0w, a2w);
                 let e_b = _mm512_xor_si512(b0, b2);
@@ -427,12 +451,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             }};
         }
 
-        macro_rules! accum2 {
-            ($g0:expr, $grp0:expr, $grp1:expr) => {{
+        macro_rules! accum2_lo {
+            ($fa:expr, $fb:expr, $g0:expr, $grp0:expr, $grp1:expr) => {{
                 pf_quarter!($g0, $grp0);
-                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp0);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($fa, $fb, $grp0);
                 pf_quarter!($g0, $grp1);
-                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($grp1);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($fa, $fb, $grp1);
                 acc[0].mul_acc2(a1w, b1, c1w, d1);
                 acc[1].mul_acc2(
                     _mm512_xor_si512(a0w, a1w),
@@ -447,6 +471,13 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                     _mm512_xor_si512(c2w, c3w),
                     _mm512_xor_si512(d2, d3),
                 );
+            }};
+        }
+
+        macro_rules! accum2_hi {
+            ($fa:expr, $fb:expr, $grp0:expr, $grp1:expr) => {{
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($fa, $fb, $grp0);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($fa, $fb, $grp1);
                 acc[4].mul_acc2(a2w, b2, c2w, d2);
                 let e_aw = _mm512_xor_si512(a0w, a2w);
                 let e_b = _mm512_xor_si512(b0, b2);
@@ -470,6 +501,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
+            // Phase 1: fold all eight packets. Nothing is accumulated yet, so
+            // the eight calls clobber only registers the fold itself needs.
             // Batch 0 (g0 & 255 == 0): elide group 0
             {
                 let g0 = row_base + 2 * x_lo;
@@ -477,38 +510,29 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(
                     a_pkt.add(g0 * 8),
                     a_mats_ptr,
-                    fa,
+                    fa0,
                     0,
                 );
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
-                    fb,
+                    fb0,
                     0,
                 );
-                pf_quarter!(g0, 0);
-                #[cfg(test)]
-                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                accum1!(g0, 1);
-                accum2!(g0, 2, 3);
             }
             // Batch 1 (g0 & 255 == 64): full 4 groups
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
-                accum2!(g0, 0, 1);
-                accum2!(g0, 2, 3);
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa1, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb1, 0);
             }
             // Batch 2 (g0 & 255 == 128): full 4 groups
             {
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
-                accum2!(g0, 0, 1);
-                accum2!(g0, 2, 3);
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa2, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb2, 0);
             }
             // Batch 3 (g0 & 255 == 192): elide group 3
             {
@@ -517,20 +541,68 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(
                     a_pkt.add(g0 * 8),
                     a_mats_ptr,
-                    fa,
+                    fa3,
                     3,
                 );
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
-                    fb,
+                    fb3,
                     3,
                 );
-                accum2!(g0, 0, 1);
-                accum1!(g0, 2);
+            }
+            // Phase 2: accumulate from the caches. XOR accumulation is
+            // associative and commutative, so this is bit-identical to the
+            // interleaved order. Pass A handles products 0..3, pass B 4..7.
+            // Batch 0 (g0 & 255 == 0): elide group 0
+            {
+                let g0 = row_base + 2 * x_lo;
+                pf_quarter!(g0, 0);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                accum1_lo!(fa0, fb0, g0, 1);
+                accum2_lo!(fa0, fb0, g0, 2, 3);
+            }
+            // Batch 1 (g0 & 255 == 64): full 4 groups
+            {
+                let g0 = row_base + 2 * (x_lo + 32);
+                accum2_lo!(fa1, fb1, g0, 0, 1);
+                accum2_lo!(fa1, fb1, g0, 2, 3);
+            }
+            // Batch 2 (g0 & 255 == 128): full 4 groups
+            {
+                let g0 = row_base + 2 * (x_lo + 64);
+                accum2_lo!(fa2, fb2, g0, 0, 1);
+                accum2_lo!(fa2, fb2, g0, 2, 3);
+            }
+            // Batch 3 (g0 & 255 == 192): elide group 3
+            {
+                let g0 = row_base + 2 * (x_lo + 96);
+                accum2_lo!(fa3, fb3, g0, 0, 1);
+                accum1_lo!(fa3, fb3, g0, 2);
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Batch 0 (g0 & 255 == 0): elide group 0
+            {
+                accum1_hi!(fa0, fb0, 1);
+                accum2_hi!(fa0, fb0, 2, 3);
+            }
+            // Batch 1 (g0 & 255 == 64): full 4 groups
+            {
+                accum2_hi!(fa1, fb1, 0, 1);
+                accum2_hi!(fa1, fb1, 2, 3);
+            }
+            // Batch 2 (g0 & 255 == 128): full 4 groups
+            {
+                accum2_hi!(fa2, fb2, 0, 1);
+                accum2_hi!(fa2, fb2, 2, 3);
+            }
+            // Batch 3 (g0 & 255 == 192): elide group 3
+            {
+                accum2_hi!(fa3, fb3, 0, 1);
+                accum1_hi!(fa3, fb3, 2);
             }
             x_lo += 128;
         }
@@ -3173,16 +3245,29 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
         let wt_ptr = wt.as_ptr();
+        // One 512-byte scratch for the fold's gather, reused by the two leaf
+        // calls of every step. The leaf no longer aligns RSP and subtracts it
+        // per call.
+        #[repr(C, align(64))]
+        struct C4FoldScratch([u8; 512]);
+        let mut c4_scratch = core::mem::MaybeUninit::<C4FoldScratch>::uninit();
+        let c4_scratch_ptr = c4_scratch.as_mut_ptr().cast::<u8>();
 
         macro_rules! step8_fast {
             ($x_expr:expr) => {{
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                let [a0, a1, a2, a3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
-                let [b0, b1, b2, b3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
+                let [a0, a1, a2, a3] = gfni_fold64_rows_c4_lm_registers(
+                    a_pkt.add(4 * xg * 8),
+                    cfold,
+                    c4_scratch_ptr,
+                );
+                let [b0, b1, b2, b3] = gfni_fold64_rows_c4_lm_registers(
+                    b_pkt.add(4 * xg * 8),
+                    cfold,
+                    c4_scratch_ptr,
+                );
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -5603,7 +5688,9 @@ unsafe extern "C" {
 /// The fallback uses the same unmasked Rust fold and output ordering.
 ///
 /// # Safety
-/// The rows pointer names 512 initialized readable bytes and m is valid.
+/// The rows pointer names 512 initialized readable bytes, m is valid, and
+/// `scratch` names 512 writable bytes aligned to 64. Calls sharing a scratch
+/// buffer must not overlap.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -5615,6 +5702,7 @@ unsafe extern "C" {
 unsafe fn gfni_fold64_rows_c4_lm_registers(
     rows: *const u8,
     m: &CFoldMats,
+    scratch: *mut u8,
 ) -> [core::arch::x86_64::__m512i; 4] {
     use core::arch::x86_64::*;
     #[cfg(target_os = "linux")]
@@ -5628,7 +5716,7 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
             kernel = sym flock_gfni_c4_lm_register_result,
             in("rdi") rows,
             in("rsi") m.1.as_ptr(),
-            lateout("rax") _,
+            in("rdx") scratch,
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Exact composed GFNI fold, lane-major output, with a private register ABI.
-// Inputs: RDI = 512 input bytes, RSI = CFoldMats.1. Returns ZMM8..11 in lane-major order.
-// Clobbers: RAX, flags, ZMM0..11. Preserves every other GPR and ZMM12..31.
+// Inputs: RDI = 512 input bytes, RSI = CFoldMats.1, RDX = 512-byte scratch,
+// 64-byte aligned. Returns ZMM8..11 in lane-major order.
+// Clobbers: flags, ZMM0..11. Preserves every GPR and ZMM12..31.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
 // No vzeroupper: the upper lanes of ZMM12..15 belong to the caller.
 .text
@@ -10,9 +11,6 @@
 .hidden flock_gfni_c4_lm_register_result
 .type flock_gfni_c4_lm_register_result,@function
 flock_gfni_c4_lm_register_result:
-    mov rax, rsp
-    and rsp, -64
-    sub rsp, 512
     vmovdqa64 zmm8, [rip + .Lflock_c4_result_oct_even]
     vmovdqa64 zmm9, [rip + .Lflock_c4_result_oct_odd]
 
@@ -29,286 +27,281 @@ flock_gfni_c4_lm_register_result:
     vmovdqa64 zmm6, zmm4
     vpermt2b zmm6, zmm8, zmm5
     vpermt2b zmm4, zmm9, zmm5
-    vmovdqa64 [rsp + 256*\p], zmm6
-    vmovdqa64 [rsp + 256*\p + 64], zmm4
+    vmovdqa64 [rdx + 256*\p], zmm6
+    vmovdqa64 [rdx + 256*\p + 64], zmm4
     vmovdqa64 zmm6, zmm0
     vpermt2b zmm6, zmm8, zmm2
     vpermt2b zmm0, zmm9, zmm2
-    vmovdqa64 [rsp + 256*\p + 128], zmm6
-    vmovdqa64 [rsp + 256*\p + 192], zmm0
+    vmovdqa64 [rdx + 256*\p + 128], zmm6
+    vmovdqa64 [rdx + 256*\p + 192], zmm0
 .endm
     flock_c4_result_gather 0
     flock_c4_result_gather 1
 
-    vpbroadcastq zmm0, [rsp + 0]
+    vpbroadcastq zmm0, [rdx + 0]
     vgf2p8affineqb zmm1, zmm0, [rsi + 2048], 0
     vgf2p8affineqb zmm0, zmm0, [rsi + 0], 0
-    vpbroadcastq zmm2, [rsp + 8]
+    vpbroadcastq zmm2, [rdx + 8]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2112], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 64], 0
-    vpbroadcastq zmm4, [rsp + 16]
+    vpbroadcastq zmm4, [rdx + 16]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2176], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 128], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 24]
+    vpbroadcastq zmm2, [rdx + 24]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2240], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 192], 0
-    vpbroadcastq zmm4, [rsp + 32]
+    vpbroadcastq zmm4, [rdx + 32]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2304], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 256], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 40]
+    vpbroadcastq zmm2, [rdx + 40]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2368], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 320], 0
-    vpbroadcastq zmm4, [rsp + 48]
+    vpbroadcastq zmm4, [rdx + 48]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2432], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 384], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 56]
+    vpbroadcastq zmm2, [rdx + 56]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2496], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 448], 0
-    vpbroadcastq zmm4, [rsp + 64]
+    vpbroadcastq zmm4, [rdx + 64]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2560], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 512], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 72]
+    vpbroadcastq zmm2, [rdx + 72]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2624], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 576], 0
-    vpbroadcastq zmm4, [rsp + 80]
+    vpbroadcastq zmm4, [rdx + 80]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2688], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 640], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 88]
+    vpbroadcastq zmm2, [rdx + 88]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2752], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 704], 0
-    vpbroadcastq zmm4, [rsp + 96]
+    vpbroadcastq zmm4, [rdx + 96]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2816], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 768], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 104]
+    vpbroadcastq zmm2, [rdx + 104]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2880], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 832], 0
-    vpbroadcastq zmm4, [rsp + 112]
+    vpbroadcastq zmm4, [rdx + 112]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2944], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 896], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 120]
+    vpbroadcastq zmm2, [rdx + 120]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3008], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 960], 0
-    vpbroadcastq zmm4, [rsp + 128]
+    vpbroadcastq zmm4, [rdx + 128]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3072], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1024], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 136]
+    vpbroadcastq zmm2, [rdx + 136]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3136], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1088], 0
-    vpbroadcastq zmm4, [rsp + 144]
+    vpbroadcastq zmm4, [rdx + 144]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3200], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1152], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 152]
+    vpbroadcastq zmm2, [rdx + 152]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3264], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1216], 0
-    vpbroadcastq zmm4, [rsp + 160]
+    vpbroadcastq zmm4, [rdx + 160]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3328], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1280], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 168]
+    vpbroadcastq zmm2, [rdx + 168]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3392], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1344], 0
-    vpbroadcastq zmm4, [rsp + 176]
+    vpbroadcastq zmm4, [rdx + 176]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3456], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1408], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 184]
+    vpbroadcastq zmm2, [rdx + 184]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3520], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1472], 0
-    vpbroadcastq zmm4, [rsp + 192]
+    vpbroadcastq zmm4, [rdx + 192]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3584], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1536], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 200]
+    vpbroadcastq zmm2, [rdx + 200]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3648], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1600], 0
-    vpbroadcastq zmm4, [rsp + 208]
+    vpbroadcastq zmm4, [rdx + 208]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3712], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1664], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 216]
+    vpbroadcastq zmm2, [rdx + 216]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3776], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1728], 0
-    vpbroadcastq zmm4, [rsp + 224]
+    vpbroadcastq zmm4, [rdx + 224]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3840], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1792], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 232]
+    vpbroadcastq zmm2, [rdx + 232]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3904], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1856], 0
-    vpbroadcastq zmm4, [rsp + 240]
+    vpbroadcastq zmm4, [rdx + 240]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3968], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1920], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 248]
+    vpbroadcastq zmm2, [rdx + 248]
     vgf2p8affineqb zmm3, zmm2, [rsi + 4032], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
     vpxorq zmm0, zmm0, zmm2
     vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm6, [rip + .Lflock_c4_result_out_even]
-    vmovdqa64 zmm7, [rip + .Lflock_c4_result_out_odd]
-    vmovdqa64 zmm8, zmm0
-    vmovdqa64 zmm9, zmm0
-    vpermt2b zmm8, zmm6, zmm1
-    vpermt2b zmm9, zmm7, zmm1
-    vpbroadcastq zmm0, [rsp + 256]
+    vmovdqa64 zmm8, [rip + .Lflock_c4_result_out_even]
+    vmovdqa64 zmm9, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm8, zmm0, zmm1
+    vpermi2b zmm9, zmm0, zmm1
+    vpbroadcastq zmm0, [rdx + 256]
     vgf2p8affineqb zmm1, zmm0, [rsi + 2048], 0
     vgf2p8affineqb zmm0, zmm0, [rsi + 0], 0
-    vpbroadcastq zmm2, [rsp + 264]
+    vpbroadcastq zmm2, [rdx + 264]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2112], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 64], 0
-    vpbroadcastq zmm4, [rsp + 272]
+    vpbroadcastq zmm4, [rdx + 272]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2176], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 128], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 280]
+    vpbroadcastq zmm2, [rdx + 280]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2240], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 192], 0
-    vpbroadcastq zmm4, [rsp + 288]
+    vpbroadcastq zmm4, [rdx + 288]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2304], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 256], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 296]
+    vpbroadcastq zmm2, [rdx + 296]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2368], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 320], 0
-    vpbroadcastq zmm4, [rsp + 304]
+    vpbroadcastq zmm4, [rdx + 304]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2432], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 384], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 312]
+    vpbroadcastq zmm2, [rdx + 312]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2496], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 448], 0
-    vpbroadcastq zmm4, [rsp + 320]
+    vpbroadcastq zmm4, [rdx + 320]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2560], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 512], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 328]
+    vpbroadcastq zmm2, [rdx + 328]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2624], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 576], 0
-    vpbroadcastq zmm4, [rsp + 336]
+    vpbroadcastq zmm4, [rdx + 336]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2688], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 640], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 344]
+    vpbroadcastq zmm2, [rdx + 344]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2752], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 704], 0
-    vpbroadcastq zmm4, [rsp + 352]
+    vpbroadcastq zmm4, [rdx + 352]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2816], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 768], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 360]
+    vpbroadcastq zmm2, [rdx + 360]
     vgf2p8affineqb zmm3, zmm2, [rsi + 2880], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 832], 0
-    vpbroadcastq zmm4, [rsp + 368]
+    vpbroadcastq zmm4, [rdx + 368]
     vgf2p8affineqb zmm5, zmm4, [rsi + 2944], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 896], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 376]
+    vpbroadcastq zmm2, [rdx + 376]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3008], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 960], 0
-    vpbroadcastq zmm4, [rsp + 384]
+    vpbroadcastq zmm4, [rdx + 384]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3072], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1024], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 392]
+    vpbroadcastq zmm2, [rdx + 392]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3136], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1088], 0
-    vpbroadcastq zmm4, [rsp + 400]
+    vpbroadcastq zmm4, [rdx + 400]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3200], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1152], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 408]
+    vpbroadcastq zmm2, [rdx + 408]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3264], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1216], 0
-    vpbroadcastq zmm4, [rsp + 416]
+    vpbroadcastq zmm4, [rdx + 416]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3328], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1280], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 424]
+    vpbroadcastq zmm2, [rdx + 424]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3392], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1344], 0
-    vpbroadcastq zmm4, [rsp + 432]
+    vpbroadcastq zmm4, [rdx + 432]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3456], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1408], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 440]
+    vpbroadcastq zmm2, [rdx + 440]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3520], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1472], 0
-    vpbroadcastq zmm4, [rsp + 448]
+    vpbroadcastq zmm4, [rdx + 448]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3584], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1536], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 456]
+    vpbroadcastq zmm2, [rdx + 456]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3648], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1600], 0
-    vpbroadcastq zmm4, [rsp + 464]
+    vpbroadcastq zmm4, [rdx + 464]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3712], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1664], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 472]
+    vpbroadcastq zmm2, [rdx + 472]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3776], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1728], 0
-    vpbroadcastq zmm4, [rsp + 480]
+    vpbroadcastq zmm4, [rdx + 480]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3840], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1792], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 488]
+    vpbroadcastq zmm2, [rdx + 488]
     vgf2p8affineqb zmm3, zmm2, [rsi + 3904], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1856], 0
-    vpbroadcastq zmm4, [rsp + 496]
+    vpbroadcastq zmm4, [rdx + 496]
     vgf2p8affineqb zmm5, zmm4, [rsi + 3968], 0
     vgf2p8affineqb zmm4, zmm4, [rsi + 1920], 0
     vpternlogq zmm0, zmm2, zmm4, 0x96
     vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 504]
+    vpbroadcastq zmm2, [rdx + 504]
     vgf2p8affineqb zmm3, zmm2, [rsi + 4032], 0
     vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
     vpxorq zmm0, zmm0, zmm2
     vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm6, [rip + .Lflock_c4_result_out_even]
-    vmovdqa64 zmm7, [rip + .Lflock_c4_result_out_odd]
-    vmovdqa64 zmm10, zmm0
-    vmovdqa64 zmm11, zmm0
-    vpermt2b zmm10, zmm6, zmm1
-    vpermt2b zmm11, zmm7, zmm1
-    mov rsp, rax
+    vmovdqa64 zmm10, [rip + .Lflock_c4_result_out_even]
+    vmovdqa64 zmm11, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm10, zmm0, zmm1
+    vpermi2b zmm11, zmm0, zmm1
     ret
 .size flock_gfni_c4_lm_register_result, .-flock_gfni_c4_lm_register_result
 .purgem flock_c4_result_gather
