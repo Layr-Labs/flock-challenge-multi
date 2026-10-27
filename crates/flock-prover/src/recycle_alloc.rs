@@ -6,10 +6,10 @@
 //! for large allocations not already handled by the typed scratch pools.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{
     AtomicUsize,
-    Ordering::{Acquire, Release},
+    Ordering::{AcqRel, Acquire, Release},
 };
 
 const RECYCLE_MIN: usize = 32 * 1024;
@@ -28,6 +28,29 @@ const EMPTY: Class = Class {
 };
 static CLASSES: [Class; MAX_CLASSES] = [EMPTY; MAX_CLASSES];
 
+// Class keys only transition from zero to their final size. Once all slots
+// have been reserved, an immutable index can answer both hits and misses
+// without walking the full open-addressed table. Freelist ownership stays
+// with the original slot; the index never stores allocation pointers.
+static REGISTERED_CLASSES: AtomicUsize = AtomicUsize::new(0);
+static FULL_CLASS_INDEX: OnceLock<[(usize, usize); MAX_CLASSES]> = OnceLock::new();
+
+#[cold]
+#[inline(never)]
+fn class_registered() {
+    // This runs exactly once for each successful zero-to-size CAS. The RMW
+    // chain orders all reservations before the final snapshot, and every
+    // key is loaded with Acquire as on the original lookup path.
+    if REGISTERED_CLASSES.fetch_add(1, AcqRel) + 1 == MAX_CLASSES {
+        let mut index = core::array::from_fn(|i| (CLASSES[i].size.load(Acquire), i));
+        index.sort_unstable_by_key(|&(size, _)| size);
+        // Sorting a fixed array allocates nothing. Keeping its stack frame
+        // in this cold function also keeps it out of pop/dealloc.
+        let _ = FULL_CLASS_INDEX.set(index);
+    }
+}
+
+
 #[inline]
 fn class_slot(size: usize) -> usize {
     (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
@@ -35,6 +58,10 @@ fn class_slot(size: usize) -> usize {
 
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
+    if let Some(index) = FULL_CLASS_INDEX.get() {
+        return index.binary_search_by_key(&size, |&(key, _)| key)
+            .ok().map(|i| index[i].1);
+    }
     let start = class_slot(size);
     for probe in 0..MAX_CLASSES {
         let i = (start + probe) % MAX_CLASSES;
@@ -51,6 +78,7 @@ fn find_class(size: usize, insert: bool) -> Option<usize> {
                 .compare_exchange(0, size, Release, Acquire)
                 .is_ok()
             {
+                class_registered();
                 return Some(i);
             }
             if CLASSES[i].size.load(Acquire) == size {
@@ -205,6 +233,74 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn full_class_index_preserves_concurrent_registration_and_freelists() {
+        use super::*;
+        use std::sync::Barrier;
+
+        // Check original probing while the table is still being populated.
+        for j in 0..32 {
+            let size = RECYCLE_MIN + 128 * j + 11;
+            if let Some(slot) = find_class(size, true) {
+                assert_eq!(CLASSES[slot].size.load(Acquire), size);
+                assert_eq!(find_class(size, false), Some(slot));
+            }
+        }
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for lane in 0..8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    // Duplicate keys race with distinct colliding keys.
+                    for j in 0..2048 {
+                        let size = RECYCLE_MIN + 128 * ((j * 37 + lane * 19) % 2048) + 11;
+                        if let Some(slot) = find_class(size, true) {
+                            assert_eq!(CLASSES[slot].size.load(Acquire), size);
+                            assert_eq!(find_class(size, false), Some(slot));
+                            assert_eq!(find_class(size, true), Some(slot));
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(REGISTERED_CLASSES.load(Acquire), MAX_CLASSES);
+        let index = FULL_CLASS_INDEX.get().expect("full table publishes its index");
+        assert!(index.windows(2).all(|w| w[0].0 < w[1].0));
+        // Physical slots are an independent oracle for the sorted lookup.
+        for (slot, class) in CLASSES.iter().enumerate() {
+            let size = class.size.load(Acquire);
+            assert_ne!(size, 0);
+            assert_eq!(find_class(size, false), Some(slot));
+            assert_eq!(find_class(size, true), Some(slot));
+        }
+        let absent = (RECYCLE_MIN..RECYCLE_MIN + MAX_CLASSES + 1)
+            .find(|size| CLASSES.iter().all(|class| class.size.load(Acquire) != *size))
+            .unwrap();
+        assert_eq!(find_class(absent, false), None);
+        assert_eq!(find_class(absent, true), None);
+
+        let cached = index.iter().find(|&&(size, _)|
+            (RECYCLE_MIN..RECYCLE_MIN + 128 * 2048 + 12).contains(&size)).unwrap().0;
+        // Exercise both an indexed freelist and the full-table System
+        // fallback, including alignment and zeroing of reused contents.
+        for size in [cached, absent] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            unsafe {
+                let first = RecycleAlloc.alloc(layout);
+                assert!(!first.is_null());
+                assert_eq!(first as usize % 64, 0);
+                core::ptr::write_bytes(first, 0xa5, size);
+                RecycleAlloc.dealloc(first, layout);
+                let zeroed = RecycleAlloc.alloc_zeroed(layout);
+                assert!(!zeroed.is_null());
+                assert_eq!(zeroed as usize % 64, 0);
+                assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&x| x == 0));
+                RecycleAlloc.dealloc(zeroed, layout);
+            }
+        }
+    }
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
     /// freelist, and grown through realloc — returns a 64-aligned pointer
