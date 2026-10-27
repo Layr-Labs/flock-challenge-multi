@@ -326,14 +326,6 @@ fn finalize_commit(
     let regroup_subtree_parents =
         subtree_parent_regroup_enabled(n_leaves, num_ntts, leaf_size, kind);
     let local_levels = AtomicUsize::new(usize::MAX);
-    let sub_blocks_done: Vec<std::sync::atomic::AtomicU32> =
-        if regroup_subtree_parents && n_leaves % RANKED_PARENT_SUBGROUP_LEAVES == 0 {
-            (0..n_leaves / RANKED_PARENT_SUBGROUP_LEAVES)
-                .map(|_| std::sync::atomic::AtomicU32::new(0))
-                .collect()
-        } else {
-            Vec::new()
-        };
 
     let t_ntt = std::time::Instant::now();
     ntt.rs_encode_interleaved_on_range_done(
@@ -385,26 +377,8 @@ fn finalize_commit(
             // only when the subgroup's final FIFO block arrives. At that
             // point all 2048 leaf CVs are ready, so one depth-11 fold fills
             // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
-            let Some(parent_range) = (if regroup_subtree_parents
-                && range.len() == RANKED_PARENT_BLOCK_LEAVES
-                && range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
-                && !sub_blocks_done.is_empty()
-            {
-                // Order-free regroup: blocks of one 2048-leaf subgroup may be
-                // hashed by different workers in any order. The worker that
-                // retires the subgroup's last block folds it; the AcqRel RMW
-                // chain orders every other block's leaf writes before it.
-                let sg = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
-                let per = (RANKED_PARENT_SUBGROUP_LEAVES / RANKED_PARENT_BLOCK_LEAVES) as u32;
-                if sub_blocks_done[sg].fetch_add(1, Ordering::AcqRel) + 1 == per {
-                    let lo = sg * RANKED_PARENT_SUBGROUP_LEAVES;
-                    Some(lo..lo + RANKED_PARENT_SUBGROUP_LEAVES)
-                } else {
-                    None
-                }
-            } else {
-                local_parent_fold_range(&range, regroup_subtree_parents)
-            }) else {
+            let Some(parent_range) = local_parent_fold_range(&range, regroup_subtree_parents)
+            else {
                 return;
             };
             let parent_range = if merkle_cut_depth == 1 {

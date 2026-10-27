@@ -645,7 +645,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let claims_arr = [ab, c];
     let pcs_open = flock_core::in_pool(|| {
         let _hot = flock_core::hot_pool::HotPool::start();
-        let opened = open_claims_with_precomputed_ligerito(
+        open_claims_with_precomputed_ligerito(
             z_packed,
             &prover_data,
             &commitment,
@@ -654,10 +654,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
             &padding,
             &lig_config,
             challenger,
-        );
-        flock_core::gaptime::abs("open done");
-        crate::seed_pipe::tail_spin_start();
-        opened
+        )
     });
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
@@ -666,7 +663,6 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         done.wait();
     }
     flock_core::gaptime::mark("open: returned");
-    flock_core::gaptime::abs("open: returned");
 
     let proof = R1csProofLigerito {
         zerocheck: zc_proof,
@@ -675,13 +671,11 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     };
     let claim = R1csClaim { ab, c };
     flock_core::gaptime::mark("proof assembled");
-    flock_core::gaptime::abs("proof assembled");
     drop(s_hat_v_ab);
     drop(s_hat_v_c);
     flock_core::gaptime::mark("s_hat_v dropped");
     drop(prover_data);
     flock_core::gaptime::mark("prover_data dropped");
-    flock_core::gaptime::abs("prover_data dropped");
     (proof, commitment, claim)
 }
 
@@ -913,7 +907,6 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
                 None => pcs::commit(&z_packed, pcs_params),
             };
-            crate::seed_pipe::preseed_spin_end();
             flock_core::gaptime::mark("commit: work done");
             r
         });
@@ -930,7 +923,6 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                 &padding,
                 prefaulted_codeword,
             );
-            crate::seed_pipe::preseed_spin_end();
             flock_core::gaptime::mark("commit: work done");
             r
         });
@@ -962,15 +954,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     } else {
         None
     };
-    // The handoff slot is thread-local and zerocheck/lincheck run on other
-    // workers, so on the incumbent (non-worker caller) path the kick and wait
-    // never see this prepare and lincheck folds inline. A pool-owner caller
-    // (the ranked hot seed-pipe body) would make the kick live and spawn the
-    // overlap thread mid-zerocheck -- measured slower -- so keep the incumbent
-    // schedule there by not preparing at all.
-    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor)
-        && !flock_core::is_pool_owner()
-    {
+    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
             r1cs.m,
@@ -1257,15 +1241,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
     } else {
         None
     };
-    // The handoff slot is thread-local and zerocheck/lincheck run on other
-    // workers, so on the incumbent (non-worker caller) path the kick and wait
-    // never see this prepare and lincheck folds inline. A pool-owner caller
-    // (the ranked hot seed-pipe body) would make the kick live and spawn the
-    // overlap thread mid-zerocheck -- measured slower -- so keep the incumbent
-    // schedule there by not preparing at all.
-    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor)
-        && !flock_core::is_pool_owner()
-    {
+    let _last_rho = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         Some(lincheck::prepare_last_rho_z_fold_with_roots(
             &z_packed,
             r1cs.m,

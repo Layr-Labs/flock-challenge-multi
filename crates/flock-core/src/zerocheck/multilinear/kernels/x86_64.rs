@@ -135,8 +135,14 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             // folded ZMMs, then sink the output stores afterwards.
             while x_lo + 4 <= eq_lo.len() {
                 let output = 2 * x_lo;
-                let a_lo =
-                    fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let a_lo = fold_x4(
+                    a_in.as_ptr().add(2 * output),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
                 let a_hi = fold_x4(
                     a_in.as_ptr().add(2 * (output + 4)),
                     r,
@@ -145,8 +151,14 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
                     odd_idx,
                     split,
                 );
-                let b_lo =
-                    fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let b_lo = fold_x4(
+                    b_in.as_ptr().add(2 * output),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
                 let b_hi = fold_x4(
                     b_in.as_ptr().add(2 * (output + 4)),
                     r,
@@ -178,8 +190,14 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             // register-resident folded ZMMs for the message.
             while x_lo + 4 <= eq_lo.len() {
                 let output = 2 * x_lo;
-                let a_lo =
-                    fold_x4(a_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let a_lo = fold_x4(
+                    a_in.as_ptr().add(2 * output),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
                 let a_hi = fold_x4(
                     a_in.as_ptr().add(2 * (output + 4)),
                     r,
@@ -188,8 +206,14 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
                     odd_idx,
                     split,
                 );
-                let b_lo =
-                    fold_x4(b_in.as_ptr().add(2 * output), r, r64, even_idx, odd_idx, split);
+                let b_lo = fold_x4(
+                    b_in.as_ptr().add(2 * output),
+                    r,
+                    r64,
+                    even_idx,
+                    odd_idx,
+                    split,
+                );
                 let b_hi = fold_x4(
                     b_in.as_ptr().add(2 * (output + 4)),
                     r,
@@ -241,34 +265,26 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
             if luna_foldmsg_reorder_enabled() {
                 // Extract the two tail message pairs directly from the folded
                 // ZMMs before writing the outputs.
-                let a0_0 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<0>(a_folded),
-                );
-                let a1_0 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<1>(a_folded),
-                );
-                let b0_0 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<0>(b_folded),
-                );
-                let b1_0 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<1>(b_folded),
-                );
+                let a0_0 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<0>(a_folded));
+                let a1_0 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<1>(a_folded));
+                let b0_0 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<0>(b_folded));
+                let b1_0 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<1>(b_folded));
                 let eq_0 = eq_lo[x_lo];
                 p1_tail ^= eq_0.mul_unreduced(a1_0 * b1_0);
                 pinf_tail ^= eq_0.mul_unreduced((a0_0 + a1_0) * (b0_0 + b1_0));
 
-                let a0_1 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<2>(a_folded),
-                );
-                let a1_1 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<3>(a_folded),
-                );
-                let b0_1 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<2>(b_folded),
-                );
-                let b1_1 = core::mem::transmute::<__m128i, F128>(
-                    _mm512_extracti32x4_epi32::<3>(b_folded),
-                );
+                let a0_1 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<2>(a_folded));
+                let a1_1 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<3>(a_folded));
+                let b0_1 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<2>(b_folded));
+                let b1_1 =
+                    core::mem::transmute::<__m128i, F128>(_mm512_extracti32x4_epi32::<3>(b_folded));
                 let eq_1 = eq_lo[x_lo + 1];
                 p1_tail ^= eq_1.mul_unreduced(a1_1 * b1_1);
                 pinf_tail ^= eq_1.mul_unreduced((a0_1 + a1_1) * (b0_1 + b1_1));
@@ -474,12 +490,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
-                gfni_fold64_rows_tr_bcast_skip_group::<true>(
-                    a_pkt.add(g0 * 8),
-                    a_mats_ptr,
-                    fa,
-                    0,
-                );
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
@@ -514,12 +525,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             {
                 let g0 = row_base + 2 * (x_lo + 96);
                 let bm = &(*b_mats_slice.add(batch_base + 3)).0;
-                gfni_fold64_rows_tr_bcast_skip_group::<true>(
-                    a_pkt.add(g0 * 8),
-                    a_mats_ptr,
-                    fa,
-                    3,
-                );
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
@@ -591,13 +597,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         && let Some(bk) = bake
     {
         return unsafe {
-            round2_lookahead_chunk_baked_elide_x86(
-                a_pkt,
-                b_pkt,
-                row_base,
-                eq_lo.len(),
-                bk,
-            )
+            round2_lookahead_chunk_baked_elide_x86(a_pkt, b_pkt, row_base, eq_lo.len(), bk)
         };
     }
     unsafe {
@@ -693,8 +693,7 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                 B_SPECIAL_ONES,
             ),
             (false, true) => (
-                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block)
-                    & (B_ONES_BLOCK_PAIRS - 1),
+                (B_SPARSE_PAIR + B_ONES_BLOCK_PAIRS - pair_in_b_block) & (B_ONES_BLOCK_PAIRS - 1),
                 B_SPECIAL_SPARSE,
             ),
             (false, false) => (usize::MAX, B_SPECIAL_NONE),
@@ -782,182 +781,172 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
         // of that window. Identical code to the incumbent 8-pair body.
         macro_rules! spread_pf {
             ($x:expr) => {{
-            // Spread delivery: one quarter of the same sixteen-hint block
-            // per loop body, so a tile's lines are asked for across all four
-            // bodies it feeds instead of in one burst at the refill. Same
-            // lines, same look-ahead, same instruction count per tile.
-            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-            if use_batch && pf_on && pf_spread {
-                let tile_base = row_base + 2 * ($x & !31);
-                let next = (tile_base + 64 * pf_tiles) * 8;
-                let l0 = ($x & 31) >> 2;
-                for l in l0..l0 + 2 {
-                    _mm_prefetch(
-                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
-                    _mm_prefetch(
-                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
-                    );
+                // Spread delivery: one quarter of the same sixteen-hint block
+                // per loop body, so a tile's lines are asked for across all four
+                // bodies it feeds instead of in one burst at the refill. Same
+                // lines, same look-ahead, same instruction count per tile.
+                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                if use_batch && pf_on && pf_spread {
+                    let tile_base = row_base + 2 * ($x & !31);
+                    let next = (tile_base + 64 * pf_tiles) * 8;
+                    let l0 = ($x & 31) >> 2;
+                    for l in l0..l0 + 2 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
                 }
-            }
             }};
         }
         macro_rules! load_window {
             ($x:expr, $special_now:expr) => {{
-            if use_batch && regfold_on {
-                let r0 = 2 * ($x % 32);
-                if tr_emit {
-                    // Residue-major cache: a_k for this window is the
-                    // contiguous ZMM at F128 index 16k + r0/4 — the exact
-                    // registers transpose4_lanes used to produce.
-                    let g = r0 / 4;
-                    let ld = |base: *const F128, k: usize| {
-                        _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
-                    };
-                    let (a0, a1, a2, a3) = (
-                        ld(fa.as_ptr(), 0),
-                        ld(fa.as_ptr(), 1),
-                        ld(fa.as_ptr(), 2),
-                        ld(fa.as_ptr(), 3),
-                    );
-                    let (b0, b1, b2, b3) = if $special_now && b_direct_pending {
-                        // This group's four cache lines were not written.
-                        // Reconstruct the exact current-map images instead;
-                        // an all-one packed word need not map to field ONE.
-                        let value = _mm512_broadcast_i32x4(_mm_set_epi64x(
-                            b_direct_folded.hi as i64,
-                            b_direct_folded.lo as i64,
-                        ));
-                        if b_special_kind == B_SPECIAL_ONES {
-                            (value, value, value, value)
-                        } else {
-                            let zero = _mm512_setzero_si512();
-                            (_mm512_maskz_mov_epi64(0x03, value), zero, zero, zero)
-                        }
-                    } else {
-                        (
-                            ld(fb.as_ptr(), 0),
-                            ld(fb.as_ptr(), 1),
-                            ld(fb.as_ptr(), 2),
-                            ld(fb.as_ptr(), 3),
-                        )
-                    };
-                    (a0, a1, a2, a3, b0, b1, b2, b3)
-                } else {
-                    let fap = fa.as_ptr().add(r0).cast::<__m512i>();
-                    let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
-                    let za = [
-                        _mm512_loadu_si512(fap),
-                        _mm512_loadu_si512(fap.add(1)),
-                        _mm512_loadu_si512(fap.add(2)),
-                        _mm512_loadu_si512(fap.add(3)),
-                    ];
-                    let zb = [
-                        _mm512_loadu_si512(fbp),
-                        _mm512_loadu_si512(fbp.add(1)),
-                        _mm512_loadu_si512(fbp.add(2)),
-                        _mm512_loadu_si512(fbp.add(3)),
-                    ];
-                    if WRITE {
-                        let ac = a_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
-                        let bc = b_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
-                        for i in 0..4 {
-                            _mm512_storeu_si512(ac.add(i), za[i]);
-                            _mm512_storeu_si512(bc.add(i), zb[i]);
-                        }
-                    }
-                    let [a0, a1, a2, a3] = transpose4_lanes(za[0], za[1], za[2], za[3]);
-                    let [b0, b1, b2, b3] = transpose4_lanes(zb[0], zb[1], zb[2], zb[3]);
-                    (a0, a1, a2, a3, b0, b1, b2, b3)
-                }
-            } else {
-                // a[k][lane]: row k (0..4) of group `lane` (0..4).
-                let mut a = [[F128::ZERO; 4]; 4];
-                let mut b = [[F128::ZERO; 4]; 4];
-                for lane in 0..4 {
-                    for half in 0..2 {
-                        let pair = $x + 2 * lane + half;
-                        let x0l = 2 * pair;
-                        let x1l = x0l + 1;
-                        if ((pair_idx_base + pair) & pair_in_block_mask) >= useful_pairs_inclusive {
-                            if WRITE {
-                                a_chunk[x0l] = F128::ZERO;
-                                a_chunk[x1l] = F128::ZERO;
-                                b_chunk[x0l] = F128::ZERO;
-                                b_chunk[x1l] = F128::ZERO;
+                if use_batch && regfold_on {
+                    let r0 = 2 * ($x % 32);
+                    if tr_emit {
+                        // Residue-major cache: a_k for this window is the
+                        // contiguous ZMM at F128 index 16k + r0/4 — the exact
+                        // registers transpose4_lanes used to produce.
+                        let g = r0 / 4;
+                        let ld = |base: *const F128, k: usize| {
+                            _mm512_loadu_si512(base.add(16 * k + g).cast::<__m512i>())
+                        };
+                        let (a0, a1, a2, a3) = (
+                            ld(fa.as_ptr(), 0),
+                            ld(fa.as_ptr(), 1),
+                            ld(fa.as_ptr(), 2),
+                            ld(fa.as_ptr(), 3),
+                        );
+                        let (b0, b1, b2, b3) = if $special_now && b_direct_pending {
+                            // This group's four cache lines were not written.
+                            // Reconstruct the exact current-map images instead;
+                            // an all-one packed word need not map to field ONE.
+                            let value = _mm512_broadcast_i32x4(_mm_set_epi64x(
+                                b_direct_folded.hi as i64,
+                                b_direct_folded.lo as i64,
+                            ));
+                            if b_special_kind == B_SPECIAL_ONES {
+                                (value, value, value, value)
+                            } else {
+                                let zero = _mm512_setzero_si512();
+                                (_mm512_maskz_mov_epi64(0x03, value), zero, zero, zero)
                             }
-                            continue;
-                        }
-                        let x0g = row_base + x0l;
-                        let x1g = x0g + 1;
-                        let folded = if use_batch {
-                            let r = 2 * (pair % 32);
-                            [fa[r], fa[r + 1], fb[r], fb[r + 1]]
                         } else {
-                            fold_round2_pair_x86_unchecked_8(
-                                table_data,
-                                a_pkt.add(x0g * 8),
-                                a_pkt.add(x1g * 8),
-                                b_pkt.add(x0g * 8),
-                                b_pkt.add(x1g * 8),
+                            (
+                                ld(fb.as_ptr(), 0),
+                                ld(fb.as_ptr(), 1),
+                                ld(fb.as_ptr(), 2),
+                                ld(fb.as_ptr(), 3),
                             )
                         };
-                        a[2 * half][lane] = folded[0];
-                        a[2 * half + 1][lane] = folded[1];
-                        b[2 * half][lane] = folded[2];
-                        b[2 * half + 1][lane] = folded[3];
+                        (a0, a1, a2, a3, b0, b1, b2, b3)
+                    } else {
+                        let fap = fa.as_ptr().add(r0).cast::<__m512i>();
+                        let fbp = fb.as_ptr().add(r0).cast::<__m512i>();
+                        let za = [
+                            _mm512_loadu_si512(fap),
+                            _mm512_loadu_si512(fap.add(1)),
+                            _mm512_loadu_si512(fap.add(2)),
+                            _mm512_loadu_si512(fap.add(3)),
+                        ];
+                        let zb = [
+                            _mm512_loadu_si512(fbp),
+                            _mm512_loadu_si512(fbp.add(1)),
+                            _mm512_loadu_si512(fbp.add(2)),
+                            _mm512_loadu_si512(fbp.add(3)),
+                        ];
                         if WRITE {
-                            a_chunk[x0l] = folded[0];
-                            a_chunk[x1l] = folded[1];
-                            b_chunk[x0l] = folded[2];
-                            b_chunk[x1l] = folded[3];
+                            let ac = a_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
+                            let bc = b_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
+                            for i in 0..4 {
+                                _mm512_storeu_si512(ac.add(i), za[i]);
+                                _mm512_storeu_si512(bc.add(i), zb[i]);
+                            }
+                        }
+                        let [a0, a1, a2, a3] = transpose4_lanes(za[0], za[1], za[2], za[3]);
+                        let [b0, b1, b2, b3] = transpose4_lanes(zb[0], zb[1], zb[2], zb[3]);
+                        (a0, a1, a2, a3, b0, b1, b2, b3)
+                    }
+                } else {
+                    // a[k][lane]: row k (0..4) of group `lane` (0..4).
+                    let mut a = [[F128::ZERO; 4]; 4];
+                    let mut b = [[F128::ZERO; 4]; 4];
+                    for lane in 0..4 {
+                        for half in 0..2 {
+                            let pair = $x + 2 * lane + half;
+                            let x0l = 2 * pair;
+                            let x1l = x0l + 1;
+                            if ((pair_idx_base + pair) & pair_in_block_mask)
+                                >= useful_pairs_inclusive
+                            {
+                                if WRITE {
+                                    a_chunk[x0l] = F128::ZERO;
+                                    a_chunk[x1l] = F128::ZERO;
+                                    b_chunk[x0l] = F128::ZERO;
+                                    b_chunk[x1l] = F128::ZERO;
+                                }
+                                continue;
+                            }
+                            let x0g = row_base + x0l;
+                            let x1g = x0g + 1;
+                            let folded = if use_batch {
+                                let r = 2 * (pair % 32);
+                                [fa[r], fa[r + 1], fb[r], fb[r + 1]]
+                            } else {
+                                fold_round2_pair_x86_unchecked_8(
+                                    table_data,
+                                    a_pkt.add(x0g * 8),
+                                    a_pkt.add(x1g * 8),
+                                    b_pkt.add(x0g * 8),
+                                    b_pkt.add(x1g * 8),
+                                )
+                            };
+                            a[2 * half][lane] = folded[0];
+                            a[2 * half + 1][lane] = folded[1];
+                            b[2 * half][lane] = folded[2];
+                            b[2 * half + 1][lane] = folded[3];
+                            if WRITE {
+                                a_chunk[x0l] = folded[0];
+                                a_chunk[x1l] = folded[1];
+                                b_chunk[x0l] = folded[2];
+                                b_chunk[x1l] = folded[3];
+                            }
                         }
                     }
+                    (
+                        f128x4_loadu(a[0].as_ptr()),
+                        f128x4_loadu(a[1].as_ptr()),
+                        f128x4_loadu(a[2].as_ptr()),
+                        f128x4_loadu(a[3].as_ptr()),
+                        f128x4_loadu(b[0].as_ptr()),
+                        f128x4_loadu(b[1].as_ptr()),
+                        f128x4_loadu(b[2].as_ptr()),
+                        f128x4_loadu(b[3].as_ptr()),
+                    )
                 }
-                (
-                    f128x4_loadu(a[0].as_ptr()),
-                    f128x4_loadu(a[1].as_ptr()),
-                    f128x4_loadu(a[2].as_ptr()),
-                    f128x4_loadu(a[3].as_ptr()),
-                    f128x4_loadu(b[0].as_ptr()),
-                    f128x4_loadu(b[1].as_ptr()),
-                    f128x4_loadu(b[2].as_ptr()),
-                    f128x4_loadu(b[3].as_ptr()),
-                )
-            }
             }};
         }
         macro_rules! eq_weights {
             ($x:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
-            if BAKE {
-                // Nothing to do: `a_k` left the prefold as `S(i)·row`, the B
-                // registers carry `Etop(B)`, and `LV(lane)` is applied once
-                // per chunk to the lane-reduced accumulators. The four
-                // `ghash_mul_x4_split` prescales are gone from the hot loop.
-                ($a0, $a1, $a2, $a3)
-            } else if let Some(wt) = wtab {
-                // (w, w·x⁶⁴) precomputed once per pass: both are pure
-                // functions of `x` (the odd eq_lo lanes and their x⁶⁴
-                // companions), yet the incumbent recomputed the companion —
-                // a permute plus a CLMUL of pure latency — at the head of
-                // the chain feeding all eight accumulates, every iteration.
-                let wp = wt.as_ptr().add($x) as *const __m512i;
-                let w = _mm512_loadu_si512(wp);
-                let w64 = _mm512_loadu_si512(wp.add(1));
-                (
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split($a0, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split($a1, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split($a2, w, w64),
-                    crate::field::gf2_128::x86_64::ghash_mul_x4_split($a3, w, w64),
-                )
-            } else {
-                let e_lo = f128x4_loadu(eq_lo.as_ptr().add($x));
-                let e_hi = f128x4_loadu(eq_lo.as_ptr().add($x + 4));
-                let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
-                if wsplit {
-                    let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                if BAKE {
+                    // Nothing to do: `a_k` left the prefold as `S(i)·row`, the B
+                    // registers carry `Etop(B)`, and `LV(lane)` is applied once
+                    // per chunk to the lane-reduced accumulators. The four
+                    // `ghash_mul_x4_split` prescales are gone from the hot loop.
+                    ($a0, $a1, $a2, $a3)
+                } else if let Some(wt) = wtab {
+                    // (w, w·x⁶⁴) precomputed once per pass: both are pure
+                    // functions of `x` (the odd eq_lo lanes and their x⁶⁴
+                    // companions), yet the incumbent recomputed the companion —
+                    // a permute plus a CLMUL of pure latency — at the head of
+                    // the chain feeding all eight accumulates, every iteration.
+                    let wp = wt.as_ptr().add($x) as *const __m512i;
+                    let w = _mm512_loadu_si512(wp);
+                    let w64 = _mm512_loadu_si512(wp.add(1));
                     (
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split($a0, w, w64),
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split($a1, w, w64),
@@ -965,14 +954,26 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                         crate::field::gf2_128::x86_64::ghash_mul_x4_split($a3, w, w64),
                     )
                 } else {
-                    (
-                        ghash_mul_x4(w, $a0),
-                        ghash_mul_x4(w, $a1),
-                        ghash_mul_x4(w, $a2),
-                        ghash_mul_x4(w, $a3),
-                    )
+                    let e_lo = f128x4_loadu(eq_lo.as_ptr().add($x));
+                    let e_hi = f128x4_loadu(eq_lo.as_ptr().add($x + 4));
+                    let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
+                    if wsplit {
+                        let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                        (
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split($a0, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split($a1, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split($a2, w, w64),
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split($a3, w, w64),
+                        )
+                    } else {
+                        (
+                            ghash_mul_x4(w, $a0),
+                            ghash_mul_x4(w, $a1),
+                            ghash_mul_x4(w, $a2),
+                            ghash_mul_x4(w, $a3),
+                        )
+                    }
                 }
-            }
             }};
         }
         // 16-pair body (default on; `FLOCK_NO_R2_UNROLL16=1` restores the
@@ -1080,13 +1081,14 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                                 && b_special_head == x_lo
                                 && b_special_kind == B_SPECIAL_ONES
                             {
-                                b_direct_pending = gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
-                                    b_pkt.add(g0 * 8),
-                                    bm,
-                                    fb.as_mut_ptr(),
-                                    0,
-                                    folded,
-                                );
+                                b_direct_pending =
+                                    gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
+                                        b_pkt.add(g0 * 8),
+                                        bm,
+                                        fb.as_mut_ptr(),
+                                        0,
+                                        folded,
+                                    );
                                 b_direct_folded = folded;
                             } else {
                                 gfni_fold64_rows_tr_bcast_b_canonical(
@@ -1108,13 +1110,14 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                                 && b_special_head == x_lo + 24
                                 && b_special_kind == B_SPECIAL_SPARSE
                             {
-                                b_direct_pending = gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
-                                    b_pkt.add(g0 * 8),
-                                    bm,
-                                    fb.as_mut_ptr(),
-                                    3,
-                                    folded,
-                                );
+                                b_direct_pending =
+                                    gfni_fold64_rows_tr_bcast_b_canonical_impl::<false>(
+                                        b_pkt.add(g0 * 8),
+                                        bm,
+                                        fb.as_mut_ptr(),
+                                        3,
+                                        folded,
+                                    );
                                 b_direct_folded = folded;
                             } else {
                                 gfni_fold64_rows_tr_bcast_b_canonical(
@@ -1254,21 +1257,18 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
                                 (
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a1, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a2, w, w64,
-                                    ),
-                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                        a3, w, w64,
-                                    ),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64),
+                                    crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64),
                                 )
                             } else {
-                                (ghash_mul_x4(w, a1), ghash_mul_x4(w, a2), ghash_mul_x4(w, a3))
+                                (
+                                    ghash_mul_x4(w, a1),
+                                    ghash_mul_x4(w, a2),
+                                    ghash_mul_x4(w, a3),
+                                )
                             }
                         };
                         #[cfg(test)]
@@ -1311,19 +1311,14 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                             let wp = wt.as_ptr().add(x_lo) as *const __m512i;
                             let w = _mm512_loadu_si512(wp);
                             let w64 = _mm512_loadu_si512(wp.add(1));
-                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                b0_lane0, w, w64,
-                            )
+                            crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                         } else {
                             let e_lo = f128x4_loadu(eq_lo.as_ptr().add(x_lo));
                             let e_hi = f128x4_loadu(eq_lo.as_ptr().add(x_lo + 4));
                             let w = _mm512_permutex2var_epi64(e_lo, odd_idx, e_hi);
                             if wsplit {
-                                let w64 =
-                                    crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
-                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(
-                                    b0_lane0, w, w64,
-                                )
+                                let w64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(w);
+                                crate::field::gf2_128::x86_64::ghash_mul_x4_split(b0_lane0, w, w64)
                             } else {
                                 ghash_mul_x4(w, b0_lane0)
                             }
@@ -1337,11 +1332,7 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                 }
             }
             let (a0w, a1w, a2w, a3w) = eq_weights!(x_lo, a0, a1, a2, a3);
-            if unroll16
-                && x_lo + 16 <= lo_size
-                && (x_lo & 31) != 24
-                && b_special_head != x_lo + 8
-            {
+            if unroll16 && x_lo + 16 <= lo_size && (x_lo & 31) != 24 && b_special_head != x_lo + 8 {
                 let x_hi = x_lo + 8;
                 spread_pf!(x_hi);
                 let (c0, c1, c2, c3, d0, d1, d2, d3) = load_window!(x_hi, false);
@@ -1640,11 +1631,7 @@ pub(crate) unsafe fn fold2_and_message_x86_avx512(
     target_feature = "vpclmulqdq"
 ))]
 #[inline]
-pub(crate) fn fold2_plain_defer_wtab_route_ok(
-    split: bool,
-    lo_size: usize,
-    has_wtab: bool,
-) -> bool {
+pub(crate) fn fold2_plain_defer_wtab_route_ok(split: bool, lo_size: usize, has_wtab: bool) -> bool {
     !split
         && has_wtab
         && lo_size >= 16
@@ -1716,14 +1703,64 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
                     _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
                     _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
                 }
-                let oa0 = fold16_to_4_deferred_gen::<IN_LM, false>(a_src, ra, rb, rarb, ra, rb, rarb);
-                let oa1 = fold16_to_4_deferred_gen::<IN_LM, false>(a_src.add(16), ra, rb, rarb, ra, rb, rarb);
-                let oa2 = fold16_to_4_deferred_gen::<IN_LM, false>(a_src.add(32), ra, rb, rarb, ra, rb, rarb);
-                let oa3 = fold16_to_4_deferred_gen::<IN_LM, false>(a_src.add(48), ra, rb, rarb, ra, rb, rarb);
-                let ob0 = fold16_to_4_deferred_gen::<IN_LM, false>(b_src, ra, rb, rarb, ra, rb, rarb);
-                let ob1 = fold16_to_4_deferred_gen::<IN_LM, false>(b_src.add(16), ra, rb, rarb, ra, rb, rarb);
-                let ob2 = fold16_to_4_deferred_gen::<IN_LM, false>(b_src.add(32), ra, rb, rarb, ra, rb, rarb);
-                let ob3 = fold16_to_4_deferred_gen::<IN_LM, false>(b_src.add(48), ra, rb, rarb, ra, rb, rarb);
+                let oa0 =
+                    fold16_to_4_deferred_gen::<IN_LM, false>(a_src, ra, rb, rarb, ra, rb, rarb);
+                let oa1 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    a_src.add(16),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
+                let oa2 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    a_src.add(32),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
+                let oa3 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    a_src.add(48),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
+                let ob0 =
+                    fold16_to_4_deferred_gen::<IN_LM, false>(b_src, ra, rb, rarb, ra, rb, rarb);
+                let ob1 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    b_src.add(16),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
+                let ob2 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    b_src.add(32),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
+                let ob3 = fold16_to_4_deferred_gen::<IN_LM, false>(
+                    b_src.add(48),
+                    ra,
+                    rb,
+                    rarb,
+                    ra,
+                    rb,
+                    rarb,
+                );
                 for l in 4..8 {
                     _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
                     _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
@@ -2074,7 +2111,10 @@ unsafe fn fold2_and_message_lookahead_general_x86_avx512(
         let rho_ab = rho_a * rho_b;
         let rarb = _mm512_broadcast_i32x4(_mm_set_epi64x(rho_ab.hi as i64, rho_ab.lo as i64));
         let defer = zc_fold_defer_enabled();
-        debug_assert!(!in_lm || defer, "lane-major input is read by the deferred fold");
+        debug_assert!(
+            !in_lm || defer,
+            "lane-major input is read by the deferred fold"
+        );
         // Split companions of the three fold constants, once per chunk.
         let (ra64, rb64, rarb64) = if defer && split {
             (
@@ -2827,9 +2867,8 @@ fn zc_b_sparse_enabled() -> bool {
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline]
 fn zc_b_canonical_prefold_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none()
-    });
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_PREFOLD").is_none());
     *ENABLED
 }
 
@@ -2839,9 +2878,8 @@ fn zc_b_canonical_prefold_enabled() -> bool {
 #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
 #[inline]
 fn zc_b_canonical_direct_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_DIRECT").is_none()
-    });
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B_CANONICAL_DIRECT").is_none());
     *ENABLED
 }
 
@@ -3169,6 +3207,22 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
     debug_assert_eq!(b_out.len(), 2 * lo_size);
 
     unsafe {
+        // Full eight-block groups have exactly 512 output fields. The new
+        // consumer checks actual bytes and otherwise evaluates the full map.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        if out_base.is_multiple_of(512) && lo_size >= 256 && lo_size.is_multiple_of(256) {
+            return c4_raw_strided::fold::<NT_OUT, OUT_LM>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, wt,
+            );
+        }
         let mut acc = [WideGhashX4::zero(); 8];
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
@@ -4334,9 +4388,8 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         // 8-plane batches so the live set never exceeds 16 + 8 = 24 ZMMs.
         let p0 = input_planes(rows0);
         let p1 = input_planes(rows1);
-        let map_pair = |k: usize| {
-            _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k))
-        };
+        let map_pair =
+            |k: usize| _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k));
         let lo_half = qword_transpose([
             map_pair(0),
             map_pair(1),
@@ -4375,7 +4428,6 @@ pub(crate) unsafe fn gfni_fold64_two_maps<const ADD: bool>(
         }
     }
 }
-
 
 /// Compose a two-map GFNI fold directly into its 8-byte-input matrix.
 ///
@@ -4466,10 +4518,7 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         };
         let map_plane = |p: &[__m512i; 8], mats: &[u64; 128], k: usize| {
             let g = |j: usize| {
-                _mm512_gf2p8affine_epi64_epi8::<0>(
-                    p[j],
-                    _mm512_set1_epi64(mats[j * 16 + k] as i64),
-                )
+                _mm512_gf2p8affine_epi64_epi8::<0>(p[j], _mm512_set1_epi64(mats[j * 16 + k] as i64))
             };
             let v1 = _mm512_ternarylogic_epi64::<0x96>(g(0), g(1), g(2));
             let v2 = _mm512_ternarylogic_epi64::<0x96>(g(3), g(4), g(5));
@@ -4499,8 +4548,9 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
         let dst = out.as_mut_ptr().cast::<__m512i>();
 
-        let acc_lo: [__m512i; 8] =
-            core::array::from_fn(|k| _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k)));
+        let acc_lo: [__m512i; 8] = core::array::from_fn(|k| {
+            _mm512_xor_si512(map_plane(&p0, mats0, k), map_plane(&p1, mats1, k))
+        });
         let lo_half = qword_transpose(acc_lo);
         for group in 0..8 {
             let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -4510,8 +4560,9 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
             _mm512_storeu_si512(dst.add(2 * group), _mm512_shuffle_epi8(t_lo, bswap));
         }
 
-        let acc_hi: [__m512i; 8] =
-            core::array::from_fn(|k| _mm512_xor_si512(map_plane(&p0, mats0, k + 8), map_plane(&p1, mats1, k + 8)));
+        let acc_hi: [__m512i; 8] = core::array::from_fn(|k| {
+            _mm512_xor_si512(map_plane(&p0, mats0, k + 8), map_plane(&p1, mats1, k + 8))
+        });
         let hi_half = qword_transpose(acc_hi);
         for group in 0..8 {
             let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -4522,7 +4573,6 @@ pub(crate) unsafe fn gfni_fold64_two_maps_to_mats(
         }
     }
 }
-
 
 /// Fold four packed-u64 maps through two staged claim accumulations. Each
 /// stage keeps only its two eight-plane inputs live and immediately stores
@@ -4882,7 +4932,13 @@ struct FoldCache([F128; 64]);
     target_feature = "vpclmulqdq"
 ))]
 #[repr(C, align(64))]
-pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128], pub(crate) [[u64; 8]; 64]);
+pub(crate) struct CFoldMats(
+    pub(crate) [[u64; 8]; 128],
+    pub(crate) [[u64; 8]; 64],
+    pub(crate) [[F128; 2]; 32],
+    // Two copies of each 32-vector broadcast bank allow a cyclic term span.
+    pub(crate) [[u64; 8]; 128],
+);
 
 /// [`build_row_fold_mats`] for the table scaled by `c`.
 ///
@@ -4971,7 +5027,12 @@ pub(crate) fn build_cfold_mats_ext(
             } else {
                 std::array::from_fn(|c| build_row_fold_mats_scaled(data, coeffs[c]))
             };
-            let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
+            let mut out = CFoldMats(
+                [[0u64; 8]; 128],
+                [[0u64; 8]; 64],
+                build_raw_c4_constants(data, coeffs),
+                [[0u64; 8]; 128],
+            );
             if include_plane {
                 for idx in 0..128 {
                     for i in 0..8 {
@@ -4985,6 +5046,12 @@ pub(crate) fn build_cfold_mats_ext(
                     out.1[32 + 8 * a + j].copy_from_slice(&per[a][16 * j + 8..16 * j + 16]);
                 }
             }
+            // Preserve the ordinary plane/broadcast banks and prepare the circular
+            // maps once at their shared owner, including partial-ISA builds.
+            out.3[..32].copy_from_slice(&out.1[..32]);
+            out.3[32..64].copy_from_slice(&out.1[..32]);
+            out.3[64..96].copy_from_slice(&out.1[32..]);
+            out.3[96..].copy_from_slice(&out.1[32..]);
             out
         }
         return unsafe { inner(data, coeffs, include_plane) };
@@ -5022,7 +5089,12 @@ pub(crate) fn build_cfold_mats_ext(
         // SAFETY: `out.1` is 100% overwritten below; `out.0` is overwritten when
         // `include_plane` is true (and never read when `include_plane` is false,
         // which holds whenever `zc_r34_bcast_enabled()` selects the broadcast kernels).
-        let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
+        let mut out = CFoldMats(
+            [[0u64; 8]; 128],
+            [[0u64; 8]; 64],
+            build_raw_c4_constants(data, coeffs),
+            [[0u64; 8]; 128],
+        );
         if include_plane {
             for idx in 0..128 {
                 for i in 0..8 {
@@ -5040,6 +5112,12 @@ pub(crate) fn build_cfold_mats_ext(
                 out.1[32 + 8 * a + j].copy_from_slice(&per[a][16 * j + 8..16 * j + 16]);
             }
         }
+        // Preserve the ordinary plane/broadcast banks and prepare the circular
+        // maps once at their shared owner, including partial-ISA builds.
+        out.3[..32].copy_from_slice(&out.1[..32]);
+        out.3[32..64].copy_from_slice(&out.1[..32]);
+        out.3[64..96].copy_from_slice(&out.1[32..]);
+        out.3[96..].copy_from_slice(&out.1[32..]);
         out
     }
 }
@@ -5597,7 +5675,6 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_register_result();
 }
 
-
 /// Return the unmasked lane-major C4 tile directly in four vector values.
 /// The private ELF leaf preserves ZMM12..31 and every GPR except RAX.
 /// The fallback uses the same unmasked Rust fold and output ordering.
@@ -5782,9 +5859,8 @@ unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_rust(
             let p67 = _mm512_permutex2var_epi64(s2, g1_hi, s3);
             let base = op.add(32 * p);
             // `oct[a].qword[j]` = chunk `j` of the eight residue-`a` rows.
-            let oct = |a: usize, v: __m512i| {
-                _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v)
-            };
+            let oct =
+                |a: usize, v: __m512i| _mm512_storeu_si512(base.add(8 * a) as *mut __m512i, v);
             oct(0, _mm512_permutex2var_epi8(p01, oct_even, p45));
             oct(1, _mm512_permutex2var_epi8(p01, oct_odd, p45));
             oct(2, _mm512_permutex2var_epi8(p23, oct_even, p67));
@@ -5844,7 +5920,10 @@ unsafe fn gfni_fold64_rows_masked_c4_bcast_lm_rust(
                 let r0 = _mm512_xor_si512(accp[0], accq[0]);
                 let r1 = _mm512_xor_si512(accp[1], accq[1]);
                 _mm512_storeu_si512(dst.add(2 * P), _mm512_permutex2var_epi8(r0, out_even, r1));
-                _mm512_storeu_si512(dst.add(2 * P + 1), _mm512_permutex2var_epi8(r0, out_odd, r1));
+                _mm512_storeu_si512(
+                    dst.add(2 * P + 1),
+                    _mm512_permutex2var_epi8(r0, out_odd, r1),
+                );
             }};
         }
         pass!(0);
@@ -6500,13 +6579,20 @@ mod cfold_initialized_checks {
         let mut y = (b.lo as u128) | ((b.hi as u128) << 64);
         let mut z = 0u128;
         for _ in 0..128 {
-            if y & 1 != 0 { z ^= x; }
+            if y & 1 != 0 {
+                z ^= x;
+            }
             let carry = x >> 127;
             x <<= 1;
-            if carry != 0 { x ^= 0x87; }
+            if carry != 0 {
+                x ^= 0x87;
+            }
             y >>= 1;
         }
-        F128 { lo: z as u64, hi: (z >> 64) as u64 }
+        F128 {
+            lo: z as u64,
+            hi: (z >> 64) as u64,
+        }
     }
 
     fn next(seed: &mut u64) -> u64 {
@@ -6521,19 +6607,29 @@ mod cfold_initialized_checks {
         let mut rng = 0x6b5c_92ae_830d_712fu64;
         let mut checks = 0;
         for case in 0..16 {
-            let data: Vec<F128> = (0..2048).map(|_| F128 {
-                lo: next(&mut rng), hi: next(&mut rng),
-            }).collect();
+            let data: Vec<F128> = (0..2048)
+                .map(|_| F128 {
+                    lo: next(&mut rng),
+                    hi: next(&mut rng),
+                })
+                .collect();
             let saved = data.clone();
-            let coeffs: [F128; 4] = std::array::from_fn(|i| {
-                match (case + i) % 8 {
-                    0 => F128::ZERO,
-                    1 => F128::ONE,
-                    2 => F128 { lo: u64::MAX, hi: u64::MAX },
-                    3 => F128 { lo: 0, hi: 1 << 63 },
-                    4 => F128 { lo: 1 << ((case + i) % 64), hi: 0 },
-                    _ => F128 { lo: next(&mut rng), hi: next(&mut rng) },
-                }
+            let coeffs: [F128; 4] = std::array::from_fn(|i| match (case + i) % 8 {
+                0 => F128::ZERO,
+                1 => F128::ONE,
+                2 => F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                3 => F128 { lo: 0, hi: 1 << 63 },
+                4 => F128 {
+                    lo: 1 << ((case + i) % 64),
+                    hi: 0,
+                },
+                _ => F128 {
+                    lo: next(&mut rng),
+                    hi: next(&mut rng),
+                },
             });
             let mut expected = [[0u64; 128]; 4];
             for a in 0..4 {
@@ -6544,7 +6640,8 @@ mod cfold_initialized_checks {
                         for byte in 0..16 {
                             for output_bit in 0..8 {
                                 let value = ((bits >> (8 * byte + output_bit)) & 1) as u64;
-                                expected[a][16 * chunk + byte] |= value << (8 * (7 - output_bit) + input_bit);
+                                expected[a][16 * chunk + byte] |=
+                                    value << (8 * (7 - output_bit) + input_bit);
                             }
                         }
                     }
@@ -6554,19 +6651,40 @@ mod cfold_initialized_checks {
                 let got = build_cfold_mats_ext(std::hint::black_box(&data), coeffs, include_plane);
                 for idx in 0..128 {
                     for lane in 0..8 {
-                        assert_eq!(got.0[idx][lane],
-                            if include_plane { expected[lane / 2][idx] } else { 0 },
-                            "plane case={case} include={include_plane} index={idx} lane={lane}");
+                        assert_eq!(
+                            got.0[idx][lane],
+                            if include_plane {
+                                expected[lane / 2][idx]
+                            } else {
+                                0
+                            },
+                            "plane case={case} include={include_plane} index={idx} lane={lane}"
+                        );
                     }
                 }
                 for half in 0..2 {
                     for a in 0..4 {
                         for chunk in 0..8 {
                             for byte in 0..8 {
-                                assert_eq!(got.1[32 * half + 8 * a + chunk][byte],
+                                assert_eq!(
+                                    got.1[32 * half + 8 * a + chunk][byte],
                                     expected[a][16 * chunk + 8 * half + byte],
-                                    "broadcast case={case} include={include_plane}");
+                                    "broadcast case={case} include={include_plane}"
+                                );
                             }
+                        }
+                    }
+                }
+                for half in 0..2 {
+                    for position in 0..64 {
+                        for byte in 0..8 {
+                            let a = (position % 32) / 8;
+                            let chunk = position % 8;
+                            assert_eq!(
+                                got.3[64 * half + position][byte],
+                                expected[a][16 * chunk + 8 * half + byte],
+                                "circular case={case} include={include_plane} half={half} position={position} byte={byte}"
+                            );
                         }
                     }
                 }
@@ -6575,6 +6693,1489 @@ mod cfold_initialized_checks {
             }
         }
         assert_eq!(checks, 32);
-        println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
+        println!(
+            "32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs"
+        );
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+/// B-only window batching over the original packed layout. Every candidate
+/// constant is checked against all eight live input blocks by the leaf.
+pub(crate) mod c4_raw_strided {
+    use super::*;
+    use core::arch::x86_64::*;
+    #[repr(C, align(64))]
+    struct RawBStage([F128; 512]);
+    #[repr(C, align(64))]
+    struct RawWindow([u8; 576]);
+    pub(crate) const EXPECTED: [[u64; 8]; 32] = [
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [
+            18446744073709551615,
+            18446744073709551615,
+            0,
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+        ],
+        [
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+        ],
+        [
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+        ],
+        [
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+        ],
+        [
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+        ],
+        [18446744073709551360, 0, 0, 0, 72057594037927935, 0, 0, 0],
+        [
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+        ],
+        [
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446742974197923840,
+        ],
+        [
+            4294967295,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+        ],
+        [
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709486080,
+        ],
+        [255, 0, 0, 18446744073709551360, 0, 0, 0, 72057594037927935],
+        [
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+        ],
+        [
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+        ],
+        [
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+        ],
+        [
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073709486080,
+            255,
+        ],
+        [0, 0, 18446744073709551360, 0, 0, 0, 18446744073709551360, 0],
+        [
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+            281474976710655,
+            0,
+        ],
+        [
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+        ],
+        [
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446744069414584320,
+            16777215,
+            0,
+        ],
+        [
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+        ],
+        [
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709551360,
+            0,
+            0,
+        ],
+        [0, 72057594037927935, 0, 0, 0, 72057594037927935, 0, 0],
+        [
+            18374686479671623680,
+            281474976710655,
+            0,
+            0,
+            18446462598732840960,
+            1099511627775,
+            0,
+            0,
+        ],
+        [
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+            18446742974197923840,
+            4294967295,
+            0,
+            0,
+        ],
+        [
+            18446744069414584320,
+            16777215,
+            0,
+            0,
+            18446744073692774400,
+            65535,
+            0,
+            0,
+        ],
+        [
+            18446744073709486080,
+            255,
+            0,
+            0,
+            18446744073709486080,
+            255,
+            0,
+            0,
+        ],
+        [
+            18446744073709551360,
+            0,
+            0,
+            0,
+            72057594037927935,
+            0,
+            0,
+            18374686479671623680,
+        ],
+        [
+            281474976710655,
+            0,
+            0,
+            18374686479671623680,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [562949953421311, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ];
+    pub(crate) const KNOWN: [[u8; 8]; 32] = [
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 0, 0, 0, 127, 0, 0],
+        [128, 63, 0, 0, 192, 31, 0, 0],
+        [192, 31, 0, 0, 224, 15, 0, 0],
+        [240, 7, 0, 0, 248, 3, 0, 0],
+        [248, 3, 0, 0, 252, 1, 0, 0],
+        [254, 0, 0, 0, 127, 0, 0, 0],
+        [127, 0, 0, 128, 63, 0, 0, 192],
+        [31, 0, 0, 224, 15, 0, 0, 224],
+        [15, 0, 0, 240, 7, 0, 0, 248],
+        [3, 0, 0, 252, 1, 0, 0, 252],
+        [1, 0, 0, 254, 0, 0, 0, 127],
+        [0, 0, 128, 63, 0, 0, 128, 63],
+        [0, 0, 192, 31, 0, 0, 224, 15],
+        [0, 0, 240, 7, 0, 0, 240, 7],
+        [0, 0, 248, 3, 0, 0, 252, 1],
+        [0, 0, 254, 0, 0, 0, 254, 0],
+        [0, 0, 127, 0, 0, 128, 63, 0],
+        [0, 192, 31, 0, 0, 192, 31, 0],
+        [0, 224, 15, 0, 0, 240, 7, 0],
+        [0, 248, 3, 0, 0, 248, 3, 0],
+        [0, 252, 1, 0, 0, 254, 0, 0],
+        [0, 127, 0, 0, 0, 127, 0, 0],
+        [128, 63, 0, 0, 192, 31, 0, 0],
+        [224, 15, 0, 0, 224, 15, 0, 0],
+        [240, 7, 0, 0, 248, 3, 0, 0],
+        [252, 1, 0, 0, 252, 1, 0, 0],
+        [254, 0, 0, 0, 127, 0, 0, 128],
+        [63, 0, 0, 128, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+        [255, 255, 255, 255, 255, 255, 255, 255],
+    ];
+    // Each guarded half omits one cyclic interval. The shared 16/24/25-term
+    // leaves read the remaining contiguous interval; a mismatched guard executes
+    // the shared 32-term fallback. Descriptors and selector tables are immutable.
+    #[repr(C)]
+    struct HalfPlan {
+        known_offset: usize,
+        variable_offset: usize,
+        expected: &'static [u64; 32],
+        leaf: unsafe extern "C" fn(),
+    }
+    #[repr(align(64))]
+    struct GuardPool<const N: usize>([[u64; 32]; N]);
+    static CIRCULAR_GUARDS: GuardPool<3> = GuardPool([
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+        ],
+        [
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            18446744073709551615,
+            72340172838076673,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ],
+    ]);
+    unsafe extern "C" {
+        fn flock_c4_circular_span0();
+        fn flock_c4_circular_span16();
+        fn flock_c4_circular_span24();
+        fn flock_c4_circular_span25();
+    }
+    static CIRCULAR_PLANS: [HalfPlan; 64] = [
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 128,
+            variable_offset: 128,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span16,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 120,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 112,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 104,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 104,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 96,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 88,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 80,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 80,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 72,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 64,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 56,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 56,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 48,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 40,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 32,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 32,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 24,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 16,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 8,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 8,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 248,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 240,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 240,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 232,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 224,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 216,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 216,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 208,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 200,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 192,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 192,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 184,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 176,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 168,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 168,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 160,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 152,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 144,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 144,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 136,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 128,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 120,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 120,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 112,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 104,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 96,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 96,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 88,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 80,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 72,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 72,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 64,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 192,
+            variable_offset: 56,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span24,
+        },
+        HalfPlan {
+            known_offset: 200,
+            variable_offset: 48,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span25,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[0],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[1],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[2],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[2],
+            leaf: flock_c4_circular_span0,
+        },
+        HalfPlan {
+            known_offset: 0,
+            variable_offset: 0,
+            expected: &CIRCULAR_GUARDS.0[2],
+            leaf: flock_c4_circular_span0,
+        },
+    ];
+
+    #[repr(C)]
+    struct PackPlan {
+        selector: &'static [u8; 64],
+        stores: [usize; 4],
+    }
+    static PACK_SELECTORS: [[u8; 64]; 8] = [
+        [
+            0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50,
+            58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37,
+            45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
+        ],
+        [
+            1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51,
+            59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38,
+            46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63, 64, 72, 80, 88, 96, 104, 112, 120,
+        ],
+        [
+            2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44,
+            52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31,
+            39, 47, 55, 63, 64, 72, 80, 88, 96, 104, 112, 120, 65, 73, 81, 89, 97, 105, 113, 121,
+        ],
+        [
+            3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45,
+            53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63, 64, 72, 80, 88,
+            96, 104, 112, 120, 65, 73, 81, 89, 97, 105, 113, 121, 66, 74, 82, 90, 98, 106, 114,
+            122,
+        ],
+        [
+            4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46,
+            54, 62, 7, 15, 23, 31, 39, 47, 55, 63, 64, 72, 80, 88, 96, 104, 112, 120, 65, 73, 81,
+            89, 97, 105, 113, 121, 66, 74, 82, 90, 98, 106, 114, 122, 67, 75, 83, 91, 99, 107, 115,
+            123,
+        ],
+        [
+            5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47,
+            55, 63, 64, 72, 80, 88, 96, 104, 112, 120, 65, 73, 81, 89, 97, 105, 113, 121, 66, 74,
+            82, 90, 98, 106, 114, 122, 67, 75, 83, 91, 99, 107, 115, 123, 68, 76, 84, 92, 100, 108,
+            116, 124,
+        ],
+        [
+            6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63, 64, 72, 80, 88, 96, 104,
+            112, 120, 65, 73, 81, 89, 97, 105, 113, 121, 66, 74, 82, 90, 98, 106, 114, 122, 67, 75,
+            83, 91, 99, 107, 115, 123, 68, 76, 84, 92, 100, 108, 116, 124, 69, 77, 85, 93, 101,
+            109, 117, 125,
+        ],
+        [
+            7, 15, 23, 31, 39, 47, 55, 63, 64, 72, 80, 88, 96, 104, 112, 120, 65, 73, 81, 89, 97,
+            105, 113, 121, 66, 74, 82, 90, 98, 106, 114, 122, 67, 75, 83, 91, 99, 107, 115, 123,
+            68, 76, 84, 92, 100, 108, 116, 124, 69, 77, 85, 93, 101, 109, 117, 125, 70, 78, 86, 94,
+            102, 110, 118, 126,
+        ],
+    ];
+    static PACK_PLANS: [PackPlan; 64] = [
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [64, 128, 192, 0],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [128, 192, 0, 64],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[5],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[4],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[3],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[2],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[1],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [192, 0, 64, 128],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[7],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[6],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+        PackPlan {
+            selector: &PACK_SELECTORS[0],
+            stores: [0, 64, 128, 192],
+        },
+    ];
+
+    /// Reconstruct the same linear map used to build CFoldMats from basis
+    /// entries, even for a caller whose other table entries are not linear.
+    /// These 64 field values are built once with the pass-owned matrix bank.
+    pub(super) fn constants(data: &[F128], coeffs: [F128; 4]) -> [[F128; 2]; 32] {
+        std::array::from_fn(|w| {
+            std::array::from_fn(|g| {
+                let mut acc = F128::ZERO;
+                for row in 4 * g..4 * g + 4 {
+                    let mut bits = EXPECTED[w][row];
+                    let mut value = F128::ZERO;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        value += data[(bit / 8) * 256 + (1usize << (bit % 8))];
+                    }
+                    acc += coeffs[row % 4] * value;
+                }
+                acc
+            })
+        })
+    }
+    #[inline(always)]
+    unsafe fn known_leaf(
+        input: *const u8,
+        mat: *const u64,
+        constants: *const F128,
+        w: usize,
+    ) -> [__m512i; 4] {
+        let a: __m512i;
+        let b: __m512i;
+        let c: __m512i;
+        let e: __m512i;
+        core::arch::asm!("call [rdx + 24]","vmovdqa64 zmm10,zmm8","vmovdqa64 zmm11,zmm9",
+ "add rdi,256","add rdx,32","add rcx,16","call [rdx + 24]",
+ inout("rdi")input=>_,in("rsi")mat,inout("rdx")CIRCULAR_PLANS.as_ptr().add(2*w)=>_,inout("rcx")constants=>_,
+ out("rax")_,out("r8")_,out("r9")_,out("k1")_,
+ out("zmm10")a,out("zmm11")b,out("zmm8")c,out("zmm9")e,
+ out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_);
+        [a, b, c, e]
+    }
+    #[inline(always)]
+    unsafe fn raw_window12(input: *const u8, out: *mut u8, w: usize) {
+        core::arch::asm!(
+"vmovdqu64 zmm0, [rdi + 0]",
+"vmovdqu64 zmm1, [rdi + 2048]",
+"vmovdqu64 zmm2, [rdi + 4096]",
+"vmovdqu64 zmm3, [rdi + 6144]",
+"vmovdqu64 zmm4, [rdi + 8192]",
+"vmovdqu64 zmm5, [rdi + 10240]",
+"vmovdqu64 zmm6, [rdi + 12288]",
+"vmovdqu64 zmm7, [rdi + 14336]",
+"vpunpcklqdq zmm8, zmm0, zmm1",
+"vpunpckhqdq zmm9, zmm0, zmm1",
+"vpunpcklqdq zmm0, zmm2, zmm3",
+"vpunpckhqdq zmm1, zmm2, zmm3",
+"vpunpcklqdq zmm2, zmm4, zmm5",
+"vpunpckhqdq zmm3, zmm4, zmm5",
+"vpunpcklqdq zmm4, zmm6, zmm7",
+"vpunpckhqdq zmm5, zmm6, zmm7",
+"vshufi64x2 zmm6, zmm8, zmm0, 0x88",
+"vshufi64x2 zmm7, zmm8, zmm0, 0xdd",
+"vshufi64x2 zmm0, zmm9, zmm1, 0x88",
+"vshufi64x2 zmm8, zmm9, zmm1, 0xdd",
+"vshufi64x2 zmm1, zmm2, zmm4, 0x88",
+"vshufi64x2 zmm9, zmm2, zmm4, 0xdd",
+"vshufi64x2 zmm2, zmm3, zmm5, 0x88",
+"vshufi64x2 zmm4, zmm3, zmm5, 0xdd",
+"vshufi64x2 zmm3, zmm6, zmm1, 0x88",
+"vshufi64x2 zmm5, zmm6, zmm1, 0xdd",
+"vshufi64x2 zmm1, zmm0, zmm2, 0x88",
+"vshufi64x2 zmm6, zmm0, zmm2, 0xdd",
+"vshufi64x2 zmm0, zmm7, zmm9, 0x88",
+"vshufi64x2 zmm2, zmm7, zmm9, 0xdd",
+"vshufi64x2 zmm7, zmm8, zmm4, 0x88",
+"vshufi64x2 zmm9, zmm8, zmm4, 0xdd",
+"mov rax, [rdx + 0]",
+"vmovdqu64 zmm11, [rax]",
+"vmovdqa64 zmm10, zmm3",
+"vpermt2b zmm10, zmm11, zmm1",
+"mov rax, [rdx + 8]",
+"vmovdqa64 [rsi + rax + 0], zmm10",
+"vmovdqa64 zmm10, zmm1",
+"vpermt2b zmm10, zmm11, zmm0",
+"mov rax, [rdx + 16]",
+"vmovdqa64 [rsi + rax + 0], zmm10",
+"vmovdqa64 zmm10, zmm0",
+"vpermt2b zmm10, zmm11, zmm7",
+"mov rax, [rdx + 24]",
+"vmovdqa64 [rsi + rax + 0], zmm10",
+"vmovdqa64 zmm10, zmm7",
+"vpermt2b zmm10, zmm11, zmm3",
+"mov rax, [rdx + 32]",
+"vmovdqa64 [rsi + rax + 0], zmm10",
+"mov rax, [rdx + 40]",
+"vmovdqu64 zmm11, [rax]",
+"vmovdqa64 zmm10, zmm5",
+"vpermt2b zmm10, zmm11, zmm6",
+"mov rax, [rdx + 48]",
+"vmovdqa64 [rsi + rax + 256], zmm10",
+"vmovdqa64 zmm10, zmm6",
+"vpermt2b zmm10, zmm11, zmm2",
+"mov rax, [rdx + 56]",
+"vmovdqa64 [rsi + rax + 256], zmm10",
+"vmovdqa64 zmm10, zmm2",
+"vpermt2b zmm10, zmm11, zmm9",
+"mov rax, [rdx + 64]",
+"vmovdqa64 [rsi + rax + 256], zmm10",
+"vmovdqa64 zmm10, zmm9",
+"vpermt2b zmm10, zmm11, zmm5",
+"mov rax, [rdx + 72]",
+"vmovdqa64 [rsi + rax + 256], zmm10",
+"mov qword ptr [rsi + 512], 0",
+in("rdi")input,in("rsi")out,in("rdx")PACK_PLANS.as_ptr().add(2*w),out("rax")_,
+out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")_,out("zmm9")_,out("zmm10")_,out("zmm11")_,options(nostack));
+    }
+    // The fused byte transpose/cyclic rotation preserves ZMM12..31. It writes
+    // all 512 live bytes plus an initialized eight-byte guard pad. The seven-
+    // qword guard masks its eighth qword. Every B output is written once.
+    #[inline(never)]
+    unsafe fn raw_b_stage(
+        input: *const u8,
+        m: *const u64,
+        constants: &[[F128; 2]; 32],
+        out: *mut F128,
+    ) {
+        let mut window = core::mem::MaybeUninit::<RawWindow>::uninit();
+        let wp = window.as_mut_ptr().cast::<u8>();
+        for group in (0..32usize).step_by(8) {
+            for parity in 0..2usize {
+                let w0 = group + parity + 0;
+                raw_window12(input.add(64 * w0), wp, w0);
+                let v0 = known_leaf(wp, m, constants[w0].as_ptr(), w0);
+                let w1 = group + parity + 2;
+                raw_window12(input.add(64 * w1), wp, w1);
+                let v1 = known_leaf(wp, m, constants[w1].as_ptr(), w1);
+                let w2 = group + parity + 4;
+                raw_window12(input.add(64 * w2), wp, w2);
+                let v2 = known_leaf(wp, m, constants[w2].as_ptr(), w2);
+                let w3 = group + parity + 6;
+                raw_window12(input.add(64 * w3), wp, w3);
+                let v3 = known_leaf(wp, m, constants[w3].as_ptr(), w3);
+                let block = transpose4_lanes(v0[0], v1[0], v2[0], v3[0]);
+                _mm512_storeu_si512(out.add(0 + 2 * group + 8 * parity + 0).cast(), block[0]);
+                _mm512_storeu_si512(out.add(64 + 2 * group + 8 * parity + 0).cast(), block[1]);
+                _mm512_storeu_si512(out.add(128 + 2 * group + 8 * parity + 0).cast(), block[2]);
+                _mm512_storeu_si512(out.add(192 + 2 * group + 8 * parity + 0).cast(), block[3]);
+                let block = transpose4_lanes(v0[1], v1[1], v2[1], v3[1]);
+                _mm512_storeu_si512(out.add(256 + 2 * group + 8 * parity + 0).cast(), block[0]);
+                _mm512_storeu_si512(out.add(320 + 2 * group + 8 * parity + 0).cast(), block[1]);
+                _mm512_storeu_si512(out.add(384 + 2 * group + 8 * parity + 0).cast(), block[2]);
+                _mm512_storeu_si512(out.add(448 + 2 * group + 8 * parity + 0).cast(), block[3]);
+                let block = transpose4_lanes(v0[2], v1[2], v2[2], v3[2]);
+                _mm512_storeu_si512(out.add(0 + 2 * group + 8 * parity + 4).cast(), block[0]);
+                _mm512_storeu_si512(out.add(64 + 2 * group + 8 * parity + 4).cast(), block[1]);
+                _mm512_storeu_si512(out.add(128 + 2 * group + 8 * parity + 4).cast(), block[2]);
+                _mm512_storeu_si512(out.add(192 + 2 * group + 8 * parity + 4).cast(), block[3]);
+                let block = transpose4_lanes(v0[3], v1[3], v2[3], v3[3]);
+                _mm512_storeu_si512(out.add(256 + 2 * group + 8 * parity + 4).cast(), block[0]);
+                _mm512_storeu_si512(out.add(320 + 2 * group + 8 * parity + 4).cast(), block[1]);
+                _mm512_storeu_si512(out.add(384 + 2 * group + 8 * parity + 4).cast(), block[2]);
+                _mm512_storeu_si512(out.add(448 + 2 * group + 8 * parity + 4).cast(), block[3]);
+            }
+        }
+    }
+    #[inline(never)]
+    pub(super) unsafe fn fold<const NT_OUT: bool, const OUT_LM: bool>(
+        a_pkt: *const u8,
+        b_pkt: *const u8,
+        out_base: usize,
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+        lo_size: usize,
+        cfold: &CFoldMats,
+        wt: &[F128],
+    ) -> [F128; 8] {
+        use core::arch::x86_64::*;
+        debug_assert!(lo_size.is_multiple_of(16));
+        debug_assert_eq!(a_out.len(), 2 * lo_size);
+        debug_assert_eq!(b_out.len(), 2 * lo_size);
+
+        let constants = &cfold.2;
+        unsafe {
+            let mut b_stage = core::mem::MaybeUninit::<RawBStage>::uninit();
+
+            let mut acc = [WideGhashX4::zero(); 8];
+            let a_out_ptr = a_out.as_mut_ptr();
+            let b_out_ptr = b_out.as_mut_ptr();
+            let wt_ptr = wt.as_ptr();
+
+            macro_rules! step8_fast {
+                ($x_expr:expr) => {{
+                    let x = $x_expr;
+                    let ol = 2 * x;
+                    let xg = out_base + ol;
+                    let [a0, a1, a2, a3] =
+                        gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
+                    let bp_stage = if OUT_LM {
+                        b_out_ptr.add(ol)
+                    } else {
+                        b_stage.as_ptr().cast::<F128>().add(ol % 512)
+                    };
+                    let b0 = _mm512_loadu_si512(bp_stage.cast());
+                    let b1 = _mm512_loadu_si512(bp_stage.add(4).cast());
+                    let b2 = _mm512_loadu_si512(bp_stage.add(8).cast());
+                    let b3 = _mm512_loadu_si512(bp_stage.add(12).cast());
+                    let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
+                    for l in 0..2 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    for l in 2..4 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let ap = a_out_ptr.add(ol);
+                    let bp = b_out_ptr.add(ol);
+                    let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                        (a0, a1, a2, a3, b0, b1, b2, b3)
+                    } else {
+                        let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                        let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                        (s0, s1, s2, s3, t0, t1, t2, t3)
+                    };
+                    if NT_OUT {
+                        stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                        if !OUT_LM {
+                            stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                        }
+                    } else {
+                        _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                        _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                        _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                        _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                        if !OUT_LM {
+                            _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                            _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                            _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                            _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                        }
+                    }
+                    for l in 4..8 {
+                        _mm_prefetch(
+                            a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                        _mm_prefetch(
+                            b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                    let wp = wt_ptr.add(x) as *const __m512i;
+                    let w = _mm512_loadu_si512(wp);
+                    let w64 = _mm512_loadu_si512(wp.add(1));
+                    let a0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64);
+                    let a1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64);
+                    let a2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64);
+                    let a3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64);
+                    (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+                }};
+            }
+
+            // Lane-major B writes go directly to the exclusively owned output.
+            // Each tile is fully initialized before the A/B message loop reads it.
+            // Other layouts retain private staging and their original publication.
+            for tile in (0..lo_size).step_by(256) {
+                raw_b_stage(
+                    b_pkt.add(32 * (out_base + 2 * tile)),
+                    cfold.3.as_ptr().cast(),
+                    constants,
+                    if OUT_LM {
+                        b_out_ptr.add(2 * tile)
+                    } else {
+                        b_stage.as_mut_ptr().cast::<F128>()
+                    },
+                );
+                let mut x_lo = tile;
+                while x_lo < tile + 256 {
+                    let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step8_fast!(x_lo);
+                    let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step8_fast!(x_lo + 8);
+                    acc[0].mul_acc2(a1w, b1, c1w, d1);
+                    acc[1].mul_acc2(
+                        _mm512_xor_si512(a0w, a1w),
+                        _mm512_xor_si512(b0, b1),
+                        _mm512_xor_si512(c0w, c1w),
+                        _mm512_xor_si512(d0, d1),
+                    );
+                    acc[2].mul_acc2(a3w, b3, c3w, d3);
+                    acc[3].mul_acc2(
+                        _mm512_xor_si512(a2w, a3w),
+                        _mm512_xor_si512(b2, b3),
+                        _mm512_xor_si512(c2w, c3w),
+                        _mm512_xor_si512(d2, d3),
+                    );
+                    acc[4].mul_acc2(a2w, b2, c2w, d2);
+                    let e_aw = _mm512_xor_si512(a0w, a2w);
+                    let e_b = _mm512_xor_si512(b0, b2);
+                    let o_aw = _mm512_xor_si512(a1w, a3w);
+                    let o_b = _mm512_xor_si512(b1, b3);
+                    let e_cw = _mm512_xor_si512(c0w, c2w);
+                    let e_d = _mm512_xor_si512(d0, d2);
+                    let o_cw = _mm512_xor_si512(c1w, c3w);
+                    let o_d = _mm512_xor_si512(d1, d3);
+                    acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                    acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                    acc[7].mul_acc2(
+                        _mm512_xor_si512(e_aw, o_aw),
+                        _mm512_xor_si512(e_b, o_b),
+                        _mm512_xor_si512(e_cw, o_cw),
+                        _mm512_xor_si512(e_d, o_d),
+                    );
+                    x_lo += 16;
+                }
+            }
+
+            if NT_OUT {
+                _mm_sfence();
+            }
+            let mut out = [F128::ZERO; 8];
+            for i in 0..8 {
+                out[i] = acc[i].fold().reduce();
+            }
+            out
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn build_raw_c4_constants(data: &[F128], coeffs: [F128; 4]) -> [[F128; 2]; 32] {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        return c4_raw_strided::constants(data, coeffs);
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = (data, coeffs);
+        [[F128::ZERO; 2]; 32]
     }
 }

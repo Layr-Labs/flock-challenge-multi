@@ -329,3 +329,527 @@ flock_gfni_c4_lm_register_result:
 .p2align 6
 .Lflock_c4_result_out_odd:
     .byte 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 3, 11, 19, 27, 35, 43, 51, 59, 67, 75, 83, 91, 99, 107, 115, 123, 5, 13, 21, 29, 37, 45, 53, 61, 69, 77, 85, 93, 101, 109, 117, 125, 7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127
+
+.text
+.p2align 5
+.globl flock_c4_circular_span0
+.type flock_c4_circular_span0,@function
+flock_c4_circular_span0:
+mov rax, [rdx]
+add rax, rdi
+mov r9, [rdx + 16]
+vmovdqa64 zmm0, [r9 + 0]
+vpxorq zmm0, zmm0, [rax + 0]
+vmovdqa64 zmm1, [r9 + 64]
+vpxorq zmm1, zmm1, [rax + 64]
+vmovdqa64 zmm2, [r9 + 128]
+vpxorq zmm2, zmm2, [rax + 128]
+vmovdqa64 zmm3, [r9 + 192]
+vpxorq zmm3, zmm3, [rax + 192]
+vpternlogq zmm0, zmm1, zmm2, 0xfe
+vporq zmm0, zmm0, zmm3
+vptestmq k1, zmm0, zmm0
+kmovw eax, k1
+test eax, 255
+jne flock_c4_circular_span32
+vbroadcasti32x4 zmm8, [rcx]
+vmovdqa64 zmm9, zmm8
+ret
+.size flock_c4_circular_span0, .-flock_c4_circular_span0
+.p2align 5
+.globl flock_c4_circular_span16
+.type flock_c4_circular_span16,@function
+flock_c4_circular_span16:
+mov rax, [rdx]
+add rax, rdi
+mov r9, [rdx + 16]
+vmovdqa64 zmm0, [r9 + 0]
+vpxorq zmm0, zmm0, [rax + 0]
+vmovdqa64 zmm1, [r9 + 64]
+vpxorq zmm1, zmm1, [rax + 64]
+vporq zmm0, zmm0, zmm1
+vptestmq k1, zmm0, zmm0
+kmovw eax, k1
+test eax, 255
+jne flock_c4_circular_span32
+mov rax, [rdx + 8]
+lea r8, [rsi + rax*8]
+mov rax, rdi
+vpbroadcastq zmm0, [rax + 0]
+vgf2p8affineqb zmm1, zmm0, [r8 + 4096], 0
+vgf2p8affineqb zmm0, zmm0, [r8 + 0], 0
+vpbroadcastq zmm2, [rax + 8]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4160], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 64], 0
+vpbroadcastq zmm4, [rax + 16]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4224], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 128], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 24]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4288], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 192], 0
+vpbroadcastq zmm4, [rax + 32]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4352], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 256], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 40]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4416], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 320], 0
+vpbroadcastq zmm4, [rax + 48]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4480], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 384], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 56]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4544], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 448], 0
+vpbroadcastq zmm4, [rax + 64]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4608], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 512], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 72]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4672], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 576], 0
+vpbroadcastq zmm4, [rax + 80]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4736], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 640], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 88]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4800], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 704], 0
+vpbroadcastq zmm4, [rax + 96]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4864], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 768], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 104]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4928], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 832], 0
+vpbroadcastq zmm4, [rax + 112]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4992], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 896], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 120]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5056], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 960], 0
+vpxorq zmm0, zmm0, zmm2
+vpxorq zmm1, zmm1, zmm3
+vmovdqa64 zmm6, [rip + .Lcircular_out_even]
+vmovdqa64 zmm7, [rip + .Lcircular_out_odd]
+vmovdqa64 zmm8, zmm0
+vmovdqa64 zmm9, zmm0
+vpermt2b zmm8, zmm6, zmm1
+vpermt2b zmm9, zmm7, zmm1
+vbroadcasti32x4 zmm0, [rcx]
+vpxorq zmm8, zmm8, zmm0
+vpxorq zmm9, zmm9, zmm0
+ret
+.size flock_c4_circular_span16, .-flock_c4_circular_span16
+.p2align 5
+.globl flock_c4_circular_span24
+.type flock_c4_circular_span24,@function
+flock_c4_circular_span24:
+mov rax, [rdx]
+add rax, rdi
+mov r9, [rdx + 16]
+vmovdqa64 zmm0, [r9 + 0]
+vpxorq zmm0, zmm0, [rax + 0]
+vptestmq k1, zmm0, zmm0
+kmovw eax, k1
+test eax, 255
+jne flock_c4_circular_span32
+mov rax, [rdx + 8]
+lea r8, [rsi + rax*8]
+mov rax, rdi
+vpbroadcastq zmm0, [rax + 0]
+vgf2p8affineqb zmm1, zmm0, [r8 + 4096], 0
+vgf2p8affineqb zmm0, zmm0, [r8 + 0], 0
+vpbroadcastq zmm2, [rax + 8]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4160], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 64], 0
+vpbroadcastq zmm4, [rax + 16]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4224], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 128], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 24]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4288], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 192], 0
+vpbroadcastq zmm4, [rax + 32]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4352], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 256], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 40]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4416], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 320], 0
+vpbroadcastq zmm4, [rax + 48]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4480], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 384], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 56]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4544], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 448], 0
+vpbroadcastq zmm4, [rax + 64]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4608], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 512], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 72]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4672], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 576], 0
+vpbroadcastq zmm4, [rax + 80]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4736], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 640], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 88]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4800], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 704], 0
+vpbroadcastq zmm4, [rax + 96]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4864], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 768], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 104]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4928], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 832], 0
+vpbroadcastq zmm4, [rax + 112]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4992], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 896], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 120]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5056], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 960], 0
+vpbroadcastq zmm4, [rax + 128]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5120], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1024], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 136]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5184], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1088], 0
+vpbroadcastq zmm4, [rax + 144]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5248], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1152], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 152]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5312], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1216], 0
+vpbroadcastq zmm4, [rax + 160]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5376], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1280], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 168]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5440], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1344], 0
+vpbroadcastq zmm4, [rax + 176]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5504], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1408], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 184]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5568], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1472], 0
+vpxorq zmm0, zmm0, zmm2
+vpxorq zmm1, zmm1, zmm3
+vmovdqa64 zmm6, [rip + .Lcircular_out_even]
+vmovdqa64 zmm7, [rip + .Lcircular_out_odd]
+vmovdqa64 zmm8, zmm0
+vmovdqa64 zmm9, zmm0
+vpermt2b zmm8, zmm6, zmm1
+vpermt2b zmm9, zmm7, zmm1
+vbroadcasti32x4 zmm0, [rcx]
+vpxorq zmm8, zmm8, zmm0
+vpxorq zmm9, zmm9, zmm0
+ret
+.size flock_c4_circular_span24, .-flock_c4_circular_span24
+.p2align 5
+.globl flock_c4_circular_span25
+.type flock_c4_circular_span25,@function
+flock_c4_circular_span25:
+mov rax, [rdx]
+add rax, rdi
+mov r9, [rdx + 16]
+vmovdqa64 zmm0, [r9 + 0]
+vpxorq zmm0, zmm0, [rax + 0]
+vptestmq k1, zmm0, zmm0
+kmovw eax, k1
+test eax, 127
+jne flock_c4_circular_span32
+mov rax, [rdx + 8]
+lea r8, [rsi + rax*8]
+mov rax, rdi
+vpbroadcastq zmm0, [rax + 0]
+vgf2p8affineqb zmm1, zmm0, [r8 + 4096], 0
+vgf2p8affineqb zmm0, zmm0, [r8 + 0], 0
+vpbroadcastq zmm2, [rax + 8]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4160], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 64], 0
+vpbroadcastq zmm4, [rax + 16]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4224], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 128], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 24]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4288], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 192], 0
+vpbroadcastq zmm4, [rax + 32]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4352], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 256], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 40]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4416], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 320], 0
+vpbroadcastq zmm4, [rax + 48]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4480], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 384], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 56]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4544], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 448], 0
+vpbroadcastq zmm4, [rax + 64]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4608], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 512], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 72]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4672], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 576], 0
+vpbroadcastq zmm4, [rax + 80]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4736], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 640], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 88]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4800], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 704], 0
+vpbroadcastq zmm4, [rax + 96]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4864], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 768], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 104]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4928], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 832], 0
+vpbroadcastq zmm4, [rax + 112]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4992], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 896], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 120]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5056], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 960], 0
+vpbroadcastq zmm4, [rax + 128]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5120], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1024], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 136]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5184], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1088], 0
+vpbroadcastq zmm4, [rax + 144]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5248], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1152], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 152]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5312], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1216], 0
+vpbroadcastq zmm4, [rax + 160]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5376], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1280], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 168]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5440], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1344], 0
+vpbroadcastq zmm4, [rax + 176]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5504], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1408], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 184]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5568], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1472], 0
+vpbroadcastq zmm4, [rax + 192]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5632], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1536], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vmovdqa64 zmm6, [rip + .Lcircular_out_even]
+vmovdqa64 zmm7, [rip + .Lcircular_out_odd]
+vmovdqa64 zmm8, zmm0
+vmovdqa64 zmm9, zmm0
+vpermt2b zmm8, zmm6, zmm1
+vpermt2b zmm9, zmm7, zmm1
+vbroadcasti32x4 zmm0, [rcx]
+vpxorq zmm8, zmm8, zmm0
+vpxorq zmm9, zmm9, zmm0
+ret
+.size flock_c4_circular_span25, .-flock_c4_circular_span25
+.p2align 5
+.globl flock_c4_circular_span32
+.type flock_c4_circular_span32,@function
+flock_c4_circular_span32:
+mov rax, [rdx + 8]
+lea r8, [rsi + rax*8]
+mov rax, rdi
+vpbroadcastq zmm0, [rax + 0]
+vgf2p8affineqb zmm1, zmm0, [r8 + 4096], 0
+vgf2p8affineqb zmm0, zmm0, [r8 + 0], 0
+vpbroadcastq zmm2, [rax + 8]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4160], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 64], 0
+vpbroadcastq zmm4, [rax + 16]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4224], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 128], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 24]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4288], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 192], 0
+vpbroadcastq zmm4, [rax + 32]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4352], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 256], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 40]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4416], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 320], 0
+vpbroadcastq zmm4, [rax + 48]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4480], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 384], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 56]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4544], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 448], 0
+vpbroadcastq zmm4, [rax + 64]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4608], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 512], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 72]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4672], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 576], 0
+vpbroadcastq zmm4, [rax + 80]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4736], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 640], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 88]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4800], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 704], 0
+vpbroadcastq zmm4, [rax + 96]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4864], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 768], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 104]
+vgf2p8affineqb zmm3, zmm2, [r8 + 4928], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 832], 0
+vpbroadcastq zmm4, [rax + 112]
+vgf2p8affineqb zmm5, zmm4, [r8 + 4992], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 896], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 120]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5056], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 960], 0
+vpbroadcastq zmm4, [rax + 128]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5120], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1024], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 136]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5184], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1088], 0
+vpbroadcastq zmm4, [rax + 144]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5248], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1152], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 152]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5312], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1216], 0
+vpbroadcastq zmm4, [rax + 160]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5376], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1280], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 168]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5440], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1344], 0
+vpbroadcastq zmm4, [rax + 176]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5504], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1408], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 184]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5568], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1472], 0
+vpbroadcastq zmm4, [rax + 192]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5632], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1536], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 200]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5696], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1600], 0
+vpbroadcastq zmm4, [rax + 208]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5760], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1664], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 216]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5824], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1728], 0
+vpbroadcastq zmm4, [rax + 224]
+vgf2p8affineqb zmm5, zmm4, [r8 + 5888], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1792], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 232]
+vgf2p8affineqb zmm3, zmm2, [r8 + 5952], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1856], 0
+vpbroadcastq zmm4, [rax + 240]
+vgf2p8affineqb zmm5, zmm4, [r8 + 6016], 0
+vgf2p8affineqb zmm4, zmm4, [r8 + 1920], 0
+vpternlogq zmm0, zmm2, zmm4, 0x96
+vpternlogq zmm1, zmm3, zmm5, 0x96
+vpbroadcastq zmm2, [rax + 248]
+vgf2p8affineqb zmm3, zmm2, [r8 + 6080], 0
+vgf2p8affineqb zmm2, zmm2, [r8 + 1984], 0
+vpxorq zmm0, zmm0, zmm2
+vpxorq zmm1, zmm1, zmm3
+vmovdqa64 zmm6, [rip + .Lcircular_out_even]
+vmovdqa64 zmm7, [rip + .Lcircular_out_odd]
+vmovdqa64 zmm8, zmm0
+vmovdqa64 zmm9, zmm0
+vpermt2b zmm8, zmm6, zmm1
+vpermt2b zmm9, zmm7, zmm1
+ret
+.size flock_c4_circular_span32, .-flock_c4_circular_span32
+.section .rodata
+.p2align 6
+.Lcircular_input:
+.byte 0,4,8,12,16,20,24,28,1,5,9,13,17,21,25,29,2,6,10,14,18,22,26,30,3,7,11,15,19,23,27,31,32,36,40,44,48,52,56,60,33,37,41,45,49,53,57,61,34,38,42,46,50,54,58,62,35,39,43,47,51,55,59,63
+.p2align 6
+.Lcircular_out_even:
+.byte 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,1,9,17,25,33,41,49,57,65,73,81,89,97,105,113,121,2,10,18,26,34,42,50,58,66,74,82,90,98,106,114,122,3,11,19,27,35,43,51,59,67,75,83,91,99,107,115,123
+.p2align 6
+.Lcircular_out_odd:
+.byte 4,12,20,28,36,44,52,60,68,76,84,92,100,108,116,124,5,13,21,29,37,45,53,61,69,77,85,93,101,109,117,125,6,14,22,30,38,46,54,62,70,78,86,94,102,110,118,126,7,15,23,31,39,47,55,63,71,79,87,95,103,111,119,127
+

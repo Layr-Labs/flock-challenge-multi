@@ -4184,14 +4184,6 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
-/// `FLOCK_NO_ZC_R1AB_CLAIM=1` restores the adaptive `fold`/`reduce` split
-/// of the round-one AB bands (same bands, same leaves, XOR combine).
-fn zc_r1ab_claim_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_CLAIM").is_none());
-    *ON
-}
-
 /// Ranked default routes the round-one AB band folds — the plane-bank
 /// accumulate and the band-end `eq_hi` fold — through the shared
 /// `f128_slice::add_scaled` leaf. `FLOCK_NO_ZC_R1_EQFOLD_X4=1` restores the
@@ -4376,115 +4368,74 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     )))]
     let direct_ab = false;
-    // One claim loop per pool thread instead of a `fold`/`reduce` tree. The
-    // 128 bands are ~0.75 ms each at the ranked shape; under the adaptive
-    // split a worker that finished its own half could steal a whole band
-    // while its join partner had long finished, holding the reduction tree's
-    // root behind that band (measured up to ~0.9 ms past the last band).
-    // Here every thread pulls bands from one counter until none remain and
-    // parks its accumulator in its own slot. The per-thread sums and their
-    // final combine are XOR (field addition in characteristic two), so the
-    // grouping of bands into threads cannot change the result bits.
-    let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq",
-            target_feature = "gfni"
-        ))]
-        let eq_fold_arg = eq_fold_state
-            .as_ref()
-            .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
-        #[cfg(not(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq",
-            target_feature = "gfni"
-        )))]
-        let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
-        if direct_ab {
-            process_one_x_hi_ab_only::<true>(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts_live,
-                ab_inner_bytes,
-                &eq_lo_scaled,
-                eq_hi[x_hi],
-                convert,
-                eq_fold_arg,
-                plane_first_write,
-                plane_cache,
-                ranked_one_rows_elided,
-                ranked_compact,
-                state,
-            );
-        } else {
-            process_one_x_hi_ab_only::<false>(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts_live,
-                ab_inner_bytes,
-                &eq_lo_scaled,
-                eq_hi[x_hi],
-                convert,
-                eq_fold_arg,
-                plane_first_write,
-                plane_cache,
-                ranked_one_rows_elided,
-                ranked_compact,
-                state,
-            );
-        }
-    };
-    let res_ab = if zc_r1ab_claim_enabled() && rayon::current_thread_index().is_some() {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let n_threads = rayon::current_num_threads();
-        let slots: Vec<std::sync::Mutex<Option<[F128; ELL]>>> =
-            (0..n_threads).map(|_| std::sync::Mutex::new(None)).collect();
-        rayon::broadcast(|ctx| {
-            let mut state: Option<WorkerStateAbOnly> = None;
-            loop {
-                let x_hi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if x_hi >= hi_size {
-                    break;
-                }
-                band(state.get_or_insert_with(WorkerStateAbOnly::new), x_hi);
+    let res_ab = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let eq_fold_arg = eq_fold_state
+                .as_ref()
+                .map(|(eq_bot, mats, bank_bits)| (eq_bot.as_slice(), mats.as_slice(), *bank_bits));
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let eq_fold_arg: Option<(&[F128], &[u64], usize)> = None;
+            if direct_ab {
+                process_one_x_hi_ab_only::<true>(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts_live,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq_hi[x_hi],
+                    convert,
+                    eq_fold_arg,
+                    plane_first_write,
+                    plane_cache,
+                    ranked_one_rows_elided,
+                    ranked_compact,
+                    &mut state,
+                );
+            } else {
+                process_one_x_hi_ab_only::<false>(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts_live,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq_hi[x_hi],
+                    convert,
+                    eq_fold_arg,
+                    plane_first_write,
+                    plane_cache,
+                    ranked_one_rows_elided,
+                    ranked_compact,
+                    &mut state,
+                );
             }
-            if let Some(state) = state {
-                *slots[ctx.index()].lock().unwrap() = Some(state.local_res_ab);
-            }
-        });
-        let mut res = [F128::ZERO; ELL];
-        for slot in slots {
-            if let Some(part) = slot.into_inner().unwrap() {
+            state
+        })
+        .map(|s| s.local_res_ab)
+        .reduce(
+            || [F128::ZERO; ELL],
+            |mut ab1, ab2| {
                 for i in 0..ELL {
-                    res[i] += part[i];
+                    ab1[i] += ab2[i];
                 }
-            }
-        }
-        res
-    } else {
-        (0..hi_size)
-            .into_par_iter()
-            .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
-                band(&mut state, x_hi);
-                state
-            })
-            .map(|s| s.local_res_ab)
-            .reduce(
-                || [F128::ZERO; ELL],
-                |mut ab1, ab2| {
-                    for i in 0..ELL {
-                        ab1[i] += ab2[i];
-                    }
-                    ab1
-                },
-            )
-    };
+                ab1
+            },
+        );
     res_ab.to_vec()
 }
 
