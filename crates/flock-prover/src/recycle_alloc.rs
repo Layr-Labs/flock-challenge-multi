@@ -33,8 +33,22 @@ fn class_slot(size: usize) -> usize {
     (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
 }
 
+// Match only the existing padded large-buffer layout. Ordinary small
+// power-of-two sizes use System instead of a shared per-size freelist.
+#[inline]
+fn retained_size(size: usize) -> bool {
+    const TAIL: usize = flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
+    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
+        && (size - TAIL).is_power_of_two()
+}
+
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
+    // At most 42 valid classes on 64-bit layouts (payload exponents 21..62).
+    // This changes retention only; recyclable() still controls alignment.
+    if !retained_size(size) {
+        return None;
+    }
     let start = class_slot(size);
     for probe in 0..MAX_CLASSES {
         let i = (start + probe) % MAX_CLASSES;
@@ -205,6 +219,79 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn padded_only_retention_preserves_real_layouts_and_bypass() {
+        use super::*;
+        use std::sync::Barrier;
+        use std::sync::atomic::Ordering::Relaxed;
+        const TAIL: usize = 96 * 4096;
+        const MIN: usize = 2 << 20;
+        assert_eq!(flock_core::UNINIT_VEC_TAIL_PAGES, 96);
+        assert_eq!(flock_core::UNINIT_VEC_LARGE_MIN_BYTES, MIN);
+        for exponent in 21..usize::BITS - 1 {
+            let payload = 1usize << exponent;
+            let size = payload + TAIL;
+            assert!(retained_size(size));
+            assert!(!retained_size(size - 1));
+            assert!(!retained_size(size + 1));
+            assert!(!retained_size(payload));
+            assert!(Layout::from_size_align(size, 8).is_ok());
+        }
+        for size in [0, RECYCLE_MIN, 64 * 1024, 128 * 1024, MIN, MIN + TAIL - 1, usize::MAX] {
+            assert!(!retained_size(size));
+            assert!(find_class(size, true).is_none());
+        }
+        let barrier = Barrier::new(8);
+        let reused = AtomicUsize::new(0);
+        let bypassed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for lane in 0..8usize {
+                let (barrier, reused, bypassed) = (&barrier, &reused, &bypassed);
+                scope.spawn(move || {
+                    for round in 0..8usize {
+                        let (size, admitted) = match round % 4 {
+                            0 => (RECYCLE_MIN, false),
+                            1 => (MIN + TAIL, true),
+                            2 => (2 * MIN + TAIL, true),
+                            _ => (MIN + TAIL + 128, false),
+                        };
+                        let layout = Layout::from_size_align(size, 8).unwrap();
+                        unsafe {
+                            let block = RecycleAlloc.alloc(layout);
+                            assert!(!block.is_null());
+                            let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
+                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
+                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            assert_eq!(block as usize % 64, 0);
+                            let value = (lane + 1 + round * 8) as u8;
+                            core::ptr::write_bytes(block, value, size);
+                            barrier.wait();
+                            assert!(core::slice::from_raw_parts(block, size).iter().all(|&v| v == value));
+                            barrier.wait();
+                            RecycleAlloc.dealloc(block, layout);
+                            let zeroed = RecycleAlloc.alloc_zeroed(layout);
+                            assert!(!zeroed.is_null());
+                            let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
+                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
+                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            assert_eq!(zeroed as usize % 64, 0);
+                            assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&v| v == 0));
+                            RecycleAlloc.dealloc(zeroed, layout);
+                        }
+                    }
+                });
+            }
+        });
+        let occupied = CLASSES.iter().filter(|c| {
+            let size = c.size.load(Acquire);
+            assert!(size == 0 || retained_size(size));
+            size != 0
+        }).count();
+        assert!(occupied <= (usize::BITS - 1 - 21) as usize);
+        assert_eq!(bypassed.load(Relaxed), 64);
+        eprintln!("REUSED_ALLOCATIONS={}", reused.load(Relaxed));
+    }
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
     /// freelist, and grown through realloc — returns a 64-aligned pointer
