@@ -1,3 +1,9 @@
+#[cfg(all(target_os = "linux", target_arch = "x86_64",
+    target_feature = "avx512f", target_feature = "avx512bw",
+    target_feature = "avx512vbmi", target_feature = "gfni",
+    target_feature = "vpclmulqdq"))]
+core::arch::global_asm!(include_str!("gfni_sigma_chunk_outer.S"));
+
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -4783,7 +4789,69 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_tr(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+#[inline]
 pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    dead_lines: u8,
+) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64",
+    target_feature = "avx512f", target_feature = "avx512bw",
+    target_feature = "avx512vbmi", target_feature = "gfni",
+    target_feature = "vpclmulqdq"))]
+    if dead_lines == 0 {
+        unsafe {
+            // The internal assembly entry preserves every undeclared register.
+            // It may read/write memory and use stack space; no restrictive asm
+            // options apply. Matrices must not overlap the output cache.
+            core::arch::asm!(
+                "call flock_sigma_chunk_outer8",
+                in("rdi") rows, in("rsi") mats.as_ptr(), in("rdx") out,
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+            );
+        }
+        return;
+    }
+    unsafe { gfni_fold64_rows_masked_tr_bcast_fallback(rows, mats, out, dead_lines) }
+}
+
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "vpclmulqdq"))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+pub(crate) unsafe fn gfni_fold64_rows_masked_tr_bcast_fallback(
     rows: *const u8,
     mats: &[u64; 128],
     out: *mut F128,
@@ -6329,7 +6397,7 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
-#[inline(never)]
+#[inline]
 #[cfg_attr(
     target_feature = "avx512bw",
     target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
@@ -6339,6 +6407,75 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
+    const WRITE_CANONICAL: bool,
+    const MULTI: bool,
+>(
+    rows: *const u8,
+    mats: *const u64,
+    out: *mut F128,
+    group: u8,
+    folded: F128,
+) {
+    debug_assert!(group == 0 || group == 3);
+    #[cfg(all(target_os = "linux", target_arch = "x86_64",
+    target_feature = "avx512f", target_feature = "avx512bw",
+    target_feature = "avx512vbmi", target_feature = "gfni",
+    target_feature = "vpclmulqdq"))]
+    if !WRITE_CANONICAL && !MULTI {
+        let first = usize::from(group == 0);
+        unsafe {
+            // The internal assembly entry preserves every undeclared register.
+            // It may read/write memory and use stack space; no restrictive asm
+            // options apply. Matrices must not overlap the output cache.
+            core::arch::asm!(
+                "call flock_sigma_chunk_outer6",
+                in("rdi") rows.add(first * 128), in("rsi") mats, in("rdx") out.add(first * 4),
+                lateout("rax") _,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+            );
+        }
+        return;
+    }
+    unsafe { gfni_fold64_rows_tr_bcast_b_canonical_leaf_fallback::<WRITE_CANONICAL, MULTI>(rows, mats, out, group, folded) }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf_fallback<
     const WRITE_CANONICAL: bool,
     const MULTI: bool,
 >(
@@ -6576,5 +6713,185 @@ mod cfold_initialized_checks {
         }
         assert_eq!(checks, 32);
         println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
+    }
+}
+
+#[cfg(all(
+    test, target_os = "linux", target_arch = "x86_64",
+    target_feature = "avx512f", target_feature = "avx512bw",
+    target_feature = "avx512vbmi", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+mod chunk_outer_tests {
+    use super::*;
+
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s
+    }
+
+    // Independent bit-matrix evaluation, including the residue-major address.
+    fn scalar(rows: &[u8], mats: &[u64; 512], multi: bool) -> [F128; 64] {
+        let mut out = [F128 { lo: 0, hi: 0 }; 64];
+        for row in 0..64 {
+            let mut bytes = [0u8; 16];
+            let group = if multi { row / 16 } else { 0 };
+            for (byte, value) in bytes.iter_mut().enumerate() {
+                for j in 0..8 {
+                    let m = mats[128 * group + 16 * j + byte];
+                    for bit in 0..8 {
+                        *value ^= (((rows[8 * row + j] & (m >> (8 * (7 - bit))) as u8)
+                            .count_ones() & 1) as u8) << bit;
+                    }
+                }
+            }
+            out[16 * (row % 4) + row / 4] = F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            };
+        }
+        out
+    }
+
+    unsafe fn canonical<const WRITE: bool, const MULTI: bool>(
+        rows: *const u8, mats: *const u64, out: *mut F128, group: u8, folded: F128,
+    ) {
+        unsafe { gfni_fold64_rows_tr_bcast_b_canonical_leaf::<WRITE, MULTI>(
+            rows, mats, out, group, folded,
+        ) }
+    }
+
+    fn canonical_expected(
+        rows: &[u8], mats: &[u64; 512], mode: usize, group: usize,
+        folded: F128, guard: F128,
+    ) -> [F128; 64] {
+        let mut out = scalar(rows, mats, mode & 1 != 0);
+        for residue in 0..4 {
+            for lane in 0..4 {
+                out[16 * residue + 4 * group + lane] = if mode & 2 == 0 {
+                    guard
+                } else if group == 0 || (residue == 0 && lane == 0) {
+                    folded
+                } else { F128 { lo: 0, hi: 0 } };
+            }
+        }
+        out
+    }
+
+    type Canonical = unsafe fn(*const u8, *const u64, *mut F128, u8, F128);
+    const CANONICAL: [Canonical; 4] = [
+        canonical::<false, false>, canonical::<false, true>,
+        canonical::<true, false>, canonical::<true, true>,
+    ];
+
+    #[test]
+    fn chunk_outer_scalar_layouts_and_all_masks() {
+        let mut seed = 0x839a717dc541a6fbu64;
+        let guard = F128 { lo: 0x123456789abcdef0, hi: 0xfedcba9876543210 };
+        let folded = F128 { lo: 0x91652741836abccd, hi: 0x617f25acc754113a };
+        let mut canonical_cases = 0;
+        let mut masked_cases = 0;
+        for case in 0..4 {
+            let mats = core::array::from_fn(|_| match case {
+                0 => 0, 1 => u64::MAX, _ => rng(&mut seed),
+            });
+            let saved_mats = mats;
+            for offset in [0, 1, 7, 15, 31, 63] {
+                let input: Vec<u8> = (0..640).map(|_| match case {
+                    0 => 0, 1 => 255, _ => rng(&mut seed) as u8,
+                }).collect();
+                let rows = &input[offset..offset + 512];
+                for group in [0usize, 3] {
+                    for (mode, f) in CANONICAL.iter().enumerate() {
+                        let expected = canonical_expected(rows, &mats, mode, group, folded, guard);
+                        let start = 1 + (offset + mode) % 4;
+                        let mut out = [guard; 72];
+                        unsafe { f(rows.as_ptr(), mats.as_ptr(), out.as_mut_ptr().add(start), group as u8, folded); }
+                        assert_eq!(&out[start..start + 64], &expected);
+                        assert!(out[..start].iter().chain(out[start + 64..].iter()).all(|&x| x == guard));
+                        canonical_cases += 1;
+                    }
+                }
+                // Exercise the dense dispatch through its actual production wrapper.
+                let expected = scalar(rows, &mats, false);
+                let mut out = [guard; 72];
+                let start = 1 + offset % 4;
+                unsafe { gfni_fold64_rows_masked_tr_bcast(rows.as_ptr(),
+                    &*mats.as_ptr().cast::<[u64; 128]>(), out.as_mut_ptr().add(start), 0); }
+                assert_eq!(&out[start..start + 64], &expected);
+                assert!(out[..start].iter().chain(out[start + 64..].iter()).all(|&x| x == guard));
+                // All inputs are captured before stores, including overlapping input/output.
+                let mut overlap = [guard; 64];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(rows.as_ptr(), overlap.as_mut_ptr().cast::<u8>(), 512);
+                    gfni_fold64_rows_masked_tr_bcast(overlap.as_ptr().cast(),
+                        &*mats.as_ptr().cast::<[u64; 128]>(), overlap.as_mut_ptr(), 0);
+                }
+                assert_eq!(overlap, expected);
+            }
+            let input: Vec<u8> = (0..512).map(|_| rng(&mut seed) as u8).collect();
+            for dead in 0u16..256 {
+                let mut masked = input.clone();
+                for line in 0..8 { if dead & (1 << line) != 0 { masked[64 * line..64 * line + 64].fill(0); } }
+                let expected = scalar(&masked, &mats, false);
+                let start = 1 + usize::from(dead % 4);
+                let mut out = [guard; 72];
+                unsafe { gfni_fold64_rows_masked_tr_bcast(input.as_ptr(),
+                    &*mats.as_ptr().cast::<[u64; 128]>(), out.as_mut_ptr().add(start), dead as u8); }
+                assert_eq!(&out[start..start + 64], &expected, "mask={dead}");
+                assert!(out[..start].iter().chain(out[start + 64..].iter()).all(|&x| x == guard));
+                masked_cases += 1;
+            }
+            assert_eq!(mats, saved_mats);
+        }
+        eprintln!("CANONICAL_CASES={canonical_cases} MASK_CASES={masked_cases} DENSE_OVERLAP_CASES=24");
+    }
+
+    #[test]
+    fn chunk_outer_skipped_pages_remain_unread() {
+        unsafe extern "C" {
+            fn mmap(addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut core::ffi::c_void;
+            fn mprotect(addr: *mut core::ffi::c_void, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+        }
+        unsafe {
+            let page = 4096usize;
+            let allocation = mmap(core::ptr::null_mut(), page * 3, 3, 0x22, -1, 0);
+            assert_ne!(allocation as isize, -1);
+            let mem = allocation.cast::<u8>();
+            assert_eq!(mprotect(mem.cast(), page, 0), 0);
+            assert_eq!(mprotect(mem.add(page * 2).cast(), page, 0), 0);
+            let mut seed = 0x9352ace718691215u64;
+            let rows: Vec<u8> = (0..512).map(|_| rng(&mut seed) as u8).collect();
+            let mats = core::array::from_fn(|_| rng(&mut seed));
+            let guard = F128 { lo: 0xabcde13279, hi: 0xe2412893ff };
+            let folded = F128 { lo: 0x134587ffff, hi: 0x78236452e1 };
+            for group in [0usize, 3] {
+                let ptr = if group == 0 { mem.add(page - 128) } else { mem.add(page * 2 - 384) };
+                let first = if group == 0 { 128 } else { 0 };
+                core::ptr::copy_nonoverlapping(rows.as_ptr().add(first), ptr.add(first), 384);
+                for (mode, f) in CANONICAL.iter().enumerate() {
+                    let mut out = [guard; 64];
+                    f(ptr, mats.as_ptr(), out.as_mut_ptr(), group as u8, folded);
+                    assert_eq!(out, canonical_expected(&rows, &mats, mode, group, folded, guard));
+                }
+            }
+            for dead_count in 1..=8 {
+                for low in [true, false] {
+                    let bytes = 64 * dead_count;
+                    let (ptr, start, dead) = if low {
+                        (mem.add(page - bytes), bytes, ((1u16 << dead_count) - 1) as u8)
+                    } else {
+                        (mem.add(page * 2 - (512 - bytes)), 0, (255u16 << (8 - dead_count)) as u8)
+                    };
+                    core::ptr::copy_nonoverlapping(rows.as_ptr().add(start), ptr.add(start), 512 - bytes);
+                    let mut masked = rows.clone();
+                    for line in 0..8 { if dead & (1 << line) != 0 { masked[64 * line..64 * line + 64].fill(0); } }
+                    let mut out = [guard; 64];
+                    gfni_fold64_rows_masked_tr_bcast(ptr, &*mats.as_ptr().cast::<[u64; 128]>(), out.as_mut_ptr(), dead);
+                    assert_eq!(out, scalar(&masked, &mats, false));
+                }
+            }
+            assert_eq!(munmap(allocation, page * 3), 0);
+        }
     }
 }
