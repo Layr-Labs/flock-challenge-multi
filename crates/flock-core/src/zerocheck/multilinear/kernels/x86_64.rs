@@ -6302,14 +6302,149 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_impl<const WRITE_CANONICAL: bool
             gfni_fold64_rows_masked_tr_bcast(rows, mats, out, 0);
             return false;
         }
-        gfni_fold64_rows_tr_bcast_b_canonical_leaf::<WRITE_CANONICAL, false>(
+        gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf::<WRITE_CANONICAL>(
             rows,
-            mats.as_ptr(),
+            mats,
             out,
             group,
             folded,
         );
         true
+    }
+}
+
+/// B-side-only immutable matrix seam for canonical prefolds. The non-inlined
+/// typed reference communicates the existing full-map lifetime to this body;
+/// no runtime alias check, alignment change, or custom ABI is introduced.
+/// This is the exact single-map body of the incumbent generic leaf below.
+///
+/// The checked canonical path computes exactly three dense groups:
+/// 3 * 2 row halves * 2 output-byte halves *
+/// 8 input chunks = 96 GFNI operations. The skipped group's 32 operations
+/// are absent, rather than executed with masked lanes.
+/// `WRITE_CANONICAL` selects complete-cache or direct-consumer publication.
+///
+/// # Safety
+/// `rows` covers 512 readable bytes, `out` covers 64 writable F128s disjoint
+/// from `mats`, and every matrix u64 remains immutable throughout the call.
+/// `group` is zero or three; its two source lines are never read. If
+/// WRITE_CANONICAL is false its output slots remain unwritten and may not
+/// be consumed. If true, `folded` is the exact guarded canonical row image.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf<const WRITE_CANONICAL: bool>(
+    rows: *const u8,
+    mats: &[u64; 128],
+    out: *mut F128,
+    group: u8,
+    folded: F128,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(group == 0 || group == 3);
+    // SAFETY: the caller licenses skipping this group; every other input
+    // line is read into the local octet scratch before any output is stored.
+    // The dense loop skips the canonical group, so it reads exactly the six
+    // scratch lines initialized below. The 48 dense output F128s are always
+    // initialized; the remaining 16 are written iff WRITE_CANONICAL.
+    unsafe {
+        #[rustfmt::skip]
+        const BT: [i8; 64] = [
+            0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
+            2, 10, 18, 26, 34, 42, 50, 58,  3, 11, 19, 27, 35, 43, 51, 59,
+            4, 12, 20, 28, 36, 44, 52, 60,  5, 13, 21, 29, 37, 45, 53, 61,
+            6, 14, 22, 30, 38, 46, 54, 62,  7, 15, 23, 31, 39, 47, 55, 63,
+        ];
+        let bt = _mm512_loadu_si512(BT.as_ptr().cast::<__m512i>());
+        #[repr(C, align(64))]
+        struct Octs([u64; 64]);
+        // Keep the 64-byte alignment without zeroing the whole 512-byte
+        // staging object. The six live lines are written in full before the
+        // only reads below; the skipped canonical group's two lines are never
+        // addressed by the dense loop or the conditional publication arm.
+        let mut octs = core::mem::MaybeUninit::<Octs>::uninit();
+        let op = octs.as_mut_ptr().cast::<u64>();
+        let skipped = usize::from(group);
+        let first_g = if group == 0 { 1 } else { 0 };
+        for relative in 0..6 {
+            let i = 2 * first_g + relative;
+            let z = _mm512_loadu_si512(rows.add(64 * i).cast::<__m512i>());
+            _mm512_storeu_si512(
+                op.add(8 * i).cast::<__m512i>(),
+                _mm512_permutexvar_epi8(bt, z),
+            );
+        }
+
+        let mp = mats.as_ptr();
+        let p01 = _mm512_setr_epi64(0, 8, 4, 12, 1, 9, 5, 13);
+        let p23 = _mm512_setr_epi64(2, 10, 6, 14, 3, 11, 7, 15);
+        let q_lo = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+        let q_hi = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+        for relative in 0..3 {
+            let g = first_g + relative;
+            // One immutable B-side map is shared by all three live groups.
+            let mi = mp;
+            let mut a01 = [_mm512_setzero_si512(); 2];
+            let mut a23 = [_mm512_setzero_si512(); 2];
+            for half in 0..2 {
+                let i = 2 * g + half;
+                let b: [__m512i; 8] =
+                    core::array::from_fn(|j| _mm512_set1_epi64(*op.add(8 * i + j) as i64));
+                let plane = |h: usize| {
+                    let aff = |j: usize| {
+                        _mm512_gf2p8affine_epi64_epi8::<0>(
+                            b[j],
+                            _mm512_loadu_si512(mi.add(16 * j + 8 * h).cast::<__m512i>()),
+                        )
+                    };
+                    let v1 = _mm512_ternarylogic_epi64::<0x96>(aff(0), aff(1), aff(2));
+                    let v2 = _mm512_ternarylogic_epi64::<0x96>(aff(3), aff(4), aff(5));
+                    let v3 = _mm512_ternarylogic_epi64::<0x96>(aff(6), aff(7), v1);
+                    _mm512_xor_si512(v2, v3)
+                };
+                let l = _mm512_permutexvar_epi8(bt, plane(0));
+                let hh = _mm512_permutexvar_epi8(bt, plane(1));
+                a01[half] = _mm512_permutex2var_epi64(l, p01, hh);
+                a23[half] = _mm512_permutex2var_epi64(l, p23, hh);
+            }
+            let dst = out.cast::<__m512i>().add(g);
+            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a01[0], q_lo, a01[1]));
+            _mm512_storeu_si512(dst.add(4), _mm512_permutex2var_epi64(a01[0], q_hi, a01[1]));
+            _mm512_storeu_si512(dst.add(8), _mm512_permutex2var_epi64(a23[0], q_lo, a23[1]));
+            _mm512_storeu_si512(dst.add(12), _mm512_permutex2var_epi64(a23[0], q_hi, a23[1]));
+        }
+
+        if WRITE_CANONICAL {
+            // Complete the cache in the incumbent residue-major layout:
+            // out[16*k + 4*g + lane] = fold(row 16*g + 4*lane + k).
+            let dst = out.cast::<__m512i>().add(skipped);
+            let value = _mm512_broadcast_i32x4(_mm_set_epi64x(folded.hi as i64, folded.lo as i64));
+            if group == 0 {
+                _mm512_storeu_si512(dst, value);
+                _mm512_storeu_si512(dst.add(4), value);
+                _mm512_storeu_si512(dst.add(8), value);
+                _mm512_storeu_si512(dst.add(12), value);
+            } else {
+                let zero = _mm512_setzero_si512();
+                _mm512_storeu_si512(dst, _mm512_maskz_mov_epi64(0x03, value));
+                _mm512_storeu_si512(dst.add(4), zero);
+                _mm512_storeu_si512(dst.add(8), zero);
+                _mm512_storeu_si512(dst.add(12), zero);
+            }
+        }
     }
 }
 
@@ -6454,7 +6589,8 @@ unsafe fn gfni_fold64_rows_tr_bcast_b_canonical_leaf<
 /// `rows` covers the tile's 512 bytes (the skipped group's two lines are
 /// never read), `out` covers 64 writable F128s not overlapping `mats`,
 /// `mats` exposes `128` (`MULTI = false`) or `4 · 128` (`MULTI = true`)
-/// readable `u64`, and `group` is zero or three. AVX-512F/VBMI/GFNI required.
+/// readable `u64` that remain immutable throughout the call, and `group`
+/// is zero or three. AVX-512F/VBMI/GFNI required.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -6481,13 +6617,26 @@ pub(crate) unsafe fn gfni_fold64_rows_tr_bcast_skip_group<const MULTI: bool>(
     // SAFETY: forwarded contract. `WRITE_CANONICAL = false` never stores the
     // skipped group and never reads `folded`.
     unsafe {
-        gfni_fold64_rows_tr_bcast_b_canonical_leaf::<false, MULTI>(
-            rows,
-            mats,
-            out,
-            group,
-            F128::ZERO,
-        );
+        if MULTI {
+            gfni_fold64_rows_tr_bcast_b_canonical_leaf::<false, true>(
+                rows,
+                mats,
+                out,
+                group,
+                F128::ZERO,
+            );
+        } else {
+            // SAFETY: the single-map contract exposes 128 initialized u64s,
+            // immutable for this call and disjoint from the output cache.
+            let b_mats = &*mats.cast::<[u64; 128]>();
+            gfni_fold64_rows_tr_bcast_b_canonical_readonly_leaf::<false>(
+                rows,
+                b_mats,
+                out,
+                group,
+                F128::ZERO,
+            );
+        }
     }
 }
 

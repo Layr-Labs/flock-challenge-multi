@@ -276,9 +276,9 @@ pub fn ranked_pool_built() -> bool {
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
 /// restored and no extra thread is spawned. The two env vars are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split. With the witness-born root cache, C finishes first:
-/// on the eight-core ranked host, assign its last sibling to AB (9/7).
-/// `FLOCK_NO_ZC_R1_AB_REBALANCE=1` restores 8/8 for local diagnostics.
+/// default is the split. Four-w AB retention balances the arms on the
+/// eight-core ranked host with eight workers each. Local diagnostics can
+/// restore 9/7 with `FLOCK_ZC_R1_AB_REBALANCE=1`.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -288,7 +288,7 @@ pub(crate) mod smt_split {
     pub(crate) const ZC_R1_SMT_SPLIT: bool = true;
 
     /// Compile-time rollback of the eight-core 9/7 arm partition.
-    const ZC_R1_AB_REBALANCE: bool = true;
+    const ZC_R1_AB_REBALANCE: bool = false;
 
     static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
 
@@ -496,7 +496,8 @@ pub(crate) mod smt_split {
                     }
                 }
             }
-            let rebalance = super::ZC_R1_AB_REBALANCE
+            let rebalance = (super::ZC_R1_AB_REBALANCE
+                || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
             let p0 = half(0, s0, debug);
