@@ -1257,3 +1257,165 @@ mod nibble_algebra_tests {
         }
     }
 }
+
+// Pair the existing even/odd direct-AB windows. Matrix and bank geometry
+// are validated once for the band; each leaf still receives only initialized
+// live rows, the same matrix, bank and logical prefetch plan. No padding is
+// borrowed as a full input block, and all arithmetic remains in the old leaf.
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[derive(Clone,Copy)]
+pub(super) struct AbPairedBandArgs {
+    pub(super) x_hi:usize, pub(super) lo_bits:usize, pub(super) bank_bits:usize,
+    pub(super) odd_end:usize, pub(super) compact:bool, pub(super) first_write:bool,
+    pub(super) pf_windows:usize, pub(super) spread:bool,
+}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(always)]
+fn paired_ab_live_base(x:usize,first:usize,compact:bool)->usize {
+    if compact { (x>>1)*1856+((x&1)*16+first-2)*64 }
+    else { x*1024+first*64 }
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(always)]
+unsafe fn paired_ab_group<const ODD:usize,const WRITE:bool,const FAST:bool>(
+    mut source:*const u8,stride:usize,mat:&[u64;256],banks:&mut[u8],
+    even_pf:&mut AbDirectPrefetch,odd_pf:&mut AbDirectPrefetch,pf_step:usize,
+)->*const u8 {
+    for pair in banks.chunks_exact_mut(2048) {
+        let(even,odd)=pair.split_at_mut(1024);
+        // Only initialized live rows are referenced; compact padding is skipped.
+        paired_ab_leaf_selected::<2,16,WRITE,FAST>(core::slice::from_raw_parts(source,896),mat,even.try_into().unwrap(),even_pf);
+        paired_ab_leaf_selected::<0,ODD,WRITE,FAST>(core::slice::from_raw_parts(source.add(896),ODD*64),mat,odd.try_into().unwrap(),odd_pf);
+        source=source.wrapping_add(stride);
+        even_pf.next_window=even_pf.next_window.wrapping_add(pf_step);
+        odd_pf.next_window=odd_pf.next_window.wrapping_add(pf_step);
+    }
+    source
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(never)]
+unsafe fn paired_ab_impl<const ODD:usize,const FAST:bool>(a:&AbPairedBandArgs,source:&[u8],mats:&[u64],banks:&mut[u8]) {
+    assert!(ODD==14||ODD==15);assert!(a.bank_bits>=1&&a.bank_bits<=a.lo_bits&&a.lo_bits<usize::BITS as usize);
+    let big_lo=1usize<<a.lo_bits;let bank_count=1usize<<a.bank_bits;
+    assert_eq!(banks.len(),bank_count.checked_mul(1024).unwrap());
+    assert_eq!(mats.len(),(big_lo/bank_count).checked_mul(256).unwrap());
+    let x_base=a.x_hi.checked_mul(big_lo).unwrap();
+    x_base.checked_add(big_lo-1).unwrap().checked_add(a.pf_windows).unwrap();
+    let stride=if a.compact{1856}else{2048};
+    let first=(x_base/2).checked_mul(stride).unwrap().checked_add(if a.compact{0}else{128}).unwrap();
+    let last=first.checked_add((big_lo/2-1).checked_mul(stride).unwrap()).unwrap().checked_add(896+ODD*64).unwrap();
+    assert!(last<=source.len());
+    let make_pf=|x:usize| {
+        if a.pf_windows==0 {return AbDirectPrefetch{next_window:core::ptr::null(),first:0,end:0,spread:a.spread};}
+        let next=x+a.pf_windows;let f=if next&1==0{2}else{0};let n=if next&1==0{16}else{ODD};
+        AbDirectPrefetch{next_window:source.as_ptr().wrapping_add(paired_ab_live_base(next,f,a.compact)),first:f,end:n,spread:a.spread}
+    };
+    let mut ep=make_pf(x_base);let mut op=make_pf(x_base+1);
+    let pf_step=if a.pf_windows==0{0}else{stride};
+    let mut src=source.as_ptr().add(first);let mut chunks=mats.chunks_exact(256);
+    let first_mat=chunks.next().unwrap().try_into().unwrap();
+    src=if a.first_write{paired_ab_group::<ODD,true,FAST>(src,stride,first_mat,banks,&mut ep,&mut op,pf_step)}
+        else{paired_ab_group::<ODD,false,FAST>(src,stride,first_mat,banks,&mut ep,&mut op,pf_step)};
+    for chunk in chunks{src=paired_ab_group::<ODD,false,FAST>(src,stride,chunk.try_into().unwrap(),banks,&mut ep,&mut op,pf_step);}
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(never)]
+pub(super) fn convert_ab_nomul_gfni_paired_band(a:&AbPairedBandArgs,source:&[u8],mats:&[u64],banks:&mut[u8]) {
+    // A nonzero even look-ahead keeps the input's parity and live row span.
+    // Decode this stable plan once for the band. Other hint modes use the
+    // general leaf, including disabled and non-spread configurations.
+    let fast=a.spread && a.pf_windows!=0 && a.pf_windows%2==0;
+    unsafe{match(a.odd_end,fast){
+        (14,true)=>paired_ab_impl::<14,true>(a,source,mats,banks),
+        (15,true)=>paired_ab_impl::<15,true>(a,source,mats,banks),
+        (14,false)=>paired_ab_impl::<14,false>(a,source,mats,banks),
+        (15,false)=>paired_ab_impl::<15,false>(a,source,mats,banks),
+        _=>panic!("unsupported odd span"),
+    }}
+}
+
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+mod paired_ab_band_oracle_tests {
+use super::*;
+fn baseline_band(a:&AbPairedBandArgs,source:&[u8],mats:&[u64],banks:&mut[u8]) {
+    let counts=[16u8,a.odd_end as u8];let big_lo=1usize<<a.lo_bits;
+    let bank_mask=(1usize<<a.bank_bits)-1;
+    for x_lo in 0..big_lo {
+        let x=x_lo|(a.x_hi<<a.lo_bits);let end=counts[x&1] as usize;
+        if end==0 {continue;}
+        let first=if x&1==0 {2}else{0};
+        let base=paired_ab_live_base(x,first,a.compact);
+        let (ne,nb,nf)=if a.pf_windows!=0 {
+            let next=x.wrapping_add(a.pf_windows);let nf=if next&1==0{2}else{0};
+            (counts[next&1] as usize,paired_ab_live_base(next,nf,a.compact),nf)
+        }else{(0,0,0)};
+        let w=x_lo>>a.bank_bits;let u=x_lo&bank_mask;
+        let mat:&[u64;256]=mats[w*256..(w+1)*256].try_into().unwrap();
+        let bank:&mut[u8;1024]=(&mut banks[u*1024..(u+1)*1024]).try_into().unwrap();
+        let rows=&source[base..base+(end-first)*64];
+        let pf=AbDirectPrefetch{next_window:if a.pf_windows==0{core::ptr::null()}else{source.as_ptr().wrapping_add(nb)},first:nf,end:ne,spread:a.spread};
+        if a.first_write&&w==0{convert_ab_nomul_gfni_direct::<true>(rows,first,end,mat,bank,&pf);}
+        else{convert_ab_nomul_gfni_direct::<false>(rows,first,end,mat,bank,&pf);}
+    }
+}
+fn rng(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+fn scalar(a:&AbPairedBandArgs,source:&[u8],mats:&[u64],banks:&mut[u8]) {
+    let count=1usize<<a.bank_bits;
+    for xlo in 0..1usize<<a.lo_bits {
+        let x=xlo+a.x_hi*(1usize<<a.lo_bits);let first=if x%2==0{2}else{0};let end=if x%2==0{16}else{a.odd_end};
+        // Express the compact indexing separately from the vector drivers.
+        let base=if a.compact{(x/2)*29*64+if x%2==0{0}else{14*64}}else{x*16*64+first*64};
+        let u=xlo%count;let w=xlo/count;
+        for k in 0..16{for lane in 0..64 {
+            let mut out=if a.first_write&&w==0{0}else{banks[u*1024+k*64+lane]};
+            for bm in first..end {
+                let v=source[base+(bm-first)*64+lane];let matrix=mats[w*256+bm*16+k];
+                let mut q=0;
+                for bit in 0..8{q|=(((v&((matrix>>(8*(7-bit)))as u8)).count_ones()&1)as u8)<<bit;}
+                out^=q;
+            }
+            banks[u*1024+k*64+lane]=out;
+        }}
+    }
+}
+#[test]
+fn actual_paired_ab_band_matches_scalar(){
+    let mut seed=0xa754c31496u64;let mut cases=0;let mut windows=0;
+    for odd_end in [14,15]{for compact in [false,true]{for first_write in [false,true]{
+    for &(lo_bits,bank_bits) in &[(1,1),(3,1),(3,2),(5,3)]{for mode in 0..4 {
+        let a=AbPairedBandArgs{x_hi:mode%3,lo_bits,bank_bits,odd_end,compact,first_write,pf_windows:mode,spread:mode%2==0};
+        let off=[0,1,7,31][mode];let stride=if compact{1856}else{2048};
+        let size=((a.x_hi+1)*(1usize<<lo_bits)/2)*stride;
+        let mut source=vec![0u8;size+off];let mut mats=vec![0u64;(1usize<<(lo_bits-bank_bits))*256];
+        for x in &mut source{*x=match mode{0=>0,1=>255,_=>rng(&mut seed)as u8};}for m in &mut mats{*m=rng(&mut seed);}
+        let len=(1usize<<bank_bits)*1024;let mut initial=vec![0xceu8;len+64];for x in &mut initial[off..off+len]{*x=rng(&mut seed)as u8;}
+        let mut b=initial.clone();let mut c=initial.clone();let source_before=source.clone();let mats_before=mats.clone();
+        baseline_band(std::hint::black_box(&a),std::hint::black_box(&source[off..]),std::hint::black_box(&mats),&mut b[off..off+len]);
+        convert_ab_nomul_gfni_paired_band(std::hint::black_box(&a),std::hint::black_box(&source[off..]),std::hint::black_box(&mats),&mut c[off..off+len]);
+
+        {
+            assert_eq!(b,c,"complete paired-band case {cases}");
+            // Full arbitrary-matrix scalar oracle on every short geometry and
+            // a representative long geometry for both output modes/layouts.
+            if lo_bits<=3||mode==2{let mut expected=initial.clone();scalar(&a,&source[off..],&mats,&mut expected[off..off+len]);assert_eq!(b,expected,"scalar case {cases}");}
+        }
+        assert_eq!(source,source_before);assert_eq!(mats,mats_before);
+        assert_eq!(&c[..off],&initial[..off]);assert_eq!(&c[off+len..],&initial[off+len..]);
+        cases+=1;windows+=1usize<<lo_bits;
+    }}}}}
+    println!("PASS {cases} band cases, {windows} windows per implementation; guards and immutable inputs checked");
+}
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(always)]
+unsafe fn paired_ab_leaf_selected<const FIRST:usize,const N:usize,const WRITE:bool,const FAST:bool>(
+    src:&[u8],mat:&[u64;256],bank:&mut[u8;1024],pf:&AbDirectPrefetch,
+) {
+    if FAST {x86_64::convert_ab_nomul_x86_gfni_direct_fixed_prefetch::<FIRST,N,WRITE>(src,mat,bank,pf)}
+    else {x86_64::convert_ab_nomul_x86_gfni_direct::<FIRST,N,WRITE>(src,mat,bank,pf)}
+}
