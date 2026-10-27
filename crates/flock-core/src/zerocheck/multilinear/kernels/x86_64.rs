@@ -2555,14 +2555,17 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
 /// on this box, so the miss is still partly in flight when the next refill
 /// asks for it.
 ///
-/// Three tiles puts a full two extra iterations (~2 400 uops) behind the
-/// hint while keeping every tile covered — tile `T+3` is requested at
-/// iteration `T`, so each tile is still prefetched exactly once, just
-/// earlier. Nothing is added and nothing moves: the same sixteen
-/// `prefetcht0` instructions issue at the same point, only the address
-/// changes, and a prefetch has no architectural effect, so the folded
-/// values are bit-identical either way.
-const ZC_PKT_PF_TILES: usize = 3;
+/// Six tiles puts a full five extra iterations (~8 500 uops, of the order of
+/// 2 500 cycles) behind the hint while keeping every tile covered — tile
+/// `T+6` is requested at iteration `T`, so each tile is still prefetched
+/// exactly once, just earlier. Six tiles of two 512-byte sides is 6 KiB of
+/// lines in flight per refill stream, far inside L2. Nothing is added and
+/// nothing moves: the same sixteen `prefetcht0` instructions issue at the
+/// same point, only the address changes, and a prefetch has no architectural
+/// effect, so the folded values are bit-identical either way. The address
+/// arithmetic wraps, so a look-ahead that runs past the tail of a packet is
+/// still just a hint.
+const ZC_PKT_PF_TILES: usize = 6;
 
 /// `FLOCK_NO_ZC_PKT_PF_FAR=1` restores the incumbent one-tile look-ahead in
 /// both packed-row prefetches (exact same-binary A/B).

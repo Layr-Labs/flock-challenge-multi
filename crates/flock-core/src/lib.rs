@@ -731,6 +731,12 @@ pub(crate) fn collapse_hugepages(_ptr: *mut u8, _bytes: usize) -> bool {
     true
 }
 
+/// Existing large uninitialized-allocation layout, shared with the prover recycler.
+#[doc(hidden)]
+pub const UNINIT_VEC_LARGE_MIN_BYTES: usize = 2 << 20;
+#[doc(hidden)]
+pub const UNINIT_VEC_TAIL_PAGES: usize = 96;
+
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
 ///
@@ -756,9 +762,9 @@ pub(crate) fn alloc_uninit_vec<T: Copy>(n: usize) -> Vec<T> {
     // those already go straight to mmap. Applying it to small allocations would
     // push them over glibc's 128 KiB M_MMAP_THRESHOLD and turn heap bumps into
     // mmap syscalls — measured at -8% before this gate was added.
-    const EY_TAIL_PAGES: usize = 96;
+    const EY_TAIL_PAGES: usize = UNINIT_VEC_TAIL_PAGES;
     let bytes = n * core::mem::size_of::<T>();
-    let tail = if bytes >= (2 << 20) {
+    let tail = if bytes >= UNINIT_VEC_LARGE_MIN_BYTES {
         core::hint::black_box(EY_TAIL_PAGES) * 4096 / core::mem::size_of::<T>().max(1)
     } else {
         0
