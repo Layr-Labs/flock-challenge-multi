@@ -532,7 +532,6 @@ pub(crate) unsafe fn gfni_fold_rows(
     }
 }
 
-
 /// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
 /// sixteen byte-plane accumulators until the last tile has been consumed.
 ///

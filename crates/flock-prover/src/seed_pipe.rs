@@ -522,37 +522,66 @@ fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
 
 const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
-static PRESEED_SPIN: AtomicBool = AtomicBool::new(false);
+// Pre-seed waiting belongs to one serial proof invocation. Even epochs are
+// live; the low bit marks the invocation stopped. Old queued callbacks must
+// never become live again when a later invocation starts. Exhaustion disables
+// only this optional waiting activity. Seed/proof work and publication do not
+// depend on admission to these callbacks.
+static PRESEED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Release the pre-seed spinners. Called once the witness phase is done (and
-/// unconditionally after every body that started them).
 #[inline]
 pub(crate) fn preseed_spin_end() {
-    PRESEED_SPIN.store(false, Ordering::Release);
+    PRESEED_EPOCH.fetch_or(1, Ordering::Release);
 }
 
-fn preseed_spinner(backoff: usize) {
-    while PRESEED_SPIN.load(Ordering::Acquire) {
+fn next_epoch() -> Option<u64> {
+    PRESEED_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            (old & !1).checked_add(2)
+        })
+        .ok()
+        .map(|old| (old & !1) + 2)
+}
+
+fn preseed_spinner(epoch: u64, owner: usize, backoff: usize) {
+    if PRESEED_EPOCH.load(Ordering::Acquire) != epoch
+        || rayon::current_thread_index() == Some(owner)
+    {
+        return;
+    }
+    let Some(_admission) = crate::hot_pool::CallbackGuard::try_enter() else {
+        return;
+    };
+    for _ in 0..2048 {
+        if PRESEED_EPOCH.load(Ordering::Acquire) != epoch {
+            return;
+        }
         if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
             for _ in 0..backoff {
                 core::hint::spin_loop();
             }
         }
     }
+    if PRESEED_EPOCH.load(Ordering::Acquire) == epoch {
+        rayon::spawn(move || preseed_spinner(epoch, owner, backoff));
+    }
 }
 
-/// Start spinners on every pool worker except the caller (which must be one).
 fn preseed_spin_start() {
     let Some(owner) = rayon::current_thread_index() else {
         return;
     };
+    let Some(epoch) = next_epoch() else {
+        // Exhaustion disables only the optional activity, never proof work.
+        preseed_spin_end();
+        return;
+    };
     let n = rayon::current_num_threads().max(1);
     let sibling = (owner + n / 2) % n;
-    PRESEED_SPIN.store(true, Ordering::Release);
     rayon::spawn_broadcast(move |ctx| {
         let me = ctx.index();
         if me != owner {
-            preseed_spinner(if me == sibling { 64 } else { 8 });
+            preseed_spinner(epoch, owner, if me == sibling { 64 } else { 8 });
         }
     });
 }
@@ -784,7 +813,14 @@ fn make_sized_tmp(path: PathBuf, len: usize) -> Option<SizedTmp> {
             let _ = std::fs::remove_file(&path);
             return None;
         }
-        let base = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, file.as_raw_fd(), 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
         if base.is_null() || base as usize == usize::MAX {
             let _ = std::fs::remove_file(&path);
             return None;
@@ -857,7 +893,10 @@ fn drop_sized_set(set: SizedSet) {
 /// published (rename included); `Err(bytes)` when the incumbent tail must
 /// write `bytes` (the exact `to_bytes()` output); `None` when no set or no
 /// stash exists and the caller must encode from scratch.
-fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
+fn publish_sized(
+    path: &Path,
+    bundle: &R1csProofBundleLigerito,
+) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
     let guard = SIZED_SET.lock().unwrap_or_else(|e| e.into_inner());
     let set = guard.as_ref()?;
     let enc = bundle.raw_encoding()?;
@@ -1263,7 +1302,11 @@ fn speculative_main(
     drop(warm);
 
     on_hot_worker(hot, move || {
-        let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
+        let line_r = if hot {
+            spin_read_line_fd(real_stdin)
+        } else {
+            read_line_fd(real_stdin)
+        };
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);
@@ -1684,5 +1727,59 @@ mod tests {
             close(fds[0]);
             close(fds[1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn epoch_stop_restart_exhaustion_and_stale_callback() {
+        PRESEED_EPOCH.store(1, Ordering::Release);
+        let old = next_epoch().unwrap();
+        assert_eq!(old, 2);
+        preseed_spin_end();
+        let current = next_epoch().unwrap();
+        assert_eq!(current, 4);
+        // An old callback cannot enter the new invocation, even off-pool.
+        preseed_spinner(old, usize::MAX, 0);
+        assert_eq!(PRESEED_EPOCH.load(Ordering::Acquire), current);
+        PRESEED_EPOCH.store(u64::MAX - 2, Ordering::Release);
+        assert_eq!(next_epoch(), Some(u64::MAX - 1));
+        preseed_spin_end();
+        assert_eq!(next_epoch(), None);
+        assert_eq!(PRESEED_EPOCH.load(Ordering::Acquire), u64::MAX);
+        // Restore the initial test state before independent integration stress.
+        PRESEED_EPOCH.store(1, Ordering::Release);
+        for n in [1usize, 2, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap();
+            let completed = AtomicUsize::new(0);
+            pool.install(|| {
+                for _ in 0..128 {
+                    // Calls use the real production callbacks and shared guard.
+                    preseed_spin_start();
+                    let epoch = PRESEED_EPOCH.load(Ordering::Acquire);
+                    let owner = rayon::current_thread_index().unwrap();
+                    // Running on the owner must not enter a waiting loop.
+                    preseed_spinner(epoch, owner, 0);
+                    rayon::scope(|scope| {
+                        for _ in 0..16 {
+                            scope.spawn(|_| {
+                                completed.fetch_add(1, Ordering::Relaxed);
+                            });
+                        }
+                    });
+                    preseed_spin_end();
+                    assert_eq!(PRESEED_EPOCH.load(Ordering::Acquire) & 1, 1);
+                }
+            });
+            assert_eq!(completed.load(Ordering::Relaxed), 128 * 16);
+            drop(pool);
+        }
+        preseed_spin_end();
     }
 }

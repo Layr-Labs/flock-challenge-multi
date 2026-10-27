@@ -321,7 +321,9 @@ pub(crate) mod smt_split {
                     assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
                     assert_eq!(&ab[..cores], &(0..cores).collect::<Vec<_>>());
                     assert_eq!(c, (cores..2 * cores - moved).collect::<Vec<_>>());
-                    if moved != 0 { assert_eq!(ab.last(), Some(&(2 * cores - 1))); }
+                    if moved != 0 {
+                        assert_eq!(ab.last(), Some(&(2 * cores - 1)));
+                    }
                 }
             }
         }
@@ -610,6 +612,9 @@ pub mod hot_pool {
         if rayon::current_thread_index() == Some(owner) || !at_top_level() {
             return;
         }
+        let Some(_admission) = CallbackGuard::try_enter() else {
+            return;
+        };
         for _ in 0..spins_per_job() {
             if !run.load(Ordering::Acquire) {
                 return;
@@ -621,6 +626,32 @@ pub mod hot_pool {
             }
         }
         rayon::spawn(move || spinner(run, owner, backoff));
+    }
+
+    std::thread_local! {
+        static CALLBACK_ACTIVE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    /// A callback may yield to ordinary work, but cannot admit another
+    /// background callback above itself on the same thread's stack.
+    pub struct CallbackGuard(core::marker::PhantomData<std::rc::Rc<()>>);
+
+    impl CallbackGuard {
+        pub fn try_enter() -> Option<Self> {
+            CALLBACK_ACTIVE.with(|active| {
+                if active.replace(true) {
+                    None
+                } else {
+                    Some(Self(core::marker::PhantomData))
+                }
+            })
+        }
+    }
+
+    impl Drop for CallbackGuard {
+        fn drop(&mut self) {
+            CALLBACK_ACTIVE.with(|active| active.set(false));
+        }
     }
 
     pub struct HotPool(Arc<AtomicBool>);
@@ -651,6 +682,40 @@ pub mod hot_pool {
     impl Drop for HotPool {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    mod callback_lifecycle_tests {
+        use super::*;
+        #[test]
+        fn callback_guard_unwinds_and_excludes_nested_admission() {
+            let first = CallbackGuard::try_enter().unwrap();
+            assert!(CallbackGuard::try_enter().is_none());
+            assert!(CallbackGuard::try_enter().is_none());
+            drop(first);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _guard = CallbackGuard::try_enter().unwrap();
+                    panic!("intentional guard unwind");
+                })
+                .is_err()
+            );
+            assert!(CallbackGuard::try_enter().is_some());
+        }
+        #[test]
+        fn callback_guard_is_thread_local() {
+            let _guard = CallbackGuard::try_enter().unwrap();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _other = CallbackGuard::try_enter().unwrap();
+                        assert!(CallbackGuard::try_enter().is_none());
+                    })
+                    .join()
+                    .unwrap();
+            });
+            assert!(CallbackGuard::try_enter().is_none());
         }
     }
 }

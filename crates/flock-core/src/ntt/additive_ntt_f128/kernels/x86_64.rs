@@ -172,7 +172,6 @@ unsafe fn mul_x4_high_one_parts(
     )
 }
 
-
 /// Store four F128 lanes. `NT` uses XMM `MOVNTDQ` so a cold codeword publish
 /// skips write-allocate; dest must be 16-byte aligned. Temporal `storeu`
 /// otherwise. Scalar twin: [`store_f128`].
@@ -3812,10 +3811,13 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
                 _mm512_maskz_shuffle_epi32::<0x40>(0xcccc, v),
                 _mm512_clmulepi64_epi128::<0x01>(v, _mm512_set1_epi64(0x87)),
             );
-            let first = _mm512_permutex2var_epi64(v,
-                _mm512_setr_epi64(0,1,8,9,2,3,10,11), shifted);
-            let last = _mm512_permutex2var_epi64(v,
-                _mm512_setr_epi64(4,5,12,13,6,7,14,15), shifted);
+            let first =
+                _mm512_permutex2var_epi64(v, _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11), shifted);
+            let last = _mm512_permutex2var_epi64(
+                v,
+                _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15),
+                shifted,
+            );
             let out = result.pairs.as_mut_ptr().add(i) as *mut __m512i;
             _mm512_storeu_si512(out, first);
             _mm512_storeu_si512(out.add(1), last);
@@ -3828,8 +3830,10 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
             let v = _mm_set_epi64x(t[i].hi as i64, t[i].lo as i64);
             let reduction = _mm_clmulepi64_si128::<0x01>(v, _mm_set_epi64x(0, 0x87));
             let folded = _mm_xor_si128(_mm_slli_si128::<8>(v), reduction);
-            F128::new(_mm_cvtsi128_si64(folded) as u64,
-                      _mm_extract_epi64::<1>(folded) as u64)
+            F128::new(
+                _mm_cvtsi128_si64(folded) as u64,
+                _mm_extract_epi64::<1>(folded) as u64,
+            )
         };
         result.pairs[i] = [t[i], companion];
     }
@@ -3997,7 +4001,6 @@ mod ab_ntt_tail_composition_tests {
         }
         println!("3900 production companions match the independent bitwise oracle");
     }
-
 
     fn oracle_rows(
         data: &mut [F128],
@@ -4197,13 +4200,23 @@ mod ab_ntt_tail_composition_tests {
         two_rows::<true, true, true>(0);
     }
 
-
     fn rows<const H: u8>() -> usize {
         let shapes = [
-            (128, 64), (8, 64), (4, 64), (1, 64),
-            (1024, 8), (128, 8), (64, 8), (16, 8),
-            (8, 8), (4, 8), (2, 8), (1, 8),
-            (3, 7), (2, 13), (5, 16),
+            (128, 64),
+            (8, 64),
+            (4, 64),
+            (1, 64),
+            (1024, 8),
+            (128, 8),
+            (64, 8),
+            (16, 8),
+            (8, 8),
+            (4, 8),
+            (2, 8),
+            (1, 8),
+            (3, 7),
+            (2, 13),
+            (5, 16),
         ];
         let mut seed = 0xc751_8234_daf3_981b;
         let guard = F128::new(0x3ca9_8546_b721_936d, 0xcaa9_d173_985e_4693);
@@ -4249,8 +4262,14 @@ mod ab_ntt_tail_composition_tests {
                 unsafe {
                     let prepared = prepare_four(black_box(&tw)).unwrap();
                     row_prepared::<H>(
-                        black_box(data.as_mut_ptr().add(offset)), s, n, lanes,
-                        r, black_box(&tw), pf_r, black_box(&prepared),
+                        black_box(data.as_mut_ptr().add(offset)),
+                        s,
+                        n,
+                        lanes,
+                        r,
+                        black_box(&tw),
+                        pf_r,
+                        black_box(&prepared),
                     );
                 }
                 assert_eq!(tw, original_tw);

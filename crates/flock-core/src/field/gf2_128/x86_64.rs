@@ -706,12 +706,7 @@ impl WideGhashX4 {
     /// `avx512f` + `vpclmulqdq` available (cfg-gated + attr).
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
-    pub unsafe fn fold4_and_reduce(
-        a0: Self,
-        a1: Self,
-        a2: Self,
-        a3: Self,
-    ) -> __m512i {
+    pub unsafe fn fold4_and_reduce(a0: Self, a1: Self, a2: Self, a3: Self) -> __m512i {
         // SAFETY: caller carries avx512f+vpclmulqdq.
         unsafe {
             let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
