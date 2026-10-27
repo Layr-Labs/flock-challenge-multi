@@ -3239,7 +3239,8 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     unsafe {
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2)
+            && [z, a, b].iter().all(|&p| (p as usize).is_multiple_of(64));
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [

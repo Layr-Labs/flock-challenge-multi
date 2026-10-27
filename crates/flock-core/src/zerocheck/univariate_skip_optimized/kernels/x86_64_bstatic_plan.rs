@@ -32,6 +32,20 @@ pub(crate) struct BstaticRow {
     pub(crate) vary: u8,
 }
 
+impl BstaticRow {
+    pub(crate) const fn known_one_bytes(self) -> u8 {
+        let mut known = 0;
+        let mut j = 0;
+        while j < 8 {
+            if ((self.mask & self.expected) >> (8 * j)) & 0xff == 0xff {
+                known |= 1 << j;
+            }
+            j += 1;
+        }
+        known
+    }
+}
+
 pub(crate) const ROW_GENERIC: u8 = 0;
 pub(crate) const ROW_STATIC: u8 = 1;
 pub(crate) const ROW_ZERO: u8 = 2;

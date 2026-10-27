@@ -1287,8 +1287,8 @@ impl CscCircuit {
             target_feature = "vpclmulqdq"
         ))]
         unsafe {
-            use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
-            let (alpha_vec, alpha_x64) = ghash_broadcast_split(alpha);
+            use crate::field::gf2_128::x86_64::ghash_broadcast_split;
+            let (alpha_vec, _) = ghash_broadcast_split(alpha);
             let n4 = out_chunk.len() & !3;
             let mut i = 0;
             while i < n4 {
@@ -1329,8 +1329,7 @@ impl CscCircuit {
                     ),
                     sb3,
                 );
-                let prod = ghash_mul_x4_split(sa_zmm, alpha_vec, alpha_x64);
-                let res = _mm512_xor_si512(prod, sb_zmm);
+                let res = kernels::fold_alpha_four(sa_zmm, sb_zmm, alpha_vec);
                 _mm512_storeu_si512(out_chunk.as_mut_ptr().add(i) as *mut __m512i, res);
                 i += 4;
             }

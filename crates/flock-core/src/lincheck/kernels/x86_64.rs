@@ -1,5 +1,29 @@
 use super::super::{F128, build_sum_table};
 
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+pub(crate) unsafe fn fold_alpha_four(
+    a: core::arch::x86_64::__m512i,
+    b: core::arch::x86_64::__m512i,
+    alpha: core::arch::x86_64::__m512i,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    use crate::field::gf2_128::x86_64::ghash_reduce_acc_x4;
+    unsafe {
+        let lo = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(a, alpha),
+            _mm512_maskz_mov_epi64(0x55, b),
+        );
+        let hi = _mm512_clmulepi64_epi128::<0x11>(a, alpha);
+        let mid = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_clmulepi64_epi128::<0x01>(a, alpha),
+            _mm512_clmulepi64_epi128::<0x10>(a, alpha),
+            _mm512_bsrli_epi128::<8>(b),
+        );
+        ghash_reduce_acc_x4(lo, mid, hi)
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

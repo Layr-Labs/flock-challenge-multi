@@ -2952,6 +2952,25 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                     for half in 0..(n_here / SIMD) {
                         let base = GROUP * g + half * SIMD;
                         let off = half * SIMD * F128_PER_BLOCK;
+                        if stage.is_none() {
+                            for j in 0..SIMD {
+                                let input = match blocks {
+                                    crate::seed_pipe::BlockSource::Slice(s) =>
+                                        *s.get(base + j).unwrap_or(padding),
+                                    crate::seed_pipe::BlockSource::Closed { init, len } =>
+                                        if base + j < len { crate::seed_pipe::gen_block(init, base + j) }
+                                        else { *padding },
+                                };
+                                let at = off + j * F128_PER_BLOCK;
+                                build_block_witness_ab_packed_into(
+                                    &input.0, &input.1, input.2, input.3, input.4,
+                                    std::slice::from_raw_parts_mut(z_out.as_mut_ptr().add(at).cast(), K / 64),
+                                    std::slice::from_raw_parts_mut(a_out.as_mut_ptr().add(at).cast(), K / 64),
+                                    std::slice::from_raw_parts_mut(b_out.as_mut_ptr().add(at).cast(), K / 64),
+                                );
+                            }
+                            continue;
+                        }
                         // Streaming arm: the drain transforms each 64-byte
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
@@ -3061,7 +3080,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                 // the dump loop above could not cover (unreachable at every
                 // power-of-two shape ≥ 8; kept so the two arms stay observably
                 // identical). Reads a/b back.
-                let j0 = if win_ab.is_some() || stage.is_some() {
+                let j0 = if stage.is_some() {
                     (n_here / SIMD) * SIMD
                 } else {
                     0

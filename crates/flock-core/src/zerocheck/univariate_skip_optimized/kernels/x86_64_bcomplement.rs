@@ -21,15 +21,7 @@ struct WindowPlan {
 
 /// Do not use BstaticRow::vary: the old plan clears it for seven varying bytes.
 const fn known_one_bytes(row: BstaticRow) -> u8 {
-    let mut known = 0u8;
-    let mut j = 0;
-    while j < 8 {
-        if (row.mask >> (8 * j)) & 0xff == 0xff && (row.expected >> (8 * j)) & 0xff == 0xff {
-            known |= 1 << j;
-        }
-        j += 1;
-    }
-    known
+    row.known_one_bytes()
 }
 
 /// 0: dense; 1..7: low n bytes known; 8..14: high n bytes known; 15: all known.
@@ -424,6 +416,14 @@ unsafe fn apply_b_complement_img<
 ) -> __m512i {
     const COMPLEMENT_OFFSETS: u64 = 0x3fc0_3fc0_3fc0_3fc0;
     unsafe {
+        if END == FIRST + 1 {
+            let at = if P { (FIRST & 1) * 32 + FIRST / 2 } else { FIRST };
+            let offset = usize::from(op.add(at).read() ^ 0x3fc0);
+            let row = _mm512_loadu_si512(imgs.0.add((FIRST % I as usize) * IMAGE_STRIDE_64 + offset).cast());
+            return if I == 4 && FIRST >= 4 {
+                _mm512_shuffle_i64x2::<0x4e>(row, row)
+            } else { row };
+        }
         let (wa, wb) = if P {
             let has_even = FIRST == 0
                 || (FIRST <= 2 && END > 2)
@@ -533,6 +533,15 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
 ) -> __m512i {
     const COMPLEMENT_OFFSETS: u64 = 0x3fc0_3fc0_3fc0_3fc0;
     unsafe {
+        if END == FIRST + 1 {
+            let at = if P { (FIRST & 1) * 32 + FIRST / 2 } else { FIRST };
+            let offset = usize::from(op.add(at).read() ^ 0x3fc0);
+            let image = if FIRST & 1 == 0 { imgs.0 } else { imgs.1 };
+            let mut row = _mm512_loadu_si512(image.add(offset).cast());
+            if FIRST & 4 != 0 { row = _mm512_shuffle_i64x2::<0x4e>(row, row); }
+            if FIRST & 2 != 0 { row = _mm512_shuffle_i64x2::<0xb1>(row, row); }
+            return row;
+        }
         // An offset is byte << 6, so complementing a byte XORs exactly these
         // eight bits. Do not complement the u16 itself or touch the arena.
         // `wa`/`wb` are (bytes 0..4, bytes 4..8) in byte order and (even

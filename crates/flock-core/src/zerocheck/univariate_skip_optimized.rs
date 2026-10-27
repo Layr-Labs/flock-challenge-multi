@@ -4442,10 +4442,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     };
     let res_ab = if zc_r1ab_claim_enabled() && rayon::current_thread_index().is_some() {
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let n_threads = rayon::current_num_threads();
-        let slots: Vec<std::sync::Mutex<Option<[F128; ELL]>>> =
-            (0..n_threads).map(|_| std::sync::Mutex::new(None)).collect();
-        rayon::broadcast(|ctx| {
+        let slots = rayon::broadcast(|_| {
             let mut state: Option<WorkerStateAbOnly> = None;
             loop {
                 let x_hi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4454,13 +4451,11 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 }
                 band(state.get_or_insert_with(WorkerStateAbOnly::new), x_hi);
             }
-            if let Some(state) = state {
-                *slots[ctx.index()].lock().unwrap() = Some(state.local_res_ab);
-            }
+            state.map(|state| state.local_res_ab)
         });
         let mut res = [F128::ZERO; ELL];
         for slot in slots {
-            if let Some(part) = slot.into_inner().unwrap() {
+            if let Some(part) = slot {
                 for i in 0..ELL {
                     res[i] += part[i];
                 }

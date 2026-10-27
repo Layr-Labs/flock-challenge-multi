@@ -523,6 +523,7 @@ fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
 const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 static PRESEED_SPIN: AtomicBool = AtomicBool::new(false);
+static PRESEED_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Release the pre-seed spinners. Called once the witness phase is done (and
 /// unconditionally after every body that started them).
@@ -549,11 +550,13 @@ fn preseed_spin_start() {
     let n = rayon::current_num_threads().max(1);
     let sibling = (owner + n / 2) % n;
     PRESEED_SPIN.store(true, Ordering::Release);
+    PRESEED_JOBS.fetch_add(n, Ordering::AcqRel);
     rayon::spawn_broadcast(move |ctx| {
         let me = ctx.index();
         if me != owner {
             preseed_spinner(if me == sibling { 64 } else { 8 });
         }
+        PRESEED_JOBS.fetch_sub(1, Ordering::Release);
     });
 }
 
@@ -589,12 +592,16 @@ fn on_hot_worker<R: Send>(hot: bool, f: impl FnOnce() -> R + Send) -> R {
     if !hot {
         return f();
     }
-    flock_core::in_pool(|| {
+    let result = flock_core::in_pool(|| {
         let _guard = SpinGuard;
         flock_core::set_pool_owner(true);
         preseed_spin_start();
         f()
-    })
+    });
+    while PRESEED_JOBS.load(Ordering::Acquire) != 0 {
+        std::thread::yield_now();
+    }
+    result
 }
 
 /// [`read_line_fd`] that waits by polling a non-blocking descriptor instead of
@@ -810,6 +817,10 @@ fn make_sized_tmp(path: PathBuf, len: usize) -> Option<SizedTmp> {
 /// leaves no set) if anything fails; the caller then rehearses the incumbent
 /// tail.
 fn setup_sized_set(path: &Path, bundle: &R1csProofBundleLigerito) -> bool {
+    let mut slot = SIZED_SET.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = slot.take() {
+        drop_sized_set(old);
+    }
     let Some(enc) = bundle.raw_encoding() else {
         return false;
     };
@@ -841,7 +852,7 @@ fn setup_sized_set(path: &Path, bundle: &R1csProofBundleLigerito) -> bool {
         drop_sized_set(set);
         return false;
     }
-    *SIZED_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(set);
+    *slot = Some(set);
     true
 }
 
@@ -931,10 +942,10 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     file.write_all(&bytes)?;
     flock_core::gaptime::abs("written");
     file.set_len(bytes.len() as u64)?;
-    drop(file);
-    flock_core::gaptime::abs("closed");
     let r = std::fs::rename(temporary, path);
     flock_core::gaptime::abs("renamed");
+    drop(file);
+    flock_core::gaptime::abs("closed");
     drop(bytes);
     flock_core::gaptime::abs("bytes dropped");
     flock_core::gaptime::abs_flush();

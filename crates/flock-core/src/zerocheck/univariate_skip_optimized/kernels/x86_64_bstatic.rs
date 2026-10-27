@@ -47,6 +47,7 @@ pub(crate) struct BstaticPartials {
     /// (kill switch + table shape), so the per-window kernel reads a plain
     /// bool from an already-resident line instead of entering a `OnceLock`.
     img2: bool,
+    unit_b: bool,
 }
 
 /// Process-wide cache of the partial images together with a fingerprint of the
@@ -77,8 +78,11 @@ fn build_partials(inv_table: &InvNttTableByteSingleGf8) -> Box<BstaticPartials> 
     let mut out = Box::new(BstaticPartials {
         rows: [[[0u8; 64]; 8]; BSTATIC_BLOCKS],
         img2: apply_2img_for(inv_table),
+        unit_b: false,
     });
     let mut f = [F8::ZERO; 64];
+    inv_table.apply(&[0xff; 8], &mut f);
+    out.unit_b = f.iter().all(|&v| v == F8::ONE);
     for blk in 0..BSTATIC_BLOCKS {
         for k in 0..8 {
             let p = BSTATIC_PLAN[blk][k];
@@ -285,9 +289,23 @@ unsafe fn all_static_acc<const IMG2: bool>(
     table8: *const u8,
     a_base: *const u8,
     parts: *const u8,
+    unit_b: bool,
 ) -> __m512i {
     // SAFETY: forwarded from the caller's contract.
     unsafe {
+        if unit_b {
+            let apply = |k| if IMG2 {
+                apply_full_2img(table, table8, a_base.add(k * N_CHUNKS))
+            } else {
+                apply_full(table, a_base.add(k * N_CHUNKS))
+            };
+            let mut acc = apply(7);
+            let x = _mm512_set1_epi8(2);
+            for k in (0..7).rev() {
+                acc = _mm512_xor_si512(_mm512_gf2p8mul_epi8(acc, x), apply(k));
+            }
+            return acc;
+        }
         let mut acc = _mm512_setzero_si512();
         for k in 0..8usize {
             let av = if IMG2 {
@@ -400,9 +418,9 @@ unsafe fn kernel<const BLK: usize>(
             // parameter of the row loop, not a per-row branch.
             let parts = partials.rows[BLK].as_ptr() as *const u8;
             let acc = if img2 {
-                all_static_acc::<true>(table, table8, a_base, parts)
+                all_static_acc::<true>(table, table8, a_base, parts, partials.unit_b && BLK < 2)
             } else {
-                all_static_acc::<false>(table, table8, a_base, parts)
+                all_static_acc::<false>(table, table8, a_base, parts, partials.unit_b && BLK < 2)
             };
             super::x86_64::store_out64(out, acc, nt);
             return true;

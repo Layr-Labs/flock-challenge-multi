@@ -177,9 +177,28 @@ impl<'a> RootOctaWriter<'a> {
     #[inline(always)]
     unsafe fn select_pair(mask: u64, first: __m512i, second: __m512i) -> __m512i {
         unsafe {
+            #[cfg(target_feature = "avx512vbmi")]
+            let select = {
+                const INDEX: [u8; 64] = {
+                    let mut a = [0; 64];
+                    let mut i = 0;
+                    while i < 64 {
+                        a[i] = ((i / 32) * 4 + i % 4) as u8;
+                        i += 1;
+                    }
+                    a
+                };
+                _mm512_permutexvar_epi8(
+                    _mm512_loadu_si512(INDEX.as_ptr().cast()),
+                    _mm512_set1_epi64(mask as i64),
+                )
+            };
+            #[cfg(not(target_feature = "avx512vbmi"))]
+            let select = {
             let lo = _mm256_set1_epi32(mask as u32 as i32);
             let hi = _mm256_set1_epi32((mask >> 32) as u32 as i32);
-            let select = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi);
+            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
+            };
             _mm512_ternarylogic_epi64::<0xca>(select, first, second)
         }
     }
@@ -198,14 +217,21 @@ impl<'a> RootOctaWriter<'a> {
                 emit(batch.leading_out as usize * 512, Self::select_pair(batch.leading_mask, self.carry, next));
                 self.pending = false;
             }
-            for op in &self.plan.full[batch.full_start as usize..batch.full_end as usize] {
-                emit(op.out as usize, Self::load_pair::<STATIC_B>(a, b, op.source as usize));
-            }
-            for op in &self.plan.pairs[batch.pair_start as usize..batch.pair_end as usize] {
-                debug_assert!(!self.pending);
-                let first = Self::load_pair::<STATIC_B>(a, b, op.source as usize);
-                let second = Self::load_pair::<STATIC_B>(a, b, op.source as usize + 64);
-                emit(op.out as usize, Self::select_pair(op.mask, first, second));
+            let full = &self.plan.full[batch.full_start as usize..batch.full_end as usize];
+            let pairs = &self.plan.pairs[batch.pair_start as usize..batch.pair_end as usize];
+            let (mut f, mut p) = (0, 0);
+            while f < full.len() || p < pairs.len() {
+                if p == pairs.len() || (f < full.len() && full[f].out < pairs[p].out) {
+                    let op = full[f];
+                    emit(op.out as usize, Self::load_pair::<STATIC_B>(a, b, op.source as usize));
+                    f += 1;
+                } else {
+                    let op = pairs[p];
+                    let first = Self::load_pair::<STATIC_B>(a, b, op.source as usize);
+                    let second = Self::load_pair::<STATIC_B>(a, b, op.source as usize + 64);
+                    emit(op.out as usize, Self::select_pair(op.mask, first, second));
+                    p += 1;
+                }
             }
             if batch.tail_source != u16::MAX {
                 let value = Self::load_pair::<STATIC_B>(a, b, batch.tail_source as usize);
@@ -287,6 +313,18 @@ mod tests {
             writer.emit_range(0, 0, 16, a.as_ptr().cast(), b.as_ptr().cast());
             _mm_sfence();
         }
+        let mut batched = Box::new(Tile([0xa5; 176 * 512]));
+        unsafe {
+            let mut writer = RootOctaWriter::new(&plan, batched.0.as_mut_ptr().add(3 * 64));
+            writer.emit_range(16, 16, 16, a.as_ptr().cast(), b.as_ptr().cast());
+            for base in (32..512).step_by(32) {
+                writer.emit_range(base, 0, 32,
+                    a.as_ptr().add(base).cast(), b.as_ptr().add(base).cast());
+            }
+            writer.emit_range(0, 0, 16, a.as_ptr().cast(), b.as_ptr().cast());
+            _mm_sfence();
+        }
+        assert_eq!(batched.0, out.0, "batch selector agrees with generic selector");
         for group in 0..176 {
             for stripe in 0..8 {
                 for column in 0..64 {

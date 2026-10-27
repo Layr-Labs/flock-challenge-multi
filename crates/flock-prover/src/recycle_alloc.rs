@@ -16,6 +16,7 @@ const RECYCLE_MIN: usize = 32 * 1024;
 const MAX_ALIGN: usize = 16;
 const MAX_CLASSES: usize = 512;
 
+#[repr(align(64))]
 struct Class {
     size: AtomicUsize,
     head: Mutex<usize>,

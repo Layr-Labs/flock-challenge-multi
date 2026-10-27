@@ -337,6 +337,16 @@ impl RootTileCache {
                             }
                         }
                         for block in 0..self.blocks {
+                            if block + 1 < self.blocks {
+                                for slot in 0..count {
+                                    unsafe {
+                                        let next = self.storage.0.as_ptr().add(self.offset).cast::<u8>()
+                                            .add(((tile + slot) * self.blocks + block + 1) * 512);
+                                        _mm_prefetch::<_MM_HINT_T0>(next.cast());
+                                        _mm_prefetch::<_MM_HINT_T0>(next.add(64).cast());
+                                    }
+                                }
+                            }
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
                             // and actual tile stride is blocks*512. Arrays of

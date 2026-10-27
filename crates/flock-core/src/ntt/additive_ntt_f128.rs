@@ -4611,12 +4611,12 @@ impl AdditiveNttF128 {
                         &tw3,
                     );
                 }
+                if j % 2 == 1 {
+                    let start = (j - 1) * 8;
+                    let lo = sub_idx * sub_size_positions + b * block_size4 + start;
+                    cb(lo..lo + 16, &blk[start * num_ntts..(start + 16) * num_ntts]);
+                }
             }
-            let lo = sub_idx * sub_size_positions + b * block_size4;
-            cb(
-                lo..lo + block_size4,
-                &sub_data[b * block_bytes4..(b + 1) * block_bytes4],
-            );
         }
         true
     }
