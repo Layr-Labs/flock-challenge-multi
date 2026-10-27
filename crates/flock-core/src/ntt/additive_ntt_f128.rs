@@ -546,7 +546,7 @@ struct DeepBlock {
     hi: usize,
 }
 
-/// Single-producer / single-consumer ring for one SMT pair.
+/// Single-producer ring; shared readers serialize descriptor copies only.
 #[cfg(target_os = "linux")]
 #[repr(align(64))]
 struct DeepQueue {
@@ -555,12 +555,14 @@ struct DeepQueue {
     tail: std::sync::atomic::AtomicUsize, // next to consume
     done: std::sync::atomic::AtomicBool,  // producer will publish no more
     gone: std::sync::atomic::AtomicBool,  // consumer left (panic)
+    pop_claim: std::sync::atomic::AtomicBool, // shared-reader copy ownership
 }
 
-// SAFETY: exactly one producer writes `slots[head % cap]` before publishing
-// `head` with Release, and exactly one consumer reads it after an Acquire
-// load of `head`; the bounded ring keeps the producer from lapping the
-// consumer, so no slot is written while it may be read.
+// SAFETY: one producer publishes slots with Release. Strict mode has one
+// consumer. Shared mode grants pop_claim to one copying consumer at a time;
+// either mode releases tail only after its copies finish. The bounded ring
+// therefore prevents producer reuse while any descriptor is being read.
+// Strict and shared consumers are selected once per pass and never mixed.
 #[cfg(target_os = "linux")]
 unsafe impl Sync for DeepQueue {}
 
@@ -584,6 +586,7 @@ impl DeepQueue {
             tail: std::sync::atomic::AtomicUsize::new(0),
             done: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
+            pop_claim: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Publish a block, waiting while the consumer is more than `depth`
@@ -622,28 +625,31 @@ impl DeepQueue {
         self.head.store(h + 1, Ordering::Release);
         true
     }
-    /// Claim the oldest published block, if any. Safe with several
-    /// consumers: the slot is copied before the claiming CAS, and the
-    /// producer cannot rewrite slot `t % CAP` before `tail` has moved past
-    /// `t` (it never runs more than `depth <= CAP` ahead of `tail`), in which
-    /// case this CAS fails and the copy is discarded.
-    fn try_pop(&self) -> Option<DeepBlock> {
+    /// Copy a bounded batch while holding exclusive consumer ownership.
+    /// Tail is released only after every descriptor has been copied, so the
+    /// producer cannot recycle any slot still being read. Callbacks run after
+    /// ownership is released; no hashing happens in this short critical section.
+    fn try_pop_batch<const N: usize>(&self, out: &mut [DeepBlock; N]) -> usize {
         use std::sync::atomic::Ordering;
-        let mut t = self.tail.load(Ordering::Acquire);
-        loop {
-            if self.head.load(Ordering::Acquire) <= t {
-                return None;
-            }
-            // SAFETY: published with Release before the Acquire above.
-            let b = unsafe { *self.slots[t % Self::CAP].get() };
-            match self
-                .tail
-                .compare_exchange_weak(t, t + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Some(b),
-                Err(cur) => t = cur,
-            }
+        if N == 0 || self.head.load(Ordering::Acquire) <= self.tail.load(Ordering::Acquire) {
+            return 0;
         }
+        if self.pop_claim.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return 0;
+        }
+        let t = self.tail.load(Ordering::Relaxed);
+        let h = self.head.load(Ordering::Acquire);
+        let n = (h - t).min(N);
+        for (i, dst) in out[..n].iter_mut().enumerate() {
+            // SAFETY: one consumer holds pop_claim; published head bounds
+            // this range and unchanged tail prevents producer reuse.
+            *dst = unsafe { *self.slots[(t + i) % Self::CAP].get() };
+        }
+        if n != 0 {
+            self.tail.store(t + n, Ordering::Release);
+        }
+        self.pop_claim.store(false, Ordering::Release);
+        n
     }
     fn is_empty(&self) -> bool {
         use std::sync::atomic::Ordering;
@@ -3810,27 +3816,25 @@ impl AdditiveNttF128 {
             };
             // Shared drain: own ring first, then every other pair's, until
             // all producers are done and every ring is empty.
-            let help = |own: usize| loop {
-                if let Some(b) = queues[own].try_pop() {
-                    run(b);
-                    continue;
-                }
-                let mut got = false;
-                for k in 1..n_pairs {
-                    if let Some(b) = queues[(own + k) % n_pairs].try_pop() {
-                        run(b);
-                        got = true;
-                        break;
+            let help = |own: usize| {
+                let mut batch = [DeepBlock { ptr: 0, len_f128: 0, lo: 0, hi: 0 }; 4];
+                loop {
+                    let mut count = queues[own].try_pop_batch(&mut batch);
+                    if count == 0 {
+                        for k in 1..n_pairs {
+                            count = queues[(own + k) % n_pairs].try_pop_batch(&mut batch);
+                            if count != 0 { break; }
+                        }
                     }
+                    if count != 0 {
+                        for &block in &batch[..count] { run(block); }
+                        continue;
+                    }
+                    if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty()) {
+                        return;
+                    }
+                    std::hint::spin_loop();
                 }
-                if got {
-                    continue;
-                }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
-                {
-                    return;
-                }
-                std::hint::spin_loop();
             };
             if producer {
                 let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
