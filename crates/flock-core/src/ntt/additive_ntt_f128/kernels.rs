@@ -1153,3 +1153,72 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
         butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, &t.raw)
     }
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[derive(Clone, Copy)]
+pub(crate) struct SeedPublish64Block {
+    pub(crate) quads: [[F128; 6]; 16],
+    pub(crate) low_modes: [u8; 16],
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(super) struct SeedPublish64Plan {
+    pub(super) blocks: [SeedPublish64Block; 8],
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl SeedPublish64Plan {
+    pub(super) fn new(four: &[FourBlock], raw: &[[[F128; 3]; 16]]) -> Option<Self> {
+        if four.len() != 8 || raw.len() != 8 {
+            return None;
+        }
+        #[cfg(target_feature = "avx512bw")]
+        {
+            // Existing cached four-layer plans prove that both multiplication
+            // diet and preparation remain enabled; no new process flag exists.
+            if four.iter().any(|x| x.cache.is_none()) {
+                return None;
+            }
+            let input: &[[[F128; 3]; 16]; 8] = raw.try_into().ok()?;
+            let mut result = Self {
+                blocks: [SeedPublish64Block {
+                    quads: [[F128::ZERO; 6]; 16],
+                    low_modes: [0; 16],
+                }; 8],
+            };
+            unsafe {
+                x86_64::seed_publish64_prepare(input, &mut result.blocks);
+            }
+            let low_enabled = !low_twiddle_disabled();
+            for b in 0..8 {
+                for q in 0..16 {
+                    let [outer, a, b_inner] = input[b][q];
+                    result.blocks[b].low_modes[q] = (u8::from(low_enabled && outer.hi == 0))
+                        | (u8::from(low_enabled && a.hi == 0 && b_inner.hi == 0) << 1);
+                }
+            }
+            Some(result)
+        }
+        #[cfg(not(target_feature = "avx512bw"))]
+        {
+            None
+        }
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg(target_feature = "avx512bw")]
+pub(super) use x86_64::seed_publish64_block;
