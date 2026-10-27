@@ -4102,71 +4102,118 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     let ab_inner_ptr = ab_inner.as_ptr();
     let pf_spread = zc_r1ab_pf_spread_enabled();
     let bank_mask = (1usize << bank_bits) - 1;
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-        if n_b_med == 0 {
-            continue;
+    let retained = {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        {
+            unsafe {
+                try_ab_bank_windows_x86(
+                    x_hi,
+                    big_lo_size,
+                    n_lo,
+                    within_outer_mask,
+                    b_med_counts,
+                    ab_inner,
+                    mats,
+                    bank_bits,
+                    eq_bot.len(),
+                    plane_first_write,
+                    ranked_one_rows_elided,
+                    ranked_compact,
+                    pf_windows,
+                    pf_spread,
+                    &mut state.plane_banks,
+                )
+            }
         }
-        let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
-            2
-        } else {
-            0
-        };
-        let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
-        let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
-            let x_ahead = x_outer.wrapping_add(pf_windows);
-            let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
-            let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            false
+        }
+    };
+    if !retained {
+        for x_outer_lo in 0..big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
                 2
             } else {
                 0
             };
-            (
-                n_next,
-                live_row_base(x_ahead, next_first, ranked_compact),
-                next_first,
-            )
-        } else {
-            (0, 0, 0)
-        };
-        let w_idx = x_outer_lo >> bank_bits;
-        let u = x_outer_lo & bank_mask;
-        let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
-            .try_into()
-            .expect("one 16x16 qword matrix block per w");
-        let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks[u * 16 * ELL..(u + 1) * 16 * ELL])
-            .try_into()
-            .expect("one plane bank per low index");
-        let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
-        let prefetch = kernels::AbDirectPrefetch {
-            next_window: if pf_windows == 0 {
-                core::ptr::null()
+            let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+            let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+                let x_ahead = x_outer.wrapping_add(pf_windows);
+                let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
+                let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                };
+                (
+                    n_next,
+                    live_row_base(x_ahead, next_first, ranked_compact),
+                    next_first,
+                )
             } else {
-                ab_inner_ptr.wrapping_add(next_live_base)
-            },
-            first: next_first_b_med,
-            end: n_next,
-            spread: pf_spread,
-        };
-        if plane_first_write && w_idx == 0 {
-            kernels::convert_ab_nomul_gfni_direct::<true>(
-                live_rows,
-                first_b_med,
-                n_b_med,
-                mats_w,
-                bank,
-                &prefetch,
-            );
-        } else {
-            kernels::convert_ab_nomul_gfni_direct::<false>(
-                live_rows,
-                first_b_med,
-                n_b_med,
-                mats_w,
-                bank,
-                &prefetch,
-            );
+                (0, 0, 0)
+            };
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & bank_mask;
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                [u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+            let prefetch = kernels::AbDirectPrefetch {
+                next_window: if pf_windows == 0 {
+                    core::ptr::null()
+                } else {
+                    ab_inner_ptr.wrapping_add(next_live_base)
+                },
+                first: next_first_b_med,
+                end: n_next,
+                spread: pf_spread,
+            };
+            if plane_first_write && w_idx == 0 {
+                kernels::convert_ab_nomul_gfni_direct::<true>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            } else {
+                kernels::convert_ab_nomul_gfni_direct::<false>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            }
         }
     }
     let wide = r1_eqfold_x4_enabled();
@@ -6699,4 +6746,343 @@ mod tests {
 /// Compile-time structural B mode for ranked eight-row projection.
 pub const fn round1_ranked_bcomplement_mode(blk: usize, k: usize) -> u8 {
     kernels::x86_64_bcomplement::window_mode(blk, k)
+}
+
+/// Retain each selected plane bank across four consecutive w values.
+/// The caller has allocated the complete bank array; all other shapes use
+/// the established window-major loop.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_ab_bank_windows_x86(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    mats: &[u64],
+    bank_bits: usize,
+    eq_bot_len: usize,
+    plane_first_write: bool,
+    ranked_one_rows_elided: bool,
+    ranked_compact: bool,
+    pf_windows: usize,
+    pf_spread: bool,
+    plane_banks: &mut [u8],
+) -> bool {
+    if !ranked_one_rows_elided
+        || !ranked_compact
+        || within_outer_mask != 1
+        || b_med_counts != [16, 14]
+        || bank_bits == 0
+        || !(pf_windows == 0 || (pf_windows == 2 && pf_spread))
+    {
+        return false;
+    }
+    let banks = 1usize << bank_bits;
+    if eq_bot_len != banks
+        || big_lo_size == 0
+        || big_lo_size % banks != 0
+        || plane_banks.len() != banks * 16 * ELL
+    {
+        return false;
+    }
+    let windows = big_lo_size / banks;
+    if mats.len() != windows * 256 {
+        return false;
+    }
+    let stride = (banks / 2) * RANKED_AB_COMPACT_BLOCK_BYTES;
+    let hint_bytes = if pf_windows == 0 {
+        0
+    } else {
+        RANKED_AB_COMPACT_BLOCK_BYTES
+    };
+    for first_w in (0..windows).step_by(4) {
+        let count = (windows - first_w).min(4);
+        let maps = &mats[first_w * 256..(first_w + count) * 256];
+        for bank in 0..banks {
+            let x_outer = ((first_w << bank_bits) | bank) | (x_hi << n_lo);
+            let first_b_med = if x_outer & 1 == 0 { 2 } else { 0 };
+            let row_in_block = (x_outer & 1) * 16 + first_b_med;
+            let live_base =
+                (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL;
+            // Each selected window exposes exactly fourteen initialized rows.
+            // The gap between compact blocks is preserved, not read as a row.
+            let rows = &ab_inner[live_base..live_base + (count - 1) * stride + 14 * ELL];
+            let output: &mut [u8; 16 * ELL] = (&mut plane_banks
+                [bank * 16 * ELL..(bank + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank");
+            // SAFETY: the checked slices cover all strided windows, complete
+            // map blocks and output bytes. Immutable input/maps are disjoint
+            // from the exclusive bank. count is nonzero and at most four.
+            unsafe {
+                kernels::x86_64::convert_ab_bank_windows_x86(
+                    rows.as_ptr(),
+                    maps.as_ptr(),
+                    output.as_mut_ptr(),
+                    stride,
+                    count,
+                    hint_bytes,
+                    first_b_med,
+                    plane_first_write && first_w == 0,
+                );
+            }
+        }
+    }
+    true
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+mod ab_bank_windows_tests {
+    use super::*;
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn original_direct_control(
+        x_hi: usize,
+        big_lo_size: usize,
+        n_lo_and_inner: usize,
+        within_outer_mask: usize,
+        b_med_counts: &[u8],
+        ab_inner: &[u8],
+        eq_hi_val: F128,
+        eq_bot: &[F128],
+        mats: &[u64],
+        bank_bits: usize,
+        plane_first_write: bool,
+        plane_cache: bool,
+        ranked_one_rows_elided: bool,
+        ranked_compact: bool,
+        state: &mut WorkerStateAbOnly,
+    ) {
+        debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
+        debug_assert!(
+            ranked_one_rows_elided
+                && within_outer_mask == 1
+                && (b_med_counts == [16, 15] || b_med_counts == [16, 14])
+        );
+        debug_assert!(!ranked_compact || ranked_one_rows_elided);
+        let plane_len = eq_bot.len() * 16 * ELL;
+        if state.plane_banks.len() != plane_len {
+            if state.cached_plane_banks {
+                state.cached_plane_banks = false;
+                give_ranked_ab_plane(core::mem::take(&mut state.plane_banks));
+            }
+            state.plane_banks = if plane_cache {
+                state.cached_plane_banks = true;
+                take_ranked_ab_plane()
+            } else if plane_first_write {
+                crate::alloc_uninit_vec(plane_len)
+            } else {
+                vec![0u8; plane_len]
+            };
+        } else if !plane_first_write {
+            state.plane_banks.fill(0);
+        }
+        let n_lo = n_lo_and_inner - N_INNER;
+        #[inline(always)]
+        fn live_row_base(x_outer: usize, first_b_med: usize, compact: bool) -> usize {
+            if compact {
+                let row_in_block = (x_outer & 1) * (1 << N_MEDIUM) + first_b_med;
+                debug_assert!((2..31).contains(&row_in_block));
+                (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (row_in_block - 2) * ELL
+            } else {
+                x_outer * (1 << N_MEDIUM) * ELL + first_b_med * ELL
+            }
+        }
+        let pf_windows = if zc_r1ab_pf_enabled() {
+            ZC_R1AB_PF_WINDOWS
+        } else {
+            0
+        };
+        let ab_inner_ptr = ab_inner.as_ptr();
+        let pf_spread = zc_r1ab_pf_spread_enabled();
+        let bank_mask = (1usize << bank_bits) - 1;
+        for x_outer_lo in 0..big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let first_b_med = if ranked_one_rows_elided && (x_outer & within_outer_mask) == 0 {
+                2
+            } else {
+                0
+            };
+            let live_base = live_row_base(x_outer, first_b_med, ranked_compact);
+            let (n_next, next_live_base, next_first_b_med) = if pf_windows != 0 {
+                let x_ahead = x_outer.wrapping_add(pf_windows);
+                let n_next = b_med_counts[x_ahead & within_outer_mask] as usize;
+                let next_first = if ranked_one_rows_elided && (x_ahead & within_outer_mask) == 0 {
+                    2
+                } else {
+                    0
+                };
+                (
+                    n_next,
+                    live_row_base(x_ahead, next_first, ranked_compact),
+                    next_first,
+                )
+            } else {
+                (0, 0, 0)
+            };
+            let w_idx = x_outer_lo >> bank_bits;
+            let u = x_outer_lo & bank_mask;
+            let mats_w: &[u64; 256] = (&mats[w_idx * 256..(w_idx + 1) * 256])
+                .try_into()
+                .expect("one 16x16 qword matrix block per w");
+            let bank: &mut [u8; 16 * ELL] = (&mut state.plane_banks
+                [u * 16 * ELL..(u + 1) * 16 * ELL])
+                .try_into()
+                .expect("one plane bank per low index");
+            let live_rows = &ab_inner[live_base..live_base + (n_b_med - first_b_med) * ELL];
+            let prefetch = kernels::AbDirectPrefetch {
+                next_window: if pf_windows == 0 {
+                    core::ptr::null()
+                } else {
+                    ab_inner_ptr.wrapping_add(next_live_base)
+                },
+                first: next_first_b_med,
+                end: n_next,
+                spread: pf_spread,
+            };
+            if plane_first_write && w_idx == 0 {
+                kernels::convert_ab_nomul_gfni_direct::<true>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            } else {
+                kernels::convert_ab_nomul_gfni_direct::<false>(
+                    live_rows,
+                    first_b_med,
+                    n_b_med,
+                    mats_w,
+                    bank,
+                    &prefetch,
+                );
+            }
+        }
+        let wide = r1_eqfold_x4_enabled();
+        if wide {
+            unsafe {
+                kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    eq_hi_val,
+                    &mut state.local_res_ab,
+                );
+            }
+            return;
+        }
+        fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
+    }
+    fn rng(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+    #[test]
+    fn retained_windows_match_original_complete_bank_and_collapse() {
+        let mut seed = 0x8134957ab2cdef12u64;
+        let mut cases = 0;
+        for (bank_bits, w_bits) in [(1, 0), (1, 1), (3, 2), (3, 3), (7, 5)] {
+            let banks = 1usize << bank_bits;
+            let windows = 1usize << w_bits;
+            let n_lo = bank_bits + w_bits;
+            let big_lo_size = banks * windows;
+            let maps: Vec<u64> = (0..windows * 256).map(|_| rng(&mut seed)).collect();
+            let eq: Vec<F128> = (0..banks)
+                .map(|_| F128 {
+                    lo: rng(&mut seed),
+                    hi: rng(&mut seed),
+                })
+                .collect();
+            let eq_hi = F128 {
+                lo: rng(&mut seed),
+                hi: rng(&mut seed),
+            };
+            for compact in [true, false] {
+                let block = if compact {
+                    RANKED_AB_COMPACT_BLOCK_BYTES
+                } else {
+                    RANKED_AB_DENSE_BLOCK_BYTES
+                };
+                let input: Vec<u8> = (0..big_lo_size * block)
+                    .map(|_| rng(&mut seed) as u8)
+                    .collect();
+                for first_write in [false, true] {
+                    for x_hi in [0, 1] {
+                        let mut expected = WorkerStateAbOnly::new();
+                        let mut got = WorkerStateAbOnly::new();
+                        unsafe {
+                            original_direct_control(
+                                x_hi,
+                                big_lo_size,
+                                n_lo + N_INNER,
+                                1,
+                                &[16, 14],
+                                &input,
+                                eq_hi,
+                                &eq,
+                                &maps,
+                                bank_bits,
+                                first_write,
+                                false,
+                                true,
+                                compact,
+                                &mut expected,
+                            );
+                            process_one_x_hi_ab_only_direct_x86(
+                                x_hi,
+                                big_lo_size,
+                                n_lo + N_INNER,
+                                1,
+                                &[16, 14],
+                                &input,
+                                eq_hi,
+                                &eq,
+                                &maps,
+                                bank_bits,
+                                first_write,
+                                false,
+                                true,
+                                compact,
+                                &mut got,
+                            );
+                        }
+                        assert_eq!(
+                            got.plane_banks, expected.plane_banks,
+                            "banks={banks} windows={windows} compact={compact} first={first_write} xhi={x_hi}"
+                        );
+                        assert_eq!(got.local_res_ab, expected.local_res_ab);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("COMPLETE_BANK_AND_COLLAPSE_CASES={cases}");
+    }
 }

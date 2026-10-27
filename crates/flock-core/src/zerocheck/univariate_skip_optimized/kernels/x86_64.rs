@@ -1,4 +1,94 @@
 #[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+core::arch::global_asm!(include_str!("ab_bank_windows.S"), options(raw));
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+unsafe extern "C" {
+    fn flock_ab_bank_windows_0_0(
+        rows: *const u8,
+        mats: *const u64,
+        bank: *mut u8,
+        stride: usize,
+        count: usize,
+        hint_bytes: usize,
+    );
+    fn flock_ab_bank_windows_0_1(
+        rows: *const u8,
+        mats: *const u64,
+        bank: *mut u8,
+        stride: usize,
+        count: usize,
+        hint_bytes: usize,
+    );
+    fn flock_ab_bank_windows_2_0(
+        rows: *const u8,
+        mats: *const u64,
+        bank: *mut u8,
+        stride: usize,
+        count: usize,
+        hint_bytes: usize,
+    );
+    fn flock_ab_bank_windows_2_1(
+        rows: *const u8,
+        mats: *const u64,
+        bank: *mut u8,
+        stride: usize,
+        count: usize,
+        hint_bytes: usize,
+    );
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) unsafe fn convert_ab_bank_windows_x86(
+    rows: *const u8,
+    mats: *const u64,
+    bank: *mut u8,
+    stride: usize,
+    count: usize,
+    hint_bytes: usize,
+    first: usize,
+    first_write: bool,
+) {
+    debug_assert!(count > 0 && count <= 4 && (first == 0 || first == 2));
+    // SAFETY: the caller supplies the complete checked strided source, maps
+    // and exclusive bank. The leaf obeys the ordinary SysV C ABI.
+    unsafe {
+        match (first, first_write) {
+            (0, false) => flock_ab_bank_windows_0_0(rows, mats, bank, stride, count, hint_bytes),
+            (0, true) => flock_ab_bank_windows_0_1(rows, mats, bank, stride, count, hint_bytes),
+            (2, false) => flock_ab_bank_windows_2_0(rows, mats, bank, stride, count, hint_bytes),
+            (2, true) => flock_ab_bank_windows_2_1(rows, mats, bank, stride, count, hint_bytes),
+            _ => unreachable!("only checked compact spans use this entry"),
+        }
+    }
+}
+
+#[cfg(all(
     target_feature = "avx512f",
     target_feature = "avx512bw",
     target_feature = "avx512vbmi",
