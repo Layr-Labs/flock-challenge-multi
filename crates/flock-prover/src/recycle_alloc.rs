@@ -35,6 +35,13 @@ fn class_slot(size: usize) -> usize {
 
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
+    // Retain only exact power-of-two sizes. A 64-bit Layout can have at
+    // most 48 such classes at or above 32 KiB, so one-use intermediate
+    // sizes cannot saturate the permanent table. Alignment of every large
+    // allocation still follows recyclable(), independently of retention.
+    if !size.is_power_of_two() {
+        return None;
+    }
     let start = class_slot(size);
     for probe in 0..MAX_CLASSES {
         let i = (start + probe) % MAX_CLASSES;
@@ -205,6 +212,64 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn power_two_retention_preserves_alignment_contents_and_bypass() {
+        use super::*;
+        use std::sync::Barrier;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        for size in RECYCLE_MIN..RECYCLE_MIN + 4096 {
+            if !size.is_power_of_two() {
+                assert!(find_class(size, false).is_none());
+                assert!(find_class(size, true).is_none());
+            }
+        }
+        let barrier = Barrier::new(8);
+        let reused = AtomicUsize::new(0);
+        let bypassed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for lane in 0..8usize {
+                let (barrier, reused, bypassed) = (&barrier, &reused, &bypassed);
+                scope.spawn(move || {
+                    for round in 0..24usize {
+                        let size = (RECYCLE_MIN << (round % 3)) + if round % 2 == 0 { 0 } else { 24 };
+                        let layout = Layout::from_size_align(size, 8).unwrap();
+                        unsafe {
+                            let block = RecycleAlloc.alloc(layout);
+                            assert!(!block.is_null());
+                            let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
+                            if hit { assert!(size.is_power_of_two()); reused.fetch_add(1, Relaxed); }
+                            if !size.is_power_of_two() { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            assert_eq!(block as usize % 64, 0);
+                            let value = (lane + 1 + round * 8) as u8;
+                            core::ptr::write_bytes(block, value, size);
+                            barrier.wait();
+                            assert!(core::slice::from_raw_parts(block, size).iter().all(|&v| v == value));
+                            barrier.wait();
+                            RecycleAlloc.dealloc(block, layout);
+                            let zeroed = RecycleAlloc.alloc_zeroed(layout);
+                            assert!(!zeroed.is_null());
+                            let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
+                            if hit { assert!(size.is_power_of_two()); reused.fetch_add(1, Relaxed); }
+                            if !size.is_power_of_two() { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            assert_eq!(zeroed as usize % 64, 0);
+                            assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&v| v == 0));
+                            RecycleAlloc.dealloc(zeroed, layout);
+                        }
+                    }
+                });
+            }
+        });
+        let occupied = CLASSES.iter().filter(|c| {
+            let size = c.size.load(Acquire);
+            assert!(size == 0 || size.is_power_of_two());
+            size != 0
+        }).count();
+        assert!(occupied <= (usize::BITS - 1 - RECYCLE_MIN.trailing_zeros()) as usize);
+        assert_eq!(bypassed.load(Relaxed), 192);
+        eprintln!("REUSED_ALLOCATIONS={}", reused.load(Relaxed));
+    }
     /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
     /// recyclable-class allocation — fresh from System, recycled off the
     /// freelist, and grown through realloc — returns a 64-aligned pointer
