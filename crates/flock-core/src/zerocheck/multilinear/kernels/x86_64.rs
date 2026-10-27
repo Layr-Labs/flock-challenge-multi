@@ -1,3 +1,243 @@
+#[cfg(all(target_arch="x86_64", target_feature="avx512f", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+core::arch::global_asm!(r#".intel_syntax noprefix
+.text
+.global flock_round2_resident_accum_lo
+.type flock_round2_resident_accum_lo, @function
+flock_round2_resident_accum_lo:
+vmovdqu64 zmm0, [rsi+0]
+vmovdqu64 zmm1, [rsi+64]
+vmovdqu64 zmm2, [rsi+128]
+vmovdqu64 zmm3, [rsi+192]
+vmovdqu64 zmm4, [rsi+256]
+vmovdqu64 zmm5, [rsi+320]
+vmovdqu64 zmm6, [rsi+384]
+vmovdqu64 zmm7, [rsi+448]
+vmovdqu64 zmm8, [rsi+512]
+vmovdqu64 zmm9, [rsi+576]
+vmovdqu64 zmm10, [rsi+640]
+vmovdqu64 zmm11, [rsi+704]
+test rcx, rcx
+jz .Lflock_r2_resident_done_lo
+.Lflock_r2_resident_pair_lo:
+mov eax, dword ptr [rdx]
+lea r10, [rdi+rax]
+mov eax, dword ptr [rdx+4]
+lea r11, [rdi+rax]
+vmovdqu64 zmm12, [r10+0]
+vmovdqu64 zmm13, [r10+256]
+vmovdqu64 zmm14, [r10+512]
+vmovdqu64 zmm15, [r10+768]
+vmovdqu64 zmm16, [r10+4096]
+vmovdqu64 zmm17, [r10+4352]
+vmovdqu64 zmm18, [r10+4608]
+vmovdqu64 zmm19, [r10+4864]
+vmovdqu64 zmm20, [r11+0]
+vmovdqu64 zmm21, [r11+256]
+vmovdqu64 zmm22, [r11+512]
+vmovdqu64 zmm23, [r11+768]
+vmovdqu64 zmm24, [r11+4096]
+vmovdqu64 zmm25, [r11+4352]
+vmovdqu64 zmm26, [r11+4608]
+vmovdqu64 zmm27, [r11+4864]
+vpclmulqdq zmm28, zmm13, zmm17, 0
+vpclmulqdq zmm29, zmm21, zmm25, 0
+vpclmulqdq zmm30, zmm13, zmm17, 17
+vpclmulqdq zmm31, zmm21, zmm25, 17
+vpternlogq zmm0, zmm28, zmm29, 0x96
+vpternlogq zmm1, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm13, zmm17, 1
+vpclmulqdq zmm29, zmm13, zmm17, 16
+vpclmulqdq zmm30, zmm21, zmm25, 1
+vpclmulqdq zmm31, zmm21, zmm25, 16
+vpternlogq zmm2, zmm28, zmm29, 0x96
+vpternlogq zmm2, zmm30, zmm31, 0x96
+vpxorq zmm12, zmm12, zmm13
+vpxorq zmm16, zmm16, zmm17
+vpxorq zmm20, zmm20, zmm21
+vpxorq zmm24, zmm24, zmm25
+vpclmulqdq zmm28, zmm12, zmm16, 0
+vpclmulqdq zmm29, zmm20, zmm24, 0
+vpclmulqdq zmm30, zmm12, zmm16, 17
+vpclmulqdq zmm31, zmm20, zmm24, 17
+vpternlogq zmm3, zmm28, zmm29, 0x96
+vpternlogq zmm4, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm12, zmm16, 1
+vpclmulqdq zmm29, zmm12, zmm16, 16
+vpclmulqdq zmm30, zmm20, zmm24, 1
+vpclmulqdq zmm31, zmm20, zmm24, 16
+vpternlogq zmm5, zmm28, zmm29, 0x96
+vpternlogq zmm5, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm15, zmm19, 0
+vpclmulqdq zmm29, zmm23, zmm27, 0
+vpclmulqdq zmm30, zmm15, zmm19, 17
+vpclmulqdq zmm31, zmm23, zmm27, 17
+vpternlogq zmm6, zmm28, zmm29, 0x96
+vpternlogq zmm7, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm15, zmm19, 1
+vpclmulqdq zmm29, zmm15, zmm19, 16
+vpclmulqdq zmm30, zmm23, zmm27, 1
+vpclmulqdq zmm31, zmm23, zmm27, 16
+vpternlogq zmm8, zmm28, zmm29, 0x96
+vpternlogq zmm8, zmm30, zmm31, 0x96
+vpxorq zmm14, zmm14, zmm15
+vpxorq zmm18, zmm18, zmm19
+vpxorq zmm22, zmm22, zmm23
+vpxorq zmm26, zmm26, zmm27
+vpclmulqdq zmm28, zmm14, zmm18, 0
+vpclmulqdq zmm29, zmm22, zmm26, 0
+vpclmulqdq zmm30, zmm14, zmm18, 17
+vpclmulqdq zmm31, zmm22, zmm26, 17
+vpternlogq zmm9, zmm28, zmm29, 0x96
+vpternlogq zmm10, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm14, zmm18, 1
+vpclmulqdq zmm29, zmm14, zmm18, 16
+vpclmulqdq zmm30, zmm22, zmm26, 1
+vpclmulqdq zmm31, zmm22, zmm26, 16
+vpternlogq zmm11, zmm28, zmm29, 0x96
+vpternlogq zmm11, zmm30, zmm31, 0x96
+add rdx, 8
+dec rcx
+jnz .Lflock_r2_resident_pair_lo
+.Lflock_r2_resident_done_lo:
+vmovdqu64 [rsi+0], zmm0
+vmovdqu64 [rsi+64], zmm1
+vmovdqu64 [rsi+128], zmm2
+vmovdqu64 [rsi+192], zmm3
+vmovdqu64 [rsi+256], zmm4
+vmovdqu64 [rsi+320], zmm5
+vmovdqu64 [rsi+384], zmm6
+vmovdqu64 [rsi+448], zmm7
+vmovdqu64 [rsi+512], zmm8
+vmovdqu64 [rsi+576], zmm9
+vmovdqu64 [rsi+640], zmm10
+vmovdqu64 [rsi+704], zmm11
+vzeroupper
+ret
+.size flock_round2_resident_accum_lo, .-flock_round2_resident_accum_lo
+.global flock_round2_resident_accum_hi
+.type flock_round2_resident_accum_hi, @function
+flock_round2_resident_accum_hi:
+vmovdqu64 zmm0, [rsi+0]
+vmovdqu64 zmm1, [rsi+64]
+vmovdqu64 zmm2, [rsi+128]
+vmovdqu64 zmm3, [rsi+192]
+vmovdqu64 zmm4, [rsi+256]
+vmovdqu64 zmm5, [rsi+320]
+vmovdqu64 zmm6, [rsi+384]
+vmovdqu64 zmm7, [rsi+448]
+vmovdqu64 zmm8, [rsi+512]
+vmovdqu64 zmm9, [rsi+576]
+vmovdqu64 zmm10, [rsi+640]
+vmovdqu64 zmm11, [rsi+704]
+test rcx, rcx
+jz .Lflock_r2_resident_done_hi
+.Lflock_r2_resident_pair_hi:
+mov eax, dword ptr [rdx]
+lea r10, [rdi+rax]
+mov eax, dword ptr [rdx+4]
+lea r11, [rdi+rax]
+vmovdqu64 zmm12, [r10+0]
+vmovdqu64 zmm13, [r10+256]
+vmovdqu64 zmm14, [r10+512]
+vmovdqu64 zmm15, [r10+768]
+vmovdqu64 zmm16, [r10+4096]
+vmovdqu64 zmm17, [r10+4352]
+vmovdqu64 zmm18, [r10+4608]
+vmovdqu64 zmm19, [r10+4864]
+vmovdqu64 zmm20, [r11+0]
+vmovdqu64 zmm21, [r11+256]
+vmovdqu64 zmm22, [r11+512]
+vmovdqu64 zmm23, [r11+768]
+vmovdqu64 zmm24, [r11+4096]
+vmovdqu64 zmm25, [r11+4352]
+vmovdqu64 zmm26, [r11+4608]
+vmovdqu64 zmm27, [r11+4864]
+vpclmulqdq zmm28, zmm14, zmm18, 0
+vpclmulqdq zmm29, zmm22, zmm26, 0
+vpclmulqdq zmm30, zmm14, zmm18, 17
+vpclmulqdq zmm31, zmm22, zmm26, 17
+vpternlogq zmm0, zmm28, zmm29, 0x96
+vpternlogq zmm1, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm14, zmm18, 1
+vpclmulqdq zmm29, zmm14, zmm18, 16
+vpclmulqdq zmm30, zmm22, zmm26, 1
+vpclmulqdq zmm31, zmm22, zmm26, 16
+vpternlogq zmm2, zmm28, zmm29, 0x96
+vpternlogq zmm2, zmm30, zmm31, 0x96
+vpxorq zmm12, zmm12, zmm14
+vpxorq zmm16, zmm16, zmm18
+vpxorq zmm20, zmm20, zmm22
+vpxorq zmm24, zmm24, zmm26
+vpclmulqdq zmm28, zmm12, zmm16, 0
+vpclmulqdq zmm29, zmm20, zmm24, 0
+vpclmulqdq zmm30, zmm12, zmm16, 17
+vpclmulqdq zmm31, zmm20, zmm24, 17
+vpternlogq zmm3, zmm28, zmm29, 0x96
+vpternlogq zmm4, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm12, zmm16, 1
+vpclmulqdq zmm29, zmm12, zmm16, 16
+vpclmulqdq zmm30, zmm20, zmm24, 1
+vpclmulqdq zmm31, zmm20, zmm24, 16
+vpternlogq zmm5, zmm28, zmm29, 0x96
+vpternlogq zmm5, zmm30, zmm31, 0x96
+vpxorq zmm13, zmm13, zmm15
+vpxorq zmm17, zmm17, zmm19
+vpxorq zmm21, zmm21, zmm23
+vpxorq zmm25, zmm25, zmm27
+vpclmulqdq zmm28, zmm13, zmm17, 0
+vpclmulqdq zmm29, zmm21, zmm25, 0
+vpclmulqdq zmm30, zmm13, zmm17, 17
+vpclmulqdq zmm31, zmm21, zmm25, 17
+vpternlogq zmm6, zmm28, zmm29, 0x96
+vpternlogq zmm7, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm13, zmm17, 1
+vpclmulqdq zmm29, zmm13, zmm17, 16
+vpclmulqdq zmm30, zmm21, zmm25, 1
+vpclmulqdq zmm31, zmm21, zmm25, 16
+vpternlogq zmm8, zmm28, zmm29, 0x96
+vpternlogq zmm8, zmm30, zmm31, 0x96
+vpxorq zmm12, zmm12, zmm13
+vpxorq zmm16, zmm16, zmm17
+vpxorq zmm20, zmm20, zmm21
+vpxorq zmm24, zmm24, zmm25
+vpclmulqdq zmm28, zmm12, zmm16, 0
+vpclmulqdq zmm29, zmm20, zmm24, 0
+vpclmulqdq zmm30, zmm12, zmm16, 17
+vpclmulqdq zmm31, zmm20, zmm24, 17
+vpternlogq zmm9, zmm28, zmm29, 0x96
+vpternlogq zmm10, zmm30, zmm31, 0x96
+vpclmulqdq zmm28, zmm12, zmm16, 1
+vpclmulqdq zmm29, zmm12, zmm16, 16
+vpclmulqdq zmm30, zmm20, zmm24, 1
+vpclmulqdq zmm31, zmm20, zmm24, 16
+vpternlogq zmm11, zmm28, zmm29, 0x96
+vpternlogq zmm11, zmm30, zmm31, 0x96
+add rdx, 8
+dec rcx
+jnz .Lflock_r2_resident_pair_hi
+.Lflock_r2_resident_done_hi:
+vmovdqu64 [rsi+0], zmm0
+vmovdqu64 [rsi+64], zmm1
+vmovdqu64 [rsi+128], zmm2
+vmovdqu64 [rsi+192], zmm3
+vmovdqu64 [rsi+256], zmm4
+vmovdqu64 [rsi+320], zmm5
+vmovdqu64 [rsi+384], zmm6
+vmovdqu64 [rsi+448], zmm7
+vmovdqu64 [rsi+512], zmm8
+vmovdqu64 [rsi+576], zmm9
+vmovdqu64 [rsi+640], zmm10
+vmovdqu64 [rsi+704], zmm11
+vzeroupper
+ret
+.size flock_round2_resident_accum_hi, .-flock_round2_resident_accum_hi
+"#);
+#[cfg(all(target_arch="x86_64", target_feature="avx512f", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+unsafe extern "C" {
+    fn flock_round2_resident_accum_lo(cache:*const u8, acc:*mut u64, offsets:*const u32, pairs:usize);
+    fn flock_round2_resident_accum_hi(cache:*const u8, acc:*mut u64, offsets:*const u32, pairs:usize);
+}
+
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -367,11 +607,23 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
     debug_assert_eq!(row_base & 255, 0);
 
     unsafe {
-        let mut acc = [WideGhashX4::zero(); 8];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        #[repr(C, align(64))]
+        struct RawAcc([__m512i; 24]);
+        let mut raw = RawAcc([_mm512_setzero_si512(); 24]);
+        const LIVE_GROUP_OFFSETS: [u32; 14] = [64,128,192,1024,1088,1152,1216,2048,2112,2176,2240,3072,3136,3200];
+        const { assert!(core::mem::size_of::<FoldCache>() == 1024); }
+        // Four batches, with A caches followed by B caches. The two skipped
+        // groups are never read; the other fourteen groups form seven pairs.
+        let mut cache_store = core::mem::MaybeUninit::<[FoldCache; 8]>::uninit();
+        let cache_base = cache_store.as_mut_ptr().cast::<FoldCache>();
+        let fa0 = core::ptr::addr_of_mut!((*cache_base.add(0)).0).cast::<F128>();
+        let fb0 = core::ptr::addr_of_mut!((*cache_base.add(4)).0).cast::<F128>();
+        let fa1 = core::ptr::addr_of_mut!((*cache_base.add(1)).0).cast::<F128>();
+        let fb1 = core::ptr::addr_of_mut!((*cache_base.add(5)).0).cast::<F128>();
+        let fa2 = core::ptr::addr_of_mut!((*cache_base.add(2)).0).cast::<F128>();
+        let fb2 = core::ptr::addr_of_mut!((*cache_base.add(6)).0).cast::<F128>();
+        let fa3 = core::ptr::addr_of_mut!((*cache_base.add(3)).0).cast::<F128>();
+        let fb3 = core::ptr::addr_of_mut!((*cache_base.add(7)).0).cast::<F128>();
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -392,84 +644,11 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
             }};
         }
 
-        macro_rules! ld_group {
-            ($g:expr) => {{
-                let g_off = 4 * ($g as usize);
-                (
-                    _mm512_loadu_si512(fa.add(g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(16 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(32 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fa.add(48 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(16 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(32 + g_off).cast::<__m512i>()),
-                    _mm512_loadu_si512(fb.add(48 + g_off).cast::<__m512i>()),
-                )
-            }};
-        }
-
-        macro_rules! accum1 {
-            ($g0:expr, $grp:expr) => {{
-                pf_quarter!($g0, $grp);
-                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp);
-                acc[0].mul_acc(a1w, b1);
-                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
-                acc[2].mul_acc(a3w, b3);
-                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
-                acc[4].mul_acc(a2w, b2);
-                let e_aw = _mm512_xor_si512(a0w, a2w);
-                let e_b = _mm512_xor_si512(b0, b2);
-                let o_aw = _mm512_xor_si512(a1w, a3w);
-                let o_b = _mm512_xor_si512(b1, b3);
-                acc[5].mul_acc(e_aw, e_b);
-                acc[6].mul_acc(o_aw, o_b);
-                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
-            }};
-        }
-
-        macro_rules! accum2 {
-            ($g0:expr, $grp0:expr, $grp1:expr) => {{
-                pf_quarter!($g0, $grp0);
-                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp0);
-                pf_quarter!($g0, $grp1);
-                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($grp1);
-                acc[0].mul_acc2(a1w, b1, c1w, d1);
-                acc[1].mul_acc2(
-                    _mm512_xor_si512(a0w, a1w),
-                    _mm512_xor_si512(b0, b1),
-                    _mm512_xor_si512(c0w, c1w),
-                    _mm512_xor_si512(d0, d1),
-                );
-                acc[2].mul_acc2(a3w, b3, c3w, d3);
-                acc[3].mul_acc2(
-                    _mm512_xor_si512(a2w, a3w),
-                    _mm512_xor_si512(b2, b3),
-                    _mm512_xor_si512(c2w, c3w),
-                    _mm512_xor_si512(d2, d3),
-                );
-                acc[4].mul_acc2(a2w, b2, c2w, d2);
-                let e_aw = _mm512_xor_si512(a0w, a2w);
-                let e_b = _mm512_xor_si512(b0, b2);
-                let o_aw = _mm512_xor_si512(a1w, a3w);
-                let o_b = _mm512_xor_si512(b1, b3);
-                let e_cw = _mm512_xor_si512(c0w, c2w);
-                let e_d = _mm512_xor_si512(d0, d2);
-                let o_cw = _mm512_xor_si512(c1w, c3w);
-                let o_d = _mm512_xor_si512(d1, d3);
-                acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
-                acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
-                acc[7].mul_acc2(
-                    _mm512_xor_si512(e_aw, o_aw),
-                    _mm512_xor_si512(e_b, o_b),
-                    _mm512_xor_si512(e_cw, o_cw),
-                    _mm512_xor_si512(e_d, o_d),
-                );
-            }};
-        }
-
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
+            // Materialize the four batches before accumulation. Each cache
+            // owns exactly the same initialized groups as the original fold.
             // Batch 0 (g0 & 255 == 0): elide group 0
             {
                 let g0 = row_base + 2 * x_lo;
@@ -477,38 +656,29 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(
                     a_pkt.add(g0 * 8),
                     a_mats_ptr,
-                    fa,
+                    fa0,
                     0,
                 );
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
-                    fb,
+                    fb0,
                     0,
                 );
-                pf_quarter!(g0, 0);
-                #[cfg(test)]
-                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                accum1!(g0, 1);
-                accum2!(g0, 2, 3);
             }
             // Batch 1 (g0 & 255 == 64): full 4 groups
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
-                accum2!(g0, 0, 1);
-                accum2!(g0, 2, 3);
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa1, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb1, 0);
             }
             // Batch 2 (g0 & 255 == 128): full 4 groups
             {
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
-                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
-                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
-                accum2!(g0, 0, 1);
-                accum2!(g0, 2, 3);
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa2, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb2, 0);
             }
             // Batch 3 (g0 & 255 == 192): elide group 3
             {
@@ -517,34 +687,43 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(
                     a_pkt.add(g0 * 8),
                     a_mats_ptr,
-                    fa,
+                    fa3,
                     3,
                 );
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(
                     b_pkt.add(g0 * 8),
                     bm.as_ptr(),
-                    fb,
+                    fb3,
                     3,
                 );
-                accum2!(g0, 0, 1);
-                accum1!(g0, 2);
-                pf_quarter!(g0, 3);
-                #[cfg(test)]
-                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            for batch in 0..4 {
+                let g0 = row_base + 2 * (x_lo + 32 * batch);
+                for quarter in 0..4 { pf_quarter!(g0, quarter); }
+            }
+            #[cfg(test)]
+            R2_CANON_ELIDE_HITS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: eight contiguous 1024-byte FoldCaches; the index list
+            // skips the uninitialized first/last groups. Both leaves read the
+            // same immutable cache and update disjoint twelve-ZMM outputs.
+            // Each leaf uses twelve accumulator, sixteen input and four
+            // temporary registers, with no hot-loop stack operands or calls.
+            flock_round2_resident_accum_lo(cache_base.cast(), raw.0.as_mut_ptr().cast(), LIVE_GROUP_OFFSETS.as_ptr(), 7);
+            flock_round2_resident_accum_hi(cache_base.cast(), raw.0.as_mut_ptr().add(12).cast(), LIVE_GROUP_OFFSETS.as_ptr(), 7);
             x_lo += 128;
         }
-
         let mut out = [F128::ZERO; 8];
         let lane_w = f128x4_loadu(bk.lane.as_ptr());
         for i in 0..8 {
-            let scaled = ghash_mul_x4(lane_w, acc[i].reduce_lanes());
+            let acc = WideGhashX4 { lo: raw.0[3*i], hi: raw.0[3*i+1], mid: raw.0[3*i+2] };
+            let scaled = ghash_mul_x4(lane_w, acc.reduce_lanes());
             let l = crate::field::gf2_128::x86_64::f128x4_extract(scaled);
             out[i] = l[0] + l[1] + l[2] + l[3];
         }
         out
     }
 }
+
 
 /// # Safety
 /// `table_data` must point to the 8 × 256 `F128` fold table; `a_pkt`/`b_pkt`
