@@ -2886,7 +2886,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             // SAFETY: each task owns one complete tile; its eight octas
             // overwrite disjoint full cache lines, including tail padding.
             // Rayon joins every producer and its SFENCE before publication.
-            let tiles = unsafe { flock_core::lincheck::WitnessRootTiles::from_witness_storage(
+            let tiles = unsafe { flock_core::lincheck::WitnessRootTiles::from_witness_bitplanes(
                 root_storage, z.len() / F128_PER_BLOCK) };
             ab_inner.set_witness_root_tiles(tiles);
         } else {

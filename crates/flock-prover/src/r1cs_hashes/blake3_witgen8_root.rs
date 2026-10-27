@@ -1,5 +1,5 @@
 //! Direct, challenge-independent root stripes from the live octa word ring.
-//! Store selected words unchanged; the shared cache reader transposes on load.
+//! Encode selected words once as lane-bit columns for both challenge consumers.
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -162,7 +162,7 @@ impl<'a> RootOctaWriter<'a> {
                 let hi = _mm256_set1_epi32((mask >> 32) as u32 as i32);
                 let words = _mm512_and_si512(value,
                     _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi));
-                _mm512_stream_si512(self.out.add(out * 512).cast(), words);
+                _mm512_stream_si512(self.out.add(out * 512).cast(), root_bitplanes(words));
             }
         }
     }
@@ -189,7 +189,7 @@ impl<'a> RootOctaWriter<'a> {
         unsafe {
             let batch = &self.plan.batches[index];
             let emit = |out: usize, value| {
-                _mm512_stream_si512(self.out.add(out).cast(), value);
+                _mm512_stream_si512(self.out.add(out).cast(), root_bitplanes(value));
             };
             let (a, b) = (a.cast::<u8>(), b.cast::<u8>());
             if batch.leading_out != u16::MAX {
@@ -238,6 +238,25 @@ impl<'a> RootOctaWriter<'a> {
         }
     }
 
+}
+
+/// Convert low/high u32 words for eight lanes to one lane-bit byte per root.
+/// The encoding contains witness bits only and is independent of challenges.
+#[inline(always)]
+unsafe fn root_bitplanes(value: __m512i) -> __m512i {
+    const WORD_TO_COLUMNS: [u8; 64] = {
+        let mut out = [0u8; 64]; let mut i = 0;
+        while i < 64 {
+            let byte = i / 8; let lane = 7 - i % 8;
+            out[i] = (if byte < 4 { lane * 4 + byte } else { 32 + lane * 4 + byte - 4 }) as u8;
+            i += 1;
+        }
+        out
+    };
+    unsafe {
+        let columns = _mm512_permutexvar_epi8(_mm512_loadu_si512(WORD_TO_COLUMNS.as_ptr().cast()), value);
+        _mm512_gf2p8affine_epi64_epi8::<0>(_mm512_set1_epi64(0x8040201008040201u64 as i64), columns)
+    }
 }
 
 #[cfg(test)]
@@ -293,14 +312,11 @@ mod tests {
                     let expected = if stripe != 3 {
                         0xa5
                     } else {
-                        let lane = column % 32 / 4;
-                        (0..8).fold(0u8, |byte, bit| {
-                            let value = fold.roots.get({
-                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
-                                    index + if index >= 833 { 64 } else { 0 }
-                                })
+                        (0..8).fold(0u8, |byte, lane| {
+                            let index = group * 64 + column;
+                            let value = fold.roots.get(index + if index >= 833 { 64 } else { 0 })
                                 .map_or(0, |&wire| (a[wire / 32][lane] & b[wire / 32][lane]) >> (wire % 32) & 1);
-                            byte | (value as u8) << bit
+                            byte | (value as u8) << lane
                         })
                     };
                     assert_eq!(out.0[group * 512 + stripe * 64 + column], expected,

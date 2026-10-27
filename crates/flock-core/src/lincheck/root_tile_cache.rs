@@ -193,6 +193,19 @@ impl RootTileCache {
         Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true }
     }
 
+    /// Adopt the same fixed-root geometry as `from_witness_storage`, encoded
+    /// as one byte of eight lane bits per root in each 64-byte stripe.
+    ///
+    /// # Safety
+    /// All ownership, initialization, fixed-input and publication requirements
+    /// of `from_witness_storage` apply. The live span must use this bitplane
+    /// encoding, including zero padding for the final fifteen roots.
+    pub unsafe fn from_witness_bitplanes(storage: Vec<F128>, compressions: usize) -> Self {
+        let mut cache = unsafe { Self::from_witness_storage(storage, compressions) };
+        cache.word_major = false;
+        cache
+    }
+
     pub(super) fn matches_geometry(&self, compressions: usize, root_bits: usize) -> bool {
         let blocks = if self.fixed_roots { 176 } else { 177 };
         root_bits == 11313 && self.blocks == blocks && self.tiles.checked_mul(64) == Some(compressions)
@@ -211,15 +224,17 @@ impl RootTileCache {
                 let source = block + usize::from(self.fixed_roots && block >= 14);
                 let mut expected = reference.block(tile * reference.blocks + source).0;
                 if self.fixed_roots && block == 13 {
-                    assert!(self.word_major);
                     expected = reference.block(tile * reference.blocks + 14).0;
                     let counter = &reference.block(tile * reference.blocks + 13).0;
-                    // Selected words splice the counter bit into the next
-                    // source group's bit zero in each octa lane.
                     for stripe in 0..8 {
-                        for lane in 0..8 {
-                            let byte = stripe * 64 + lane * 4;
-                            expected[byte] = (expected[byte] & !1) | (counter[byte] & 1);
+                        if self.word_major {
+                            for lane in 0..8 {
+                                let byte = stripe * 64 + lane * 4;
+                                expected[byte] = (expected[byte] & !1) | (counter[byte] & 1);
+                            }
+                        } else {
+                            // One byte contains the counter bit for all lanes.
+                            expected[stripe * 64] = counter[stripe * 64];
                         }
                     }
                 }
@@ -262,18 +277,26 @@ impl RootTileCache {
     ) -> Vec<F128> {
         // Dispatch before constructing worker closures, so the false
         // monomorph can discard every batch matrix slot and preparation path.
-        // Canonical and generic word-major capture retain the old reader.
-        if batch_word_tiles && self.word_major && self.fixed_roots {
-            self.fold_impl::<true>(eq8_at)
+        // Generic capture retains the one-tile reader. Fixed-root witness
+        // caches use either raw words or pretransposed lane-bit bytes.
+        if batch_word_tiles && self.fixed_roots {
+            if self.word_major { self.fold_impl::<true, true>(eq8_at) }
+            else { self.fold_impl::<true, false>(eq8_at) }
+        } else if self.word_major {
+            self.fold_impl::<false, true>(eq8_at)
         } else {
-            self.fold_impl::<false>(eq8_at)
+            self.fold_impl::<false, false>(eq8_at)
         }
     }
 
-    fn fold_impl<const BATCH_WORD_TILES: bool>(
+    fn fold_impl<const BATCH_WORD_TILES: bool, const WORD_MAJOR: bool>(
         &self,
         eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
     ) -> Vec<F128> {
+        static PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
+        });
+        let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -347,13 +370,18 @@ impl RootTileCache {
                             // batch the leaf initializes all sixteen planes
                             // without reading dst; later calls load them once.
                             unsafe {
-                                kernels::gfni_fold_word_tiles4(
-                                    self.storage.0.as_ptr().add(self.offset).cast::<u8>()
-                                        .add((tile * self.blocks + block) * 512),
-                                    matrices.as_ptr().cast::<u64>(),
-                                    dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                    self.blocks * 512, count, first,
-                                    WORD_TO_COLUMNS.as_ptr());
+                                let source = self.storage.0.as_ptr().add(self.offset).cast::<u8>()
+                                    .add((tile * self.blocks + block) * 512);
+                                let output = dst.as_mut_ptr().cast::<u8>().add(block * 1024);
+                                if WORD_MAJOR {
+                                    kernels::gfni_fold_word_tiles4(source, matrices.as_ptr().cast(),
+                                        output, self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                } else {
+                                    kernels::gfni_fold_bitplane_tiles4(source, matrices.as_ptr().cast(),
+                                        output, self.blocks * 512, count, first,
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
                             }
                         }
                         first = false;
@@ -378,7 +406,7 @@ impl RootTileCache {
                                 .cast::<__m512i>();
                             let rows = core::array::from_fn(|i| {
                                 let row = _mm512_load_si512(src.add(i));
-                                if self.word_major {
+                                if WORD_MAJOR {
                                     let matrix = _mm512_permutexvar_epi8(
                                         _mm512_loadu_si512(WORD_TO_COLUMNS.as_ptr().cast()), row);
                                     _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -475,7 +503,7 @@ mod tests {
                 }
             }
             for count in 1..=4 {
-                for seed_zero in [true, false] {
+                for seed_zero in [true, false] { for prefetch in [false, true] {
                     // Deliberately stale output, with untouched sentinels on
                     // both sides. Source group 175 ends at a true tile edge.
                     let mut expected = [0u8; 1024];
@@ -503,7 +531,7 @@ mod tests {
                         kernels::gfni_fold_word_tiles4(
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
                             new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
-                            WORD_TO_COLUMNS.as_ptr());
+                            WORD_TO_COLUMNS.as_ptr(), prefetch);
                     }
                     assert_eq!(&old[64..1088], &expected,
                         "old oracle, group={group}, count={count}, first={seed_zero}");
@@ -511,7 +539,7 @@ mod tests {
                         "fold4 oracle, group={group}, count={count}, first={seed_zero}");
                     assert!(new[..64].iter().chain(new[1088..].iter()).all(|&b| b == 0x5d));
                     assert!(old[..64].iter().chain(old[1088..].iter()).all(|&b| b == 0x5d));
-                }
+                } }
             }
         }
     }
@@ -543,6 +571,48 @@ mod tests {
             }
         }
         unsafe { RootTileCache::from_witness_storage(storage, tiles * 64) }
+    }
+
+    #[test]
+    fn pretransposed_cache_matches_raw_complete_readers() {
+        let weights = |i: usize, salt: u64| core::array::from_fn(|lane| {
+            let n = (i + lane) as u64 + salt;
+            F128::new(n.rotate_left(17).wrapping_mul(0x9e3779b97f4a7c15),
+                n.wrapping_mul(0xbf58476d1ce4e5b9))
+        });
+        for threads in [1, 8] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                for tiles in [1, 3, 4, 5, 17] {
+                    let raw = selected_word_cache_fixture(tiles);
+                    let mut storage = crate::scratch::take_f128(tiles * 176 * 32 + 3);
+                    let offset = storage.as_ptr().align_offset(64);
+                    for tile in 0..tiles { for block in 0..176 { for stripe in 0..8 {
+                        unsafe {
+                            let row = _mm512_loadu_si512(raw.block(tile * 176 + block).0.as_ptr().add(stripe * 64).cast());
+                            let columns = _mm512_permutexvar_epi8(_mm512_loadu_si512(WORD_TO_COLUMNS.as_ptr().cast()), row);
+                            let bits = _mm512_gf2p8affine_epi64_epi8::<0>(_mm512_set1_epi64(0x8040201008040201u64 as i64), columns);
+                            _mm512_storeu_si512(storage.as_mut_ptr().add(offset).cast::<u8>().add((tile * 176 + block) * 512 + stripe * 64).cast(), bits);
+                        }
+                    }}}
+                    let encoded = unsafe { RootTileCache::from_witness_bitplanes(storage, tiles * 64) };
+                    for salt in [31, 997] {
+                        let eq = |i| weights(i, salt);
+                        let expected = raw.fold_with_mode(&eq, false);
+                        assert_eq!(raw.fold_with_mode(&eq, true), expected);
+                        assert_eq!(encoded.fold_with_mode(&eq, false), expected,
+                            "single-tile encoded reader tiles={tiles} threads={threads}");
+                        assert_eq!(encoded.fold_with_mode(&eq, true), expected,
+                            "four-tile encoded reader tiles={tiles} threads={threads}");
+                    }
+                    let (a,b) = rayon::join(
+                        || encoded.fold_with_mode(&|i| weights(i,31), true),
+                        || encoded.fold_with_mode(&|i| weights(i,997), true));
+                    assert_eq!(a, raw.fold_with_mode(&|i| weights(i,31), false));
+                    assert_eq!(b, raw.fold_with_mode(&|i| weights(i,997), false));
+                }
+            });
+        }
     }
 
     #[test]
