@@ -533,24 +533,32 @@ pub(crate) unsafe fn gfni_fold_rows(
 }
 
 
-/// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
-/// sixteen byte-plane accumulators until the last tile has been consumed.
+/// Fold every selected-word block of a 1..=8 tile batch across its tiles,
+/// retaining all sixteen byte-plane accumulators until the last tile has been
+/// consumed, and store each block's planes once.
+///
+/// A block is 512 contiguous bytes: eight 64-byte raw selected-word stripes.
+/// Blocks are consecutive in the source (`+512` each) and in the destination
+/// (`+1024` each). The tile axis is `tile_stride` bytes and the matrix axis is
+/// 128 u64 per tile, so one call covers the whole block axis for its batch.
 ///
 /// Exactly 22 ZMM registers are used: accumulators 0..15, transformed current
 /// rows 16..17, products 18..19, permutation 20 and transpose identity 21.
-/// This outlined leaf's asm never touches the stack or spills a vector. Inspect
-/// the optimized wrapper on the measured target before enabling production.
+/// This outlined leaf's asm never touches the stack or spills a vector. The
+/// four stripe pairs of a block are unrolled (the loop is always four
+/// iterations) and the per-tile control is the only branch inside the block.
 ///
 /// # Safety
-/// - `count` is in 1..=4 and `tile_stride >= 512`.
-/// - For each `t < count`, `source.add(t * tile_stride)` covers 512 readable
-///   bytes containing eight raw selected-word stripes (low u32 lanes then high).
-///   The entire addressed span belongs to one allocation; offset arithmetic
-///   must fit usize/isize. No alignment beyond byte alignment is required.
+/// - `count` is in 1..=8, `blocks` is at least 1 and `tile_stride >= 512`.
+/// - For each `t < count`, `source.add(t * tile_stride + b * 512)` covers 512
+///   readable bytes for every `b < blocks`: eight raw selected-word stripes
+///   (low u32 lanes then high). The entire addressed span belongs to one
+///   allocation; offset arithmetic must fit usize/isize. No alignment beyond
+///   byte alignment is required.
 /// - `mats` covers `count * 128` initialized u64s, ordered
 ///   `[tile][stripe * 16 + plane]`; no non-live matrix slot is read.
-/// - `planes` covers 1024 writable bytes, initialized iff `!seed_zero`, and
-///   does not alias source, matrices, or permutation storage.
+/// - `planes` covers `blocks * 1024` writable bytes, initialized iff
+///   `!seed_zero`, and does not alias source, matrices, or permutation storage.
 /// - `permutation` covers the 64 initialized bytes of WORD_TO_COLUMNS, and
 ///   all readable inputs remain immutable for this call.
 #[cfg(all(
@@ -568,23 +576,27 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     planes: *mut u8,
     tile_stride: usize,
     count: usize,
+    blocks: usize,
     seed_zero: bool,
     permutation: *const u8,
 ) {
-    debug_assert!((1..=4).contains(&count));
+    debug_assert!((1..=8).contains(&count));
+    debug_assert!(blocks >= 1);
     debug_assert!(tile_stride >= 512);
     // SAFETY: the caller upholds the exact byte ranges above. Every modified
     // GPR and ZMM is explicitly an output; flags and memory are also clobbered
-    // (no preserves_flags/nomem/readonly). No callee-saved GPR is touched. The
-    // ABI may place the seventh argument on the caller's stack; this asm itself
-    // neither reads nor writes the stack and contains no call instruction.
+    // (no preserves_flags/nomem/readonly). No stack traffic and no call.
     unsafe {
         core::arch::asm!(
             "vmovdqu64 zmm20, [r10]",
             "mov rax, 0x8040201008040201",
             "vpbroadcastq zmm21, rax",
+            "2:",
+            "mov rdi, r15",
+            "mov rsi, r12",
+            "mov r8, r13",
             "test r9, r9",
-            "jz 2f",
+            "jz 3f",
             "vpxord zmm0, zmm0, zmm0",
             "vpxord zmm1, zmm1, zmm1",
             "vpxord zmm2, zmm2, zmm2",
@@ -601,8 +613,8 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "vpxord zmm13, zmm13, zmm13",
             "vpxord zmm14, zmm14, zmm14",
             "vpxord zmm15, zmm15, zmm15",
-            "jmp 3f",
-            "2:",
+            "jmp 4f",
+            "3:",
             "vmovdqu64 zmm0, [rdx + 0]",
             "vmovdqu64 zmm1, [rdx + 64]",
             "vmovdqu64 zmm2, [rdx + 128]",
@@ -619,12 +631,9 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "vmovdqu64 zmm13, [rdx + 832]",
             "vmovdqu64 zmm14, [rdx + 896]",
             "vmovdqu64 zmm15, [rdx + 960]",
-            "3:",
-            "mov r11d, 4",
             "4:",
-            "vpermb zmm16, zmm20, [rdi]",
+            "vpermb zmm16, zmm20, [rdi + 0]",
             "vpermb zmm17, zmm20, [rdi + 64]",
-            // Same operand order as affine(identity, permuted_raw_row).
             "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
             "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
             "vgf2p8affineqb zmm18, zmm16, [rsi + 0]{{1to8}}, 0",
@@ -675,19 +684,166 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "vgf2p8affineqb zmm18, zmm16, [rsi + 120]{{1to8}}, 0",
             "vgf2p8affineqb zmm19, zmm17, [rsi + 248]{{1to8}}, 0",
             "vpternlogq zmm15, zmm18, zmm19, 0x96",
-            "add rdi, 128",
-            "add rsi, 256",
-            "dec r11d",
-            "jnz 4b",
-            "dec r8",
-            "jz 5f",
-            // The stripe-pair loop has advanced source by one 512-byte block.
-            // Advance to this block in the next tile, using its actual stride.
-            // These two steps avoid transiently going past the final tile.
-            "sub rdi, 512",
+            "vpermb zmm16, zmm20, [rdi + 128]",
+            "vpermb zmm17, zmm20, [rdi + 192]",
+            "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
+            "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 256]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 384]{{1to8}}, 0",
+            "vpternlogq zmm0, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 264]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 392]{{1to8}}, 0",
+            "vpternlogq zmm1, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 272]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 400]{{1to8}}, 0",
+            "vpternlogq zmm2, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 280]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 408]{{1to8}}, 0",
+            "vpternlogq zmm3, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 288]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 416]{{1to8}}, 0",
+            "vpternlogq zmm4, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 296]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 424]{{1to8}}, 0",
+            "vpternlogq zmm5, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 304]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 432]{{1to8}}, 0",
+            "vpternlogq zmm6, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 312]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 440]{{1to8}}, 0",
+            "vpternlogq zmm7, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 320]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 448]{{1to8}}, 0",
+            "vpternlogq zmm8, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 328]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 456]{{1to8}}, 0",
+            "vpternlogq zmm9, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 336]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 464]{{1to8}}, 0",
+            "vpternlogq zmm10, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 344]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 472]{{1to8}}, 0",
+            "vpternlogq zmm11, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 352]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 480]{{1to8}}, 0",
+            "vpternlogq zmm12, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 360]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 488]{{1to8}}, 0",
+            "vpternlogq zmm13, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 368]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 496]{{1to8}}, 0",
+            "vpternlogq zmm14, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 376]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 504]{{1to8}}, 0",
+            "vpternlogq zmm15, zmm18, zmm19, 0x96",
+            "vpermb zmm16, zmm20, [rdi + 256]",
+            "vpermb zmm17, zmm20, [rdi + 320]",
+            "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
+            "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 512]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 640]{{1to8}}, 0",
+            "vpternlogq zmm0, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 520]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 648]{{1to8}}, 0",
+            "vpternlogq zmm1, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 528]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 656]{{1to8}}, 0",
+            "vpternlogq zmm2, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 536]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 664]{{1to8}}, 0",
+            "vpternlogq zmm3, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 544]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 672]{{1to8}}, 0",
+            "vpternlogq zmm4, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 552]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 680]{{1to8}}, 0",
+            "vpternlogq zmm5, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 560]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 688]{{1to8}}, 0",
+            "vpternlogq zmm6, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 568]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 696]{{1to8}}, 0",
+            "vpternlogq zmm7, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 576]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 704]{{1to8}}, 0",
+            "vpternlogq zmm8, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 584]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 712]{{1to8}}, 0",
+            "vpternlogq zmm9, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 592]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 720]{{1to8}}, 0",
+            "vpternlogq zmm10, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 600]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 728]{{1to8}}, 0",
+            "vpternlogq zmm11, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 608]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 736]{{1to8}}, 0",
+            "vpternlogq zmm12, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 616]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 744]{{1to8}}, 0",
+            "vpternlogq zmm13, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 624]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 752]{{1to8}}, 0",
+            "vpternlogq zmm14, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 632]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 760]{{1to8}}, 0",
+            "vpternlogq zmm15, zmm18, zmm19, 0x96",
+            "vpermb zmm16, zmm20, [rdi + 384]",
+            "vpermb zmm17, zmm20, [rdi + 448]",
+            "vgf2p8affineqb zmm16, zmm21, zmm16, 0",
+            "vgf2p8affineqb zmm17, zmm21, zmm17, 0",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 768]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 896]{{1to8}}, 0",
+            "vpternlogq zmm0, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 776]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 904]{{1to8}}, 0",
+            "vpternlogq zmm1, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 784]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 912]{{1to8}}, 0",
+            "vpternlogq zmm2, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 792]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 920]{{1to8}}, 0",
+            "vpternlogq zmm3, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 800]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 928]{{1to8}}, 0",
+            "vpternlogq zmm4, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 808]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 936]{{1to8}}, 0",
+            "vpternlogq zmm5, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 816]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 944]{{1to8}}, 0",
+            "vpternlogq zmm6, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 824]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 952]{{1to8}}, 0",
+            "vpternlogq zmm7, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 832]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 960]{{1to8}}, 0",
+            "vpternlogq zmm8, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 840]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 968]{{1to8}}, 0",
+            "vpternlogq zmm9, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 848]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 976]{{1to8}}, 0",
+            "vpternlogq zmm10, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 856]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 984]{{1to8}}, 0",
+            "vpternlogq zmm11, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 864]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 992]{{1to8}}, 0",
+            "vpternlogq zmm12, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 872]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 1000]{{1to8}}, 0",
+            "vpternlogq zmm13, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 880]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 1008]{{1to8}}, 0",
+            "vpternlogq zmm14, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 888]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 1016]{{1to8}}, 0",
+            "vpternlogq zmm15, zmm18, zmm19, 0x96",
             "add rdi, rcx",
-            "jmp 3b",
-            "5:",
+            "add rsi, 1024",
+            "dec r8",
+            "jnz 4b",
             "vmovdqu64 [rdx + 0], zmm0",
             "vmovdqu64 [rdx + 64], zmm1",
             "vmovdqu64 [rdx + 128], zmm2",
@@ -704,15 +860,22 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "vmovdqu64 [rdx + 832], zmm13",
             "vmovdqu64 [rdx + 896], zmm14",
             "vmovdqu64 [rdx + 960], zmm15",
-            inout("rdi") source => _,
-            inout("rsi") mats => _,
-            in("rdx") planes,
+            "add r15, 512",
+            "add rdx, 1024",
+            "dec r14",
+            "jnz 2b",
+            inout("r15") source => _,
+            in("r12") mats,
+            inout("rdx") planes => _,
             in("rcx") tile_stride,
-            inout("r8") count => _,
+            in("r13") count,
+            inout("r14") blocks => _,
             in("r9") usize::from(seed_zero),
             in("r10") permutation,
+            out("rdi") _,
+            out("rsi") _,
+            out("r8") _,
             out("rax") _,
-            out("r11") _,
             out("zmm0") _,
             out("zmm1") _,
             out("zmm2") _,
