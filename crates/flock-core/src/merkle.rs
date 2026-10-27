@@ -599,6 +599,37 @@ pub(crate) fn hash_leaf_pairs_serial(
     const SCRATCH_LEAVES: usize = BLAKE3_GROUP;
     assert_eq!(data.len(), 2 * out.len() * leaf_size);
 
+    // Only the transient first edge uses planes. Retained parent CVs remain
+    // canonical bytes, so cut-depth-one tree layout and openings are unchanged.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux",
+              target_feature = "avx512f", target_feature = "avx512vl"))]
+    let (out, data) = if kind == HashKind::Blake3 && blake3_leaf_size_is_batchable(leaf_size) {
+        let full = out.len() / 16 * 16;
+        if full != 0 {
+            let leaves = &data[..2 * full * leaf_size];
+            let parents = &mut out[..full];
+            match leaf_size {
+                64 => contiguous::hash_leaf_pairs::<64>(leaves, parents),
+                128 => contiguous::hash_leaf_pairs::<128>(leaves, parents),
+                256 => contiguous::hash_leaf_pairs::<256>(leaves, parents),
+                512 => contiguous::hash_leaf_pairs::<512>(leaves, parents),
+                1024 => contiguous::hash_leaf_pairs::<1024>(leaves, parents),
+                _ => unreachable!(),
+            }
+            #[cfg(feature = "hash-count")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                hash_count::LEAF_CALLS.fetch_add((2 * full) as u64, Relaxed);
+                hash_count::LEAF_COMPRESSIONS.fetch_add(
+                    (2 * full) as u64 * hash_count::blocks(kind, leaf_size), Relaxed);
+                hash_count::PAIR_CALLS.fetch_add(full as u64, Relaxed);
+            }
+        }
+        (&mut out[full..], &data[2 * full * leaf_size..])
+    } else {
+        (out, data)
+    };
+
     let mut scratch = core::mem::MaybeUninit::<[Hash; SCRATCH_LEAVES]>::uninit();
     for (parents, leaves) in out
         .chunks_mut(SCRATCH_LEAVES / 2)
@@ -1401,6 +1432,78 @@ mod tests {
                         blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]),
                         "leaf {i} of {n} at size {leaf_size}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_pairs_plane_edge_matches_hazmat() {
+        use blake3::hazmat::HasherExt;
+        let mut seed = 0xc2b2ae3d27d4eb4fu64;
+        for leaf_size in [1usize, 32, 63, 64, 65, 128, 256, 512, 1023, 1024, 1025] {
+            for nparents in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+                for offset in [0usize, 1, 31, 63] {
+                    let mut storage = vec![0u8; offset + 2 * nparents * leaf_size];
+                    for x in &mut storage {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        *x = seed as u8;
+                    }
+                    let data = &storage[offset..];
+                    let guard = [0xa5u8; 32];
+                    let mut got = vec![guard; nparents + 2];
+                    hash_leaf_pairs_serial(data, leaf_size, &mut got[1..nparents + 1], HashKind::Blake3);
+                    for i in 0..nparents {
+                        let lo = 2 * i * leaf_size;
+                        let left = blake3::Hasher::new().update(&data[lo..lo + leaf_size]).finalize_non_root();
+                        let right = blake3::Hasher::new().update(&data[lo + leaf_size..lo + 2 * leaf_size]).finalize_non_root();
+                        let want = blake3::hazmat::merge_subtrees_non_root(&left, &right, blake3::hazmat::Mode::Hash);
+                        assert_eq!(got[i + 1], want, "size={leaf_size} parents={nparents} offset={offset} i={i}");
+                    }
+                    assert_eq!(got[0], guard);
+                    assert_eq!(got[nparents + 1], guard);
+                }
+            }
+        }
+    }
+
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux",
+              target_feature = "avx512f", target_feature = "avx512vl"))]
+    #[test]
+    fn cv_plane_first_edge_interface_matches_hazmat() {
+        use blake3::hazmat::HasherExt;
+        let mut seed = 0x94d049bb133111ebu64;
+        for size in [64usize, 128, 256, 512, 1024] {
+            // 32,64,128 leaves explicitly, then batch/loop boundaries.
+            for count in [16usize, 32, 64, 80, 128] {
+                for offset in [0usize, 1, 31, 63] {
+                    let mut storage = vec![0u8; offset + 2 * count * size];
+                    for x in &mut storage {
+                        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                        *x = seed as u8;
+                    }
+                    let data = &storage[offset..];
+                    let guard = [0xa5u8;32];
+                    let mut got = vec![guard;count+2];
+                    match size {
+                        64 => contiguous::hash_leaf_pairs::<64>(data, &mut got[1..count+1]),
+                        128 => contiguous::hash_leaf_pairs::<128>(data, &mut got[1..count+1]),
+                        256 => contiguous::hash_leaf_pairs::<256>(data, &mut got[1..count+1]),
+                        512 => contiguous::hash_leaf_pairs::<512>(data, &mut got[1..count+1]),
+                        1024 => contiguous::hash_leaf_pairs::<1024>(data, &mut got[1..count+1]),
+                        _ => unreachable!(),
+                    }
+                    for i in 0..count {
+                        let lo=2*i*size;
+                        let left=blake3::Hasher::new().update(&data[lo..lo+size]).finalize_non_root();
+                        let right=blake3::Hasher::new().update(&data[lo+size..lo+2*size]).finalize_non_root();
+                        let want=blake3::hazmat::merge_subtrees_non_root(&left,&right,blake3::hazmat::Mode::Hash);
+                        assert_eq!(got[i+1],want,"size={size} parents={count} offset={offset} i={i}");
+                    }
+                    assert_eq!(got[0],guard); assert_eq!(got[count+1],guard);
                 }
             }
         }

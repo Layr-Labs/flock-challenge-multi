@@ -2653,3 +2653,300 @@ mod ab_prefetch_plan_tests {
         println!("144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards");
     }
 }
+
+
+/// Accumulate 1..=4 ranked 14-row windows into one fixed 1024-byte bank.
+/// Matrix rows keep absolute bm indexing: `mats` points at the first live
+/// row, with 256 qwords between consecutive w's. Source windows have the
+/// caller's byte stride. All sixteen output planes stay in ZMM0..15.
+///
+/// # Safety
+/// - `source` covers `(count-1)*source_stride + 896` initialized bytes;
+///   source_stride >= 896, count in 1..=4.
+/// - `mats` covers `(count-1)*256 + 14*16` initialized u64s.
+/// - `planes` covers 1024 writable bytes, initialized iff !seed_zero, and
+///   does not alias source or mats. Unaligned pointers are supported.
+/// - prefetch_mode is 0 (off), 1 (spread), or 2 (burst). Hints target the
+///   same-parity compact window +2 (1856 bytes); only nonfaulting hint
+///   addresses may lie beyond source. No out-of-range demand load occurs.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[target_feature(enable = "avx512f,gfni")]
+#[inline(never)]
+pub(crate) unsafe fn convert_ab_nomul_x86_gfni_w4(
+    source: *const u8, mats: *const u64, planes: *mut u8,
+    source_stride: usize, count: usize, seed_zero: bool, prefetch_mode: usize,
+) {
+    debug_assert!((1..=4).contains(&count));
+    debug_assert!(source_stride >= 896);
+    debug_assert!(prefetch_mode <= 2);
+    // All modified GPRs and ZMMs are outputs. No callee-saved GPR is touched,
+    // and no stack, call, implicit input, or out-of-range demand access exists.
+    // Memory and flags are clobbered (no nomem/readonly/preserves_flags).
+    unsafe {
+        core::arch::asm!(
+            "test r9, r9",
+            "jz 2f",
+            "vpxord zmm0, zmm0, zmm0",
+            "vpxord zmm1, zmm1, zmm1",
+            "vpxord zmm2, zmm2, zmm2",
+            "vpxord zmm3, zmm3, zmm3",
+            "vpxord zmm4, zmm4, zmm4",
+            "vpxord zmm5, zmm5, zmm5",
+            "vpxord zmm6, zmm6, zmm6",
+            "vpxord zmm7, zmm7, zmm7",
+            "vpxord zmm8, zmm8, zmm8",
+            "vpxord zmm9, zmm9, zmm9",
+            "vpxord zmm10, zmm10, zmm10",
+            "vpxord zmm11, zmm11, zmm11",
+            "vpxord zmm12, zmm12, zmm12",
+            "vpxord zmm13, zmm13, zmm13",
+            "vpxord zmm14, zmm14, zmm14",
+            "vpxord zmm15, zmm15, zmm15",
+            "jmp 3f",
+            "2:",
+            "vmovdqu64 zmm0, [rdx + 0]",
+            "vmovdqu64 zmm1, [rdx + 64]",
+            "vmovdqu64 zmm2, [rdx + 128]",
+            "vmovdqu64 zmm3, [rdx + 192]",
+            "vmovdqu64 zmm4, [rdx + 256]",
+            "vmovdqu64 zmm5, [rdx + 320]",
+            "vmovdqu64 zmm6, [rdx + 384]",
+            "vmovdqu64 zmm7, [rdx + 448]",
+            "vmovdqu64 zmm8, [rdx + 512]",
+            "vmovdqu64 zmm9, [rdx + 576]",
+            "vmovdqu64 zmm10, [rdx + 640]",
+            "vmovdqu64 zmm11, [rdx + 704]",
+            "vmovdqu64 zmm12, [rdx + 768]",
+            "vmovdqu64 zmm13, [rdx + 832]",
+            "vmovdqu64 zmm14, [rdx + 896]",
+            "vmovdqu64 zmm15, [rdx + 960]",
+            "3:",
+            "cmp r10, 2",
+            "jne 4f",
+            "prefetcht0 [rdi + 1856]",
+            "prefetcht0 [rdi + 1920]",
+            "prefetcht0 [rdi + 1984]",
+            "prefetcht0 [rdi + 2048]",
+            "prefetcht0 [rdi + 2112]",
+            "prefetcht0 [rdi + 2176]",
+            "prefetcht0 [rdi + 2240]",
+            "prefetcht0 [rdi + 2304]",
+            "prefetcht0 [rdi + 2368]",
+            "prefetcht0 [rdi + 2432]",
+            "prefetcht0 [rdi + 2496]",
+            "prefetcht0 [rdi + 2560]",
+            "prefetcht0 [rdi + 2624]",
+            "prefetcht0 [rdi + 2688]",
+            "4:",
+            "mov r11d, 7",
+            "5:",
+            "cmp r10, 1",
+            "jne 6f",
+            "prefetcht0 [rdi + 1856]",
+            "prefetcht0 [rdi + 1920]",
+            "6:",
+            "vmovdqu64 zmm16, [rdi]",
+            "vmovdqu64 zmm17, [rdi + 64]",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 0]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 128]{{1to8}}, 0",
+            "vpternlogq zmm0, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 8]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 136]{{1to8}}, 0",
+            "vpternlogq zmm1, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 16]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 144]{{1to8}}, 0",
+            "vpternlogq zmm2, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 24]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 152]{{1to8}}, 0",
+            "vpternlogq zmm3, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 32]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 160]{{1to8}}, 0",
+            "vpternlogq zmm4, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 40]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 168]{{1to8}}, 0",
+            "vpternlogq zmm5, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 48]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 176]{{1to8}}, 0",
+            "vpternlogq zmm6, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 56]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 184]{{1to8}}, 0",
+            "vpternlogq zmm7, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 64]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 192]{{1to8}}, 0",
+            "vpternlogq zmm8, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 72]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 200]{{1to8}}, 0",
+            "vpternlogq zmm9, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 80]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 208]{{1to8}}, 0",
+            "vpternlogq zmm10, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 88]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 216]{{1to8}}, 0",
+            "vpternlogq zmm11, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 96]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 224]{{1to8}}, 0",
+            "vpternlogq zmm12, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 104]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 232]{{1to8}}, 0",
+            "vpternlogq zmm13, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 112]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 240]{{1to8}}, 0",
+            "vpternlogq zmm14, zmm18, zmm19, 0x96",
+            "vgf2p8affineqb zmm18, zmm16, [rsi + 120]{{1to8}}, 0",
+            "vgf2p8affineqb zmm19, zmm17, [rsi + 248]{{1to8}}, 0",
+            "vpternlogq zmm15, zmm18, zmm19, 0x96",
+            "add rdi, 128",
+            "add rsi, 256",
+            "dec r11",
+            "jnz 5b",
+            "add rdi, rcx",
+            "add rsi, 256",
+            "dec r8",
+            "jnz 3b",
+            "vmovdqu64 [rdx + 0], zmm0",
+            "vmovdqu64 [rdx + 64], zmm1",
+            "vmovdqu64 [rdx + 128], zmm2",
+            "vmovdqu64 [rdx + 192], zmm3",
+            "vmovdqu64 [rdx + 256], zmm4",
+            "vmovdqu64 [rdx + 320], zmm5",
+            "vmovdqu64 [rdx + 384], zmm6",
+            "vmovdqu64 [rdx + 448], zmm7",
+            "vmovdqu64 [rdx + 512], zmm8",
+            "vmovdqu64 [rdx + 576], zmm9",
+            "vmovdqu64 [rdx + 640], zmm10",
+            "vmovdqu64 [rdx + 704], zmm11",
+            "vmovdqu64 [rdx + 768], zmm12",
+            "vmovdqu64 [rdx + 832], zmm13",
+            "vmovdqu64 [rdx + 896], zmm14",
+            "vmovdqu64 [rdx + 960], zmm15",
+            inout("rdi") source => _,
+            inout("rsi") mats => _,
+            in("rdx") planes,
+            in("rcx") (source_stride - 896),
+            inout("r8") count => _,
+            in("r9") usize::from(seed_zero),
+            in("r10") prefetch_mode,
+            out("r11") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm16") _,
+            out("zmm17") _,
+            out("zmm18") _,
+            out("zmm19") _,
+            options(nostack),
+        );
+    }
+}
+
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod ab_batch4_tests {
+    use super::{convert_ab_nomul_x86_gfni_direct, convert_ab_nomul_x86_gfni_w4};
+    use super::super::AbDirectPrefetch;
+    fn rng(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+    fn affine(x: u8, mat: u64) -> u8 {
+        (0..8).fold(0, |v, bit| v | ((((x & (mat >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit))
+    }
+    #[test]
+    fn ab_batch4_leaf_matches_scalar_and_incumbent() {
+        let mut seed = 0x34af5a17bc001u64;
+        for first in [0usize, 2] { for count in 1..=4 { for seed_zero in [false, true] {
+            for mode in 0..=2 { for offset in [0usize, 1, 31] {
+                // Non-production stride and output misalignment test exact
+                // accesses independently of the ranked-layout integration.
+                let stride = 1024usize;
+                let mut source = vec![0u8; offset + 3 * stride + 896 + 2048];
+                for b in &mut source { *b = rng(&mut seed) as u8; }
+                let before_source = source.clone();
+                let mut mats = vec![0u64; 4 * 256];
+                for b in &mut mats { *b = rng(&mut seed); }
+                // Exercise all-zero and all-one maps as well as dense maps.
+                if mode == 0 { mats[0..256].fill(0); }
+                if mode == 1 { mats[256..512].fill(!0); }
+                let before_mats = mats.clone();
+                let mut guarded = vec![0xceu8; offset + 1024 + 33];
+                for b in &mut guarded[offset..offset + 1024] { *b = rng(&mut seed) as u8; }
+                let mut scalar: [u8; 1024] = guarded[offset..offset + 1024].try_into().unwrap();
+                let mut incumbent = scalar;
+                if seed_zero { scalar.fill(0); }
+                for w in 0..count {
+                    for row in 0..14 { for k in 0..16 { for lane in 0..64 {
+                        scalar[k * 64 + lane] ^= affine(source[offset + w * stride + row * 64 + lane], mats[w * 256 + (first + row) * 16 + k]);
+                    } } }
+                    let row: &[u64; 256] = (&mats[w * 256..(w + 1) * 256]).try_into().unwrap();
+                    let pf = AbDirectPrefetch { next_window: core::ptr::null(), first: 0, end: 0, spread: true };
+                    unsafe {
+                        if first == 0 {
+                            if seed_zero && w == 0 { convert_ab_nomul_x86_gfni_direct::<0,14,true>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
+                            else { convert_ab_nomul_x86_gfni_direct::<0,14,false>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
+                        } else {
+                            if seed_zero && w == 0 { convert_ab_nomul_x86_gfni_direct::<2,16,true>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
+                            else { convert_ab_nomul_x86_gfni_direct::<2,16,false>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
+                        }
+                    }
+                }
+                unsafe {
+                    convert_ab_nomul_x86_gfni_w4(source.as_ptr().add(offset), mats.as_ptr().add(first * 16),
+                        guarded.as_mut_ptr().add(offset), stride, count, seed_zero, mode);
+                }
+                assert_eq!(&guarded[offset..offset+1024], &scalar, "first={first} count={count} zero={seed_zero} mode={mode} offset={offset}");
+                assert_eq!(incumbent, scalar);
+                assert!(guarded[..offset].iter().chain(guarded[offset+1024..].iter()).all(|&x| x == 0xce));
+                assert_eq!(source, before_source);
+                assert_eq!(mats, before_mats);
+            } }
+        } } }
+    }
+
+    #[test]
+    fn ab_batch4_ranked_compact_band_matches_incumbent() {
+        // Full 4096-window band, including the compact dead window-30 row.
+        // Vary stale arenas and first-write mode; every bank must match.
+        let mut seed = 0x17ca9f445u64;
+        let mut source = vec![0u8; 2 * 2048 * 1856 + 2048];
+        let mut mats = vec![0u64; 32 * 256];
+        for b in &mut source { *b = rng(&mut seed) as u8; }
+        for b in &mut mats { *b = rng(&mut seed); }
+        for x_hi in [0usize, 1] { for first_write in [false, true] {
+            let mut old = vec![0u8; 128 * 1024];
+            for b in &mut old { *b = rng(&mut seed) as u8; }
+            let mut new = old.clone();
+            for x in 0usize..4096 {
+                let first = if x & 1 == 0 { 2 } else { 0 };
+                let base = (((x_hi << 12) | x) >> 1) * 1856 + (x & 1) * 896;
+                let w = x >> 7;
+                let row: &[u64;256] = (&mats[w*256..(w+1)*256]).try_into().unwrap();
+                let bank: &mut [u8;1024] = (&mut old[(x&127)*1024..((x&127)+1)*1024]).try_into().unwrap();
+                let pf = AbDirectPrefetch { next_window: core::ptr::null(), first: 0, end: 0, spread: true };
+                unsafe {
+                    if first == 0 {
+                        if first_write && w == 0 { convert_ab_nomul_x86_gfni_direct::<0,14,true>(&source[base..base+896],row,bank,&pf); }
+                        else { convert_ab_nomul_x86_gfni_direct::<0,14,false>(&source[base..base+896],row,bank,&pf); }
+                    } else {
+                        if first_write && w == 0 { convert_ab_nomul_x86_gfni_direct::<2,16,true>(&source[base..base+896],row,bank,&pf); }
+                        else { convert_ab_nomul_x86_gfni_direct::<2,16,false>(&source[base..base+896],row,bank,&pf); }
+                    }
+                }
+            }
+            // Invoke exactly the production planner, not a test duplicate.
+            unsafe { super::super::super::process_ranked_ab_w4_band(source.as_slice(), &mats, x_hi, first_write, 0, &mut new); }
+            assert_eq!(new, old, "ranked-band x_hi={x_hi} first_write={first_write}");
+        } }
+    }
+}

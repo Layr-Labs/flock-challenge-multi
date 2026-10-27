@@ -36,6 +36,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
+mod sparse_window;
+
 /// `FLOCK_OPEN_TIMING`: per-level open-phase instrumentation — recursive
 /// commit shapes with their NTT-encode/Merkle split, plus the section totals
 /// the `LIG_PROVE_TRACE` breakdown already prints. Read once per process
@@ -4549,11 +4551,11 @@ fn induce_window_k(log_d: usize, n_queries: usize, threads: usize, singleton: bo
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct InduceSingletonStats {
-    /// Windows expanded through the one-nonzero shortcut.
+    /// Windows with exactly one supplied query.
     singleton_hits: usize,
-    /// Windows with `2 ≤ nnz ≤ k/2`, expanded per-nonzero and XOR-summed.
+    /// Windows in the legacy `2..=k/2` summed-singleton occupancy bucket.
     multi_hits: usize,
-    /// Windows past the `nnz ≤ k/2` cost boundary — incumbent dense path.
+    /// Windows past the legacy cost boundary; dense only with the trie off.
     collision_fallbacks: usize,
 }
 
@@ -4637,6 +4639,7 @@ fn transpose_forward_ntt_sparse_inner_dead(
     // whole-mechanism switch).
     let fill = open_fill_enabled();
     let singleton_on = fill && singleton_override.unwrap_or_else(lig_induce_singleton_enabled);
+    let sparse_trie = singleton_on && sparse_window::enabled();
     // No prefix for small domains or empty query sets — scatter + full dense
     // transform. `k_override` is a test clamp.
     let k = if log_d < 12 || positions.is_empty() {
@@ -4684,7 +4687,13 @@ fn transpose_forward_ntt_sparse_inner_dead(
     let mut order: Vec<u32> = Vec::new();
     if fill {
         order.extend(0..positions.len() as u32);
-        if !positions.windows(2).all(|w| (w[0] >> k) <= (w[1] >> k)) {
+        if sparse_trie {
+            // Full position order exposes shared child windows to the sparse
+            // recursion. Equal positions remain stable and still add by XOR.
+            if !positions.windows(2).all(|w| w[0] <= w[1]) {
+                order.sort_by_key(|&i| positions[i as usize]);
+            }
+        } else if !positions.windows(2).all(|w| (w[0] >> k) <= (w[1] >> k)) {
             order.sort_by_key(|&i| positions[i as usize] >> k);
         }
         let mut s = 0usize;
@@ -4708,11 +4717,12 @@ fn transpose_forward_ntt_sparse_inner_dead(
         win_vec = windows.into_iter().collect();
     }
 
-    // The `nnz ≤ k/2` threshold is the exact per-window cost boundary:
+    // With the sparse trie off, `nnz ≤ k/2` is the per-window cost boundary:
     // `nnz` expansions cost `nnz·(2^k − 1)` products vs the dense window's
     // `k·2^(k-1)`, and `nnz ≤ k·2^(k-1)/(2^k − 1)` reduces to the integer
     // test `nnz ≤ k/2` for every k. The shortcut is therefore never costlier
-    // than the dense window it replaces.
+    // than the dense window it replaces. Preserve these occupancy buckets
+    // for comparable diagnostics even when the shared trie handles a window.
     let multi_max = k / 2;
     let singleton_stats = if singleton_on && fill {
         InduceSingletonStats {
@@ -4781,7 +4791,11 @@ fn transpose_forward_ntt_sparse_inner_dead(
                         continue;
                     }
                     let first = order[rs] as usize;
-                    if singleton_on && nnz <= multi_max {
+                    if sparse_trie {
+                        sparse_window::expand(
+                            ntt, log_d, k, w, positions, values, &order[rs..re], dst,
+                        );
+                    } else if singleton_on && nnz <= multi_max {
                         expand_singleton_into(
                             ntt,
                             log_d,
@@ -4843,7 +4857,13 @@ fn transpose_forward_ntt_sparse_inner_dead(
                     let first = order[rs] as usize;
                     let w = positions[first] >> k;
                     let nnz = re - rs;
-                    if singleton_on && nnz <= multi_max {
+                    if sparse_trie {
+                        let mut buf = take_singleton_buf(k);
+                        sparse_window::expand(
+                            ntt, log_d, k, w, positions, values, &order[rs..re], &mut buf,
+                        );
+                        return (w, buf);
+                    } else if singleton_on && nnz <= multi_max {
                         let mut buf = take_singleton_buf(k);
                         expand_singleton_into(
                             ntt,
