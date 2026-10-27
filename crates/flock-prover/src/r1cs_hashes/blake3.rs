@@ -100,6 +100,16 @@ use flock_core::verifier;
 #[path = "blake3_witgen8.rs"]
 mod blake3_witgen8;
 
+#[cfg(any(test, all(
+    target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vl",
+    target_feature = "avx512vbmi", target_feature = "avx512vbmi2",
+    target_feature = "avx512dq", target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+)))]
+#[path = "blake3_witgen16_core.rs"]
+mod blake3_witgen16_core;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -2824,9 +2834,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         && w30_elided
         && blake3_witgen8::ranked_static01_direct_enabled()
     {
-        // One task owns a full root-cache tile. Each octa publishes one
-        // complete 64-byte stripe per group from its live word vectors.
+        // One task owns a full root-cache tile. The AVX-512 arithmetic
+        // handles two octas together; publication keeps the octa cache lines.
         const GROUP: usize = 64;
+        const OCTAS_PER_KERNEL: usize = if cfg!(all(
+            target_feature = "avx512vl", target_feature = "avx512vbmi2",
+            target_feature = "avx512dq"
+        )) { 2 } else { 1 };
         let group_f128 = GROUP * F128_PER_BLOCK;
         let group_bytes = GROUP * ab_block_bytes;
         const ROOT_FIELDS_PER_TILE: usize = GROUP * 176 * 8 / 16;
@@ -2851,12 +2865,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             .for_each(|(g, ((((z_out, a_out), b_out), ab_out), root_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
                 unsafe {
-                    for half in 0..(n_here / SIMD) {
+                    for half in (0..(n_here / SIMD)).step_by(OCTAS_PER_KERNEL) {
                         let base = GROUP * g + half * SIMD;
                         let off = half * SIMD * F128_PER_BLOCK;
-                        let proj = blake3_witgen8::StreamProj {
+                        let mut proj = |octa| blake3_witgen8::StreamProj {
                             stage: core::ptr::null_mut(),
-                            out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
+                            out: ab_out.as_mut_ptr().add(octa * SIMD * ab_block_bytes),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
                             inv_table,
@@ -2864,19 +2878,40 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             one_rows_elided: true,
                             w30_elided: true,
                         };
+                        let mut roots = |octa| {
+                            if root_enabled {
+                                root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
+                                    plan, root_out.as_mut_ptr().cast::<u8>().add(octa * 64)))
+                            } else { None }
+                        };
+                        #[cfg(all(
+                            target_feature = "avx512vl", target_feature = "avx512vbmi2",
+                            target_feature = "avx512dq"
+                        ))]
+                        blake3_witgen8::wide::build16_witness_ab_stream_ranked_closed(
+                            init,
+                            base,
+                            z_out.as_mut_ptr().add(off).cast::<u32>(),
+                            a_out.as_mut_ptr().add(off).cast::<u32>(),
+                            b_out.as_mut_ptr().add(off).cast::<u32>(),
+                            [proj(half), proj(half + 1)],
+                            &preps.0,
+                            [roots(half), roots(half + 1)],
+                        );
+                        #[cfg(not(all(
+                            target_feature = "avx512vl", target_feature = "avx512vbmi2",
+                            target_feature = "avx512dq"
+                        )))]
                         blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
                             init,
                             base,
                             z_out.as_mut_ptr().add(off).cast::<u32>(),
                             a_out.as_mut_ptr().add(off).cast::<u32>(),
                             b_out.as_mut_ptr().add(off).cast::<u32>(),
-                            proj,
+                            proj(half),
                             &preps.0,
                             [true; 3],
-                            if root_enabled {
-                                root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
-                                    plan, root_out.as_mut_ptr().cast::<u8>().add(half * 64)))
-                            } else { None },
+                            roots(half),
                         );
                     }
                 }

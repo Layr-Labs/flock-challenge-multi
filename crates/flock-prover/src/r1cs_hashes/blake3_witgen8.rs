@@ -97,6 +97,15 @@ const _ELIDE_GEOMETRY: () = {
 
 type V8 = __m256i;
 
+#[cfg(all(
+    target_feature = "avx512f", target_feature = "avx512bw",
+    target_feature = "avx512vl", target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2", target_feature = "avx512dq",
+    target_feature = "gfni", target_feature = "vpclmulqdq"
+))]
+#[path = "blake3_witgen16.rs"]
+pub(crate) mod wide;
+
 /// Input form for one eight-compression witness kernel invocation.
 ///
 /// The ranked speculative path carries the generator's closed form all the
