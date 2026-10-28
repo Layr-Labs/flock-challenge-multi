@@ -784,7 +784,14 @@ fn make_sized_tmp(path: PathBuf, len: usize) -> Option<SizedTmp> {
             let _ = std::fs::remove_file(&path);
             return None;
         }
-        let base = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, file.as_raw_fd(), 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
         if base.is_null() || base as usize == usize::MAX {
             let _ = std::fs::remove_file(&path);
             return None;
@@ -857,7 +864,10 @@ fn drop_sized_set(set: SizedSet) {
 /// published (rename included); `Err(bytes)` when the incumbent tail must
 /// write `bytes` (the exact `to_bytes()` output); `None` when no set or no
 /// stash exists and the caller must encode from scratch.
-fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
+fn publish_sized(
+    path: &Path,
+    bundle: &R1csProofBundleLigerito,
+) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
     let guard = SIZED_SET.lock().unwrap_or_else(|e| e.into_inner());
     let set = guard.as_ref()?;
     let enc = bundle.raw_encoding()?;
@@ -1263,7 +1273,11 @@ fn speculative_main(
     drop(warm);
 
     on_hot_worker(hot, move || {
-        let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
+        let line_r = if hot {
+            spin_read_line_fd(real_stdin)
+        } else {
+            read_line_fd(real_stdin)
+        };
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);

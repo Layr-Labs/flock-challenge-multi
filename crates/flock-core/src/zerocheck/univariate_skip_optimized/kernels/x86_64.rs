@@ -1813,9 +1813,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline]
 fn r1_ab_write_fixed_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none());
     *ON
 }
 
@@ -1947,14 +1946,17 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     unsafe {
         // Membership in [first,end), clipped to the sixteen demand rows.
         // Tail hints beyond the clipped range keep the existing loop.
-        let pf_mask: u32 = if prefetch.first >= 16 { 0 } else {
+        let pf_mask: u32 = if prefetch.first >= 16 {
+            0
+        } else {
             ((1u32 << prefetch.end.min(16)) - 1) & !((1u32 << prefetch.first) - 1)
         };
-        let pf_origin = prefetch.next_window.wrapping_sub(prefetch.first.wrapping_mul(ELL));
+        let pf_origin = prefetch
+            .next_window
+            .wrapping_sub(prefetch.first.wrapping_mul(ELL));
         let pf_one = |bm: usize| {
             _mm_prefetch(
-                pf_origin.wrapping_add(bm.wrapping_mul(ELL))
-                    .cast::<i8>(),
+                pf_origin.wrapping_add(bm.wrapping_mul(ELL)).cast::<i8>(),
                 _MM_HINT_T0,
             );
         };
@@ -2485,9 +2487,7 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
     half_offset: usize,
     local_res_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{
-        WideGhashX4, ghash_broadcast_split, ghash_mul_x4_split,
-    };
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_broadcast_split, ghash_mul_x4_split};
     use core::arch::x86_64::*;
     debug_assert_eq!(plane_banks.len(), eq_bot.len() * 16 * ELL);
     debug_assert!(half_offset == 0 || half_offset == 8);
@@ -2511,14 +2511,54 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
             let wb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(e1.hi as i64, e1.lo as i64));
             let p0 = base_ptr.add(u * 16);
             let p1 = base_ptr.add((u + 1) * 16);
-            acc0.mul_acc2(_mm512_loadu_si512(p0.add(0)), wb0, _mm512_loadu_si512(p1.add(0)), wb1);
-            acc1.mul_acc2(_mm512_loadu_si512(p0.add(1)), wb0, _mm512_loadu_si512(p1.add(1)), wb1);
-            acc2.mul_acc2(_mm512_loadu_si512(p0.add(2)), wb0, _mm512_loadu_si512(p1.add(2)), wb1);
-            acc3.mul_acc2(_mm512_loadu_si512(p0.add(3)), wb0, _mm512_loadu_si512(p1.add(3)), wb1);
-            acc4.mul_acc2(_mm512_loadu_si512(p0.add(4)), wb0, _mm512_loadu_si512(p1.add(4)), wb1);
-            acc5.mul_acc2(_mm512_loadu_si512(p0.add(5)), wb0, _mm512_loadu_si512(p1.add(5)), wb1);
-            acc6.mul_acc2(_mm512_loadu_si512(p0.add(6)), wb0, _mm512_loadu_si512(p1.add(6)), wb1);
-            acc7.mul_acc2(_mm512_loadu_si512(p0.add(7)), wb0, _mm512_loadu_si512(p1.add(7)), wb1);
+            acc0.mul_acc2(
+                _mm512_loadu_si512(p0.add(0)),
+                wb0,
+                _mm512_loadu_si512(p1.add(0)),
+                wb1,
+            );
+            acc1.mul_acc2(
+                _mm512_loadu_si512(p0.add(1)),
+                wb0,
+                _mm512_loadu_si512(p1.add(1)),
+                wb1,
+            );
+            acc2.mul_acc2(
+                _mm512_loadu_si512(p0.add(2)),
+                wb0,
+                _mm512_loadu_si512(p1.add(2)),
+                wb1,
+            );
+            acc3.mul_acc2(
+                _mm512_loadu_si512(p0.add(3)),
+                wb0,
+                _mm512_loadu_si512(p1.add(3)),
+                wb1,
+            );
+            acc4.mul_acc2(
+                _mm512_loadu_si512(p0.add(4)),
+                wb0,
+                _mm512_loadu_si512(p1.add(4)),
+                wb1,
+            );
+            acc5.mul_acc2(
+                _mm512_loadu_si512(p0.add(5)),
+                wb0,
+                _mm512_loadu_si512(p1.add(5)),
+                wb1,
+            );
+            acc6.mul_acc2(
+                _mm512_loadu_si512(p0.add(6)),
+                wb0,
+                _mm512_loadu_si512(p1.add(6)),
+                wb1,
+            );
+            acc7.mul_acc2(
+                _mm512_loadu_si512(p0.add(7)),
+                wb0,
+                _mm512_loadu_si512(p1.add(7)),
+                wb1,
+            );
             u += 2;
         }
         while u < n {
@@ -2568,18 +2608,33 @@ pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
 ) {
     unsafe {
         transpose_plane_banks_in_place_x86_avx512(plane_banks, eq_bot.len());
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 0, local_res_ab);
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 8, local_res_ab);
+        accumulate_transposed_banks_half_x86_avx512(
+            plane_banks,
+            eq_bot,
+            eq_hi_val,
+            0,
+            local_res_ab,
+        );
+        accumulate_transposed_banks_half_x86_avx512(
+            plane_banks,
+            eq_bot,
+            eq_hi_val,
+            8,
+            local_res_ab,
+        );
     }
 }
 
-
-
-#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
-          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 mod ab_prefetch_plan_tests {
-    use super::convert_ab_nomul_x86_gfni_direct;
     use super::super::AbDirectPrefetch;
+    use super::convert_ab_nomul_x86_gfni_direct;
     use std::hint::black_box;
 
     fn rng(s: &mut u64) -> u64 {
@@ -2590,9 +2645,20 @@ mod ab_prefetch_plan_tests {
     }
 
     fn check<const FIRST: usize, const N: usize, const WRITE: bool>(seed: &mut u64) -> usize {
-        let plans = [(0, 0, false), (0, 0, true), (0, 14, true), (2, 16, true),
-                     (0, 15, true), (0, 16, true), (0, 16, false), (2, 16, false),
-                     (5, 3, true), (16, 20, true), (1, 19, true), (19, 20, false)];
+        let plans = [
+            (0, 0, false),
+            (0, 0, true),
+            (0, 14, true),
+            (2, 16, true),
+            (0, 15, true),
+            (0, 16, true),
+            (0, 16, false),
+            (2, 16, false),
+            (5, 3, true),
+            (16, 20, true),
+            (1, 19, true),
+            (19, 20, false),
+        ];
         for case in 0..24 {
             let off = [0, 1, 7, 31][case % 4];
             let mut input = [0u8; 1088];
@@ -2601,14 +2667,24 @@ mod ab_prefetch_plan_tests {
             let mut guarded = [0xceu8; 1152];
             let mut expected = [0u8; 1024];
             for x in &mut input {
-                *x = match case { 0 => 0, 1 => 255, _ => rng(seed) as u8 };
+                *x = match case {
+                    0 => 0,
+                    1 => 255,
+                    _ => rng(seed) as u8,
+                };
             }
-            for x in &mut mats { *x = rng(seed); }
-            for x in &mut expected { *x = rng(seed) as u8; }
+            for x in &mut mats {
+                *x = rng(seed);
+            }
+            for x in &mut expected {
+                *x = rng(seed) as u8;
+            }
             guarded[off..off + 1024].copy_from_slice(&expected);
             let original_input = input;
             let original_mats = mats;
-            if WRITE { expected.fill(0); }
+            if WRITE {
+                expected.fill(0);
+            }
             for k in 0..16 {
                 for lane in 0..64 {
                     let mut value = 0u8;
@@ -2616,7 +2692,9 @@ mod ab_prefetch_plan_tests {
                         let x = input[off + (row - FIRST) * 64 + lane];
                         let matrix = mats[row * 16 + k];
                         for bit in 0..8 {
-                            value ^= (((x & (matrix >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit;
+                            value ^= (((x & (matrix >> (8 * (7 - bit))) as u8).count_ones() & 1)
+                                as u8)
+                                << bit;
                         }
                     }
                     expected[k * 64 + lane] ^= value;
@@ -2624,8 +2702,14 @@ mod ab_prefetch_plan_tests {
             }
             let (first, end, spread) = plans[case % plans.len()];
             let prefetch = AbDirectPrefetch {
-                next_window: if first >= end { core::ptr::null() } else { next.as_ptr() },
-                first, end, spread,
+                next_window: if first >= end {
+                    core::ptr::null()
+                } else {
+                    next.as_ptr()
+                },
+                first,
+                end,
+                spread,
             };
             let out: &mut [u8; 1024] = (&mut guarded[off..off + 1024]).try_into().unwrap();
             // SAFETY: exact live-row extent, full matrix/output buffers, and
@@ -2633,12 +2717,20 @@ mod ab_prefetch_plan_tests {
             unsafe {
                 convert_ab_nomul_x86_gfni_direct::<FIRST, N, WRITE>(
                     black_box(&input[off..off + (N - FIRST) * 64]),
-                    black_box(&mats), out, black_box(&prefetch));
+                    black_box(&mats),
+                    out,
+                    black_box(&prefetch),
+                );
             }
             assert_eq!(*out, expected, "shape={FIRST},{N},{WRITE} case={case}");
             assert_eq!(input, original_input);
             assert_eq!(mats, original_mats);
-            assert!(guarded[..off].iter().chain(guarded[off + 1024..].iter()).all(|&x| x == 0xce));
+            assert!(
+                guarded[..off]
+                    .iter()
+                    .chain(guarded[off + 1024..].iter())
+                    .all(|&x| x == 0xce)
+            );
         }
         24
     }
@@ -2646,10 +2738,15 @@ mod ab_prefetch_plan_tests {
     #[test]
     fn actual_direct_ab_prefetch_plan_matches_scalar() {
         let mut seed = 0x4273158b99u64;
-        let count = check::<2, 16, false>(&mut seed) + check::<2, 16, true>(&mut seed)
-            + check::<0, 14, false>(&mut seed) + check::<0, 14, true>(&mut seed)
-            + check::<0, 15, false>(&mut seed) + check::<0, 15, true>(&mut seed);
+        let count = check::<2, 16, false>(&mut seed)
+            + check::<2, 16, true>(&mut seed)
+            + check::<0, 14, false>(&mut seed)
+            + check::<0, 14, true>(&mut seed)
+            + check::<0, 15, false>(&mut seed)
+            + check::<0, 15, true>(&mut seed);
         assert_eq!(count, 144);
-        println!("144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards");
+        println!(
+            "144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards"
+        );
     }
 }

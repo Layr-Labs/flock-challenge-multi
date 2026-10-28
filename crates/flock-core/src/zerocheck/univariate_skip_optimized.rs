@@ -4443,8 +4443,9 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let res_ab = if zc_r1ab_claim_enabled() && rayon::current_thread_index().is_some() {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_threads = rayon::current_num_threads();
-        let slots: Vec<std::sync::Mutex<Option<[F128; ELL]>>> =
-            (0..n_threads).map(|_| std::sync::Mutex::new(None)).collect();
+        let slots: Vec<std::sync::Mutex<Option<[F128; ELL]>>> = (0..n_threads)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         rayon::broadcast(|ctx| {
             let mut state: Option<WorkerStateAbOnly> = None;
             loop {

@@ -438,6 +438,20 @@ fn finalize_commit(
             if depth == 0 || seen == 0 {
                 return;
             }
+            // SAFETY: the existing retirement barrier has published every
+            // leaf in this aligned subtree. This callback exclusively owns
+            // its ancestor ranges; the join still precedes the upper fold.
+            if unsafe {
+                merkle::try_hash_subtree_parents_dual(
+                    tree_addr as *mut Hash,
+                    stored_leaves,
+                    parent_range.start,
+                    len,
+                    kind,
+                )
+            } {
+                return;
+            }
             // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
             // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
             // nodes [start >> j, (start + len) >> j) of it.

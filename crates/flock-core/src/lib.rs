@@ -321,7 +321,9 @@ pub(crate) mod smt_split {
                     assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
                     assert_eq!(&ab[..cores], &(0..cores).collect::<Vec<_>>());
                     assert_eq!(c, (cores..2 * cores - moved).collect::<Vec<_>>());
-                    if moved != 0 { assert_eq!(ab.last(), Some(&(2 * cores - 1))); }
+                    if moved != 0 {
+                        assert_eq!(ab.last(), Some(&(2 * cores - 1)));
+                    }
                 }
             }
         }

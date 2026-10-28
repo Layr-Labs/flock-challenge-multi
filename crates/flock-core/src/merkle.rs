@@ -599,6 +599,43 @@ pub(crate) fn hash_leaf_pairs_serial(
     const SCRATCH_LEAVES: usize = BLAKE3_GROUP;
     assert_eq!(data.len(), 2 * out.len() * leaf_size);
 
+    // Only the transient first edge uses planes. Retained parent CVs remain
+    // canonical bytes, so cut-depth-one tree layout and openings are unchanged.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    let (out, data) = if kind == HashKind::Blake3 && blake3_leaf_size_is_batchable(leaf_size) {
+        let full = out.len() / 16 * 16;
+        if full != 0 {
+            let leaves = &data[..2 * full * leaf_size];
+            let parents = &mut out[..full];
+            match leaf_size {
+                64 => contiguous::hash_leaf_pairs::<64>(leaves, parents),
+                128 => contiguous::hash_leaf_pairs::<128>(leaves, parents),
+                256 => contiguous::hash_leaf_pairs::<256>(leaves, parents),
+                512 => contiguous::hash_leaf_pairs::<512>(leaves, parents),
+                1024 => contiguous::hash_leaf_pairs::<1024>(leaves, parents),
+                _ => unreachable!(),
+            }
+            #[cfg(feature = "hash-count")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                hash_count::LEAF_CALLS.fetch_add((2 * full) as u64, Relaxed);
+                hash_count::LEAF_COMPRESSIONS.fetch_add(
+                    (2 * full) as u64 * hash_count::blocks(kind, leaf_size),
+                    Relaxed,
+                );
+                hash_count::PAIR_CALLS.fetch_add(full as u64, Relaxed);
+            }
+        }
+        (&mut out[full..], &data[2 * full * leaf_size..])
+    } else {
+        (out, data)
+    };
+
     let mut scratch = core::mem::MaybeUninit::<[Hash; SCRATCH_LEAVES]>::uninit();
     for (parents, leaves) in out
         .chunks_mut(SCRATCH_LEAVES / 2)
@@ -1407,6 +1444,113 @@ mod tests {
     }
 
     #[test]
+    fn leaf_pairs_plane_edge_matches_hazmat() {
+        use blake3::hazmat::HasherExt;
+        let mut seed = 0xc2b2ae3d27d4eb4fu64;
+        for leaf_size in [1usize, 32, 63, 64, 65, 128, 256, 512, 1023, 1024, 1025] {
+            for nparents in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+                for offset in [0usize, 1, 31, 63] {
+                    let mut storage = vec![0u8; offset + 2 * nparents * leaf_size];
+                    for x in &mut storage {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        *x = seed as u8;
+                    }
+                    let data = &storage[offset..];
+                    let guard = [0xa5u8; 32];
+                    let mut got = vec![guard; nparents + 2];
+                    hash_leaf_pairs_serial(
+                        data,
+                        leaf_size,
+                        &mut got[1..nparents + 1],
+                        HashKind::Blake3,
+                    );
+                    for i in 0..nparents {
+                        let lo = 2 * i * leaf_size;
+                        let left = blake3::Hasher::new()
+                            .update(&data[lo..lo + leaf_size])
+                            .finalize_non_root();
+                        let right = blake3::Hasher::new()
+                            .update(&data[lo + leaf_size..lo + 2 * leaf_size])
+                            .finalize_non_root();
+                        let want = blake3::hazmat::merge_subtrees_non_root(
+                            &left,
+                            &right,
+                            blake3::hazmat::Mode::Hash,
+                        );
+                        assert_eq!(
+                            got[i + 1],
+                            want,
+                            "size={leaf_size} parents={nparents} offset={offset} i={i}"
+                        );
+                    }
+                    assert_eq!(got[0], guard);
+                    assert_eq!(got[nparents + 1], guard);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    #[test]
+    fn cv_plane_first_edge_interface_matches_hazmat() {
+        use blake3::hazmat::HasherExt;
+        let mut seed = 0x94d049bb133111ebu64;
+        for size in [64usize, 128, 256, 512, 1024] {
+            // 32,64,128 leaves explicitly, then batch/loop boundaries.
+            for count in [16usize, 32, 64, 80, 128] {
+                for offset in [0usize, 1, 31, 63] {
+                    let mut storage = vec![0u8; offset + 2 * count * size];
+                    for x in &mut storage {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        *x = seed as u8;
+                    }
+                    let data = &storage[offset..];
+                    let guard = [0xa5u8; 32];
+                    let mut got = vec![guard; count + 2];
+                    match size {
+                        64 => contiguous::hash_leaf_pairs::<64>(data, &mut got[1..count + 1]),
+                        128 => contiguous::hash_leaf_pairs::<128>(data, &mut got[1..count + 1]),
+                        256 => contiguous::hash_leaf_pairs::<256>(data, &mut got[1..count + 1]),
+                        512 => contiguous::hash_leaf_pairs::<512>(data, &mut got[1..count + 1]),
+                        1024 => contiguous::hash_leaf_pairs::<1024>(data, &mut got[1..count + 1]),
+                        _ => unreachable!(),
+                    }
+                    for i in 0..count {
+                        let lo = 2 * i * size;
+                        let left = blake3::Hasher::new()
+                            .update(&data[lo..lo + size])
+                            .finalize_non_root();
+                        let right = blake3::Hasher::new()
+                            .update(&data[lo + size..lo + 2 * size])
+                            .finalize_non_root();
+                        let want = blake3::hazmat::merge_subtrees_non_root(
+                            &left,
+                            &right,
+                            blake3::hazmat::Mode::Hash,
+                        );
+                        assert_eq!(
+                            got[i + 1],
+                            want,
+                            "size={size} parents={count} offset={offset} i={i}"
+                        );
+                    }
+                    assert_eq!(got[0], guard);
+                    assert_eq!(got[count + 1], guard);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn blake3_contiguous_groups_and_tails_match_scalar() {
         let mut seed = 0x9b85da2c174930edu64;
         for size in [64usize, 128, 256, 512, 1024] {
@@ -2063,6 +2207,193 @@ mod tests {
                 positions.len(),
                 log_n
             );
+        }
+    }
+}
+
+/// Try the bounded dual-output BLAKE3 subtree fold. Returns false, without
+/// accessing tree, for unsupported targets, hash kinds or geometry.
+///
+/// # Safety
+/// For accepted geometry, tree must point to 2 * stored_leaves - 1 Hash slots.
+/// The caller owns the initialized leaves [start, start + len) and their
+/// ancestor ranges up to this subtree's root, exclusively until return. Other
+/// workers may own disjoint subtrees. No reference to the whole tree may be
+/// used concurrently. All resulting nodes retain canonical Hash layout.
+#[inline]
+pub(crate) unsafe fn try_hash_subtree_parents_dual(
+    tree: *mut Hash,
+    stored_leaves: usize,
+    start: usize,
+    len: usize,
+    kind: HashKind,
+) -> bool {
+    if kind != HashKind::Blake3
+        || !stored_leaves.is_power_of_two()
+        || stored_leaves > isize::MAX as usize / (2 * core::mem::size_of::<Hash>())
+        || !(64..=2048).contains(&len)
+        || !len.is_power_of_two()
+        || len > stored_leaves
+        || start > stored_leaves - len
+        || !start.is_multiple_of(len)
+    {
+        return false;
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    {
+        // SAFETY: geometry is checked above; remaining ownership and pointer
+        // validity requirements are explicitly delegated to the caller.
+        unsafe {
+            contiguous::hash_subtree_parents_dual(tree, stored_leaves, start, len);
+        }
+        true
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    )))]
+    {
+        let _ = tree;
+        false
+    }
+}
+
+#[cfg(test)]
+mod dual_subtree_tests {
+    use super::*;
+    #[test]
+    fn unsupported_geometry_does_not_touch_tree() {
+        let mut tree = vec![[0xa5u8; 32]; 8191];
+        for (n, start, len, kind) in [
+            (4096, 0, 1024, HashKind::Sha256),
+            (0, 0, 64, HashKind::Blake3),
+            (4095, 0, 64, HashKind::Blake3),
+            (4096, 0, 0, HashKind::Blake3),
+            (4096, 0, 32, HashKind::Blake3),
+            (4096, 0, 96, HashKind::Blake3),
+            (4096, 0, 4096, HashKind::Blake3),
+            (4096, 1, 64, HashKind::Blake3),
+            (4096, 4096, 64, HashKind::Blake3),
+            (4096, usize::MAX, 64, HashKind::Blake3),
+            (32, 0, 64, HashKind::Blake3),
+            (1usize << (usize::BITS - 1), 0, 64, HashKind::Blake3),
+        ] {
+            assert!(!unsafe {
+                try_hash_subtree_parents_dual(tree.as_mut_ptr(), n, start, len, kind)
+            });
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_feature = "avx512f",
+            target_feature = "avx512vl"
+        )))]
+        assert!(!unsafe {
+            try_hash_subtree_parents_dual(tree.as_mut_ptr(), 4096, 0, 1024, HashKind::Blake3)
+        });
+        assert!(tree.iter().all(|h| *h == [0xa5u8; 32]));
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    #[test]
+    fn parallel_dual_subtrees_preserve_every_canonical_node() {
+        use rayon::prelude::*;
+        const N: usize = 8192;
+        for threads in [1, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for len in [64usize, 128, 256, 1024, 2048] {
+                for pattern in 0..3 {
+                    let mut oracle = vec![[0u8; 32]; 2 * N - 1];
+                    let mut seed = 0x9e3779b97f4a7c15u64;
+                    for h in &mut oracle[..N] {
+                        for b in h {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            *b = match pattern {
+                                0 => 0,
+                                1 => 255,
+                                _ => seed as u8,
+                            };
+                        }
+                    }
+                    let offset = if pattern == 1 { 1 } else { 63 };
+                    let mut bytes = vec![0xa5; offset + oracle.len() * 32 + 64];
+                    for (h, dst) in oracle[..N].iter().zip(bytes[offset..].chunks_mut(32)) {
+                        dst.copy_from_slice(h);
+                    }
+                    let mut width = N;
+                    while width > 1 {
+                        let read = 2 * N - 2 * width;
+                        let write = 2 * N - width;
+                        for i in 0..width / 2 {
+                            oracle[write + i] = blake3::hazmat::merge_subtrees_non_root(
+                                &oracle[read + 2 * i],
+                                &oracle[read + 2 * i + 1],
+                                blake3::hazmat::Mode::Hash,
+                            );
+                        }
+                        width /= 2;
+                    }
+                    let address = unsafe { bytes.as_mut_ptr().add(offset) } as usize;
+                    // Each job owns one subtree's ranges at every local
+                    // level. The odd multiplier permutes the power-of-two
+                    // number of subtrees. The join precedes upper folding.
+                    pool.install(|| {
+                        (0..N / len).into_par_iter().for_each(|g| {
+                            let start = ((g * 37) % (N / len)) * len;
+                            assert!(unsafe {
+                                try_hash_subtree_parents_dual(
+                                    address as *mut Hash,
+                                    N,
+                                    start,
+                                    len,
+                                    HashKind::Blake3,
+                                )
+                            });
+                        })
+                    });
+                    let actual =
+                        unsafe { core::slice::from_raw_parts_mut(address as *mut Hash, 2 * N - 1) };
+                    width = N / len;
+                    while width > 1 {
+                        let read = 2 * N - 2 * width;
+                        let write = 2 * N - width;
+                        let (before, after) = actual.split_at_mut(write);
+                        hash_pairs_level_serial(
+                            &before[read..read + width],
+                            &mut after[..width / 2],
+                            HashKind::Blake3,
+                        );
+                        width /= 2;
+                    }
+                    assert_eq!(
+                        actual, &oracle,
+                        "threads={threads} len={len} pattern={pattern}"
+                    );
+                    assert!(bytes[..offset].iter().all(|&b| b == 0xa5));
+                    assert!(
+                        bytes[offset + oracle.len() * 32..]
+                            .iter()
+                            .all(|&b| b == 0xa5)
+                    );
+                }
+            }
         }
     }
 }
