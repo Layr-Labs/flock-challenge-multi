@@ -1447,11 +1447,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
         // per-element operation in identical order, so the result is
         // bit-identical to the scalar loop below.
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_quad[..n_packed],
-            low_eq[0],
-        );
+        crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_quad[..n_packed], low_eq[0]);
         for q in 1..4 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
@@ -1554,11 +1550,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         // `add_scaled` leaves — identical per-element operation in identical
         // order, so the result is bit-identical to the scalar loop below.
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_fold8[..n_packed],
-            low_eq[0],
-        );
+        crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_fold8[..n_packed], low_eq[0]);
         for bank in 1..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
@@ -2149,9 +2141,7 @@ pub(crate) struct GfniDirectFoldMap {
     target_feature = "gfni",
 ))]
 #[inline]
-pub(crate) fn build_gfni_direct_fold_map_from_generators(
-    generators: &[F128],
-) -> GfniDirectFoldMap {
+pub(crate) fn build_gfni_direct_fold_map_from_generators(generators: &[F128]) -> GfniDirectFoldMap {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
     use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
     GfniDirectFoldMap {
@@ -2172,9 +2162,8 @@ pub(crate) fn build_gfni_direct_fold_map_from_generators(
 #[inline]
 pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirectFoldMap {
     debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
-    let generators: [F128; 128] = core::array::from_fn(|i| {
-        table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]
-    });
+    let generators: [F128; 128] =
+        core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
     build_gfni_direct_fold_map_from_generators(&generators)
 }
 
@@ -2248,11 +2237,8 @@ pub(crate) fn compose_block_mats_gfni_into(
                         _mm512_add_epi64(top, top),
                     );
                     let next_hi = _mm512_shldi_epi64::<8>(hi, lo);
-                    let next_lo = _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_slli_epi64::<8>(lo),
-                        red_721,
-                        top,
-                    );
+                    let next_lo =
+                        _mm512_ternarylogic_epi64::<0x96>(_mm512_slli_epi64::<8>(lo), red_721, top);
                     lo = next_lo;
                     hi = next_hi;
                 }
@@ -3088,9 +3074,8 @@ fn direct_fold8_states_seq(
 /// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather state build.
 #[inline]
 fn df8_state_direct_disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
-    });
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some());
     *OFF
 }
 
@@ -3164,11 +3149,7 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
     target_feature = "gfni"
 ))]
 #[inline(always)]
-unsafe fn direct_fold8_w_state_gfni(
-    low_eq: &[F128; 64],
-    table: &[F128],
-    w_state: &mut [F128],
-) {
+unsafe fn direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
     debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
     let generators: [F128; 128] =
         core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
@@ -3186,7 +3167,9 @@ fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut 
         target_feature = "gfni"
     ))]
     {
-        unsafe { direct_fold8_w_state_gfni(low_eq, table, w_state); }
+        unsafe {
+            direct_fold8_w_state_gfni(low_eq, table, w_state);
+        }
         return;
     }
     #[cfg(not(all(
@@ -3978,175 +3961,177 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // route and the full-width ranked route (see `rs_tail_par_enabled`). The
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
-    let claim_output =
-        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
-            let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
-            crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
-            let wants_direct = !elide_basis
-                && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let skip_table =
-                elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let skip_table = false;
-            let table = if skip_table {
-                Vec::new()
-            } else {
-                build_fold_byte_table(&scaled_eq_r_dprime)
-            };
-            let direct_fold2 = match kinds[i] {
-                Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let products = w.s_hat_v_quad.as_deref().map(|quad| {
-                        let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
-                        for e in 0..4 {
-                            let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                            for d_low in 0..4 {
-                                for p in 0..n_packed {
-                                    scaled_bank[p] = low_eq[d_low] * bank[p];
-                                }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
-                                products[e * 4 + d_low] =
-                                    inner_product(&transposed, &scaled_eq_r_dprime);
+    let claim_output = |i: usize,
+                        mut w: ClaimWork,
+                        g: F128|
+     -> (RingSwitchProof, RingSwitchBatchOutput) {
+        let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
+        crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
+        let wants_direct =
+            !elide_basis && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let skip_table =
+            elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        let skip_table = false;
+        let table = if skip_table {
+            Vec::new()
+        } else {
+            build_fold_byte_table(&scaled_eq_r_dprime)
+        };
+        let direct_fold2 = match kinds[i] {
+            Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
+                let suffix = dense_suffixes[d];
+                let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                    .try_into()
+                    .expect("two-coordinate eq has four entries");
+                let products = w.s_hat_v_quad.as_deref().map(|quad| {
+                    let mut products = [F128::ZERO; 16];
+                    let mut scaled_bank = vec![F128::ZERO; n_packed];
+                    for e in 0..4 {
+                        let bank = &quad[e * n_packed..(e + 1) * n_packed];
+                        for d_low in 0..4 {
+                            for p in 0..n_packed {
+                                scaled_bank[p] = low_eq[d_low] * bank[p];
                             }
+                            let transposed = tensor_algebra_transpose(&scaled_bank);
+                            products[e * 4 + d_low] =
+                                inner_product(&transposed, &scaled_eq_r_dprime);
                         }
-                        products
-                    });
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
-                (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 16] = build_eq(&suffix[..4])
-                        .try_into()
-                        .expect("four-coordinate eq has sixteen entries");
-                    let products = direct_fold4_products(fold4, &low_eq, &scaled_eq_r_dprime);
-                    let tail = &suffix[4..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold4Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                    #[cfg(all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "avx512vbmi",
-                        target_feature = "vpclmulqdq",
-                        target_feature = "gfni"
-                    ))]
-                    let factors = if skip_table {
-                        build_direct_fold8_factors_reusing_a_state_from_generators(
-                            fold8,
-                            dense_suffixes[d],
-                            &scaled_eq_r_dprime,
-                        )
-                    } else {
-                        build_direct_fold8_factors_reusing_a_state(
-                            fold8,
-                            dense_suffixes[d],
-                            &table,
-                            tail_par,
-                        )
-                    };
-                    #[cfg(not(all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "avx512vbmi",
-                        target_feature = "vpclmulqdq",
-                        target_feature = "gfni"
-                    )))]
-                    let factors = build_direct_fold8_factors_reusing_a_state(
+                    }
+                    products
+                });
+                let tail = &suffix[2..];
+                let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                Some(DirectFold2Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq,
+                    table: table.clone(),
+                    products,
+                })
+            }
+            _ => None,
+        };
+        let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
+            (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
+                let suffix = dense_suffixes[d];
+                let low_eq: [F128; 16] = build_eq(&suffix[..4])
+                    .try_into()
+                    .expect("four-coordinate eq has sixteen entries");
+                let products = direct_fold4_products(fold4, &low_eq, &scaled_eq_r_dprime);
+                let tail = &suffix[4..];
+                let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                Some(DirectFold4Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq,
+                    table: table.clone(),
+                    products,
+                })
+            }
+            _ => None,
+        };
+        let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
+            (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                let factors = if skip_table {
+                    build_direct_fold8_factors_reusing_a_state_from_generators(
+                        fold8,
+                        dense_suffixes[d],
+                        &scaled_eq_r_dprime,
+                    )
+                } else {
+                    build_direct_fold8_factors_reusing_a_state(
                         fold8,
                         dense_suffixes[d],
                         &table,
                         tail_par,
-                    );
-                    Some(factors)
-                }
-                _ => None,
-            };
-            let rs_eq_ind = match kinds[i] {
-                Kind::Dense(d) => {
-                    if use_split {
-                        // Defer the fold: carry the split factors + γ-baked byte
-                        // table so pcs's combine folds each slot directly into
-                        // `b_combined` (no 2^(m-7) materialize + readback). The
-                        // table build is the only work done here (16·256 adds).
-                        if elide_basis {
-                            // Dead basis: only `RsEqInd::len()` is observed.
-                            // Preserve the logical tensor shape without
-                            // allocating or zeroing factors no caller reads.
-                            let n_lo = split_n_lo(dense_suffixes[d].len());
-                            let n_hi = dense_suffixes[d].len() - n_lo;
-                            RsEqInd::DeferredDense {
-                                eq_lo: Vec::new(),
-                                eq_hi: Vec::new(),
-                                table,
-                                logical_len: (1usize << n_lo) * (1usize << n_hi),
-                            }
-                        } else {
-                            let (eq_lo, eq_hi) = &dense_splits[d];
-                            RsEqInd::DeferredDense {
-                                eq_lo: eq_lo.clone(),
-                                eq_hi: eq_hi.clone(),
-                                table,
-                                logical_len: eq_lo.len() * eq_hi.len(),
-                            }
+                    )
+                };
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                )))]
+                let factors = build_direct_fold8_factors_reusing_a_state(
+                    fold8,
+                    dense_suffixes[d],
+                    &table,
+                    tail_par,
+                );
+                Some(factors)
+            }
+            _ => None,
+        };
+        let rs_eq_ind = match kinds[i] {
+            Kind::Dense(d) => {
+                if use_split {
+                    // Defer the fold: carry the split factors + γ-baked byte
+                    // table so pcs's combine folds each slot directly into
+                    // `b_combined` (no 2^(m-7) materialize + readback). The
+                    // table build is the only work done here (16·256 adds).
+                    if elide_basis {
+                        // Dead basis: only `RsEqInd::len()` is observed.
+                        // Preserve the logical tensor shape without
+                        // allocating or zeroing factors no caller reads.
+                        let n_lo = split_n_lo(dense_suffixes[d].len());
+                        let n_hi = dense_suffixes[d].len() - n_lo;
+                        RsEqInd::DeferredDense {
+                            eq_lo: Vec::new(),
+                            eq_hi: Vec::new(),
+                            table,
+                            logical_len: (1usize << n_lo) * (1usize << n_hi),
                         }
                     } else {
-                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                        let (eq_lo, eq_hi) = &dense_splits[d];
+                        RsEqInd::DeferredDense {
+                            eq_lo: eq_lo.clone(),
+                            eq_hi: eq_hi.clone(),
+                            table,
+                            logical_len: eq_lo.len() * eq_hi.len(),
+                        }
                     }
+                } else {
+                    RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
                 }
-                Kind::Sparse(s) => RsEqInd::Sparse {
-                    len: l,
-                    entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
-                },
-            };
-            (
-                RingSwitchProof { s_hat_v: w.s_hat_v },
-                RingSwitchBatchOutput {
-                    rs_eq_ind,
-                    sumcheck_claim: w.sumcheck_claim,
-                    direct_fold2,
-                    direct_fold4,
-                    direct_fold8,
-                },
-            )
+            }
+            Kind::Sparse(s) => RsEqInd::Sparse {
+                len: l,
+                entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
+            },
         };
+        (
+            RingSwitchProof { s_hat_v: w.s_hat_v },
+            RingSwitchBatchOutput {
+                rs_eq_ind,
+                sumcheck_claim: w.sumcheck_claim,
+                direct_fold2,
+                direct_fold4,
+                direct_fold8,
+            },
+        )
+    };
     // Indexed parallel collect preserves claim order, so the output vector —
     // and with it every transcript-visible byte downstream — is identical to
     // the sequential route.
