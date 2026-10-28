@@ -74,7 +74,7 @@
 //!   scratch pools).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use flock_core::pcs::Commitment;
@@ -514,30 +514,55 @@ fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
 // (IPI -> host -> guest resume), paid inside the timed window. The witness
 // phase that follows then wakes the sleeping Rayon workers the same way, one
 // tickle at a time. Waiting hot removes both: the body below runs ON a pool
-// worker that polls the descriptor non-blockingly, while every other worker
-// spins in `rayon::yield_now` and so picks up the witness jobs the moment
+// worker that polls the descriptor non-blockingly, while eligible idle workers
+// run bounded `rayon::yield_now` callbacks and pick up witness jobs the moment
 // they are pushed. Nothing seed-dependent happens before the read; this only
 // changes how the idle wait before it is spent. Bounded: after
 // `HOT_WAIT_BUDGET` the wait degrades to the original blocking read.
 
 const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
-static PRESEED_SPIN: AtomicBool = AtomicBool::new(false);
+// Each start gets a distinct even epoch; setting its low bit cancels it.
+// A reusable boolean revives delayed callbacks after end/start, including on
+// the new owner above the continuation that must eventually stop them. Never
+// wrap: at exhaustion new starts simply leave warming disabled. As before,
+// the ranked worker has one serial proof owner, not concurrent sessions.
+static PRESEED_EPOCH: AtomicU64 = AtomicU64::new(0);
+const PRESEED_SPINS_PER_JOB: usize = 2048;
 
 /// Release the pre-seed spinners. Called once the witness phase is done (and
 /// unconditionally after every body that started them).
 #[inline]
 pub(crate) fn preseed_spin_end() {
-    PRESEED_SPIN.store(false, Ordering::Release);
+    PRESEED_EPOCH.fetch_or(1, Ordering::Release);
 }
 
-fn preseed_spinner(backoff: usize) {
-    while PRESEED_SPIN.load(Ordering::Acquire) {
+fn preseed_spinner(epoch: u64, owner: usize, backoff: usize) {
+    if PRESEED_EPOCH.load(Ordering::Acquire) != epoch
+        || rayon::current_thread_index() == Some(owner)
+    {
+        return;
+    }
+    let Some(_callback) = flock_core::hot_pool::CallbackGuard::enter() else {
+        return;
+    };
+    #[cfg(test)]
+    let _depth = tests::PreseedDepth::enter();
+    // Even a current callback must return: it can be entered by yield_now
+    // above a suspended parallel continuation. Admission also prevents a
+    // rescheduled callback from nesting indefinitely inside another spinner.
+    for _ in 0..PRESEED_SPINS_PER_JOB {
+        if PRESEED_EPOCH.load(Ordering::Acquire) != epoch {
+            return;
+        }
         if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
             for _ in 0..backoff {
                 core::hint::spin_loop();
             }
         }
+    }
+    if PRESEED_EPOCH.load(Ordering::Acquire) == epoch {
+        rayon::spawn(move || preseed_spinner(epoch, owner, backoff));
     }
 }
 
@@ -548,11 +573,16 @@ fn preseed_spin_start() {
     };
     let n = rayon::current_num_threads().max(1);
     let sibling = (owner + n / 2) % n;
-    PRESEED_SPIN.store(true, Ordering::Release);
+    let Ok(previous) = PRESEED_EPOCH.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+        old.checked_add(2).map(|next| next & !1)
+    }) else {
+        return;
+    };
+    let epoch = (previous + 2) & !1;
     rayon::spawn_broadcast(move |ctx| {
         let me = ctx.index();
         if me != owner {
-            preseed_spinner(if me == sibling { 64 } else { 8 });
+            preseed_spinner(epoch, owner, if me == sibling { 64 } else { 8 });
         }
     });
 }
@@ -1207,10 +1237,14 @@ fn speculative_main(
         // slots, and its rayon injector/sleep bookkeeping, none of which
         // appear in that curve. This is the ONLY warm-up knob that warms the
         // thread the ranked harness actually times (`killed.md:6039`).
-        // 8, not 11: the binding budget is the 1500 s JOB budget, not the
-        // 45 s per-worker guard -- ranked benchmark.sh is 808 s/120 trials,
-        // leaving ~5.7 s/trial, and 4 extra proves spend ~1.1 s of it.
-        const SPEC_WARMUP_PROVES: usize = 8;
+        // 11, not 8: the binding budget is the 1500 s JOB budget, not the
+        // 45 s per-worker guard. Ranked benchmark.sh spends about 12 minutes
+        // of that job on its 120 trials, and three more warm-up proves add
+        // under a minute on top, so the extra passes fit with the job budget
+        // still wide open. Each pass commits more of this thread's
+        // lazily-grown stack and its thread-local and pool bookkeeping before
+        // the timed prove.
+        const SPEC_WARMUP_PROVES: usize = 11;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
@@ -1461,6 +1495,147 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static PRESEED_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+    static PRESEED_MAX_DEPTH: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static PRESEED_ENTRIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    pub(super) struct PreseedDepth;
+    impl PreseedDepth {
+        pub(super) fn enter() -> Self {
+            let depth = PRESEED_DEPTH.with(|d| {
+                let next = d.get() + 1;
+                d.set(next);
+                next
+            });
+            PRESEED_MAX_DEPTH.fetch_max(depth, Ordering::Relaxed);
+            PRESEED_ENTRIES.fetch_add(1, Ordering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for PreseedDepth {
+        fn drop(&mut self) {
+            PRESEED_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    /// Exercise production callbacks while allowing a broken spinner to be
+    /// cancelled externally, so regression failures do not hang the suite.
+    fn preseed_finishes_without_rescue(body: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> bool {
+        let _ = flock_core::init_perf_thread_pool();
+        assert!(flock_core::ranked_pool_built(), "requires the ranked topology pool");
+        assert!(std::env::var_os("FLOCK_NO_HOT_POOL").is_none());
+        let finished = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (done, stop) = (finished.clone(), cancel.clone());
+        let worker = std::thread::spawn(move || {
+            body(stop);
+            done.store(true, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !finished.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let timely = finished.load(Ordering::Acquire);
+        cancel.store(true, Ordering::Release);
+        let cleanup = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !finished.load(Ordering::Acquire) && std::time::Instant::now() < cleanup {
+            preseed_spin_end();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(finished.load(Ordering::Acquire), "spinner cleanup failed");
+        worker.join().unwrap();
+        timely
+    }
+
+    #[test]
+    #[ignore = "requires a fresh ranked pool; run with RAYON_NUM_THREADS=16"]
+    fn preseed_delayed_callback_cannot_block_new_owner() {
+        assert!(preseed_finishes_without_rescue(|cancel| {
+            let b_entered = AtomicBool::new(false);
+            let a_done = AtomicBool::new(false);
+            rayon::broadcast(|ctx| match ctx.index() {
+                0 => {
+                    while !b_entered.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    if !cancel.load(Ordering::Acquire) { on_hot_worker(true, || {}); }
+                    a_done.store(true, Ordering::Release);
+                }
+                1 => {
+                    // Do not Rayon-yield: A's callback for B stays queued
+                    // until A has ended and B has begun its new lifetime.
+                    b_entered.store(true, Ordering::Release);
+                    while !a_done.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    if !cancel.load(Ordering::Acquire) {
+                        on_hot_worker(true, || { let _ = rayon::yield_now(); });
+                    }
+                }
+                _ => {}
+            });
+        }), "a stale callback blocked its new owner until watchdog rescue");
+    }
+
+    #[test]
+    #[ignore = "requires a fresh ranked pool; run with RAYON_NUM_THREADS=16"]
+    fn preseed_restart_and_nested_work_complete() {
+        use std::sync::atomic::AtomicUsize;
+        PRESEED_MAX_DEPTH.store(0, Ordering::Relaxed);
+        PRESEED_ENTRIES.store(0, Ordering::Relaxed);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        let timely = preseed_finishes_without_rescue(move |stop| {
+            for iteration in 0..512usize {
+                if stop.load(Ordering::Acquire) { break; }
+                on_hot_worker(true, || {
+                    let (a, b) = rayon::join(
+                        || (0..64usize).into_par_iter().map(|x| x ^ iteration).sum::<usize>(),
+                        || rayon::join(|| iteration.wrapping_mul(17), || iteration ^ 91),
+                    );
+                    std::hint::black_box((a, b));
+                    if !stop.load(Ordering::Acquire) { tail_spin_start(); }
+                });
+                count.fetch_add(1, Ordering::Release);
+            }
+        });
+        let entries = PRESEED_ENTRIES.load(Ordering::Relaxed);
+        let depth = PRESEED_MAX_DEPTH.load(Ordering::Relaxed);
+        eprintln!("preseed callbacks admitted={entries}, max admitted depth={depth}");
+        assert!(timely, "preseed lifetimes stalled after {} completed phases", completed.load(Ordering::Acquire));
+        assert_eq!(completed.load(Ordering::Acquire), 512);
+        assert!(entries > 0, "no production spinner was admitted");
+        assert_eq!(depth, 1, "a spinner admitted a nested spinner");
+    }
+
+    #[test]
+    #[ignore = "requires a fresh ranked pool; run with RAYON_NUM_THREADS=16"]
+    fn preseed_and_hot_pool_nested_work_complete() {
+        use std::sync::atomic::AtomicUsize;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = completed.clone();
+        assert!(preseed_finishes_without_rescue(move |stop| {
+            for iteration in 0..512usize {
+                if stop.load(Ordering::Acquire) { break; }
+                on_hot_worker(true, || {
+                    let _hot = flock_core::hot_pool::HotPool::start().expect("hot pool enabled");
+                    std::hint::black_box(rayon::join(
+                        || (0..64usize).into_par_iter().map(|x| x ^ iteration).sum::<usize>(),
+                        || rayon::join(|| iteration.wrapping_mul(17), || iteration ^ 91),
+                    ));
+                    if !stop.load(Ordering::Acquire) { tail_spin_start(); }
+                });
+                count.fetch_add(1, Ordering::Release);
+            }
+        }), "mixed warming callbacks stalled after {} phases", completed.load(Ordering::Acquire));
+        assert_eq!(completed.load(Ordering::Acquire), 512);
+    }
+
 
     /// Literal transcription of `flock_benchmark_common::generate_compressions`
     /// and its `Rng`, so the parallel form is checked against the protected

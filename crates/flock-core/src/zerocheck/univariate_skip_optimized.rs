@@ -4101,6 +4101,16 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     };
     let ab_inner_ptr = ab_inner.as_ptr();
     let pf_spread = zc_r1ab_pf_spread_enabled();
+    let batch4 = ranked_compact && ranked_one_rows_elided
+        && n_lo == 12 && big_lo_size == 4096 && bank_bits == 7
+        && within_outer_mask == 1 && b_med_counts == [16, 14]
+        && eq_bot.len() == 128 && mats.len() == 32 * 256
+        && zc_r1_ab_batch4_enabled();
+    if batch4 {
+        let prefetch_mode = if pf_windows == 0 { 0 } else if pf_spread { 1 } else { 2 };
+        unsafe { process_ranked_ab_w4_band(ab_inner, mats, x_hi, plane_first_write,
+            prefetch_mode, &mut state.plane_banks); }
+    } else {
     let bank_mask = (1usize << bank_bits) - 1;
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
@@ -4169,6 +4179,7 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
             );
         }
     }
+    }
     let wide = r1_eqfold_x4_enabled();
     if wide {
         unsafe {
@@ -4190,6 +4201,50 @@ fn zc_r1ab_claim_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1AB_CLAIM").is_none());
     *ON
+}
+
+
+
+/// Diagnostic rollback of the ranked four-w bank retention. Resolved once.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+fn zc_r1_ab_batch4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+        std::env::var_os("FLOCK_NO_ZC_R1_AB_BATCH4").is_none());
+    *ON
+}
+
+/// Same compact source and matrix layout, with w grouped four at a time:
+/// within each slab visit all u banks, retaining that bank's sixteen planes
+/// across the four w contributions. Source stride in w is 64 compact blocks.
+/// Production uses this only for the existing exact 14-row direct route.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+unsafe fn process_ranked_ab_w4_band(
+    source: &[u8], mats: &[u64], x_hi: usize, first_write: bool,
+    prefetch_mode: usize, planes: &mut [u8],
+) {
+    assert!(source.len() >= (x_hi + 1) * 2048 * RANKED_AB_COMPACT_BLOCK_BYTES);
+    assert_eq!(mats.len(), 32 * 256);
+    assert_eq!(planes.len(), RANKED_AB_PLANE_BYTES);
+    for w_base in (0usize..32).step_by(4) {
+        for u in 0usize..128 {
+            let x_outer = (x_hi << 12) | (w_base << 7) | u;
+            let first = if u & 1 == 0 { 2 } else { 0 };
+            let base = (x_outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES + (u & 1) * 14 * ELL;
+            // SAFETY: exact ranked compact geometry supplies all four live
+            // spans. Each bank is initialized by the w_base=0 call before
+            // subsequent loads. Matrix rows retain their absolute bm offset.
+            unsafe {
+                kernels::x86_64::convert_ab_nomul_x86_gfni_w4(
+                    source.as_ptr().add(base), mats.as_ptr().add(w_base * 256 + first * 16),
+                    planes.as_mut_ptr().add(u * 16 * ELL),
+                    64 * RANKED_AB_COMPACT_BLOCK_BYTES, 4,
+                    first_write && w_base == 0, prefetch_mode,
+                );
+            }
+        }
+    }
 }
 
 /// Ranked default routes the round-one AB band folds — the plane-bank
@@ -6699,4 +6754,131 @@ mod tests {
 /// Compile-time structural B mode for ranked eight-row projection.
 pub const fn round1_ranked_bcomplement_mode(blk: usize, k: usize) -> u8 {
     kernels::x86_64_bcomplement::window_mode(blk, k)
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+          target_feature = "avx512bw", target_feature = "avx512vbmi",
+          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod ab_batch4_worker_tests {
+    use super::*;
+
+    #[test]
+    fn ab_batch4_actual_worker_gate_cache_and_collapse_match_reference() {
+        fn next(s: &mut u64) -> u64 {
+            *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s
+        }
+        fn nonzero(s: &mut u64) -> F128 {
+            F128 { lo: next(s) | 1, hi: next(s) }
+        }
+        fn reference(
+            source: &[u8], mats: &[u64], x_hi: usize, eq_bot: &[F128], eq_hi: F128,
+        ) -> [F128; ELL] {
+            // Force the incumbent one-window wrapper, independent of the
+            // batch4 dispatch. Its ordinary accumulating leaf builds planes.
+            let mut planes = vec![0u8; RANKED_AB_PLANE_BYTES];
+            let pf = kernels::AbDirectPrefetch {
+                next_window: core::ptr::null(), first: 0, end: 0, spread: true,
+            };
+            for x_lo in 0usize..4096 {
+                let outer = (x_hi << 12) | x_lo;
+                let first = if outer & 1 == 0 { 2 } else { 0 };
+                let end = first + 14;
+                let base = (outer >> 1) * RANKED_AB_COMPACT_BLOCK_BYTES
+                    + (outer & 1) * 14 * ELL;
+                let w = x_lo >> 7;
+                let u = x_lo & 127;
+                let row: &[u64; 256] = (&mats[w * 256..(w + 1) * 256]).try_into().unwrap();
+                let bank: &mut [u8; 16 * ELL] =
+                    (&mut planes[u * 16 * ELL..(u + 1) * 16 * ELL]).try_into().unwrap();
+                kernels::convert_ab_nomul_gfni_direct::<false>(
+                    &source[base..base + 14 * ELL], first, end, row, bank, &pf,
+                );
+            }
+            // Independently decode plane bytes and perform the scalar field
+            // fold. Do not call the production transpose/collapse helpers.
+            let mut result = [F128::ZERO; ELL];
+            for u in 0..128 { for lane in 0..ELL {
+                let bank = &planes[u * 16 * ELL..(u + 1) * 16 * ELL];
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for k in 0..8 {
+                    lo |= (bank[k * ELL + lane] as u64) << (k * 8);
+                    hi |= (bank[(k + 8) * ELL + lane] as u64) << (k * 8);
+                }
+                result[lane] += eq_bot[u] * F128 { lo, hi };
+            } }
+            for value in &mut result { *value = *value * eq_hi; }
+            result
+        }
+        fn add(dst: &mut [F128; ELL], src: &[F128; ELL]) {
+            for lane in 0..ELL { dst[lane] += src[lane]; }
+        }
+        // Restore any pre-existing TLS cache even if an assertion unwinds.
+        struct RestoreCache(Option<Vec<u8>>);
+        impl Drop for RestoreCache {
+            fn drop(&mut self) {
+                RANKED_AB_PLANE_CACHE.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = RestoreCache(RANKED_AB_PLANE_CACHE.with(|slot| slot.borrow_mut().take()));
+        let mut seed = 0xc94d7a34e02u64;
+        let mut source = vec![0u8; 2 * 2048 * RANKED_AB_COMPACT_BLOCK_BYTES];
+        let mut mats = vec![0u64; 32 * 256];
+        for byte in &mut source { *byte = next(&mut seed) as u8; }
+        for matrix in &mut mats { *matrix = next(&mut seed); }
+        let eq_bot: Vec<F128> = (0..128).map(|_| nonzero(&mut seed)).collect();
+        let eq_hi = nonzero(&mut seed);
+        let expected = [reference(&source, &mats, 0, &eq_bot, eq_hi),
+                        reference(&source, &mats, 1, &eq_bot, eq_hi)];
+        let poisoned = vec![0xd3u8; RANKED_AB_PLANE_BYTES];
+        let arena_ptr = poisoned.as_ptr();
+        RANKED_AB_PLANE_CACHE.with(|slot| *slot.borrow_mut() = Some(poisoned));
+
+        let mut state = WorkerStateAbOnly::new();
+        let mut accumulated = std::array::from_fn(|_| nonzero(&mut seed));
+        state.local_res_ab = accumulated;
+        // Exact production gate: compact, one rows and W30 elided, n_lo=12,
+        // bank_bits=7, 4096 windows, 128 low weights and 32 matrix rows.
+        // No hook or env mutation changes the real dispatch. A fresh-process
+        // rerun with FLOCK_NO_ZC_R1_AB_BATCH4=1 checks the rollback route.
+        for x_hi in [0usize, 1] {
+            if x_hi != 0 { state.plane_banks.fill(0xa7); }
+            unsafe {
+                process_one_x_hi_ab_only_direct_x86(
+                    x_hi, 4096, 12 + N_INNER, 1, &[16, 14], &source,
+                    eq_hi, &eq_bot, &mats, 7, true, true, true, true, &mut state,
+                );
+            }
+            add(&mut accumulated, &expected[x_hi]);
+            assert_eq!(state.local_res_ab, accumulated, "cached first-write x_hi={x_hi}");
+            assert!(state.cached_plane_banks);
+            assert_eq!(state.plane_banks.as_ptr(), arena_ptr);
+            assert_eq!(state.plane_banks.len(), RANKED_AB_PLANE_BYTES);
+            assert!(RANKED_AB_PLANE_CACHE.with(|slot| slot.borrow().is_none()));
+        }
+        // Drop parks the transformed arena; a different worker-state owner
+        // must obtain that same allocation and overwrite its stale bytes.
+        drop(state);
+        assert_eq!(RANKED_AB_PLANE_CACHE.with(|slot| slot.borrow().as_ref().unwrap().as_ptr()), arena_ptr);
+        let mut recycled = WorkerStateAbOnly::new();
+        for first_write in [true, false] {
+            unsafe {
+                process_one_x_hi_ab_only_direct_x86(
+                    1, 4096, 12 + N_INNER, 1, &[16, 14], &source,
+                    eq_hi, &eq_bot, &mats, 7, first_write, first_write, true, true,
+                    &mut recycled,
+                );
+            }
+            // The second pass explicitly exercises zero-fill mode on the
+            // same stale arena and accumulates into an existing result.
+            let mut wanted = expected[1];
+            if !first_write { add(&mut wanted, &expected[1]); }
+            assert_eq!(recycled.local_res_ab, wanted, "recycled first_write={first_write}");
+            assert!(recycled.cached_plane_banks);
+            assert_eq!(recycled.plane_banks.as_ptr(), arena_ptr);
+        }
+        drop(recycled);
+        println!("actual direct-worker integration matched incumbent planes + scalar collapse; batch4_enabled={}",
+                 zc_r1_ab_batch4_enabled());
+    }
 }
