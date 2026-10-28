@@ -2899,14 +2899,29 @@ impl AdditiveNttF128 {
                         pf_msg_rows(src, r + k * sub_stride, block_size, row_len, pf_lines);
                     }
                 }
-                static PF2: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-                static PF2L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2L").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
+                static PF2: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                    std::env::var("DIAG_PF2")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0)
+                });
+                static PF2L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                    std::env::var("DIAG_PF2L")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(16)
+                });
                 let pf2 = *PF2;
                 if pf2 != 0 {
                     for k in 1..pf2.min(64) {
                         for i in 0..4 {
-                            let p = src.add((i * block_size + r + k * sub_stride) * row_len) as *const i8;
-                            for l in 0..*PF2L { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(p.add(l * 64)); }
+                            let p = src.add((i * block_size + r + k * sub_stride) * row_len)
+                                as *const i8;
+                            for l in 0..*PF2L {
+                                core::arch::x86_64::_mm_prefetch::<
+                                    { core::arch::x86_64::_MM_HINT_T1 },
+                                >(p.add(l * 64));
+                            }
                         }
                     }
                 }
@@ -2915,8 +2930,13 @@ impl AdditiveNttF128 {
                     let kp = perm(k);
                     if pf2 != 0 && k + pf2 < 64 {
                         for i in 0..4 {
-                            let p = src.add((i * block_size + r_s + pf2 * sub_stride) * row_len) as *const i8;
-                            for l in 0..*PF2L { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(p.add(l * 64)); }
+                            let p = src.add((i * block_size + r_s + pf2 * sub_stride) * row_len)
+                                as *const i8;
+                            for l in 0..*PF2L {
+                                core::arch::x86_64::_mm_prefetch::<
+                                    { core::arch::x86_64::_MM_HINT_T1 },
+                                >(p.add(l * 64));
+                            }
                         }
                     }
                     // One line per lane step from inside the kernel, or the
@@ -2953,8 +2973,13 @@ impl AdditiveNttF128 {
                         } else {
                             row_len
                         };
-                        static NOREAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DIAG_NOREAD").is_some());
-                        let (q_, rs_, pf_) = if *NOREAD { (1024usize, r_s & 1023, core::ptr::null()) } else { (block_size, r_s, pf_next) };
+                        static NOREAD: std::sync::LazyLock<bool> =
+                            std::sync::LazyLock::new(|| std::env::var_os("DIAG_NOREAD").is_some());
+                        let (q_, rs_, pf_) = if *NOREAD {
+                            (1024usize, r_s & 1023, core::ptr::null())
+                        } else {
+                            (block_size, r_s, pf_next)
+                        };
                         kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
                             src,
                             q_,
@@ -3236,8 +3261,7 @@ impl AdditiveNttF128 {
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2, after)
-            {
+            if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2, after) {
                 return after.is_some();
             }
             (0..sub_stride)
@@ -3826,7 +3850,8 @@ impl AdditiveNttF128 {
                 if got {
                     continue;
                 }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
+                if prod_done.load(Ordering::Acquire) == n_pairs
+                    && queues.iter().all(|q| q.is_empty())
                 {
                     return;
                 }
