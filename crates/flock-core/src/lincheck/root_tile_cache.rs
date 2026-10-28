@@ -281,20 +281,9 @@ impl RootTileCache {
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
-        #[cfg(not(test))]
-        let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride);
-        // The ranked prover's global recycler aligns allocations >=32 KiB to
-        // 64 bytes. Core-only test binaries use System instead, so emulate that
-        // alignment for the complete-reader premise rather than timing extra
-        // split-line loads/stores absent from production. The leaf oracle
-        // separately exercises unaligned raw buffers.
-        #[cfg(test)]
-        let mut plane_storage =
-            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride + 63);
-        #[cfg(test)]
+        let mut plane_storage = crate::scratch::take_root_planes(workers * stride + 63);
         let plane_offset = plane_storage.as_ptr().align_offset(64);
-        #[cfg(test)]
-        let mut planes = &mut plane_storage[plane_offset..plane_offset + workers * stride];
+        let planes = &mut plane_storage[plane_offset..plane_offset + workers * stride];
         let mut active = vec![0u8; workers];
         let next = std::sync::atomic::AtomicUsize::new(0);
         let dynamic = dynamic_tiles_enabled();
@@ -408,7 +397,7 @@ impl RootTileCache {
             .filter_map(|(i, v)| (v != 0).then_some(i))
             .collect();
         let output_blocks = self.blocks + usize::from(self.fixed_roots);
-        let mut out = vec![F128::ZERO; output_blocks * 64];
+        let mut out = crate::scratch::take_root_folded(output_blocks * 64);
         out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
@@ -420,6 +409,7 @@ impl RootTileCache {
                 reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
             }
         });
+        crate::scratch::give_root_planes(plane_storage);
         if self.fixed_roots {
             out.copy_within(833..896, 897);
             out[833..897].fill(F128::ZERO);

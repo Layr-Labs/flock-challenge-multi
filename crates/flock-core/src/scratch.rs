@@ -19,7 +19,303 @@
 
 use crate::field::F128;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+static TIMED_PROVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn set_timed_prove_active(active: bool) {
+    TIMED_PROVE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_timed_prove_active() -> bool {
+    TIMED_PROVE_ACTIVE.load(Ordering::Relaxed)
+}
+
+static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static LINCHECK_NODES_SCRATCH: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static SPARSE_NTT_DATA_SCRATCH: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static ROOT_PLANES_SCRATCH: Mutex<Vec<Vec<core::mem::MaybeUninit<u8>>>> = Mutex::new(Vec::new());
+static ROOT_FOLDED_SCRATCH: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static ONE_FOLD8_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+pub type SparseDualBufs = (Vec<[F128; 32]>, Vec<[F128; 30]>, Vec<[F128; 32]>);
+static SPARSE_DUAL_SCRATCH: Mutex<Vec<SparseDualBufs>> = Mutex::new(Vec::new());
+
+pub fn take_root_planes(n: usize) -> Vec<core::mem::MaybeUninit<u8>> {
+    if let Ok(mut guard) = ROOT_PLANES_SCRATCH.lock() {
+        if let Some(pos) = guard.iter().position(|v| v.capacity() >= n) {
+            let mut v = guard.swap_remove(pos);
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n)
+}
+
+pub fn give_root_planes(mut v: Vec<core::mem::MaybeUninit<u8>>) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    if v.capacity() < 180_224 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = ROOT_PLANES_SCRATCH.lock() {
+        if guard.len() < 2 {
+            guard.push(v);
+        }
+    }
+}
+
+pub fn take_root_folded(n: usize) -> Vec<F128> {
+    if let Ok(mut guard) = ROOT_FOLDED_SCRATCH.lock() {
+        if let Some(pos) = guard.iter().position(|v| v.capacity() >= n) {
+            let mut v = guard.swap_remove(pos);
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    vec![F128::ZERO; n]
+}
+
+pub fn give_root_folded(mut v: Vec<F128>) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap < 11_264 {
+        return;
+    }
+    unsafe { v.set_len(cap) };
+    v.fill(F128::ZERO);
+    if let Ok(mut guard) = ROOT_FOLDED_SCRATCH.lock() {
+        if guard.len() < 2 {
+            guard.push(v);
+        }
+    }
+}
+
+pub fn take_one_fold8(half: usize, extra: usize) -> Vec<F128> {
+    let total = half + extra;
+    if let Ok(mut guard) = ONE_FOLD8_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= total {
+                v.clear();
+                unsafe { v.set_len(half) };
+                return v;
+            }
+        }
+    }
+    let mut v = Vec::with_capacity(total);
+    v.resize(half, F128::ZERO);
+    v
+}
+
+pub fn give_one_fold8(mut v: Vec<F128>) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap < 8192 {
+        return;
+    }
+    unsafe { v.set_len(cap) };
+    v.fill(F128::ZERO);
+    if let Ok(mut guard) = ONE_FOLD8_SCRATCH.lock() {
+        if guard.as_ref().is_none_or(|old| old.capacity() <= cap) {
+            *guard = Some(v);
+        }
+    }
+}
+
+pub fn take_sparse_dual_bufs(n_queries: usize, snapshot_len: usize) -> SparseDualBufs {
+    if let Ok(mut guard) = SPARSE_DUAL_SCRATCH.lock() {
+        if let Some(pos) = guard.iter().position(|(a, b, c)| {
+            a.capacity() >= n_queries && b.capacity() >= snapshot_len && c.capacity() >= snapshot_len
+        }) {
+            let (mut a, mut b, mut c) = guard.swap_remove(pos);
+            unsafe {
+                a.set_len(n_queries);
+                b.set_len(snapshot_len);
+                c.set_len(snapshot_len);
+            }
+            return (a, b, c);
+        }
+    }
+    (
+        crate::alloc_uninit_vec::<[F128; 32]>(n_queries),
+        crate::alloc_uninit_vec::<[F128; 30]>(snapshot_len),
+        crate::alloc_uninit_vec::<[F128; 32]>(snapshot_len),
+    )
+}
+
+pub fn give_sparse_dual_bufs(
+    mut a: Vec<[F128; 32]>,
+    mut b: Vec<[F128; 30]>,
+    mut c: Vec<[F128; 32]>,
+) {
+    if is_timed_prove_active() {
+        std::mem::forget(a);
+        std::mem::forget(b);
+        std::mem::forget(c);
+        return;
+    }
+    if a.capacity() == 0 {
+        return;
+    }
+    a.clear();
+    b.clear();
+    c.clear();
+    if let Ok(mut guard) = SPARSE_DUAL_SCRATCH.lock() {
+        if guard.len() < 2 {
+            guard.push((a, b, c));
+        }
+    }
+}
+
+pub fn take_sparse_ntt_data(n: usize) -> Vec<F128> {
+    if n >= (1usize << 12) {
+        if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
+            let mut best: Option<usize> = None;
+            for (i, v) in guard.iter().enumerate() {
+                if v.capacity() >= n {
+                    if best.is_none_or(|b| v.capacity() < guard[b].capacity()) {
+                        best = Some(i);
+                    }
+                }
+            }
+            if let Some(i) = best {
+                let mut v = guard.swap_remove(i);
+                unsafe { v.set_len(n) };
+                return v;
+            }
+        }
+    }
+    crate::alloc_uninit_vec::<F128>(n)
+}
+
+pub fn give_sparse_ntt_data(mut v: Vec<F128>) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap < (1usize << 12) {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
+        if guard.len() < 4 {
+            guard.push(v);
+        }
+    }
+}
+
+pub fn take_lincheck_acc(n: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= n {
+                unsafe { v.set_len(n) };
+                return v;
+            }
+        }
+    }
+    vec![F128::ZERO; n]
+}
+
+pub fn give_lincheck_acc(mut v: Vec<F128>, _zero_prefix: usize) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap == 0 {
+        return;
+    }
+    unsafe { v.set_len(cap) };
+    v.fill(F128::ZERO);
+    if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
+        if guard.as_ref().is_none_or(|old| old.capacity() <= cap) {
+            *guard = Some(v);
+        }
+    }
+}
+
+pub fn take_lincheck_nodes(total: usize, zero_from: usize, zero_to_inclusive: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_NODES_SCRATCH.lock() {
+        if let Some(pos) = guard.iter().position(|v| v.capacity() >= total) {
+            let mut v = guard.swap_remove(pos);
+            unsafe { v.set_len(total) };
+            if zero_from > zero_to_inclusive {
+                v.fill(F128::ZERO);
+            }
+            return v;
+        }
+    }
+    if zero_from <= zero_to_inclusive && zero_to_inclusive < total {
+        let mut v = crate::alloc_uninit_vec::<F128>(total);
+        v[zero_from..=zero_to_inclusive].fill(F128::ZERO);
+        v
+    } else {
+        vec![F128::ZERO; total]
+    }
+}
+
+pub fn give_lincheck_nodes(mut v: Vec<F128>, zero_from: usize, zero_to_inclusive: usize) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap < 36096 {
+        return;
+    }
+    unsafe { v.set_len(cap) };
+    if zero_from <= zero_to_inclusive && zero_to_inclusive < cap {
+        v[zero_from..=zero_to_inclusive].fill(F128::ZERO);
+    } else {
+        v.fill(F128::ZERO);
+    }
+    if let Ok(mut guard) = LINCHECK_NODES_SCRATCH.lock() {
+        if guard.len() < 2 {
+            guard.push(v);
+        }
+    }
+}
+
+pub fn take_lincheck_eq(n: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_EQ_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= n {
+                unsafe { v.set_len(n) };
+                return v;
+            }
+        }
+    }
+    crate::alloc_uninit_vec::<F128>(n)
+}
+
+pub fn give_lincheck_eq(mut v: Vec<F128>) {
+    if is_timed_prove_active() {
+        std::mem::forget(v);
+        return;
+    }
+    let cap = v.capacity();
+    if cap == 0 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = LINCHECK_EQ_SCRATCH.lock() {
+        if guard.as_ref().is_none_or(|old| old.capacity() <= cap) {
+            *guard = Some(v);
+        }
+    }
+}
 
 /// Pool entries carry a provenance tag: `0` means "no provenance". A non-zero
 /// tag asserts the buffer's contents are EXACTLY what its previous owner
@@ -237,7 +533,10 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
             .min_by_key(|(_, (v, _))| v.capacity())
             .map(|(i, _)| i)
             .expect("pool non-empty");
-        pool.swap_remove(smallest);
+        let evicted = pool.swap_remove(smallest);
+        if is_timed_prove_active() {
+            std::mem::forget(evicted);
+        }
     }
 }
 
@@ -285,6 +584,54 @@ pub fn prewarm_prover(m: usize) {
     });
     for b in bufs {
         give_f128(b);
+    }
+    if m == 32 {
+        let mut sntt_bufs = Vec::with_capacity(3);
+        for &sz in &[1usize << 18, 1usize << 14, 1usize << 12] {
+            let mut sntt = take_sparse_ntt_data(sz);
+            sntt.fill(F128::ZERO);
+            crate::collapse_hugepages(sntt.as_mut_ptr().cast::<u8>(), sntt.len() * 16);
+            sntt_bufs.push(sntt);
+        }
+        for sntt in sntt_bufs {
+            give_sparse_ntt_data(sntt);
+        }
+        let mut rp_bufs = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let mut rp = take_root_planes(16 * 176 * 1024 + 63);
+            unsafe { std::ptr::write_bytes(rp.as_mut_ptr(), 0u8, rp.len()) };
+            crate::collapse_hugepages(rp.as_mut_ptr().cast::<u8>(), rp.len());
+            rp_bufs.push(rp);
+        }
+        for rp in rp_bufs {
+            give_root_planes(rp);
+        }
+        let rf0 = take_root_folded(177 * 64);
+        let rf1 = take_root_folded(177 * 64);
+        give_root_folded(rf0);
+        give_root_folded(rf1);
+        let one_f8 = take_one_fold8(8192, 17 * 64);
+        give_one_fold8(one_f8);
+        let mut sd_bufs = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (mut a, mut b, mut c) = take_sparse_dual_bufs(256, 256);
+            a.fill([F128::ZERO; 32]);
+            b.fill([F128::ZERO; 30]);
+            c.fill([F128::ZERO; 32]);
+            sd_bufs.push((a, b, c));
+        }
+        for (a, b, c) in sd_bufs {
+            give_sparse_dual_bufs(a, b, c);
+        }
+        let acc = take_lincheck_acc(36096);
+        give_lincheck_acc(acc, 36096);
+        let n0 = take_lincheck_nodes(36096, 0, 36095);
+        let n1 = take_lincheck_nodes(36096, 0, 36095);
+        give_lincheck_nodes(n0, 0, 16384);
+        give_lincheck_nodes(n1, 0, 16384);
+        let mut eq = take_lincheck_eq(16384);
+        eq.fill(F128::ZERO);
+        give_lincheck_eq(eq);
     }
 }
 

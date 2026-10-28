@@ -340,13 +340,7 @@ impl LinearFoldPlan {
         }
         let total = k + 1 + self.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
-        let mut nodes = if live_cols <= k {
-            let mut v = crate::alloc_uninit_vec::<F128>(total);
-            v[live_cols..=k].fill(F128::ZERO);
-            v
-        } else {
-            vec![F128::ZERO; total]
-        };
+        let mut nodes = crate::scratch::take_lincheck_nodes(total, live_cols, k);
         debug_assert!(folded.len() >= self.roots.len());
         for (&col, &value) in self.roots.iter().zip(folded) {
             debug_assert!(col < k);
@@ -379,13 +373,7 @@ impl LinearFoldPlan {
     fn reconstruct_level(&self, sched: &LevelSched, folded: &[F128], k: usize) -> Vec<F128> {
         let total = k + 1 + sched.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
-        let mut nodes = if live_cols <= k {
-            let mut v = crate::alloc_uninit_vec::<F128>(total);
-            v[live_cols..=k].fill(F128::ZERO);
-            v
-        } else {
-            vec![F128::ZERO; total]
-        };
+        let mut nodes = crate::scratch::take_lincheck_nodes(total, live_cols, k);
         debug_assert!(folded.len() >= self.roots.len());
         for (&col, &value) in self.roots.iter().zip(folded) {
             debug_assert!(col < k);
@@ -660,7 +648,9 @@ impl RootFoldSource {
             let eq = build_eq_table(x_outer);
             self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]))
         };
-        self.plan.reconstruct(&folded, k)
+        let out = self.plan.reconstruct(&folded, k);
+        crate::scratch::give_root_folded(folded);
+        out
     }
 }
 
@@ -3908,8 +3898,7 @@ pub(crate) fn finish_block_major_fold(
         let r = top_bind.expect("ranked one-row contribution needs top bind");
         assert_eq!(k, 1 << 14);
         let half = k / 2;
-        let mut one = Vec::with_capacity(half + if capture_canon { 17 * 64 } else { 0 });
-        one.resize(half, F128::ZERO);
+        let mut one = crate::scratch::take_one_fold8(half, if capture_canon { 17 * 64 } else { 0 });
         let scale_lo = F128::ONE + r;
         // Ranked one-rows: 1152 live low slots and 256 live high slots.
         // Kill `FLOCK_NO_LC_ONE_SCALE=1` restores the scalar loops.
@@ -4171,7 +4160,11 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = crate::alloc_uninit_vec::<F128>(total);
+    let mut out = if total == (1usize << 14) {
+        crate::scratch::take_lincheck_eq(total)
+    } else {
+        crate::alloc_uninit_vec::<F128>(total)
+    };
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
     for (chunk, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
         crate::field::f128_slice::scale_slice(chunk, &lambda_skip, er);
@@ -4975,7 +4968,7 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -5163,16 +5156,22 @@ fn prove_padded_inner<Ch: Challenger>(
                 e1 = ne1;
                 einf = neinf;
             } else {
-                // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+                // Final round: just fold; z_vec collapses to z_partial (`comb_vec` is unused).
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
             if fold8_ready && t == 0 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
-                captured_z_vec = Some(z_vec.clone());
+                let mut cap = std::mem::take(&mut eq_inner);
+                cap.clear();
+                cap.extend_from_slice(&z_vec);
+                captured_z_vec = Some(cap);
             }
         }
     }
+    if eq_inner.capacity() == (1usize << 14) {
+        crate::scratch::give_lincheck_eq(eq_inner);
+    }
+    crate::scratch::give_lincheck_acc(comb_vec, k + 1);
     if let Some(t) = t_sumcheck_start {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -5182,7 +5181,13 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec;
+    let z_partial = if z_vec.capacity() > k {
+        let out = z_vec.as_slice().to_vec();
+        crate::scratch::give_lincheck_nodes(z_vec, 0, k);
+        out
+    } else {
+        z_vec
+    };
     challenger.observe_f128_slice(&z_partial);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel

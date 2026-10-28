@@ -5049,11 +5049,13 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     }
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     let one_ab_lifted = one_fold8.map(|one_fold8| {
-        if ranked_one_rows {
+        let res = if ranked_one_rows {
             round1_lifted_from_ranked_one_fold8(&one_fold8, inner_tail, prefix, inv_table)
         } else {
             round1_lifted_from_fold8(&one_fold8, inner_tail, prefix, inv_table)
-        }
+        };
+        crate::scratch::give_one_fold8(one_fold8);
+        res
     });
     (
         res_c_lifted,
