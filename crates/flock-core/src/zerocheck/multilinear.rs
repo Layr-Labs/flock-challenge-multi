@@ -1939,6 +1939,19 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     #[allow(unused_variables)]
     let r2_mats_arg = r2_mats.as_ref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    // DIAGNOSTIC: fold-3 cost-proxy arm (see `gaptime::ARM_COST`).
+    #[allow(unused_variables)]
+    let cost_arm = crate::gaptime::diag_arm() == crate::gaptime::ARM_COST;
+    if std::env::var_os("FLOCK_DIAG_PROFILE_DEBUG").is_some() {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        eprintln!("[diag-arm] round 2: cost_arm={cost_arm} fast_r2={fast_r2} lo_size={lo_size}");
+    }
 
     let (sum1_even, sum_inf_even, agg) = (0..hi_size)
         .into_par_iter()
@@ -1964,13 +1977,23 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && (row_base & 255) == 0
                     && let Some(bk) = bake_arg
                 {
-                    kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
-                        lo_size,
-                        bk,
-                    )
+                    if cost_arm {
+                        kernels::x86_64::round2_lookahead_chunk_baked_elide_x86::<true>(
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            row_base,
+                            lo_size,
+                            bk,
+                        )
+                    } else {
+                        kernels::x86_64::round2_lookahead_chunk_baked_elide_x86::<false>(
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            row_base,
+                            lo_size,
+                            bk,
+                        )
+                    }
                 } else if let Some(bk) = bake_arg {
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
                         table.data.as_ptr(),
@@ -2311,6 +2334,13 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         wtab_arg.is_some(),
     );
 
+    // DIAGNOSTIC: fold-3 traffic-proxy arm (see `gaptime::ARM_TRAFFIC`).
+    #[allow(unused_variables)]
+    let traffic_arm = crate::gaptime::diag_arm() == crate::gaptime::ARM_TRAFFIC
+        && quarter * 16 == crate::gaptime::DIAG_TRAFFIC_BYTES;
+    if std::env::var_os("FLOCK_DIAG_PROFILE_DEBUG").is_some() {
+        eprintln!("[diag-arm] level 0: traffic_arm={traffic_arm} quarter={quarter}");
+    }
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -2417,6 +2447,10 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                 useful_pairs_inclusive,
             );
 
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            if traffic_arm {
+                diag_traffic_stream(x_hi, chunk_out * 16, true);
+            }
             let eq_h = eq_hi[x_hi];
             (
                 eq_h * out[0],
@@ -2446,6 +2480,36 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next4[0] * sum1, sum_inf, la)
+}
+
+/// DIAGNOSTIC (fold-3 traffic proxy): stream `bytes` of chunk `x_hi`'s slice
+/// of the scratch buffer out with non-temporal stores (`store`), or read it
+/// back (`!store`), adding pure DRAM traffic to the surrounding pass.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn diag_traffic_stream(x_hi: usize, bytes: usize, store: bool) {
+    use core::arch::x86_64::*;
+    let total = crate::gaptime::DIAG_TRAFFIC_BYTES;
+    if bytes == 0 || bytes % 64 != 0 || (x_hi + 1) * bytes > total {
+        return;
+    }
+    // SAFETY: the slice lies inside the 4096-aligned scratch buffer and every
+    // access is a whole aligned 64-byte line; avx512f is cfg-gated.
+    unsafe {
+        let p = crate::gaptime::diag_traffic_buf().add(x_hi * bytes);
+        if store {
+            let v = _mm512_set1_epi64(x_hi as i64);
+            for off in (0..bytes).step_by(64) {
+                _mm512_stream_si512(p.add(off).cast::<__m512i>(), v);
+            }
+            _mm_sfence();
+        } else {
+            let mut acc = _mm512_setzero_si512();
+            for off in (0..bytes).step_by(64) {
+                acc = _mm512_xor_si512(acc, _mm512_load_si512(p.add(off).cast::<__m512i>()));
+            }
+            core::hint::black_box(acc);
+        }
+    }
 }
 
 /// Portable leaf of [`fold2_from_packed_and_round_pair_lookahead_into`] for
@@ -3343,6 +3407,14 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         wtab_arg.is_some(),
     );
 
+    // DIAGNOSTIC: level one of the traffic-proxy arm reads the 256 MiB that
+    // level zero streamed out (see `gaptime::ARM_TRAFFIC`).
+    #[allow(unused_variables)]
+    let traffic_read = crate::gaptime::diag_arm() == crate::gaptime::ARM_TRAFFIC
+        && n * 16 == crate::gaptime::DIAG_TRAFFIC_BYTES;
+    if std::env::var_os("FLOCK_DIAG_PROFILE_DEBUG").is_some() && traffic_read {
+        eprintln!("[diag-arm] level 1: traffic_read=true n={n} hi_size={hi_size}");
+    }
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -3350,6 +3422,10 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         .map(|(x_hi, (a_out, b_out))| {
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            if traffic_read {
+                diag_traffic_stream(x_hi, crate::gaptime::DIAG_TRAFFIC_BYTES / hi_size, false);
+            }
 
             #[cfg(all(
                 target_arch = "x86_64",

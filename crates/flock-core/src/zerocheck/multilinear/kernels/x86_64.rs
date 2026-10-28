@@ -299,6 +299,89 @@ pub(crate) unsafe fn fold_and_message_x86_avx512(
     }
 }
 
+/// DIAGNOSTIC (fold-3 cost proxy): the bivariate round-four lookahead
+/// products for one 64-row prefold batch already in `fa`/`fb` (four groups of
+/// four lanes; adjacent lanes are the x2 = 0/1 halves of an eight-row group).
+/// `xacc[0]` takes the X = 1 (0,0) position on the raw lanes; `xacc[1..10]`
+/// take the nine X = inf positions on lane-pair sums of two groups packed into
+/// one ZMM, so no lane is wasted. The pair sums are built once into an L1
+/// scratch and the nine products run in two phases (five, then four live
+/// accumulators) to keep the register file from spilling accumulators.
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[inline(always)]
+unsafe fn r2_bivariate_extra(fa: *const F128, fb: *const F128, xacc: &mut [WideGhashX4; 10]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut ps = core::mem::MaybeUninit::<[__m512i; 16]>::uninit();
+        let psp = ps.as_mut_ptr().cast::<__m512i>();
+        macro_rules! ld {
+            ($p:expr, $off:expr) => {
+                _mm512_loadu_si512($p.add($off).cast::<__m512i>())
+            };
+        }
+        macro_rules! pair {
+            ($v:expr, $u:expr) => {
+                _mm512_xor_si512(
+                    _mm512_shuffle_i64x2::<0x88>($v, $u),
+                    _mm512_shuffle_i64x2::<0xDD>($v, $u),
+                )
+            };
+        }
+        let mut x0 = xacc[0];
+        for gp in 0..2 {
+            let (g0, g1) = (8 * gp, 8 * gp + 4);
+            for row in 0..4 {
+                let va = ld!(fa, 16 * row + g0);
+                let ua = ld!(fa, 16 * row + g1);
+                let vb = ld!(fb, 16 * row + g0);
+                let ub = ld!(fb, 16 * row + g1);
+                if row == 0 {
+                    x0.mul_acc2(va, vb, ua, ub);
+                }
+                _mm512_storeu_si512(psp.add(8 * gp + row), pair!(va, ua));
+                _mm512_storeu_si512(psp.add(8 * gp + 4 + row), pair!(vb, ub));
+            }
+        }
+        xacc[0] = x0;
+        macro_rules! group {
+            ($gp:expr) => {{
+                let q = psp.add(8 * $gp);
+                (
+                    _mm512_loadu_si512(q),
+                    _mm512_loadu_si512(q.add(1)),
+                    _mm512_loadu_si512(q.add(2)),
+                    _mm512_loadu_si512(q.add(3)),
+                    _mm512_loadu_si512(q.add(4)),
+                    _mm512_loadu_si512(q.add(5)),
+                    _mm512_loadu_si512(q.add(6)),
+                    _mm512_loadu_si512(q.add(7)),
+                )
+            }};
+        }
+        let (mut p1, mut p2, mut p3, mut p4, mut p5) = (xacc[1], xacc[2], xacc[3], xacc[4], xacc[5]);
+        for gp in 0..2 {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = group!(gp);
+            p1.mul_acc(a1, b1);
+            p2.mul_acc(_mm512_xor_si512(a0, a1), _mm512_xor_si512(b0, b1));
+            p3.mul_acc(a2, b2);
+            p4.mul_acc(a3, b3);
+            p5.mul_acc(_mm512_xor_si512(a2, a3), _mm512_xor_si512(b2, b3));
+        }
+        (xacc[1], xacc[2], xacc[3], xacc[4], xacc[5]) = (p1, p2, p3, p4, p5);
+        let (mut p6, mut p7, mut p8, mut p9) = (xacc[6], xacc[7], xacc[8], xacc[9]);
+        for gp in 0..2 {
+            let (a0, a1, a2, a3, b0, b1, b2, b3) = group!(gp);
+            let (ea, eb) = (_mm512_xor_si512(a0, a2), _mm512_xor_si512(b0, b2));
+            let (oa, ob) = (_mm512_xor_si512(a1, a3), _mm512_xor_si512(b1, b3));
+            p6.mul_acc(ea, eb);
+            p7.mul_acc(oa, ob);
+            p8.mul_acc(_mm512_xor_si512(ea, oa), _mm512_xor_si512(eb, ob));
+            p9.mul_acc(a0, b0);
+        }
+        (xacc[6], xacc[7], xacc[8], xacc[9]) = (p6, p7, p8, p9);
+    }
+}
+
 /// Whether [`round2_lookahead_chunk_baked_elide_x86`] applies to the whole
 /// pass: hoisted once per pass so the 8,192 Rayon chunks do not re-query the
 /// four `LazyLock` switches on every chunk.
@@ -354,7 +437,7 @@ pub(crate) fn round2_baked_elide_route_ok(
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86<const EXTRA: bool>(
     a_pkt: *const u8,
     b_pkt: *const u8,
     row_base: usize,
@@ -368,6 +451,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
+        let mut xacc = [WideGhashX4::zero(); 10];
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
@@ -491,6 +575,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
+                if EXTRA {
+                    r2_bivariate_extra(fa, fb, &mut xacc);
+                }
             }
             // Batch 1 (g0 & 255 == 64): full 4 groups
             {
@@ -500,6 +587,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
+                if EXTRA {
+                    r2_bivariate_extra(fa, fb, &mut xacc);
+                }
             }
             // Batch 2 (g0 & 255 == 128): full 4 groups
             {
@@ -509,6 +599,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
+                if EXTRA {
+                    r2_bivariate_extra(fa, fb, &mut xacc);
+                }
             }
             // Batch 3 (g0 & 255 == 192): elide group 3
             {
@@ -529,12 +622,24 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_x86(
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
                 pf_quarter!(g0, 3);
+                if EXTRA {
+                    r2_bivariate_extra(fa, fb, &mut xacc);
+                }
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             x_lo += 128;
         }
 
+        if EXTRA {
+            // Keep the proxy's work live without changing any message.
+            let mut sink = F128::ZERO;
+            for x in &xacc {
+                let l = crate::field::gf2_128::x86_64::f128x4_extract(x.reduce_lanes());
+                sink += l[0] + l[1] + l[2] + l[3];
+            }
+            core::hint::black_box(sink);
+        }
         let mut out = [F128::ZERO; 8];
         let lane_w = f128x4_loadu(bk.lane.as_ptr());
         for i in 0..8 {
@@ -591,7 +696,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_x86_avx512<const WRITE: bool, const 
         && let Some(bk) = bake
     {
         return unsafe {
-            round2_lookahead_chunk_baked_elide_x86(
+            round2_lookahead_chunk_baked_elide_x86::<false>(
                 a_pkt,
                 b_pkt,
                 row_base,

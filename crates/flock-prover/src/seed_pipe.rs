@@ -1325,6 +1325,7 @@ fn speculative_main(
         }
 
         let seed_at = std::time::Instant::now();
+        diag_profile::seed_received();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Inline path: nothing is materialized except the two blocks the O(1)
             // adoption gate reads. Everything else is evaluated inside witgen from
@@ -1369,6 +1370,7 @@ fn speculative_main(
         match (direct_proof_path.as_deref(), outcome) {
             (Some(path), Ok(out)) => {
                 let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    diag_profile::delay_before_publish(path);
                     publish_direct_proof(path, out)
                 }))
                 .is_ok_and(|result| result.is_ok());
@@ -1858,6 +1860,150 @@ mod tests {
         unsafe {
             close(fds[0]);
             close(fds[1]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC BUILD: runner phase profile through the publication delay.
+// The harness names trial r's proof `run-{r}.proof`, so run r reports metric
+// (r - 1) % METRICS.len() by waiting g(value) before it publishes the proof.
+// Method after weijiekoh's b2bce1bb / cf5ccc66 profiles of an older frontier.
+// ---------------------------------------------------------------------------
+mod diag_profile {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use flock_core::gaptime::{self, Rec};
+
+    static SEED_NS: AtomicU64 = AtomicU64::new(0);
+    static SEED_CPU: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn seed_received() {
+        SEED_NS.store(gaptime::now_ns(), Ordering::SeqCst);
+        SEED_CPU.store(gaptime::cpu_ns(), Ordering::SeqCst);
+    }
+
+    /// A point: seed arrival, the instant before publication, or the
+    /// `occurrence`-th mark carrying `label` in the timed prove.
+    type P = (&'static str, usize);
+    const FT: P = ("zc: fold_table built", 0);
+    const R2: P = ("zc: round2 fused fold done", 0);
+    const R34: P = ("zc: rounds 3+4 composed fold done", 0);
+    const TD: P = ("zc: tail rounds done", 0);
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Control,
+        /// Wall time between two points.
+        Wall(P, P),
+        /// Busy threads between two points: process CPU time / wall time.
+        /// Not normalized by the CPU count, because this thread is pinned and
+        /// `available_parallelism` reports its affinity mask, not the pool.
+        Util(P, P),
+    }
+    use Kind::*;
+
+    /// Fold-3 de-risking build: run r is arm `slot / 4` (see
+    /// `flock_core::gaptime::diag_arm`) and reports `METRICS[slot % 4]`, with
+    /// slot = (r - 1) % DIAG_SLOTS. Kind 0 gives the arm's own baseline P.
+    const METRICS: [Kind; 4] = [
+        Control,        // 0 the arm's undelayed trial time
+        Wall(FT, R2),   // 1 round 2 sweep
+        Wall(R2, R34),  // 2 level 0 (rounds 3+4 composed pass)
+        Wall(R34, TD),  // 3 levels 1.. and the tail rounds
+    ];
+
+    fn run_index(path: &Path) -> Option<usize> {
+        let name = path.file_name()?.to_str()?;
+        name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()
+    }
+
+    fn find(log: &[Rec], p: P, pub_at: (u64, u64)) -> Option<(u64, u64)> {
+        match p.0 {
+            "SEED" => Some((SEED_NS.load(Ordering::SeqCst), SEED_CPU.load(Ordering::SeqCst))),
+            "PUB" => Some(pub_at),
+            label => log
+                .iter()
+                .filter(|r| r.label == label)
+                .nth(p.1)
+                .map(|r| (r.wall_ns, r.cpu_ns)),
+        }
+    }
+
+    /// Encoded delay (ms) for a wall interval of `x` ms: 100x up to 2 ms,
+    /// then 200 + 10 (x - 2).
+    fn g_wall(x: f64) -> f64 {
+        if x <= 2.0 { 100.0 * x } else { 200.0 + 10.0 * (x - 2.0) }
+    }
+
+    /// Encoded delay (ms) for `busy` threads: 20 ms per thread.
+    fn g_util(busy: f64) -> f64 {
+        20.0 * busy.min(32.0)
+    }
+
+    /// Delay (ms) reporting `metric`; 900 ms flags a missing or misordered mark.
+    fn encode(metric: Kind, log: &[Rec], pub_at: (u64, u64)) -> f64 {
+        match metric {
+            Control => 0.0,
+            Wall(a, b) | Util(a, b) => match (find(log, a, pub_at), find(log, b, pub_at)) {
+                (Some((wa, ca)), Some((wb, cb))) if wb >= wa => {
+                    let wall_ms = (wb - wa) as f64 / 1e6;
+                    if let Util(..) = metric {
+                        let cpu_ms = cb.saturating_sub(ca) as f64 / 1e6;
+                        g_util(cpu_ms / wall_ms.max(1e-9))
+                    } else {
+                        g_wall(wall_ms)
+                    }
+                }
+                _ => 900.0,
+            },
+        }
+    }
+
+    pub(super) fn delay_before_publish(path: &Path) {
+        let pub_at = (gaptime::now_ns(), gaptime::cpu_ns());
+        let Some(run) = run_index(path) else { return };
+        let log = gaptime::snapshot();
+        let slot = ((run.max(1) - 1) % flock_core::gaptime::DIAG_SLOTS) % METRICS.len();
+        let delay_ms = encode(METRICS[slot], &log, pub_at);
+        if std::env::var_os("FLOCK_DIAG_PROFILE_DEBUG").is_some() {
+            let base = log.first().map_or(0, |r| r.wall_ns);
+            let cpu_base = log.first().map_or(0, |r| r.cpu_ns);
+            let rel = |ns: u64| (ns as f64 - base as f64) / 1e6;
+            eprintln!(
+                "[diag-profile] seed @{:.3} ms, publish @{:.3} ms",
+                rel(SEED_NS.load(Ordering::SeqCst)),
+                rel(pub_at.0)
+            );
+            for r in &log {
+                eprintln!(
+                    "[diag-profile] @{:10.3} ms  cpu {:10.3} ms  {}",
+                    rel(r.wall_ns),
+                    (r.cpu_ns as f64 - cpu_base as f64) / 1e6,
+                    r.label
+                );
+            }
+            for (i, m) in METRICS.iter().enumerate() {
+                eprintln!("[diag-profile] metric {i:2}: delay {:9.3} ms", encode(*m, &log, pub_at));
+            }
+            eprintln!(
+                "[diag-profile] run {run} -> arm {} metric {slot}, delay {delay_ms:.3} ms",
+                flock_core::gaptime::diag_arm()
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(delay_ms / 1e3);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let left = deadline - now;
+            if left > std::time::Duration::from_millis(2) {
+                std::thread::sleep(left - std::time::Duration::from_millis(1));
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 }
