@@ -502,12 +502,18 @@ impl InvNttTableByteSingleGf8 {
             let row = |img: *const u8, b: usize| {
                 _mm512_loadu_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
             };
-            let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
-            let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
             let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
             let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
-            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            let even = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                row(base, 0),
+                row(base8, 1),
+            );
+            let odd = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u3, u3),
+                row(base, 2),
+                row(base8, 3),
+            );
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
         }
     }
@@ -545,12 +551,18 @@ impl InvNttTableByteSingleGf8 {
             let row = |img: *const u8, b: usize| {
                 _mm512_loadu_si512(img.add(*off.add(b) as usize) as *const __m512i)
             };
-            let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
-            let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
             let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
             let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
-            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            let even = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                row(base, 0),
+                row(base8, 1),
+            );
+            let odd = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u3, u3),
+                row(base, 2),
+                row(base8, 3),
+            );
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
         }
     }
@@ -617,14 +629,6 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
             let w0 = (off as *const u64).read_unaligned();
             let w1 = (off.add(4) as *const u64).read_unaligned();
             let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
-            let u0 = _mm512_xor_si512(
-                row(base, w0 as u16 as usize),
-                row(base8, (w0 >> 16) as u16 as usize),
-            );
-            let u1 = _mm512_xor_si512(
-                row(base, (w0 >> 32) as u16 as usize),
-                row(base8, (w0 >> 48) as usize),
-            );
             let u2 = _mm512_xor_si512(
                 row(base, w1 as u16 as usize),
                 row(base8, (w1 >> 16) as u16 as usize),
@@ -633,8 +637,16 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
                 row(base, (w1 >> 32) as u16 as usize),
                 row(base8, (w1 >> 48) as usize),
             );
-            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            let even = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                row(base, w0 as u16 as usize),
+                row(base8, (w0 >> 16) as u16 as usize),
+            );
+            let odd = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u3, u3),
+                row(base, (w0 >> 32) as u16 as usize),
+                row(base8, (w0 >> 48) as usize),
+            );
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
         }
     }
@@ -669,14 +681,6 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
         let we = (even as *const u64).read_unaligned();
         let wo = (even.add(32) as *const u64).read_unaligned();
         let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
-        let u0 = _mm512_xor_si512(
-            row(base, we as u16 as usize),
-            row(base8, wo as u16 as usize),
-        );
-        let u1 = _mm512_xor_si512(
-            row(base, (we >> 16) as u16 as usize),
-            row(base8, (wo >> 16) as u16 as usize),
-        );
         let u2 = _mm512_xor_si512(
             row(base, (we >> 32) as u16 as usize),
             row(base8, (wo >> 32) as u16 as usize),
@@ -685,9 +689,17 @@ pub(crate) unsafe fn apply_x86_avx512_register_2img_offp_at(
             row(base, (we >> 48) as usize),
             row(base8, (wo >> 48) as usize),
         );
-        let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-        let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
-        _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        let even_v = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+            row(base, we as u16 as usize),
+            row(base8, wo as u16 as usize),
+        );
+        let odd_v = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_shuffle_i64x2::<0x4E>(u3, u3),
+            row(base, (we >> 16) as u16 as usize),
+            row(base8, (wo >> 16) as u16 as usize),
+        );
+        _mm512_xor_si512(even_v, _mm512_shuffle_i64x2::<0xB1>(odd_v, odd_v))
     }
 }
 
@@ -820,15 +832,17 @@ pub(crate) unsafe fn apply_x86_avx512_register_4img_krow_at<const P: bool>(
         let row = |image: usize, offset: usize| {
             _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + offset) as *const __m512i)
         };
-        let v0 = _mm512_xor_si512(
-            _mm512_xor_si512(row(0, o[0]), row(1, o[1])),
-            _mm512_xor_si512(row(2, o[2]), row(3, o[3])),
-        );
-        let v1 = _mm512_xor_si512(
+        let v0_012 = _mm512_ternarylogic_epi64::<0x96>(row(0, o[0]), row(1, o[1]), row(2, o[2]));
+        let v1 = _mm512_ternarylogic_epi64::<0x96>(
             _mm512_xor_si512(row(0, o[4]), row(1, o[5])),
-            _mm512_xor_si512(row(2, o[6]), row(3, o[7])),
+            row(2, o[6]),
+            row(3, o[7]),
         );
-        _mm512_xor_si512(v0, _mm512_shuffle_i64x2::<0x4E>(v1, v1))
+        _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_shuffle_i64x2::<0x4E>(v1, v1),
+            v0_012,
+            row(3, o[3]),
+        )
     }
 }
 
@@ -861,16 +875,10 @@ pub(crate) unsafe fn apply_x86_avx512_register_8img_krow_at<const P: bool>(
         let row = |image: usize| {
             _mm512_loadu_si512(base.add(image * IMAGE_STRIDE_64 + o[image]) as *const __m512i)
         };
-        _mm512_xor_si512(
-            _mm512_xor_si512(
-                _mm512_xor_si512(row(0), row(1)),
-                _mm512_xor_si512(row(2), row(3)),
-            ),
-            _mm512_xor_si512(
-                _mm512_xor_si512(row(4), row(5)),
-                _mm512_xor_si512(row(6), row(7)),
-            ),
-        )
+        let t0 = _mm512_ternarylogic_epi64::<0x96>(row(0), row(1), row(2));
+        let t1 = _mm512_ternarylogic_epi64::<0x96>(row(3), row(4), row(5));
+        let t2 = _mm512_xor_si512(row(6), row(7));
+        _mm512_ternarylogic_epi64::<0x96>(t0, t1, t2)
     }
 }
 
