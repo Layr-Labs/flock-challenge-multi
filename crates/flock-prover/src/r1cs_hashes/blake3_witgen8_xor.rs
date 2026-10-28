@@ -951,9 +951,9 @@ _ => unreachable!(),
         );
     }
 }
-/// Same ring, ranked-static and non-temporal publication contract as the
-/// direct-inline path. The caller issues the task's existing final sfence.
-#[inline(never)]
+/// Select the existing z store policy once before projecting this window.
+/// AB streams in both versions; the caller retains its final publication fence.
+#[inline(always)]
 pub(super) unsafe fn project(
     proj: &StreamProj<'_>,
     blk: usize,
@@ -963,6 +963,29 @@ pub(super) unsafe fn project(
     rw: usize,
     t: &Tables,
 ) {
+    unsafe {
+        if rows.cached_z {
+            project_policy::<true>(proj, blk, rows, ar, br, rw, t);
+        } else {
+            project_policy::<false>(proj, blk, rows, ar, br, rw, t);
+        }
+    }
+}
+
+// Keep the selected policy constant through the inlined per-block arithmetic.
+// This prevents opaque publication boundaries from causing repeated reloads
+// of the incoming row descriptor's runtime flag. Values and stores are unchanged.
+#[inline(never)]
+unsafe fn project_policy<const CACHED_Z: bool>(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    rows: RankedRows,
+    ar: *const V8,
+    br: *const V8,
+    rw: usize,
+    t: &Tables,
+) {
+    let rows = rows.with_cached_z(CACHED_Z);
     unsafe {
         let ap = pretranspose_ring::<0, true>(ar, rw);
         let a = tr8x16_zmm(ar, rw);
