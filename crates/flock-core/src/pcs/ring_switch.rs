@@ -2904,6 +2904,13 @@ pub(crate) struct DirectFold8Factors {
     pub(crate) round0: (F128, F128),
 }
 
+impl Drop for DirectFold8Factors {
+    fn drop(&mut self) {
+        crate::scratch::give_df8_state(std::mem::take(&mut self.a_state));
+        crate::scratch::give_df8_state(std::mem::take(&mut self.w_state));
+    }
+}
+
 fn direct_fold8_round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     assert_eq!(witness.len(), basis.len());
     let mut u0 = F128::ZERO;
@@ -2983,11 +2990,11 @@ fn build_direct_fold8_factors(
     table: &[F128],
     par: bool,
 ) -> DirectFold8Factors {
-    build_direct_fold8_factors_reusing_a_state(fold8.to_vec(), suffix, table, par)
+    build_direct_fold8_factors_reusing_a_state(fold8, suffix, table, par)
 }
 
 fn build_direct_fold8_factors_reusing_a_state(
-    fold8: Vec<F128>,
+    fold8: &[F128],
     suffix: &[F128],
     table: &[F128],
     par: bool,
@@ -2995,13 +3002,10 @@ fn build_direct_fold8_factors_reusing_a_state(
     let low_eq: [F128; 64] = build_eq(&suffix[..6])
         .try_into()
         .expect("six-coordinate eq has sixty-four entries");
-    // Keep H[e,d] = <A_e,W_d> factored. Bit-major storage makes every
-    // retained-coordinate pair contiguous, so the six challenges bind these
-    // 512 KiB states online.
     let (a_state, w_state, round0) = if par {
         direct_fold8_states_par(fold8, &low_eq, table)
     } else {
-        direct_fold8_states_seq(&fold8, &low_eq, table)
+        direct_fold8_states_seq(fold8, &low_eq, table)
     };
     let tail = &suffix[6..];
     let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -3022,7 +3026,7 @@ fn build_direct_fold8_factors_reusing_a_state(
     target_feature = "gfni"
 ))]
 fn build_direct_fold8_factors_reusing_a_state_from_generators(
-    fold8: Vec<F128>,
+    fold8: &[F128],
     suffix: &[F128],
     generators: &[F128],
 ) -> DirectFold8Factors {
@@ -3032,21 +3036,14 @@ fn build_direct_fold8_factors_reusing_a_state_from_generators(
     let n_packed = 1usize << LOG_PACKING;
     let state_len = 64 * n_packed;
     assert_eq!(fold8.len(), state_len);
-    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
-    let mut w_state;
-    if rs_reuse_fold8_a_state_enabled() {
-        direct_fold8_a_state_into(&fold8, &mut a_state);
-        w_state = fold8;
-        unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
-    } else {
-        w_state = crate::alloc_uninit_vec::<F128>(state_len);
-        rayon::join(
-            || unsafe {
-                direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state)
-            },
-            || direct_fold8_a_state_into(&fold8, &mut a_state),
-        );
-    }
+    let mut a_state = crate::scratch::take_df8_state(state_len);
+    let mut w_state = crate::scratch::take_df8_state(state_len);
+    rayon::join(
+        || unsafe {
+            direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state)
+        },
+        || direct_fold8_a_state_into(fold8, &mut a_state),
+    );
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     let tail = &suffix[6..];
     let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -3245,7 +3242,7 @@ fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
 /// is then fully overwritten as W; this ordering prevents scatter stores from
 /// clobbering another producer's input bank.
 fn direct_fold8_states_par(
-    fold8: Vec<F128>,
+    fold8: &[F128],
     low_eq: &[F128; 64],
     table: &[F128],
 ) -> (Vec<F128>, Vec<F128>, (F128, F128)) {
@@ -3279,11 +3276,7 @@ fn direct_fold8_states_par(
             },
         );
         let mut w_state = vec![F128::ZERO; state_len];
-        let mut a_state = if rs_reuse_fold8_a_state_enabled() {
-            fold8
-        } else {
-            vec![F128::ZERO; state_len]
-        };
+        let mut a_state = vec![F128::ZERO; state_len];
         w_state
             .par_chunks_mut(64)
             .zip(a_state.par_chunks_mut(64))
@@ -3298,19 +3291,12 @@ fn direct_fold8_states_par(
         return (a_state, w_state, round0);
     }
 
-    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
-    let mut w_state;
-    if rs_reuse_fold8_a_state_enabled() {
-        direct_fold8_a_state_into(&fold8, &mut a_state);
-        w_state = fold8;
-        direct_fold8_w_state_into(low_eq, table, &mut w_state);
-    } else {
-        w_state = crate::alloc_uninit_vec::<F128>(state_len);
-        rayon::join(
-            || direct_fold8_w_state_into(low_eq, table, &mut w_state),
-            || direct_fold8_a_state_into(&fold8, &mut a_state),
-        );
-    }
+    let mut a_state = crate::scratch::take_df8_state(state_len);
+    let mut w_state = crate::scratch::take_df8_state(state_len);
+    rayon::join(
+        || direct_fold8_w_state_into(low_eq, table, &mut w_state),
+        || direct_fold8_a_state_into(fold8, &mut a_state),
+    );
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
     (a_state, w_state, round0)
 }
@@ -3905,15 +3891,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //        already has γ_k baked in — pcs combine just adds.
     let t = std::time::Instant::now();
 
-    struct ClaimWork {
+    struct ClaimWork<'a> {
         s_hat_v: Vec<F128>,
-        s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
-        s_hat_v_fold8: Option<Vec<F128>>,
+        s_hat_v_quad: Option<&'a [F128]>,
+        s_hat_v_fold4: Option<&'a [F128]>,
+        s_hat_v_fold8: Option<&'a [F128]>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
-    let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
+    let mut work: Vec<ClaimWork<'_>> = Vec::with_capacity(n);
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
         let s_hat_v: Vec<F128> = match kinds[i] {
@@ -3924,20 +3910,17 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 4 * n_packed);
         let s_hat_v_fold4 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 16 * n_packed);
         let s_hat_v_fold8 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 64 * n_packed);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = crate::lincheck::build_eq_table(&r_dprime);
