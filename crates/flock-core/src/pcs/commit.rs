@@ -220,6 +220,44 @@ pub fn commit_into(
     finalize_commit(codeword, z_packed, params)
 }
 
+/// Commit the exact ranked witness while its disjoint octas are generated.
+/// The returned commitment owns the complete codeword and ordinary Merkle
+/// tree; no partial-completion marker escapes this function.
+///
+/// # Safety
+/// The callback must initialize every field of `z_packed` using only the
+/// supplied pointer. For group 0..128 and role 0..2, its octa ordinals are
+/// `(role..256).step_by(2)`; ordinal j starts at row
+/// `(j / 64) * 2^17 + group * 16 + (j % 64) * 2^11` and covers 16 rows
+/// of 64 fields. Proven initialized constants may be retained, but stale
+/// data-dependent fields must be overwritten. Calls can overlap. They may
+/// not access other groups/roles or retain pointers, and any extra outputs
+/// must have disjoint ownership and stay exclusively borrowed until return.
+/// No shared view of z may coexist with these writes. Unwinding joins all
+/// callbacks and publishes no completed commitment.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub unsafe fn commit_generated_into(
+    z_packed: &mut [F128],
+    params: &PcsParams,
+    codeword: Vec<F128>,
+    produce: &(dyn Fn(*mut F128, usize, usize) + Sync),
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(params.log_msg_len(), 25);
+    assert_eq!(params.num_ntts(), 64);
+    assert_eq!(params.k_code(), 20);
+    assert_eq!(z_packed.len(), 1 << 25);
+    assert_eq!(codeword.len(), 1 << 26);
+    let ntt = AdditiveNttF128::standard(params.k_code());
+    finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
+        // SAFETY: this function forwards its exclusive message borrow and
+        // the documented producer contract; the encoder joins every role.
+        unsafe {
+            ntt.rs_encode_generated_on_range_done(z_packed, codeword, produce, on_range_done);
+        }
+    })
+}
+
 /// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
 /// logical cores, including efficiency cores that otherwise idle).
 /// Built lazily — the ranked worker's untimed warm-up prove pays the spawn.
@@ -289,6 +327,21 @@ fn finalize_commit(
         }
     }
 
+    finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
+        ntt.rs_encode_interleaved_on_range_done(z_packed, codeword, params.num_ntts(), on_range_done);
+    })
+}
+
+/// Shared CPU commit tail: the encoder invokes the original Merkle callback
+/// only for final codeword ranges, then joins before upper levels are built.
+#[allow(clippy::collapsible_if, clippy::manual_is_multiple_of, clippy::manual_slice_size_calculation)]
+fn finalize_cpu_commit(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+) -> (Commitment, ProverData) {
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
     // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
     // each NTT deep-pass sub-group retires (regular stores, same worker).
     // Parents fold after the encode join via [`build_upper_levels`] — the
@@ -336,10 +389,8 @@ fn finalize_commit(
         };
 
     let t_ntt = std::time::Instant::now();
-    ntt.rs_encode_interleaved_on_range_done(
-        z_packed,
+    encode(
         &mut codeword,
-        num_ntts,
         &|range, sub_data| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
             // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
@@ -1353,17 +1404,28 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
+    prefault_codeword_during_with_resident(params, |codeword| (codeword, generate()))
+}
+
+/// Like prefault_codeword_during, but lets the generator consume an already
+/// resident warm buffer. It returns the unconsumed buffer (if any) with R.
+/// On a cold/disabled call the input is None and the closure must return None;
+/// cold allocation and first-touch still overlap the ordinary generation.
+pub fn prefault_codeword_during_with_resident<R>(
+    params: &PcsParams,
+    generate: impl FnOnce(Option<Vec<F128>>) -> (Option<Vec<F128>>, R),
+) -> (Option<Vec<F128>>, R) {
     if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
-        return (None, generate());
+        return generate(None);
     }
     let codeword_len = params.n_positions() * params.num_ntts();
     // Warm path: a pooled buffer is already resident — there is nothing to
     // pre-fault, and commit_into writes every slot itself. Skip the thread.
     if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
-        return (Some(buf), generate());
+        return generate(Some(buf));
     }
     // Cold path: allocate + first-touch on a background-QoS thread, hidden
     // under witness generation. (commit_into rewrites all slots, so the
@@ -1377,7 +1439,8 @@ pub fn prefault_codeword_during<R>(
             }
             buf
         });
-        let r = generate();
+        let (unused, r) = generate(None);
+        assert!(unused.is_none(), "cold generation must not supply a codeword");
         (Some(h.join().unwrap()), r)
     })
 }
