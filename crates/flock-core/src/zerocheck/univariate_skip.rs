@@ -329,12 +329,13 @@ unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
             for i in 0..8 {
                 let p = v * basis[i];
                 let pv = _mm512_broadcast_i32x4(_mm_set_epi64x(p.hi as i64, p.lo as i64));
-                let m64: u64 =
-                    _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
+                let m64: u64 = _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
                 for g in 0..16 {
                     let nibble = ((m64 >> (4 * g)) & 0xF) as u8;
-                    let mask8 =
-                        ((nibble & 1) * 3) | (((nibble >> 1) & 1) * 12) | (((nibble >> 2) & 1) * 48) | (((nibble >> 3) & 1) * 192);
+                    let mask8 = ((nibble & 1) * 3)
+                        | (((nibble >> 1) & 1) * 12)
+                        | (((nibble >> 2) & 1) * 48)
+                        | (((nibble >> 3) & 1) * 192);
                     acc[g] = _mm512_mask_xor_epi64(acc[g], mask8, acc[g], pv);
                 }
             }

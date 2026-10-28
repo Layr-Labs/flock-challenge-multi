@@ -1813,9 +1813,8 @@ unsafe fn accumulate_convert_ab_nomul_x86_gfni_impl<const FIRST_WRITE: bool>(
 ))]
 #[inline]
 fn r1_ab_write_fixed_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_AB_WRITE_FIXED").is_none());
     *ON
 }
 
@@ -1947,14 +1946,17 @@ pub(super) unsafe fn convert_ab_nomul_x86_gfni_direct<
     unsafe {
         // Membership in [first,end), clipped to the sixteen demand rows.
         // Tail hints beyond the clipped range keep the existing loop.
-        let pf_mask: u32 = if prefetch.first >= 16 { 0 } else {
+        let pf_mask: u32 = if prefetch.first >= 16 {
+            0
+        } else {
             ((1u32 << prefetch.end.min(16)) - 1) & !((1u32 << prefetch.first) - 1)
         };
-        let pf_origin = prefetch.next_window.wrapping_sub(prefetch.first.wrapping_mul(ELL));
+        let pf_origin = prefetch
+            .next_window
+            .wrapping_sub(prefetch.first.wrapping_mul(ELL));
         let pf_one = |bm: usize| {
             _mm_prefetch(
-                pf_origin.wrapping_add(bm.wrapping_mul(ELL))
-                    .cast::<i8>(),
+                pf_origin.wrapping_add(bm.wrapping_mul(ELL)).cast::<i8>(),
                 _MM_HINT_T0,
             );
         };
@@ -2485,9 +2487,7 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
     half_offset: usize,
     local_res_ab: &mut [F128; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{
-        WideGhashX4, ghash_broadcast_split, ghash_mul_x4_split,
-    };
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_broadcast_split, ghash_mul_x4_split};
     use core::arch::x86_64::*;
     debug_assert_eq!(plane_banks.len(), eq_bot.len() * 16 * ELL);
     debug_assert!(half_offset == 0 || half_offset == 8);
@@ -2511,14 +2511,54 @@ unsafe fn accumulate_transposed_banks_half_x86_avx512(
             let wb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(e1.hi as i64, e1.lo as i64));
             let p0 = base_ptr.add(u * 16);
             let p1 = base_ptr.add((u + 1) * 16);
-            acc0.mul_acc2(_mm512_loadu_si512(p0.add(0)), wb0, _mm512_loadu_si512(p1.add(0)), wb1);
-            acc1.mul_acc2(_mm512_loadu_si512(p0.add(1)), wb0, _mm512_loadu_si512(p1.add(1)), wb1);
-            acc2.mul_acc2(_mm512_loadu_si512(p0.add(2)), wb0, _mm512_loadu_si512(p1.add(2)), wb1);
-            acc3.mul_acc2(_mm512_loadu_si512(p0.add(3)), wb0, _mm512_loadu_si512(p1.add(3)), wb1);
-            acc4.mul_acc2(_mm512_loadu_si512(p0.add(4)), wb0, _mm512_loadu_si512(p1.add(4)), wb1);
-            acc5.mul_acc2(_mm512_loadu_si512(p0.add(5)), wb0, _mm512_loadu_si512(p1.add(5)), wb1);
-            acc6.mul_acc2(_mm512_loadu_si512(p0.add(6)), wb0, _mm512_loadu_si512(p1.add(6)), wb1);
-            acc7.mul_acc2(_mm512_loadu_si512(p0.add(7)), wb0, _mm512_loadu_si512(p1.add(7)), wb1);
+            acc0.mul_acc2(
+                _mm512_loadu_si512(p0.add(0)),
+                wb0,
+                _mm512_loadu_si512(p1.add(0)),
+                wb1,
+            );
+            acc1.mul_acc2(
+                _mm512_loadu_si512(p0.add(1)),
+                wb0,
+                _mm512_loadu_si512(p1.add(1)),
+                wb1,
+            );
+            acc2.mul_acc2(
+                _mm512_loadu_si512(p0.add(2)),
+                wb0,
+                _mm512_loadu_si512(p1.add(2)),
+                wb1,
+            );
+            acc3.mul_acc2(
+                _mm512_loadu_si512(p0.add(3)),
+                wb0,
+                _mm512_loadu_si512(p1.add(3)),
+                wb1,
+            );
+            acc4.mul_acc2(
+                _mm512_loadu_si512(p0.add(4)),
+                wb0,
+                _mm512_loadu_si512(p1.add(4)),
+                wb1,
+            );
+            acc5.mul_acc2(
+                _mm512_loadu_si512(p0.add(5)),
+                wb0,
+                _mm512_loadu_si512(p1.add(5)),
+                wb1,
+            );
+            acc6.mul_acc2(
+                _mm512_loadu_si512(p0.add(6)),
+                wb0,
+                _mm512_loadu_si512(p1.add(6)),
+                wb1,
+            );
+            acc7.mul_acc2(
+                _mm512_loadu_si512(p0.add(7)),
+                wb0,
+                _mm512_loadu_si512(p1.add(7)),
+                wb1,
+            );
             u += 2;
         }
         while u < n {
@@ -2568,18 +2608,33 @@ pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
 ) {
     unsafe {
         transpose_plane_banks_in_place_x86_avx512(plane_banks, eq_bot.len());
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 0, local_res_ab);
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 8, local_res_ab);
+        accumulate_transposed_banks_half_x86_avx512(
+            plane_banks,
+            eq_bot,
+            eq_hi_val,
+            0,
+            local_res_ab,
+        );
+        accumulate_transposed_banks_half_x86_avx512(
+            plane_banks,
+            eq_bot,
+            eq_hi_val,
+            8,
+            local_res_ab,
+        );
     }
 }
 
-
-
-#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
-          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 mod ab_prefetch_plan_tests {
-    use super::convert_ab_nomul_x86_gfni_direct;
     use super::super::AbDirectPrefetch;
+    use super::convert_ab_nomul_x86_gfni_direct;
     use std::hint::black_box;
 
     fn rng(s: &mut u64) -> u64 {
@@ -2590,9 +2645,20 @@ mod ab_prefetch_plan_tests {
     }
 
     fn check<const FIRST: usize, const N: usize, const WRITE: bool>(seed: &mut u64) -> usize {
-        let plans = [(0, 0, false), (0, 0, true), (0, 14, true), (2, 16, true),
-                     (0, 15, true), (0, 16, true), (0, 16, false), (2, 16, false),
-                     (5, 3, true), (16, 20, true), (1, 19, true), (19, 20, false)];
+        let plans = [
+            (0, 0, false),
+            (0, 0, true),
+            (0, 14, true),
+            (2, 16, true),
+            (0, 15, true),
+            (0, 16, true),
+            (0, 16, false),
+            (2, 16, false),
+            (5, 3, true),
+            (16, 20, true),
+            (1, 19, true),
+            (19, 20, false),
+        ];
         for case in 0..24 {
             let off = [0, 1, 7, 31][case % 4];
             let mut input = [0u8; 1088];
@@ -2601,14 +2667,24 @@ mod ab_prefetch_plan_tests {
             let mut guarded = [0xceu8; 1152];
             let mut expected = [0u8; 1024];
             for x in &mut input {
-                *x = match case { 0 => 0, 1 => 255, _ => rng(seed) as u8 };
+                *x = match case {
+                    0 => 0,
+                    1 => 255,
+                    _ => rng(seed) as u8,
+                };
             }
-            for x in &mut mats { *x = rng(seed); }
-            for x in &mut expected { *x = rng(seed) as u8; }
+            for x in &mut mats {
+                *x = rng(seed);
+            }
+            for x in &mut expected {
+                *x = rng(seed) as u8;
+            }
             guarded[off..off + 1024].copy_from_slice(&expected);
             let original_input = input;
             let original_mats = mats;
-            if WRITE { expected.fill(0); }
+            if WRITE {
+                expected.fill(0);
+            }
             for k in 0..16 {
                 for lane in 0..64 {
                     let mut value = 0u8;
@@ -2616,7 +2692,9 @@ mod ab_prefetch_plan_tests {
                         let x = input[off + (row - FIRST) * 64 + lane];
                         let matrix = mats[row * 16 + k];
                         for bit in 0..8 {
-                            value ^= (((x & (matrix >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit;
+                            value ^= (((x & (matrix >> (8 * (7 - bit))) as u8).count_ones() & 1)
+                                as u8)
+                                << bit;
                         }
                     }
                     expected[k * 64 + lane] ^= value;
@@ -2624,8 +2702,14 @@ mod ab_prefetch_plan_tests {
             }
             let (first, end, spread) = plans[case % plans.len()];
             let prefetch = AbDirectPrefetch {
-                next_window: if first >= end { core::ptr::null() } else { next.as_ptr() },
-                first, end, spread,
+                next_window: if first >= end {
+                    core::ptr::null()
+                } else {
+                    next.as_ptr()
+                },
+                first,
+                end,
+                spread,
             };
             let out: &mut [u8; 1024] = (&mut guarded[off..off + 1024]).try_into().unwrap();
             // SAFETY: exact live-row extent, full matrix/output buffers, and
@@ -2633,12 +2717,20 @@ mod ab_prefetch_plan_tests {
             unsafe {
                 convert_ab_nomul_x86_gfni_direct::<FIRST, N, WRITE>(
                     black_box(&input[off..off + (N - FIRST) * 64]),
-                    black_box(&mats), out, black_box(&prefetch));
+                    black_box(&mats),
+                    out,
+                    black_box(&prefetch),
+                );
             }
             assert_eq!(*out, expected, "shape={FIRST},{N},{WRITE} case={case}");
             assert_eq!(input, original_input);
             assert_eq!(mats, original_mats);
-            assert!(guarded[..off].iter().chain(guarded[off + 1024..].iter()).all(|&x| x == 0xce));
+            assert!(
+                guarded[..off]
+                    .iter()
+                    .chain(guarded[off + 1024..].iter())
+                    .all(|&x| x == 0xce)
+            );
         }
         24
     }
@@ -2646,14 +2738,18 @@ mod ab_prefetch_plan_tests {
     #[test]
     fn actual_direct_ab_prefetch_plan_matches_scalar() {
         let mut seed = 0x4273158b99u64;
-        let count = check::<2, 16, false>(&mut seed) + check::<2, 16, true>(&mut seed)
-            + check::<0, 14, false>(&mut seed) + check::<0, 14, true>(&mut seed)
-            + check::<0, 15, false>(&mut seed) + check::<0, 15, true>(&mut seed);
+        let count = check::<2, 16, false>(&mut seed)
+            + check::<2, 16, true>(&mut seed)
+            + check::<0, 14, false>(&mut seed)
+            + check::<0, 14, true>(&mut seed)
+            + check::<0, 15, false>(&mut seed)
+            + check::<0, 15, true>(&mut seed);
         assert_eq!(count, 144);
-        println!("144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards");
+        println!(
+            "144 actual production direct-AB shape/metadata/alignment cases match scalar arithmetic and guards"
+        );
     }
 }
-
 
 /// Accumulate 1..=4 ranked 14-row windows into one fixed 1024-byte bank.
 /// Matrix rows keep absolute bm indexing: `mats` points at the first live
@@ -2669,13 +2765,22 @@ mod ab_prefetch_plan_tests {
 /// - prefetch_mode is 0 (off), 1 (spread), or 2 (burst). Hints target the
 ///   same-parity compact window +2 (1856 bytes); only nonfaulting hint
 ///   addresses may lie beyond source. No out-of-range demand load occurs.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
-          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 #[target_feature(enable = "avx512f,gfni")]
 #[inline(never)]
 pub(crate) unsafe fn convert_ab_nomul_x86_gfni_w4(
-    source: *const u8, mats: *const u64, planes: *mut u8,
-    source_stride: usize, count: usize, seed_zero: bool, prefetch_mode: usize,
+    source: *const u8,
+    mats: *const u64,
+    planes: *mut u8,
+    source_stride: usize,
+    count: usize,
+    seed_zero: bool,
+    prefetch_mode: usize,
 ) {
     debug_assert!((1..=4).contains(&count));
     debug_assert!(source_stride >= 896);
@@ -2853,65 +2958,154 @@ pub(crate) unsafe fn convert_ab_nomul_x86_gfni_w4(
     }
 }
 
-
-#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
-          target_feature = "vpclmulqdq", target_feature = "gfni"))]
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 mod ab_batch4_tests {
-    use super::{convert_ab_nomul_x86_gfni_direct, convert_ab_nomul_x86_gfni_w4};
     use super::super::AbDirectPrefetch;
-    fn rng(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+    use super::{convert_ab_nomul_x86_gfni_direct, convert_ab_nomul_x86_gfni_w4};
+    fn rng(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
     fn affine(x: u8, mat: u64) -> u8 {
-        (0..8).fold(0, |v, bit| v | ((((x & (mat >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit))
+        (0..8).fold(0, |v, bit| {
+            v | ((((x & (mat >> (8 * (7 - bit))) as u8).count_ones() & 1) as u8) << bit)
+        })
     }
     #[test]
     fn ab_batch4_leaf_matches_scalar_and_incumbent() {
         let mut seed = 0x34af5a17bc001u64;
-        for first in [0usize, 2] { for count in 1..=4 { for seed_zero in [false, true] {
-            for mode in 0..=2 { for offset in [0usize, 1, 31] {
-                // Non-production stride and output misalignment test exact
-                // accesses independently of the ranked-layout integration.
-                let stride = 1024usize;
-                let mut source = vec![0u8; offset + 3 * stride + 896 + 2048];
-                for b in &mut source { *b = rng(&mut seed) as u8; }
-                let before_source = source.clone();
-                let mut mats = vec![0u64; 4 * 256];
-                for b in &mut mats { *b = rng(&mut seed); }
-                // Exercise all-zero and all-one maps as well as dense maps.
-                if mode == 0 { mats[0..256].fill(0); }
-                if mode == 1 { mats[256..512].fill(!0); }
-                let before_mats = mats.clone();
-                let mut guarded = vec![0xceu8; offset + 1024 + 33];
-                for b in &mut guarded[offset..offset + 1024] { *b = rng(&mut seed) as u8; }
-                let mut scalar: [u8; 1024] = guarded[offset..offset + 1024].try_into().unwrap();
-                let mut incumbent = scalar;
-                if seed_zero { scalar.fill(0); }
-                for w in 0..count {
-                    for row in 0..14 { for k in 0..16 { for lane in 0..64 {
-                        scalar[k * 64 + lane] ^= affine(source[offset + w * stride + row * 64 + lane], mats[w * 256 + (first + row) * 16 + k]);
-                    } } }
-                    let row: &[u64; 256] = (&mats[w * 256..(w + 1) * 256]).try_into().unwrap();
-                    let pf = AbDirectPrefetch { next_window: core::ptr::null(), first: 0, end: 0, spread: true };
-                    unsafe {
-                        if first == 0 {
-                            if seed_zero && w == 0 { convert_ab_nomul_x86_gfni_direct::<0,14,true>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
-                            else { convert_ab_nomul_x86_gfni_direct::<0,14,false>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
-                        } else {
-                            if seed_zero && w == 0 { convert_ab_nomul_x86_gfni_direct::<2,16,true>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
-                            else { convert_ab_nomul_x86_gfni_direct::<2,16,false>(&source[offset + w*stride..offset+w*stride+896], row, &mut incumbent, &pf); }
+        for first in [0usize, 2] {
+            for count in 1..=4 {
+                for seed_zero in [false, true] {
+                    for mode in 0..=2 {
+                        for offset in [0usize, 1, 31] {
+                            // Non-production stride and output misalignment test exact
+                            // accesses independently of the ranked-layout integration.
+                            let stride = 1024usize;
+                            let mut source = vec![0u8; offset + 3 * stride + 896 + 2048];
+                            for b in &mut source {
+                                *b = rng(&mut seed) as u8;
+                            }
+                            let before_source = source.clone();
+                            let mut mats = vec![0u64; 4 * 256];
+                            for b in &mut mats {
+                                *b = rng(&mut seed);
+                            }
+                            // Exercise all-zero and all-one maps as well as dense maps.
+                            if mode == 0 {
+                                mats[0..256].fill(0);
+                            }
+                            if mode == 1 {
+                                mats[256..512].fill(!0);
+                            }
+                            let before_mats = mats.clone();
+                            let mut guarded = vec![0xceu8; offset + 1024 + 33];
+                            for b in &mut guarded[offset..offset + 1024] {
+                                *b = rng(&mut seed) as u8;
+                            }
+                            let mut scalar: [u8; 1024] =
+                                guarded[offset..offset + 1024].try_into().unwrap();
+                            let mut incumbent = scalar;
+                            if seed_zero {
+                                scalar.fill(0);
+                            }
+                            for w in 0..count {
+                                for row in 0..14 {
+                                    for k in 0..16 {
+                                        for lane in 0..64 {
+                                            scalar[k * 64 + lane] ^= affine(
+                                                source[offset + w * stride + row * 64 + lane],
+                                                mats[w * 256 + (first + row) * 16 + k],
+                                            );
+                                        }
+                                    }
+                                }
+                                let row: &[u64; 256] =
+                                    (&mats[w * 256..(w + 1) * 256]).try_into().unwrap();
+                                let pf = AbDirectPrefetch {
+                                    next_window: core::ptr::null(),
+                                    first: 0,
+                                    end: 0,
+                                    spread: true,
+                                };
+                                unsafe {
+                                    if first == 0 {
+                                        if seed_zero && w == 0 {
+                                            convert_ab_nomul_x86_gfni_direct::<0, 14, true>(
+                                                &source[offset + w * stride
+                                                    ..offset + w * stride + 896],
+                                                row,
+                                                &mut incumbent,
+                                                &pf,
+                                            );
+                                        } else {
+                                            convert_ab_nomul_x86_gfni_direct::<0, 14, false>(
+                                                &source[offset + w * stride
+                                                    ..offset + w * stride + 896],
+                                                row,
+                                                &mut incumbent,
+                                                &pf,
+                                            );
+                                        }
+                                    } else {
+                                        if seed_zero && w == 0 {
+                                            convert_ab_nomul_x86_gfni_direct::<2, 16, true>(
+                                                &source[offset + w * stride
+                                                    ..offset + w * stride + 896],
+                                                row,
+                                                &mut incumbent,
+                                                &pf,
+                                            );
+                                        } else {
+                                            convert_ab_nomul_x86_gfni_direct::<2, 16, false>(
+                                                &source[offset + w * stride
+                                                    ..offset + w * stride + 896],
+                                                row,
+                                                &mut incumbent,
+                                                &pf,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            unsafe {
+                                convert_ab_nomul_x86_gfni_w4(
+                                    source.as_ptr().add(offset),
+                                    mats.as_ptr().add(first * 16),
+                                    guarded.as_mut_ptr().add(offset),
+                                    stride,
+                                    count,
+                                    seed_zero,
+                                    mode,
+                                );
+                            }
+                            assert_eq!(
+                                &guarded[offset..offset + 1024],
+                                &scalar,
+                                "first={first} count={count} zero={seed_zero} mode={mode} offset={offset}"
+                            );
+                            assert_eq!(incumbent, scalar);
+                            assert!(
+                                guarded[..offset]
+                                    .iter()
+                                    .chain(guarded[offset + 1024..].iter())
+                                    .all(|&x| x == 0xce)
+                            );
+                            assert_eq!(source, before_source);
+                            assert_eq!(mats, before_mats);
                         }
                     }
                 }
-                unsafe {
-                    convert_ab_nomul_x86_gfni_w4(source.as_ptr().add(offset), mats.as_ptr().add(first * 16),
-                        guarded.as_mut_ptr().add(offset), stride, count, seed_zero, mode);
-                }
-                assert_eq!(&guarded[offset..offset+1024], &scalar, "first={first} count={count} zero={seed_zero} mode={mode} offset={offset}");
-                assert_eq!(incumbent, scalar);
-                assert!(guarded[..offset].iter().chain(guarded[offset+1024..].iter()).all(|&x| x == 0xce));
-                assert_eq!(source, before_source);
-                assert_eq!(mats, before_mats);
-            } }
-        } } }
+            }
+        }
     }
 
     #[test]
@@ -2921,32 +3115,86 @@ mod ab_batch4_tests {
         let mut seed = 0x17ca9f445u64;
         let mut source = vec![0u8; 2 * 2048 * 1856 + 2048];
         let mut mats = vec![0u64; 32 * 256];
-        for b in &mut source { *b = rng(&mut seed) as u8; }
-        for b in &mut mats { *b = rng(&mut seed); }
-        for x_hi in [0usize, 1] { for first_write in [false, true] {
-            let mut old = vec![0u8; 128 * 1024];
-            for b in &mut old { *b = rng(&mut seed) as u8; }
-            let mut new = old.clone();
-            for x in 0usize..4096 {
-                let first = if x & 1 == 0 { 2 } else { 0 };
-                let base = (((x_hi << 12) | x) >> 1) * 1856 + (x & 1) * 896;
-                let w = x >> 7;
-                let row: &[u64;256] = (&mats[w*256..(w+1)*256]).try_into().unwrap();
-                let bank: &mut [u8;1024] = (&mut old[(x&127)*1024..((x&127)+1)*1024]).try_into().unwrap();
-                let pf = AbDirectPrefetch { next_window: core::ptr::null(), first: 0, end: 0, spread: true };
-                unsafe {
-                    if first == 0 {
-                        if first_write && w == 0 { convert_ab_nomul_x86_gfni_direct::<0,14,true>(&source[base..base+896],row,bank,&pf); }
-                        else { convert_ab_nomul_x86_gfni_direct::<0,14,false>(&source[base..base+896],row,bank,&pf); }
-                    } else {
-                        if first_write && w == 0 { convert_ab_nomul_x86_gfni_direct::<2,16,true>(&source[base..base+896],row,bank,&pf); }
-                        else { convert_ab_nomul_x86_gfni_direct::<2,16,false>(&source[base..base+896],row,bank,&pf); }
+        for b in &mut source {
+            *b = rng(&mut seed) as u8;
+        }
+        for b in &mut mats {
+            *b = rng(&mut seed);
+        }
+        for x_hi in [0usize, 1] {
+            for first_write in [false, true] {
+                let mut old = vec![0u8; 128 * 1024];
+                for b in &mut old {
+                    *b = rng(&mut seed) as u8;
+                }
+                let mut new = old.clone();
+                for x in 0usize..4096 {
+                    let first = if x & 1 == 0 { 2 } else { 0 };
+                    let base = (((x_hi << 12) | x) >> 1) * 1856 + (x & 1) * 896;
+                    let w = x >> 7;
+                    let row: &[u64; 256] = (&mats[w * 256..(w + 1) * 256]).try_into().unwrap();
+                    let bank: &mut [u8; 1024] = (&mut old
+                        [(x & 127) * 1024..((x & 127) + 1) * 1024])
+                        .try_into()
+                        .unwrap();
+                    let pf = AbDirectPrefetch {
+                        next_window: core::ptr::null(),
+                        first: 0,
+                        end: 0,
+                        spread: true,
+                    };
+                    unsafe {
+                        if first == 0 {
+                            if first_write && w == 0 {
+                                convert_ab_nomul_x86_gfni_direct::<0, 14, true>(
+                                    &source[base..base + 896],
+                                    row,
+                                    bank,
+                                    &pf,
+                                );
+                            } else {
+                                convert_ab_nomul_x86_gfni_direct::<0, 14, false>(
+                                    &source[base..base + 896],
+                                    row,
+                                    bank,
+                                    &pf,
+                                );
+                            }
+                        } else {
+                            if first_write && w == 0 {
+                                convert_ab_nomul_x86_gfni_direct::<2, 16, true>(
+                                    &source[base..base + 896],
+                                    row,
+                                    bank,
+                                    &pf,
+                                );
+                            } else {
+                                convert_ab_nomul_x86_gfni_direct::<2, 16, false>(
+                                    &source[base..base + 896],
+                                    row,
+                                    bank,
+                                    &pf,
+                                );
+                            }
+                        }
                     }
                 }
+                // Invoke exactly the production planner, not a test duplicate.
+                unsafe {
+                    super::super::super::process_ranked_ab_w4_band(
+                        source.as_slice(),
+                        &mats,
+                        x_hi,
+                        first_write,
+                        0,
+                        &mut new,
+                    );
+                }
+                assert_eq!(
+                    new, old,
+                    "ranked-band x_hi={x_hi} first_write={first_write}"
+                );
             }
-            // Invoke exactly the production planner, not a test duplicate.
-            unsafe { super::super::super::process_ranked_ab_w4_band(source.as_slice(), &mats, x_hi, first_write, 0, &mut new); }
-            assert_eq!(new, old, "ranked-band x_hi={x_hi} first_write={first_write}");
-        } }
+        }
     }
 }

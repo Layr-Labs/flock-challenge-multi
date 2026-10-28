@@ -4280,7 +4280,10 @@ mod tests {
                         target_feature = "gfni",
                         target_feature = "vpclmulqdq"
                     ))]
-                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
+                    Some(root_emit::RootOctaWriter::new(
+                        &roots,
+                        root_tile.0.as_mut_ptr(),
+                    )),
                 );
                 _mm_sfence();
             }
@@ -4295,17 +4298,28 @@ mod tests {
                 for column in 0..64 {
                     let lane = column % 32 / 4;
                     let expected = (0..8).fold(0u8, |bits, bit| {
-                        let value = fold.roots.get({
-                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
-                                    index + if index >= 833 { 64 } else { 0 }
-                                })
-                            .map_or(0, |&wire| (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1);
+                        let value = fold
+                            .roots
+                            .get({
+                                let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
+                                index + if index >= 833 { 64 } else { 0 }
+                            })
+                            .map_or(0, |&wire| {
+                                (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1
+                            });
                         bits | (value as u8) << bit
                     });
-                    assert_eq!(root_tile.0[group * 512 + column], expected,
-                        "live drain base={base}, group={group}, column={column}");
+                    assert_eq!(
+                        root_tile.0[group * 512 + column],
+                        expected,
+                        "live drain base={base}, group={group}, column={column}"
+                    );
                 }
-                assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
+                assert!(
+                    root_tile.0[group * 512 + 64..(group + 1) * 512]
+                        .iter()
+                        .all(|&v| v == 0xa5)
+                );
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");
             assert_eq!(a_ref, a_new, "a mismatch at base={base}");

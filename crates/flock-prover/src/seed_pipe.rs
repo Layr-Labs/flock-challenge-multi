@@ -814,7 +814,14 @@ fn make_sized_tmp(path: PathBuf, len: usize) -> Option<SizedTmp> {
             let _ = std::fs::remove_file(&path);
             return None;
         }
-        let base = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, file.as_raw_fd(), 0);
+        let base = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
         if base.is_null() || base as usize == usize::MAX {
             let _ = std::fs::remove_file(&path);
             return None;
@@ -887,7 +894,10 @@ fn drop_sized_set(set: SizedSet) {
 /// published (rename included); `Err(bytes)` when the incumbent tail must
 /// write `bytes` (the exact `to_bytes()` output); `None` when no set or no
 /// stash exists and the caller must encode from scratch.
-fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
+fn publish_sized(
+    path: &Path,
+    bundle: &R1csProofBundleLigerito,
+) -> Option<Result<std::io::Result<()>, Vec<u8>>> {
     let guard = SIZED_SET.lock().unwrap_or_else(|e| e.into_inner());
     let set = guard.as_ref()?;
     let enc = bundle.raw_encoding()?;
@@ -1297,7 +1307,11 @@ fn speculative_main(
     drop(warm);
 
     on_hot_worker(hot, move || {
-        let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
+        let line_r = if hot {
+            spin_read_line_fd(real_stdin)
+        } else {
+            read_line_fd(real_stdin)
+        };
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);
@@ -1501,8 +1515,7 @@ mod tests {
     }
     static PRESEED_MAX_DEPTH: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
-    static PRESEED_ENTRIES: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static PRESEED_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     pub(super) struct PreseedDepth;
     impl PreseedDepth {
@@ -1525,9 +1538,14 @@ mod tests {
 
     /// Exercise production callbacks while allowing a broken spinner to be
     /// cancelled externally, so regression failures do not hang the suite.
-    fn preseed_finishes_without_rescue(body: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> bool {
+    fn preseed_finishes_without_rescue(
+        body: impl FnOnce(Arc<AtomicBool>) + Send + 'static,
+    ) -> bool {
         let _ = flock_core::init_perf_thread_pool();
-        assert!(flock_core::ranked_pool_built(), "requires the ranked topology pool");
+        assert!(
+            flock_core::ranked_pool_built(),
+            "requires the ranked topology pool"
+        );
         assert!(std::env::var_os("FLOCK_NO_HOT_POOL").is_none());
         let finished = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1555,31 +1573,39 @@ mod tests {
     #[test]
     #[ignore = "requires a fresh ranked pool; run with RAYON_NUM_THREADS=16"]
     fn preseed_delayed_callback_cannot_block_new_owner() {
-        assert!(preseed_finishes_without_rescue(|cancel| {
-            let b_entered = AtomicBool::new(false);
-            let a_done = AtomicBool::new(false);
-            rayon::broadcast(|ctx| match ctx.index() {
-                0 => {
-                    while !b_entered.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
-                        std::thread::yield_now();
+        assert!(
+            preseed_finishes_without_rescue(|cancel| {
+                let b_entered = AtomicBool::new(false);
+                let a_done = AtomicBool::new(false);
+                rayon::broadcast(|ctx| match ctx.index() {
+                    0 => {
+                        while !b_entered.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire)
+                        {
+                            std::thread::yield_now();
+                        }
+                        if !cancel.load(Ordering::Acquire) {
+                            on_hot_worker(true, || {});
+                        }
+                        a_done.store(true, Ordering::Release);
                     }
-                    if !cancel.load(Ordering::Acquire) { on_hot_worker(true, || {}); }
-                    a_done.store(true, Ordering::Release);
-                }
-                1 => {
-                    // Do not Rayon-yield: A's callback for B stays queued
-                    // until A has ended and B has begun its new lifetime.
-                    b_entered.store(true, Ordering::Release);
-                    while !a_done.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
-                        std::thread::yield_now();
+                    1 => {
+                        // Do not Rayon-yield: A's callback for B stays queued
+                        // until A has ended and B has begun its new lifetime.
+                        b_entered.store(true, Ordering::Release);
+                        while !a_done.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        if !cancel.load(Ordering::Acquire) {
+                            on_hot_worker(true, || {
+                                let _ = rayon::yield_now();
+                            });
+                        }
                     }
-                    if !cancel.load(Ordering::Acquire) {
-                        on_hot_worker(true, || { let _ = rayon::yield_now(); });
-                    }
-                }
-                _ => {}
-            });
-        }), "a stale callback blocked its new owner until watchdog rescue");
+                    _ => {}
+                });
+            }),
+            "a stale callback blocked its new owner until watchdog rescue"
+        );
     }
 
     #[test]
@@ -1592,14 +1618,23 @@ mod tests {
         let count = completed.clone();
         let timely = preseed_finishes_without_rescue(move |stop| {
             for iteration in 0..512usize {
-                if stop.load(Ordering::Acquire) { break; }
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 on_hot_worker(true, || {
                     let (a, b) = rayon::join(
-                        || (0..64usize).into_par_iter().map(|x| x ^ iteration).sum::<usize>(),
+                        || {
+                            (0..64usize)
+                                .into_par_iter()
+                                .map(|x| x ^ iteration)
+                                .sum::<usize>()
+                        },
                         || rayon::join(|| iteration.wrapping_mul(17), || iteration ^ 91),
                     );
                     std::hint::black_box((a, b));
-                    if !stop.load(Ordering::Acquire) { tail_spin_start(); }
+                    if !stop.load(Ordering::Acquire) {
+                        tail_spin_start();
+                    }
                 });
                 count.fetch_add(1, Ordering::Release);
             }
@@ -1607,7 +1642,11 @@ mod tests {
         let entries = PRESEED_ENTRIES.load(Ordering::Relaxed);
         let depth = PRESEED_MAX_DEPTH.load(Ordering::Relaxed);
         eprintln!("preseed callbacks admitted={entries}, max admitted depth={depth}");
-        assert!(timely, "preseed lifetimes stalled after {} completed phases", completed.load(Ordering::Acquire));
+        assert!(
+            timely,
+            "preseed lifetimes stalled after {} completed phases",
+            completed.load(Ordering::Acquire)
+        );
         assert_eq!(completed.load(Ordering::Acquire), 512);
         assert!(entries > 0, "no production spinner was admitted");
         assert_eq!(depth, 1, "a spinner admitted a nested spinner");
@@ -1619,23 +1658,36 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let completed = Arc::new(AtomicUsize::new(0));
         let count = completed.clone();
-        assert!(preseed_finishes_without_rescue(move |stop| {
-            for iteration in 0..512usize {
-                if stop.load(Ordering::Acquire) { break; }
-                on_hot_worker(true, || {
-                    let _hot = flock_core::hot_pool::HotPool::start().expect("hot pool enabled");
-                    std::hint::black_box(rayon::join(
-                        || (0..64usize).into_par_iter().map(|x| x ^ iteration).sum::<usize>(),
-                        || rayon::join(|| iteration.wrapping_mul(17), || iteration ^ 91),
-                    ));
-                    if !stop.load(Ordering::Acquire) { tail_spin_start(); }
-                });
-                count.fetch_add(1, Ordering::Release);
-            }
-        }), "mixed warming callbacks stalled after {} phases", completed.load(Ordering::Acquire));
+        assert!(
+            preseed_finishes_without_rescue(move |stop| {
+                for iteration in 0..512usize {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    on_hot_worker(true, || {
+                        let _hot =
+                            flock_core::hot_pool::HotPool::start().expect("hot pool enabled");
+                        std::hint::black_box(rayon::join(
+                            || {
+                                (0..64usize)
+                                    .into_par_iter()
+                                    .map(|x| x ^ iteration)
+                                    .sum::<usize>()
+                            },
+                            || rayon::join(|| iteration.wrapping_mul(17), || iteration ^ 91),
+                        ));
+                        if !stop.load(Ordering::Acquire) {
+                            tail_spin_start();
+                        }
+                    });
+                    count.fetch_add(1, Ordering::Release);
+                }
+            }),
+            "mixed warming callbacks stalled after {} phases",
+            completed.load(Ordering::Acquire)
+        );
         assert_eq!(completed.load(Ordering::Acquire), 512);
     }
-
 
     /// Literal transcription of `flock_benchmark_common::generate_compressions`
     /// and its `Rng`, so the parallel form is checked against the protected
