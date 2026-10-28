@@ -2440,33 +2440,30 @@ pub(crate) unsafe fn reduce_worker_plane_block_x86_avx512(
     target_feature = "avx512vbmi"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
-unsafe fn transpose_plane_banks_in_place_x86_avx512(plane_banks: &mut [u8], n_banks: usize) {
+///
+/// # Safety
+unsafe fn transpose_one_plane_bank_x86_avx512(src: *const u8, dst: *mut u8) {
     use core::arch::x86_64::*;
-    debug_assert_eq!(plane_banks.len(), n_banks * 16 * ELL);
     unsafe {
         let idx0 = _mm512_set_epi64(11, 3, 10, 2, 9, 1, 8, 0);
         let idx1 = _mm512_set_epi64(15, 7, 14, 6, 13, 5, 12, 4);
-        let base_ptr = plane_banks.as_mut_ptr();
-        for u in 0..n_banks {
-            let ptr = base_ptr.add(u * 16 * ELL);
-            let lo_rows: [__m512i; 8] =
-                std::array::from_fn(|k| _mm512_loadu_si512(ptr.add(k * ELL) as *const __m512i));
-            let hi_rows: [__m512i; 8] = std::array::from_fn(|k| {
-                _mm512_loadu_si512(ptr.add((8 + k) * ELL) as *const __m512i)
-            });
-            let los = byte_transpose_8x64::<false>(lo_rows);
-            let his = byte_transpose_8x64::<false>(hi_rows);
-            let dst = ptr as *mut __m512i;
-            for k in 0..8usize {
-                _mm512_storeu_si512(
-                    dst.add(2 * k),
-                    _mm512_permutex2var_epi64(los[k], idx0, his[k]),
-                );
-                _mm512_storeu_si512(
-                    dst.add(2 * k + 1),
-                    _mm512_permutex2var_epi64(los[k], idx1, his[k]),
-                );
-            }
+        let lo_rows: [__m512i; 8] =
+            std::array::from_fn(|k| _mm512_loadu_si512(src.add(k * ELL) as *const __m512i));
+        let hi_rows: [__m512i; 8] = std::array::from_fn(|k| {
+            _mm512_loadu_si512(src.add((8 + k) * ELL) as *const __m512i)
+        });
+        let los = byte_transpose_8x64::<false>(lo_rows);
+        let his = byte_transpose_8x64::<false>(hi_rows);
+        let dst = dst as *mut __m512i;
+        for k in 0..8usize {
+            _mm512_storeu_si512(
+                dst.add(2 * k),
+                _mm512_permutex2var_epi64(los[k], idx0, his[k]),
+            );
+            _mm512_storeu_si512(
+                dst.add(2 * k + 1),
+                _mm512_permutex2var_epi64(los[k], idx1, his[k]),
+            );
         }
     }
 }
@@ -2567,9 +2564,43 @@ pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
     local_res_ab: &mut [F128; ELL],
 ) {
     unsafe {
-        transpose_plane_banks_in_place_x86_avx512(plane_banks, eq_bot.len());
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 0, local_res_ab);
-        accumulate_transposed_banks_half_x86_avx512(plane_banks, eq_bot, eq_hi_val, 8, local_res_ab);
+        debug_assert_eq!(plane_banks.len(), eq_bot.len() * 16 * ELL);
+        let src = plane_banks.as_ptr();
+        let mut scratch = [0u8; 2 * 16 * ELL];
+        let mut u = 0usize;
+        let n = eq_bot.len();
+        while u + 2 <= n {
+            transpose_one_plane_bank_x86_avx512(src.add(u * 16 * ELL), scratch.as_mut_ptr());
+            transpose_one_plane_bank_x86_avx512(
+                src.add((u + 1) * 16 * ELL),
+                scratch.as_mut_ptr().add(16 * ELL),
+            );
+            let eq_pair = &eq_bot[u..u + 2];
+            accumulate_transposed_banks_half_x86_avx512(
+                &scratch, eq_pair, eq_hi_val, 0, local_res_ab,
+            );
+            accumulate_transposed_banks_half_x86_avx512(
+                &scratch, eq_pair, eq_hi_val, 8, local_res_ab,
+            );
+            u += 2;
+        }
+        if u < n {
+            transpose_one_plane_bank_x86_avx512(src.add(u * 16 * ELL), scratch.as_mut_ptr());
+            accumulate_transposed_banks_half_x86_avx512(
+                &scratch[..16 * ELL],
+                &eq_bot[u..u + 1],
+                eq_hi_val,
+                0,
+                local_res_ab,
+            );
+            accumulate_transposed_banks_half_x86_avx512(
+                &scratch[..16 * ELL],
+                &eq_bot[u..u + 1],
+                eq_hi_val,
+                8,
+                local_res_ab,
+            );
+        }
     }
 }
 

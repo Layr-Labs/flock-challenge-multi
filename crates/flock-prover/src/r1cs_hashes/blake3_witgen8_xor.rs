@@ -5,15 +5,17 @@
 //! eliminating accumulator field multiplies. Setup is once per shared invocation.
 use super::*;
 use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
+const PROJECTION_NORMALIZED_OFFSET: usize = 8 * 128;
+const PROJECTION_NORMALIZED_READY: usize = PROJECTION_NORMALIZED_OFFSET + 64;
 #[repr(align(64))]
-pub(super) struct Tables([u64; 8 * 128]);
+pub(super) struct Tables([u64; PROJECTION_NORMALIZED_READY + 8]);
 impl Tables {
     pub(super) fn new(table: &InvNttTableByteSingleGf8) -> Self {
         assert_eq!(table.ell, 64);
         // Bank k absorbs the Horner weight 2^k into the linear A map.
         // GF(256) multiplication distributes over both the byte map and XOR
         // convolution. B keeps bank zero; products then accumulate by XOR.
-        let mut m = [0u64; 8 * 128];
+        let mut m = [0u64; PROJECTION_NORMALIZED_READY + 8];
         for k in 0..8 {
             let bank = &mut m[k * 128..(k + 1) * 128];
             for i in 0..64 {
@@ -38,6 +40,30 @@ impl Tables {
                     bank[64 + subset * 8 + c] = v;
                 }
             }
+        }
+        // M_i = M_0 N_i. Weighted A differs only in its final M_0,
+        // so dense A/B can share N_1..N_7 without extra field multiplies.
+        // Derive these from the actual table; singular M_0 keeps the original
+        // projection path, including same-coset and other valid tables.
+        let mut inverses = [0u64; 8];
+        let mut normalized_available = true;
+        for lane in 0..8 {
+            if let Some(inverse) = projection_matrix_inverse(m[64 + lane]) {
+                inverses[lane] = inverse;
+            } else {
+                normalized_available = false;
+                break;
+            }
+        }
+        if normalized_available {
+            for lane in 0..8 {
+                m[PROJECTION_NORMALIZED_OFFSET + lane] = m[64 + lane];
+                for subset in 1..8 {
+                    m[PROJECTION_NORMALIZED_OFFSET + 8 * subset + lane] =
+                        projection_matrix_compose(inverses[lane], m[64 + 8 * subset + lane]);
+                }
+            }
+            m[PROJECTION_NORMALIZED_READY] = 1;
         }
         Self(m)
     }
@@ -620,6 +646,89 @@ unsafe fn row_product<const MODE: u8, const FIRST: bool>(
     }
 }
 
+// Matrix words follow the GFNI reversed-output-row encoding.
+fn projection_matrix_compose(left: u64, right: u64) -> u64 {
+    let mut result = 0u64;
+    for output in 0..8 {
+        let row = (left >> (8 * (7 - output))) as u8;
+        let mut composed = 0u8;
+        for input in 0..8 {
+            if row & (1 << input) != 0 {
+                composed ^= (right >> (8 * (7 - input))) as u8;
+            }
+        }
+        result |= (composed as u64) << (8 * (7 - output));
+    }
+    result
+}
+
+fn projection_matrix_inverse(matrix: u64) -> Option<u64> {
+    let mut rows: [u16; 8] = core::array::from_fn(|i| {
+        ((matrix >> (8 * (7 - i))) as u8 as u16) | (1u16 << (8 + i))
+    });
+    for column in 0..8 {
+        let pivot = (column..8).find(|&row| rows[row] & (1 << column) != 0)?;
+        rows.swap(column, pivot);
+        for row in 0..8 {
+            if row != column && rows[row] & (1 << column) != 0 {
+                rows[row] ^= rows[column];
+            }
+        }
+    }
+    let mut inverse = 0u64;
+    for row in 0..8 {
+        inverse |= ((rows[row] >> 8) as u64) << (8 * (7 - row));
+    }
+    Some(inverse)
+}
+
+#[inline(always)] unsafe fn affine_normalized_common(p:*const u64,m0:*const u64,m:*const u64)->[__m512i;8]{unsafe{
+let x0=_mm512_set1_epi64(*p.add(0)as i64);
+let x1=_mm512_set1_epi64(*p.add(1)as i64);
+let x2=_mm512_set1_epi64(*p.add(2)as i64);
+let x3=_mm512_set1_epi64(*p.add(3)as i64);
+let x4=_mm512_set1_epi64(*p.add(4)as i64);
+let x5=_mm512_set1_epi64(*p.add(5)as i64);
+let x6=_mm512_set1_epi64(*p.add(6)as i64);
+let x7=_mm512_set1_epi64(*p.add(7)as i64);
+let m1=_mm512_loadu_si512(m.add(8).cast());
+let m2=_mm512_loadu_si512(m.add(16).cast());
+let m3=_mm512_loadu_si512(m.add(24).cast());
+let m4=_mm512_loadu_si512(m.add(32).cast());
+let m5=_mm512_loadu_si512(m.add(40).cast());
+let m6=_mm512_loadu_si512(m.add(48).cast());
+let m7=_mm512_loadu_si512(m.add(56).cast());
+let mut c0=x0;
+let mut c1=_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m1),x1);
+let mut c2=_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m2),x2);
+let mut c3=_mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m3),_mm512_gf2p8affine_epi64_epi8::<0>(x1,m2)),_mm512_gf2p8affine_epi64_epi8::<0>(x2,m1),x3);
+let mut c4=_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m4),x4);
+let mut c5=_mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m5),_mm512_gf2p8affine_epi64_epi8::<0>(x1,m4)),_mm512_gf2p8affine_epi64_epi8::<0>(x4,m1),x5);
+let mut c6=_mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m6),_mm512_gf2p8affine_epi64_epi8::<0>(x2,m4)),_mm512_gf2p8affine_epi64_epi8::<0>(x4,m2),x6);
+let mut c7=_mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(_mm512_gf2p8affine_epi64_epi8::<0>(x0,m7),_mm512_gf2p8affine_epi64_epi8::<0>(x1,m6)),_mm512_gf2p8affine_epi64_epi8::<0>(x2,m5),_mm512_gf2p8affine_epi64_epi8::<0>(x3,m4)),_mm512_gf2p8affine_epi64_epi8::<0>(x4,m3),_mm512_gf2p8affine_epi64_epi8::<0>(x5,m2)),_mm512_gf2p8affine_epi64_epi8::<0>(x6,m1),x7);
+let final_matrix=_mm512_loadu_si512(m0.cast());
+c0=_mm512_xor_si512(c0,c1);
+c2=_mm512_xor_si512(c2,c3);
+c4=_mm512_xor_si512(c4,c5);
+c6=_mm512_xor_si512(c6,c7);
+c0=_mm512_xor_si512(c0,c2);
+c1=_mm512_xor_si512(c1,c3);
+c4=_mm512_xor_si512(c4,c6);
+c5=_mm512_xor_si512(c5,c7);
+c0=_mm512_xor_si512(c0,c4);
+c1=_mm512_xor_si512(c1,c5);
+c2=_mm512_xor_si512(c2,c6);
+c3=_mm512_xor_si512(c3,c7);
+c0=_mm512_gf2p8affine_epi64_epi8::<0>(c0,final_matrix);
+c1=_mm512_gf2p8affine_epi64_epi8::<0>(c1,final_matrix);
+c2=_mm512_gf2p8affine_epi64_epi8::<0>(c2,final_matrix);
+c3=_mm512_gf2p8affine_epi64_epi8::<0>(c3,final_matrix);
+c4=_mm512_gf2p8affine_epi64_epi8::<0>(c4,final_matrix);
+c5=_mm512_gf2p8affine_epi64_epi8::<0>(c5,final_matrix);
+c6=_mm512_gf2p8affine_epi64_epi8::<0>(c6,final_matrix);
+c7=_mm512_gf2p8affine_epi64_epi8::<0>(c7,final_matrix);
+[c0,c1,c2,c3,c4,c5,c6,c7]}}
+
 // Share the expensive arithmetic by structural row mode. The eight Horner
 // weights remain selected by the caller's matrix-bank pointer.
 #[inline(never)]
@@ -629,8 +738,14 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
     acc: &mut [__m512i; 8], acc0: __m512i,
 ) -> __m512i {
     unsafe {
-        let av = affine_prepared(ap, ma);
-        let bv = if MODE == 0 { affine_prepared(bp, mb) } else { affine_conv(bp, mb, MODE) };
+        let (av, bv) = if MODE == 0 && *mb.add(PROJECTION_NORMALIZED_READY) != 0 {
+            let common = mb.add(PROJECTION_NORMALIZED_OFFSET);
+            (affine_normalized_common(ap, ma.add(64), common),
+             affine_normalized_common(bp, common, common))
+        } else {
+            (affine_prepared(ap, ma),
+             if MODE == 0 { affine_prepared(bp, mb) } else { affine_conv(bp, mb, MODE) })
+        };
         let mut result = _mm512_setzero_si512();
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
@@ -1202,5 +1317,72 @@ mod tests {
                 "280 complete ring-to-published-window cases, including A/B/Z, compact output stride, both ring halves and untouched bytes"
             );
         }
+    }
+
+    #[test]
+    fn normalized_dense_projection_tables_and_fallback_match_scalar() {
+        let mut seed = 0xc5a1_127b_239du64;
+        let mut next = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed
+        };
+        let mut fast_tables = 0usize;
+        let mut fallback_tables = 0usize;
+        let mut cases = 0usize;
+        for (small, large) in [(0, 64), (0, 128), (0, 192), (64, 0), (0, 0), (0, 1)] {
+            let ns = AdditiveNttGf8::new(6, F8(small));
+            let nl = AdditiveNttGf8::new(6, F8(large));
+            let table = InvNttTableByteSingleGf8::new(&ns, &nl);
+            let t = Tables::new(&table);
+            let fast = t.0[PROJECTION_NORMALIZED_READY] != 0;
+            if fast { fast_tables += 1; } else { fallback_tables += 1; }
+            if (small, large) == (0, 64) { assert!(fast); }
+            if small == large { assert!(!fast); }
+            if fast {
+                for lane in 0..8 {
+                    for weight in 0..8 {
+                        let m0 = t.0[128 * weight + 64 + lane];
+                        for subset in 1..8 {
+                            let normal = t.0[PROJECTION_NORMALIZED_OFFSET + 8 * subset + lane];
+                            assert_eq!(projection_matrix_compose(m0, normal), t.0[128 * weight + 64 + 8 * subset + lane]);
+                        }
+                    }
+                }
+            }
+            for weight in 0..8 {
+                for case in 0..66 {
+                    let mut a: [u64; 8] = core::array::from_fn(|_| next());
+                    let mut b: [u64; 8] = core::array::from_fn(|_| next());
+                    if case == 0 { a.fill(0); b.fill(0); }
+                    if case == 1 { a.fill(!0); b.fill(!0); }
+                    let mut product = [0u64; 64];
+                    for row in 0..8 {
+                        let aa: [u8; 8] = core::array::from_fn(|i| (a[i] >> (8 * row)) as u8);
+                        let bb: [u8; 8] = core::array::from_fn(|i| (b[i] >> (8 * row)) as u8);
+                        let mut av = [F8::ZERO; 64]; let mut bv = [F8::ZERO; 64];
+                        table.apply_scalar(&aa, &mut av); table.apply_scalar(&bb, &mut bv);
+                        for i in 0..64 { product[i] |= ((av[i] * bv[i] * F8(1 << weight)).0 as u64) << (8 * row); }
+                    }
+                    for bit in [1usize, 2, 4] {
+                        for i in 0..8 { if i & bit == 0 { a[i] ^= a[i | bit]; b[i] ^= b[i | bit]; } }
+                    }
+                    let initial: [u64; 64] = core::array::from_fn(|_| next());
+                    unsafe {
+                        let mut output: [__m512i; 8] = core::mem::transmute(initial);
+                        row_product::<0, true>(a.as_ptr(), b.as_ptr(), t.0.as_ptr().add(128 * weight), t.0.as_ptr(), &mut output);
+                        let got: [u64; 64] = core::mem::transmute(output);
+                        assert_eq!(got, product, "first small={small} large={large} weight={weight} case={case}");
+                        output = core::mem::transmute(initial);
+                        row_product::<0, false>(a.as_ptr(), b.as_ptr(), t.0.as_ptr().add(128 * weight), t.0.as_ptr(), &mut output);
+                        let got: [u64; 64] = core::mem::transmute(output);
+                        let want: [u64; 64] = core::array::from_fn(|i| product[i] ^ initial[i]);
+                        assert_eq!(got, want, "add small={small} large={large} weight={weight} case={case}");
+                    }
+                    cases += 2;
+                }
+            }
+        }
+        assert!(fast_tables > 0 && fallback_tables > 0);
+        assert_eq!(cases, 6336);
+        println!("PASS {cases} normalized dense scalar cases, fast_tables={fast_tables}, fallback_tables={fallback_tables}");
     }
 }
