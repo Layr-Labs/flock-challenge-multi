@@ -1465,7 +1465,7 @@ impl Blake3AdjointPlan {
     #[inline(always)]
     fn fold_alpha_batched_fallback(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut acc = vec![F128::ZERO; self.n_nodes];
+        let mut acc = flock_core::scratch::take_lincheck_acc(self.n_nodes);
 
         // Inject. Writes land on leaves, internal nodes, or the zero node —
         // the zero node has no children and is dropped by the truncate below,
@@ -1511,7 +1511,9 @@ impl Blake3AdjointPlan {
         for i in (0..self.children.len()).rev() {
             // SAFETY: `base + i < n_nodes`, and children are node ids `< base + i < n_nodes`.
             unsafe {
-                let v = *acc.get_unchecked(base + i);
+                let slot = acc.get_unchecked_mut(base + i);
+                let v = *slot;
+                *slot = F128::ZERO;
                 let [p, q] = *self.children.get_unchecked(i);
                 *acc.get_unchecked_mut(p as usize) += v;
                 *acc.get_unchecked_mut(q as usize) += v;
@@ -2834,8 +2836,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
+        static ROOT_CACHE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let root_enabled = linear_fold_enabled()
-            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
+            && *ROOT_CACHE_ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none());
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
                 let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
