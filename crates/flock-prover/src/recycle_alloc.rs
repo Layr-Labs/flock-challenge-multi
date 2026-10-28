@@ -1,10 +1,3 @@
-//! Recycling global allocator for the prover process.
-//!
-//! Blocks at least 32 KiB are parked on exact-size freelists rather than
-//! returned to the system allocator. The ranked worker performs an untimed warm proof
-//! with the same allocation pattern, so the timed proof reuses resident pages
-//! for large allocations not already handled by the typed scratch pools.
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{
@@ -33,19 +26,14 @@ fn class_slot(size: usize) -> usize {
     (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
 }
 
-// Match only the existing padded large-buffer layout. Ordinary small
-// power-of-two sizes use System instead of a shared per-size freelist.
 #[inline]
 fn retained_size(size: usize) -> bool {
     const TAIL: usize = flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
-    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
-        && (size - TAIL).is_power_of_two()
+    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL && (size - TAIL).is_power_of_two()
 }
 
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
-    // At most 42 valid classes on 64-bit layouts (payload exponents 21..62).
-    // This changes retention only; recyclable() still controls alignment.
     if !retained_size(size) {
         return None;
     }
@@ -80,32 +68,16 @@ fn recyclable(layout: &Layout) -> bool {
     layout.size() >= RECYCLE_MIN && layout.align() <= MAX_ALIGN
 }
 
-/// `FLOCK_NO_ALIGN64=1` restores raw System pointers for the recyclable
-/// class (exact same-binary A/B). Latched once, and only ever initialized
-/// from a RECYCLABLE allocation — `var_os`'s own small allocations take the
-/// non-recyclable branch straight to System, so initialization cannot
-/// re-enter this latch.
 #[inline]
 fn align64_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ALIGN64").is_none())
 }
 
-/// Every large prover buffer historically landed `16 mod 64` (glibc mmap
-/// chunk header), which the hot kernels pay for three ways: every wide
-/// load/store on these buffers is a cache-line split, non-temporal 64-byte
-/// writes straddle two lines (partial write-combining flushes are DRAM
-/// read-modify-writes), and single-uop ZMM streaming stores are illegal.
-/// For the recyclable class, over-allocate by `ALIGN_SLACK` and return
-/// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
-/// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
-/// never collide with the freelist link word at `aligned + 0`.
 const ALIGN_SLACK: usize = 64;
 
 #[inline]
 fn adjusted(layout: &Layout) -> Layout {
-    // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
-    // caller could have constructed, and 16 is a power of two.
     Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
 }
 
@@ -115,16 +87,12 @@ unsafe fn align_up(base: *mut u8) -> *mut u8 {
         return base;
     }
     let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
-    // over-allocated, and aligned - 8 >= base.
     unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
     aligned
 }
 
 #[inline]
 unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
-    // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
-    // intact (freelist links live at ptr + 0 and never touch it).
     let off = unsafe { *(ptr.sub(8) as *const usize) };
     debug_assert!((8..=ALIGN_SLACK).contains(&off));
     unsafe { ptr.sub(off) }
@@ -157,24 +125,15 @@ fn push(ptr: *mut u8, size: usize) -> bool {
 
 pub struct RecycleAlloc;
 
-// SAFETY: every recycled block came from this allocator with the exact same
-// size class. With align64 on, every recyclable-class block System sees uses
-// the `adjusted` layout on both alloc and dealloc, and the user pointer is
-// recovered to its System base via the offset word `align_up` stored.
-// glibc/mimalloc and the macOS allocator provide at least 16-byte alignment
-// at these sizes; layouts requiring larger alignment bypass the recycler.
 unsafe impl GlobalAlloc for RecycleAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if recyclable(&layout) {
             let p = pop(layout.size());
-            // Provenance for `flock_core::alloc_uninit_vec`, which skips its
-            // `MADV_HUGEPAGE` re-advise on a block that came off a freelist.
             let _ = flock_core::LAST_ALLOC_RECYCLED.try_with(|c| c.set(!p.is_null()));
             if !p.is_null() {
                 return p;
             }
             if align64_enabled() {
-                // SAFETY: adjusted() reserves the slack align_up consumes.
                 return unsafe { align_up(System.alloc(adjusted(&layout))) };
             }
         }
@@ -190,9 +149,6 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 return p;
             }
             if align64_enabled() {
-                // The user range [aligned, aligned + size) is inside the
-                // zeroed System block; the offset word sits before it.
-                // SAFETY: as for alloc.
                 return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
             }
         }
@@ -205,9 +161,6 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 return;
             }
             if align64_enabled() {
-                // SAFETY: every recyclable-class pointer this allocator
-                // handed out with align64 on came from align_up; recover the
-                // System base and the adjusted layout it was allocated with.
                 unsafe {
                     return System.dealloc(align_base(ptr), adjusted(&layout));
                 }
@@ -238,7 +191,15 @@ mod tests {
             assert!(!retained_size(payload));
             assert!(Layout::from_size_align(size, 8).is_ok());
         }
-        for size in [0, RECYCLE_MIN, 64 * 1024, 128 * 1024, MIN, MIN + TAIL - 1, usize::MAX] {
+        for size in [
+            0,
+            RECYCLE_MIN,
+            64 * 1024,
+            128 * 1024,
+            MIN,
+            MIN + TAIL - 1,
+            usize::MAX,
+        ] {
             assert!(!retained_size(size));
             assert!(find_class(size, true).is_none());
         }
@@ -261,42 +222,60 @@ mod tests {
                             let block = RecycleAlloc.alloc(layout);
                             assert!(!block.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(block as usize % 64, 0);
                             let value = (lane + 1 + round * 8) as u8;
                             core::ptr::write_bytes(block, value, size);
                             barrier.wait();
-                            assert!(core::slice::from_raw_parts(block, size).iter().all(|&v| v == value));
+                            assert!(
+                                core::slice::from_raw_parts(block, size)
+                                    .iter()
+                                    .all(|&v| v == value)
+                            );
                             barrier.wait();
                             RecycleAlloc.dealloc(block, layout);
                             let zeroed = RecycleAlloc.alloc_zeroed(layout);
                             assert!(!zeroed.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(zeroed as usize % 64, 0);
-                            assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&v| v == 0));
+                            assert!(
+                                core::slice::from_raw_parts(zeroed, size)
+                                    .iter()
+                                    .all(|&v| v == 0)
+                            );
                             RecycleAlloc.dealloc(zeroed, layout);
                         }
                     }
                 });
             }
         });
-        let occupied = CLASSES.iter().filter(|c| {
-            let size = c.size.load(Acquire);
-            assert!(size == 0 || retained_size(size));
-            size != 0
-        }).count();
+        let occupied = CLASSES
+            .iter()
+            .filter(|c| {
+                let size = c.size.load(Acquire);
+                assert!(size == 0 || retained_size(size));
+                size != 0
+            })
+            .count();
         assert!(occupied <= (usize::BITS - 1 - 21) as usize);
         assert_eq!(bypassed.load(Relaxed), 64);
         eprintln!("REUSED_ALLOCATIONS={}", reused.load(Relaxed));
     }
-    /// With `FLOCK_NO_ALIGN64` unset (the ranked worker's cleared env), every
-    /// recyclable-class allocation — fresh from System, recycled off the
-    /// freelist, and grown through realloc — returns a 64-aligned pointer
-    /// with intact contents. (The switch-off arm can't be covered in the
-    /// same process: the latch resolves once.)
     #[test]
     fn recyclable_class_is_64_aligned_and_roundtrips() {
         for i in 0..4usize {
@@ -311,8 +290,6 @@ mod tests {
             assert_eq!(z.as_ptr() as usize % 64, 0, "alloc_zeroed n={}", n + 64);
             assert!(z.iter().all(|&b| b == 0), "zeroed contents n={}", n + 64);
         }
-        // Growth path: realloc = alloc + copy + dealloc through this
-        // allocator; contents must survive the move between size classes.
         let mut g: Vec<u8> = Vec::with_capacity(48 * 1024);
         g.extend(std::iter::repeat_n(0xA5u8, 48 * 1024));
         g.extend(std::iter::repeat_n(0x5Au8, 128 * 1024));

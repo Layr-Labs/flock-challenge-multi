@@ -1,11 +1,3 @@
-//! Shared sparse-prefix transpose for one additive-NTT window.
-//!
-//! The transpose's fine layers operate independently on the two children of
-//! a window. Expand singleton children with the existing output-complete
-//! kernel, then merge their results once. Unlike a sum of full singleton
-//! expansions, common ancestors are evaluated only once. Unlike a dense
-//! window, empty children never perform a transform.
-
 use super::{
     AdditiveNttF128, F128, expand_singleton_into, transpose_butterfly,
     transpose_forward_ntt_window_dense_slice,
@@ -17,13 +9,6 @@ pub(super) fn enabled() -> bool {
     *ON
 }
 
-/// `order` contains indices into `positions` and `values`, sorted by position.
-/// All selected positions belong to window `w` of width `2^k`.
-///
-/// Every output is initialized before it is read, including empty windows,
-/// duplicate positions, and sums that cancel. No witness or query value is
-/// retained across proofs. Only the already-public query positions determine
-/// the recursion.
 pub(super) fn expand(
     ntt: &AdditiveNttF128,
     log_d: usize,
@@ -52,8 +37,6 @@ pub(super) fn expand(
     let first = order[0] as usize;
     let last = *order.last().unwrap() as usize;
     if positions[first] == positions[last] {
-        // Sorted equal endpoints imply one distinct position. Combining
-        // duplicates here is also essential for reduced sparse-dual queries.
         let value = order
             .iter()
             .fold(F128::ZERO, |sum, &i| sum + values[i as usize]);
@@ -73,9 +56,6 @@ pub(super) fn expand(
         return;
     }
 
-    // Tiny occupied windows are cheaper as a few regular butterflies than
-    // as a full binary recursion. This is a cost cutoff, not a shape or
-    // correctness assumption; every entry is scattered with XOR.
     if k <= 4 && order.len() >= out.len() / 2 {
         out.fill(F128::ZERO);
         for &i in order {
@@ -92,9 +72,6 @@ pub(super) fn expand(
     let twiddle = ntt.twiddle(log_d - k, w);
     let (top, bot) = out.split_at_mut(half);
     if split == 0 || split == order.len() {
-        // An empty sibling contributes zero. Whichever child is live, the
-        // parent's top is that child's transform. Produce it directly into
-        // `top`, avoiding both zero-fill and a copy from the right half.
         let right = split == 0;
         expand(
             ntt,
@@ -129,7 +106,6 @@ pub(super) fn expand(
             &order[split..],
             bot,
         );
-        // (a, b) -> (a+b, t*(a+b)+b), exactly the incumbent transpose.
         transpose_butterfly(top, bot, twiddle);
     }
 }
@@ -141,8 +117,6 @@ fn scale_into(out: &mut [F128], input: &[F128], scale: F128) {
         out.copy_from_slice(input);
     } else {
         #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-        // SAFETY: cfg supplies both features; the halves are disjoint and
-        // equal-sized, and the kernel writes without reading its destination.
         unsafe {
             super::eq_expand_block_x4(out, input, scale);
         }
@@ -170,8 +144,6 @@ mod tests {
         if k > 0 {
             transpose_forward_ntt_window_dense_slice(&ntt, log_d, k, w, &mut want);
         }
-        // Poison instead of zeroing: catches incomplete writes and stale
-        // sibling reads without relying on an uninitialized allocation.
         let mut got = vec![F128::new(u64::MAX, 0xabad_1dea); 1usize << k];
         expand(&ntt, log_d, k, w, &positions, &values, &order, &mut got);
         assert_eq!(
@@ -236,8 +208,6 @@ mod tests {
                 for w in [0usize, 1, 5] {
                     compare(k + 3, k, w, &entries);
                 }
-                // Clustered inputs exercise long one-child paths; reverse
-                // order proves that the wrapper's stable sort is sufficient.
                 let entries: Vec<_> = entries.into_iter().rev().map(|(p, v)| (p / 4, v)).collect();
                 compare(k + 3, k, 7, &entries);
             }
@@ -257,7 +227,7 @@ mod tests {
 
     #[test]
     fn sparse_trie_complete_transform_and_dead_outputs() {
-        use super::super::transpose_forward_ntt_sparse_inner_dead;
+        use super::super::transpose_forward_ntt_sparse_truncated;
         use rayon::ThreadPoolBuilder;
 
         for threads in [1, 4] {
@@ -266,13 +236,11 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                for (log_d, k, queries) in
+                for (log_d, _k, queries) in
                     [(12, 6, 71), (14, 10, 106), (16, 12, 218), (20, 12, 218)]
                 {
                     let n = 1usize << log_d;
                     let ntt = AdditiveNttF128::standard(log_d);
-                    // Reverse order and repeated positions cover the wrapper's
-                    // sort and the sparse-dual reduced-query collision case.
                     let positions: Vec<_> = (0..queries)
                         .rev()
                         .map(|i| ((i / 2) * 7919 + 17) & (n - 1))
@@ -281,44 +249,24 @@ mod tests {
                         .map(|i| F128::new((i as u64 + 1) * 0x1234, !(i as u64)))
                         .collect();
                     for dead in [0, 1, 3, 5] {
-                        let got = transpose_forward_ntt_sparse_inner_dead(
-                            &ntt,
-                            &positions,
-                            &values,
-                            log_d,
-                            Some(true),
-                            Some(k),
-                            dead,
-                        )
-                        .0;
-                        let want = transpose_forward_ntt_sparse_inner_dead(
-                            &ntt,
-                            &positions,
-                            &values,
-                            log_d,
-                            Some(false),
-                            Some(k),
-                            dead,
-                        )
-                        .0;
+                        let got = transpose_forward_ntt_sparse_truncated(
+                            &ntt, &positions, &values, log_d, dead,
+                        );
+                        let want = transpose_forward_ntt_sparse_truncated(
+                            &ntt, &positions, &values, log_d, 0,
+                        );
                         let kept = n >> dead;
                         assert_eq!(
                             &got[..kept],
                             &want[..kept],
                             "threads={threads}, log_d={log_d}, dead={dead}"
                         );
-                        if dead == 0 {
-                            assert_eq!(got, want);
-                        }
                     }
                 }
             });
         }
     }
 
-    // Arithmetic-work model, not a wall-clock benchmark. Counts one product
-    // per scalar butterfly slot and per singleton output except the first.
-    // Zero/one scales can only decrease the actual multiplication count.
     fn product_bound(k: usize, positions: &[usize]) -> usize {
         let n = 1usize << k;
         if positions.is_empty() {
