@@ -284,9 +284,10 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
                 let p5 = p(5);
                 let p6 = p(6);
                 let p7 = p(7);
-                _mm512_xor_si512(
-                    _mm512_xor_si512(p2, p3),
-                    _mm512_xor_si512(_mm512_xor_si512(p4, p5), _mm512_xor_si512(p6, p7)),
+                _mm512_ternarylogic_epi64::<0x96>(
+                    _mm512_ternarylogic_epi64::<0x96>(p2, p3, p4),
+                    _mm512_xor_si512(p5, p6),
+                    p7,
                 )
             }
             0x0f => {
@@ -297,7 +298,7 @@ pub(crate) unsafe fn shift_reduce_residual_offw_nt2_img<
                         k,
                     )
                 };
-                _mm512_xor_si512(_mm512_xor_si512(p0, p(1)), _mm512_xor_si512(p(2), p(3)))
+                _mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(p0, p(1)), p(2), p(3))
             }
             _ => core::hint::unreachable_unchecked(),
         };
@@ -494,24 +495,31 @@ unsafe fn apply_b_complement_img<
                 }
             };
         }
+        macro_rules! join3 {
+            ($a:expr, $has_a:expr, $b:expr, $has_b:expr, $c:expr, $has_c:expr) => {
+                if $has_a && $has_b && $has_c {
+                    _mm512_ternarylogic_epi64::<0x96>($a, $b, $c)
+                } else if $has_a {
+                    join!($a, true, join!($b, $has_b, $c, $has_c), $has_b || $has_c)
+                } else {
+                    join!($b, $has_b, $c, $has_c)
+                }
+            };
+        }
         let lo_live = live!(0) || live!(1) || live!(2) || live!(3);
         let hi_live = live!(4) || live!(5) || live!(6) || live!(7);
         if I == 8 {
             let l01 = join!(row(0, 0), live!(0), row(1, 1), live!(1));
-            let l23 = join!(row(2, 2), live!(2), row(3, 3), live!(3));
             let l45 = join!(row(4, 4), live!(4), row(5, 5), live!(5));
-            let l67 = join!(row(6, 6), live!(6), row(7, 7), live!(7));
-            let lo = join!(l01, live!(0) || live!(1), l23, live!(2) || live!(3));
-            let hi = join!(l45, live!(4) || live!(5), l67, live!(6) || live!(7));
+            let lo = join3!(l01, live!(0) || live!(1), row(2, 2), live!(2), row(3, 3), live!(3));
+            let hi = join3!(l45, live!(4) || live!(5), row(6, 6), live!(6), row(7, 7), live!(7));
             join!(lo, lo_live, hi, hi_live)
         } else {
             debug_assert_eq!(I, 4);
             let a01 = join!(row(0, 0), live!(0), row(1, 1), live!(1));
-            let a23 = join!(row(2, 2), live!(2), row(3, 3), live!(3));
             let b01 = join!(row(0, 4), live!(4), row(1, 5), live!(5));
-            let b23 = join!(row(2, 6), live!(6), row(3, 7), live!(7));
-            let v0 = join!(a01, live!(0) || live!(1), a23, live!(2) || live!(3));
-            let v1 = join!(b01, live!(4) || live!(5), b23, live!(6) || live!(7));
+            let v0 = join3!(a01, live!(0) || live!(1), row(2, 2), live!(2), row(3, 3), live!(3));
+            let v1 = join3!(b01, live!(4) || live!(5), row(2, 6), live!(6), row(3, 7), live!(7));
             join!(v0, lo_live, _mm512_shuffle_i64x2::<0x4E>(v1, v1), hi_live)
         }
     }
@@ -600,18 +608,17 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
                 }
             };
         }
-        let u0 = join!(
-            row(imgs.0, field(0)),
-            FIRST == 0,
-            row(imgs.1, field(1)),
-            FIRST <= 1 && END > 1
-        );
-        let u1 = join!(
-            row(imgs.0, field(2)),
-            FIRST <= 2 && END > 2,
-            row(imgs.1, field(3)),
-            FIRST <= 3 && END > 3
-        );
+        macro_rules! join3 {
+            ($a:expr, $has_a:expr, $b:expr, $has_b:expr, $c:expr, $has_c:expr) => {
+                if $has_a && $has_b && $has_c {
+                    _mm512_ternarylogic_epi64::<0x96>($a, $b, $c)
+                } else if $has_a {
+                    join!($a, true, join!($b, $has_b, $c, $has_c), $has_b || $has_c)
+                } else {
+                    join!($b, $has_b, $c, $has_c)
+                }
+            };
+        }
         let u2 = join!(
             row(imgs.0, field(4)),
             FIRST <= 4 && END > 4,
@@ -624,25 +631,45 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
             row(imgs.1, field(7)),
             END == 8
         );
-        let even = join!(
-            u0,
-            FIRST < 2,
-            _mm512_shuffle_i64x2::<0x4E>(u2, u2),
-            FIRST < 6 && END > 4
-        );
-        let odd = join!(
-            u1,
-            FIRST < 4 && END > 2,
+        let odd = join3!(
             _mm512_shuffle_i64x2::<0x4E>(u3, u3),
-            END > 6
+            END > 6,
+            row(imgs.0, field(2)),
+            FIRST <= 2 && END > 2,
+            row(imgs.1, field(3)),
+            FIRST <= 3 && END > 3
         );
-        let complement = join!(
-            even,
-            FIRST < 2 || (FIRST < 6 && END > 4),
-            _mm512_shuffle_i64x2::<0xB1>(odd, odd),
-            (FIRST < 4 && END > 2) || END > 6
-        );
-        complement
+        if FIRST == 0 {
+            let even = join3!(
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                FIRST < 6 && END > 4,
+                row(imgs.0, field(0)),
+                true,
+                row(imgs.1, field(1)),
+                END > 1
+            );
+            join!(
+                even,
+                true,
+                _mm512_shuffle_i64x2::<0xB1>(odd, odd),
+                END > 2
+            )
+        } else {
+            let u0 = join!(
+                row(imgs.0, field(0)),
+                false,
+                row(imgs.1, field(1)),
+                FIRST <= 1 && END > 1
+            );
+            join3!(
+                u0,
+                FIRST < 2 && END > 1,
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                FIRST < 6 && END > 4,
+                _mm512_shuffle_i64x2::<0xB1>(odd, odd),
+                (FIRST < 4 && END > 2) || END > 6
+            )
+        }
     }
 }
 

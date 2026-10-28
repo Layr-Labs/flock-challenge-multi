@@ -476,9 +476,10 @@ unsafe fn residual_2img_offw_k2_7<const P: bool>(
         let p5 = scaled!(5);
         let p6 = scaled!(6);
         let p7 = scaled!(7);
-        _mm512_xor_si512(
-            _mm512_xor_si512(p2, p3),
-            _mm512_xor_si512(_mm512_xor_si512(p4, p5), _mm512_xor_si512(p6, p7)),
+        _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_ternarylogic_epi64::<0x96>(p2, p3, p4),
+            _mm512_xor_si512(p5, p6),
+            p7,
         )
     }
 }
@@ -509,12 +510,18 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512_window30_k0(
             let row = |img: *const u8, i: usize| {
                 _mm512_loadu_si512(img.add(*bytes.add(i) as usize * 64).cast::<__m512i>())
             };
-            let u0 = _mm512_xor_si512(row(imgs.0, 0), row(imgs.1, 1));
-            let u1 = _mm512_xor_si512(row(imgs.0, 2), row(imgs.1, 3));
             let u2 = _mm512_xor_si512(row(imgs.0, 4), row(imgs.1, 5));
             let u3 = _mm512_xor_si512(row(imgs.0, 6), row(imgs.1, 7));
-            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
-            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            let even = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u2, u2),
+                row(imgs.0, 0),
+                row(imgs.1, 1),
+            );
+            let odd = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_shuffle_i64x2::<0x4E>(u3, u3),
+                row(imgs.0, 2),
+                row(imgs.1, 3),
+            );
             _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
         };
         let acc = _mm512_gf2p8mul_epi8(apply(a.as_ptr()), apply(b.as_ptr()));
@@ -548,10 +555,7 @@ unsafe fn residual_2img_offw_k0_3<const P: bool>(
                 _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << $k) as i8))
             }};
         }
-        _mm512_xor_si512(
-            _mm512_xor_si512(p0, scaled!(1)),
-            _mm512_xor_si512(scaled!(2), scaled!(3)),
-        )
+        _mm512_ternarylogic_epi64::<0x96>(_mm512_xor_si512(p0, scaled!(1)), scaled!(2), scaled!(3))
     }
 }
 
