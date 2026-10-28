@@ -3364,7 +3364,6 @@ impl SparseDualL0 {
         log_inv_rate: usize,
         l0_codeword: &[F128],
         num_interleaved: usize,
-        opened_rows: &[Vec<F128>],
         lane_challenges: &[F128],
         queries: &[usize],
         alpha: &[F128],
@@ -3377,7 +3376,6 @@ impl SparseDualL0 {
         assert!(log_inv_rate + depth <= log_d);
         assert_eq!(num_interleaved, 1usize << lane_challenges.len());
         assert_eq!(l0_codeword.len(), (1usize << log_d) * num_interleaved);
-        assert_eq!(opened_rows.len(), queries.len());
         let lane_weights = build_eq_table(lane_challenges);
         let alpha_pows: Vec<F128> = if queries.is_empty() {
             Vec::new()
@@ -10572,32 +10570,17 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> =
-        gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-    let merkle_proof_0 = merkle_multi_proof_for_l0(
-        l0_tree,
-        l0_codeword,
-        l0_block_len,
-        l0_num_interleaved,
-        &queries_0,
-        config.merkle_hash,
-    );
-    if trace {
-        t_opens += _t.elapsed();
-    }
-    // The proof's copy of the opened rows is the SAME data the induce below
-    // reads. The incumbent cloned all 218 rows (218 allocations, 223 KiB) here,
-    // on one core, purely to keep `opened_rows_0` alive for the induce; moving
-    // the rows in after the induce deletes the copy outright.
-    let mut merkle_proof_0 = Some(merkle_proof_0);
-    let mut initial_proof = if open_fill_enabled() {
-        None
-    } else {
-        Some(RecursiveProof {
-            opened_rows: opened_rows_0.clone(),
-            merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
-        })
+    let open_l0 = || {
+        let opened_rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+        let merkle_proof = merkle_multi_proof_for_l0(
+            l0_tree,
+            l0_codeword,
+            l0_block_len,
+            l0_num_interleaved,
+            &queries_0,
+            config.merkle_hash,
+        );
+        (opened_rows, merkle_proof)
     };
 
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
@@ -10609,7 +10592,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     } else {
         Some(eval_sk_at_vks(n1))
     };
-    let _t = std::time::Instant::now();
     let sparse_dual_depth = ranked_sparse_dual_l0_depth(
         config,
         log_n,
@@ -10620,31 +10602,42 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         lazy_l1_ood,
         direct_fold8_mode,
     );
-    let (basis_0_induced, sparse_dual_0, enforced_sum_0) = if let Some(depth) = sparse_dual_depth {
-        let (dual, enforced_sum) = SparseDualL0::new(
-            depth,
-            n1 + log_inv_rate_0,
-            log_inv_rate_0,
-            l0_codeword,
-            l0_num_interleaved,
-            &opened_rows_0,
-            &r_lane_fold,
-            &queries_0,
-            &alpha_0,
-        );
-        (None, Some(dual), enforced_sum)
-    } else {
-        let (basis, enforced_sum) = induce_sumcheck_poly_auto(
-            n1,
-            log_inv_rate_0,
-            sks_vks_n1.as_deref(),
-            &opened_rows_0,
-            &r_lane_fold,
-            &queries_0,
-            &alpha_0,
-        );
-        (Some(basis), None, enforced_sum)
-    };
+    // The opening (row gather + Merkle multi-proof) never enters the
+    // transcript, and the sparse dual reads the codeword blocks itself, not the
+    // opened rows, so on the sparse arm the two run side by side instead of
+    // back to back. The dense arm reads the opened rows and keeps the order.
+    let _t = std::time::Instant::now();
+    let ((opened_rows_0, merkle_proof_0), (basis_0_induced, sparse_dual_0, enforced_sum_0)) =
+        if let Some(depth) = sparse_dual_depth {
+            let (opened, (dual, enforced_sum)) = rayon::join(open_l0, || {
+                SparseDualL0::new(
+                    depth,
+                    n1 + log_inv_rate_0,
+                    log_inv_rate_0,
+                    l0_codeword,
+                    l0_num_interleaved,
+                    &r_lane_fold,
+                    &queries_0,
+                    &alpha_0,
+                )
+            });
+            (opened, (None, Some(dual), enforced_sum))
+        } else {
+            let opened = open_l0();
+            if trace {
+                t_opens += _t.elapsed();
+            }
+            let (basis, enforced_sum) = induce_sumcheck_poly_auto(
+                n1,
+                log_inv_rate_0,
+                sks_vks_n1.as_deref(),
+                &opened.0,
+                &r_lane_fold,
+                &queries_0,
+                &alpha_0,
+            );
+            (opened, (Some(basis), None, enforced_sum))
+        };
     if trace {
         let d = _t.elapsed();
         t_induce += d;
@@ -10658,10 +10651,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         ));
     }
 
-    let initial_proof = initial_proof.take().unwrap_or_else(|| RecursiveProof {
+    let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0,
-        merkle_proof: merkle_proof_0.take().expect("merkle proof taken once"),
-    });
+        merkle_proof: merkle_proof_0,
+    };
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -10943,23 +10936,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> =
-            gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
-        if trace {
-            t_opens += _t.elapsed();
-        }
-        // Same deletion as the L0 block: the rows move into the proof after the
-        // induce has read them instead of being cloned before it.
-        let mut merkle_proof_i = Some(merkle_proof_i);
-        if !open_fill_enabled() {
-            recursive_proofs.push(RecursiveProof {
-                opened_rows: opened_rows_i.clone(),
-                merkle_proof: merkle_proof_i.take().expect("merkle proof taken once"),
-            });
-        }
+        let open_i = || {
+            let opened_rows =
+                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
+            let merkle_proof =
+                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+            (opened_rows, merkle_proof)
+        };
 
         // The dispatcher builds the dense arm's table itself on the lazy
         // path (see [`induce_lazy_sks_enabled`]); the sched-disabled arm
@@ -10992,43 +10975,50 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // dispatch L0 uses applies here. (Was hard-wired to the dense arm
         // back when the transposed NTT cost one DRAM pass per layer; the
         // blocked sweep moved the crossover well below level 1's shape.)
-        let (basis_i_induced, deep_dual_i, enforced_sum_i) = if let Some(depth) = deep_dual_depth {
-            let (dual, enforced_sum) = SparseDualL0::new(
-                depth,
-                n_next + config.log_inv_rates[i + 1],
-                config.log_inv_rates[i + 1],
-                &wtns_prev.mat,
-                wtns_prev.num_interleaved,
-                &opened_rows_i,
-                &level_rs,
-                &queries_i,
-                &alpha_i,
-            );
-            (None, Some(dual), enforced_sum)
-        } else if induce_sched_enabled() {
-            let (basis, enforced_sum) = induce_sumcheck_poly_auto(
-                n_next,
-                config.log_inv_rates[i + 1],
-                sks_vks_i.as_deref(),
-                &opened_rows_i,
-                &level_rs,
-                &queries_i,
-                &alpha_i,
-            );
-            (Some(basis), None, enforced_sum)
-        } else {
-            let (basis, enforced_sum) = induce_sumcheck_poly(
-                n_next,
-                sks_vks_i
-                    .as_deref()
-                    .expect("sched-disabled induce always precomputes sks_vks"),
-                &opened_rows_i,
-                &level_rs,
-                &queries_i,
-                &alpha_i,
-            );
-            (Some(basis), None, enforced_sum)
-        };
+        // Same overlap as the L0 block: the sparse dual reads `wtns_prev.mat`
+        // directly, so the opening runs beside it; the dense arms read the
+        // opened rows and keep the order.
+        let ((opened_rows_i, merkle_proof_i), (basis_i_induced, deep_dual_i, enforced_sum_i)) =
+            if let Some(depth) = deep_dual_depth {
+                let (opened, (dual, enforced_sum)) = rayon::join(open_i, || {
+                    SparseDualL0::new(
+                        depth,
+                        n_next + config.log_inv_rates[i + 1],
+                        config.log_inv_rates[i + 1],
+                        &wtns_prev.mat,
+                        wtns_prev.num_interleaved,
+                        &level_rs,
+                        &queries_i,
+                        &alpha_i,
+                    )
+                });
+                (opened, (None, Some(dual), enforced_sum))
+            } else if induce_sched_enabled() {
+                let opened = open_i();
+                let (basis, enforced_sum) = induce_sumcheck_poly_auto(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    sks_vks_i.as_deref(),
+                    &opened.0,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                );
+                (opened, (Some(basis), None, enforced_sum))
+            } else {
+                let opened = open_i();
+                let (basis, enforced_sum) = induce_sumcheck_poly(
+                    n_next,
+                    sks_vks_i
+                        .as_deref()
+                        .expect("sched-disabled induce always precomputes sks_vks"),
+                    &opened.0,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                );
+                (opened, (Some(basis), None, enforced_sum))
+            };
         if trace {
             let d = _t.elapsed();
             t_induce += d;
@@ -11045,12 +11035,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             ));
         }
 
-        if let Some(mp) = merkle_proof_i.take() {
-            recursive_proofs.push(RecursiveProof {
-                opened_rows: opened_rows_i,
-                merkle_proof: mp,
-            });
-        }
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         let _t = std::time::Instant::now();
         let intro_msg_i = if let Some(dual) = deep_dual_i.as_ref() {
@@ -14207,7 +14195,6 @@ mod tests {
                     log_inv_rate,
                     &l0_codeword,
                     num_interleaved,
-                    &opened_rows,
                     &lane_challenges,
                     &queries,
                     &alpha,
@@ -14238,7 +14225,6 @@ mod tests {
                 log_inv_rate,
                 &l0_codeword,
                 num_interleaved,
-                &opened_rows,
                 &lane_challenges,
                 &queries,
                 &alpha,
@@ -14363,7 +14349,6 @@ mod tests {
                 1,
                 &l0_codeword,
                 num_interleaved,
-                &opened_rows,
                 &lane_challenges,
                 &queries,
                 &alpha,
@@ -14840,7 +14825,6 @@ mod tests {
                 1,
                 &l0_codeword,
                 LANES,
-                &opened_rows,
                 &lane_challenges,
                 &queries,
                 &alpha,
