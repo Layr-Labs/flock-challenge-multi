@@ -534,35 +534,54 @@ impl DeepSplitState {
     }
 }
 
-/// One finished block handed from a butterfly worker to its paired
-/// leaf-hash worker: where the block starts in the codeword, how many
-/// elements it holds, and the leaf range it covers.
+/// One fixed 128-position block, identified by its first codeword row.
+/// The consuming pass retains the codeword base and number of field columns.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct DeepBlock {
-    ptr: usize,
-    len_f128: usize,
     lo: usize,
-    hi: usize,
 }
 
-/// Single-producer / single-consumer ring for one SMT pair.
+#[cfg(target_os = "linux")]
+impl DeepBlock {
+    const ROWS: usize = 128;
+
+    /// Only canonical fixed blocks enter the compressed queue. An unexpected
+    /// shape is handled synchronously by the producer's existing callback.
+    #[inline]
+    fn from_finished(
+        range: &core::ops::Range<usize>,
+        blk: &[F128],
+        base_addr: usize,
+        columns: usize,
+    ) -> Option<Self> {
+        if range.end - range.start == Self::ROWS
+            && blk.len() == Self::ROWS * columns
+            && blk.as_ptr() as usize
+                == base_addr + range.start * columns * core::mem::size_of::<F128>()
+        {
+            Some(Self { lo: range.start })
+        } else {
+            None
+        }
+    }
+}
+
+/// Single producer; strict one-consumer or shared multi-consumer drain.
 #[cfg(target_os = "linux")]
 #[repr(align(64))]
 struct DeepQueue {
-    slots: Vec<std::cell::UnsafeCell<DeepBlock>>,
+    slots: Vec<std::sync::atomic::AtomicUsize>,
     head: std::sync::atomic::AtomicUsize, // next to publish
     tail: std::sync::atomic::AtomicUsize, // next to consume
     done: std::sync::atomic::AtomicBool,  // producer will publish no more
     gone: std::sync::atomic::AtomicBool,  // consumer left (panic)
 }
 
-// SAFETY: exactly one producer writes `slots[head % cap]` before publishing
-// `head` with Release, and exactly one consumer reads it after an Acquire
-// load of `head`; the bounded ring keeps the producer from lapping the
-// consumer, so no slot is written while it may be read.
-#[cfg(target_os = "linux")]
-unsafe impl Sync for DeepQueue {}
+// All shared queue storage is atomic; Sync follows from the field types.
+// A successful tail CAS owns that logical entry. Atomic payload copies from
+// losing readers remain legal even when the producer later reuses the slot.
+
 
 #[cfg(target_os = "linux")]
 impl DeepQueue {
@@ -572,12 +591,7 @@ impl DeepQueue {
         Self {
             slots: (0..Self::CAP)
                 .map(|_| {
-                    std::cell::UnsafeCell::new(DeepBlock {
-                        ptr: 0,
-                        len_f128: 0,
-                        lo: 0,
-                        hi: 0,
-                    })
+                    std::sync::atomic::AtomicUsize::new(0)
                 })
                 .collect(),
             head: std::sync::atomic::AtomicUsize::new(0),
@@ -598,11 +612,9 @@ impl DeepQueue {
             }
             std::hint::spin_loop();
         }
-        // SAFETY: the slot is free (checked above) and only this producer
-        // writes it.
-        unsafe {
-            *self.slots[h % Self::CAP].get() = b;
-        }
+        // The release on head publishes both this atomic token and the
+        // producer's completed writes to the corresponding codeword block.
+        self.slots[h % Self::CAP].store(b.lo, Ordering::Relaxed);
         self.head.store(h + 1, Ordering::Release);
         true
     }
@@ -614,19 +626,17 @@ impl DeepQueue {
         if h - self.tail.load(Ordering::Acquire) >= depth {
             return false;
         }
-        // SAFETY: the slot is free (checked above) and only this producer
-        // writes it.
-        unsafe {
-            *self.slots[h % Self::CAP].get() = b;
-        }
+        // The release on head publishes both this atomic token and the
+        // producer's completed writes to the corresponding codeword block.
+        self.slots[h % Self::CAP].store(b.lo, Ordering::Relaxed);
         self.head.store(h + 1, Ordering::Release);
         true
     }
-    /// Claim the oldest published block, if any. Safe with several
-    /// consumers: the slot is copied before the claiming CAS, and the
-    /// producer cannot rewrite slot `t % CAP` before `tail` has moved past
-    /// `t` (it never runs more than `depth <= CAP` ahead of `tail`), in which
-    /// case this CAS fails and the copy is discarded.
+    /// Claim the oldest published block. Copy the atomic token before CAS.
+    /// A successful CAS means tail did not advance while copying, so the
+    /// bounded producer could not recycle this occupied slot. If another
+    /// consumer advances tail, discard the speculative token. Unlike a
+    /// non-atomic descriptor copy, the losing read is legal during reuse.
     fn try_pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
         let mut t = self.tail.load(Ordering::Acquire);
@@ -634,8 +644,7 @@ impl DeepQueue {
             if self.head.load(Ordering::Acquire) <= t {
                 return None;
             }
-            // SAFETY: published with Release before the Acquire above.
-            let b = unsafe { *self.slots[t % Self::CAP].get() };
+            let b = DeepBlock { lo: self.slots[t % Self::CAP].load(Ordering::Relaxed) };
             match self
                 .tail
                 .compare_exchange_weak(t, t + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -654,9 +663,7 @@ impl DeepQueue {
         let t = self.tail.load(Ordering::Relaxed);
         loop {
             if self.head.load(Ordering::Acquire) > t {
-                // SAFETY: published by the producer with Release before the
-                // Acquire load above.
-                let b = unsafe { *self.slots[t % Self::CAP].get() };
+                let b = DeepBlock { lo: self.slots[t % Self::CAP].load(Ordering::Relaxed) };
                 self.tail.store(t + 1, Ordering::Release);
                 return Some(b);
             }
@@ -3805,8 +3812,9 @@ impl AdditiveNttF128 {
                 // before publishing it, and the release on the ring head /
                 // acquire in the claiming pop order those writes before
                 // this read.
-                let blk = unsafe { std::slice::from_raw_parts(b.ptr as *const F128, b.len_f128) };
-                cb(b.lo..b.hi, blk);
+                let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
+                let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
+                cb(b.lo..b.lo + DeepBlock::ROWS, blk);
             };
             // Shared drain: own ring first, then every other pair's, until
             // all producers are done and every ring is empty.
@@ -3834,11 +3842,9 @@ impl AdditiveNttF128 {
             };
             if producer {
                 let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
-                    let b = DeepBlock {
-                        ptr: blk.as_ptr() as usize,
-                        len_f128: blk.len(),
-                        lo: range.start,
-                        hi: range.end,
+                    let Some(b) = DeepBlock::from_finished(&range, blk, deep_base_addr, num_ntts) else {
+                        cb(range, blk);
+                        return;
                     };
                     let queued = if share {
                         q.try_push(b, depth)
@@ -5348,6 +5354,89 @@ mod tests {
         }
     }
 
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_atomic_index_stalled_wrap() {
+        use std::sync::atomic::Ordering;
+        for after_wrap in [false, true] {
+            let q = DeepQueue::new();
+            assert!(q.try_push(DeepBlock { lo: 0 }, 8));
+            let stale = q.tail.load(Ordering::Acquire);
+            assert!(q.head.load(Ordering::Acquire) > stale);
+            let before = q.slots[stale % DeepQueue::CAP].load(Ordering::Relaxed);
+            for i in 0..DeepQueue::CAP {
+                assert_eq!(q.try_pop().unwrap().lo, i * DeepBlock::ROWS);
+                assert!(q.try_push(DeepBlock { lo: (i + 1) * DeepBlock::ROWS }, 8));
+            }
+            let copied = if after_wrap {
+                q.slots[stale % DeepQueue::CAP].load(Ordering::Relaxed)
+            } else { before };
+            assert_eq!(copied, if after_wrap { DeepQueue::CAP * DeepBlock::ROWS } else { 0 });
+            assert!(q.tail.compare_exchange(stale, stale + 1, Ordering::AcqRel, Ordering::Acquire).is_err());
+            assert_eq!(q.try_pop().unwrap().lo, DeepQueue::CAP * DeepBlock::ROWS);
+            assert!(q.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_deep_token_rejects_noncanonical_ranges() {
+        let columns = 8;
+        let data = vec![F128::ZERO; 256 * columns];
+        let base = data.as_ptr() as usize;
+        assert_eq!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns).unwrap().lo, 0);
+        assert_eq!(DeepBlock::from_finished(&(128..256), &data[128 * columns..], base, columns).unwrap().lo, 128);
+        assert!(DeepBlock::from_finished(&(0..256), &data, base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[128 * columns..], base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..64 * columns], base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns + 1).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_index_queue_reconstructs_finished_callbacks() {
+        use std::sync::Mutex;
+        let mut rng = Rng::new(0x8a17_c103);
+        let ntt = AdditiveNttF128::standard(13);
+        let mut cases = 0;
+        let mut callbacks = 0;
+        for columns in [1usize, 8, 64] {
+            for sub_idx in [0usize, 3] {
+                let mut data = rand_vec(&mut rng, (1 << 13) * columns);
+                let base = data.as_ptr() as usize;
+                let snapshots = Mutex::new(Vec::new());
+                let q = DeepQueue::new();
+                let callback = |range: core::ops::Range<usize>, block: &[F128]| {
+                    let token = DeepBlock::from_finished(&range, block, base, columns).expect("fixed callback");
+                    assert!(q.try_push(token, 8));
+                    let got = q.try_pop().unwrap();
+                    let ptr = (base as *const F128).wrapping_add(got.lo * columns);
+                    let restored = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * columns) };
+                    assert_eq!(range, got.lo..got.lo + DeepBlock::ROWS);
+                    assert_eq!(restored.as_ptr(), block.as_ptr());
+                    assert_eq!(restored, block);
+                    snapshots.lock().unwrap().push((range, block.to_vec()));
+                };
+                let lo = sub_idx * 2048 * columns;
+                assert!(ntt.deep_sub_fused_blocks_fallback(
+                    sub_idx, &mut data[lo..lo + 2048 * columns], &callback,
+                    2, 13, columns, 0, 2048, 0,
+                ));
+                let snapshots = snapshots.into_inner().unwrap();
+                assert_eq!(snapshots.len(), 16);
+                for (j, (range, values)) in snapshots.into_iter().enumerate() {
+                    assert_eq!(range.start, sub_idx * 2048 + j * DeepBlock::ROWS);
+                    assert_eq!(values, data[range.start * columns..range.end * columns]);
+                    callbacks += 1;
+                }
+                assert!(q.is_empty());
+                cases += 1;
+            }
+        }
+        println!("atomic token cases={cases} finalized_callbacks={callbacks}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn deep_split_depth_default_override_and_clamp() {
@@ -5378,12 +5467,7 @@ mod tests {
                 let mut all_published = true;
                 for i in 0..N {
                     all_published &= queue.push(
-                        DeepBlock {
-                            ptr: i,
-                            len_f128: i + 1,
-                            lo: i * 2,
-                            hi: i * 2 + 1,
-                        },
+                        DeepBlock { lo: i * 2 },
                         DeepQueue::DEFAULT_DEPTH,
                     );
                 }
@@ -5400,7 +5484,7 @@ mod tests {
             };
             let mut seen = Vec::with_capacity(N);
             while let Some(block) = queue.pop() {
-                seen.push((block.ptr, block.len_f128, block.lo, block.hi));
+                seen.push(block.lo);
             }
             (producer.join().unwrap(), initial_head, seen)
         });
@@ -5409,7 +5493,7 @@ mod tests {
         assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
         assert_eq!(seen.len(), N);
         for (i, block) in seen.into_iter().enumerate() {
-            assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
+            assert_eq!(block, i * 2);
         }
         assert_eq!(queue.head.load(Ordering::Relaxed), N);
         assert_eq!(queue.tail.load(Ordering::Relaxed), N);
