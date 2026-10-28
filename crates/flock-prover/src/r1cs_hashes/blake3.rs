@@ -2834,11 +2834,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
-        let root_enabled = linear_fold_enabled()
-            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
+        let root_enabled =
+            linear_fold_enabled() && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
-                let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                let plan = BLAKE3_ADJOINT_PLAN
+                    .linear_fold
+                    .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
                 blake3_witgen8::root_emit::RootEmitPlan::new(&plan.roots)
             });
         let root_plan = &*ROOT_PLAN;
@@ -2846,7 +2848,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             .zip(a.par_chunks_mut(group_f128))
             .zip(b.par_chunks_mut(group_f128))
             .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
-            .zip(root_storage[root_offset..root_offset + root_fields].par_chunks_mut(ROOT_FIELDS_PER_TILE))
+            .zip(
+                root_storage[root_offset..root_offset + root_fields]
+                    .par_chunks_mut(ROOT_FIELDS_PER_TILE),
+            )
             .enumerate()
             .for_each(|(g, ((((z_out, a_out), b_out), ab_out), root_out))| {
                 let n_here = z_out.len() / F128_PER_BLOCK;
@@ -2874,9 +2879,15 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
                             &preps.0,
                             [true; 3],
                             if root_enabled {
-                                root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
-                                    plan, root_out.as_mut_ptr().cast::<u8>().add(half * 64)))
-                            } else { None },
+                                root_plan.as_ref().map(|plan| {
+                                    blake3_witgen8::root_emit::RootOctaWriter::new(
+                                        plan,
+                                        root_out.as_mut_ptr().cast::<u8>().add(half * 64),
+                                    )
+                                })
+                            } else {
+                                None
+                            },
                         );
                     }
                 }
@@ -2886,8 +2897,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
             // SAFETY: each task owns one complete tile; its eight octas
             // overwrite disjoint full cache lines, including tail padding.
             // Rayon joins every producer and its SFENCE before publication.
-            let tiles = unsafe { flock_core::lincheck::WitnessRootTiles::from_witness_storage(
-                root_storage, z.len() / F128_PER_BLOCK) };
+            let tiles = unsafe {
+                flock_core::lincheck::WitnessRootTiles::from_witness_storage(
+                    root_storage,
+                    z.len() / F128_PER_BLOCK,
+                )
+            };
             ab_inner.set_witness_root_tiles(tiles);
         } else {
             flock_core::scratch::give_f128(root_storage);
@@ -6603,23 +6618,42 @@ mod chain_e2e_tests {
     #[test]
     #[ignore = "ranked full-cache oracle uses >2 GiB; run serially on benchmark host"]
     fn ranked_witness_root_cache_matches_capture_and_reweights() {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
         pool.install(|| {
             for pass in 0..3 {
                 let blocks = crate::seed_pipe::BlockSource::closed(18, 0x953a_81c7 + pass);
-                let (z, a, b, mut ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
+                let (z, a, b, mut ab) =
+                    generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
                 let tiles = ab.take_witness_root_tiles();
                 if pass != 0 {
                     let tiles = tiles.expect("warm ranked witness must publish root tiles");
-                    let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                    let plan = BLAKE3_ADJOINT_PLAN
+                        .linear_fold
+                        .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
                     tiles.assert_matches_witness(&z, K_LOG, plan);
                     let source = flock_core::lincheck::RootFoldSource::new(&z, K_LOG, plan);
                     assert!(source.install_witness_root_tiles(&z, tiles));
                     for challenge in [17u64, 283] {
-                        let point: Vec<F128> = (0..18).map(|i| F128::new(challenge + i, (challenge * 51 + i).rotate_left(23))).collect();
+                        let point: Vec<F128> = (0..18)
+                            .map(|i| F128::new(challenge + i, (challenge * 51 + i).rotate_left(23)))
+                            .collect();
                         let eq = flock_core::lincheck::build_eq_table(&point);
-                        let reference = flock_core::lincheck::partial_fold_packed_z_block_major_padded(&z, K_LOG + 18, K_LOG, USEFUL_BITS, &eq);
-                        assert_eq!(source.fold(&z, K_LOG + 18, &point), reference, "pass={pass}, challenge={challenge}");
+                        let reference =
+                            flock_core::lincheck::partial_fold_packed_z_block_major_padded(
+                                &z,
+                                K_LOG + 18,
+                                K_LOG,
+                                USEFUL_BITS,
+                                &eq,
+                            );
+                        assert_eq!(
+                            source.fold(&z, K_LOG + 18, &point),
+                            reference,
+                            "pass={pass}, challenge={challenge}"
+                        );
                     }
                 }
                 flock_core::scratch::give_f128(z);
@@ -6628,5 +6662,4 @@ mod chain_e2e_tests {
             }
         });
     }
-
 }

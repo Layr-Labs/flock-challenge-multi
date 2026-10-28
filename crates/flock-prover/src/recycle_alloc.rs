@@ -38,8 +38,7 @@ fn class_slot(size: usize) -> usize {
 #[inline]
 fn retained_size(size: usize) -> bool {
     const TAIL: usize = flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
-    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
-        && (size - TAIL).is_power_of_two()
+    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL && (size - TAIL).is_power_of_two()
 }
 
 #[inline]
@@ -238,7 +237,15 @@ mod tests {
             assert!(!retained_size(payload));
             assert!(Layout::from_size_align(size, 8).is_ok());
         }
-        for size in [0, RECYCLE_MIN, 64 * 1024, 128 * 1024, MIN, MIN + TAIL - 1, usize::MAX] {
+        for size in [
+            0,
+            RECYCLE_MIN,
+            64 * 1024,
+            128 * 1024,
+            MIN,
+            MIN + TAIL - 1,
+            usize::MAX,
+        ] {
             assert!(!retained_size(size));
             assert!(find_class(size, true).is_none());
         }
@@ -261,33 +268,56 @@ mod tests {
                             let block = RecycleAlloc.alloc(layout);
                             assert!(!block.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(block as usize % 64, 0);
                             let value = (lane + 1 + round * 8) as u8;
                             core::ptr::write_bytes(block, value, size);
                             barrier.wait();
-                            assert!(core::slice::from_raw_parts(block, size).iter().all(|&v| v == value));
+                            assert!(
+                                core::slice::from_raw_parts(block, size)
+                                    .iter()
+                                    .all(|&v| v == value)
+                            );
                             barrier.wait();
                             RecycleAlloc.dealloc(block, layout);
                             let zeroed = RecycleAlloc.alloc_zeroed(layout);
                             assert!(!zeroed.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(zeroed as usize % 64, 0);
-                            assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&v| v == 0));
+                            assert!(
+                                core::slice::from_raw_parts(zeroed, size)
+                                    .iter()
+                                    .all(|&v| v == 0)
+                            );
                             RecycleAlloc.dealloc(zeroed, layout);
                         }
                     }
                 });
             }
         });
-        let occupied = CLASSES.iter().filter(|c| {
-            let size = c.size.load(Acquire);
-            assert!(size == 0 || retained_size(size));
-            size != 0
-        }).count();
+        let occupied = CLASSES
+            .iter()
+            .filter(|c| {
+                let size = c.size.load(Acquire);
+                assert!(size == 0 || retained_size(size));
+                size != 0
+            })
+            .count();
         assert!(occupied <= (usize::BITS - 1 - 21) as usize);
         assert_eq!(bypassed.load(Relaxed), 64);
         eprintln!("REUSED_ALLOCATIONS={}", reused.load(Relaxed));
