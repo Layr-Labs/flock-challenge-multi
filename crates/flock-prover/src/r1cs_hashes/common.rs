@@ -1,15 +1,9 @@
-//! Bit-packing and R1CS-row helpers shared by the monolithic hash R1CS
-//! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
-//! orchestration lives in [`crate::prover::prove_fast_from_witness`].
-
 use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
-/// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
-/// Handles u64 straddling when `bit_off % 64 > 32`.
 #[inline(always)]
 pub(crate) fn or_u32_at_bit(buf: &mut [u64], bit_off: usize, val: u32) {
     let u64_idx = bit_off >> 6;
@@ -20,21 +14,11 @@ pub(crate) fn or_u32_at_bit(buf: &mut [u64], bit_off: usize, val: u32) {
     }
 }
 
-/// Set bit `bit_off` of `buf` (low-bit-first within each u64).
 #[inline(always)]
 pub(crate) fn or_bit_at(buf: &mut [u64], bit_off: usize) {
     buf[bit_off >> 6] |= 1u64 << (bit_off & 63);
 }
 
-/// A `64·NW`-bit record composed in registers and OR-flushed into the block
-/// buffer once.
-///
-/// Hash witness builders write groups of adjacent sub-word fields (e.g.
-/// 31-bit carry slots) with `or_u32_at_bit`; back-to-back fields hit the
-/// same u64 word, serializing on store-to-load forwarding, with a straddle
-/// branch per call. Composing the group in registers (const positions,
-/// branchless) and flushing with one `NW + 1`-word shifted OR pass turns
-/// ~2 read-modify-writes per field into `NW + 1` per group.
 pub(crate) struct BitRecord<const NW: usize> {
     w: [u64; NW],
 }
@@ -45,8 +29,6 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
-    /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
-    /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
     pub(crate) fn push<const POS: usize>(&mut self, val: u32) {
         let v = val as u64;
@@ -58,7 +40,6 @@ impl<const NW: usize> BitRecord<NW> {
         }
     }
 
-    /// OR the record into `buf` starting at bit `base_bit`.
     #[inline(always)]
     pub(crate) fn flush(&self, buf: &mut [u64], base_bit: usize) {
         let bi = base_bit >> 6;
@@ -66,37 +47,23 @@ impl<const NW: usize> BitRecord<NW> {
         let mut spill = 0u64;
         for j in 0..NW {
             buf[bi + j] |= (self.w[j] << s) | spill;
-            // `(x >> 1) >> (63 - s)` = `x >> (64 - s)` without the s = 0 UB.
             spill = (self.w[j] >> 1) >> (63 - s);
         }
         buf[bi + NW] |= spill;
     }
 }
 
-/// One 32-bit ADD's witness parts: `(sum, left, right, carry_aux)` with
-/// `left/right/carry_aux` masked to the low 31 bits (bit 31 is the discarded
-/// mod-2³² carry-out; the carry slot is 31 bits wide).
 #[inline(always)]
 pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
-    let sum = x.wrapping_add(y);
-    let cin = sum ^ x ^ y;
-    const MASK_LO31: u32 = 0x7FFF_FFFF;
-    let left = (x ^ cin) & MASK_LO31;
-    let right = (y ^ cin) & MASK_LO31;
-    let carry_aux = left & right;
-    (sum, left, right, carry_aux)
+    unsafe {
+        let xu = x as u64;
+        let yu = y as u64;
+        let sc = flock_core::gf2_kernels::gf2_kern_blake3_add_sum_carry(xu, yu);
+        let lr = flock_core::gf2_kernels::gf2_kern_blake3_add_lr(xu, yu);
+        (sc as u32, lr as u32, (lr >> 32) as u32, (sc >> 32) as u32)
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Shared R1CS helpers: empty matrix, identity, BlockR1cs stub builder.
-//
-// The K_LOG=16 hash encoders all use empty A_0/B_0 matrices (constraint
-// definition lives in their LincheckCircuit walkers) and C_0 = I_K. These
-// three helpers were duplicated across keccak.rs, blake3.rs, sha2.rs.
-// ---------------------------------------------------------------------------
-
-/// K × K sparse matrix with no nonzero entries. Used as an `a_0`/`b_0` stub
-/// when the constraint definition lives in a `LincheckCircuit` walker.
 pub(crate) fn empty_matrix(k: usize) -> SparseBinaryMatrix {
     SparseBinaryMatrix {
         num_rows: k,
@@ -105,7 +72,6 @@ pub(crate) fn empty_matrix(k: usize) -> SparseBinaryMatrix {
     }
 }
 
-/// K × K identity sparse matrix.
 pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
     SparseBinaryMatrix {
         num_rows: k,
@@ -114,9 +80,6 @@ pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
     }
 }
 
-/// Build a `BlockR1cs` shell with empty A_0, B_0 stubs and C_0 = I_K. The
-/// constraint definition lives in a per-hash `LincheckCircuit` walker. Used
-/// by Keccak.
 pub(crate) fn build_block_r1cs_empty_stub(
     n_blocks_log: usize,
     k_log: usize,
@@ -124,8 +87,6 @@ pub(crate) fn build_block_r1cs_empty_stub(
     useful_bits: usize,
 ) -> BlockR1cs {
     let k = 1usize << k_log;
-    // Empty-stub R1CS carry their constraints (and constant-wire pin) on a
-    // per-hash `LincheckCircuit` walker, so no R1CS-level `const_pin` here.
     build_block_r1cs_with_matrices(
         n_blocks_log,
         k_log,
@@ -137,18 +98,6 @@ pub(crate) fn build_block_r1cs_empty_stub(
     )
 }
 
-/// Build a `BlockR1cs` with caller-supplied A_0, B_0 sparse matrices and
-/// C_0 = I_K. Used by BLAKE3 and SHA-2 (they materialize real A_0/B_0 via
-/// their `build_matrices`).
-///
-/// `useful_bits ≤ 2^k_log` declares how many rows of each block carry real
-/// data; the remainder is zero padding (URM can skip work over those).
-///
-/// `const_pin` is the column of the constant-one wire to pin to 1 across all
-/// blocks (closing the all-zero soundness gap — see `docs/const-wire-pin.md`),
-/// or `None`. It is propagated into the CSC / sparse `LincheckCircuit` this
-/// R1CS builds. Encoders that set it MUST fill padding blocks with valid
-/// (constant = 1) computations.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_block_r1cs_with_matrices(
     n_blocks_log: usize,
@@ -183,32 +132,6 @@ pub(crate) fn build_block_r1cs_with_matrices(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Generic witness packing driver.
-//
-// All three hash encoders (keccak, blake3, sha2) had identical chunked
-// parallel iteration + bit-transpose-to-stripe boilerplate around their
-// per-block witness builder. This driver captures that shape; each hash
-// passes its `per_block` closure that fills 3 length-`U64_PER_BLOCK`
-// buffers (z, a, b) from one input.
-// ---------------------------------------------------------------------------
-
-/// Drive the parallel chunked witness build for `n_blocks` instances padded
-/// to `2^n_blocks_log` slots. Returns `(z, a, b, z_lincheck)` packed in
-/// F128 form (z/a/b) and byte-stripe form (z_lincheck).
-///
-/// `per_block(initial, z_u64, a_u64, b_u64)` populates one block's worth of
-/// `(z, a, b)` data — 3 zero-initialized `u64`-buffers of length `K / 64`.
-/// `K` is derived from `k_log`. `initial_states.len()` may be less than
-/// `2^n_blocks_log`.
-///
-/// `padding` controls what fills the trailing `2^n_blocks_log −
-/// initial_states.len()` slots:
-/// - `None` — leave them all-zero (trivial constraint satisfaction).
-/// - `Some(p)` — build a real block from `p` in every padding slot. Encoders
-///   that pin a constant wire need this so the constant column is all-ones
-///   across *every* batched instance (see `docs/const-wire-pin.md`); for keccak
-///   the padding input is the all-zero state, whose witness is `keccak_f(0)`.
 pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
@@ -236,12 +159,6 @@ where
     );
 
     let total_f128 = n_total * f128_per_block;
-    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
-    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
-    // thread count instead of running serially on the main thread before the
-    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
-    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
-    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
@@ -253,12 +170,6 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
             unsafe {
                 std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
                 std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
@@ -269,18 +180,13 @@ where
                 let init: &S = if global_idx < n_blocks {
                     &initial_states[global_idx]
                 } else if let Some(p) = padding {
-                    // Fill the padding slot with a real block so its constant
-                    // wire is set (see `padding` docs above).
                     p
                 } else {
-                    // No padding block — leave this slot zero.
                     continue;
                 };
                 let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
                 let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
                 let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
-                // LE order — same byte layout as a u64 pair.
                 let z_u64: &mut [u64] = unsafe {
                     std::slice::from_raw_parts_mut(
                         z_chunk.as_mut_ptr() as *mut u64,
@@ -302,7 +208,6 @@ where
                 per_block(init, z_u64, a_u64, b_u64);
             }
 
-            // Bit-transpose 8 z chunks into the lincheck stripe.
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
@@ -324,9 +229,6 @@ where
     (z, a, b, z_lincheck)
 }
 
-/// Stripe-free row-major witness driver for producers that assign every
-/// destination word. It skips the group-wide zero pass; callers must provide
-/// padding and fully initialize all three block slices.
 pub(crate) fn drive_witness_packed<S: Sync, F>(
     initial_states: &[S],
     padding: &S,
@@ -353,13 +255,6 @@ where
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
 
-    // The three destination streams total 3 · 2^m bits (1.5 GiB at the ranked
-    // m = 32) and are next read only in later phases — far beyond any cache —
-    // so regular stores' write-allocate costs one hidden DRAM read per line.
-    // On aarch64, build each block in an L1-resident staging buffer and
-    // publish it with `stnp` (same shape as the batch-major driver's
-    // `flush_rows_nt`). `FLOCK_NO_WITNESS_NT` is a local-diagnostics kill
-    // switch; the ranked worker's cleared environment never sets it.
     let use_nt = cfg!(target_arch = "aarch64")
         && u64_per_block_is_nt_compatible(f128_per_block * 2)
         && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
@@ -387,9 +282,6 @@ where
                     if use_nt {
                         per_block(initial, z_stage, a_stage, b_stage);
                         let n = z_stage.len();
-                        // SAFETY: staging and destination are disjoint,
-                        // both `n` u64s; n = K/64 is a multiple of 16 (checked
-                        // by the gate above).
                         unsafe {
                             nt_copy_u64s(z_stage.as_ptr(), z_chunk.as_mut_ptr() as *mut u64, n);
                             nt_copy_u64s(a_stage.as_ptr(), a_chunk.as_mut_ptr() as *mut u64, n);
@@ -397,8 +289,6 @@ where
                         }
                         continue;
                     }
-                    // SAFETY: F128 is repr(C, align(16)) with two little-endian
-                    // u64 fields, and the producer overwrites every destination.
                     let z_u64 = unsafe {
                         std::slice::from_raw_parts_mut(
                             z_chunk.as_mut_ptr() as *mut u64,
@@ -425,15 +315,11 @@ where
     (z, a, b)
 }
 
-/// The staged NT flush copies whole 128-byte rows, so the per-block u64
-/// count must divide into 16-u64 chunks.
 #[inline]
 pub(crate) fn u64_per_block_is_nt_compatible(u64s: usize) -> bool {
     u64s.is_multiple_of(16)
 }
 
-/// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
-/// rows in canonical (sorted, square-free) form.
 pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     v.sort();
     let mut out = Vec::with_capacity(v.len());
@@ -452,45 +338,19 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Batch-major (WitnessLayout::BatchMajor) witness-producer plumbing.
-//
-// The batch-major producers simulate V = 8 instances in lockstep and write
-// witness words directly at their batch-major addresses: the word-row for
-// block-u64 index `w` across the 8 instances is exactly one 128-byte
-// chunk-row (= one cache line) at dest word `((w >> 1) << n_log) + o0`,
-// stored non-temporally (dest lines are fully overwritten and not re-read
-// soon, so write-allocate reads are pure waste). V = 8 also equals the
-// lincheck stripe group, so the byte-stripe is transposed from the in-flight
-// rows at zero extra reads.
-//
-// Producer contract: chunk-columns `[0, useful_chunks)` are FULLY written
-// every call; the padding suffix `[useful_chunks, k/128)` columns are never
-// written (the generators zero that contiguous buffer suffix themselves, so
-// recycled scratch buffers stay valid).
-// ---------------------------------------------------------------------------
-
-/// Instances per lockstep group (= one lincheck-stripe group; one chunk-row
-/// emission = 128 B).
 pub(crate) const BM_V: usize = 8;
-/// One interleaved word-row: the same block-u64 index across BM_V instances.
 pub(crate) type BmRow = [u64; BM_V];
 
-/// Raw-pointer wrapper for the disjoint per-group strided writes.
 #[derive(Copy, Clone)]
 pub(crate) struct SendPtr(pub *mut u64);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 impl SendPtr {
-    /// Method (not field) access so `move` closures capture the whole
-    /// wrapper — field capture would move the bare `*mut u64` (`!Send`).
     pub(crate) fn get(self) -> *mut u64 {
         self.0
     }
 }
 
-/// V-wide `or_u32_at_bit`: OR the V instances' 32-bit values into row `w`
-/// (and `w + 1` on straddle) at bit offset `bit`.
 #[inline(always)]
 pub(crate) fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
     let w = bit >> 6;
@@ -505,7 +365,6 @@ pub(crate) fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
     }
 }
 
-/// V-wide `or_bit_at`: set bit `bit` in every instance's row.
 #[inline(always)]
 pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     let w = bit >> 6;
@@ -515,7 +374,6 @@ pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     }
 }
 
-/// Non-temporal store of one interleaved 128-byte chunk-row.
 #[inline(always)]
 pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     #[cfg(target_arch = "aarch64")]
@@ -540,11 +398,6 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     }
 }
 
-/// Non-temporal copy of `n` u64s (`n` divisible by 16) in 128-byte
-/// `ldp q / stnp q` chunks. Fallback: plain copy off-aarch64.
-///
-/// SAFETY: `src` valid for `n` u64 reads, `dst` for `n` u64 writes; ranges
-/// must not overlap.
 #[inline]
 pub(crate) unsafe fn nt_copy_u64s(src: *const u64, dst: *mut u64, n: usize) {
     debug_assert!(n.is_multiple_of(16));
@@ -555,10 +408,6 @@ pub(crate) unsafe fn nt_copy_u64s(src: *const u64, dst: *mut u64, n: usize) {
     }
 }
 
-/// NT-flush `useful_chunks` chunk-rows of an interleaved row buffer to the
-/// batch-major destination (dest word index `(c << n_log) + o0`).
-///
-/// SAFETY: caller guarantees dest sizing and per-group disjointness.
 #[inline]
 pub(crate) unsafe fn flush_rows_nt(
     rows: &[BmRow],
@@ -582,8 +431,6 @@ pub(crate) unsafe fn flush_rows_nt(
     }
 }
 
-/// Transpose the z rows into the lincheck byte-stripe for one V = 8 group.
-/// Only `useful_words` rows are written (the stripe tail stays zero).
 #[inline]
 pub(crate) unsafe fn stripe_from_rows(
     rows: &[BmRow],
@@ -599,7 +446,6 @@ pub(crate) unsafe fn stripe_from_rows(
     }
 }
 
-/// V-wide [`add_carry_parts`]: per-instance `(sum, left, right, carry_aux)`.
 #[inline(always)]
 pub(crate) fn add_carry_parts_v(
     x: &[u32; BM_V],
@@ -623,14 +469,6 @@ pub(crate) fn add_carry_parts_v(
     (sum, left, right, carry)
 }
 
-/// Shared driver for the interleaved-row batch-major producers (sha2,
-/// blake3 — the bit-packed encoders): parallel over V-instance groups, each
-/// group builds its rows via `per_group(group_inputs, rows)` then NT-flushes
-/// the useful chunks and transposes the stripe. Padding slots use `padding`
-/// (required, matching the row-major driver's const-wire-pin behavior).
-///
-/// Returns `(z, a, b, stripe)`; z/a/b come from the scratch pool with the
-/// padding suffix zeroed (the producers fully write the useful prefix).
 pub(crate) fn drive_witness_batch_major<S: Sync, F>(
     inputs: &[S],
     padding: &S,
@@ -656,8 +494,6 @@ where
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
     let stripe = vec![0u8; n_total * u64_per_block * 8];
-    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
-    // the producers fully rewrite the useful prefix every call.
     let tail = useful_chunks << n_blocks_log;
     for buf in [&mut z, &mut a, &mut b] {
         buf[tail..]
@@ -689,7 +525,6 @@ where
             let group: [&S; BM_V] =
                 std::array::from_fn(|j| inputs_ref.get(o0 + j).unwrap_or(padding));
             per_group(group, rz, ra, rb);
-            // SAFETY: disjoint instance ranges per group; suffix pre-zeroed.
             unsafe {
                 flush_rows_nt(rz, zp.get(), o0, n_blocks_log, useful_chunks);
                 flush_rows_nt(ra, ap.get(), o0, n_blocks_log, useful_chunks);
