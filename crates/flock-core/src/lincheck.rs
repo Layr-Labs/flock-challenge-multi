@@ -3629,7 +3629,8 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
     // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
     // kill switch, which restores the always-on probes). Resolved once here
     // so the worker loop reads a register, not the environment.
-    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    static LC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace_fold = *LC_TRACE.get_or_init(|| std::env::var_os("LINCHECK_TRACE").is_some());
     // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
     // so `LINCHECK_TRACE=1` measures the production sweep. Set
     // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
@@ -3923,7 +3924,7 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
                 .for_each(|(o, p)| *o += *p);
         }
     }
-    if std::env::var_os("LINCHECK_TRACE").is_some() {
+    if trace_fold {
         eprintln!(
             "[lc] fold alloc {:.2} ms par {:.2} ms reduce {:.2} ms",
             (probe_t1 - probe_t0).as_secs_f64() * 1e3,
@@ -4700,7 +4701,8 @@ pub fn kick_last_rho_z_fold(mlv: &[F128]) {
             // the leftover fold starts after the last ρ, when C is no
             // longer written).
             let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
-            let trace = std::env::var_os("LINCHECK_TRACE").is_some();
+            static LC_TRACE2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trace = *LC_TRACE2.get_or_init(|| std::env::var_os("LINCHECK_TRACE").is_some());
             let t0 = std::time::Instant::now();
             let out = match roots {
                 Some(roots) => roots.fold(z, m, &x_outer),
@@ -4997,7 +4999,8 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    static LC_TRACE3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *LC_TRACE3.get_or_init(|| std::env::var("LINCHECK_TRACE").is_ok());
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -5201,7 +5204,6 @@ fn prove_padded_inner<Ch: Challenger>(
                 einf = neinf;
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
             if fold8_ready && t == 0 {
