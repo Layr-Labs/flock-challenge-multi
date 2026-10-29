@@ -501,6 +501,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -529,6 +530,7 @@ pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -558,7 +560,32 @@ pub fn prove_fast_ligerito_from_block_major_witness_with_precomputed_ab<Ch: Chal
         FastLincheckInput::BlockMajor,
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
+    )
+}
+
+/// Consume the private per-proof witness/commitment binding exactly once.
+/// A non-ranked/cold witness carries no completed commitment and follows the
+/// same ordinary commit branch as the existing public entry points.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_generated_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    witness: crate::r1cs_hashes::blake3::WitnessWithCommitment,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let (z_packed, precommitted) = witness.into_parts();
+    assert!(precommitted.is_none() || prefaulted_codeword.is_none());
+    prove_fast_ligerito_from_witness_inner(
+        r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
+        Some(ab_inner), FastLincheckInput::BlockMajor, lincheck_circuit,
+        prefaulted_codeword, precommitted, challenger,
     )
 }
 
@@ -573,6 +600,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    precommitted: Option<(Commitment, pcs::ProverData)>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
@@ -600,6 +628,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
+        precommitted,
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -859,6 +888,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         FastLincheckInput::Stripe(z_packed_lincheck),
         lincheck_circuit,
         prefaulted_codeword,
+        None,
         challenger,
     )
 }
@@ -874,6 +904,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_input: FastLincheckInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    precommitted: Option<(Commitment, pcs::ProverData)>,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -909,9 +940,15 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     let ((commitment, prover_data), mut ab_inner) = if let Some(ab_inner) = ab_inner {
         let committed = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
-            let r = match prefaulted_codeword {
-                Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-                None => pcs::commit(&z_packed, pcs_params),
+            let r = match precommitted {
+                Some(committed) => {
+                    assert!(prefaulted_codeword.is_none());
+                    committed
+                }
+                None => match prefaulted_codeword {
+                    Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
+                    None => pcs::commit(&z_packed, pcs_params),
+                },
             };
             crate::seed_pipe::preseed_spin_end();
             flock_core::gaptime::mark("commit: work done");
@@ -920,6 +957,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         flock_core::gaptime::mark("commit: pool exited");
         (committed, ab_inner)
     } else {
+        assert!(precommitted.is_none());
         let r = in_commit_phase_pool(r1cs.m, || {
             flock_core::gaptime::mark("commit: pool entered");
             let r = commit_with_round1_ab_precompute(

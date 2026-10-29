@@ -3,6 +3,8 @@
 // Inputs: RDI = 512 input bytes, RSI = CFoldMats.1. Returns ZMM8..11 in lane-major order.
 // Clobbers: RAX, flags, ZMM0..11. Preserves every other GPR and ZMM12..31.
 // Called ONLY by the matching inline-asm wrapper, never through the C ABI.
+// Index-into-destination vpermi2b: each index loads straight into the
+// register the permute overwrites, so no table needs a register copy.
 // No vzeroupper: the upper lanes of ZMM12..15 belong to the caller.
 .text
 .p2align 6
@@ -13,7 +15,6 @@ flock_gfni_c4_lm_register_result:
     mov rax, rsp
     and rsp, -64
     sub rsp, 512
-    vmovdqa64 zmm8, [rip + .Lflock_c4_result_oct_even]
     vmovdqa64 zmm9, [rip + .Lflock_c4_result_oct_odd]
 
 // Gather both passes into the original initialized scratch before reducing.
@@ -26,13 +27,13 @@ flock_gfni_c4_lm_register_result:
     vshufi64x2 zmm0, zmm0, zmm1, 0xdd
     vshufi64x2 zmm5, zmm2, zmm3, 0x88
     vshufi64x2 zmm2, zmm2, zmm3, 0xdd
-    vmovdqa64 zmm6, zmm4
-    vpermt2b zmm6, zmm8, zmm5
+    vmovdqa64 zmm6, [rip + .Lflock_c4_result_oct_even]
+    vpermi2b zmm6, zmm4, zmm5
     vpermt2b zmm4, zmm9, zmm5
     vmovdqa64 [rsp + 256*\p], zmm6
     vmovdqa64 [rsp + 256*\p + 64], zmm4
-    vmovdqa64 zmm6, zmm0
-    vpermt2b zmm6, zmm8, zmm2
+    vmovdqa64 zmm6, [rip + .Lflock_c4_result_oct_even]
+    vpermi2b zmm6, zmm0, zmm2
     vpermt2b zmm0, zmm9, zmm2
     vmovdqa64 [rsp + 256*\p + 128], zmm6
     vmovdqa64 [rsp + 256*\p + 192], zmm0
@@ -168,12 +169,10 @@ flock_gfni_c4_lm_register_result:
     vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
     vpxorq zmm0, zmm0, zmm2
     vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm6, [rip + .Lflock_c4_result_out_even]
-    vmovdqa64 zmm7, [rip + .Lflock_c4_result_out_odd]
-    vmovdqa64 zmm8, zmm0
-    vmovdqa64 zmm9, zmm0
-    vpermt2b zmm8, zmm6, zmm1
-    vpermt2b zmm9, zmm7, zmm1
+    vmovdqa64 zmm8, [rip + .Lflock_c4_result_out_even]
+    vpermi2b zmm8, zmm0, zmm1
+    vmovdqa64 zmm9, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm9, zmm0, zmm1
     vpbroadcastq zmm0, [rsp + 256]
     vgf2p8affineqb zmm1, zmm0, [rsi + 2048], 0
     vgf2p8affineqb zmm0, zmm0, [rsi + 0], 0
@@ -302,12 +301,10 @@ flock_gfni_c4_lm_register_result:
     vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
     vpxorq zmm0, zmm0, zmm2
     vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm6, [rip + .Lflock_c4_result_out_even]
-    vmovdqa64 zmm7, [rip + .Lflock_c4_result_out_odd]
-    vmovdqa64 zmm10, zmm0
-    vmovdqa64 zmm11, zmm0
-    vpermt2b zmm10, zmm6, zmm1
-    vpermt2b zmm11, zmm7, zmm1
+    vmovdqa64 zmm10, [rip + .Lflock_c4_result_out_even]
+    vpermi2b zmm10, zmm0, zmm1
+    vmovdqa64 zmm11, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm11, zmm0, zmm1
     mov rsp, rax
     ret
 .size flock_gfni_c4_lm_register_result, .-flock_gfni_c4_lm_register_result
