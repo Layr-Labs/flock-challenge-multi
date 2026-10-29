@@ -5638,51 +5638,63 @@ unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhas
                 _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
             }
         };
-        let mut ops = [[_mm512_setzero_si512(); 20]; 2];
-        for set in 0..2 {
-            let (g0, g1) = (2 * set, 2 * set + 1);
-            let st = &mut ops[set];
-            let mut ca = [_mm512_setzero_si512(); 4];
-            let mut cb = [_mm512_setzero_si512(); 4];
-            for k in 0..4 {
-                let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
-                let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
-                let ao = _mm512_shuffle_i64x2::<0xDD>(xa, ya);
-                let bo = _mm512_shuffle_i64x2::<0xDD>(xb, yb);
-                if k == 0 {
-                    st[0] = ao;
-                    st[1] = bo;
-                }
-                ca[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa, ya), ao);
-                cb[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb, yb), bo);
-            }
-            let a01 = _mm512_xor_si512(ca[0], ca[1]);
-            let b01 = _mm512_xor_si512(cb[0], cb[1]);
-            let a23 = _mm512_xor_si512(ca[2], ca[3]);
-            let b23 = _mm512_xor_si512(cb[2], cb[3]);
-            st[2] = ca[0];
-            st[3] = cb[0];
-            st[4] = ca[1];
-            st[5] = cb[1];
-            st[6] = a01;
-            st[7] = b01;
-            st[8] = ca[2];
-            st[9] = cb[2];
-            st[10] = ca[3];
-            st[11] = cb[3];
-            st[12] = a23;
-            st[13] = b23;
-            st[14] = _mm512_xor_si512(ca[0], ca[2]);
-            st[15] = _mm512_xor_si512(cb[0], cb[2]);
-            st[16] = _mm512_xor_si512(ca[1], ca[3]);
-            st[17] = _mm512_xor_si512(cb[1], cb[3]);
-            st[18] = _mm512_xor_si512(a01, a23);
-            st[19] = _mm512_xor_si512(b01, b23);
+        macro_rules! pair_k {
+            ($k:expr) => {{
+                let (xa0, ya0) = (ld(fa, 0, $k), ld(fa, 1, $k));
+                let (xb0, yb0) = (ld(fb, 0, $k), ld(fb, 1, $k));
+                let (xa1, ya1) = (ld(fa, 2, $k), ld(fa, 3, $k));
+                let (xb1, yb1) = (ld(fb, 2, $k), ld(fb, 3, $k));
+                let ao0 = _mm512_shuffle_i64x2::<0xDD>(xa0, ya0);
+                let bo0 = _mm512_shuffle_i64x2::<0xDD>(xb0, yb0);
+                let ao1 = _mm512_shuffle_i64x2::<0xDD>(xa1, ya1);
+                let bo1 = _mm512_shuffle_i64x2::<0xDD>(xb1, yb1);
+                let ca = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa0, ya0), ao0);
+                let cb = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb0, yb0), bo0);
+                let da = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa1, ya1), ao1);
+                let db = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb1, yb1), bo1);
+                (ao0, bo0, ao1, bo1, ca, cb, da, db)
+            }};
         }
-        let (s0, s1) = (&ops[0], &ops[1]);
-        for k in 0..10 {
-            acc4[k].mul_acc2(s0[2 * k], s0[2 * k + 1], s1[2 * k], s1[2 * k + 1]);
-        }
+        let (ao0, bo0, ao1, bo1, ca0, cb0, da0, db0) = pair_k!(0);
+        acc4[0].mul_acc2(ao0, bo0, ao1, bo1);
+        acc4[1].mul_acc2(ca0, cb0, da0, db0);
+
+        let (_, _, _, _, ca1, cb1, da1, db1) = pair_k!(1);
+        acc4[2].mul_acc2(ca1, cb1, da1, db1);
+        let a01 = _mm512_xor_si512(ca0, ca1);
+        let b01 = _mm512_xor_si512(cb0, cb1);
+        let c01 = _mm512_xor_si512(da0, da1);
+        let d01 = _mm512_xor_si512(db0, db1);
+        acc4[3].mul_acc2(a01, b01, c01, d01);
+
+        let (_, _, _, _, ca2, cb2, da2, db2) = pair_k!(2);
+        acc4[4].mul_acc2(ca2, cb2, da2, db2);
+        acc4[7].mul_acc2(
+            _mm512_xor_si512(ca0, ca2),
+            _mm512_xor_si512(cb0, cb2),
+            _mm512_xor_si512(da0, da2),
+            _mm512_xor_si512(db0, db2),
+        );
+
+        let (_, _, _, _, ca3, cb3, da3, db3) = pair_k!(3);
+        acc4[5].mul_acc2(ca3, cb3, da3, db3);
+        acc4[8].mul_acc2(
+            _mm512_xor_si512(ca1, ca3),
+            _mm512_xor_si512(cb1, cb3),
+            _mm512_xor_si512(da1, da3),
+            _mm512_xor_si512(db1, db3),
+        );
+        let a23 = _mm512_xor_si512(ca2, ca3);
+        let b23 = _mm512_xor_si512(cb2, cb3);
+        let c23 = _mm512_xor_si512(da2, da3);
+        let d23 = _mm512_xor_si512(db2, db3);
+        acc4[6].mul_acc2(a23, b23, c23, d23);
+        acc4[9].mul_acc2(
+            _mm512_xor_si512(a01, a23),
+            _mm512_xor_si512(b01, b23),
+            _mm512_xor_si512(c01, c23),
+            _mm512_xor_si512(d01, d23),
+        );
     }
 }
 

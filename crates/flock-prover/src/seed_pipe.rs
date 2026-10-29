@@ -600,7 +600,8 @@ fn preseed_spin_start() {
 /// worker awake, so no sleeping worker has to be woken for the parallel
 /// encode. Released by the body's [`SpinGuard`] (or earlier, see publish).
 pub(crate) fn tail_spin_start() {
-    if flock_core::is_pool_owner() && std::env::var_os("FLOCK_EXP_NO_TAILSPIN").is_none() {
+    static TAILSPIN_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if flock_core::is_pool_owner() && *TAILSPIN_ON.get_or_init(|| std::env::var_os("FLOCK_EXP_NO_TAILSPIN").is_none()) {
         preseed_spin_start();
     }
 }
@@ -915,7 +916,8 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
         }
     }
     flock_core::gaptime::abs("encoded");
-    if std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none() {
+    static SPIN_END_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SPIN_END_OFF.get_or_init(|| std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none()) {
         preseed_spin_end();
     }
     Some(Ok(std::fs::rename(&f.path, path)))
@@ -1252,7 +1254,7 @@ fn speculative_main(
         // fit with the job budget still open (kaankolcu's ab380ec8 ran 26). Each pass commits more of this thread's
         // lazily-grown stack and its thread-local and pool bookkeeping before
         // the timed prove.
-        const SPEC_WARMUP_PROVES: usize = 26;
+        const SPEC_WARMUP_PROVES: usize = 32;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {

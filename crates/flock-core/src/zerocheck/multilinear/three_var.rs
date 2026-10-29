@@ -210,9 +210,11 @@ pub(crate) fn round4_canonical_window_deltas(
 /// eight-entry group of a rank-one tensor XORs to its suffix weight).
 pub(crate) fn marginalize_eq_low3(eq: &[F128]) -> Vec<F128> {
     assert!(eq.len().is_power_of_two() && eq.len() >= 8);
-    eq.chunks_exact(8)
-        .map(|v| v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7])
-        .collect()
+    let mut out = crate::alloc_uninit_vec(eq.len() / 8);
+    for (dst, v) in out.iter_mut().zip(eq.chunks_exact(8)) {
+        *dst = ((v[0] + v[1]) + (v[2] + v[3])) + ((v[4] + v[5]) + (v[6] + v[7]));
+    }
+    out
 }
 
 /// Portable leaf of the three-variable packed pass for one worker chunk:
