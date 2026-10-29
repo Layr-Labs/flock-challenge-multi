@@ -1237,14 +1237,14 @@ fn speculative_main(
         // slots, and its rayon injector/sleep bookkeeping, none of which
         // appear in that curve. This is the ONLY warm-up knob that warms the
         // thread the ranked harness actually times (`killed.md:6039`).
-        // 11, not 8: the binding budget is the 1500 s JOB budget, not the
-        // 45 s per-worker guard. Ranked benchmark.sh spends about 12 minutes
-        // of that job on its 120 trials, and three more warm-up proves add
-        // under a minute on top, so the extra passes fit with the job budget
-        // still wide open. Each pass commits more of this thread's
-        // lazily-grown stack and its thread-local and pool bookkeeping before
-        // the timed prove.
-        const SPEC_WARMUP_PROVES: usize = 11;
+        // 20 passes. The 1500 s job budget binds, not the 45 s per-worker
+        // guard: twenty passes at ~0.14 s are ~2.8 s per worker start, and the
+        // ranked run's 120 trials take about twelve minutes of the job, so the
+        // budget keeps ample room. Every pass commits more of this thread's
+        // lazily-grown stack, its thread-local scratch provenance slots and its
+        // rayon injector and sleep bookkeeping before the timed prove, which is
+        // the only thing this knob warms.
+        const SPEC_WARMUP_PROVES: usize = 20;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
