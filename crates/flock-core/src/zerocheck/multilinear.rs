@@ -44,6 +44,8 @@ use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 pub(crate) mod kernels;
+pub(crate) mod three_var;
+pub use three_var::{Round4Lookahead, eval_round4_lookahead};
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
@@ -1763,7 +1765,9 @@ pub fn uni_skip_round_pair_lookahead_nomat_packed_padded(
         padding,
         None,
         None,
+        false,
     )
+    .0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1777,7 +1781,8 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     padding: &PaddingSpec,
     eq_override: Option<&SplitEqGhash>,
     canon: Option<&[F128]>,
-) -> (F128, F128, Round3Lookahead) {
+    want_r4: bool,
+) -> ((F128, F128, Round3Lookahead), Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1940,9 +1945,52 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let r2_mats_arg = r2_mats.as_ref();
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    let (sum1_even, sum_inf_even, agg) = (0..hi_size)
+    // ZC-3VAR: the ranked fast kernel also carries the deferred round-four
+    // biquadratic. Only that route computes it in the sweep; elsewhere the
+    // caller falls back to the two-variable route (tests use the reference).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let r4_fast = want_r4
+        && fast_r2
+        && (lo_size & 127) == 0
+        && bake_arg.is_some()
+        && mlv_challenges.len() >= 4;
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    let r4_fast = false;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let r4_lv = if r4_fast {
+        let r3 = mlv_challenges[3];
+        let one = F128::ONE;
+        Some(kernels::x86_64::R4LaneWeights {
+            lv4: [one + r3, one + r3, r3, r3],
+            lv4_odd: [F128::ZERO, one + r3, F128::ZERO, r3],
+        })
+    } else {
+        None
+    };
+
+    let (sum1_even, sum_inf_even, agg, r4_flat) = (0..hi_size)
         .into_par_iter()
         .map(|x_hi| {
+            #[allow(unused_mut)]
+            let mut r4_out = [F128::ZERO; 18];
             let row_base = x_hi * chunk_size;
             let pair_idx_base = x_hi * lo_size;
             let mut none_a: [F128; 0] = [];
@@ -1964,13 +2012,26 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && (row_base & 255) == 0
                     && let Some(bk) = bake_arg
                 {
-                    kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
-                        lo_size,
-                        bk,
-                    )
+                    if let Some(lw) = r4_lv.as_ref() {
+                        let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            row_base,
+                            lo_size,
+                            bk,
+                            lw,
+                        );
+                        r4_out = r4;
+                        o
+                    } else {
+                        kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            row_base,
+                            lo_size,
+                            bk,
+                        )
+                    }
                 } else if let Some(bk) = bake_arg {
                     kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
                         table.data.as_ptr(),
@@ -2069,16 +2130,21 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     eq_h * out[6],
                     eq_h * out[7],
                 ],
+                if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
             )
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]),
+            |(s1, sinf, sa, sr), (c1, cinf, ca, cr)| {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
                     *x += *y;
                 }
-                (s1 + c1, sinf + cinf, a)
+                let mut r4 = sr;
+                for (x, y) in r4.iter_mut().zip(cr.iter()) {
+                    *x += *y;
+                }
+                (s1 + c1, sinf + cinf, a, r4)
             },
         );
 
@@ -2094,7 +2160,30 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             *c += d;
         }
     }
-    (mlv_challenges[0] * sum1, sum_inf, la)
+    let r4 = if r4_fast {
+        let mut r4 = Round4Lookahead::from_flat(&r4_flat);
+        if let Some(rows) = canon_elided {
+            r4.add(&three_var::round4_canonical_window_deltas(
+                table,
+                mlv_challenges,
+                rows,
+            ));
+        }
+        Some(r4)
+    } else if want_r4 && cfg!(test) {
+        Some(three_var::round4_lookahead_ref(
+            a_packed,
+            b_packed,
+            table,
+            mlv_challenges,
+            padding,
+            k_skip,
+        ))
+    } else {
+        let _ = r4_flat;
+        None
+    };
+    ((mlv_challenges[0] * sum1, sum_inf, la), r4)
 }
 
 /// Composed rounds-3+4 pass **from the packed witness**: re-derives the
@@ -5100,8 +5189,8 @@ mod tests {
             mlv[0] = F128::ONE;
             let (mut a, mut b) = ranked_canonical_witness(&mut rng, n_rows);
             let rows = canonical_rows_direct(&a, &mlv, n_rows / 256);
-            let full = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
+            let (full, full4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None, true,
             );
             for blk in 0..n_rows / 256 {
                 let row = |r: usize| (blk * 256 + r) * 8;
@@ -5110,10 +5199,15 @@ mod tests {
                 a[row(240)..row(256)].fill(0);
                 b[row(240)..row(256)].fill(0);
             }
-            let rest = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None,
+            let (rest, rest4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                &a, &b, m, K_SKIP, &table, &mlv, &padding, None, None, true,
             );
             let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
+            {
+                let mut want = rest4.expect("test route computes round four");
+                want.add(&three_var::round4_canonical_window_deltas(&table, &mlv, &rows));
+                assert_eq!(full4.expect("round four"), want, "r4 deltas blocks_log={blocks_log}");
+            }
             assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
             assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
             for i in 0..6 {
@@ -5161,14 +5255,17 @@ mod tests {
                     let rows = canonical_rows_direct(&a, &mlv, n_rows / 256);
                     let eq = SplitEqGhash::with_n_hi(&mlv[1..], n_hi);
                     assert!((1usize << eq.n_lo) >= 32 && eq.n_lo < mlv.len());
-                    let incumbent = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None,
+                    let (incumbent, inc4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), None, true,
                     );
                     let hits = kernels::x86_64::R2_CANON_ELIDE_HITS
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    let elided = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
-                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows),
+                    let (elided, eli4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+                        &a, &b, m, K_SKIP, &table, &mlv, &padding, Some(&eq), Some(&rows), true,
                     );
+                    let ref4 = three_var::round4_lookahead_ref(&a, &b, &table, &mlv, &padding, K_SKIP);
+                    assert_eq!(inc4, Some(ref4), "r4 incumbent route blocks_log={blocks_log} n_hi={n_hi}");
+                    assert_eq!(eli4, Some(ref4), "r4 fast elided route blocks_log={blocks_log} n_hi={n_hi} unroll16={unroll16}");
                     assert!(
                         kernels::x86_64::R2_CANON_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
                             > hits,
