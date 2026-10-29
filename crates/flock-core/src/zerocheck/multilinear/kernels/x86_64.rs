@@ -5588,3 +5588,483 @@ mod cfold_initialized_checks {
         println!("32 actual CFoldMats constructors match independent bitwise matrices, initialized optional planes and immutable inputs");
     }
 }
+
+// ---------------------------------------------------------------------------
+// ZC-3VAR kernels (see `multilinear::three_var`).
+// ---------------------------------------------------------------------------
+
+/// Post-loop lane weights for the round-four lookahead in the baked sweep:
+/// `lv4` for the cross-lane (`shuffle_i64x2` 0x88/0xDD) accumulators, lane `L`
+/// ↔ `f_{r3}(L & 1)`; `lv4_odd` re-weights the incumbent per-lane accumulators
+/// (odd `u` only) by `f_{r3}(l >> 1)`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) struct R4LaneWeights {
+    pub(crate) lv4: [F128; 4],
+    pub(crate) lv4_odd: [F128; 4],
+}
+
+/// Round-four products of one 64-row batch (four groups in the transposed
+/// fold cache): for group pairs (0,1), (2,3), 0x88 gathers the X3 = 0 member of
+/// each w-pair and 0xDD the X3 = 1 member. `skip` names an elided canonical
+/// group (treated as zero), or 255. Kept out of line so the incumbent
+/// accumulate loop keeps its register allocation.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let ld = |p: *const F128, g: usize, k: usize| -> __m512i {
+            if g as u8 == skip {
+                _mm512_setzero_si512()
+            } else {
+                _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
+            }
+        };
+        let mut ops = [[_mm512_setzero_si512(); 20]; 2];
+        for set in 0..2 {
+            let (g0, g1) = (2 * set, 2 * set + 1);
+            let st = &mut ops[set];
+            let mut ca = [_mm512_setzero_si512(); 4];
+            let mut cb = [_mm512_setzero_si512(); 4];
+            for k in 0..4 {
+                let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
+                let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
+                let ao = _mm512_shuffle_i64x2::<0xDD>(xa, ya);
+                let bo = _mm512_shuffle_i64x2::<0xDD>(xb, yb);
+                if k == 0 {
+                    st[0] = ao;
+                    st[1] = bo;
+                }
+                ca[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa, ya), ao);
+                cb[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb, yb), bo);
+            }
+            let a01 = _mm512_xor_si512(ca[0], ca[1]);
+            let b01 = _mm512_xor_si512(cb[0], cb[1]);
+            let a23 = _mm512_xor_si512(ca[2], ca[3]);
+            let b23 = _mm512_xor_si512(cb[2], cb[3]);
+            st[2] = ca[0];
+            st[3] = cb[0];
+            st[4] = ca[1];
+            st[5] = cb[1];
+            st[6] = a01;
+            st[7] = b01;
+            st[8] = ca[2];
+            st[9] = cb[2];
+            st[10] = ca[3];
+            st[11] = cb[3];
+            st[12] = a23;
+            st[13] = b23;
+            st[14] = _mm512_xor_si512(ca[0], ca[2]);
+            st[15] = _mm512_xor_si512(cb[0], cb[2]);
+            st[16] = _mm512_xor_si512(ca[1], ca[3]);
+            st[17] = _mm512_xor_si512(cb[1], cb[3]);
+            st[18] = _mm512_xor_si512(a01, a23);
+            st[19] = _mm512_xor_si512(b01, b23);
+        }
+        let (s0, s1) = (&ops[0], &ops[1]);
+        for k in 0..10 {
+            acc4[k].mul_acc2(s0[2 * k], s0[2 * k + 1], s1[2 * k], s1[2 * k + 1]);
+        }
+    }
+}
+
+/// [`round2_lookahead_chunk_baked_elide_x86`] plus the deferred round-four
+/// biquadratic: returns the incumbent eight sums and the 18 round-four sums
+/// `[v1; 9] ++ [vinf; 9]` (on `S·Etop·f_{r3}` weights; the driver applies
+/// `eq_hi`). Elided canonical groups contribute nothing here; the driver adds
+/// `round4_canonical_window_deltas`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+) -> ([F128; 8], [F128; 18]) {
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
+    debug_assert_eq!(row_base & 255, 0);
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc4 = [WideGhashX4::zero(); 10];
+        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
+        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
+        let b_mats_slice = bk.b_mats.as_ptr();
+
+        macro_rules! pf_quarter {
+            ($g0:expr, $q:expr) => {{
+                let next = ($g0 + 64 * ZC_PKT_PF_TILES) * 8;
+                let l0 = 2 * ($q as usize);
+                for l in l0..l0 + 2 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }};
+        }
+
+        macro_rules! ld_group {
+            ($g:expr) => {{
+                let g_off = 4 * ($g as usize);
+                (
+                    _mm512_loadu_si512(fa.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(48 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(48 + g_off).cast::<__m512i>()),
+                )
+            }};
+        }
+
+        macro_rules! accum1 {
+            ($g0:expr, $grp:expr) => {{
+                pf_quarter!($g0, $grp);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp);
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }};
+        }
+
+        macro_rules! accum2 {
+            ($g0:expr, $grp0:expr, $grp1:expr) => {{
+                pf_quarter!($g0, $grp0);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp0);
+                pf_quarter!($g0, $grp1);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($grp1);
+                acc[0].mul_acc2(a1w, b1, c1w, d1);
+                acc[1].mul_acc2(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(c0w, c1w),
+                    _mm512_xor_si512(d0, d1),
+                );
+                acc[2].mul_acc2(a3w, b3, c3w, d3);
+                acc[3].mul_acc2(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(c2w, c3w),
+                    _mm512_xor_si512(d2, d3),
+                );
+                acc[4].mul_acc2(a2w, b2, c2w, d2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                let e_cw = _mm512_xor_si512(c0w, c2w);
+                let e_d = _mm512_xor_si512(d0, d2);
+                let o_cw = _mm512_xor_si512(c1w, c3w);
+                let o_d = _mm512_xor_si512(d1, d3);
+                acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                acc[7].mul_acc2(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(e_cw, o_cw),
+                    _mm512_xor_si512(e_d, o_d),
+                );
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 128 <= lo_size {
+            let batch_base = x_lo >> 5;
+            {
+                let g0 = row_base + 2 * x_lo;
+                let bm = &(*b_mats_slice.add(batch_base)).0;
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0);
+                pf_quarter!(g0, 0);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                accum1!(g0, 1);
+                accum2!(g0, 2, 3);
+                r4_round4_batch(fa, fb, &mut acc4, 0);
+            }
+            {
+                let g0 = row_base + 2 * (x_lo + 32);
+                let bm = &(*b_mats_slice.add(batch_base + 1)).0;
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
+            }
+            {
+                let g0 = row_base + 2 * (x_lo + 64);
+                let bm = &(*b_mats_slice.add(batch_base + 2)).0;
+                gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
+            }
+            {
+                let g0 = row_base + 2 * (x_lo + 96);
+                let bm = &(*b_mats_slice.add(batch_base + 3)).0;
+                gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
+                gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
+                accum2!(g0, 0, 1);
+                accum1!(g0, 2);
+                r4_round4_batch(fa, fb, &mut acc4, 3);
+                pf_quarter!(g0, 3);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            x_lo += 128;
+        }
+
+        use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
+        let lane_sum = |v: __m512i, w: __m512i, w64: __m512i| -> F128 {
+            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
+            l[0] + l[1] + l[2] + l[3]
+        };
+        let mut out = [F128::ZERO; 8];
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let lane_w64 = ghash_shift64_x4(lane_w);
+        let mut red = [_mm512_setzero_si512(); 8];
+        for i in 0..8 {
+            red[i] = acc[i].reduce_lanes();
+            out[i] = lane_sum(red[i], lane_w, lane_w64);
+        }
+        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
+        let lv4_64 = ghash_shift64_x4(lv4);
+        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
+        let lvo_64 = ghash_shift64_x4(lvo);
+        let mut r4 = [F128::ZERO; 18];
+        // v1[i+3j] for the odd-u (X3 = 1) corners from the incumbent accumulators.
+        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
+        r4[0] = lane_sum(acc4[0].reduce_lanes(), lv4, lv4_64);
+        for k in 1..9 {
+            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
+        }
+        for k in 0..9 {
+            r4[9 + k] = lane_sum(acc4[1 + k].reduce_lanes(), lv4, lv4_64);
+        }
+        (out, r4)
+    }
+}
+
+/// Three-variable composed pass leaf: [`fold2_from_packed_lookahead_c4_lm_wtab_x86`]
+/// with each step consuming 128 packed rows (two c4 register folds at
+/// `ρ₁, ρ₂`) and applying the `ρ₃` level in registers, so a step yields one
+/// 16-output lane-major tile of the eighth-size table.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(b_out.len(), 2 * lo_size);
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wt.as_ptr();
+        let (r3, r3_64) = ghash_broadcast_split(rho3);
+
+        macro_rules! fold_side {
+            ($pkt:expr, $row0:expr) => {{
+                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8), cfold);
+                let [p0, p1, p2, p3] =
+                    gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8 + 512), cfold);
+                let oe1 = _mm512_xor_si512(q0, ghash_mul_x4_split(_mm512_xor_si512(q0, q1), r3, r3_64));
+                let oo1 = _mm512_xor_si512(q2, ghash_mul_x4_split(_mm512_xor_si512(q2, q3), r3, r3_64));
+                let oe2 = _mm512_xor_si512(p0, ghash_mul_x4_split(_mm512_xor_si512(p0, p1), r3, r3_64));
+                let oo2 = _mm512_xor_si512(p2, ghash_mul_x4_split(_mm512_xor_si512(p2, p3), r3, r3_64));
+                [
+                    _mm512_shuffle_i64x2::<0x88>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0x88>(oo1, oo2),
+                    _mm512_shuffle_i64x2::<0xDD>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0xDD>(oo1, oo2),
+                ]
+            }};
+        }
+
+        macro_rules! step16 {
+            ($x_expr:expr) => {{
+                let x = $x_expr;
+                let ol = 2 * x;
+                let xg = out_base + ol;
+                let row0 = 8 * xg;
+                let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+                for l in 0..8 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let [a0, a1, a2, a3] = fold_side!(a_pkt, row0);
+                for l in 8..16 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let [b0, b1, b2, b3] = fold_side!(b_pkt, row0);
+                let ap = a_out_ptr.add(ol);
+                let bp = b_out_ptr.add(ol);
+                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else {
+                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                    (s0, s1, s2, s3, t0, t1, t2, t3)
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                }
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = ghash_mul_x4_split(a0, w, w64);
+                let a1w = ghash_mul_x4_split(a1, w, w64);
+                let a2w = ghash_mul_x4_split(a2, w, w64);
+                let a3w = ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step16!(x_lo);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step16!(x_lo + 8);
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}

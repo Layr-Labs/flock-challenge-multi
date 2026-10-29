@@ -15,6 +15,17 @@
 //! is tested on honest witnesses; verify also rejects byte-mutated proofs and
 //! shape-corrupted ones.
 
+
+/// One-time resolution of a diagnostic flag. The process environment does not
+/// change after entry, so the first answer is the answer every later call would
+/// get; caching it keeps a lock and a string scan out of the per-round path.
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::challenger::Challenger;
 use crate::field::{F8, F128};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
@@ -31,7 +42,7 @@ use multilinear::{
     fold2_from_packed_and_round_pair_lookahead_into_with_eq,
     fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
-    packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
+    eval_round4_lookahead, packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
     uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq, zc_lane_major_handoff_on,
@@ -65,8 +76,7 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_LOOKAHEAD")
 }
 
 /// Test-only: number of lookahead/cascade levels the last prove ran with, so
@@ -93,8 +103,7 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_CASCADE2")
 }
 
 /// Test-only forced-off latch for the no-materialize sweep.
@@ -118,8 +127,7 @@ fn nomat_off() -> bool {
     if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_SWEEP_NOMAT")
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
@@ -129,8 +137,7 @@ fn cascade3_off() -> bool {
     if ZC_CASCADE3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_CASCADE3")
 }
 
 /// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Both
@@ -154,8 +161,7 @@ fn cascade4_off() -> bool {
     if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_CASCADE4")
 }
 
 /// Cascade level 4 (rounds 11+12) ships on: `FLOCK_NO_ZC_CASCADE5=1` restores
@@ -172,8 +178,7 @@ fn cascade5_off() -> bool {
     if ZC_CASCADE5_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_CASCADE5")
 }
 
 /// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted five-level cap. The
@@ -181,8 +186,29 @@ fn cascade5_off() -> bool {
 /// the ranked 26-variable tail.
 #[inline]
 fn deep_cascade_off() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some())
+    hoisted_flag!("FLOCK_NO_ZC_DEEP_CASCADE")
+}
+
+/// Test-only forced-off latch for the three-variable composed fold.
+#[cfg(test)]
+pub(crate) static ZC_3VAR_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only: whether the last prove ran the three-variable route.
+#[cfg(test)]
+pub(crate) static ZC_3VAR_LAST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_ZC_3VAR=1` restores the two-variable rounds-3+4 composed pass
+/// (see `multilinear::three_var`). Same transcript either way.
+#[inline]
+fn three_var_off() -> bool {
+    #[cfg(test)]
+    if ZC_3VAR_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_ZC_3VAR"));
+    *OFF
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -489,7 +515,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_identity_c_
 /// from the identity-C fold. Diagnostics only; read once per process.
 fn w30_elide_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_W30_ELIDE_DEBUG").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_W30_ELIDE_DEBUG"));
     *ON
 }
 
@@ -548,8 +574,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    static ZC_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let zc_timing = *ZC_TIMING.get_or_init(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+    let zc_timing = hoisted_flag!("FLOCK_ZC_TIMING");
     let t_round1 = std::time::Instant::now();
     let inv_table_owned;
     let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
@@ -786,7 +811,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // and, being the "no fusion at all" oracle, also disables the lookahead.
     // Transcript bytes are identical either way; the ranked worker's cleared
     // environment never sets it.
-    let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
+    let no_tail_fusion = hoisted_flag!("FLOCK_NO_TAIL_FUSION");
 
     // Two-challenge symbolic lookahead: round three's message is a quadratic
     // in ρ₁, so its six coefficients ride along inside round two's sweep and
@@ -831,8 +856,16 @@ fn prove_packed_padded_inner<C: Challenger>(
         // independently built split.
         .filter(|eq| eq.n_lo >= 3);
 
+    // ZC-3VAR candidate: needs the round-six parity weight r[k_skip+4] ≠ 0
+    // (β₁ at the ranked shape) and enough variables for the shifted cascade.
+    let want_3var = use_nomat
+        && n_mlv >= 9
+        && r[k_skip + 4] != F128::ZERO
+        && (cfg!(test) || cfg!(target_arch = "x86_64"))
+        && !three_var_off();
+    let mut la4: Option<multilinear::Round4Lookahead> = None;
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
-        let (m1, mi, la) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+        let ((m1, mi, la), r4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             a_packed,
             b_packed,
             m,
@@ -842,7 +875,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             packed_eq.as_ref(),
             r2_canon_rows.as_deref(),
+            want_3var,
         );
+        la4 = r4;
         (Vec::new(), Vec::new(), m1, mi, Some(la))
     } else if use_lookahead {
         let (a, b, m1, mi, la) = uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead(
@@ -904,8 +939,28 @@ fn prove_packed_padded_inner<C: Challenger>(
     // No-materialize: `a_mlv`/`b_mlv` are empty; the composed pass writes its
     // N/4 outputs into freshly taken buffers and the scratch pair is sized for
     // the fold after it (N/8).
+    let use_3var = la4.is_some();
+    #[cfg(test)]
+    ZC_3VAR_LAST.store(use_3var, std::sync::atomic::Ordering::Relaxed);
+    if use_3var && hoisted_flag!("FLOCK_ZC_3VAR_CHECK") {
+        let want = multilinear::three_var::round4_lookahead_ref(
+            a_packed, b_packed, &fold_table, &mlv_arg, padding, k_skip,
+        );
+        let got = la4.unwrap();
+        for k in 0..9 {
+            if got.v1[k] != want.v1[k] || got.vinf[k] != want.vinf[k] {
+                eprintln!("[zc3-check] MISMATCH k={k} v1 {} vinf {}", got.v1[k] == want.v1[k], got.vinf[k] == want.vinf[k]);
+            }
+        }
+        eprintln!("[zc3-check] done (equal={})", got == want);
+    }
+    // Variable offset of every cascade level after the first (the 3var first
+    // level folds one extra variable).
+    let off = use_3var as usize;
     let n_in = 1usize << n_mlv;
-    let first_out = if use_nomat {
+    let first_out = if use_3var {
+        n_in / 16
+    } else if use_nomat {
         n_in / 8
     } else if lookahead.is_some() {
         n_in / 4
@@ -940,33 +995,34 @@ fn prove_packed_padded_inner<C: Challenger>(
     // continues from there. `n_mlv ≥ 7` (level 2) / `≥ 8` (level 3) keep
     // every composed input ≥ 16 and every eq split at lo_size ≥ 2.
     // Kill switches: FLOCK_NO_ZC_CASCADE2 / FLOCK_NO_ZC_CASCADE3.
-    let use_cascade2 =
-        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
-    let use_cascade3 = use_cascade2 && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
-    // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain. Their
-    // parity weights r[k_skip+7] / r[k_skip+9] are sampled slots (the seven
-    // protocol constants end at k_skip+6), so they are non-zero except with
-    // probability 2⁻¹²⁸; the chain simply stops a level earlier otherwise.
-    // The n_mlv floors keep the last composed pass's input at ≥ 16 elements
-    // (level L consumes 2^(n_mlv−2L)) with a level of margin, matching the
-    // Apple track's shipped gating.
-    //
-    // Level 3 ships on (kill switch FLOCK_NO_ZC_CASCADE4): at the ranked shape
-    // it turns tail rounds log_n 20 and 19 — 2.0 + 1.2 ms of rayon regions —
-    // into one 1.7 ms composed pass and deletes an FS round boundary.
-    // Level 4 ships on (kill switch FLOCK_NO_ZC_CASCADE5); see `cascade5_off`.
-    let use_cascade4 =
-        use_cascade3 && n_mlv >= 10 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
-    let use_cascade5 =
-        use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
-    let use_cascade6 =
-        use_cascade5 && n_mlv >= 14 && r[k_skip + 11] != F128::ZERO && !deep_cascade_off();
-    let use_cascade7 = use_cascade6 && n_mlv >= 16 && r[k_skip + 13] != F128::ZERO;
-    let use_cascade8 = use_cascade7 && n_mlv >= 18 && r[k_skip + 15] != F128::ZERO;
-    let use_cascade9 = use_cascade8 && n_mlv >= 20 && r[k_skip + 17] != F128::ZERO;
-    let use_cascade10 = use_cascade9 && n_mlv >= 22 && r[k_skip + 19] != F128::ZERO;
-    let use_cascade11 = use_cascade10 && n_mlv >= 24 && r[k_skip + 21] != F128::ZERO;
-    let use_cascade12 = use_cascade11 && n_mlv >= 26 && r[k_skip + 23] != F128::ZERO;
+    let use_cascade2 = use_lookahead
+        && n_mlv >= 7 + off
+        && r[k_skip + 3 + off] != F128::ZERO
+        && !cascade2_off();
+    let use_cascade3 = use_cascade2
+        && n_mlv >= 8 + off
+        && r[k_skip + 5 + off] != F128::ZERO
+        && !cascade3_off();
+    // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain; with
+    // ZC-3VAR every level sits one variable later (`off`).
+    let use_cascade4 = use_cascade3
+        && n_mlv >= 10 + off
+        && r[k_skip + 7 + off] != F128::ZERO
+        && !cascade4_off();
+    let use_cascade5 = use_cascade4
+        && n_mlv >= 12 + off
+        && r[k_skip + 9 + off] != F128::ZERO
+        && !cascade5_off();
+    let use_cascade6 = use_cascade5
+        && n_mlv >= 14 + off
+        && r[k_skip + 11 + off] != F128::ZERO
+        && !deep_cascade_off();
+    let use_cascade7 = use_cascade6 && n_mlv >= 16 + off && r[k_skip + 13 + off] != F128::ZERO;
+    let use_cascade8 = use_cascade7 && n_mlv >= 18 + off && r[k_skip + 15 + off] != F128::ZERO;
+    let use_cascade9 = use_cascade8 && n_mlv >= 20 + off && r[k_skip + 17 + off] != F128::ZERO;
+    let use_cascade10 = use_cascade9 && n_mlv >= 22 + off && r[k_skip + 19 + off] != F128::ZERO;
+    let use_cascade11 = use_cascade10 && n_mlv >= 24 + off && r[k_skip + 21 + off] != F128::ZERO;
+    let use_cascade12 = use_cascade11 && n_mlv >= 26 + off && r[k_skip + 23 + off] != F128::ZERO;
     let n_levels = match (
         use_lookahead,
         use_cascade2,
@@ -1008,12 +1064,22 @@ fn prove_packed_padded_inner<C: Challenger>(
     let mut lm_in = false;
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
+        // Level offset: with ZC-3VAR, levels ≥ 1 sit one variable later.
+        let lo_off = if level == 0 { 0 } else { off };
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
-        let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level]);
+        let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
         multilinear_msgs.push((m_odd_1, m_odd_inf));
         challenger.observe_f128(m_odd_1);
         challenger.observe_f128(m_odd_inf);
         mlv_rhos.push(challenger.sample_f128());
+        if level == 0 && use_3var {
+            // Round four from the deferred biquadratic at (ρ₁, ρ₂). No pass.
+            let (g1, ginf) = eval_round4_lookahead(la4.as_ref().unwrap(), mlv_rhos[0], mlv_rhos[1]);
+            multilinear_msgs.push((g1, ginf));
+            challenger.observe_f128(g1);
+            challenger.observe_f128(ginf);
+            mlv_rhos.push(challenger.sample_f128());
+        }
 
         // Rounds 2L+3 and 2L+4 fold together in one pass (ρ_{2L+1} and
         // ρ_{2L+2} at once), replacing tail iterations i = 2L and i = 2L+1.
@@ -1023,15 +1089,54 @@ fn prove_packed_padded_inner<C: Challenger>(
         let t_round = std::time::Instant::now();
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         let log_n_cur = n_cur.trailing_zeros() as usize;
-        let quarter = n_cur / 4;
-        let mut r_next = vec![F128::ONE; log_n_cur - 2];
-        r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 3..]);
+        let quarter = if level == 0 && use_3var { n_cur / 8 } else { n_cur / 4 };
+        let shift = if level == 0 && use_3var { 3 } else { 2 };
+        let mut r_next = vec![F128::ONE; log_n_cur - shift];
+        r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 1 + shift + lo_off..]);
         // This level may store lane-major tiles only for another lookahead
         // level (the last level's pair fold reads row-major) whose chunks are
         // all eight-group chunks; its own chunk split is checked per branch.
         let lm_reader_ok =
             lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter) % 8 == 0;
-        let (m_even_1, m_even_inf, lm_out) = if level == 0 && use_nomat {
+        let (m_even_1, m_even_inf, lm_out) = if level == 0 && use_3var {
+            // Rounds 3+4+5 straight from the packed witness: one pass folds
+            // X₁..X₃ into N/8 tables and yields round five + round-six lookahead.
+            let mut a8 = crate::scratch::take_f128(quarter);
+            let mut b8 = crate::scratch::take_f128(quarter);
+            let round2_eq = packed_eq.take();
+            let eq_lo = round2_eq
+                .as_ref()
+                .filter(|eq| eq.n_lo >= 4)
+                .map(|eq| multilinear::three_var::marginalize_eq_low3(&eq.lo));
+            let eq_override = match (&eq_lo, &round2_eq) {
+                (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
+                _ => None,
+            };
+            let lm_out = lm_reader_ok
+                && cfg!(target_arch = "x86_64")
+                && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
+            let (m1, mi, la_next) =
+                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
+                    a_packed,
+                    b_packed,
+                    m,
+                    k_skip,
+                    &fold_table,
+                    padding,
+                    &mut a8,
+                    &mut b8,
+                    [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]],
+                    &r_next,
+                    eq_override,
+                    lm_out,
+                );
+            a_mlv = a8;
+            b_mlv = b8;
+            if level + 1 < n_levels {
+                la = Some(la_next);
+            }
+            (m1, mi, lm_out)
+        } else if level == 0 && use_nomat {
             // Rounds 3+4 straight from the packed witness (see above); the
             // outputs land in freshly taken N/4 buffers, and the old (empty)
             // pair is dropped. Also yields the round-five lookahead.
@@ -1072,8 +1177,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &b_mlv,
                 &mut a_nxt[..quarter],
                 &mut b_nxt[..quarter],
-                mlv_rhos[2 * level],
-                mlv_rhos[2 * level + 1],
+                mlv_rhos[2 * level + lo_off],
+                mlv_rhos[2 * level + 1 + lo_off],
                 &r_next,
                 lm_in,
                 lm_out,
@@ -1087,14 +1192,14 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &b_mlv,
                 &mut a_nxt[..quarter],
                 &mut b_nxt[..quarter],
-                mlv_rhos[2 * level],
-                mlv_rhos[2 * level + 1],
+                mlv_rhos[2 * level + lo_off],
+                mlv_rhos[2 * level + 1 + lo_off],
                 &r_next,
             );
             (m1, mi, false)
         };
         lm_in = lm_out;
-        if !(level == 0 && use_nomat) {
+        if !(level == 0 && (use_nomat || use_3var)) {
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(quarter);
@@ -1111,7 +1216,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
     }
-    let loop_start = 2 * n_levels;
+    let loop_start = 2 * n_levels + if n_levels > 0 { off } else { 0 };
 
     for i in loop_start..(n_mlv - 1) {
         let t_round = std::time::Instant::now();
@@ -1503,6 +1608,8 @@ mod tests {
     #[test]
     fn prove_transcript_identical_with_and_without_lookahead() {
         use std::sync::atomic::Ordering;
+        // The level counts below are the two-variable route's.
+        ZC_3VAR_FORCED_OFF.store(true, Ordering::Relaxed);
         for &(m, padded) in &[
             (13usize, false),
             (14, false),
@@ -1587,6 +1694,7 @@ mod tests {
             ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_CASCADE5_FORCED_OFF.store(false, Ordering::Relaxed);
             ZC_NOMAT_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_3VAR_FORCED_OFF.store(true, Ordering::Relaxed);
 
             let (proof_full, claim_full) = &results[0];
             for (k, (proof, claim)) in results.iter().enumerate().skip(1) {
@@ -1604,6 +1712,63 @@ mod tests {
             let claim_v = verify(m, proof_full, &mut ch_v)
                 .unwrap_or_else(|e| panic!("verify rejected cascade proof at m={m}: {e:?}"));
             assert_eq!(&claim_v, claim_full, "verify claim mismatch at m={m}");
+        }
+        ZC_3VAR_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **ZC-3VAR transcript identity**: the three-variable composed fold
+    /// (round-four biquadratic in the round-two sweep, X1..X3 packed pass,
+    /// shifted cascade) emits a proof and claim byte-identical to the
+    /// two-variable route, dense and padded, and the proof verifies.
+    #[test]
+    fn prove_transcript_identical_with_and_without_3var() {
+        use std::sync::atomic::Ordering;
+        for &(m, padded) in &[
+            (15usize, false),
+            (16, false),
+            (17, false),
+            (18, false),
+            (19, false),
+            (20, false),
+            (17, true),
+            (18, true),
+            (20, true),
+        ] {
+            let mut rng = Rng::new(9900 + m as u64 + padded as u64 * 1000);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            let padding = if padded {
+                let (k_log, useful) = (14usize, 15_409usize);
+                let block = 1usize << k_log;
+                for blk in 0..((1usize << m) / block) {
+                    for j in useful..block {
+                        a[blk * block + j] = false;
+                        b[blk * block + j] = false;
+                    }
+                }
+                PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful,
+                }
+            } else {
+                PaddingSpec::dense(m)
+            };
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+            let mut out = Vec::new();
+            for off in [true, false] {
+                ZC_3VAR_FORCED_OFF.store(off, Ordering::Relaxed);
+                let mut ch = FsChallenger::new(b"flock-test-v0");
+                out.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
+                assert_eq!(ZC_3VAR_LAST.load(Ordering::Relaxed), !off, "3var engagement m={m}");
+            }
+            ZC_3VAR_FORCED_OFF.store(false, Ordering::Relaxed);
+            assert_eq!(out[0].0, out[1].0, "proof diverges m={m} padded={padded}");
+            assert_eq!(out[0].1, out[1].1, "claim diverges m={m} padded={padded}");
+            let mut ch_v = FsChallenger::new(b"flock-test-v0");
+            let claim_v = verify(m, &out[1].0, &mut ch_v)
+                .unwrap_or_else(|e| panic!("verify rejected 3var proof at m={m}: {e:?}"));
+            assert_eq!(claim_v, out[1].1);
         }
     }
 
