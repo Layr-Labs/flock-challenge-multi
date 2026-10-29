@@ -5638,12 +5638,15 @@ unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhas
                 _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
             }
         };
-        let mut ops = [[_mm512_setzero_si512(); 20]; 2];
+        let mut ops_uninit = core::mem::MaybeUninit::<[[__m512i; 20]; 2]>::uninit();
+        let ops = &mut *ops_uninit.as_mut_ptr();
         for set in 0..2 {
             let (g0, g1) = (2 * set, 2 * set + 1);
             let st = &mut ops[set];
-            let mut ca = [_mm512_setzero_si512(); 4];
-            let mut cb = [_mm512_setzero_si512(); 4];
+            let mut ca_uninit = core::mem::MaybeUninit::<[__m512i; 4]>::uninit();
+            let mut cb_uninit = core::mem::MaybeUninit::<[__m512i; 4]>::uninit();
+            let ca = &mut *ca_uninit.as_mut_ptr();
+            let cb = &mut *cb_uninit.as_mut_ptr();
             for k in 0..4 {
                 let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
                 let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
