@@ -437,6 +437,16 @@ mod root_tile_cache;
 ))]
 pub use root_tile_cache::RootTileCache as WitnessRootTiles;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub use root_tile_cache::WitnessTileView;
+
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
     source: RootFoldStorage,
@@ -476,13 +486,78 @@ impl RootFoldSource {
     /// Publish a completed proof-local witness cache before the first fold.
     /// A consumer geometry mismatch keeps the ordinary capture fallback.
     pub fn install_witness_root_tiles(&self, z: &[F128], tiles: WitnessRootTiles) -> bool {
-        if self.k_log != 14 || !z.len().is_multiple_of(128) { return false; }
+        self.try_install_witness_root_tiles(z, tiles).is_ok()
+    }
+
+    /// [`Self::install_witness_root_tiles`] that hands the tiles back on a
+    /// geometry/source mismatch instead of dropping them.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn try_install_witness_root_tiles(
+        &self,
+        z: &[F128],
+        tiles: WitnessRootTiles,
+    ) -> Result<(), WitnessRootTiles> {
+        if self.k_log != 14 || !z.len().is_multiple_of(128) { return Err(tiles); }
         if let RootFoldStorage::Splice(splice) = &self.source {
             if tiles.matches_geometry(z.len() / 128, splice.root_bits) {
-                return self.cached_tiles.set(tiles).is_ok();
+                return self.cached_tiles.set(tiles);
             }
         }
-        false
+        Err(tiles)
+    }
+
+    /// The installed witness-born root tiles, if any.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn witness_root_tiles(&self) -> Option<&WitnessRootTiles> {
+        self.cached_tiles.get()
+    }
+
+    /// True iff [`Self::new`] on a witness of `z_len` elements selects the
+    /// splice source, i.e. construction does not read `z` and later folds
+    /// read only installed witness tiles.
+    pub fn splice_eligible(z_len: usize, k_log: usize, plan: &LinearFoldPlan) -> bool {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        {
+            let k = 1usize << k_log;
+            let stride = k / 128;
+            k_log == 14
+                && z_len % stride == 0
+                && z_len / stride >= 64
+                && (z_len / stride) % 64 == 0
+                && block_major_gfni_enabled()
+                && RootSplicePlan::new(plan, k).is_some()
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        {
+            let _ = (z_len, k_log, plan);
+            false
+        }
     }
 
     pub fn new(z: &[F128], k_log: usize, plan: &'static LinearFoldPlan) -> Self {

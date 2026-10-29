@@ -672,6 +672,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         None
     };
     let claims_arr = [ab, c];
+    let z_key = (z_packed.as_ptr() as usize, z_packed.len());
     let pcs_open = flock_core::in_pool(|| {
         let _hot = flock_core::hot_pool::HotPool::start();
         let opened = open_claims_with_precomputed_ligerito(
@@ -688,6 +689,9 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         crate::seed_pipe::tail_spin_start();
         opened
     });
+    // The open consumed (or densified) any elided-z registration; drop a
+    // stale one defensively so a recycled buffer can never match it.
+    flock_core::pcs::elided_z::forget(z_key.0, z_key.1);
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -902,6 +906,114 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     )
 }
 
+/// Lincheck root source for a block-major witness, adopting the witness-born
+/// root tiles. When the ranked producer elided z's DRAM stores
+/// (`WitnessRootTiles::z_elided`), either registers an exact regenerator for
+/// the stale buffer with [`flock_core::pcs::elided_z`] (tiles installed: every
+/// later reader folds the tiles or calls `ensure_dense`), or regenerates z in
+/// place right here when any route would read it before installation.
+fn build_root_source(
+    z_packed: &mut Vec<F128>,
+    k_log: usize,
+    plan: Option<&'static lincheck::LinearFoldPlan>,
+    ab_inner: &mut zerocheck::univariate_skip_optimized::Round1AbInner,
+) -> Option<std::sync::Arc<lincheck::RootFoldSource>> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        use crate::r1cs_hashes::blake3::blake3_zregen::TileRegen;
+        use flock_core::pcs::elided_z::ZRegen;
+        let zr_trace = |site: &str| {
+            if std::env::var_os("FLOCK_ZR_TRACE").is_some() {
+                eprintln!("[zr] fallback materialize at {site}");
+            }
+        };
+        if !ab_inner.witness_root_tiles_z_elided() {
+            // This buffer is dense: no stale registration may shadow it.
+            flock_core::pcs::elided_z::forget(z_packed.as_ptr() as usize, z_packed.len());
+            return plan.map(|plan| {
+                let source = lincheck::RootFoldSource::new(z_packed, k_log, plan);
+                if let Some(tiles) = ab_inner.take_witness_root_tiles() {
+                    source.install_witness_root_tiles(z_packed, tiles);
+                }
+                std::sync::Arc::new(source)
+            });
+        }
+        let mut tiles = ab_inner.take_witness_root_tiles();
+        let Some(plan) = plan else {
+            zr_trace("no root plan");
+            TileRegen::owned(tiles.take().expect("elided z keeps its tiles")).materialize(z_packed);
+            return None;
+        };
+        if !lincheck::RootFoldSource::splice_eligible(z_packed.len(), k_log, plan) {
+            zr_trace("splice ineligible");
+            TileRegen::owned(tiles.take().expect("elided z keeps its tiles")).materialize(z_packed);
+        }
+        let source = lincheck::RootFoldSource::new(z_packed, k_log, plan);
+        let mut installed = false;
+        if let Some(tiles) = tiles {
+            match source.try_install_witness_root_tiles(z_packed, tiles) {
+                Ok(()) => installed = true,
+                Err(tiles) => {
+                    zr_trace("tile install rejected");
+                    TileRegen::owned(tiles).materialize(z_packed)
+                }
+            }
+        }
+        let source = std::sync::Arc::new(source);
+        if installed {
+            flock_core::pcs::elided_z::install(
+                z_packed,
+                Box::new(TileRegen::installed(source.clone())),
+            );
+        }
+        Some(source)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "avx512vbmi2",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        plan.map(|plan| {
+            let source = lincheck::RootFoldSource::new(z_packed, k_log, plan);
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            if let Some(tiles) = ab_inner.take_witness_root_tiles() {
+                assert!(!tiles.z_elided(), "z elision requires the regenerator");
+                source.install_witness_root_tiles(z_packed, tiles);
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            )))]
+            let _ = &ab_inner;
+            std::sync::Arc::new(source)
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -990,25 +1102,30 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // Last-ρ leftover z-fold: arm before zerocheck so the last ML ρ can
     // start today's one-shot fold. Guard keeps `z_packed` live until
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
+    let mut z_packed = z_packed;
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
-        lincheck_circuit.root_fold_plan().map(|plan| {
-            let source = lincheck::RootFoldSource::new(&z_packed, r1cs.k_log, plan);
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw",
-                target_feature = "avx512vbmi",
-                target_feature = "gfni",
-                target_feature = "vpclmulqdq"
-            ))]
-            if let Some(tiles) = ab_inner.take_witness_root_tiles() {
-                source.install_witness_root_tiles(&z_packed, tiles);
-            }
-            std::sync::Arc::new(source)
-        })
+        build_root_source(
+            &mut z_packed,
+            r1cs.k_log,
+            lincheck_circuit.root_fold_plan(),
+            &mut ab_inner,
+        )
     } else {
         None
     };
+    // Elided witness: zerocheck must take the identity-C root fold, the
+    // only round-one route that never reads z itself.
+    if flock_core::pcs::elided_z::is_elided(&z_packed)
+        && !(roots.is_some()
+            && ranked_identity_c_fold_enabled(r1cs)
+            && zerocheck::univariate_skip_optimized::identity_c_fold_reads_roots_only(
+                r1cs.k_log,
+                r1cs.k_skip,
+            ))
+    {
+        flock_core::pcs::elided_z::ensure_dense(&mut z_packed, "zerocheck");
+    }
+    let z_packed = z_packed;
     // The handoff slot is thread-local and zerocheck/lincheck run on other
     // workers, so on the incumbent (non-worker caller) path the kick and wait
     // never see this prepare and lincheck folds inline. A pool-owner caller
@@ -1297,6 +1414,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
                 target_feature = "vpclmulqdq"
             ))]
             if let Some(tiles) = ab_inner.take_witness_root_tiles() {
+                assert!(!tiles.z_elided(), "timed path takes dense witnesses only");
                 source.install_witness_root_tiles(&z_packed, tiles);
             }
             std::sync::Arc::new(source)

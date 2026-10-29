@@ -6918,6 +6918,35 @@ fn split_eq_lo_halves_avx512(eq_lo: &[F128]) -> (Vec<u64>, Vec<u64>) {
     (lo, hi)
 }
 
+/// Benchmark/oracle hook: the dense direct-fold8 f materialization exactly
+/// as the ranked open runs it (`chunk_len = 512`), bypassing any elided-z
+/// registration.
+#[doc(hidden)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+pub fn bench_direct_fold8_f_dense(
+    packed_witness: &[F128],
+    folded_f: &mut [F128],
+    fold16_weight: &[F128; 16],
+    r4: F128,
+    r5: F128,
+) {
+    use rayon::prelude::*;
+    folded_f
+        .par_chunks_mut(512)
+        .enumerate()
+        .for_each(|(block, f_out)| {
+            let start = 64 * block * 512;
+            let f_in = &packed_witness[start..start + 64 * f_out.len()];
+            crate::field::f128_slice::fold64_banked_nested(f_in, f_out, fold16_weight, r4, r5);
+        });
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -6934,6 +6963,27 @@ fn materialize_direct_fold8_f_for_precommit(
     r5: F128,
 ) {
     use rayon::prelude::*;
+
+    // Elided witness: fold straight from the exact regenerator. The weight
+    // of source slot 16s+b is the product of the same factors the nested
+    // fold applies (fold16 weight, then r4 on s bit 0, r5 on s bit 1); the
+    // field is exact, so every output is bit-identical.
+    if let Some(regen) = super::elided_z::take(packed_witness) {
+        let t = std::time::Instant::now();
+        let e4 = [F128::ONE + r4, r4];
+        let e5 = [F128::ONE + r5, r5];
+        let w: [F128; 64] = std::array::from_fn(|i| {
+            let s = i >> 4;
+            fold16_weight[i & 15] * e4[s & 1] * e5[s >> 1]
+        });
+        assert_eq!(folded_f.len() * 64, packed_witness.len());
+        regen.fold64(folded_f, &w);
+        drop(regen);
+        if open_timing() || std::env::var_os("FLOCK_ZR_TRACE").is_some() {
+            eprintln!("[zr] regen fold64 {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        return;
+    }
 
     let chunk_len = block_len.min(512);
     folded_f
@@ -7132,7 +7182,7 @@ fn direct_fold8_msg_par(folded_f: &[F128], folded_b: &[F128], block_len: usize) 
 }
 
 fn materialize_direct_fold8(
-    packed_witness: Vec<F128>,
+    mut packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
@@ -7298,6 +7348,8 @@ fn materialize_direct_fold8(
         target_feature = "gfni"
     )))]
     let _ = l1_precommit;
+    // Every route below reads the witness directly.
+    super::elided_z::ensure_dense(&mut packed_witness, "fold8 non-precommit");
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -8552,6 +8604,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         target_feature = "gfni"
     )))]
     let l1_precommit_candidate = false;
+    // Only the direct-fold8 L1-precommit route can fold an elided witness
+    // from its regenerator; every other route reads it directly.
+    if !l1_precommit_candidate {
+        if let Some(w) = packed_witness.as_mut() {
+            super::elided_z::ensure_dense(w, "ligerito non-fold8");
+        }
+    }
     let mut early_wtns_1: Option<LigeroWitness> = None;
     let mut fold4_challenges: Vec<F128> = Vec::with_capacity(6);
     let mut fold4_msgs: Vec<SumcheckMessage> = Vec::with_capacity(6);

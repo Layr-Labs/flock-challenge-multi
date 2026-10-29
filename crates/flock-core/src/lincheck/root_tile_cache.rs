@@ -29,6 +29,19 @@ pub struct RootTileCache {
     word_major: bool,
     fixed_roots: bool,
     cross_quarter: bool,
+    /// The witness producer skipped z's DRAM stores; this cache is then the
+    /// only complete source of z (see `pcs::elided_z`).
+    z_elided: bool,
+}
+
+/// Raw read-only view of witness-produced word-major root tiles: `tiles`
+/// tiles of 176 groups x 512 bytes; group `g` of tile `t` starts at
+/// `base + (t * 176 + g) * 512`, octa `o` of that group at `+ o * 64`.
+#[derive(Clone, Copy, Debug)]
+pub struct WitnessTileView {
+    pub base: usize,
+    pub tiles: usize,
+    pub cross_quarter: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +159,7 @@ fn prepare(
             word_major,
             fixed_roots: false,
             cross_quarter: false,
+            z_elided: false,
         },
         folded,
     )
@@ -193,7 +207,27 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false }
+    }
+
+    /// Record that the witness producer did not store z for (some of) the
+    /// compressions covered by this cache. Only witness-born tiles qualify.
+    pub fn mark_z_elided(&mut self) {
+        assert!(self.fixed_roots && self.word_major);
+        self.z_elided = true;
+    }
+
+    pub fn z_elided(&self) -> bool {
+        self.z_elided
+    }
+
+    /// Word-major witness tile view (witness-born caches only).
+    pub fn witness_view(&self) -> Option<WitnessTileView> {
+        (self.fixed_roots && self.word_major && self.blocks == 176).then(|| WitnessTileView {
+            base: self.storage.0.as_ptr() as usize + self.offset * core::mem::size_of::<F128>(),
+            tiles: self.tiles,
+            cross_quarter: self.cross_quarter,
+        })
     }
 
     pub(super) fn matches_geometry(&self, compressions: usize, root_bits: usize) -> bool {

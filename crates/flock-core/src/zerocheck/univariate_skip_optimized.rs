@@ -606,6 +606,19 @@ impl Round1AbInner {
         self.witness_root_tiles.take()
     }
 
+    /// True iff witness root tiles are present and the producer elided z.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub fn witness_root_tiles_z_elided(&self) -> bool {
+        self.witness_root_tiles.as_ref().is_some_and(|t| t.z_elided())
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4820,6 +4833,15 @@ pub fn round1_c_fold4_from_block_major_z(
             None,
         );
     (c, s_hat_v_c, quad, fold4, fold8, one_ab)
+}
+
+/// True iff [`round1_c_fold4_from_block_major_z_with_canon`] given
+/// `roots: Some(..)` (with installed tiles) derives every output from the
+/// root fold and never reads `z_packed` itself.
+pub fn identity_c_fold_reads_roots_only(k_log: usize, k_skip: usize) -> bool {
+    crate::pcs::ranked_direct_fold8_enabled()
+        && crate::serial_par_enabled()
+        && k_log == k_skip + 8
 }
 
 /// [`round1_c_fold4_from_block_major_z`] that can also return the unbound

@@ -20,6 +20,7 @@
 //! ligerito module docs for the recursion.
 
 pub mod commit;
+pub mod elided_z;
 pub mod jagged;
 pub mod ligerito;
 pub mod pack;
@@ -127,7 +128,7 @@ fn in_wide_combine_pool<R: Send>(_l: usize, op: impl FnOnce() -> R + Send) -> R 
 /// `prover_data`'s codeword/tree shape matches what Ligerito expects for L0.
 #[allow(clippy::explicit_auto_deref, clippy::too_many_arguments)]
 pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
-    packed_witness: Vec<F128>,
+    mut packed_witness: Vec<F128>,
     prover_data: &ProverData,
     commitment: &Commitment,
     x_outers: &[&[F128]],
@@ -181,6 +182,14 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     let fold_arena: Option<ligerito::FoldArena> = None;
     crate::gaptime::mark("open: fold arena ready");
 
+    // An elided witness survives ring-switch only when every claim brings
+    // its precomputed `s_hat_v` (no `fold_1b_rows` pass over z).
+    if !(packed_direct.is_empty()
+        && precomputed_s_hat_v.len() == x_outers.len()
+        && precomputed_s_hat_v.iter().all(Option::is_some))
+    {
+        elided_z::ensure_dense(&mut packed_witness, "ring_switch");
+    }
     let combined = compute_combined_basis_and_target(
         &packed_witness,
         x_outers,
@@ -191,6 +200,9 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         trace,
     );
     crate::gaptime::mark("open: combined basis + target done");
+    if combined.direct_fold8.is_none() {
+        elided_z::ensure_dense(&mut packed_witness, "open non-fold8");
+    }
 
     let t = std::time::Instant::now();
     let ligerito_proof = if let Some(direct) = combined.direct_fold8 {

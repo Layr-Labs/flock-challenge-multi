@@ -56,6 +56,8 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Before any worker thread (and its malloc arena) exists.
+    pin_glibc_heap_thresholds();
     let built = init_global_pool();
     // Process start, on the (unpinned) main thread, after the global pool
     // exists. This is the only place the zerocheck round-1 half-pools may be
@@ -63,6 +65,48 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     smt_split::init();
     built
 }
+
+/// Pin glibc's heap thresholds at process start: `M_MMAP_THRESHOLD` = 32 MiB
+/// (the ceiling glibc's own dynamic threshold can reach, `HEAP_MAX_SIZE / 2`)
+/// and `M_TRIM_THRESHOLD` = 1 GiB.
+///
+/// Mid-size (128 KiB – 32 MiB) prover transients that the typed scratch pools
+/// and the recycling allocator do not cover go to glibc. Under the default
+/// dynamic regime they are `mmap`/`munmap` pairs until a large enough free
+/// has raised the threshold, and afterwards heap chunks whose arena top can
+/// still be trimmed and re-faulted between proves. Pinning both keeps them
+/// on arena heaps whose pages stay resident across proves.
+///
+/// ORDER MATTERS: any `mallopt` of either parameter disables the dynamic
+/// threshold. Setting only the trim threshold freezes the mmap threshold at
+/// its 128 KiB default and turns every mid-size buffer into an mmap/munmap
+/// pair (measured worse, 02c77fd1). So the trim threshold is set only after
+/// the mmap threshold was accepted. `FLOCK_NO_MALLOPT=1` skips both. Pure
+/// allocator policy: no proof byte depends on it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin_glibc_heap_thresholds() {
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("FLOCK_NO_MALLOPT").is_some() {
+            return;
+        }
+        // SAFETY: plain glibc tunable setters; they take the main arena lock
+        // and have no memory-safety preconditions.
+        unsafe {
+            if mallopt(M_MMAP_THRESHOLD, 32 << 20) == 1 {
+                mallopt(M_TRIM_THRESHOLD, 1 << 30);
+            }
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn pin_glibc_heap_thresholds() {}
 
 fn init_global_pool() -> Option<usize> {
     if let Some(n) = topology_pool::try_build_global() {

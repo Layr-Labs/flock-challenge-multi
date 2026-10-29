@@ -100,6 +100,9 @@ use flock_core::verifier;
 #[path = "blake3_witgen8.rs"]
 mod blake3_witgen8;
 
+#[path = "blake3_zregen.rs"]
+pub(crate) mod blake3_zregen;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -2958,6 +2961,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 blake3_witgen8::root_emit::RootEmitPlan::new(&plan.roots)
             });
         let root_plan = &*ROOT_PLAN;
+        // z elision: octas seeded from their compact copy skip z's global
+        // stores; the prover regenerates z exactly from the root tiles.
+        let elide_z = root_enabled
+            && root_plan.is_some()
+            && blake3_zregen::z_elide_enabled();
+        let elided_octas = std::sync::atomic::AtomicUsize::new(0);
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
         let pipelined = if let Some(context) = commit_ctx
             && context.ranked_resident()
@@ -3002,6 +3011,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         let proj = blake3_witgen8::StreamProj {
                             cross_quarter: true,
                             compact_z: if target.is_some() { input.0.as_mut_ptr().cast::<u32>() } else { core::ptr::null_mut() },
+                            elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
                             out: (ab_addr as *mut u8).add(base * ab_block_bytes),
                             out_stride: ab_block_bytes,
@@ -3027,6 +3037,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         if let Some(target) = target {
+                            if elide_z {
+                                elided_octas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             target.seed_octa(input.0.as_ptr(), kpair);
                         }
                     }
@@ -3070,7 +3083,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             let base = GROUP * g + half * SIMD;
                             let off = half * SIMD * F128_PER_BLOCK;
                             let proj = blake3_witgen8::StreamProj {
-                                cross_quarter: false, compact_z: core::ptr::null_mut(),
+                                cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: stage.as_mut_ptr().cast::<u32>(),
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
@@ -3105,7 +3118,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // schedules overwrite every stripe, including tail padding.
             // The commit entry or Rayon joins all producers and their SFENCEs
             // before this completed root-cache storage is published.
-            let tiles = unsafe {
+            let mut tiles = unsafe {
                 if pipelined {
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_witness_storage(
                         root_storage, z.len() / F128_PER_BLOCK)
@@ -3114,8 +3127,14 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         root_storage, z.len() / F128_PER_BLOCK)
                 }
             };
+            if elided_octas.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                // Some z lines were never stored: these tiles are now the
+                // only complete source of z for this proof.
+                tiles.mark_z_elided();
+            }
             ab_inner.set_witness_root_tiles(tiles);
         } else {
+            assert_eq!(elided_octas.load(std::sync::atomic::Ordering::Relaxed), 0);
             flock_core::scratch::give_f128(root_storage);
         }
         return;
@@ -3183,7 +3202,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
                             blake3_witgen8::StreamProj {
-                                cross_quarter: false, compact_z: core::ptr::null_mut(),
+                                cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: st,
                                 out: ab_out
                                     .as_mut_ptr()
