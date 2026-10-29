@@ -595,6 +595,7 @@ impl RootFoldSource {
         m: usize,
         k: usize,
         eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
+        eq8_indices: impl Fn([usize; 8]) -> [F128; 8] + Sync,
     ) -> Vec<F128> {
         #[allow(unused_variables)]
         match &self.source {
@@ -622,7 +623,7 @@ impl RootFoldSource {
             RootFoldStorage::Splice(splice) => {
                 #[cfg(target_feature = "vpclmulqdq")]
                 {
-                    root_tile_cache::fold(self, splice, z_canonical, k, &eq8_at)
+                    root_tile_cache::fold(self, splice, z_canonical, k, &eq8_at, &eq8_indices)
                 }
                 #[cfg(not(target_feature = "vpclmulqdq"))]
                 {
@@ -655,10 +656,10 @@ impl RootFoldSource {
                     return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, i, log_b, mask) };
                 }
                 eq8_from_factors_scalar_cold(&eq_lo, &eq_hi, i, log_b, mask)
-            })
+            }, |indices| eq8_from_factors_indices(&eq_lo, &eq_hi, indices, log_b, mask))
         } else {
             let eq = build_eq_table(x_outer);
-            self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]))
+            self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]), |indices| indices.map(|i| eq[i]))
         };
         self.plan.reconstruct(&folded, k)
     }
@@ -2091,6 +2092,42 @@ fn eq8_from_factors_scalar_cold(
         let outer = outer_base + r;
         eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
     })
+}
+
+/// Exactly eight requested outer weights, without expanding discarded
+/// neighbors of each index. Factors belong to the current fold challenge.
+#[inline]
+fn eq8_from_factors_indices(
+    eq_lo: &[F128], eq_hi: &[F128], indices: [usize; 8], log_b: usize, lo_mask: usize,
+) -> [F128; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    if lc_eq8_x4_enabled() {
+        // SAFETY: compile-time target features admit the same multiplication
+        // leaf as the consecutive-index path. Factor accesses are checked.
+        return unsafe { eq8_from_factors_indices_x4(eq_lo, eq_hi, indices, log_b, lo_mask) };
+    }
+    indices.map(|i| eq_lo[i & lo_mask] * eq_hi[i >> log_b])
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn eq8_from_factors_indices_x4(
+    eq_lo: &[F128], eq_hi: &[F128], indices: [usize; 8], log_b: usize, lo_mask: usize,
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4;
+    use core::arch::x86_64::*;
+    let mut out = core::mem::MaybeUninit::<[F128; 8]>::uninit();
+    unsafe {
+        let out_ptr = out.as_mut_ptr().cast::<F128>();
+        for group in 0..2 {
+            let lo = core::array::from_fn::<_, 4, _>(|lane| eq_lo[indices[group*4+lane] & lo_mask]);
+            let hi = core::array::from_fn::<_, 4, _>(|lane| eq_hi[indices[group*4+lane] >> log_b]);
+            let product = ghash_mul_x4(_mm512_loadu_si512(lo.as_ptr().cast::<__m512i>()),
+                _mm512_loadu_si512(hi.as_ptr().cast::<__m512i>()));
+            _mm512_storeu_si512(out_ptr.add(group*4).cast::<__m512i>(), product);
+        }
+        out.assume_init()
+    }
 }
 
 /// Eight consecutive factorized outer weights starting at `outer_base`.
@@ -5164,7 +5201,6 @@ fn prove_padded_inner<Ch: Challenger>(
                 einf = neinf;
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
             if fold8_ready && t == 0 {
