@@ -347,6 +347,33 @@ fn deep_block_fuse_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_BLOCK_FUSE").is_none())
 }
 
+/// Decode exactly two distinct, ordered sibling CPUs. Linux cpu lists may
+/// spell adjacent IDs as a range; all affinity/pool coverage checks remain in
+/// the callers. Reject longer sets without expanding an unbounded range.
+#[cfg(target_os = "linux")]
+fn sibling_pair_from_cpu_list(list: &str) -> Option<[usize; 2]> {
+    let mut ids = [0; 2];
+    let mut used = 0;
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        let (lo, hi) = if let Some((lo, hi)) = part.split_once('-') {
+            (lo.trim().parse::<usize>().ok()?, hi.trim().parse::<usize>().ok()?)
+        } else {
+            let id = part.parse::<usize>().ok()?;
+            (id, id)
+        };
+        let count = hi.checked_sub(lo)?.checked_add(1)?;
+        if count > 2 || used + count > 2 {
+            return None;
+        }
+        for id in lo..=hi {
+            ids[used] = id;
+            used += 1;
+        }
+    }
+    (used == 2 && ids[0] < ids[1]).then_some(ids)
+}
+
 /// SMT sibling pairs for the deep pass's producer/consumer split, or `None`
 /// when this machine or pool cannot be paired.
 ///
@@ -381,11 +408,8 @@ fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
                 "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
             ))
             .ok()?;
-            let mut ids = Vec::new();
-            for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
-            }
-            if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
+            let ids = sibling_pair_from_cpu_list(&list)?;
+            if ids[0] != c || ids[1] >= n || seen[ids[1]] {
                 return None;
             }
             seen[c] = true;
@@ -534,35 +558,54 @@ impl DeepSplitState {
     }
 }
 
-/// One finished block handed from a butterfly worker to its paired
-/// leaf-hash worker: where the block starts in the codeword, how many
-/// elements it holds, and the leaf range it covers.
+/// One fixed 128-position block, identified by its first codeword row.
+/// The consuming pass retains the codeword base and number of field columns.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct DeepBlock {
-    ptr: usize,
-    len_f128: usize,
     lo: usize,
-    hi: usize,
 }
 
-/// Single-producer / single-consumer ring for one SMT pair.
+#[cfg(target_os = "linux")]
+impl DeepBlock {
+    const ROWS: usize = 128;
+
+    /// Only canonical fixed blocks enter the compressed queue. An unexpected
+    /// shape is handled synchronously by the producer's existing callback.
+    #[inline]
+    fn from_finished(
+        range: &core::ops::Range<usize>,
+        blk: &[F128],
+        base_addr: usize,
+        columns: usize,
+    ) -> Option<Self> {
+        if range.end - range.start == Self::ROWS
+            && blk.len() == Self::ROWS * columns
+            && blk.as_ptr() as usize
+                == base_addr + range.start * columns * core::mem::size_of::<F128>()
+        {
+            Some(Self { lo: range.start })
+        } else {
+            None
+        }
+    }
+}
+
+/// Single producer; strict one-consumer or shared multi-consumer drain.
 #[cfg(target_os = "linux")]
 #[repr(align(64))]
 struct DeepQueue {
-    slots: Vec<std::cell::UnsafeCell<DeepBlock>>,
+    slots: Vec<std::sync::atomic::AtomicUsize>,
     head: std::sync::atomic::AtomicUsize, // next to publish
     tail: std::sync::atomic::AtomicUsize, // next to consume
     done: std::sync::atomic::AtomicBool,  // producer will publish no more
     gone: std::sync::atomic::AtomicBool,  // consumer left (panic)
 }
 
-// SAFETY: exactly one producer writes `slots[head % cap]` before publishing
-// `head` with Release, and exactly one consumer reads it after an Acquire
-// load of `head`; the bounded ring keeps the producer from lapping the
-// consumer, so no slot is written while it may be read.
-#[cfg(target_os = "linux")]
-unsafe impl Sync for DeepQueue {}
+// All shared queue storage is atomic; Sync follows from the field types.
+// A successful tail CAS owns that logical entry. Atomic payload copies from
+// losing readers remain legal even when the producer later reuses the slot.
+
 
 #[cfg(target_os = "linux")]
 impl DeepQueue {
@@ -572,12 +615,7 @@ impl DeepQueue {
         Self {
             slots: (0..Self::CAP)
                 .map(|_| {
-                    std::cell::UnsafeCell::new(DeepBlock {
-                        ptr: 0,
-                        len_f128: 0,
-                        lo: 0,
-                        hi: 0,
-                    })
+                    std::sync::atomic::AtomicUsize::new(0)
                 })
                 .collect(),
             head: std::sync::atomic::AtomicUsize::new(0),
@@ -598,11 +636,9 @@ impl DeepQueue {
             }
             std::hint::spin_loop();
         }
-        // SAFETY: the slot is free (checked above) and only this producer
-        // writes it.
-        unsafe {
-            *self.slots[h % Self::CAP].get() = b;
-        }
+        // The release on head publishes both this atomic token and the
+        // producer's completed writes to the corresponding codeword block.
+        self.slots[h % Self::CAP].store(b.lo, Ordering::Relaxed);
         self.head.store(h + 1, Ordering::Release);
         true
     }
@@ -614,19 +650,17 @@ impl DeepQueue {
         if h - self.tail.load(Ordering::Acquire) >= depth {
             return false;
         }
-        // SAFETY: the slot is free (checked above) and only this producer
-        // writes it.
-        unsafe {
-            *self.slots[h % Self::CAP].get() = b;
-        }
+        // The release on head publishes both this atomic token and the
+        // producer's completed writes to the corresponding codeword block.
+        self.slots[h % Self::CAP].store(b.lo, Ordering::Relaxed);
         self.head.store(h + 1, Ordering::Release);
         true
     }
-    /// Claim the oldest published block, if any. Safe with several
-    /// consumers: the slot is copied before the claiming CAS, and the
-    /// producer cannot rewrite slot `t % CAP` before `tail` has moved past
-    /// `t` (it never runs more than `depth <= CAP` ahead of `tail`), in which
-    /// case this CAS fails and the copy is discarded.
+    /// Claim the oldest published block. Copy the atomic token before CAS.
+    /// A successful CAS means tail did not advance while copying, so the
+    /// bounded producer could not recycle this occupied slot. If another
+    /// consumer advances tail, discard the speculative token. Unlike a
+    /// non-atomic descriptor copy, the losing read is legal during reuse.
     fn try_pop(&self) -> Option<DeepBlock> {
         use std::sync::atomic::Ordering;
         let mut t = self.tail.load(Ordering::Acquire);
@@ -634,8 +668,7 @@ impl DeepQueue {
             if self.head.load(Ordering::Acquire) <= t {
                 return None;
             }
-            // SAFETY: published with Release before the Acquire above.
-            let b = unsafe { *self.slots[t % Self::CAP].get() };
+            let b = DeepBlock { lo: self.slots[t % Self::CAP].load(Ordering::Relaxed) };
             match self
                 .tail
                 .compare_exchange_weak(t, t + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -654,9 +687,7 @@ impl DeepQueue {
         let t = self.tail.load(Ordering::Relaxed);
         loop {
             if self.head.load(Ordering::Acquire) > t {
-                // SAFETY: published by the producer with Release before the
-                // Acquire load above.
-                let b = unsafe { *self.slots[t % Self::CAP].get() };
+                let b = DeepBlock { lo: self.slots[t % Self::CAP].load(Ordering::Relaxed) };
                 self.tail.store(t + 1, Ordering::Release);
                 return Some(b);
             }
@@ -1107,11 +1138,8 @@ fn st_fmp_pairs() -> Option<&'static Vec<(usize, usize)>> {
                 "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
             ))
             .ok()?;
-            let mut ids = Vec::new();
-            for part in list.trim().split(',') {
-                ids.push(part.trim().parse::<usize>().ok()?);
-            }
-            if ids.len() != 2 || ids[0] != c || ids[1] >= n || seen[ids[1]] {
+            let ids = sibling_pair_from_cpu_list(&list)?;
+            if ids[0] != c || ids[1] >= n || seen[ids[1]] {
                 return None;
             }
             seen[c] = true;
@@ -1211,7 +1239,12 @@ const ST_FMP_CAP: usize = 4;
 ))]
 #[inline]
 fn select_st_fmp_bufs(requested: Option<usize>) -> usize {
-    requested.unwrap_or(2).clamp(2, ST_FMP_CAP)
+    // Generated-input schedule: the per-pair input group shrank from 512 KiB
+    // to two 16 KiB octa scratches, so a third 512 KiB staging slot fits the
+    // footprint the two-slot ring used to share with that group. Three slots
+    // let M+P announce group g+1 after publishing only task 2g, so the F
+    // sibling no longer idles between its folds and its next octas.
+    requested.unwrap_or(3).clamp(2, ST_FMP_CAP)
 }
 
 #[cfg(all(
@@ -1272,6 +1305,12 @@ struct StFmpPair {
     /// The F sibling has left its loop (normally, or because it is unwinding).
     /// Only ever read to break a wait that would otherwise never end.
     f_gone: std::sync::atomic::AtomicBool,
+    /// Two reserved staging outputs, released with each group announcement.
+    producer_output: [std::sync::atomic::AtomicUsize; 2],
+    // Generated-input handoff; untouched on the completed-message path.
+    group: std::sync::atomic::AtomicUsize,
+    announced: std::sync::atomic::AtomicUsize,
+    witness_done: std::sync::atomic::AtomicUsize,
     slot_r: [std::cell::UnsafeCell<usize>; ST_FMP_CAP],
 }
 
@@ -1302,6 +1341,10 @@ impl StFmpPair {
             total: AtomicUsize::new(usize::MAX),
             bufp: AtomicUsize::new(0),
             f_gone: AtomicBool::new(false),
+            producer_output: [const { AtomicUsize::new(0) }; 2],
+            group: AtomicUsize::new(usize::MAX),
+            announced: AtomicUsize::new(0),
+            witness_done: AtomicUsize::new(0),
             slot_r: [const { std::cell::UnsafeCell::new(0) }; ST_FMP_CAP],
         }
     }
@@ -1325,6 +1368,138 @@ impl StFmpPair {
             }
             std::hint::spin_loop();
         }
+    }
+}
+
+/// The ordinary encoder borrows a completed message. The generating arm
+/// instead retains exclusive custody without materializing a shared slice
+/// while its producers are writing. It is consumed by one encoding call.
+enum SeedInput<'a> {
+    Ready(&'a [F128]),
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    Generating {
+        address: usize,
+        len: usize,
+        produce: &'a (dyn Fn(*mut F128, usize, usize, Option<&WitnessSeedTarget>) + Sync),
+        _exclusive: core::marker::PhantomData<&'a mut [F128]>,
+    },
+}
+
+/// Explicit destination for seeding a generated octa while its local input is
+/// still resident. Constructed by the encoder for the current pass only.
+/// Both producer roles receive the same two output blocks and own disjoint
+/// `kpair` values; no shared slice of either output exists during production.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub struct WitnessSeedTarget {
+    output: [*mut F128; 2],
+    odd_tail: usize,
+    stage_perm: bool,
+    right: F128,
+    dense: [F128; 3],
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+impl WitnessSeedTarget {
+    /// Seed both r parities for the octa with lanes `2*q + kbit`. This uses
+    /// exactly the same complete-row kernel and coefficient preparation as
+    /// the group gather, with the source now confined to sixteen local rows.
+    ///
+    /// # Safety
+    /// `input` owns 8 initialized compressions of 128 fields in q-major order,
+    /// including the zero final window. `kpair < 32` belongs exclusively to
+    /// this callback's role. Call exactly once per owned kpair and retain no
+    /// target or input pointer after the producer callback returns.
+    #[inline]
+    pub unsafe fn seed_octa(&self, input: *const F128, kpair: usize) {
+        assert!(kpair < 32);
+        unsafe {
+            for parity in 0..2 {
+                for kbit in 0..2 {
+                    let kp = seed_top_stage_row(2 * kpair + kbit, self.stage_perm);
+                    let dst = self.output[parity].add(kp * 64);
+                    let rs = 2 * kbit + parity;
+                    if !ntt_seed_hold4_disabled() {
+                        let active = if parity == 1 { 64 - self.odd_tail } else { 64 };
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                            input, 4, rs, dst, dst.add(256 * 64), 64, 64, active,
+                            self.right, &self.dense, core::ptr::null());
+                    } else {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            input, 4, rs, dst, 64, 0, 64, self.right);
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            input, 4, rs, dst.add(256 * 64), 64, 0, 64, &self.dense);
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+impl<'a> SeedInput<'a> {
+    /// Caller supplies the exact disjoint-initialization contract documented
+    /// by rs_encode_generated_on_range_done. The lifetime here ties raw
+    /// custody to the current exclusive borrow, not an earlier pointer.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    unsafe fn generating(
+        msg: &'a mut [F128],
+        produce: &'a (dyn Fn(*mut F128, usize, usize, Option<&WitnessSeedTarget>) + Sync),
+    ) -> Self {
+        Self::Generating {
+            address: msg.as_mut_ptr() as usize,
+            len: msg.len(),
+            produce,
+            _exclusive: core::marker::PhantomData,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Ready(msg) => msg.len(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            Self::Generating { len, .. } => *len,
+        }
+    }
+
+    fn as_ptr(&self) -> *const F128 {
+        match self {
+            Self::Ready(msg) => msg.as_ptr(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            Self::Generating { address, .. } => *address as *const F128,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    fn producer(&self) -> Option<&'a (dyn Fn(*mut F128, usize, usize, Option<&WitnessSeedTarget>) + Sync)> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Generating { produce, .. } => Some(*produce),
+        }
+    }
+
+    /// Used only when the paired schedule has not started. Every callback
+    /// joins before any ordinary whole-message reader may run.
+    fn generate_all(&self) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        if let Self::Generating { address, produce, .. } = self {
+            use rayon::prelude::*;
+            (0..1024).into_par_iter().for_each(|group| {
+                produce(*address as *mut F128, group, 0, None);
+                produce(*address as *mut F128, group, 1, None);
+                // The callback may stream z, AB and root-cache lines. Join
+                // alone does not drain this worker's write-combining stores.
+                unsafe { core::arch::x86_64::_mm_sfence() };
+            });
+        }
+    }
+
+    fn into_ready(self) -> &'a [F128] {
+        self.generate_all();
+        // SAFETY: Ready already carries this lifetime. Generating was
+        // constructed from an exclusive borrow of exactly this region;
+        // its producer contract initializes every element, and generate_all
+        // joins all producers and their store fences before this shared view.
+        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
 }
 
@@ -1356,12 +1531,12 @@ impl StFmpPair {
 fn st_fmp_run(
     n_tasks: usize,
     row_len: usize,
-    seed: &(dyn Fn(*mut F128, usize) + Sync),
+    seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
+    produce: Option<&(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)>,
     after: Option<&(dyn Fn(usize) + Sync)>,
 ) -> bool {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let Some(pairs) = st_fmp_pairs() else {
         return false;
     };
@@ -1372,13 +1547,38 @@ fn st_fmp_run(
     // tasks for the pipeline to fill.
     if n_pairs * 2 != rayon::current_num_threads()
         || n_tasks < 4 * nbuf * n_pairs
+        || (produce.is_some() && (n_tasks != 2048 || row_len != 64))
         || !crate::owns_whole_pool()
     {
         return false;
     }
-    let Some(_claim) = StFmpClaim::take() else {
+    let Some(claim) = StFmpClaim::take() else {
         return false;
     };
+    st_fmp_run_claimed(n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf, claim)
+}
+
+/// The same body is exercised with explicit CPUs by correctness tests; only
+/// st_fmp_run resolves production topology and acquires whole-pool custody.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline(never)]
+fn st_fmp_run_claimed(
+    n_tasks: usize,
+    row_len: usize,
+    seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
+    fold: &(dyn Fn(*mut F128, usize) + Sync),
+    publish: &(dyn Fn(*mut F128, usize) + Sync),
+    produce: Option<&(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)>,
+    after: Option<&(dyn Fn(usize) + Sync)>,
+    pairs: &[(usize, usize)],
+    nbuf: usize,
+    _claim: StFmpClaim,
+) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n_pairs = pairs.len();
+    assert_eq!(n_pairs * 2, rayon::current_num_threads());
+    assert!((2..=ST_FMP_CAP).contains(&nbuf));
+    assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
     {
@@ -1436,7 +1636,25 @@ fn st_fmp_run(
             }
             let _fg = FGuard { st };
             let mut i = 0usize;
+            let mut epoch = 0usize;
             loop {
+                if let Some(produce) = produce
+                    && i.is_multiple_of(2)
+                {
+                    while st.announced.load(Ordering::Acquire) <= epoch {
+                        if st.total.load(Ordering::Acquire) <= i {
+                            return;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    epoch += 1;
+                    let group = st.group.load(Ordering::Relaxed);
+                    produce(group, 1,
+                        st.producer_output[0].load(Ordering::Relaxed) as *mut F128,
+                        st.producer_output[1].load(Ordering::Relaxed) as *mut F128);
+                    unsafe { core::arch::x86_64::_mm_sfence() };
+                    st.witness_done.store(epoch, Ordering::Release);
+                }
                 loop {
                     if st.seeded.load(Ordering::Acquire) > i {
                         break;
@@ -1468,6 +1686,8 @@ fn st_fmp_run(
         // ---- the M+P sibling: seed, then publish what F has folded ----
         // `nbuf` back-to-back 512-row staging blocks; the pair works on two of
         // them at a time.
+        // Producers seed directly into the reserved staging pair from their
+        // private 16 KiB octa scratch. No group-sized input allocation exists.
         let mut staging = staging_block(512 * nbuf, row_len);
         let bufp = staging.as_mut_ptr();
         st.bufp.store(bufp as usize, Ordering::Release);
@@ -1493,54 +1713,79 @@ fn st_fmp_run(
         }
         let _drain = DrainGuard { st };
         let mut i = 0usize;
-        loop {
-            let r = next.fetch_add(1, Ordering::Relaxed);
-            if r >= n_tasks {
-                break;
-            }
-            if i >= nbuf {
-                // Slot `i % nbuf` still holds task `i - nbuf`. Publishing it
-                // is what frees the slot, so it must happen before the seed.
-                let j = i - nbuf;
-                if !st.wait_folded(j + 1) {
-                    // Only reachable when the fold sibling panicked; that
-                    // panic is already unwinding and `rayon::broadcast`
-                    // propagates it to the caller, so no proof is produced
-                    // from the partial codeword this leaves behind.
-                    return;
-                }
-                // SAFETY: `staging` holds `nbuf` blocks of `512 * row_len`
-                // F128s; the acquire in `wait_folded` synchronises with the
-                // fold sibling's release for task `j`, so every byte it wrote
-                // is visible here, and it will not touch slot `j % nbuf`
-                // again until this thread republishes it below.
-                unsafe {
-                    publish(bufp.add((j % nbuf) * stride), *st.slot_r[j % nbuf].get());
-                }
-            }
-            let s = i % nbuf;
-            // SAFETY: slot `s` is free — for `i < nbuf` it has never been
-            // used, and otherwise its previous occupant was just published.
-            unsafe {
-                seed(bufp.add(s * stride), r);
-                *st.slot_r[s].get() = r;
-            }
-            st.seeded.store(i + 1, Ordering::Release);
-            i += 1;
-        }
-        // No more tasks: publish the count first so the fold sibling can
-        // leave, then drain the blocks still in flight.
-        st.total.store(i, Ordering::Release);
-        for j in i.saturating_sub(nbuf)..i {
+        let mut published = 0usize;
+        let mut epoch = 0usize;
+        let group_width = if produce.is_some() { 2 } else { 1 };
+        let publish_ready = |j: usize| {
             if !st.wait_folded(j + 1) {
-                return;
+                return false;
             }
-            // SAFETY: as above; slot `j % nbuf` was last written for task `j`
-            // (the next write to it would have been task `j + nbuf`, which
-            // was never claimed).
+            // SAFETY: the folded acquire gives this thread the completed
+            // slot. Only this thread publishes or reuses it, in that order.
             unsafe {
                 publish(bufp.add((j % nbuf) * stride), *st.slot_r[j % nbuf].get());
             }
+            true
+        };
+        loop {
+            let first_r = next.fetch_add(group_width, Ordering::Relaxed);
+            if first_r >= n_tasks {
+                break;
+            }
+            if let Some(produce) = produce {
+                // Both output slots must be published before either producer
+                // may seed them. With two slots this joins the previous group;
+                // larger rings can retain old slots while producing new ones.
+                while i + 2 - published > nbuf {
+                    if !publish_ready(published) { return; }
+                    published += 1;
+                }
+                let output0 = unsafe { bufp.add((i % nbuf) * stride) };
+                let output1 = unsafe { bufp.add(((i + 1) % nbuf) * stride) };
+                st.producer_output[0].store(output0 as usize, Ordering::Relaxed);
+                st.producer_output[1].store(output1 as usize, Ordering::Relaxed);
+                epoch += 1;
+                st.group.store(first_r / 2, Ordering::Relaxed);
+                st.announced.store(epoch, Ordering::Release);
+                produce(first_r / 2, 0, output0, output1);
+                unsafe { core::arch::x86_64::_mm_sfence() };
+                while st.witness_done.load(Ordering::Acquire) < epoch {
+                    if st.f_gone.load(Ordering::Acquire) {
+                        // A callback on F unwound. Broadcast propagates it;
+                        // DrainGuard still joins F before staging is freed.
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+            for r in first_r..(first_r + group_width).min(n_tasks) {
+                if i - published == nbuf {
+                    if !publish_ready(published) {
+                        return;
+                    }
+                    published += 1;
+                }
+                let s = i % nbuf;
+                // SAFETY: this slot is either unused or was published above.
+                // Generated staging was already seeded by the two disjoint
+                // producer roles, joined above. Ready input still uses seed.
+                unsafe {
+                    if produce.is_none() { seed(bufp.add(s * stride), r, core::ptr::null()); }
+                    *st.slot_r[s].get() = r;
+                }
+                st.seeded.store(i + 1, Ordering::Release);
+                i += 1;
+            }
+            // The next group reserves both of its output slots before any
+            // producer can write. Final draining and DrainGuard join every
+            // fold and callback before the staging allocation is released.
+        }
+        st.total.store(i, Ordering::Release);
+        while published < i {
+            if !publish_ready(published) {
+                return;
+            }
+            published += 1;
         }
     };
     let Some(after) = after else {
@@ -1595,6 +1840,41 @@ fn st_fmp_run(
         after(idx);
     });
     true
+}
+
+/// Seed one of the two rows of a completed compact witness group. The
+/// producer stores compression (kpair,lane) at kpair*8+lane; lane=2*q+(k&1).
+/// Thus a source row is16*(k/2)+2*(k%2)+(r%2)+4*q. q/r_s are solely address
+/// geometry in the existing kernels; all field coefficients and output rows
+/// remain the ordinary global-row seed's coefficients and output rows.
+///
+/// # Safety
+/// `src` owns512 initialized rows of64 F128, written by both joined producer
+/// roles. `bufp` owns512 disjoint staging rows. The input lives through return.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+unsafe fn seed_compact_witness_group(
+    bufp: *mut F128, src: *const F128, r: usize, row_len: usize,
+    odd_tail: usize, stage_perm: bool, seed_right: F128, seed_dense: &[F128;3],
+) {
+    debug_assert_eq!(row_len, 64);
+    unsafe {
+        for k in 0..64 {
+            let rs = (k / 2) * 16 + (k % 2) * 2 + (r & 1);
+            let kp = seed_top_stage_row(k, stage_perm);
+            if !ntt_seed_hold4_disabled() {
+                let active = if r & 1 == 1 { row_len - odd_tail } else { row_len };
+                kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                    src, 4, rs, bufp.add(kp * row_len), bufp.add((256 + kp) * row_len),
+                    64, row_len, active, seed_right, seed_dense, core::ptr::null());
+            } else {
+                kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                    src, 4, rs, bufp.add(kp * row_len), 64, 0, row_len, seed_right);
+                kernels::butterfly_fused_2layer_row_from_geo(
+                    src, 4, rs, bufp.add((256 + kp) * row_len), 64, 0, row_len, seed_dense);
+            }
+        }
+    }
 }
 
 /// The fused-four half of [`AdditiveNttF128::seed_top_direct_fused2_publish`]:
@@ -1866,7 +2146,7 @@ impl AdditiveNttF128 {
                 3,
                 None,
                 on_sub_done,
-                Some(msg),
+                Some(SeedInput::Ready(msg)),
             );
         } else {
             self.seed_rate_half_layers_1_through_2(msg, codeword, num_ntts);
@@ -1891,6 +2171,49 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )) || cfg!(test)
+    }
+
+    /// Encode a ranked message while two siblings generate each 2-r input
+    /// group. No shared reference to the message is created until all writes
+    /// have joined; seed kernels consume only each published group's rows.
+    ///
+    /// # Safety
+    /// `produce(base, group, role, seed_target)` must use the supplied base, not a raw
+    /// pointer derived before the exclusive `msg` borrow. For group 0..1024
+    /// and role 0..2, it owns kpair in (role..32).step_by(2), all q=0..4,
+    /// both k=2*kpair and k+1, and both r=2*group and r+1. These rows at
+    /// `q*2^17 + k*2^11 + r` each contain 64 fields. Every field must remain
+    /// initialized, including any proven constant-elision regions.
+    /// A Some `seed_target` owns two reserved staging blocks for this group.
+    /// For every owned kpair, fully initialize a private q-major octa input
+    /// and call seed_octa once before reusing it. Both roles join before any
+    /// folding or slot reuse. The materialize-first fallback passes None and
+    /// requires only the complete global witness. The encoder joins every
+    /// producer on unwinding too; no input or target pointer may escape.
+    /// Calls may run concurrently and must not access other groups/roles or
+    /// retain pointers after return. Any extra outputs must be similarly
+    /// disjoint and remain exclusively borrowed until this function returns.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    pub(crate) unsafe fn rs_encode_generated_on_range_done(
+        &self,
+        msg: &mut [F128],
+        codeword: &mut [F128],
+        produce: &(dyn Fn(*mut F128, usize, usize, Option<&WitnessSeedTarget>) + Sync),
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        assert_eq!(msg.len(), 1 << 25);
+        assert_eq!(codeword.len(), 1 << 26);
+        assert_eq!(self.log_domain_size(), 20);
+        // SAFETY: forward this entry's exclusive borrow and producer contract.
+        let input = unsafe { SeedInput::generating(msg, produce) };
+        if rate_half_seed_disabled() || ntt_seed_top_fusion_disabled() {
+            let ready = input.into_ready();
+            self.rs_encode_interleaved_on_range_done(ready, codeword, 64, on_range_done);
+        } else {
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                codeword, 64, 3, None, Some(on_range_done), Some(input),
+            );
+        }
     }
 
     /// [`Self::rs_encode_interleaved`] plus a same-worker hook: after the
@@ -2753,7 +3076,7 @@ impl AdditiveNttF128 {
     #[allow(clippy::manual_is_multiple_of)]
     fn seed_top_fused8_pass(
         &self,
-        msg: &[F128],
+        msg: SeedInput<'_>,
         data: &mut [F128],
         num_ntts: usize,
         log_d: usize,
@@ -2885,8 +3208,15 @@ impl AdditiveNttF128 {
         //
         // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
         // `bufp` addresses the 512 staging rows that only this task writes.
-        let seed = |bufp: *mut F128, r: usize| {
+        let seed = |bufp: *mut F128, r: usize, compact: *const F128| {
             unsafe {
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                if !compact.is_null() {
+                    seed_compact_witness_group(bufp, compact, r, row_len,
+                        if seed_odd_tail { odd_tail } else { 0 }, stage_perm,
+                        seed_right, &seed_dense);
+                    return;
+                }
                 let src = src_addr as *const F128;
                 // Seed: 64 row groups → staging rows [block][k].
                 //
@@ -3059,7 +3389,7 @@ impl AdditiveNttF128 {
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             let bufp = buf.as_mut_ptr();
-            seed(bufp, r);
+            seed(bufp, r, core::ptr::null());
             // SAFETY: codeword rows `block·B + r + k·S` are inside `data`;
             // distinct `r` select pairwise-disjoint codeword row sets, so no two
             // concurrent tasks write the same element. `buf` (512 rows) is this
@@ -3211,6 +3541,17 @@ impl AdditiveNttF128 {
             }
         };
 
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let produce = msg.producer().map(|produce| {
+            move |group, role, output0, output1| {
+                let target = WitnessSeedTarget {
+                    output: [output0, output1],
+                    odd_tail: if seed_odd_tail { odd_tail } else { 0 },
+                    stage_perm, right: seed_right, dense: seed_dense,
+                };
+                produce(src_addr as *mut F128, group, role, Some(&target));
+            }
+        });
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // across every lane the selected downstream path can read. The exact
@@ -3220,6 +3561,7 @@ impl AdditiveNttF128 {
         // per init was therefore dead work — rayon runs the
         // initializer once per JOB, not per worker.
         if sub_stride < PARALLEL_TASK_THRESHOLD {
+            msg.generate_all();
             let mut buf = staging_block(512, row_len);
             for r in 0..sub_stride {
                 task(&mut buf, r);
@@ -3236,10 +3578,14 @@ impl AdditiveNttF128 {
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            if direct_publish && st_fmp_run(sub_stride, row_len, &seed, &fold4, &publish2, after)
+            if direct_publish && st_fmp_run(
+                sub_stride, row_len, &seed, &fold4, &publish2,
+                produce.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after,
+            )
             {
                 return after.is_some();
             }
+            msg.generate_all();
             (0..sub_stride)
                 .into_par_iter()
                 .for_each_init(|| staging_block(512, row_len), |buf, r| task(buf, r));
@@ -3400,7 +3746,7 @@ impl AdditiveNttF128 {
             &mut (dyn FnMut(usize, core::ops::Range<usize>) + Send),
         )>,
         on_sub_done: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
-        seed_msg: Option<&[F128]>,
+        seed_msg: Option<SeedInput<'_>>,
     ) {
         use rayon::prelude::*;
         let n_total = data.len();
@@ -3438,12 +3784,10 @@ impl AdditiveNttF128 {
         // message. That is only possible when layers 3..8 are all top layers;
         // otherwise run the separate seed pass here and continue as usual.
         let mut seed_msg = seed_msg;
-        if let Some(msg) = seed_msg {
-            let fits = start_layer == 3 && top_fusion_ok && n_top >= 9 && log_d >= 9;
-            if !fits {
-                self.seed_rate_half_layers_1_through_2(msg, data, num_ntts);
-                seed_msg = None;
-            }
+        let seed_fits = start_layer == 3 && top_fusion_ok && n_top >= 9 && log_d >= 9;
+        if seed_msg.is_some() && !seed_fits {
+            let msg = seed_msg.take().unwrap().into_ready();
+            self.seed_rate_half_layers_1_through_2(msg, data, num_ntts);
         }
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
@@ -3805,8 +4149,9 @@ impl AdditiveNttF128 {
                 // before publishing it, and the release on the ring head /
                 // acquire in the claiming pop order those writes before
                 // this read.
-                let blk = unsafe { std::slice::from_raw_parts(b.ptr as *const F128, b.len_f128) };
-                cb(b.lo..b.hi, blk);
+                let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
+                let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
+                cb(b.lo..b.lo + DeepBlock::ROWS, blk);
             };
             // Shared drain: own ring first, then every other pair's, until
             // all producers are done and every ring is empty.
@@ -3834,11 +4179,9 @@ impl AdditiveNttF128 {
             };
             if producer {
                 let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
-                    let b = DeepBlock {
-                        ptr: blk.as_ptr() as usize,
-                        len_f128: blk.len(),
-                        lo: range.start,
-                        hi: range.end,
+                    let Some(b) = DeepBlock::from_finished(&range, blk, deep_base_addr, num_ntts) else {
+                        cb(range, blk);
+                        return;
                     };
                     let queued = if share {
                         q.try_push(b, depth)
@@ -5228,7 +5571,7 @@ mod tests {
     ))]
     #[test]
     fn st_fmp_bufs_default_override_and_clamp() {
-        assert_eq!(select_st_fmp_bufs(None), 2);
+        assert_eq!(select_st_fmp_bufs(None), 3);
         assert_eq!(select_st_fmp_bufs(Some(0)), 2);
         assert_eq!(select_st_fmp_bufs(Some(1)), 2);
         assert_eq!(select_st_fmp_bufs(Some(2)), 2);
@@ -5307,7 +5650,8 @@ mod tests {
                     lo: !(r as u64),
                     hi: rep as u64 + 1,
                 };
-                let seed = |p: *mut F128, r: usize| {
+                let seed = |p: *mut F128, r: usize, compact: *const F128| {
+                    assert!(compact.is_null());
                     seeded[r].fetch_add(1, Ordering::Relaxed);
                     // SAFETY: `p` is this task's staging block, 512 * ROW_LEN
                     // elements, owned by the seeder until it publishes it.
@@ -5334,7 +5678,7 @@ mod tests {
                     }
                     published[r].fetch_add(1, Ordering::Relaxed);
                 };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None));
+                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None, None));
                 for r in 0..n_tasks {
                     assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
                     assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
@@ -5346,6 +5690,89 @@ mod tests {
                 }
             }
         }
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_queue_atomic_index_stalled_wrap() {
+        use std::sync::atomic::Ordering;
+        for after_wrap in [false, true] {
+            let q = DeepQueue::new();
+            assert!(q.try_push(DeepBlock { lo: 0 }, 8));
+            let stale = q.tail.load(Ordering::Acquire);
+            assert!(q.head.load(Ordering::Acquire) > stale);
+            let before = q.slots[stale % DeepQueue::CAP].load(Ordering::Relaxed);
+            for i in 0..DeepQueue::CAP {
+                assert_eq!(q.try_pop().unwrap().lo, i * DeepBlock::ROWS);
+                assert!(q.try_push(DeepBlock { lo: (i + 1) * DeepBlock::ROWS }, 8));
+            }
+            let copied = if after_wrap {
+                q.slots[stale % DeepQueue::CAP].load(Ordering::Relaxed)
+            } else { before };
+            assert_eq!(copied, if after_wrap { DeepQueue::CAP * DeepBlock::ROWS } else { 0 });
+            assert!(q.tail.compare_exchange(stale, stale + 1, Ordering::AcqRel, Ordering::Acquire).is_err());
+            assert_eq!(q.try_pop().unwrap().lo, DeepQueue::CAP * DeepBlock::ROWS);
+            assert!(q.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_deep_token_rejects_noncanonical_ranges() {
+        let columns = 8;
+        let data = vec![F128::ZERO; 256 * columns];
+        let base = data.as_ptr() as usize;
+        assert_eq!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns).unwrap().lo, 0);
+        assert_eq!(DeepBlock::from_finished(&(128..256), &data[128 * columns..], base, columns).unwrap().lo, 128);
+        assert!(DeepBlock::from_finished(&(0..256), &data, base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[128 * columns..], base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..64 * columns], base, columns).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns + 1).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_index_queue_reconstructs_finished_callbacks() {
+        use std::sync::Mutex;
+        let mut rng = Rng::new(0x8a17_c103);
+        let ntt = AdditiveNttF128::standard(13);
+        let mut cases = 0;
+        let mut callbacks = 0;
+        for columns in [1usize, 8, 64] {
+            for sub_idx in [0usize, 3] {
+                let mut data = rand_vec(&mut rng, (1 << 13) * columns);
+                let base = data.as_ptr() as usize;
+                let snapshots = Mutex::new(Vec::new());
+                let q = DeepQueue::new();
+                let callback = |range: core::ops::Range<usize>, block: &[F128]| {
+                    let token = DeepBlock::from_finished(&range, block, base, columns).expect("fixed callback");
+                    assert!(q.try_push(token, 8));
+                    let got = q.try_pop().unwrap();
+                    let ptr = (base as *const F128).wrapping_add(got.lo * columns);
+                    let restored = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * columns) };
+                    assert_eq!(range, got.lo..got.lo + DeepBlock::ROWS);
+                    assert_eq!(restored.as_ptr(), block.as_ptr());
+                    assert_eq!(restored, block);
+                    snapshots.lock().unwrap().push((range, block.to_vec()));
+                };
+                let lo = sub_idx * 2048 * columns;
+                assert!(ntt.deep_sub_fused_blocks_fallback(
+                    sub_idx, &mut data[lo..lo + 2048 * columns], &callback,
+                    2, 13, columns, 0, 2048, 0,
+                ));
+                let snapshots = snapshots.into_inner().unwrap();
+                assert_eq!(snapshots.len(), 16);
+                for (j, (range, values)) in snapshots.into_iter().enumerate() {
+                    assert_eq!(range.start, sub_idx * 2048 + j * DeepBlock::ROWS);
+                    assert_eq!(values, data[range.start * columns..range.end * columns]);
+                    callbacks += 1;
+                }
+                assert!(q.is_empty());
+                cases += 1;
+            }
+        }
+        println!("atomic token cases={cases} finalized_callbacks={callbacks}");
     }
 
     #[cfg(target_os = "linux")]
@@ -5378,12 +5805,7 @@ mod tests {
                 let mut all_published = true;
                 for i in 0..N {
                     all_published &= queue.push(
-                        DeepBlock {
-                            ptr: i,
-                            len_f128: i + 1,
-                            lo: i * 2,
-                            hi: i * 2 + 1,
-                        },
+                        DeepBlock { lo: i * 2 },
                         DeepQueue::DEFAULT_DEPTH,
                     );
                 }
@@ -5400,7 +5822,7 @@ mod tests {
             };
             let mut seen = Vec::with_capacity(N);
             while let Some(block) = queue.pop() {
-                seen.push((block.ptr, block.len_f128, block.lo, block.hi));
+                seen.push(block.lo);
             }
             (producer.join().unwrap(), initial_head, seen)
         });
@@ -5409,7 +5831,7 @@ mod tests {
         assert_eq!(initial_head, DeepQueue::DEFAULT_DEPTH);
         assert_eq!(seen.len(), N);
         for (i, block) in seen.into_iter().enumerate() {
-            assert_eq!(block, (i, i + 1, i * 2, i * 2 + 1));
+            assert_eq!(block, i * 2);
         }
         assert_eq!(queue.head.load(Ordering::Relaxed), N);
         assert_eq!(queue.tail.load(Ordering::Relaxed), N);
@@ -7469,5 +7891,243 @@ mod prepared_four_composition_tests {
         eprintln!(
             "{cases} complete prepared-four block and owned-table cases matched raw rows with guards"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod generated_pair_dispatch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+
+    #[test]
+    #[ignore = "requires four CPUs and exclusive global claim; run with --ignored --test-threads=1"]
+    fn generated_pair_actual_dispatch_joins_panics_and_recovers() {
+        let mask = affinity::get();
+        let cpus: Vec<_> = (0..mask.len()*64)
+            .filter(|&c| mask[c/64] & (1 << (c%64)) != 0).take(4).collect();
+        assert_eq!(cpus.len(),4);
+        let pairs = [(cpus[0],cpus[1]),(cpus[2],cpus[3])];
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut normal_runs=0;let mut injected_panics=0;let mut reuse_checks=0;
+        let cases = [
+            (0,true,2),(1,true,2),(0,true,2),(2,true,2),(0,true,2),
+            (3,true,2),(0,true,2),(4,true,2),(0,true,2),(5,true,2),(0,true,2),
+            (0,true,3),(0,true,4),(6,true,2),(0,true,2),(7,true,2),(0,true,2),
+            (8,true,2),(0,true,2),(9,true,2),(0,true,2),(10,true,2),(0,true,2),
+            (0,false,2),(0,false,3),(0,false,4),
+        ];
+        for (round,(injection,generating,nbuf)) in cases.into_iter().enumerate() {
+            let counts:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
+            let published:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
+            let seeded:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
+            let previous=std::sync::Mutex::new(std::collections::HashMap::<usize,usize>::new());
+            let reused=AtomicUsize::new(0);let after_count=AtomicUsize::new(0);
+            let live=AtomicUsize::new(0);let injected=AtomicBool::new(false);
+            struct Guard<'a>(&'a AtomicUsize);
+            impl Drop for Guard<'_>{fn drop(&mut self){self.0.fetch_sub(1,AcqRel);}}
+            let enter=||{live.fetch_add(1,AcqRel);Guard(&live)};
+            let fail=|point|{if injection==point && !injected.swap(true,AcqRel){panic!("injected octa dispatch point {point}")}};
+            let produce=|group:usize,role:usize,out0:*mut F128,out1:*mut F128| {
+                let _guard=enter();assert!(group<1024 && role<2);
+                assert_eq!(counts[2*group+role].fetch_add(1,Relaxed),0);
+                fail(role+1);if role==1 && group>=4 {fail(7);}
+                if !out0.is_null() {
+                    assert!(!out1.is_null());assert_ne!(out0,out1);
+                    for (parity,slot) in [out0,out1].into_iter().enumerate() {
+                        let r=2*group+parity;
+                        if role==0 {
+                            let old=previous.lock().unwrap().insert(slot as usize,r);
+                            if let Some(old)=old {
+                                assert_eq!(published[old].load(Acquire),1,"producer overwrote unpublished stage");
+                                reused.fetch_add(1,Relaxed);fail(6);
+                            }
+                            fail(3);if group>=4{fail(8);}
+                        }
+                        // Each role owns a disjoint full line in each output.
+                        unsafe {
+                            slot.add(role*4).write(F128::new(r as u64,round as u64));
+                            slot.add(role*4+1).write(F128::new(!r as u64,0x12ab));
+                        }
+                        seeded[r].fetch_add(1,Release);
+                    }
+                } else {assert!(out1.is_null());}
+                if (group+role+round)%7==0 {std::thread::yield_now();}
+            };
+            let seed=|slot:*mut F128,r:usize,input:*const F128| {
+                let _guard=enter();assert!(!generating,"generated input seeded a second time");assert!(input.is_null());
+                assert_eq!(counts[2*(r/2)].load(Relaxed),1);
+                assert_eq!(counts[2*(r/2)+1].load(Relaxed),1);
+                for role in 0..2 {unsafe {
+                    slot.add(role*4).write(F128::new(r as u64,round as u64));
+                    slot.add(role*4+1).write(F128::new(!r as u64,0x12ab));
+                }}
+                assert_eq!(seeded[r].fetch_add(2,Release),0);
+            };
+            let fold=|slot:*mut F128,r:usize| {
+                let _guard=enter();fail(4);if r>=8{fail(9);}
+                assert_eq!(seeded[r].load(Acquire),2,"fold ran before both seed roles joined");
+                for role in 0..2 {unsafe {
+                    assert_eq!(*slot.add(role*4),F128::new(r as u64,round as u64));
+                    assert_eq!(*slot.add(role*4+1),F128::new(!r as u64,0x12ab));
+                    (*slot.add(role*4+1)).hi=0x98fe;
+                }}
+                if (r+round)%19==0{std::thread::yield_now();}
+            };
+            let publish=|slot:*mut F128,r:usize| {
+                let _guard=enter();fail(5);if r>=8{fail(10);}
+                for role in 0..2 {unsafe {
+                    assert_eq!(*slot.add(role*4),F128::new(r as u64,round as u64));
+                    assert_eq!(*slot.add(role*4+1),F128::new(!r as u64,0x98fe));
+                    (*slot.add(role*4+1)).hi=0;
+                }}
+                assert_eq!(published[r].fetch_add(1,Release),0);
+            };
+            let after=|_:usize| {
+                assert!(published.iter().all(|v|v.load(Relaxed)==1));
+                assert!(counts.iter().all(|v|v.load(Relaxed)==1));
+                after_count.fetch_add(1,Relaxed);
+            };
+            if !generating {for group in 0..1024{produce(group,0,core::ptr::null_mut(),core::ptr::null_mut());produce(group,1,core::ptr::null_mut(),core::ptr::null_mut());}}
+            let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
+            let claim=StFmpClaim::take().expect("previous call leaked its claim");
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
+                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,claim))));
+            assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
+            if injection==0 {
+                assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
+                assert!(published.iter().all(|v|v.load(Relaxed)==1));
+                assert!(seeded.iter().all(|v|v.load(Relaxed)==2));
+                if generating{assert_eq!(reused.load(Relaxed),2048-previous.lock().unwrap().len());}
+                reuse_checks+=reused.load(Relaxed);normal_runs+=1;
+            } else {
+                let payload=result.expect_err("injected panic was swallowed");
+                let message=payload.downcast_ref::<String>().map(String::as_str).or_else(||payload.downcast_ref::<&str>().copied()).unwrap_or("");
+                assert!(message.starts_with("injected octa dispatch point"),"{message}");
+                assert!(injected.load(Acquire));assert_eq!(after_count.load(Relaxed),0);injected_panics+=1;
+            }
+        }
+        println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true");
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod compact_seed_geometry_tests {
+    use super::*;
+    unsafe extern "C" {
+        fn mmap(p: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut core::ffi::c_void;
+        fn munmap(p: *mut core::ffi::c_void, len: usize) -> i32;
+    }
+    struct Arena(*mut F128);
+    impl Drop for Arena {
+        fn drop(&mut self) { assert_eq!(unsafe { munmap(self.0.cast(), 1 << 29) }, 0); }
+    }
+    #[test]
+    fn compact_seed_rows_match_global_geometry_and_detect_wrong_quarter() {
+        let p = unsafe { mmap(core::ptr::null_mut(), 1 << 29, 3, 0x22, -1, 0) };
+        assert_ne!(p as isize, -1);
+        let global = Arena(p.cast());
+        let mut compact = vec![F128::ZERO; 512 * 64];
+        let poison = F128 { lo: 0x9999999999999999, hi: 0x3333333333333333 };
+        let mut checked = 0;
+        let mut detected = 0;
+        let mut rng = 0x6929_1a64_e2d6_7b3cu64;
+        let mut random = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        for group in [0usize, 1, 127, 511, 1023] {
+            // Independent producer order: each actual SIMD octa is kpair,
+            // and its eight lanes are q-major with adjacent k parity.
+            for kpair in 0..32 {
+                for lane in 0..8 {
+                    let compression = (lane / 2) * 65536 + (2 * kpair + lane % 2) * 1024 + group;
+                    for part in 0..2 {
+                        for field in 0..64 {
+                            let value = if part == 1 && field >= 60 { F128::ZERO }
+                                else { F128 { lo: random(), hi: random() } };
+                            compact[((kpair * 8 + lane) * 2 + part) * 64 + field] = value;
+                            unsafe { global.0.add((2 * compression + part) * 64 + field).write(value); }
+                        }
+                    }
+                }
+            }
+            for perm in [false, true] {
+                for tail in [0, 4] {
+                    for parity in 0..2 {
+                        let r = 2 * group + parity;
+                        let right = F128 { lo: random(), hi: random() };
+                        let dense = [F128 { lo: random(), hi: 0 }, F128 { lo: random(), hi: random() }, F128 { lo: random(), hi: random() }];
+                        let mut expected = vec![poison; 512 * 64];
+                        let mut actual = expected.clone();
+                        let mut wrong = expected.clone();
+                        unsafe {
+                            // Ordinary completed-message geometry, exactly the
+                            // original production seed's global indices.
+                            for k in 0..64 {
+                                let rs = r + k * 2048;
+                                let kp = seed_top_stage_row(k, perm);
+                                if !ntt_seed_hold4_disabled() {
+                                    kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                                        global.0, 131072, rs, expected.as_mut_ptr().add(kp*64), expected.as_mut_ptr().add((256+kp)*64),
+                                        64, 64, if parity == 1 { 64-tail } else { 64 }, right, &dense, core::ptr::null());
+                                } else {
+                                    kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                                        global.0, 131072, rs, expected.as_mut_ptr().add(kp*64), 64, 0, 64, right);
+                                    kernels::butterfly_fused_2layer_row_from_geo(
+                                        global.0, 131072, rs, expected.as_mut_ptr().add((256+kp)*64), 64, 0, 64, &dense);
+                                }
+                            }
+                            seed_compact_witness_group(actual.as_mut_ptr(), compact.as_ptr(), r, 64, tail, perm, right, &dense);
+                            assert_eq!(actual, expected, "group={group} parity={parity} perm={perm} tail={tail}");
+                            // A valid in-bounds but wrong q ordering must fail.
+                            for j in 0..64 { compact.swap(parity*64+j, (4+parity)*64+j); }
+                            seed_compact_witness_group(wrong.as_mut_ptr(), compact.as_ptr(), r, 64, tail, perm, right, &dense);
+                            assert_ne!(wrong, expected, "wrong-quarter negative control was invisible");
+                            for j in 0..64 { compact.swap(parity*64+j, (4+parity)*64+j); }
+                        }
+                        checked += 1;
+                        detected += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 40);
+        assert_eq!(detected, 40);
+        println!("COMPACT_SEED_GEOMETRY full_staging_equalities={checked} wrong_quarter_mutants_detected={detected} groups=5 parities=2 row_permutations=2 tail_modes=2 hold4_disabled={} actual_production_helper=true", ntt_seed_hold4_disabled());
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod octa_seed_geometry_tests {
+    use super::*;
+    #[test]
+    fn immediate_octa_seed_matches_full_group_and_preserves_guards() {
+        let poison=F128::new(0x0123456789abcdef,0xfedcba9876543210);
+        let mut rng=0xa78b_291a_07fa_f559u64;
+        let mut next=||{rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;F128::new(rng,rng.rotate_left(19)^0x9e3779b97f4a7c15)};
+        let mut cases=0;let mut negative_controls=0;
+        for low in [false,true]{for perm in [false,true]{for tail in [0,4]{for _ in 0..2 {
+            let input:Vec<_>=(0..512*64).map(|i|if i%128>=124 {F128::ZERO}else{next()}).collect();
+            let original=input.clone();let right=next();let mut dense=[next(),next(),next()];if low{dense[0].hi=0;}
+            let mut expected=vec![poison;2*512*64+8];let mut actual=expected.clone();
+            unsafe {
+                for parity in 0..2{seed_compact_witness_group(expected.as_mut_ptr().add(4+parity*512*64),input.as_ptr(),parity,64,tail,perm,right,&dense);}
+                let target=WitnessSeedTarget{output:[actual.as_mut_ptr().add(4),actual.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,right,dense};
+                // Actual producer order: roles process alternating kpair, each
+                // fully consumes its reusable local input before overwriting.
+                let mut local=[F128::ZERO;8*128];
+                for role in 0..2{for kpair in(role..32).step_by(2){
+                    local.copy_from_slice(&input[kpair*1024..(kpair+1)*1024]);
+                    target.seed_octa(local.as_ptr(),kpair);
+                    local.fill(poison);
+                }}
+            }
+            assert_eq!(actual,expected,"low={low} perm={perm} tail={tail}");assert_eq!(input,original);
+            assert!(actual[..4].iter().chain(actual[actual.len()-4..].iter()).all(|v|*v==poison));
+            let mut wrong=vec![poison;2*512*64+8];let mut local=input[..1024].to_vec();
+            for lane in 0..128{local.swap(lane,4*128+lane);}
+            unsafe {let target=WitnessSeedTarget{output:[wrong.as_mut_ptr().add(4),wrong.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,right,dense};target.seed_octa(local.as_ptr(),0);}
+            // Compare one independently selected output lane affected by q0.
+            assert_ne!(wrong[4],expected[4]);negative_controls+=1;cases+=1;
+        }}}}
+        println!("OCTA_SEED_GEOMETRY full_groups={cases} fields_per_group=63488_or_65536 wrong_quarter_controls={negative_controls} input_unchanged=true guards_unchanged=true reusable_local_input=true hold4_disabled={}",ntt_seed_hold4_disabled());
     }
 }
