@@ -2950,8 +2950,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
+        static ROOT_CACHE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let root_enabled = linear_fold_enabled()
-            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
+            && *ROOT_CACHE_ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none());
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
                 let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
