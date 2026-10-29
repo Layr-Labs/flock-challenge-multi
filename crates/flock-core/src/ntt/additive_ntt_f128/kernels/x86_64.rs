@@ -5032,3 +5032,236 @@ mod seed_compact_address_oracle_tests {
         println!("576 production compact-address seed cases match independent bitwise products, guards, source and twiddle immutability");
     }
 }
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+mod seed_three_three {
+    use super::*;
+    use core::arch::x86_64::*;
+    const GAP: usize = 2048 * 64;
+    #[repr(C, align(16))]
+    struct PreparedThree {
+        pairs: [[F128; 2]; 7],
+    }
+    #[inline(always)]
+    unsafe fn direct_three_store(out: *mut F128, v: [__m512i; 8]) {
+        unsafe {
+            core::arch::asm!(
+            "vmovntdq zmmword ptr [{out} + 0], {v0}",
+            "vmovntdq zmmword ptr [{out} + 2097152], {v1}",
+            "vmovntdq zmmword ptr [{out} + 4194304], {v2}",
+            "vmovntdq zmmword ptr [{out} + 6291456], {v3}",
+            "vmovntdq zmmword ptr [{out} + 8388608], {v4}",
+            "vmovntdq zmmword ptr [{out} + 10485760], {v5}",
+            "vmovntdq zmmword ptr [{out} + 12582912], {v6}",
+            "vmovntdq zmmword ptr [{out} + 14680064], {v7}",
+            out=in(reg)out,
+            v0=in(zmm_reg)v[0],
+            v1=in(zmm_reg)v[1],
+            v2=in(zmm_reg)v[2],
+            v3=in(zmm_reg)v[3],
+            v4=in(zmm_reg)v[4],
+            v5=in(zmm_reg)v[5],
+            v6=in(zmm_reg)v[6],
+            v7=in(zmm_reg)v[7],
+            options(nostack,preserves_flags),
+            );
+        }
+    }
+    #[inline(always)]
+    unsafe fn butterfly_three_general(mut values: [__m512i; 8], tw: &[TwX4; 7]) -> [__m512i; 8] {
+        unsafe {
+            // Reuse the previously reviewed three-layer delayed-addend identity.
+            // Only reduced field elements are multiplicands; pending halves are addends.
+            let zero = _mm512_setzero_si512();
+            let mut pending = [zero; 8];
+            macro_rules! lazy {
+                ($u:expr,$v:expr,$t:expr,$fold:expr) => {{
+                    let (lo, hi) = mul_x4_parts::<false>($t, values[$v]);
+                    pending[$u] = _mm512_xor_si512(pending[$u], hi);
+                    let mut new_u = _mm512_xor_si512(values[$u], lo);
+                    if $fold {
+                        new_u = _mm512_xor_si512(new_u, fold_x64(pending[$u]));
+                        pending[$u] = zero;
+                    }
+                    values[$v] = _mm512_xor_si512(values[$v], new_u);
+                    pending[$v] = _mm512_xor_si512(pending[$v], pending[$u]);
+                    values[$u] = new_u;
+                }};
+            }
+            for i in 0..4 {
+                lazy!(i, i + 4, tw[0], i & 2 != 0);
+            }
+            for s in 0..2 {
+                for i in 0..2 {
+                    lazy!(4 * s + i, 4 * s + i + 2, tw[1 + s], i & 1 != 0);
+                }
+            }
+            for s in 0..4 {
+                lazy!(2 * s, 2 * s + 1, tw[3 + s], true);
+            }
+            values
+        }
+    }
+    #[inline(always)]
+    unsafe fn broadcast_three(t: &PreparedThree) -> [TwX4; 7] {
+        unsafe {
+            core::array::from_fn(|i| {
+                (
+                    _mm512_broadcast_i32x4(_mm_loadu_si128((&t.pairs[i][0] as *const F128).cast())),
+                    _mm512_broadcast_i32x4(_mm_loadu_si128((&t.pairs[i][1] as *const F128).cast())),
+                )
+            })
+        }
+    }
+    #[inline(never)]
+    unsafe fn first_three_block(region: *mut F128, active: usize, t: &PreparedThree) {
+        unsafe {
+            let t = broadcast_three(t);
+            for j in 0..4 {
+                for m in 0..2 {
+                    let a = region.add((j * 16 + m) * 64);
+                    for lane in (0..active).step_by(4) {
+                        let v = core::array::from_fn(|i| {
+                            _mm512_loadu_si512(a.add(i * 2 * 64 + lane).cast())
+                        });
+                        let out = butterfly_three_general(v, &t);
+                        for i in 0..8 {
+                            _mm512_storeu_si512(a.add(i * 2 * 64 + lane).cast(), out[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[inline(never)]
+    unsafe fn final_three_publish(
+        input: *const F128,
+        out: *mut F128,
+        active: usize,
+        t: &PreparedThree,
+    ) {
+        unsafe {
+            const OFF: [usize; 8] = [0, 16, 32, 48, 1, 17, 33, 49];
+            let t = broadcast_three(t);
+            for lane in (0..active).step_by(4) {
+                let v = core::array::from_fn(|i| {
+                    _mm512_loadu_si512(input.add(OFF[i] * 64 + lane).cast())
+                });
+                let v = butterfly_three_general(v, &t);
+                direct_three_store(out.add(lane), v);
+            }
+            if active == 60 {
+                let zero = _mm512_setzero_si512();
+                direct_three_store(out.add(60), [zero; 8]);
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn prepare_three(t: [F128; 7]) -> PreparedThree {
+        unsafe {
+            PreparedThree {
+                pairs: core::array::from_fn(|i| {
+                    let v = _mm_set_epi64x(t[i].hi as i64, t[i].lo as i64);
+                    let companion = _mm_xor_si128(
+                        _mm_slli_si128::<8>(v),
+                        _mm_clmulepi64_si128::<0x01>(v, _mm_set_epi64x(0, 0x87)),
+                    );
+                    [
+                        t[i],
+                        F128 {
+                            lo: _mm_cvtsi128_si64(companion) as u64,
+                            hi: _mm_extract_epi64::<1>(companion) as u64,
+                        },
+                    ]
+                }),
+            }
+        }
+    }
+
+    /// Shared immutable coefficients for the six postseed layers split3+3.
+    pub(crate) struct SeedThreeThreePlan {
+        early: Vec<PreparedThree>,
+        last: Vec<PreparedThree>,
+    }
+    pub(crate) unsafe fn prepare_seed_three_three(
+        t4: &[super::super::FourBlock],
+        t2: &[[[F128; 3]; 16]],
+    ) -> Option<SeedThreeThreePlan> {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_THREE_THREE").is_some());
+        if *OFF || !super::super::super::ntt_shaped_enabled() || t4.len() != 8 || t2.len() != 8 {
+            return None;
+        }
+        let mut early = Vec::with_capacity(8);
+        let mut last = Vec::with_capacity(64);
+        for b in 0..8 {
+            // Preserve twiddle/diet rollback through the original cache gate.
+            let cache = t4[b].cache.as_ref()?;
+            early.push(PreparedThree {
+                pairs: core::array::from_fn(|i| cache.pairs[i]),
+            });
+            for g in 0..8 {
+                let raw = core::array::from_fn(|i| match i {
+                    0 => t4[b][7 + g],
+                    1..=2 => t2[b][2 * g + i - 1][0],
+                    3..=6 => t2[b][2 * g + (i - 3) / 2][1 + (i - 3) % 2],
+                    _ => unreachable!(),
+                });
+                last.push(unsafe { prepare_three(raw) });
+            }
+        }
+        Some(SeedThreeThreePlan { early, last })
+    }
+    /// Exact-shape caller owns512 staging rows and60 or64 active fields.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_three_three_fold(
+        buf: *mut F128,
+        active: usize,
+        plan: &SeedThreeThreePlan,
+    ) {
+        debug_assert!(active == 60 || active == 64);
+        for b in 0..8 {
+            unsafe {
+                first_three_block(buf.add(b * 4096), active, &plan.early[b]);
+            }
+        }
+    }
+    /// Final three layers publish eight rows per group,2MiB apart. The caller
+    /// retains its one final SFENCE before releasing the staging slot.
+    #[inline(never)]
+    pub(crate) unsafe fn seed_three_three_publish(
+        buf: *mut F128,
+        out: *mut F128,
+        active: usize,
+        plan: &SeedThreeThreePlan,
+    ) {
+        debug_assert!(active == 60 || active == 64);
+        debug_assert_eq!(out as usize % 64, 0);
+        for b in 0..8 {
+            for g in 0..8 {
+                unsafe {
+                    final_three_publish(
+                        buf.add(b * 4096 + 2 * g * 64),
+                        out.add(b * 131072 * 64 + g * 8 * GAP),
+                        active,
+                        &plan.last[b * 8 + g],
+                    );
+                }
+            }
+        }
+    }
+}
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) use seed_three_three::{
+    prepare_seed_three_three, seed_three_three_fold, seed_three_three_publish,
+};
