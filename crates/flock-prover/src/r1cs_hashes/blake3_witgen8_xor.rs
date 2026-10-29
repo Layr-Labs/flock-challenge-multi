@@ -649,7 +649,7 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
-unsafe fn project_const<const BLK: usize>(
+unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows,
     a: [__m512i; 8],
@@ -903,57 +903,57 @@ _ => unreachable!(),
         ]);
         _mm512_stream_si512(
             proj.out
-                .add(0 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(0, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[0],
         );
         _mm512_stream_si512(
             proj.out
-                .add(1 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(1, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[1],
         );
         _mm512_stream_si512(
             proj.out
-                .add(2 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(2, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[2],
         );
         _mm512_stream_si512(
             proj.out
-                .add(3 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(3, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[3],
         );
         _mm512_stream_si512(
             proj.out
-                .add(4 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(4, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[4],
         );
         _mm512_stream_si512(
             proj.out
-                .add(5 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(5, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[5],
         );
         _mm512_stream_si512(
             proj.out
-                .add(6 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(6, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[6],
         );
         _mm512_stream_si512(
             proj.out
-                .add(7 * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(super::compression_lane_offset(7, CROSS_QUARTER) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast(),
             out[7],
         );
     }
 }
-/// Same ring, ranked-static and non-temporal publication contract as the
-/// direct-inline path. The caller issues the task's existing final sfence.
-#[inline(never)]
+/// Select the existing z store policy once before projecting this window.
+/// AB streams in both versions; the caller retains its final publication fence.
+#[inline(always)]
 pub(super) unsafe fn project(
     proj: &StreamProj<'_>,
     blk: usize,
@@ -964,38 +964,62 @@ pub(super) unsafe fn project(
     t: &Tables,
 ) {
     unsafe {
+        match (rows.cached_z, rows.cross_quarter) {
+            (true, true) => project_policy::<true, true>(proj, blk, rows, ar, br, rw, t),
+            (true, false) => project_policy::<true, false>(proj, blk, rows, ar, br, rw, t),
+            (false, true) => project_policy::<false, true>(proj, blk, rows, ar, br, rw, t),
+            (false, false) => project_policy::<false, false>(proj, blk, rows, ar, br, rw, t),
+        }
+    }
+}
+
+// Keep the selected policy constant through the inlined per-block arithmetic.
+// This prevents opaque publication boundaries from causing repeated reloads
+// of the incoming row descriptor's runtime flag. Values and stores are unchanged.
+#[inline(never)]
+unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool>(
+    proj: &StreamProj<'_>,
+    blk: usize,
+    rows: RankedRows,
+    ar: *const V8,
+    br: *const V8,
+    rw: usize,
+    t: &Tables,
+) {
+    let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
+    unsafe {
         let ap = pretranspose_ring::<0, true>(ar, rw);
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
-            2 => project_const::<2>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
@@ -1138,6 +1162,7 @@ mod tests {
                         let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
                         assert!(plan.bcomplement_static_eligible());
                         let proj = StreamProj {
+                            cross_quarter: false, compact_z: core::ptr::null_mut(),
                             stage: core::ptr::null_mut(),
                             out: output.0.as_mut_ptr(),
                             out_stride: stride,
