@@ -28,6 +28,7 @@ pub struct RootTileCache {
     blocks: usize,
     word_major: bool,
     fixed_roots: bool,
+    cross_quarter: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +145,7 @@ fn prepare(
             blocks,
             word_major,
             fixed_roots: false,
+            cross_quarter: false,
         },
         folded,
     )
@@ -190,7 +192,7 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false }
     }
 
     pub(super) fn matches_geometry(&self, compressions: usize, root_bits: usize) -> bool {
@@ -246,6 +248,19 @@ impl RootTileCache {
         }
     }
 
+    /// Adopt complete root storage in two-seed-group physical order.
+    ///
+    /// # Safety
+    /// Every selected root word must be initialized at physical index
+    /// p=g*256+kpair*8+lane for original compression
+    /// c=(lane/2)*65536+(2*kpair+lane%2)*1024+g. All writers must be joined.
+    pub unsafe fn from_cross_quarter_witness_storage(storage: Vec<F128>, compressions: usize) -> Self {
+        assert_eq!(compressions, 1 << 18);
+        let mut result = unsafe { Self::from_witness_storage(storage, compressions) };
+        result.cross_quarter = true;
+        result
+    }
+
     fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
         // Retain each output plane across four tiles. The kill switch keeps
         // the original per-tile reader available for diagnostic comparisons.
@@ -278,6 +293,20 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        let logical_eq8 = |physical: usize| {
+            if self.cross_quarter {
+                core::array::from_fn(|lane| {
+                    let p = physical + lane;
+                    let group = p / 256;
+                    let kpair = (p % 256) / 8;
+                    let lane = p % 8;
+                    let c = (lane / 2) * 65536 + (2 * kpair + lane % 2) * 1024 + group;
+                    eq8_at(c & !7)[c & 7]
+                })
+            } else {
+                eq8_at(physical)
+            }
+        };
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -335,7 +364,7 @@ impl RootTileCache {
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
                             for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                                let eq8 = eq8_at(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));
+                                let eq8 = logical_eq8(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));
                                 kernels::fold_mats_from_basis(&eq8,
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
@@ -367,7 +396,7 @@ impl RootTileCache {
                     let tile = lo;
                     lo += 1;
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                        let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
+                        let eq8 = logical_eq8(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
                         kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                     }
                     for block in 0..self.blocks {
