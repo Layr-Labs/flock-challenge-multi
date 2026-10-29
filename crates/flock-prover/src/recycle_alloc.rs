@@ -38,8 +38,9 @@ fn class_slot(size: usize) -> usize {
 #[inline]
 fn retained_size(size: usize) -> bool {
     const TAIL: usize = flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
-    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
-        && (size - TAIL).is_power_of_two()
+    matches!(size, 37_888 | 75_776 | 151_552)
+        || (size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
+            && (size - TAIL).is_power_of_two())
 }
 
 #[inline]

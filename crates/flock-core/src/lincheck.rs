@@ -4975,7 +4975,7 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -5164,12 +5164,14 @@ fn prove_padded_inner<Ch: Challenger>(
                 einf = neinf;
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
             if fold8_ready && t == 0 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
-                captured_z_vec = Some(z_vec.clone());
+                let mut cap = std::mem::take(&mut eq_inner);
+                cap.clear();
+                cap.extend_from_slice(&z_vec);
+                captured_z_vec = Some(cap);
             }
         }
     }
@@ -5291,7 +5293,7 @@ pub fn verify<Ch: Challenger>(
     //    the prover made — sparse default delegates to the fused row-fold;
     //    per-hash impls walk the constraint graph directly).
     let t = std::time::Instant::now();
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if trace {
         eprintln!(
             "        [lcv] build_quirky_eq_table (2^{k_log}): {}",
@@ -6628,7 +6630,7 @@ mod tests {
 
         // Pick a mutation position where BOTH row vectors are nonzero so the
         // mutation guarantees both checks would diverge.
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+        let mut eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
         let row_a = sparse_row_fold(&a_0, &eq_inner);
         let row_b = sparse_row_fold(&b_0, &eq_inner);
         let idx = (0..k)
