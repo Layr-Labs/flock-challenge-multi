@@ -1549,6 +1549,18 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = crate::lincheck::build_eq_table(low_point);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    if rs_tail_par_enabled() {
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        unsafe {
+            collapse_s_hat_v_fold8_avx512(s_hat_v_fold8, &low_eq, &mut out);
+        }
+        return out;
+    }
     if rs_tail_par_enabled() {
         // Same bank-major accumulation through the vectorized `scale_slice` /
         // `add_scaled` leaves — identical per-element operation in identical
@@ -1575,6 +1587,107 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         }
     }
     out
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn collapse_s_hat_v_fold8_avx512(
+    s_hat_v_fold8: &[F128],
+    low_eq: &[F128],
+    out: &mut [F128],
+) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    let n_packed = 1usize << LOG_PACKING;
+    debug_assert_eq!(s_hat_v_fold8.len(), 64 * n_packed);
+    debug_assert_eq!(low_eq.len(), 64);
+    debug_assert_eq!(out.len(), n_packed);
+    let src_ptr = s_hat_v_fold8.as_ptr();
+    let eq_ptr = low_eq.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let mut col = 0usize;
+    while col < n_packed {
+        let mut acc0 = WideGhashX4::zero();
+        let mut acc1 = WideGhashX4::zero();
+        let mut acc2 = WideGhashX4::zero();
+        let mut acc3 = WideGhashX4::zero();
+        let mut acc4 = WideGhashX4::zero();
+        let mut acc5 = WideGhashX4::zero();
+        let mut acc6 = WideGhashX4::zero();
+        let mut acc7 = WideGhashX4::zero();
+        let mut bank = 0usize;
+        while bank < 64 {
+            let e0 = *eq_ptr.add(bank);
+            let e1 = *eq_ptr.add(bank + 1);
+            let w0 = _mm512_broadcast_i32x4(_mm_set_epi64x(e0.hi as i64, e0.lo as i64));
+            let w1 = _mm512_broadcast_i32x4(_mm_set_epi64x(e1.hi as i64, e1.lo as i64));
+            let row0 = src_ptr.add(bank * n_packed + col);
+            let row1 = row0.add(n_packed);
+            acc0.mul_acc2(
+                _mm512_loadu_si512(row0 as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1 as *const __m512i),
+                w1,
+            );
+            acc1.mul_acc2(
+                _mm512_loadu_si512(row0.add(4) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(4) as *const __m512i),
+                w1,
+            );
+            acc2.mul_acc2(
+                _mm512_loadu_si512(row0.add(8) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(8) as *const __m512i),
+                w1,
+            );
+            acc3.mul_acc2(
+                _mm512_loadu_si512(row0.add(12) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(12) as *const __m512i),
+                w1,
+            );
+            acc4.mul_acc2(
+                _mm512_loadu_si512(row0.add(16) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(16) as *const __m512i),
+                w1,
+            );
+            acc5.mul_acc2(
+                _mm512_loadu_si512(row0.add(20) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(20) as *const __m512i),
+                w1,
+            );
+            acc6.mul_acc2(
+                _mm512_loadu_si512(row0.add(24) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(24) as *const __m512i),
+                w1,
+            );
+            acc7.mul_acc2(
+                _mm512_loadu_si512(row0.add(28) as *const __m512i),
+                w0,
+                _mm512_loadu_si512(row1.add(28) as *const __m512i),
+                w1,
+            );
+            bank += 2;
+        }
+        let dst = out_ptr.add(col);
+        _mm512_storeu_si512(dst as *mut __m512i, acc0.reduce_lanes());
+        _mm512_storeu_si512(dst.add(4) as *mut __m512i, acc1.reduce_lanes());
+        _mm512_storeu_si512(dst.add(8) as *mut __m512i, acc2.reduce_lanes());
+        _mm512_storeu_si512(dst.add(12) as *mut __m512i, acc3.reduce_lanes());
+        _mm512_storeu_si512(dst.add(16) as *mut __m512i, acc4.reduce_lanes());
+        _mm512_storeu_si512(dst.add(20) as *mut __m512i, acc5.reduce_lanes());
+        _mm512_storeu_si512(dst.add(24) as *mut __m512i, acc6.reduce_lanes());
+        _mm512_storeu_si512(dst.add(28) as *mut __m512i, acc7.reduce_lanes());
+        col += 32;
+    }
 }
 
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
@@ -3220,19 +3333,30 @@ fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
     assert_eq!(fold8.len(), 64 * n_packed);
     assert_eq!(a_state.len(), 64 * n_packed);
     let a_addr = a_state.as_mut_ptr() as usize;
-    (0..64usize).into_par_iter().for_each(|e| {
-        let mut transposed = core::mem::MaybeUninit::<[F128; 128]>::uninit();
-        // SAFETY: `tensor_algebra_transpose_into` initializes all 128 elements.
+    (0..16usize).into_par_iter().for_each(|group| {
+        let e_base = group * 4;
+        let mut transposed = core::mem::MaybeUninit::<[[F128; 128]; 4]>::uninit();
+        // SAFETY: `tensor_algebra_transpose_into` initializes all 4 * 128 elements.
         let transposed_ref = unsafe {
-            let ptr = transposed.as_mut_ptr();
-            tensor_algebra_transpose_into(&fold8[e * n_packed..(e + 1) * n_packed], &mut *ptr);
-            &*ptr
+            let ptr = transposed.as_mut_ptr() as *mut [F128; 128];
+            for k in 0..4 {
+                let e = e_base + k;
+                tensor_algebra_transpose_into(
+                    &fold8[e * n_packed..(e + 1) * n_packed],
+                    &mut *ptr.add(k),
+                );
+            }
+            &*transposed.as_ptr()
         };
         let a = a_addr as *mut F128;
-        // SAFETY: each e owns one disjoint lane in every output row.
+        // SAFETY: each group owns a disjoint 64-byte (4-F128) cache line in every output row.
         unsafe {
-            for (bit, &value) in transposed_ref.iter().enumerate() {
-                *a.add(bit * 64 + e) = value;
+            for bit in 0..n_packed {
+                let dst = a.add(bit * 64 + e_base);
+                *dst = transposed_ref[0][bit];
+                *dst.add(1) = transposed_ref[1][bit];
+                *dst.add(2) = transposed_ref[2][bit];
+                *dst.add(3) = transposed_ref[3][bit];
             }
         }
     });
