@@ -18,6 +18,8 @@
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
 pub mod bits;
+#[path = "stage_ir.rs"]
+pub mod gf2_kernels;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;
