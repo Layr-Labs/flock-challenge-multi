@@ -320,10 +320,8 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
                 let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2); // bank 4g+1
                 let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3); // bank 4g+2
                 let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3); // bank 4g+3
-                acc.mul_acc(u0, wb[4 * g]);
-                acc.mul_acc(u1, wb[4 * g + 1]);
-                acc.mul_acc(u2, wb[4 * g + 2]);
-                acc.mul_acc(u3, wb[4 * g + 3]);
+                acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(t) as *mut __m512i, acc.reduce_lanes());
             t += 4;
@@ -417,10 +415,8 @@ pub(super) unsafe fn fold64_banked_nested(
                     let u1 = _mm512_permutex2var_epi64(t0, s2_hi, t2);
                     let u2 = _mm512_permutex2var_epi64(t1, s2_lo, t3);
                     let u3 = _mm512_permutex2var_epi64(t1, s2_hi, t3);
-                    acc.mul_acc(u0, wb[4 * g]);
-                    acc.mul_acc(u1, wb[4 * g + 1]);
-                    acc.mul_acc(u2, wb[4 * g + 2]);
-                    acc.mul_acc(u3, wb[4 * g + 3]);
+                    acc.mul_acc2(u0, wb[4 * g], u1, wb[4 * g + 1]);
+                    acc.mul_acc2(u2, wb[4 * g + 2], u3, wb[4 * g + 3]);
                 }
                 _mm512_store_si512(m4_ptr.add(slot_idx), acc.reduce_lanes());
                 slot_idx += 1;
@@ -530,12 +526,10 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            let f_odd = _mm512_shuffle_i32x4::<0xDD>(f0, f1);
+            let b_odd = _mm512_shuffle_i32x4::<0xDD>(b0, b1);
+            let f_sum = _mm512_xor_si512(f_even, f_odd);
+            let b_sum = _mm512_xor_si512(b_even, b_odd);
             u2_acc.mul_acc(f_sum, b_sum);
 
             t += 8;
