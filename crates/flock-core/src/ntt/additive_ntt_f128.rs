@@ -1239,11 +1239,6 @@ const ST_FMP_CAP: usize = 4;
 ))]
 #[inline]
 fn select_st_fmp_bufs(requested: Option<usize>) -> usize {
-    // Generated-input schedule: the per-pair input group shrank from 512 KiB
-    // to two 16 KiB octa scratches, so a third 512 KiB staging slot fits the
-    // footprint the two-slot ring used to share with that group. Three slots
-    // let M+P announce group g+1 after publishing only task 2g, so the F
-    // sibling no longer idles between its folds and its next octas.
     requested.unwrap_or(3).clamp(2, ST_FMP_CAP)
 }
 
@@ -1750,6 +1745,13 @@ fn st_fmp_run_claimed(
                 produce(first_r / 2, 0, output0, output1);
                 unsafe { core::arch::x86_64::_mm_sfence() };
                 while st.witness_done.load(Ordering::Acquire) < epoch {
+                    if published < i && st.folded.load(Ordering::Acquire) > published {
+                        if !publish_ready(published) {
+                            return;
+                        }
+                        published += 1;
+                        continue;
+                    }
                     if st.f_gone.load(Ordering::Acquire) {
                         // A callback on F unwound. Broadcast propagates it;
                         // DrainGuard still joins F before staging is freed.

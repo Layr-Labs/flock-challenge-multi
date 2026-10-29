@@ -2950,8 +2950,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
+        static ROOT_CACHE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let root_enabled = linear_fold_enabled()
-            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
+            && *ROOT_CACHE_ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none());
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
                 let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
@@ -2975,9 +2976,21 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // One private octa per role: seed it before the next octa can
                 // reuse these bytes. Initialization covers the omitted final
                 // window; all live windows are overwritten by this producer.
-                #[repr(align(64))]
-                struct OctaInput([F128; 8 * F128_PER_BLOCK]);
-                let mut input = OctaInput([F128::ZERO; 8 * F128_PER_BLOCK]);
+                #[repr(C, align(64))]
+                struct OctaInput([core::mem::MaybeUninit<F128>; 8 * F128_PER_BLOCK]);
+                let mut input = OctaInput([const { core::mem::MaybeUninit::uninit() }; 8 * F128_PER_BLOCK]);
+                if target.is_some() {
+                    let base_ptr = input.0.as_mut_ptr().cast::<F128>();
+                    for row in 0..8 {
+                        unsafe {
+                            core::ptr::write_bytes(
+                                base_ptr.add(row * F128_PER_BLOCK + (F128_PER_BLOCK - 4)),
+                                0,
+                                4,
+                            );
+                        }
+                    }
+                }
                 // The const-window rollback uses StreamProj's scratch even
                 // in the exact path. Each callback owns this aligned 1 KiB
                 // buffer until all its octas return; drains initialize every
@@ -3027,7 +3040,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         if let Some(target) = target {
-                            target.seed_octa(input.0.as_ptr(), kpair);
+                            target.seed_octa(input.0.as_ptr().cast::<F128>(), kpair);
                         }
                     }
                 }
