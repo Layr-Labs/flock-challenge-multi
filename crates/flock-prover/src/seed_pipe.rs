@@ -1252,7 +1252,7 @@ fn speculative_main(
         // fit with the job budget still open (kaankolcu's ab380ec8 ran 26). Each pass commits more of this thread's
         // lazily-grown stack and its thread-local and pool bookkeeping before
         // the timed prove.
-        const SPEC_WARMUP_PROVES: usize = 26;
+        const SPEC_WARMUP_PROVES: usize = 38;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
