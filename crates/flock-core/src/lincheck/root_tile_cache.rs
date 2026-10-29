@@ -28,6 +28,7 @@ pub struct RootTileCache {
     blocks: usize,
     word_major: bool,
     fixed_roots: bool,
+    cross_quarter: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +145,7 @@ fn prepare(
             blocks,
             word_major,
             fixed_roots: false,
+            cross_quarter: false,
         },
         folded,
     )
@@ -155,6 +157,7 @@ pub(super) fn fold(
     z: &[F128],
     k: usize,
     eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    eq8_indices: &(impl Fn([usize; 8]) -> [F128; 8] + Sync),
 ) -> Vec<F128> {
     let mut first_fold = None;
     let cache = source.cached_tiles.get_or_init(|| {
@@ -165,7 +168,7 @@ pub(super) fn fold(
     if let Some(folded) = first_fold {
         folded
     } else {
-        cache.fold(eq8_at)
+        cache.fold_indexed_with_mode(eq8_at, eq8_indices, RootTileCache::batch_mode())
     }
 }
 
@@ -190,7 +193,7 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false }
     }
 
     pub(super) fn matches_geometry(&self, compressions: usize, root_bits: usize) -> bool {
@@ -246,33 +249,75 @@ impl RootTileCache {
         }
     }
 
-    fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
-        // Retain each output plane across four tiles. The kill switch keeps
-        // the original per-tile reader available for diagnostic comparisons.
+    /// Adopt complete root storage in two-seed-group physical order.
+    ///
+    /// # Safety
+    /// Every selected root word must be initialized at physical index
+    /// p=g*256+kpair*8+lane for original compression
+    /// c=(lane/2)*65536+(2*kpair+lane%2)*1024+g. All writers must be joined.
+    pub unsafe fn from_cross_quarter_witness_storage(storage: Vec<F128>, compressions: usize) -> Self {
+        assert_eq!(compressions, 1 << 18);
+        let mut result = unsafe { Self::from_witness_storage(storage, compressions) };
+        result.cross_quarter = true;
+        result
+    }
+
+    fn batch_mode() -> bool {
         static BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_BATCH4").is_none()
         });
-        self.fold_with_mode(eq8_at, *BATCH)
+        *BATCH
     }
 
+    fn fold(&self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
+        self.fold_with_mode(eq8_at, Self::batch_mode())
+    }
+
+    fn cross_quarter_indices(physical: usize) -> [usize; 8] {
+        debug_assert!(physical.is_multiple_of(8) && physical < (1 << 18));
+        core::array::from_fn(|lane| {
+            let p = physical + lane;
+            let group = p / 256;
+            let kpair = (p % 256) / 8;
+            let lane = p % 8;
+            (lane / 2) * 65536 + (2 * kpair + lane % 2) * 1024 + group
+        })
+    }
+
+    // Keep the consecutive-weight API available to existing independent
+    // consumer tests. Production's reordered cache takes the indexed route.
     fn fold_with_mode(
+        &self, eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync), batch_word_tiles: bool,
+    ) -> Vec<F128> {
+        let logical = |physical| if self.cross_quarter {
+            Self::cross_quarter_indices(physical).map(|c| eq8_at(c & !7)[c & 7])
+        } else { eq8_at(physical) };
+        self.fold_physical_with_mode(&logical, batch_word_tiles)
+    }
+
+    fn fold_indexed_with_mode(
         &self,
         eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+        eq8_indices: &(impl Fn([usize; 8]) -> [F128; 8] + Sync),
         batch_word_tiles: bool,
     ) -> Vec<F128> {
-        // Dispatch before constructing worker closures, so the false
-        // monomorph can discard every batch matrix slot and preparation path.
-        // Canonical and generic word-major capture retain the old reader.
+        if !self.cross_quarter { return self.fold_with_mode(eq8_at, batch_word_tiles); }
+        let logical = |physical| eq8_indices(Self::cross_quarter_indices(physical));
+        self.fold_physical_with_mode(&logical, batch_word_tiles)
+    }
+
+    fn fold_physical_with_mode(
+        &self, logical: &(impl Fn(usize) -> [F128; 8] + Sync), batch_word_tiles: bool,
+    ) -> Vec<F128> {
         if batch_word_tiles && self.word_major && self.fixed_roots {
-            self.fold_impl::<true>(eq8_at)
+            self.fold_impl::<true>(logical)
         } else {
-            self.fold_impl::<false>(eq8_at)
+            self.fold_impl::<false>(logical)
         }
     }
 
     fn fold_impl<const BATCH_WORD_TILES: bool>(
-        &self,
-        eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+        &self, logical_eq8: &(impl Fn(usize) -> [F128; 8] + Sync),
     ) -> Vec<F128> {
         static PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
@@ -335,7 +380,7 @@ impl RootTileCache {
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
                             for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                                let eq8 = eq8_at(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));
+                                let eq8 = logical_eq8(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));
                                 kernels::fold_mats_from_basis(&eq8,
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
@@ -367,7 +412,7 @@ impl RootTileCache {
                     let tile = lo;
                     lo += 1;
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
-                        let eq8 = eq8_at(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
+                        let eq8 = logical_eq8(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
                         kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
                     }
                     for block in 0..self.blocks {
@@ -782,5 +827,108 @@ mod tests {
             assert_eq!(fresh_cache.fold(&eq1), fresh_reference);
             assert_eq!(fresh_cache.fold(&eq2), plan.fold(&fresh_z, 384, &eq2));
         });
+    }
+}
+
+
+#[cfg(test)]
+mod indexed_weight_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17; *state
+    }
+    #[test]
+    fn indexed_weights_and_full_root_consumer_match_scalar_oracle() {
+        use super::super::{eq8_from_factors_indices, eq8_from_factors};
+        // Independent forward construction from original q/k/g labels.
+        let mut labels = vec![usize::MAX; 1 << 18];
+        for g in 0..1024 {
+            for k in 0..64 {
+                for q in 0..4 {
+                    let p = g*256 + (k/2)*8 + q*2 + k%2;
+                    assert_eq!(labels[p], usize::MAX);
+                    labels[p] = q*65536 + k*1024 + g;
+                }
+            }
+        }
+        for p in (0..labels.len()).step_by(8) {
+            assert_eq!(RootTileCache::cross_quarter_indices(p).as_slice(), &labels[p..p+8]);
+        }
+        let mut state = 0x4255_9931_3dc8_a64bu64;
+        let mut weight_cases = 0;
+        let mut reader_equalities = 0;
+        let mut mutants = 0;
+        for basis in 0..2 {
+            let lo: Vec<_> = (0..512).map(|_| F128::new(next(&mut state), next(&mut state))).collect();
+            let hi: Vec<_> = (0..512).map(|_| F128::new(next(&mut state), next(&mut state))).collect();
+            let scalar = |i: usize| lo[i % 512] * hi[i / 512];
+            for group in [0usize, 1, 2, 7, 8, 127, 511, 512, 1023] {
+                for kp in [0usize, 1, 7, 15, 30, 31] {
+                    let indices = RootTileCache::cross_quarter_indices(group*256+kp*8);
+                    let expected = indices.map(&scalar);
+                    assert_eq!(eq8_from_factors_indices(&lo, &hi, indices, 9, 511), expected);
+                    assert_eq!(indices.map(|c| eq8_from_factors(&lo, &hi, c & !7, 9, 511)[c & 7]), expected);
+                    weight_cases += 1;
+                }
+            }
+            let tiles = 32;
+            let blocks = 176;
+            let mut storage = crate::scratch::take_f128(tiles*blocks*32+3);
+            storage.fill(F128::new(u64::MAX,u64::MAX));
+            let offset = storage.as_ptr().align_offset(64);
+            let weights: Vec<_> = labels[..tiles*64].iter().map(|&i| scalar(i)).collect();
+            let mut expected = vec![F128::ZERO;177*64];
+            for tile in 0..tiles {
+                for block in 0..blocks {
+                    for stripe in 0..8 {
+                        for lane in 0..8 {
+                            let n = next(&mut state);
+                            let mut bits = (1u64<<(n%64)) | (1u64<<(n.rotate_left(21)%64)) | (1u64<<(n.rotate_left(43)%64));
+                            if block==4 { bits |= 1; }
+                            if block==175 { bits &= (1u64<<49)-1; }
+                            unsafe {
+                                let dst=storage.as_mut_ptr().add(offset).cast::<u8>().add((tile*blocks+block)*512+stripe*64).cast::<u32>();
+                                dst.add(lane).write(bits as u32);dst.add(8+lane).write((bits>>32)as u32);
+                            }
+                            let mut remaining=bits;
+                            while remaining!=0 {
+                                let bit=remaining.trailing_zeros()as usize;remaining&=remaining-1;
+                                let compact=block*64+bit;
+                                let column=compact+usize::from(compact>=833)*64;
+                                expected[column]+=weights[tile*64+stripe*8+lane];
+                            }
+                        }
+                    }
+                }
+            }
+            for column in [839,865,866,868] { expected[column]=expected[256]; }
+            // A bounded32-tile fixture exercises the complete real reader;
+            // the full262144-label permutation was independently checked above.
+            let mut cache=unsafe { RootTileCache::from_witness_storage(storage,tiles*64) };
+            cache.cross_quarter=true;
+            for threads in [7,9] {
+                let pool=rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                for batch in [false,true] {
+                    let old_calls=AtomicUsize::new(0);
+                    let indexed_calls=AtomicUsize::new(0);
+                    let original=|i| {old_calls.fetch_add(1,Ordering::Relaxed);eq8_from_factors(&lo,&hi,i,9,511)};
+                    let indexed=|indices| {indexed_calls.fetch_add(1,Ordering::Relaxed);eq8_from_factors_indices(&lo,&hi,indices,9,511)};
+                    let old=pool.install(||cache.fold_with_mode(&original,batch));
+                    assert_eq!(old,expected,"old basis={basis} threads={threads} batch={batch}");
+                    assert_eq!(old_calls.swap(0,Ordering::Relaxed),tiles*64);
+                    let new=pool.install(||cache.fold_indexed_with_mode(&original,&indexed,batch));
+                    assert_eq!(new,expected,"indexed basis={basis} threads={threads} batch={batch}");
+                    assert_eq!(old_calls.load(Ordering::Relaxed),0);
+                    assert_eq!(indexed_calls.load(Ordering::Relaxed),tiles*8);
+                    reader_equalities+=2;
+                    let wrong=|mut indices:[usize;8]| {indices[0]^=1024;eq8_from_factors_indices(&lo,&hi,indices,9,511)};
+                    assert_ne!(pool.install(||cache.fold_indexed_with_mode(&original,&wrong,batch)),expected);
+                    mutants+=1;
+                }
+            }
+        }
+        assert_eq!(weight_cases,108);assert_eq!(reader_equalities,16);assert_eq!(mutants,8);
+        println!("INDEXED_ROOT_WEIGHTS labels=262144 arithmetic_octa_cases={weight_cases} full_reader_equalities={reader_equalities} wrong_weight_mutants_detected={mutants} original_expansions_per_reader=2048 indexed_expansions_per_reader=256 threads=7,9 reader_modes=2 bases=2 actual_production_consumer=true x4_enabled={}",super::super::lc_eq8_x4_enabled());
     }
 }
