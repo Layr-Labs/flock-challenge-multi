@@ -530,12 +530,10 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             let b_even = _mm512_shuffle_i32x4::<0x88>(b0, b1);
             u0_acc.mul_acc(f_even, b_even);
 
-            let f0s = _mm512_xor_si512(f0, _mm512_shuffle_i32x4::<0xB1>(f0, f0));
-            let f1s = _mm512_xor_si512(f1, _mm512_shuffle_i32x4::<0xB1>(f1, f1));
-            let f_sum = _mm512_shuffle_i32x4::<0x88>(f0s, f1s);
-            let b0s = _mm512_xor_si512(b0, _mm512_shuffle_i32x4::<0xB1>(b0, b0));
-            let b1s = _mm512_xor_si512(b1, _mm512_shuffle_i32x4::<0xB1>(b1, b1));
-            let b_sum = _mm512_shuffle_i32x4::<0x88>(b0s, b1s);
+            let f_odd = _mm512_shuffle_i32x4::<0xDD>(f0, f1);
+            let b_odd = _mm512_shuffle_i32x4::<0xDD>(b0, b1);
+            let f_sum = _mm512_xor_si512(f_even, f_odd);
+            let b_sum = _mm512_xor_si512(b_even, b_odd);
             u2_acc.mul_acc(f_sum, b_sum);
 
             t += 8;

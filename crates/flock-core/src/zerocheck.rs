@@ -65,7 +65,8 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some())
 }
 
 /// Test-only: number of lookahead/cascade levels the last prove ran with, so
@@ -92,7 +93,8 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some())
 }
 
 /// Test-only forced-off latch for the no-materialize sweep.
@@ -116,7 +118,8 @@ fn nomat_off() -> bool {
     if ZC_NOMAT_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_SWEEP_NOMAT").is_some())
 }
 
 /// `FLOCK_NO_ZC_CASCADE3=1` stops the cascade after rounds 5+6.
@@ -126,7 +129,8 @@ fn cascade3_off() -> bool {
     if ZC_CASCADE3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some())
 }
 
 /// Test-only latches for cascade levels 3 and 4 (rounds 9+10, 11+12). Both
@@ -150,7 +154,8 @@ fn cascade4_off() -> bool {
     if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some())
 }
 
 /// Cascade level 4 (rounds 11+12) ships on: `FLOCK_NO_ZC_CASCADE5=1` restores
@@ -167,7 +172,8 @@ fn cascade5_off() -> bool {
     if ZC_CASCADE5_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some())
 }
 
 /// `FLOCK_NO_ZC_DEEP_CASCADE=1` restores the promoted five-level cap. The
@@ -175,7 +181,8 @@ fn cascade5_off() -> bool {
 /// the ranked 26-variable tail.
 #[inline]
 fn deep_cascade_off() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some()
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_DEEP_CASCADE").is_some())
 }
 
 fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
@@ -541,7 +548,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    static ZC_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let zc_timing = *ZC_TIMING.get_or_init(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
     let t_round1 = std::time::Instant::now();
     let inv_table_owned;
     let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
