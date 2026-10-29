@@ -5628,33 +5628,95 @@ pub(crate) struct R4LaneWeights {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
+unsafe fn r4_round4_block(fa4: *const F128, fb4: *const F128, acc4: &mut [WideGhashX4; 10]) {
+    for bi in 0..4usize {
+        let skip = match bi {
+            0 => 0u8,
+            3 => 3u8,
+            _ => 255u8,
+        };
+        unsafe { r4_round4_batch(fa4.add(64 * bi), fb4.add(64 * bi), acc4, skip) };
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline]
 unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
     use core::arch::x86_64::*;
     unsafe {
-        let ld = |p: *const F128, g: usize, k: usize| -> __m512i {
-            if g as u8 == skip {
-                _mm512_setzero_si512()
-            } else {
-                _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
-            }
-        };
+        // Shuffle-free cross-lane sums from the L1 fold cache: for the group
+        // pair (g, g' = g+1) and row k, lanes [0, 2] take g's (u, u^1) sums via
+        // an aligned + one-forward load, lanes [1, 3] take g's via an aligned
+        // + one-back load (merge-masked XOR). Lane L ↔ (group L&1, w-bit L>>1).
         let mut ops = [[_mm512_setzero_si512(); 20]; 2];
         for set in 0..2 {
             let (g0, g1) = (2 * set, 2 * set + 1);
+            let z0 = g0 as u8 == skip;
+            let z1 = g1 as u8 == skip;
             let st = &mut ops[set];
             let mut ca = [_mm512_setzero_si512(); 4];
             let mut cb = [_mm512_setzero_si512(); 4];
             for k in 0..4 {
-                let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
-                let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
-                let ao = _mm512_shuffle_i64x2::<0xDD>(xa, ya);
-                let bo = _mm512_shuffle_i64x2::<0xDD>(xb, yb);
+                let side = |p: *const F128| -> (__m512i, __m512i) {
+                    let p0 = p.add(16 * k + 4 * g0);
+                    let p1 = p.add(16 * k + 4 * g1);
+                    let lo = if z0 {
+                        _mm512_setzero_si512()
+                    } else {
+                        _mm512_xor_si512(
+                            _mm512_loadu_si512(p0.cast::<__m512i>()),
+                            _mm512_loadu_si512(p0.add(1).cast::<__m512i>()),
+                        )
+                    };
+                    let c = if z1 {
+                        _mm512_maskz_mov_epi64(0x33, lo)
+                    } else {
+                        _mm512_mask_xor_epi64(
+                            lo,
+                            0xCC,
+                            _mm512_loadu_si512(p1.cast::<__m512i>()),
+                            _mm512_loadu_si512(p1.sub(1).cast::<__m512i>()),
+                        )
+                    };
+                    // Odd-u members (corner (0,0) of t = 1), same lane map.
+                    let o = if k == 0 {
+                        let base = if z0 {
+                            _mm512_setzero_si512()
+                        } else {
+                            _mm512_loadu_si512(p0.add(1).cast::<__m512i>())
+                        };
+                        if z1 {
+                            _mm512_maskz_mov_epi64(0x33, base)
+                        } else {
+                            _mm512_mask_loadu_epi64(base, 0xCC, p1.cast::<i64>())
+                        }
+                    } else {
+                        _mm512_setzero_si512()
+                    };
+                    (c, o)
+                };
+                let (c_a, o_a) = side(fa);
+                let (c_b, o_b) = side(fb);
                 if k == 0 {
-                    st[0] = ao;
-                    st[1] = bo;
+                    st[0] = o_a;
+                    st[1] = o_b;
                 }
-                ca[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa, ya), ao);
-                cb[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb, yb), bo);
+                ca[k] = c_a;
+                cb[k] = c_b;
             }
             let a01 = _mm512_xor_si512(ca[0], ca[1]);
             let b01 = _mm512_xor_si512(cb[0], cb[1]);
@@ -5722,10 +5784,12 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
         let mut acc4 = [WideGhashX4::zero(); 10];
-        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        let mut fa_store = core::mem::MaybeUninit::<[FoldCache; 4]>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<[FoldCache; 4]>::uninit();
+        let fa4 = fa_store.as_mut_ptr().cast::<F128>();
+        let fb4 = fb_store.as_mut_ptr().cast::<F128>();
+        let mut fa = fa4;
+        let mut fb = fb4;
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -5825,6 +5889,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
             {
+                fa = fa4;
+                fb = fb4;
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
@@ -5834,38 +5900,45 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 0);
+                
             }
             {
+                fa = fa4.add(64);
+                fb = fb4.add(64);
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
                 gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                
             }
             {
+                fa = fa4.add(128);
+                fb = fb4.add(128);
                 let g0 = row_base + 2 * (x_lo + 64);
                 let bm = &(*b_mats_slice.add(batch_base + 2)).0;
                 gfni_fold64_rows_masked_tr_bcast4(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                
             }
             {
+                fa = fa4.add(192);
+                fb = fb4.add(192);
                 let g0 = row_base + 2 * (x_lo + 96);
                 let bm = &(*b_mats_slice.add(batch_base + 3)).0;
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
-                r4_round4_batch(fa, fb, &mut acc4, 3);
+                
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            r4_round4_block(fa4, fb4, &mut acc4);
             x_lo += 128;
         }
 

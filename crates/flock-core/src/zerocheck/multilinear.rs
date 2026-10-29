@@ -1979,7 +1979,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         let r3 = mlv_challenges[3];
         let one = F128::ONE;
         Some(kernels::x86_64::R4LaneWeights {
-            lv4: [one + r3, r3, one + r3, r3],
+            lv4: [one + r3, one + r3, r3, r3],
             lv4_odd: [F128::ZERO, one + r3, F128::ZERO, r3],
         })
     } else {
