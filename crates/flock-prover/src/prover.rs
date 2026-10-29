@@ -35,10 +35,11 @@ use flock_core::zerocheck;
 
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(target_arch = "x86_64")
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none())
 }
 
 #[inline]
@@ -110,6 +111,7 @@ fn c0_is_identity_cached(r1cs: &BlockR1cs) -> bool {
 /// always emits the fold4 tensor, so the downstream consumer gate still agrees.
 #[inline]
 fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     ranked_direct_ab_precompute_enabled(r1cs)
         && pcs::ranked_direct_fold4_enabled()
         && r1cs.k_log >= pcs::LOG_PACKING + 4
@@ -119,7 +121,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && c0_is_identity_cached(r1cs)
-        && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
+        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none())
 }
 
 /// Direct-fold8 capture/consumer predicate: the fold4 shape plus the shared
@@ -302,7 +304,8 @@ fn in_zerocheck_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + Send) -> 
 /// all-available pool. The pool's platform and large-instance guards remain
 /// centralized in `zerocheck_phase_pool`; this adds only a phase-local opt-out.
 pub(crate) fn in_witness_phase_pool<R: Send>(m: usize, op: impl FnOnce() -> R + Send) -> R {
-    if std::env::var_os(WITNESS_PHASE_POOL_DISABLE_ENV).is_some() {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os(WITNESS_PHASE_POOL_DISABLE_ENV).is_some()) {
         return op();
     }
     in_zerocheck_phase_pool(m, op)

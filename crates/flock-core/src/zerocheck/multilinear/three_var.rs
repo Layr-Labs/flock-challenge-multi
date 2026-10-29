@@ -210,9 +210,11 @@ pub(crate) fn round4_canonical_window_deltas(
 /// eight-entry group of a rank-one tensor XORs to its suffix weight).
 pub(crate) fn marginalize_eq_low3(eq: &[F128]) -> Vec<F128> {
     assert!(eq.len().is_power_of_two() && eq.len() >= 8);
-    eq.chunks_exact(8)
-        .map(|v| v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7])
-        .collect()
+    let mut out = crate::alloc_uninit_vec(eq.len() / 8);
+    for (dst, v) in out.iter_mut().zip(eq.chunks_exact(8)) {
+        *dst = ((v[0] + v[1]) + (v[2] + v[3])) + ((v[4] + v[5]) + (v[6] + v[7]));
+    }
+    out
 }
 
 /// Portable leaf of the three-variable packed pass for one worker chunk:
@@ -338,9 +340,10 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
         let cfold = (zc_gfni_enabled() && cfold_bake_enabled()).then(|| {
             let one = F128::ONE;
             let (r1, r2) = (rho[0], rho[1]);
-            kernels::x86_64::build_cfold_mats(
+            kernels::x86_64::build_fold3_mats(
                 &table.data,
                 [(one + r1) * (one + r2), r1 * (one + r2), (one + r1) * r2, r1 * r2],
+                rho[2],
             )
         });
         let wtab = (kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8))
@@ -391,16 +394,16 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                 // supplies every feature; lo_size is a multiple of 16.
                 unsafe {
                     match (*nt, out_lm) {
-                        (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
+                        (true, true) => kernels::x86_64::fold3_from_packed_prepared_wtab_x86::<true, true>(
                             ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
-                        (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
+                        (true, false) => kernels::x86_64::fold3_from_packed_prepared_wtab_x86::<true, false>(
                             ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
-                        (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
+                        (false, true) => kernels::x86_64::fold3_from_packed_prepared_wtab_x86::<false, true>(
                             ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
-                        (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
+                        (false, false) => kernels::x86_64::fold3_from_packed_prepared_wtab_x86::<false, false>(
                             ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
                     }

@@ -5201,7 +5201,6 @@ fn prove_padded_inner<Ch: Challenger>(
                 einf = neinf;
             } else {
                 // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
             if fold8_ready && t == 0 {
