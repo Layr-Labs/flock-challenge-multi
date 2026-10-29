@@ -5,6 +5,18 @@
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{

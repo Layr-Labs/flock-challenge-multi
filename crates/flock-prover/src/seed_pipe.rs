@@ -73,6 +73,18 @@
 //!   speculative run (two concurrent proofs would race for the process-global
 //!   scratch pools).
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -1056,7 +1068,7 @@ fn is_ranked_worker() -> bool {
 /// a 59 MiB comparison dispatched onto the pool that is proving.
 /// `FLOCK_NO_WARMUP_GENCHECK=1` keeps the full comparison.
 pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compression]) {
-    if std::env::var_os("FLOCK_NO_WARMUP_GENCHECK").is_some() || !is_ranked_worker() {
+    if hoisted_flag!("FLOCK_NO_WARMUP_GENCHECK") || !is_ranked_worker() {
         return;
     }
     if warmup_blocks.len() != 1usize << log2_size {
@@ -1095,7 +1107,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     let Some(proof_path) = ranked_worker_proof_path() else {
         return;
     };
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() {
+    if hoisted_flag!("FLOCK_NO_SEED_PIPE") {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {
@@ -1255,7 +1267,7 @@ fn speculative_main(
         const SPEC_WARMUP_PROVES: usize = 26;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
-        let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
+        let spec_warmup_proves = if hoisted_flag!("FLOCK_NO_SPEC_WARMUP") {
             1
         } else {
             SPEC_WARMUP_PROVES
@@ -1278,7 +1290,7 @@ fn speculative_main(
             }))
             .map(|out| last_warm_out = Some(out))
             .is_ok();
-            if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+            if hoisted_flag!("FLOCK_SEED_PIPE_DEBUG") {
                 eprintln!(
                     "[seed-pipe] thread warm-up prove {:.1} ms (ok={warm_ok}, untimed, inline={inline})",
                     t0.elapsed().as_secs_f64() * 1e3
@@ -1467,7 +1479,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     };
 
     // The head start is exactly what this mechanism buys; make it printable.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+    if hoisted_flag!("FLOCK_SEED_PIPE_DEBUG")
         && let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at)
     {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -1487,7 +1499,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     let result = state.result.take();
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()
+    if hoisted_flag!("FLOCK_SEED_PIPE_DEBUG")
         && let Some(seed_at) = seed_at
     {
         eprintln!(

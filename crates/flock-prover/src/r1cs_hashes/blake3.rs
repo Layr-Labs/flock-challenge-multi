@@ -88,6 +88,18 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use super::common::{add_carry_parts, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
@@ -3631,7 +3643,7 @@ pub(crate) mod witgen_simd {
         // Sapphire Rapids, so the default matches the scalar driver's plain
         // stores. `FLOCK_WITGEN_SIMD_NT=1` enables the NT drains for A/B.
         static NT: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_SIMD_NT").is_some());
+            LazyLock::new(|| hoisted_flag!("FLOCK_WITGEN_SIMD_NT"));
         *NT
     }
 

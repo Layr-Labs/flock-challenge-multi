@@ -1,3 +1,16 @@
+
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F128;
 
 /// `FLOCK_NO_NTT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
@@ -7,7 +20,7 @@ use crate::field::F128;
 #[inline]
 fn mul_diet_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_MUL_DIET"))
 }
 
 /// `FLOCK_NO_NTT_LOW_INNER_SPARSE=1` restores the general/diet product for
@@ -17,7 +30,7 @@ fn mul_diet_disabled() -> bool {
 #[inline]
 fn low_inner_sparse_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_INNER_SPARSE").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_LOW_INNER_SPARSE"))
 }
 
 /// A butterfly twiddle broadcast into all four 128-bit lanes, in the split
@@ -2920,7 +2933,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
 #[inline(never)]
 fn low_outer_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_OUTER_FUSED3").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_LOW_OUTER_FUSED3"))
 }
 
 /// Restore the general product for outer twiddles whose high limb is one.
@@ -2928,7 +2941,7 @@ fn low_outer_fused3_disabled() -> bool {
 #[inline(never)]
 fn high_one_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_HIGH_ONE_FUSED3").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_HIGH_ONE_FUSED3"))
 }
 
 /// `FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3=1` restores general products in all three
@@ -2937,7 +2950,7 @@ fn high_one_fused3_disabled() -> bool {
 #[inline(never)]
 fn low_twiddle_fused3_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_LOW_TWIDDLE_FUSED3"))
 }
 
 /// # Safety
@@ -3921,7 +3934,7 @@ pub(crate) struct PreparedFour {
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TWIDDLE_PREP").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_NTT_TWIDDLE_PREP"));
     if *OFF {
         return None;
     }

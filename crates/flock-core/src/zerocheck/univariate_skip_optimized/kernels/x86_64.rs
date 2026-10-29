@@ -5,6 +5,18 @@
     target_feature = "vpclmulqdq",
     target_feature = "gfni"
 ))]
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use super::super::{C_FOLD4_MATS_PER_GROUP, C_PLANE_BANK_BYTES, N_C_BANKS, N_C_Q};
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 use super::super::{ELL, F128, N_MEDIUM};

@@ -116,6 +116,18 @@
 //!   `byte_idx` and apply it across all `i_inner` with one lookup + one XOR
 //!   per byte.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
@@ -2591,7 +2603,7 @@ fn lc_plane_f128_enabled() -> bool {
 /// the two live ranges (zero dest ⇒ `scale * src`). Ranked env is cleared.
 fn lc_one_scale_vec_disabled() -> bool {
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ONE_SCALE").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_LC_ONE_SCALE"));
     *OFF
 }
 

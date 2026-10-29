@@ -19,6 +19,18 @@
 //! See [DP24](https://eprint.iacr.org/2024/504) (ring-switching) and the
 //! ligerito module docs for the recursion.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 pub mod commit;
 pub mod jagged;
 pub mod ligerito;
@@ -1090,7 +1102,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
                 if rs_deferred.len() <= 2
                     && b >= MERGE_MIN_BLOCK
-                    && std::env::var_os("FLOCK_COMBINE_MERGE").is_some()
+                    && hoisted_flag!("FLOCK_COMBINE_MERGE")
                 {
                     fused_fast_combine_merged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
                 } else {

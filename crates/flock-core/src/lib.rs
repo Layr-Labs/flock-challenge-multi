@@ -17,6 +17,18 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 pub mod bits;
 #[path = "stage_ir.rs"]
 pub mod gf2_kernels;
@@ -160,7 +172,7 @@ pub(crate) mod topology_pool {
         }
         #[cfg(target_os = "linux")]
         {
-            if std::env::var_os("FLOCK_NO_TOPOLOGY_POOL").is_some() {
+            if hoisted_flag!("FLOCK_NO_TOPOLOGY_POOL") {
                 return None;
             }
             let want: usize = std::env::var("RAYON_NUM_THREADS").ok()?.parse().ok()?;
@@ -457,8 +469,8 @@ pub(crate) mod smt_split {
         }
 
         pub(super) fn build() -> Option<(ThreadPool, ThreadPool)> {
-            let debug = std::env::var_os("FLOCK_SMT_SPLIT_DEBUG").is_some();
-            if std::env::var_os("FLOCK_NO_ZC_R1_SMT_SPLIT").is_some() {
+            let debug = hoisted_flag!("FLOCK_SMT_SPLIT_DEBUG");
+            if hoisted_flag!("FLOCK_NO_ZC_R1_SMT_SPLIT") {
                 if debug {
                     eprintln!("[smt_split] disabled by FLOCK_NO_ZC_R1_SMT_SPLIT");
                 }
@@ -499,12 +511,12 @@ pub(crate) mod smt_split {
                 }
             }
             let rebalance = (super::ZC_R1_AB_REBALANCE
-                || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
+                || hoisted_flag!("FLOCK_ZC_R1_AB_REBALANCE"))
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
-            if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
+            if hoisted_flag!("FLOCK_ZC_R1_SMT_SPLIT_IDLE") {
                 // Diagnostics: pools are built (and their threads spawned and
                 // pinned) but never installed on, isolating the standing cost
                 // of the extra threads from the value of the partition.
@@ -535,7 +547,7 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
         return;
     }
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HUGEPAGES").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_HUGEPAGES"));
     if *DISABLED {
         return;
     }
@@ -575,7 +587,7 @@ pub mod hot_pool {
 
     fn enabled() -> bool {
         static OFF: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT_POOL").is_some());
+            std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_HOT_POOL"));
         !*OFF
     }
 
@@ -751,7 +763,7 @@ pub(crate) fn collapse_hugepages(ptr: *mut u8, bytes: usize) -> bool {
         return true;
     }
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MADV_COLLAPSE").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_MADV_COLLAPSE"));
     if *DISABLED {
         return false;
     }
@@ -864,7 +876,7 @@ thread_local! {
 
 fn always_advise() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ALWAYS_ADVISE").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_ALWAYS_ADVISE"));
     *ON
 }
 

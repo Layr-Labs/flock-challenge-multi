@@ -9,13 +9,25 @@
 //! the disabled path is a single cached-bool load. Output goes to stderr so
 //! it never mixes with bench stdout parsing.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Cached `FLOCK_GAP_TIMING` presence. Read once per process.
 pub fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_GAP_TIMING").is_some());
+    static ON: LazyLock<bool> = LazyLock::new(|| hoisted_flag!("FLOCK_GAP_TIMING"));
     *ON
 }
 
@@ -59,7 +71,7 @@ pub fn mark(label: &str) {
 struct Ts { s: i64, ns: i64 }
 unsafe extern "C" { fn clock_gettime(clk: i32, ts: *mut Ts) -> i32; }
 pub fn abs_enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_ABS_TRACE").is_some());
+    static ON: LazyLock<bool> = LazyLock::new(|| hoisted_flag!("FLOCK_ABS_TRACE"));
     *ON
 }
 static ABS_BUF: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());

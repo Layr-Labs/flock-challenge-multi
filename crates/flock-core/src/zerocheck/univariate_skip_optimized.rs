@@ -30,6 +30,18 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
@@ -1843,7 +1855,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
 ///
 /// `FLOCK_NO_AB_INNER_SKIP=1` force-disables the skip (diagnostics).
 pub fn planned_round1_gpu_prefix_bytes(m: usize) -> usize {
-    if m < K_SKIP + N_INNER || std::env::var_os("FLOCK_NO_AB_INNER_SKIP").is_some() {
+    if m < K_SKIP + N_INNER || hoisted_flag!("FLOCK_NO_AB_INNER_SKIP") {
         return 0;
     }
     let n_outer = m - K_SKIP - N_INNER;

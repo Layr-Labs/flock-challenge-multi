@@ -20,6 +20,18 @@
 //! Scalar/correctness-first implementation; NEON `apply_triple` and the
 //! unrolled `ntt_and_accum` can be added if the URM hot path needs them.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F8;
 use crate::ntt::AdditiveNttGf8;
 
@@ -51,9 +63,9 @@ fn x86_table_images() -> usize {
         }
     }
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_INV_IMAGES8").is_some() {
+        if hoisted_flag!("FLOCK_INV_IMAGES8") {
             8
-        } else if std::env::var_os("FLOCK_INV_TABLE_IMAGES4").is_some() {
+        } else if hoisted_flag!("FLOCK_INV_TABLE_IMAGES4") {
             4
         } else {
             2

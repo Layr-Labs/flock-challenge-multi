@@ -41,6 +41,18 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
@@ -208,7 +220,7 @@ static ZERO_ODD_TAIL_LANES: std::sync::atomic::AtomicUsize = std::sync::atomic::
 #[inline]
 fn zero_lane_skip_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_LANE_SKIP").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_ZERO_LANE_SKIP"))
 }
 
 /// `FLOCK_NO_NTT_TOP_FUSION=1` restores the incumbent two-pass top-layer
@@ -219,7 +231,7 @@ fn zero_lane_skip_disabled() -> bool {
 /// cleared env never sets it).
 fn ntt_lone_top_bump_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LONE_TOP_BUMP").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_LONE_TOP_BUMP"))
 }
 
 /// [`AdditiveNttF128::top_fused6_pass`].
@@ -229,7 +241,7 @@ fn ntt_top_fusion_disabled() -> bool {
         return true;
     }
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_TOP_FUSION").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_TOP_FUSION"))
 }
 
 /// Test-only latch: forces the incumbent top schedule without touching the
@@ -249,7 +261,7 @@ fn ntt_seed_top_fusion_disabled() -> bool {
         return true;
     }
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_TOP_FUSION").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_SEED_TOP_FUSION"))
 }
 
 /// `FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH=1` restores the incumbent final
@@ -263,7 +275,7 @@ fn ntt_seed_top_fusion_disabled() -> bool {
 ))]
 fn ntt_direct_fused2_publish_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_DIRECT_FUSED2_PUBLISH"))
 }
 
 /// `FLOCK_NO_NTT_SEED_HOLD4=1` restores the two-gather seed step (sparse
@@ -277,7 +289,7 @@ fn ntt_direct_fused2_publish_disabled() -> bool {
 ))]
 fn ntt_seed_hold4_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_HOLD4").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_SEED_HOLD4"))
 }
 
 /// `FLOCK_NO_NTT_SEED_ODD_TAIL=1` restores the full-width seed step. By
@@ -292,7 +304,7 @@ fn ntt_seed_hold4_disabled() -> bool {
 ))]
 fn ntt_seed_odd_tail_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_SEED_ODD_TAIL").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_SEED_ODD_TAIL"))
 }
 
 /// Test-only latch for the seed fusion (see [`TOP_FUSION_TEST_OFF`]).
@@ -320,7 +332,7 @@ static SEED_TOP_FUSION_HITS: std::sync::atomic::AtomicUsize =
 ///    layers cost one row load + one row store instead of two of each.
 fn ntt_kernel_diet_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_KERNEL_DIET").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_KERNEL_DIET"))
 }
 
 /// Kernel-diet part 1: snap the odd-row lane bound to whole SIMD groups.
@@ -334,7 +346,7 @@ fn ntt_lane_round_disabled() -> bool {
     }
     static OFF: OnceLock<bool> = OnceLock::new();
     ntt_kernel_diet_disabled()
-        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_LANE_ROUND").is_some())
+        || *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_LANE_ROUND"))
 }
 
 /// Kernel-diet part 2: fuse the three-layer deep tail into one sweep.
@@ -389,7 +401,7 @@ fn sibling_pair_from_cpu_list(list: &str) -> Option<[usize; 2]> {
 #[cfg(target_os = "linux")]
 fn deep_split_pairs() -> Option<&'static Vec<(usize, usize)>> {
     static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_DEEP_SPLIT").is_some() {
+        if hoisted_flag!("FLOCK_NO_NTT_DEEP_SPLIT") {
             return None;
         }
         let n = rayon::current_num_threads();
@@ -718,7 +730,7 @@ impl DeepQueue {
 #[cfg(target_os = "linux")]
 fn deep_pf_hint() -> u8 {
     static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_DEEP_PF").is_some() {
+        if hoisted_flag!("FLOCK_NO_NTT_DEEP_PF") {
             return 0;
         }
         std::env::var("FLOCK_NTT_DEEP_PF_HINT")
@@ -772,7 +784,7 @@ fn ntt_fused3_disabled() -> bool {
     }
     static OFF: OnceLock<bool> = OnceLock::new();
     ntt_kernel_diet_disabled()
-        || *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FUSED3").is_some())
+        || *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_NTT_FUSED3"))
 }
 
 /// Test-only latch for the kernel diet (see [`TOP_FUSION_TEST_OFF`]).
@@ -1046,7 +1058,7 @@ pub struct AdditiveNttF128 {
 #[cfg(target_arch = "x86_64")]
 fn seed_pf_params() -> (usize, usize, bool) {
     static P: std::sync::LazyLock<(usize, usize, bool)> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_SEED_PF").is_some() {
+        if hoisted_flag!("FLOCK_NO_NTT_SEED_PF") {
             return (0, 0, false);
         }
         let g = |k: &str, d: usize| {
@@ -1121,7 +1133,7 @@ unsafe fn pf_msg_rows(
 ))]
 fn st_fmp_pairs() -> Option<&'static Vec<(usize, usize)>> {
     static P: std::sync::LazyLock<Option<Vec<(usize, usize)>>> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_NTT_ST_FMP").is_some() {
+        if hoisted_flag!("FLOCK_NO_NTT_ST_FMP") {
             return None;
         }
         let n = rayon::current_num_threads();
@@ -1583,7 +1595,7 @@ fn st_fmp_run_claimed(
     // worker runs under `env_clear()`, so this is compiled in and dead there.
     {
         static DBG: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ST_FMP_DEBUG").is_some());
+            std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_ST_FMP_DEBUG"));
         if *DBG {
             eprintln!(
                 "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len}"
@@ -2291,7 +2303,7 @@ impl AdditiveNttF128 {
         // `FLOCK_NTT_TIMING`: fill/transform split per encode (diagnostics;
         // read once per process, the ranked worker's cleared env never sets it).
         static NTT_TIMING: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_TIMING").is_some());
+            std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NTT_TIMING"));
         let ntt_timing = *NTT_TIMING;
         let t_fill = std::time::Instant::now();
         replicate_message_fill(codeword, msg);
@@ -4425,7 +4437,7 @@ impl AdditiveNttF128 {
                 let n_subs = 1usize << n_top;
                 let chunks = n_chunks.clamp(1, n_subs);
 
-                if std::env::var_os("FLOCK_NTT_STREAM_BARRIERS").is_some() {
+                if hoisted_flag!("FLOCK_NTT_STREAM_BARRIERS") {
                     // Kill switch: season-1 scheme — ordered super-chunks
                     // with a rayon barrier per chunk, callbacks on the
                     // calling thread. Costs ~10 ms of fork-join idle per
@@ -5297,7 +5309,7 @@ fn log2_pow2(n: usize) -> usize {
 ))]
 #[inline]
 fn rate_half_seed_disabled() -> bool {
-    std::env::var_os("FLOCK_NO_RATE_HALF_SEED").is_some()
+    hoisted_flag!("FLOCK_NO_RATE_HALF_SEED")
 }
 
 /// `FLOCK_NO_NTT_RATE_SEED=1` restores `replicate_message_fill` + a transform
@@ -5305,7 +5317,7 @@ fn rate_half_seed_disabled() -> bool {
 /// default ON (the ranked worker clears its env).
 fn rate_seed_disabled() -> bool {
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RATE_SEED").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_NTT_RATE_SEED"));
     *OFF
 }
 
@@ -7762,7 +7774,7 @@ mod low_twiddle_ranked_ab_probe {
         }
         println!(
             "LOWTWIDDLE off={} min_ms={best:.2} digest={digest:016x}",
-            std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some(),
+            hoisted_flag!("FLOCK_NO_LOW_TWIDDLE"),
             best = best,
         );
     }

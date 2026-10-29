@@ -38,6 +38,18 @@
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
@@ -323,7 +335,7 @@ fn lagrange_denominator_inv(k_skip: usize, node_base: usize) -> &'static [F128] 
 #[inline]
 fn lagrange_batch_inv_off() -> bool {
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LAGRANGE_BATCH_INV").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_LAGRANGE_BATCH_INV"));
     *OFF
 }
 
@@ -1137,7 +1149,7 @@ const TAIL_SPLIT_MIN_LO_LOG: usize = 10;
 fn tail_split_n_hi(n_vars: usize) -> usize {
     let base = lookahead_n_hi(n_vars);
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_ZC_TAIL_SPLIT"));
     if *OFF {
         return base;
     }
@@ -1364,7 +1376,7 @@ fn packed_split_n_hi(n_vars: usize) -> usize {
         return over.min(n_vars.saturating_sub(1));
     }
     static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PACKED_SPLIT").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_ZC_PACKED_SPLIT"));
     if *OFF {
         return base;
     }
@@ -2828,7 +2840,7 @@ fn zc_tail_chunk_min_out_log() -> usize {
         // Default OFF on this lineage: the calling-thread/fan-out route measured
         // -0.66% on the ranked runner (rayon regions are cheap there);
         // FLOCK_ZC_TAIL_FANOUT=1 opts back in for local A/B.
-        if std::env::var_os("FLOCK_NO_ZC_TAIL_FANOUT").is_some()
+        if hoisted_flag!("FLOCK_NO_ZC_TAIL_FANOUT")
             || std::env::var_os("FLOCK_ZC_TAIL_FANOUT").is_none()
         {
             return 0;
@@ -2866,7 +2878,7 @@ const ZC_SERIAL_TAIL_MAX_OUT_LOG: usize = 17;
 fn zc_serial_tail_max_out() -> usize {
     static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         // Default OFF (see zc_tail_chunk_min_out_log); FLOCK_ZC_SERIAL_TAIL=1 opts in.
-        if std::env::var_os("FLOCK_NO_ZC_SERIAL_TAIL").is_some()
+        if hoisted_flag!("FLOCK_NO_ZC_SERIAL_TAIL")
             || std::env::var_os("FLOCK_ZC_SERIAL_TAIL").is_none()
         {
             return 0;
@@ -2969,7 +2981,7 @@ pub(crate) fn fold_and_compute_round_pair_into_with_n_hi(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let use_qneon = std::env::var_os("FLOCK_NO_TAIL_QNEON").is_none();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let use_ldnp = std::env::var_os("FLOCK_TAIL_LDNP").is_some();
+    let use_ldnp = hoisted_flag!("FLOCK_TAIL_LDNP");
 
     // Per-chunk body, shared by the rayon route and the calling-thread route.
     let chunk_body = |x_hi: usize, a_out: &mut [F128], b_out: &mut [F128]| {

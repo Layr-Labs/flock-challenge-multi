@@ -1,5 +1,17 @@
 
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -11,7 +23,7 @@ mod sparse_window;
 
 pub(crate) fn open_timing() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_TIMING").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_OPEN_TIMING"));
     *ON
 }
 
@@ -1549,7 +1561,7 @@ fn tnt_pass_b_zero_selected(disabled: bool) -> bool {
 
 fn tnt_pass_b_zero_enabled() -> bool {
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TNT_ZERO_TWIDDLE").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_TNT_ZERO_TWIDDLE"));
     tnt_pass_b_zero_selected(*DISABLED)
 }
 
@@ -4322,12 +4334,12 @@ pub(crate) fn ligero_commit(
 
 fn gpu_open_merkle_min_leaves() -> usize {
     static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_GPU_OPEN_MERKLE").is_some() {
+        if hoisted_flag!("FLOCK_NO_GPU_OPEN_MERKLE") {
             return usize::MAX;
         }
         match std::env::var("FLOCK_GPU_OPEN_MERKLE_MIN_LOG2") {
             Ok(s) => s.parse::<u32>().map(|l| 1usize << l).unwrap_or(usize::MAX),
-            Err(_) if std::env::var_os("FLOCK_GPU_OPEN_MERKLE").is_some() => 1usize << 18,
+            Err(_) if hoisted_flag!("FLOCK_GPU_OPEN_MERKLE") => 1usize << 18,
             Err(_) => usize::MAX,
         }
     });
@@ -5006,7 +5018,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
 ))]
 fn open_nt_min_half_x86() -> usize {
     static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_OPEN_NT_17").is_some() {
+        if hoisted_flag!("FLOCK_OPEN_NT_17") {
             1usize << 17
         } else {
             1usize << 21
@@ -6451,7 +6463,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
+        hoisted_flag!("FLOCK_NO_LIG_LAZY_OOD_EQ"),
     )
 }
 
@@ -6500,8 +6512,8 @@ fn ranked_deep_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
-            || std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP").is_some(),
+        hoisted_flag!("FLOCK_NO_LIG_LAZY_OOD_EQ")
+            || hoisted_flag!("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP"),
     )
 }
 

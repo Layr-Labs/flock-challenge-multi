@@ -38,6 +38,18 @@
 //!     lengths anywhere. Digests land directly in the caller's tree memory
 //!     (flat `merkle_tree` layout) via the zero-copy wrap: no readback copies.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F128;
 use crate::ntt::InvNttTableByteSingleGf8;
 
@@ -229,11 +241,11 @@ mod real {
     // -- env escapes ---------------------------------------------------------
 
     static ENV_NO_GPU: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU").is_some());
+        LazyLock::new(|| hoisted_flag!("FLOCK_NO_GPU"));
     static ENV_NO_URM: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_URM").is_some());
+        LazyLock::new(|| hoisted_flag!("FLOCK_NO_GPU_URM"));
     static ENV_NO_MERKLE: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_MERKLE").is_some());
+        LazyLock::new(|| hoisted_flag!("FLOCK_NO_GPU_MERKLE"));
 
     // -- objc runtime / framework FFI ---------------------------------------
 
@@ -459,7 +471,7 @@ mod real {
     fn disable() {
         let loc = std::panic::Location::caller();
         crate::gpu::gpu_dbg_trace(&format!("DISABLE latched at {loc}"));
-        if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+        if hoisted_flag!("FLOCK_GPU_TRACE") {
             eprintln!("[gpu] DISABLE latched at {loc}");
         }
         DISABLED.store(true, Ordering::Relaxed);
@@ -814,7 +826,7 @@ mod real {
             if !(t_gpu.is_finite() && t_cpu.is_finite()) || t_gpu <= 0.0 || t_cpu <= 0.0 {
                 return; // keep the initial split
             }
-            if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+            if hoisted_flag!("FLOCK_GPU_TRACE") {
                 eprintln!(
                     "[gpu-urm] calibrate: g={g} gpu_ts={:.2}ms turnaround={:.2}ms ({:.3}ms/x_hi) cpu_share={:.2}ms ({:.3}ms/x_hi over {cpu_count}) -> new g={}",
                     gpu_seconds * 1e3,

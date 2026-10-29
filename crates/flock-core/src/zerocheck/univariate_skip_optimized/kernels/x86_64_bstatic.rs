@@ -26,6 +26,18 @@
 //!
 //! Kill switch: `FLOCK_NO_FAST_SHIFT_REDUCE=1` keeps the incumbent kernel.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use core::arch::x86_64::*;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

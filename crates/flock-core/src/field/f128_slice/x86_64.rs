@@ -1,3 +1,16 @@
+
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F128;
 
 /// Four-lane pair fold using AVX-512 lane deinterleaving and VPCLMULQDQ.
@@ -247,7 +260,7 @@ const FOLD16_PF_AHEAD: usize = 512;
 
 fn fold16_pf_ahead() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if std::env::var_os("FLOCK_NO_FOLD16_PF").is_some() {
+        if hoisted_flag!("FLOCK_NO_FOLD16_PF") {
             return 0;
         }
         std::env::var("FLOCK_FOLD16_PF")

@@ -6,6 +6,18 @@
 //! expansions, common ancestors are evaluated only once. Unlike a dense
 //! window, empty children never perform a transform.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use super::{
     AdditiveNttF128, F128, expand_singleton_into, transpose_butterfly,
     transpose_forward_ntt_window_dense_slice,

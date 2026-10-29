@@ -14,6 +14,18 @@
 //! The codeword is a flat sequence of `2^k_code` F_{2^128} elements. Each
 //! Merkle leaf is **one** F_{2^128} element = 16 bytes.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F128;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
@@ -295,7 +307,7 @@ fn finalize_commit(
     z_packed: &[F128],
     params: &PcsParams,
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let timing = hoisted_flag!("FLOCK_COMMIT_TIMING");
     let ntt = AdditiveNttF128::standard(params.k_code());
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
 
@@ -346,7 +358,7 @@ fn finalize_cpu_commit(
     params: &PcsParams,
     encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let timing = hoisted_flag!("FLOCK_COMMIT_TIMING");
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
     // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
     // each NTT deep-pass sub-group retires (regular stores, same worker).
@@ -699,7 +711,7 @@ static TREE_COLLAPSED: Mutex<Vec<(usize, u8, bool)>> = Mutex::new(Vec::new());
 
 fn tree_recollapse_every_park() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_TREE_RECOLLAPSE").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_TREE_RECOLLAPSE"));
     *ON
 }
 
@@ -911,7 +923,7 @@ fn subtree_parent_regroup_enabled(
     kind: HashKind,
 ) -> bool {
     static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_REGROUP").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_NO_MERKLE_SUBTREE_REGROUP"));
     subtree_parent_regroup_selected(n_leaves, num_ntts, leaf_size, kind, *DISABLED)
 }
 
@@ -1421,7 +1433,7 @@ pub fn prefault_codeword_during_with_resident<R>(
     params: &PcsParams,
     generate: impl FnOnce(Option<Vec<F128>>) -> (Option<Vec<F128>>, R),
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    if rayon::current_num_threads() <= 1 || hoisted_flag!("FLOCK_NO_PREFAULT") {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.

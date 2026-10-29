@@ -1,3 +1,16 @@
+
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -2200,7 +2213,7 @@ pub(crate) fn zc_lm_handoff_enabled() -> bool {
 
 pub(crate) fn zc_defer_split_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_DEFER_SPLIT").is_some());
+        std::sync::LazyLock::new(|| hoisted_flag!("FLOCK_ZC_DEFER_SPLIT"));
     *ON
 }
 

@@ -22,6 +22,18 @@
 //! re-attempt without first cutting PMULL count below 6/mul or NEON glue
 //! below the current form.
 
+
+// One-time resolution of a diagnostic flag. The process environment does not
+// change after entry, so the first answer is the answer every later call would
+// get; caching it keeps a lock and a string scan out of the per-call path.
+#[allow(unused_macros)]
+macro_rules! hoisted_flag {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
 use crate::field::F128;
 
 #[allow(dead_code)] // Portable fallbacks remain available for rollback builds.
@@ -78,7 +90,7 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
 #[inline]
 fn low_twiddle_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some())
+    *OFF.get_or_init(|| hoisted_flag!("FLOCK_NO_LOW_TWIDDLE"))
 }
 
 #[allow(clippy::too_many_arguments)]
