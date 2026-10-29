@@ -5032,3 +5032,576 @@ mod seed_compact_address_oracle_tests {
         println!("576 production compact-address seed cases match independent bitwise products, guards, source and twiddle immutability");
     }
 }
+
+/// Immutable coefficients for the exact ranked seed-tail2+4 factorization.
+/// The two stages share the original staging ownership and release/acquire seam.
+pub(crate) struct SeedTwoFourPlan {
+    early: Vec<[[F128; 2]; 3]>,
+    last: Vec<PreparedFour>,
+}
+
+pub(crate) unsafe fn prepare_seed_two_four(
+    t4: &[super::FourBlock],
+    t2: &[[[F128; 3]; 16]],
+) -> Option<SeedTwoFourPlan> {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TWO_FOUR").is_some());
+    if *OFF || !super::super::ntt_shaped_enabled() || t4.len() != 8 || t2.len() != 8 {
+        return None;
+    }
+    let mut early = Vec::with_capacity(8);
+    let mut last = Vec::with_capacity(32);
+    for b in 0..8 {
+        // An absent parent cache preserves the existing twiddle/diet rollback.
+        let cache = t4[b].cache.as_ref()?;
+        early.push(core::array::from_fn(|i| cache.pairs[i]));
+        for g in 0..4 {
+            let raw = core::array::from_fn(|i| match i {
+                0 => t4[b][3 + g],
+                1..=2 => t4[b][7 + 2 * g + i - 1],
+                3..=6 => t2[b][4 * g + i - 3][0],
+                7..=14 => t2[b][4 * g + (i - 7) / 2][1 + (i - 7) % 2],
+                _ => unreachable!(),
+            });
+            last.push(unsafe { prepare_four(&raw) }?);
+        }
+    }
+    Some(SeedTwoFourPlan { early, last })
+}
+#[inline(never)]
+unsafe fn seed_two_four_first_block(region: *mut F128, active: usize, t: &[[F128; 2]; 3]) {
+    use core::arch::x86_64::*;
+    // SAFETY: the exact-shape caller owns all four disjoint active row prefixes.
+    unsafe {
+        let coeff = |i: usize| {
+            (
+                _mm512_broadcast_i32x4(_mm_loadu_si128((&t[i][0] as *const F128).cast())),
+                _mm512_broadcast_i32x4(_mm_loadu_si128((&t[i][1] as *const F128).cast())),
+            )
+        };
+        let outer = coeff(0);
+        let inner_a = coeff(1);
+        let inner_b = coeff(2);
+        for j in 0..4 {
+            for m in 0..4 {
+                let a = region.add((j * 16 + m) * 64);
+                let b = a.add(4 * 64);
+                let c = a.add(8 * 64);
+                let d = a.add(12 * 64);
+                let mut i = 0;
+                while i + 8 <= active {
+                    let v0 = butterfly_2layer_diet_x4::<false, false>(
+                        outer,
+                        inner_a,
+                        inner_b,
+                        _mm512_loadu_si512(a.add(i).cast()),
+                        _mm512_loadu_si512(b.add(i).cast()),
+                        _mm512_loadu_si512(c.add(i).cast()),
+                        _mm512_loadu_si512(d.add(i).cast()),
+                    );
+                    let v1 = butterfly_2layer_diet_x4::<false, false>(
+                        outer,
+                        inner_a,
+                        inner_b,
+                        _mm512_loadu_si512(a.add(i + 4).cast()),
+                        _mm512_loadu_si512(b.add(i + 4).cast()),
+                        _mm512_loadu_si512(c.add(i + 4).cast()),
+                        _mm512_loadu_si512(d.add(i + 4).cast()),
+                    );
+                    _mm512_storeu_si512(a.add(i).cast(), v0.0);
+                    _mm512_storeu_si512(b.add(i).cast(), v0.1);
+                    _mm512_storeu_si512(c.add(i).cast(), v0.2);
+                    _mm512_storeu_si512(d.add(i).cast(), v0.3);
+                    _mm512_storeu_si512(a.add(i + 4).cast(), v1.0);
+                    _mm512_storeu_si512(b.add(i + 4).cast(), v1.1);
+                    _mm512_storeu_si512(c.add(i + 4).cast(), v1.2);
+                    _mm512_storeu_si512(d.add(i + 4).cast(), v1.3);
+                    i += 8;
+                }
+                if i < active {
+                    let v = butterfly_2layer_diet_x4::<false, false>(
+                        outer,
+                        inner_a,
+                        inner_b,
+                        _mm512_loadu_si512(a.add(i).cast()),
+                        _mm512_loadu_si512(b.add(i).cast()),
+                        _mm512_loadu_si512(c.add(i).cast()),
+                        _mm512_loadu_si512(d.add(i).cast()),
+                    );
+                    _mm512_storeu_si512(a.add(i).cast(), v.0);
+                    _mm512_storeu_si512(b.add(i).cast(), v.1);
+                    _mm512_storeu_si512(c.add(i).cast(), v.2);
+                    _mm512_storeu_si512(d.add(i).cast(), v.3);
+                }
+            }
+        }
+    }
+}
+
+/// Requires16 seeded staging rows in the permuted64-row block,60 or64 active
+/// lanes, and16 disjoint64-byte-aligned output rows spaced by2MiB.
+#[inline(never)]
+unsafe fn seed_two_four_final_block(
+    ptr: *mut F128,
+    prepared: &PreparedFour,
+    vector_bytes: usize,
+    output: *mut F128,
+) {
+    unsafe {
+        core::arch::asm!(
+            "test rdx, rdx",
+            "jz 3f",
+            "vbroadcasti32x4 zmm16, [rsi+0]",
+            "vbroadcasti32x4 zmm17, [rsi+16]",
+            "mov eax, 0x87",
+            "vmovq xmm30, rax",
+            "vshufi32x4 zmm30, zmm30, zmm30, 0",
+            "vbroadcasti32x4 zmm18, [rsi+32]",
+            "vbroadcasti32x4 zmm19, [rsi+48]",
+            "vbroadcasti32x4 zmm20, [rsi+64]",
+            "vbroadcasti32x4 zmm21, [rsi+80]",
+            "xor eax, eax",
+            ".p2align 5",
+            "2:",
+            "vmovdqu64 zmm0, [rdi+rax+0]",
+            "vmovdqu64 zmm1, [rdi+rax+16384]",
+            "vmovdqu64 zmm2, [rdi+rax+32768]",
+            "vmovdqu64 zmm3, [rdi+rax+49152]",
+            "vmovdqu64 zmm4, [rdi+rax+1024]",
+            "vmovdqu64 zmm5, [rdi+rax+17408]",
+            "vmovdqu64 zmm6, [rdi+rax+33792]",
+            "vmovdqu64 zmm7, [rdi+rax+50176]",
+            "vmovdqu64 zmm8, [rdi+rax+2048]",
+            "vmovdqu64 zmm9, [rdi+rax+18432]",
+            "vmovdqu64 zmm10, [rdi+rax+34816]",
+            "vmovdqu64 zmm11, [rdi+rax+51200]",
+            "vmovdqu64 zmm12, [rdi+rax+3072]",
+            "vmovdqu64 zmm13, [rdi+rax+19456]",
+            "vmovdqu64 zmm14, [rdi+rax+35840]",
+            "vmovdqu64 zmm15, [rdi+rax+52224]",
+            "vpclmulqdq zmm22, zmm12, zmm16, 0",
+            "vpclmulqdq zmm23, zmm12, zmm17, 1",
+            "vpternlogd zmm4, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm13, zmm16, 0",
+            "vpclmulqdq zmm23, zmm13, zmm17, 1",
+            "vpternlogd zmm5, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm14, zmm16, 0",
+            "vpclmulqdq zmm23, zmm14, zmm17, 1",
+            "vpternlogd zmm6, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm15, zmm16, 0",
+            "vpclmulqdq zmm23, zmm15, zmm17, 1",
+            "vpternlogd zmm7, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm12, zmm16, 16",
+            "vpclmulqdq zmm23, zmm12, zmm17, 17",
+            "vpclmulqdq zmm24, zmm13, zmm16, 16",
+            "vpclmulqdq zmm25, zmm13, zmm17, 17",
+            "vpclmulqdq zmm26, zmm14, zmm16, 16",
+            "vpclmulqdq zmm27, zmm14, zmm17, 17",
+            "vpclmulqdq zmm28, zmm15, zmm16, 16",
+            "vpclmulqdq zmm29, zmm15, zmm17, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm23, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpxorq zmm25, zmm28, zmm29",
+            "vpslldq zmm26, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm4, zmm22, zmm26, 0x96",
+            "vpxorq zmm12, zmm12, zmm4",
+            "vpslldq zmm22, zmm23, 8",
+            "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            "vpternlogd zmm5, zmm23, zmm22, 0x96",
+            "vpxorq zmm13, zmm13, zmm5",
+            "vpslldq zmm22, zmm24, 8",
+            "vpclmulqdq zmm23, zmm24, zmm30, 1",
+            "vpternlogd zmm6, zmm23, zmm22, 0x96",
+            "vpxorq zmm14, zmm14, zmm6",
+            "vpslldq zmm22, zmm25, 8",
+            "vpclmulqdq zmm23, zmm25, zmm30, 1",
+            "vpternlogd zmm7, zmm23, zmm22, 0x96",
+            "vpxorq zmm15, zmm15, zmm7",
+            "vpclmulqdq zmm22, zmm8, zmm16, 0",
+            "vpclmulqdq zmm23, zmm8, zmm17, 1",
+            "vpternlogd zmm0, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm9, zmm16, 0",
+            "vpclmulqdq zmm23, zmm9, zmm17, 1",
+            "vpternlogd zmm1, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm10, zmm16, 0",
+            "vpclmulqdq zmm23, zmm10, zmm17, 1",
+            "vpternlogd zmm2, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm11, zmm16, 0",
+            "vpclmulqdq zmm23, zmm11, zmm17, 1",
+            "vpternlogd zmm3, zmm22, zmm23, 0x96",
+            "vpclmulqdq zmm22, zmm8, zmm16, 16",
+            "vpclmulqdq zmm23, zmm8, zmm17, 17",
+            "vpclmulqdq zmm24, zmm9, zmm16, 16",
+            "vpclmulqdq zmm25, zmm9, zmm17, 17",
+            "vpclmulqdq zmm26, zmm10, zmm16, 16",
+            "vpclmulqdq zmm27, zmm10, zmm17, 17",
+            "vpclmulqdq zmm28, zmm11, zmm16, 16",
+            "vpclmulqdq zmm29, zmm11, zmm17, 17",
+            "vpxorq zmm22, zmm22, zmm23",
+            "vpxorq zmm23, zmm24, zmm25",
+            "vpxorq zmm24, zmm26, zmm27",
+            "vpxorq zmm25, zmm28, zmm29",
+            "vpxorq zmm8, zmm8, zmm0",
+            "vpxorq zmm9, zmm9, zmm1",
+            "vpxorq zmm10, zmm10, zmm2",
+            "vpxorq zmm11, zmm11, zmm3",
+            "vpclmulqdq zmm26, zmm14, zmm20, 0",
+            "vpclmulqdq zmm27, zmm14, zmm21, 1",
+            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpclmulqdq zmm26, zmm15, zmm20, 0",
+            "vpclmulqdq zmm27, zmm15, zmm21, 1",
+            "vpternlogd zmm11, zmm26, zmm27, 0x96",
+            "vpclmulqdq zmm26, zmm14, zmm20, 16",
+            "vpclmulqdq zmm27, zmm14, zmm21, 17",
+            "vpclmulqdq zmm28, zmm15, zmm20, 16",
+            "vpclmulqdq zmm29, zmm15, zmm21, 17",
+            "vpternlogd zmm26, zmm27, zmm24, 0x96",
+            "vpternlogd zmm28, zmm29, zmm25, 0x96",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpxorq zmm14, zmm14, zmm10",
+            "vpslldq zmm26, zmm28, 8",
+            "vpclmulqdq zmm27, zmm28, zmm30, 1",
+            "vpternlogd zmm11, zmm27, zmm26, 0x96",
+            "vpxorq zmm15, zmm15, zmm11",
+            "vpclmulqdq zmm26, zmm6, zmm18, 0",
+            "vpclmulqdq zmm27, zmm6, zmm19, 1",
+            "vpternlogd zmm2, zmm26, zmm27, 0x96",
+            "vpclmulqdq zmm26, zmm7, zmm18, 0",
+            "vpclmulqdq zmm27, zmm7, zmm19, 1",
+            "vpternlogd zmm3, zmm26, zmm27, 0x96",
+            "vpclmulqdq zmm26, zmm6, zmm18, 16",
+            "vpclmulqdq zmm27, zmm6, zmm19, 17",
+            "vpclmulqdq zmm28, zmm7, zmm18, 16",
+            "vpclmulqdq zmm29, zmm7, zmm19, 17",
+            "vpternlogd zmm24, zmm26, zmm27, 0x96",
+            "vpternlogd zmm25, zmm28, zmm29, 0x96",
+            "vpslldq zmm26, zmm24, 8",
+            "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            "vpternlogd zmm2, zmm24, zmm26, 0x96",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpslldq zmm24, zmm25, 8",
+            "vpclmulqdq zmm25, zmm25, zmm30, 1",
+            "vpternlogd zmm3, zmm25, zmm24, 0x96",
+            "vpxorq zmm7, zmm7, zmm3",
+            "vpclmulqdq zmm24, zmm12, zmm20, 0",
+            "vpclmulqdq zmm25, zmm12, zmm21, 1",
+            "vpternlogd zmm8, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm13, zmm20, 0",
+            "vpclmulqdq zmm25, zmm13, zmm21, 1",
+            "vpternlogd zmm9, zmm24, zmm25, 0x96",
+            "vpclmulqdq zmm24, zmm12, zmm20, 16",
+            "vpclmulqdq zmm25, zmm12, zmm21, 17",
+            "vpclmulqdq zmm26, zmm13, zmm20, 16",
+            "vpclmulqdq zmm27, zmm13, zmm21, 17",
+            "vpternlogd zmm24, zmm25, zmm22, 0x96",
+            "vpternlogd zmm26, zmm27, zmm23, 0x96",
+            "vpxorq zmm12, zmm12, zmm8",
+            "vpxorq zmm13, zmm13, zmm9",
+            "vpclmulqdq zmm25, zmm4, zmm18, 0",
+            "vpclmulqdq zmm27, zmm4, zmm19, 1",
+            "vpternlogd zmm0, zmm25, zmm27, 0x96",
+            "vpclmulqdq zmm25, zmm5, zmm18, 0",
+            "vpclmulqdq zmm27, zmm5, zmm19, 1",
+            "vpternlogd zmm1, zmm25, zmm27, 0x96",
+            "vpclmulqdq zmm25, zmm4, zmm18, 16",
+            "vpclmulqdq zmm27, zmm4, zmm19, 17",
+            "vpclmulqdq zmm28, zmm5, zmm18, 16",
+            "vpclmulqdq zmm29, zmm5, zmm19, 17",
+            "vpternlogd zmm22, zmm25, zmm27, 0x96",
+            "vpternlogd zmm23, zmm28, zmm29, 0x96",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpxorq zmm5, zmm5, zmm1",
+            "vbroadcasti32x4 zmm25, [rsi+128]",
+            "vbroadcasti32x4 zmm27, [rsi+144]",
+            "vpclmulqdq zmm28, zmm7, zmm25, 0",
+            "vpclmulqdq zmm29, zmm7, zmm27, 1",
+            "vpternlogd zmm5, zmm28, zmm29, 0x96",
+            "vpclmulqdq zmm28, zmm6, zmm25, 0",
+            "vpclmulqdq zmm29, zmm6, zmm27, 1",
+            "vpternlogd zmm4, zmm28, zmm29, 0x96",
+            "vpclmulqdq zmm28, zmm7, zmm25, 16",
+            "vpclmulqdq zmm29, zmm7, zmm27, 17",
+            "vpclmulqdq zmm25, zmm6, zmm25, 16",
+            "vpclmulqdq zmm27, zmm6, zmm27, 17",
+            "vpternlogd zmm28, zmm29, zmm23, 0x96",
+            "vpternlogd zmm25, zmm27, zmm22, 0x96",
+            "vpslldq zmm27, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm5, zmm28, zmm27, 0x96",
+            "vpxorq zmm7, zmm7, zmm5",
+            "vpxorq zmm6, zmm6, zmm4",
+            "vbroadcasti32x4 zmm27, [rsi+96]",
+            "vbroadcasti32x4 zmm28, [rsi+112]",
+            "vpclmulqdq zmm29, zmm3, zmm27, 0",
+            "vpclmulqdq zmm31, zmm3, zmm28, 1",
+            "vpternlogd zmm1, zmm29, zmm31, 0x96",
+            "vpclmulqdq zmm29, zmm2, zmm27, 0",
+            "vpclmulqdq zmm31, zmm2, zmm28, 1",
+            "vpternlogd zmm0, zmm29, zmm31, 0x96",
+            "vpclmulqdq zmm29, zmm3, zmm27, 16",
+            "vpclmulqdq zmm31, zmm3, zmm28, 17",
+            "vpclmulqdq zmm27, zmm2, zmm27, 16",
+            "vpclmulqdq zmm28, zmm2, zmm28, 17",
+            "vpternlogd zmm23, zmm29, zmm31, 0x96",
+            "vpternlogd zmm22, zmm27, zmm28, 0x96",
+            "vpslldq zmm27, zmm23, 8",
+            "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            "vpternlogd zmm1, zmm23, zmm27, 0x96",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vpxorq zmm2, zmm2, zmm0",
+            "vbroadcasti32x4 zmm23, [rsi+192]",
+            "vbroadcasti32x4 zmm27, [rsi+208]",
+            "vpclmulqdq zmm28, zmm15, zmm23, 0",
+            "vpclmulqdq zmm29, zmm15, zmm27, 1",
+            "vpternlogd zmm13, zmm28, zmm29, 0x96",
+            "vpclmulqdq zmm28, zmm14, zmm23, 0",
+            "vpclmulqdq zmm29, zmm14, zmm27, 1",
+            "vpternlogd zmm12, zmm28, zmm29, 0x96",
+            "vpclmulqdq zmm28, zmm15, zmm23, 16",
+            "vpclmulqdq zmm29, zmm15, zmm27, 17",
+            "vpclmulqdq zmm23, zmm14, zmm23, 16",
+            "vpclmulqdq zmm27, zmm14, zmm27, 17",
+            "vpternlogd zmm28, zmm29, zmm26, 0x96",
+            "vpternlogd zmm23, zmm27, zmm24, 0x96",
+            "vpslldq zmm27, zmm28, 8",
+            "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            "vpternlogd zmm13, zmm28, zmm27, 0x96",
+            "vpxorq zmm15, zmm15, zmm13",
+            "vpxorq zmm14, zmm14, zmm12",
+            "vbroadcasti32x4 zmm27, [rsi+160]",
+            "vbroadcasti32x4 zmm28, [rsi+176]",
+            "vpclmulqdq zmm29, zmm11, zmm27, 0",
+            "vpclmulqdq zmm31, zmm11, zmm28, 1",
+            "vpternlogd zmm9, zmm29, zmm31, 0x96",
+            "vpclmulqdq zmm29, zmm10, zmm27, 0",
+            "vpclmulqdq zmm31, zmm10, zmm28, 1",
+            "vpternlogd zmm8, zmm29, zmm31, 0x96",
+            "vpclmulqdq zmm29, zmm11, zmm27, 16",
+            "vpclmulqdq zmm31, zmm11, zmm28, 17",
+            "vpclmulqdq zmm27, zmm10, zmm27, 16",
+            "vpclmulqdq zmm28, zmm10, zmm28, 17",
+            "vpternlogd zmm26, zmm29, zmm31, 0x96",
+            "vpternlogd zmm24, zmm27, zmm28, 0x96",
+            "vpslldq zmm27, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm9, zmm26, zmm27, 0x96",
+            "vpxorq zmm11, zmm11, zmm9",
+            "vpxorq zmm10, zmm10, zmm8",
+            "vbroadcasti32x4 zmm26, [rsi+256]",
+            "vbroadcasti32x4 zmm27, [rsi+272]",
+            "vpclmulqdq zmm28, zmm3, zmm26, 0",
+            "vpclmulqdq zmm29, zmm3, zmm27, 1",
+            "vpternlogd zmm2, zmm28, zmm29, 0x96",
+            "vpclmulqdq zmm26, zmm3, zmm26, 16",
+            "vpclmulqdq zmm27, zmm3, zmm27, 17",
+            "vpternlogd zmm26, zmm27, zmm22, 0x96",
+            "vbroadcasti32x4 zmm27, [rsi+224]",
+            "vbroadcasti32x4 zmm28, [rsi+240]",
+            "vpslldq zmm29, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpclmulqdq zmm31, zmm1, zmm27, 0",
+            "vpternlogd zmm2, zmm26, zmm29, 0x96",
+            "vpxorq zmm3, zmm3, zmm2",
+            "vmovntdq [rcx+rax+4194304], zmm2",
+            "vmovntdq [rcx+rax+6291456], zmm3",
+            "vpclmulqdq zmm26, zmm1, zmm28, 1",
+            "vpternlogd zmm0, zmm31, zmm26, 0x96",
+            "vpclmulqdq zmm26, zmm1, zmm27, 16",
+            "vpclmulqdq zmm27, zmm1, zmm28, 17",
+            "vpternlogd zmm26, zmm27, zmm22, 0x96",
+            "vpslldq zmm22, zmm26, 8",
+            "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            "vpternlogd zmm0, zmm26, zmm22, 0x96",
+            "vpxorq zmm1, zmm1, zmm0",
+            "vmovntdq [rcx+rax+0], zmm0",
+            "vmovntdq [rcx+rax+2097152], zmm1",
+            "vbroadcasti32x4 zmm22, [rsi+320]",
+            "vbroadcasti32x4 zmm26, [rsi+336]",
+            "vpclmulqdq zmm27, zmm7, zmm22, 0",
+            "vpclmulqdq zmm28, zmm7, zmm26, 1",
+            "vpternlogd zmm6, zmm27, zmm28, 0x96",
+            "vpclmulqdq zmm22, zmm7, zmm22, 16",
+            "vpclmulqdq zmm26, zmm7, zmm26, 17",
+            "vpternlogd zmm22, zmm26, zmm25, 0x96",
+            "vbroadcasti32x4 zmm26, [rsi+288]",
+            "vbroadcasti32x4 zmm27, [rsi+304]",
+            "vpslldq zmm28, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpclmulqdq zmm29, zmm5, zmm26, 0",
+            "vpternlogd zmm6, zmm22, zmm28, 0x96",
+            "vpxorq zmm7, zmm7, zmm6",
+            "vmovntdq [rcx+rax+12582912], zmm6",
+            "vmovntdq [rcx+rax+14680064], zmm7",
+            "vpclmulqdq zmm22, zmm5, zmm27, 1",
+            "vpternlogd zmm4, zmm29, zmm22, 0x96",
+            "vpclmulqdq zmm22, zmm5, zmm26, 16",
+            "vpclmulqdq zmm26, zmm5, zmm27, 17",
+            "vpternlogd zmm22, zmm26, zmm25, 0x96",
+            "vpslldq zmm25, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm4, zmm22, zmm25, 0x96",
+            "vpxorq zmm5, zmm5, zmm4",
+            "vmovntdq [rcx+rax+8388608], zmm4",
+            "vmovntdq [rcx+rax+10485760], zmm5",
+            "vbroadcasti32x4 zmm22, [rsi+384]",
+            "vbroadcasti32x4 zmm25, [rsi+400]",
+            "vpclmulqdq zmm26, zmm11, zmm22, 0",
+            "vpclmulqdq zmm27, zmm11, zmm25, 1",
+            "vpternlogd zmm10, zmm26, zmm27, 0x96",
+            "vpclmulqdq zmm22, zmm11, zmm22, 16",
+            "vpclmulqdq zmm25, zmm11, zmm25, 17",
+            "vpternlogd zmm22, zmm25, zmm24, 0x96",
+            "vbroadcasti32x4 zmm25, [rsi+352]",
+            "vbroadcasti32x4 zmm26, [rsi+368]",
+            "vpslldq zmm27, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpclmulqdq zmm28, zmm9, zmm25, 0",
+            "vpternlogd zmm10, zmm22, zmm27, 0x96",
+            "vpxorq zmm11, zmm11, zmm10",
+            "vmovntdq [rcx+rax+20971520], zmm10",
+            "vmovntdq [rcx+rax+23068672], zmm11",
+            "vpclmulqdq zmm22, zmm9, zmm26, 1",
+            "vpternlogd zmm8, zmm28, zmm22, 0x96",
+            "vpclmulqdq zmm22, zmm9, zmm25, 16",
+            "vpclmulqdq zmm25, zmm9, zmm26, 17",
+            "vpternlogd zmm22, zmm25, zmm24, 0x96",
+            "vpslldq zmm24, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm8, zmm22, zmm24, 0x96",
+            "vpxorq zmm9, zmm9, zmm8",
+            "vmovntdq [rcx+rax+16777216], zmm8",
+            "vmovntdq [rcx+rax+18874368], zmm9",
+            "vbroadcasti32x4 zmm22, [rsi+448]",
+            "vbroadcasti32x4 zmm24, [rsi+464]",
+            "vpclmulqdq zmm25, zmm15, zmm22, 0",
+            "vpclmulqdq zmm26, zmm15, zmm24, 1",
+            "vpternlogd zmm14, zmm25, zmm26, 0x96",
+            "vpclmulqdq zmm22, zmm15, zmm22, 16",
+            "vpclmulqdq zmm24, zmm15, zmm24, 17",
+            "vpternlogd zmm22, zmm24, zmm23, 0x96",
+            "vbroadcasti32x4 zmm24, [rsi+416]",
+            "vbroadcasti32x4 zmm25, [rsi+432]",
+            "vpslldq zmm26, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpclmulqdq zmm27, zmm13, zmm24, 0",
+            "vpternlogd zmm14, zmm22, zmm26, 0x96",
+            "vpxorq zmm15, zmm15, zmm14",
+            "vmovntdq [rcx+rax+29360128], zmm14",
+            "vmovntdq [rcx+rax+31457280], zmm15",
+            "vpclmulqdq zmm22, zmm13, zmm25, 1",
+            "vpternlogd zmm12, zmm27, zmm22, 0x96",
+            "vpclmulqdq zmm22, zmm13, zmm24, 16",
+            "vpclmulqdq zmm24, zmm13, zmm25, 17",
+            "vpternlogd zmm22, zmm24, zmm23, 0x96",
+            "vpslldq zmm23, zmm22, 8",
+            "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            "vpternlogd zmm12, zmm22, zmm23, 0x96",
+            "vpxorq zmm13, zmm13, zmm12",
+            "vmovntdq [rcx+rax+25165824], zmm12",
+            "vmovntdq [rcx+rax+27262976], zmm13",
+            "add rax, 64",
+            "cmp rax, rdx",
+            "jb 2b",
+            "3:",
+            "cmp rdx, 960",
+            "jne 4f",
+            "vpxorq zmm0, zmm0, zmm0",
+            "vmovntdq [rcx+960], zmm0",
+            "vmovntdq [rcx+2098112], zmm0",
+            "vmovntdq [rcx+4195264], zmm0",
+            "vmovntdq [rcx+6292416], zmm0",
+            "vmovntdq [rcx+8389568], zmm0",
+            "vmovntdq [rcx+10486720], zmm0",
+            "vmovntdq [rcx+12583872], zmm0",
+            "vmovntdq [rcx+14681024], zmm0",
+            "vmovntdq [rcx+16778176], zmm0",
+            "vmovntdq [rcx+18875328], zmm0",
+            "vmovntdq [rcx+20972480], zmm0",
+            "vmovntdq [rcx+23069632], zmm0",
+            "vmovntdq [rcx+25166784], zmm0",
+            "vmovntdq [rcx+27263936], zmm0",
+            "vmovntdq [rcx+29361088], zmm0",
+            "vmovntdq [rcx+31458240], zmm0",
+            "4:",
+
+            in("rdi") ptr, in("rsi") prepared, in("rdx") vector_bytes,
+            in("rcx") output, out("rax") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm16") _,
+            out("zmm17") _,
+            out("zmm18") _,
+            out("zmm19") _,
+            out("zmm20") _,
+            out("zmm21") _,
+            out("zmm22") _,
+            out("zmm23") _,
+            out("zmm24") _,
+            out("zmm25") _,
+            out("zmm26") _,
+            out("zmm27") _,
+            out("zmm28") _,
+            out("zmm29") _,
+            out("zmm30") _,
+            out("zmm31") _,
+
+            options(nostack),
+        );
+    }
+}
+
+/// Fold only the first two remaining layers in the private512-row staging slot.
+/// No NT stores occur here; the caller retains its existing release handoff.
+#[inline(never)]
+pub(crate) unsafe fn seed_two_four_fold(buf: *mut F128, active: usize, plan: &SeedTwoFourPlan) {
+    debug_assert!(active == 60 || active == 64);
+    for b in 0..8 {
+        unsafe {
+            seed_two_four_first_block(buf.add(b * 4096), active, &plan.early[b]);
+        }
+    }
+}
+
+/// Finish the remaining four layers and publish all512 rows of this task.
+/// `output` already points to row r; the caller issues its original one SFENCE
+/// after return and does not recycle the staging slot before publication ends.
+#[inline(never)]
+pub(crate) unsafe fn seed_two_four_publish(
+    buf: *mut F128,
+    output: *mut F128,
+    active: usize,
+    plan: &SeedTwoFourPlan,
+) {
+    debug_assert!(active == 60 || active == 64);
+    debug_assert_eq!(output as usize % 64, 0);
+    for b in 0..8 {
+        for g in 0..4 {
+            unsafe {
+                seed_two_four_final_block(
+                    buf.add(b * 4096 + g * 256),
+                    &plan.last[b * 4 + g],
+                    active * 16,
+                    output.add(b * 131072 * 64 + g * 16 * 2048 * 64),
+                );
+            }
+        }
+    }
+}
