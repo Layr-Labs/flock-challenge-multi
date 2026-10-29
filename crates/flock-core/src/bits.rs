@@ -182,6 +182,58 @@ pub(crate) unsafe fn transpose_8_f128_to_16_mats_swapped_gfni(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[rustfmt::skip]
+#[inline]
+#[cfg_attr(
+    target_feature = "vpclmulqdq",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "vpclmulqdq"),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
+)]
+pub(crate) unsafe fn transpose_8_f128_basis_chain_16_gfni(
+    basis0: &[crate::field::F128; 8],
+    out_mats: &mut [u64],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(out_mats.len(), 256);
+    const I:[u8;64]=[56,48,40,32,24,16,8,0,57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,28,20,12,4,61,53,45,37,29,21,13,5,62,54,46,38,30,22,14,6,63,55,47,39,31,23,15,7];
+    const BSWAP:[u8;64]=[7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8,23,22,21,20,19,18,17,16,31,30,29,28,27,26,25,24,39,38,37,36,35,34,33,32,47,46,45,44,43,42,41,40,55,54,53,52,51,50,49,48,63,62,61,60,59,58,57,56];
+    unsafe {
+        let p = basis0.as_ptr() as *const __m512i;
+        let v0 = _mm512_loadu_si512(p);
+        let v1 = _mm512_loadu_si512(p.add(1));
+        let lo_idx = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
+        let hi_idx = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
+        let mut lo = _mm512_permutex2var_epi64(v0, lo_idx, v1);
+        let mut hi = _mm512_permutex2var_epi64(v0, hi_idx, v1);
+        let i = _mm512_loadu_si512(I.as_ptr() as *const __m512i);
+        let bswap = _mm512_loadu_si512(BSWAP.as_ptr() as *const __m512i);
+        let id = _mm512_set1_epi64(0x8040201008040201u64 as i64);
+        let poly = _mm512_set1_epi64(0x87);
+        let dst = out_mats.as_mut_ptr() as *mut __m512i;
+        for bm in 0..16usize {
+            let t_lo = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, lo));
+            let t_hi = _mm512_gf2p8affine_epi64_epi8::<0>(id, _mm512_permutexvar_epi8(i, hi));
+            _mm512_storeu_si512(dst.add(2 * bm), _mm512_shuffle_epi8(t_lo, bswap));
+            _mm512_storeu_si512(dst.add(2 * bm + 1), _mm512_shuffle_epi8(t_hi, bswap));
+            if bm < 15 {
+                let mask = _mm512_srai_epi64::<63>(hi);
+                hi = _mm512_or_si512(_mm512_slli_epi64::<1>(hi), _mm512_srli_epi64::<63>(lo));
+                lo = _mm512_xor_si512(_mm512_slli_epi64::<1>(lo), _mm512_and_si512(poly, mask));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

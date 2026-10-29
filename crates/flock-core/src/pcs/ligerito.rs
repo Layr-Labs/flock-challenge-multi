@@ -5153,7 +5153,10 @@ fn fold_and_msg_lsb_inner(
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
         && half >= (1usize << 21)
-        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+        && {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_NT").is_none())
+        };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5162,7 +5165,10 @@ fn fold_and_msg_lsb_inner(
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
         && half >= open_nt_min_half_x86()
-        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+        && {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_NT").is_none())
+        };
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -6451,7 +6457,10 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
+        {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some())
+        },
     )
 }
 
@@ -6500,8 +6509,13 @@ fn ranked_deep_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
-            || std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP").is_some(),
+        {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *OFF.get_or_init(|| {
+                std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
+                    || std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP").is_some()
+            })
+        },
     )
 }
 
@@ -6607,7 +6621,10 @@ fn ranked_deferred_induced_glue_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some(),
+        {
+            static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *OFF.get_or_init(|| std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some())
+        },
     )
 }
 
@@ -6688,9 +6705,18 @@ fn ranked_sparse_dual_l0_depth(
             return Some(forced);
         }
     }
-    let sparse_disabled = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
-        || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
-    let defer_disabled = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
+    static FLAGS: std::sync::OnceLock<(bool, bool, usize)> = std::sync::OnceLock::new();
+    let &(sparse_disabled, defer_disabled, depth) = FLAGS.get_or_init(|| {
+        let s = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
+            || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
+        let d = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
+        let exp = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
+        let dep = ranked_sparse_dual_l0_depth_setting(
+            exp.as_deref(),
+            std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
+        );
+        (s, d, dep)
+    });
     let platform_supported = cfg!(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -6714,11 +6740,6 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
-    let depth = ranked_sparse_dual_l0_depth_setting(
-        explicit_depth.as_deref(),
-        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
-    );
     Some(depth)
 }
 
@@ -6753,16 +6774,22 @@ fn ranked_sparse_dual_deep_depth(
             return (depth >= 2).then_some(depth);
         }
     }
-    if std::env::var_os(ENV_NO_DEEP_INDUCE_DUAL).is_some() {
+    static DEEP_FLAGS: std::sync::OnceLock<(bool, bool, bool)> = std::sync::OnceLock::new();
+    let &(deep_off, sparse_disabled, defer_disabled) = DEEP_FLAGS.get_or_init(|| {
+        (
+            std::env::var_os(ENV_NO_DEEP_INDUCE_DUAL).is_some(),
+            std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
+                || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some(),
+            std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some(),
+        )
+    });
+    if deep_off {
         return None;
     }
     let depth = ranked_sparse_dual_deep_depth_for_level(n_level)?;
     if depth > remaining_folds {
         return None;
     }
-    let sparse_disabled = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
-        || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
-    let defer_disabled = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
     let platform_supported = cfg!(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
