@@ -705,12 +705,21 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     flock_core::gaptime::mark("proof assembled");
     flock_core::gaptime::abs("proof assembled");
-    drop(s_hat_v_ab);
-    drop(s_hat_v_c);
-    flock_core::gaptime::mark("s_hat_v dropped");
-    drop(prover_data);
-    flock_core::gaptime::mark("prover_data dropped");
-    flock_core::gaptime::abs("prover_data dropped");
+    if crate::seed_pipe::is_timed_speculative_prove() {
+        // Timed speculative prove: the worker exits right after publishing,
+        // so these buffers are reclaimed by process exit outside the timed
+        // window (Th0rgal Wave 1 pre-publish drop elimination).
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+    } else {
+        drop(s_hat_v_ab);
+        drop(s_hat_v_c);
+        flock_core::gaptime::mark("s_hat_v dropped");
+        drop(prover_data);
+        flock_core::gaptime::mark("prover_data dropped");
+        flock_core::gaptime::abs("prover_data dropped");
+    }
     (proof, commitment, claim)
 }
 
