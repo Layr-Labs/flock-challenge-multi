@@ -376,8 +376,31 @@ fn ab_eq_fold_mats_transpose_enabled() -> bool {
 )]
 fn ab_eq_fold_mats_row_transposed(convert: &[F128], scale: F128, row: &mut [u64]) {
     debug_assert_eq!(row.len(), 256);
+    let derive_rows = CONVERT_TABLE_CACHE
+        .get()
+        .is_some_and(|table| core::ptr::eq(convert, table.as_slice()));
+    let mut basis = if derive_rows {
+        [
+            scale,
+            convert[2] * scale,
+            convert[4] * scale,
+            convert[8] * scale,
+            convert[16] * scale,
+            convert[32] * scale,
+            convert[64] * scale,
+            convert[128] * scale,
+        ]
+    } else {
+        [F128::ZERO; 8]
+    };
     for bm in 0..16 {
-        let basis: [F128; 8] = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * scale);
+        if !derive_rows {
+            basis = std::array::from_fn(|j| convert[bm * 256 + (1 << j)] * scale);
+        } else if bm > 0 {
+            for b in &mut basis {
+                *b = mul_by_x(*b);
+            }
+        }
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
