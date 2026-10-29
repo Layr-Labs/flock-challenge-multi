@@ -108,6 +108,13 @@ pub(crate) enum OctaInputs<'a> {
     Closed { init: u64, base: usize },
 }
 
+/// Compression offset of a live SIMD lane. Cross-quarter lanes cover
+/// all four quarters and the adjacent k pair for one pair of seed rows.
+#[inline(always)]
+fn compression_lane_offset(lane: usize, cross_quarter: bool) -> usize {
+    if cross_quarter { (lane / 2) * 65536 + (lane % 2) * 1024 } else { lane }
+}
+
 struct PreparedInputs {
     cv: [V8; 8],
     message: [V8; 16],
@@ -202,6 +209,12 @@ unsafe fn next_generator_draw(states: &mut [__m256i; 2]) -> V8 {
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+    unsafe { prepare_closed_inputs_ordered(init, base, false) }
+}
+
+#[cfg(not(target_feature = "avx512dq"))]
+#[inline(always)]
+unsafe fn prepare_closed_inputs_ordered(init: u64, base: usize, cross_quarter: bool) -> PreparedInputs {
     unsafe {
         let stride =
             crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
@@ -209,15 +222,15 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
         let mut states = [
             _mm256_setr_epi64x(
                 first as i64,
-                first.wrapping_add(stride) as i64,
-                first.wrapping_add(stride.wrapping_mul(2)) as i64,
-                first.wrapping_add(stride.wrapping_mul(3)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64)) as i64,
             ),
             _mm256_setr_epi64x(
-                first.wrapping_add(stride.wrapping_mul(4)) as i64,
-                first.wrapping_add(stride.wrapping_mul(5)) as i64,
-                first.wrapping_add(stride.wrapping_mul(6)) as i64,
-                first.wrapping_add(stride.wrapping_mul(7)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64)) as i64,
+                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64)) as i64,
             ),
         ];
         let cv = std::array::from_fn(|_| next_generator_draw(&mut states));
@@ -258,19 +271,25 @@ unsafe fn next_generator_draw(state: &mut __m512i) -> V8 {
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
 unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
+    unsafe { prepare_closed_inputs_ordered(init, base, false) }
+}
+
+#[cfg(target_feature = "avx512dq")]
+#[inline(always)]
+unsafe fn prepare_closed_inputs_ordered(init: u64, base: usize, cross_quarter: bool) -> PreparedInputs {
     unsafe {
         let stride =
             crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
-            first.wrapping_add(stride) as i64,
-            first.wrapping_add(stride.wrapping_mul(2)) as i64,
-            first.wrapping_add(stride.wrapping_mul(3)) as i64,
-            first.wrapping_add(stride.wrapping_mul(4)) as i64,
-            first.wrapping_add(stride.wrapping_mul(5)) as i64,
-            first.wrapping_add(stride.wrapping_mul(6)) as i64,
-            first.wrapping_add(stride.wrapping_mul(7)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64)) as i64,
+            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64)) as i64,
         );
         let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
         let message = std::array::from_fn(|_| next_generator_draw(&mut state));
@@ -718,7 +737,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
                 let out = &mut *proj
                     .out
-                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                    .add(proj.lane_offset(j) * proj.out_stride + 2 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(
                     &*off
@@ -739,7 +758,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
                 let out = &mut *proj
                     .out
-                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                    .add(proj.lane_offset(j) * proj.out_stride + 29 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(
                     &*off
@@ -915,7 +934,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_fast<const P: bool>(
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
             let out = &mut *proj
                 .out
-                .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                .add(proj.lane_offset(j) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
             round1_ab_inner_window_from_offsets_nt2::<P>(
                 &*off
@@ -957,7 +976,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
                 let out = &mut *proj
                     .out
-                    .add(j * proj.out_stride + 2 * 64 - proj.out_bias)
+                    .add(proj.lane_offset(j) * proj.out_stride + 2 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(
                     &*off
@@ -978,7 +997,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
                 rows.publish_dense_values(j, a_rows[j], b_rows[j]);
                 let out = &mut *proj
                     .out
-                    .add(j * proj.out_stride + 29 * 64 - proj.out_bias)
+                    .add(proj.lane_offset(j) * proj.out_stride + 29 * 64 - proj.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(
                     &*off
@@ -1154,7 +1173,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline<const P: bool>(
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
             let out = &mut *proj
                 .out
-                .add(j * proj.out_stride + blk * 64 - proj.out_bias)
+                .add(proj.lane_offset(j) * proj.out_stride + blk * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
             if plan.bcomplement_static_eligible() {
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static::<P>(
@@ -1206,7 +1225,7 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
             rows.publish_dense_values(j, a_rows[j], b_rows[j]);
             let out = &mut *proj
                 .out
-                .add(j * proj.out_stride + BLK * 64 - proj.out_bias)
+                .add(proj.lane_offset(j) * proj.out_stride + BLK * 64 - proj.out_bias)
                 .cast::<[u8; 64]>();
             round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
                 &*off
@@ -1254,7 +1273,9 @@ const _RING_GEOMETRY: () = {
 ///
 /// `stage` owns `STREAM_STAGE_WORDS` u32s (a side then b side, eight 16-word
 /// block rows each) and is 64-byte aligned. `out` owns this octa's eight
-/// `BYTES_PER_BLOCK` ab_inner blocks.
+/// `BYTES_PER_BLOCK` ab_inner blocks at the selected lane offsets.
+/// Cross-quarter output bases reference the full ranked allocation and must
+/// cover every mapped compression, not only eight adjacent blocks.
 pub(crate) struct StreamProj<'t> {
     pub(crate) stage: *mut u32,
     /// Physical start of this octa's output region. `out_bias` maps logical
@@ -1262,6 +1283,10 @@ pub(crate) struct StreamProj<'t> {
     /// the allocation.
     pub(crate) out: *mut u8,
     pub(crate) out_stride: usize,
+    pub(crate) cross_quarter: bool,
+    /// Optional dense octa copy for the immediate paired seed. Points at
+    /// eight complete2048-byte compression rows; absent on ordinary paths.
+    pub(crate) compact_z: *mut u32,
     pub(crate) out_bias: usize,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
@@ -1337,6 +1362,11 @@ static RANKED_ZERO: RankedStaticWindow = RankedStaticWindow([0u8; 64]);
 
 impl StreamProj<'_> {
     #[inline(always)]
+    fn lane_offset(&self, lane: usize) -> usize {
+        compression_lane_offset(lane, self.cross_quarter)
+    }
+
+    #[inline(always)]
     fn sides(&self) -> (*mut u32, *mut u32) {
         // SAFETY: the staging owns `STREAM_STAGE_WORDS` u32s.
         (self.stage, unsafe { self.stage.add(8 * STEP_WORDS) })
@@ -1361,7 +1391,7 @@ impl StreamProj<'_> {
                 let mut j=0usize;
                 while j!=8 {
                     rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                     round1_ab_inner_window_from_offsets::<false>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                     j+=1;
                 }
@@ -1369,7 +1399,7 @@ impl StreamProj<'_> {
                 let mut j=0usize;
                 while j!=8 {
                     rows.publish(j,sa,sb);
-                    let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                     round1_ab_inner_window_with_images(&*sa.add(j*STEP_WORDS).cast::<[u8;64]>(),&*sb.add(j*STEP_WORDS).cast::<[u8;64]>(),out,blk,self.inv_table,plan,imgs);
                     j+=1;
                 }
@@ -1407,7 +1437,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs);
                 j+=1;
             }
@@ -1458,7 +1488,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static::<P>(
                     &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
                     out,
@@ -1481,7 +1511,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_bcomplement_static_const::<BLK, P>(
                     &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
                     out,
@@ -1510,7 +1540,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
-                let out=&mut *self.out.add(j*self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+blk*64-self.out_bias).cast::<[u8;64]>();
                 if plan.bcomplement_static_eligible() {
                     round1_ab_inner_window_from_offsets_nt2_bcomplement_static::<P>(
                         &*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),
@@ -1536,7 +1566,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense(j,sa,sb);
-                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
@@ -1552,7 +1582,7 @@ impl StreamProj<'_> {
             let mut j=0usize;
             while j!=8 {
                 rows.publish_dense_values(j,a_rows[j],b_rows[j]);
-                let out=&mut *self.out.add(j*self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
+                let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+BLK*64-self.out_bias).cast::<[u8;64]>();
                 round1_ab_inner_window_from_offsets_nt2_residual::<P>(&*off.add(j*ROUND1_AB_OFF_WORDS).cast::<[u16;ROUND1_AB_OFF_WORDS]>(),out,plan,imgs,KEEP);
                 j+=1;
             }
@@ -1574,7 +1604,7 @@ impl StreamProj<'_> {
                 let a = &*self.stage.add(j * STEP_WORDS).cast::<[u8; 64]>();
                 let out = &mut *self
                     .out
-                    .add(j * self.out_stride + BLK * 64 - self.out_bias)
+                    .add(self.lane_offset(j) * self.out_stride + BLK * 64 - self.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_with_images(
                     a,
@@ -1601,7 +1631,7 @@ impl StreamProj<'_> {
             while j != 8 {
                 let out = &mut *self
                     .out
-                    .add(j * self.out_stride + 31 * 64 - self.out_bias)
+                    .add(self.lane_offset(j) * self.out_stride + 31 * 64 - self.out_bias)
                     .cast::<[u8; 64]>();
                 round1_ab_inner_window_with_images(
                     &RANKED_ZERO.0,
@@ -1633,7 +1663,7 @@ impl StreamProj<'_> {
                 rows.publish_sparse_30(j,q.add(j));
                 if !self.w30_elided {
                     let a=&*q.add(j).cast::<[u8;64]>();
-                    let out=&mut *self.out.add(j*self.out_stride+30*64-self.out_bias).cast::<[u8;64]>();
+                    let out=&mut *self.out.add(self.lane_offset(j) * self.out_stride+30*64-self.out_bias).cast::<[u8;64]>();
                     round1_ab_inner_window30_k0(a,&RANKED_B30.0,out,self.inv_table,plan,imgs,30);
                 }
                 j+=1;
@@ -1657,6 +1687,7 @@ struct Drain8<'t> {
     ranked_static: bool,
     #[allow(dead_code)]
     ranked_fast: bool,
+    cached_z: bool,
     #[allow(dead_code)]
     ranked_preps: Option<&'t RankedClosedWindowPreps>,
     #[cfg(all(
@@ -2118,7 +2149,8 @@ impl StepRows {
     }
 }
 
-/// Fixed-policy row publisher for the measured all-elide path.
+/// Ranked all-elide row publisher. AB always streams; z streams unless
+/// the caller explicitly selects cached stores for immediate seed consumption.
 ///
 /// The ranked AVX-512 binary installs `RecycleAlloc` globally. Its cleared
 /// environment selects the allocator's 64-byte-aligned recyclable class for
@@ -2127,15 +2159,31 @@ impl StepRows {
 /// base alignment. `StreamProj::stage` is backed by `AbWinLine`, also aligned
 /// to 64 bytes, and its side/row strides preserve it. Consequently no ranked
 /// store needs to carry the generic publisher's flags, width policy, or
-/// runtime alignment recovery.
+/// runtime alignment recovery. The z policy is explicit per producer; it
+/// never changes liveness, arithmetic, addresses, or synchronization.
 #[derive(Clone, Copy)]
 struct RankedRows {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
+    cached_z: bool,
+    cross_quarter: bool,
+    compact_z: *mut u32,
 }
 
 impl RankedRows {
+    #[inline(always)]
+    fn with_compact_z(mut self, base: *mut u32, word: usize) -> Self {
+        self.compact_z = if base.is_null() { base } else { unsafe { base.add(word) } };
+        self
+    }
+
+    #[inline(always)]
+    fn with_cross_quarter(mut self, cross_quarter: bool) -> Self {
+        self.cross_quarter = cross_quarter;
+        self
+    }
+
     #[inline(always)]
     fn new(z: *mut u32, a: *mut u32, b: *mut u32) -> Self {
         #[cfg(target_feature = "avx512f")]
@@ -2144,21 +2192,48 @@ impl RankedRows {
             debug_assert!((a as usize).is_multiple_of(64));
             debug_assert!((b as usize).is_multiple_of(64));
         }
-        Self { z, a, b }
+        Self { z, a, b, cached_z: false, cross_quarter: false, compact_z: core::ptr::null_mut() }
+    }
+
+    /// Only the actual immediate-seed producer requests this policy. All
+    /// other ranked callers retain streaming z stores. AB/root policy and
+    /// every producer's publication fence remain unchanged.
+    #[inline(always)]
+    fn with_cached_z(mut self, cached_z: bool) -> Self {
+        self.cached_z = cached_z;
+        self
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    #[inline(always)]
+    unsafe fn publish_z(&self, j: usize, p: *mut u32, value: __m512i) {
+        unsafe {
+            if !self.compact_z.is_null() {
+                // Keep the complete global witness for later protocol reads.
+                stream_ranked_line(p, value);
+                // Vec<F128> need not be64-byte aligned; use the unaligned
+                // cached intrinsic. Each role still owns whole dense rows.
+                _mm512_storeu_si512(self.compact_z.add(j * U32_PER_BLOCK).cast::<__m512i>(), value);
+            } else if self.cached_z {
+                _mm512_store_si512(p.cast::<__m512i>(), value);
+            } else {
+                stream_ranked_line(p, value);
+            }
+        }
     }
 
     /// Dense ranked windows 2..29: z, a, and b are all fully live.
     #[inline(always)]
     unsafe fn publish_dense(&self, j: usize, sa: *const u32, sb: *const u32) {
         unsafe {
-            let o = j * U32_PER_BLOCK;
+            let o = compression_lane_offset(j, self.cross_quarter) * U32_PER_BLOCK;
             let ap = sa.add(j * STEP_WORDS);
             let bp = sb.add(j * STEP_WORDS);
             #[cfg(target_feature = "avx512f")]
             {
                 let av = _mm512_load_si512(ap.cast::<__m512i>());
                 let bv = _mm512_load_si512(bp.cast::<__m512i>());
-                stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+                self.publish_z(j, self.z.add(o), _mm512_and_si512(av, bv));
                 stream_ranked_line(self.a.add(o), av);
                 stream_ranked_line(self.b.add(o), bv);
             }
@@ -2168,7 +2243,7 @@ impl RankedRows {
                 let a_hi = load_v8(ap.add(8));
                 let b_lo = load_v8(bp);
                 let b_hi = load_v8(bp.add(8));
-                stream_pair_v8(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true);
+                emit_pair(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true, true, !self.cached_z, true);
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
                 stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
             }
@@ -2181,8 +2256,8 @@ impl RankedRows {
     #[inline(always)]
     unsafe fn publish_dense_values(&self, j: usize, av: __m512i, bv: __m512i) {
         unsafe {
-            let o = j * U32_PER_BLOCK;
-            stream_ranked_line(self.z.add(o), _mm512_and_si512(av, bv));
+            let o = compression_lane_offset(j, self.cross_quarter) * U32_PER_BLOCK;
+            self.publish_z(j, self.z.add(o), _mm512_and_si512(av, bv));
             stream_ranked_line(self.a.add(o), av);
             stream_ranked_line(self.b.add(o), bv);
         }
@@ -2195,8 +2270,8 @@ impl RankedRows {
     #[inline(always)]
     unsafe fn publish_static_values(&self, j: usize, av: __m512i) {
         unsafe {
-            let o = j * U32_PER_BLOCK;
-            stream_ranked_line(self.z.add(o), av);
+            let o = compression_lane_offset(j, self.cross_quarter) * U32_PER_BLOCK;
+            self.publish_z(j, self.z.add(o), av);
             stream_ranked_line(self.a.add(o), av);
         }
     }
@@ -2206,19 +2281,19 @@ impl RankedRows {
     unsafe fn publish_static<const BLK: usize>(&self, j: usize, sa: *const u32) {
         unsafe {
             const { assert!(BLK <= 1) };
-            let o = j * U32_PER_BLOCK;
+            let o = compression_lane_offset(j, self.cross_quarter) * U32_PER_BLOCK;
             let ap = sa.add(j * STEP_WORDS);
             #[cfg(target_feature = "avx512f")]
             {
                 let av = _mm512_load_si512(ap.cast::<__m512i>());
-                stream_ranked_line(self.z.add(o), av);
+                self.publish_z(j, self.z.add(o), av);
                 stream_ranked_line(self.a.add(o), av);
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
                 let a_lo = load_v8(ap);
                 let a_hi = load_v8(ap.add(8));
-                stream_pair_v8(self.z.add(o), a_lo, a_hi, true);
+                emit_pair(self.z.add(o), a_lo, a_hi, true, true, !self.cached_z, true);
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
             }
         }
@@ -2229,21 +2304,36 @@ impl RankedRows {
     #[inline(always)]
     unsafe fn publish_sparse_30(&self, j: usize, p: *const u64) {
         unsafe {
-            let o = j * U32_PER_BLOCK;
+            let o = compression_lane_offset(j, self.cross_quarter) * U32_PER_BLOCK;
             #[cfg(target_feature = "avx512f")]
             {
                 let av = _mm512_maskz_loadu_epi64(1, p.cast::<i64>());
-                stream_ranked_line(self.z.add(o), av);
+                self.publish_z(j, self.z.add(o), av);
                 stream_ranked_line(self.a.add(o), av);
             }
             #[cfg(not(target_feature = "avx512f"))]
             {
                 let lo = _mm256_set_epi64x(0, 0, 0, core::ptr::read_unaligned(p) as i64);
                 let hi = _mm256_setzero_si256();
-                stream_pair_v8(self.z.add(o), lo, hi, true);
+                emit_pair(self.z.add(o), lo, hi, true, true, !self.cached_z, true);
                 stream_pair_v8(self.a.add(o), lo, hi, true);
             }
         }
+    }
+}
+
+/// Initialize only the final, unproduced window of each private compact row.
+///
+/// # Safety
+/// `z` must point to writable storage for eight full `U32_PER_BLOCK` rows.
+/// This does not initialize the other windows. Before reading them, the exact
+/// ranked closed producer must publish complete windows 0 through 30 for all
+/// eight lanes; its static and sparse publishers also store complete lines.
+#[inline(always)]
+pub(crate) unsafe fn initialize_compact_zero_tails(z: *mut u32) {
+    const { assert!(U32_PER_BLOCK == 32 * STEP_WORDS); }
+    for lane in 0..8 {
+        unsafe { z.add(lane * U32_PER_BLOCK + 31 * STEP_WORDS).write_bytes(0, STEP_WORDS); }
     }
 }
 
@@ -2397,7 +2487,7 @@ impl Drain8<'_> {
                 let mut q = [0u64; 8];
                 store_v8(q.as_mut_ptr().cast::<u32>(), _mm256_permute2x128_si256::<0x20>(l, h));
                 store_v8(q.as_mut_ptr().cast::<u32>().add(8), _mm256_permute2x128_si256::<0x31>(l, h));
-                let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480));
+                let rows = RankedRows::new(self.z.add(480), self.a.add(480), self.b.add(480)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, 480);
                 let qp = q.as_ptr();
                 let mut j = 0usize;
                 while j != 8 {
@@ -2411,7 +2501,7 @@ impl Drain8<'_> {
                     self.z.add(base_word),
                     self.a.add(base_word),
                     self.b.add(base_word),
-                );
+                ).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, base_word);
                 let mut j = 0usize;
                 while j != 8 {
                     rows.publish_static_values(j, a_rows[j]);
@@ -2459,7 +2549,7 @@ impl Drain8<'_> {
                     self.z.add(abs_word),
                     self.a.add(abs_word),
                     self.b.add(abs_word),
-                );
+                ).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                 let plan = preps.get_unchecked(blk).0;
 #[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni"))]
                 if (2..=29).contains(&blk) && plan.bcomplement_static_eligible(){
@@ -2498,7 +2588,7 @@ impl Drain8<'_> {
                 self.z.add(abs_word),
                 self.a.add(abs_word),
                 self.b.add(abs_word),
-            );
+            ).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
             let (plan, imgs) = *preps.get_unchecked(blk);
             let wc = WidenConsts::new();
             #[repr(align(64))]
@@ -2541,7 +2631,7 @@ impl Drain8<'_> {
                 match blk {
                     0 | 1 if static01_direct => {
                         let a_rows = tr8x16_zmm(self.ast, rw);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static_values(j, a_rows[j]);
@@ -2557,7 +2647,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<0>(j, sa);
@@ -2573,7 +2663,7 @@ impl Drain8<'_> {
                             store_v8(p, a_lo[r]);
                             store_v8(p.add(8), a_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         let mut j = 0usize;
                         while j != 8 {
                             rows.publish_static::<1>(j, sa);
@@ -2591,7 +2681,7 @@ impl Drain8<'_> {
                         let z = _mm256_setzero_si256();
                         store_v8(sa.add(16), z);
                         store_v8(sa.add(24), z);
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         let (plan, imgs) = preps[30];
                         proj.project_blocks_ranked_30(plan, imgs, rows);
                     }
@@ -2601,7 +2691,7 @@ impl Drain8<'_> {
                         struct OffArena([u16; 8 * ROUND1_AB_OFF_WORDS]);
                         let mut arena = core::mem::MaybeUninit::<OffArena>::uninit();
                         let op = core::ptr::addr_of_mut!((*arena.as_mut_ptr()).0) as *mut u16;
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         let (plan, imgs) = preps[blk];
                         project_blocks_ranked_hot_offsets_direct_inline::<true>(
                             proj,
@@ -2675,7 +2765,7 @@ impl Drain8<'_> {
                 }
                 let (plan, imgs) = proj.window_prep(blk);
                 if E && (blk <= 1 || blk == 30 || blk == 31) {
-                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                    let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                     if blk == 30 {
                         // Only A words 480 and 481 are live. Pair those two
                         // word-major ring vectors into eight block-major
@@ -2742,7 +2832,7 @@ impl Drain8<'_> {
                     // z/a/b.
                     #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
                     {
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         if ranked_direct_dense_publish_enabled() {
                             if ranked_direct_dense_inline_enabled() {
                                 if maddubs {
@@ -2788,7 +2878,7 @@ impl Drain8<'_> {
                             store_v8(p,b_lo[r]);
                             store_v8(p.add(8),b_hi[r]);
                         }
-                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word));
+                        let rows=RankedRows::new(self.z.add(abs_word),self.a.add(abs_word),self.b.add(abs_word)).with_cached_z(self.cached_z).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z, abs_word);
                         proj.project_blocks_ranked_hot_offsets::<false>(blk,plan,imgs,rows,op as *const u16);
                     }
                 } else {
@@ -2995,6 +3085,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
         target_feature = "vpclmulqdq"
     ))]
     roots: Option<root_emit::RootOctaWriter<'_>>,
+    cached_z: bool,
 ) {
     unsafe {
         #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -3046,6 +3137,7 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool>
             elide,
             ranked_static,
             ranked_fast,
+            cached_z,
             ranked_preps,
             #[cfg(all(
                 target_feature = "avx512f",
@@ -3339,6 +3431,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 target_feature = "vpclmulqdq"
             ))]
             None,
+        false,
         );
     }
 }
@@ -3373,6 +3466,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         target_feature = "vpclmulqdq"
     ))]
     roots: Option<root_emit::RootOctaWriter<'_>>,
+    cached_z: bool,
 ) {
     unsafe {
         debug_assert_eq!(elide, [true; 3]);
@@ -3382,7 +3476,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(ranked_direct_dense_inline_enabled());
         debug_assert!(widen_maddubs_enabled());
         let ranked_static = proj.plan.offsets_eligible(2);
-        let prepared = prepare_closed_inputs(init, base);
+        let prepared = prepare_closed_inputs_ordered(init, base, proj.cross_quarter);
         build_octa_witness_ab_stream_prepared_elide::<true>(
             &prepared,
             z,
@@ -3400,6 +3494,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
                 target_feature = "vpclmulqdq"
             ))]
             roots,
+        cached_z,
         );
     }
 }
@@ -4194,6 +4289,7 @@ mod tests {
                 a_seed.0.as_mut_ptr(),
                 b_seed.0.as_mut_ptr(),
                 StreamProj {
+                    cross_quarter: false, compact_z: core::ptr::null_mut(),
                     stage: stage_ref.0.as_mut_ptr(),
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
@@ -4244,6 +4340,7 @@ mod tests {
                     a_ref.0.as_mut_ptr(),
                     b_ref.0.as_mut_ptr(),
                     StreamProj {
+                        cross_quarter: false, compact_z: core::ptr::null_mut(),
                         stage: stage_ref.0.as_mut_ptr(),
                         out: ab_ref.0.as_mut_ptr(),
                         out_stride,
@@ -4262,6 +4359,7 @@ mod tests {
                     a_new.0.as_mut_ptr(),
                     b_new.0.as_mut_ptr(),
                     StreamProj {
+                        cross_quarter: false, compact_z: core::ptr::null_mut(),
                         stage: stage_new.0.as_mut_ptr(),
                         out: ab_new.0.as_mut_ptr(),
                         out_stride,
@@ -4281,6 +4379,7 @@ mod tests {
                         target_feature = "vpclmulqdq"
                     ))]
                     Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
+                false,
                 );
                 _mm_sfence();
             }
@@ -4329,3 +4428,428 @@ mod tests {
 // vbmi2draw-1: independent official timing sample of promoted fbc3001 VBMI2 W8 packer; no executable change.
 // rivaldraw-28 marker 76708 on 2758bc1
 // rivaldraw-37 marker 33507 on ca47b5d
+
+#[cfg(all(test, target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+mod cached_z_seed_pair_dispatch_tests {
+    use super::*;
+    #[test]
+    fn cached_z_seed_group_actual_octa_outputs() {
+        #[repr(C, align(64))]
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct AlignedWords([u32; 8 * U32_PER_BLOCK]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbCompact([u8; 8 * 29 * 64]);
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct AlignedAbFull([u8; 8 * 32 * 64]);
+        #[repr(C, align(64))]
+        struct AlignedStage([u32; STREAM_STAGE_WORDS]);
+
+        let ntt_s =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let ntt_l = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1u8 << super::super::K_SKIP),
+        );
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let dummy_ab = Box::new(AlignedAbCompact([0u8; 8 * 29 * 64]));
+        let win_plan =
+            flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+                &inv_table,
+                &dummy_ab.0,
+                true,
+            );
+        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, win_plan));
+        let crate::seed_pipe::BlockSource::Closed { init, .. } =
+            crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
+        else {
+            unreachable!()
+        };
+        let compact = win_plan.offsets_eligible(2);
+        let out_stride = if compact { 29 * 64 } else { 32 * 64 };
+        let out_bias = if compact { 2 * 64 } else { 0 };
+        let mut stage_ref = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+
+        // First seed reference z/a/b with full writes (elide = [false; 3])
+        let mut z_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut a_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut b_seed = Box::new(AlignedWords([0u32; 8 * U32_PER_BLOCK]));
+        let mut ab_seed = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+        unsafe {
+            build_octa_witness_ab_stream_elide(
+                OctaInputs::Closed { init, base: 0 },
+                z_seed.0.as_mut_ptr(),
+                a_seed.0.as_mut_ptr(),
+                b_seed.0.as_mut_ptr(),
+                StreamProj {
+                    cross_quarter: false, compact_z: core::ptr::null_mut(),
+                    stage: stage_ref.0.as_mut_ptr(),
+                    out: ab_seed.0.as_mut_ptr(),
+                    out_stride: 32 * 64,
+                    out_bias: 0,
+                    inv_table: &inv_table,
+                    plan: win_plan,
+                    one_rows_elided: false,
+                    w30_elided: false,
+                },
+                [false; 3],
+            );
+        }
+
+
+        // Constants come from a completed, fenced generation of a DIFFERENT
+        // seed. This is a real elision-provenance fixture, not a zero-filled
+        // guess at B's constant-one regions.
+        unsafe { _mm_sfence(); }
+        assert!(compact, "this probe requires the actual ranked compact plan");
+        fn shared_window_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
+            &value.0
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed = AtomicUsize::new(0);
+        let stripe_mask = AtomicUsize::new(0);
+        let selected = [
+            (0x1234_5678_90AB_CDEFu64, [0usize, 1, 2, 3]),
+            (0xFEDC_BA09_8765_4321u64, [4usize, 5, 6, 127]),
+        ];
+        for (case_seed, groups) in selected {
+            let crate::seed_pipe::BlockSource::Closed { init, .. } =
+                crate::seed_pipe::BlockSource::closed(18, case_seed)
+            else { unreachable!() };
+            for seed_group in groups {
+                // Each real worker owns its actual output allocations. The
+                // sparse arena preserves every octa's original input base,
+                // intra-octa pitches and root stripe, but deliberately does
+                // not pretend to benchmark global-address cache locality.
+                std::thread::scope(|scope| {
+                    for parity in 0..2 {
+                        let inv_table = &inv_table;
+                        let preps = &preps;
+                        let z_seed = &z_seed;
+                        let a_seed = &a_seed;
+                        let b_seed = &b_seed;
+                        let completed = &completed;
+                        let stripe_mask = &stripe_mask;
+                        scope.spawn(move || {
+                            let preps = shared_window_preps(preps);
+                            let mut stage_ref = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+                            let mut stage_new = Box::new(AlignedStage([0u32; STREAM_STAGE_WORDS]));
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let fold = super::super::Blake3AdjointPlan::build().linear_fold_plan();
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            let roots = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
+
+                            for ordinal in (parity..256usize).step_by(2) {
+                                let q = ordinal / 64;
+                                let k = ordinal % 64;
+                                let first_row = q * (1 << 17) + seed_group * 16 + k * (1 << 11);
+                                let base = first_row / 2;
+                                assert_eq!(base % 8, 0);
+                                assert!(base + 8 <= 1 << 18);
+                                let stripe = (base % 64) / 8;
+                                stripe_mask.fetch_or(1 << stripe, Ordering::Relaxed);
+
+            let mut z_ref = z_seed.clone();
+            let mut a_ref = a_seed.clone();
+            let mut b_ref = b_seed.clone();
+            let mut ab_ref = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+
+            let mut z_new = z_seed.clone();
+            let mut a_new = a_seed.clone();
+            let mut b_new = b_seed.clone();
+            let mut ab_new = Box::new(AlignedAbFull([0u8; 8 * 32 * 64]));
+            #[repr(align(64))]
+            struct RootTile([u8; 176 * 512]);
+            let mut root_tile = Box::new(RootTile([0xa5; 176 * 512]));
+
+            unsafe {
+                build_octa_witness_ab_stream_elide(
+                    OctaInputs::Closed { init, base },
+                    z_ref.0.as_mut_ptr(),
+                    a_ref.0.as_mut_ptr(),
+                    b_ref.0.as_mut_ptr(),
+                    StreamProj {
+                        cross_quarter: false, compact_z: core::ptr::null_mut(),
+                        stage: stage_ref.0.as_mut_ptr(),
+                        out: ab_ref.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    [true; 3],
+                );
+                build_octa_witness_ab_stream_ranked_closed(
+                    init,
+                    base,
+                    z_new.0.as_mut_ptr(),
+                    a_new.0.as_mut_ptr(),
+                    b_new.0.as_mut_ptr(),
+                    StreamProj {
+                        cross_quarter: false, compact_z: core::ptr::null_mut(),
+                        stage: stage_new.0.as_mut_ptr(),
+                        out: ab_new.0.as_mut_ptr(),
+                        out_stride,
+                        out_bias,
+                        inv_table: &inv_table,
+                        plan: win_plan,
+                        one_rows_elided: compact,
+                        w30_elided: compact,
+                    },
+                    &preps,
+                    [true; 3],
+                    #[cfg(all(
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vbmi",
+                        target_feature = "gfni",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr().add(stripe * 64))),
+                true,
+                );
+                _mm_sfence();
+            }
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
+            for group in 0..176 {
+                for column in 0..64 {
+                    let lane = column % 32 / 4;
+                    let expected = (0..8).fold(0u8, |bits, bit| {
+                        let value = fold.roots.get({
+                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
+                                    index + if index >= 833 { 64 } else { 0 }
+                                })
+                            .map_or(0, |&wire| (z_ref.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1);
+                        bits | (value as u8) << bit
+                    });
+                    assert_eq!(root_tile.0[group * 512 + stripe * 64 + column], expected,
+                        "live drain base={base}, group={group}, column={column}");
+                }
+                for untouched in 0..8 {
+                    if untouched != stripe {
+                        let start = group * 512 + untouched * 64;
+                        assert!(root_tile.0[start..start + 64].iter().all(|&v| v == 0xa5),
+                            "adjacent root stripe overwritten: base={base} stripe={stripe} untouched={untouched}");
+                    }
+                }
+            }
+            assert_eq!(z_ref, z_new, "z mismatch at base={base}");
+            assert_eq!(a_ref, a_new, "a mismatch at base={base}");
+            assert_eq!(b_ref, b_new, "b mismatch at base={base}");
+            let check_bytes = if compact { 28 * 64 } else { 31 * 64 };
+            for j in 0..8 {
+                let s = j * out_stride;
+                assert_eq!(
+                    &ab_ref.0[s..s + check_bytes],
+                    &ab_new.0[s..s + check_bytes],
+                    "ab mismatch at base={base} lane={j}"
+                );
+            }
+
+                                completed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        assert_eq!(completed.load(Ordering::Relaxed), 2048);
+        assert_eq!(stripe_mask.load(Ordering::Relaxed), 255);
+        println!("CACHED_Z_PAIR_WITNESS cases=2048 cached_z=true compressions=16384 seeds=2 groups=8 worker_roles=2 root_stripes=8 full_zab_bytes_compared=100663296 compact_ab_live_bytes_compared=29360128 root_bytes_checked=23068672 adjacent_stripes_unchanged=true field_witness_arithmetic=true ntt_arithmetic=false");
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+mod cross_quarter_witness_tests {
+    use super::*;
+
+    // Reserve the true ranked address ranges without eagerly touching every
+    // page. Every selected live row is initialized from a completed oracle.
+    struct Arena { address: *mut u8, bytes: usize }
+    unsafe extern "C" {
+        fn mmap(address: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut core::ffi::c_void;
+        fn munmap(address: *mut core::ffi::c_void, len: usize) -> i32;
+    }
+    impl Arena {
+        fn new(bytes: usize) -> Self {
+            let address = unsafe { mmap(core::ptr::null_mut(), bytes, 3, 0x22, -1, 0) };
+            assert_ne!(address as isize, -1);
+            assert!((address as usize).is_multiple_of(64));
+            Self { address: address.cast(), bytes }
+        }
+    }
+    impl Drop for Arena {
+        fn drop(&mut self) { assert_eq!(unsafe { munmap(self.address.cast(), self.bytes) }, 0); }
+    }
+
+    #[repr(C, align(64))]
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Words([u32; 8 * U32_PER_BLOCK]);
+    #[repr(C, align(64))]
+    struct Ab([u8; 8 * 32 * 64]);
+    #[repr(C, align(64))]
+    struct Stage([u32; STREAM_STAGE_WORDS]);
+    #[repr(C, align(64))]
+    struct Roots([u8; 176 * 512]);
+
+    fn shared_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
+        &value.0
+    }
+
+    #[test]
+    fn compact_copy_actual_witness_matches_scalar_inputs_and_root_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Independent literal geometry plus leading/trailing canaries proves
+        // the actual initializer touches only eight 64-byte final windows.
+        let mut guarded = [0xa5a5_a5a5u32; 4096 + 32];
+        unsafe { initialize_compact_zero_tails(guarded.as_mut_ptr().add(16)); }
+        for (i, &word) in guarded.iter().enumerate() {
+            let tail = (16..4112).contains(&i) && (i - 16) % 512 >= 496;
+            assert_eq!(word, if tail { 0 } else { 0xa5a5_a5a5 }, "initializer offset={i}");
+        }
+        let short = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let long = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8(1 << super::super::K_SKIP));
+        let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&short, &long);
+        let dummy = Box::new(Ab([0; 8 * 32 * 64]));
+        let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&inv_table, &dummy.0, true);
+        assert!(plan.offsets_eligible(2));
+        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, plan));
+        let stride = 29 * 64;
+        let z = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
+        let a = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
+        let b = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
+        let ab = Arena::new((1 << 18) * stride);
+        let addresses = [z.address as usize, a.address as usize, b.address as usize, ab.address as usize];
+        let completed = AtomicUsize::new(0);
+        let stripe_mask = AtomicUsize::new(0);
+        for seed in [0x1234_5678_90ab_cdefu64, 0xfedc_ba09_8765_4321] {
+            let crate::seed_pipe::BlockSource::Closed { init, .. } = crate::seed_pipe::BlockSource::closed(18, seed) else { unreachable!() };
+            for group in [0usize, 1, 2, 3, 127, 255, 511, 1023] {
+                std::thread::scope(|scope| {
+                    for role in 0..2 {
+                        let preps = &preps;
+                        let inv_table = &inv_table;
+                        let completed = &completed;
+                        let stripe_mask = &stripe_mask;
+                        scope.spawn(move || {
+                            let preps = shared_preps(preps);
+                            let fold = super::super::Blake3AdjointPlan::build().linear_fold_plan();
+                            let root_plan = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
+                            let mut reference_stage = Box::new(Stage([0; STREAM_STAGE_WORDS]));
+                            let mut stage = Box::new(Stage([0; STREAM_STAGE_WORDS]));
+                            // Match the production callback lifetime: initialize
+                            // only tails once, then reuse the input for 16 octas.
+                            let mut compact_z = Box::new(Words([0xa5a5_a5a5; 8 * U32_PER_BLOCK]));
+                            unsafe { initialize_compact_zero_tails(compact_z.0.as_mut_ptr()); }
+                            for kpair in (role..32).step_by(2) {
+                                let base = group + 2 * kpair * 1024;
+                                let labels = core::array::from_fn::<_,8,_>(|lane| group + (2 * kpair + lane % 2) * (1 << 10) + (lane / 2) * (1 << 16));
+                                let scalar_blocks = labels.map(|index| crate::seed_pipe::gen_block(init, index));
+                                let old_blocks = labels.map(|index| crate::seed_pipe::gen_block(init ^ 0xd1cec105eda51e5d, index));
+                                let mut zr = Box::new(Words([0; 8 * U32_PER_BLOCK]));
+                                let mut ar = zr.clone();
+                                let mut br = zr.clone();
+                                let mut abr = Box::new(Ab([0; 8 * 32 * 64]));
+                                unsafe {
+                                    // Populate valid old constants from a different input, then
+                                    // use the ordinary supplied-block producer as the new oracle.
+                                    for blocks in [&old_blocks, &scalar_blocks] {
+                                        let old = core::ptr::eq(blocks, &old_blocks);
+                                        build_octa_witness_ab_stream_elide(
+                                            OctaInputs::Blocks(core::array::from_fn(|lane| &blocks[lane])),
+                                            zr.0.as_mut_ptr(), ar.0.as_mut_ptr(), br.0.as_mut_ptr(),
+                                            StreamProj { stage: reference_stage.0.as_mut_ptr(), out: abr.0.as_mut_ptr(), out_stride: if old { 32*64 } else { stride }, cross_quarter: false, compact_z: core::ptr::null_mut(), out_bias: if old { 0 } else { 2*64 }, inv_table, plan, one_rows_elided: !old, w30_elided: !old },
+                                            [!old;3],
+                                        );
+                                        _mm_sfence();
+                                        if old {
+                                            for (lane, &logical) in labels.iter().enumerate() {
+                                                for (address, values) in addresses[..3].iter().zip([&zr.0, &ar.0, &br.0]) {
+                                                    core::ptr::copy_nonoverlapping(values.as_ptr().add(lane*U32_PER_BLOCK), (*address as *mut u32).add(logical*U32_PER_BLOCK), U32_PER_BLOCK);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Every live word starts unequal to its independent
+                                    // scalar oracle. Any omitted producer write must fail.
+                                    for lane in 0..8 {
+                                        let row = lane * U32_PER_BLOCK;
+                                        for word in 0..31 * STEP_WORDS {
+                                            compact_z.0[row + word] = !zr.0[row + word];
+                                        }
+                                        assert!(compact_z.0[row + 31 * STEP_WORDS..row + U32_PER_BLOCK].iter().all(|&v| v == 0));
+                                    }
+                                    for &logical in &labels {
+                                        core::ptr::write_bytes((addresses[3] as *mut u8).add(logical*stride),0xa5,stride);
+                                    }
+                                    let stripe = kpair % 8;
+                                    stripe_mask.fetch_or(1 << stripe, Ordering::Relaxed);
+                                    let mut roots = Box::new(Roots([0xa5;176*512]));
+                                    build_octa_witness_ab_stream_ranked_closed(
+                                        init, base,
+                                        (addresses[0] as *mut u32).add(base*U32_PER_BLOCK),
+                                        (addresses[1] as *mut u32).add(base*U32_PER_BLOCK),
+                                        (addresses[2] as *mut u32).add(base*U32_PER_BLOCK),
+                                        StreamProj { stage: stage.0.as_mut_ptr(), out: (addresses[3] as *mut u8).add(base*stride), out_stride: stride, cross_quarter: true, compact_z: compact_z.0.as_mut_ptr(), out_bias: 2*64, inv_table, plan, one_rows_elided: true, w30_elided: true },
+                                        preps, [true;3], Some(root_emit::RootOctaWriter::new(&root_plan, roots.0.as_mut_ptr().add(stripe*64))), false,
+                                    );
+                                    _mm_sfence();
+                                    assert_eq!(compact_z.0, zr.0, "compact copy: base={base}");
+                                    for (lane, &logical) in labels.iter().enumerate() {
+                                        for (name,(address,values)) in ["z","a","b"].into_iter().zip(addresses[..3].iter().zip([&zr.0,&ar.0,&br.0])) {
+                                            let got=core::slice::from_raw_parts((*address as *const u32).add(logical*U32_PER_BLOCK),U32_PER_BLOCK);
+                                            assert_eq!(got,&values[lane*U32_PER_BLOCK..(lane+1)*U32_PER_BLOCK],"{name}: base={base}, lane={lane}, cached={}",role==0);
+                                        }
+                                        let got=core::slice::from_raw_parts((addresses[3] as *const u8).add(logical*stride),stride);
+                                        assert_eq!(&got[..28*64],&abr.0[lane*stride..lane*stride+28*64],"AB: base={base}, lane={lane}");
+                                        assert!(got[28*64..].iter().all(|&v|v==0xa5),"elided AB window was overwritten");
+                                    }
+                                    for root_group in 0..176 {
+                                        for column in 0..64 {
+                                            let lane=column%32/4;
+                                            let expected=(0..8).fold(0u8,|bits,bit| {
+                                                let index=root_group*64+column/32*32+column%4*8+bit;
+                                                let root=index+usize::from(index>=833)*64;
+                                                let value=fold.roots.get(root).map_or(0,|&wire|(zr.0[lane*U32_PER_BLOCK+wire/32]>>(wire%32))&1);
+                                                bits|((value as u8)<<bit)
+                                            });
+                                            assert_eq!(roots.0[root_group*512+stripe*64+column],expected,"root base={base} group={root_group} column={column}");
+                                        }
+                                        for untouched in 0..8 {
+                                            if untouched!=stripe { assert!(roots.0[root_group*512+untouched*64..root_group*512+(untouched+1)*64].iter().all(|&v|v==0xa5)); }
+                                        }
+                                    }
+                                }
+                                completed.fetch_add(1,Ordering::Relaxed);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        assert_eq!(completed.load(Ordering::Relaxed),512);
+        assert_eq!(stripe_mask.load(Ordering::Relaxed),255);
+        println!("TAIL_INIT_WITNESS initialized_bytes_per_callback=512 reused_octas_per_callback=16 poisoned_live_words=2031616 initializer_canaries=true cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_streamed=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true");
+    }
+}
