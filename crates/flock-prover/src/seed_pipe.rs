@@ -409,6 +409,14 @@ struct Pipe {
 
 static PIPE: OnceLock<Pipe> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// True only while the timed speculative prove runs (Th0rgal Wave 1
+/// pre-publish drop elimination): its large prover buffers are released by
+/// process exit after publication instead of inside the timed window.
+static TIMED_SPEC_PROVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_timed_speculative_prove() -> bool {
+    TIMED_SPEC_PROVE.load(Ordering::Relaxed)
+}
 /// Set once the untimed warm-up proved that [`generate_compressions_par`]
 /// reproduces the protected generator at the ranked size on this build.
 static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
@@ -1244,7 +1252,7 @@ fn speculative_main(
         // fit with the job budget still open (kaankolcu's ab380ec8 ran 26). Each pass commits more of this thread's
         // lazily-grown stack and its thread-local and pool bookkeeping before
         // the timed prove.
-        const SPEC_WARMUP_PROVES: usize = 26;
+        const SPEC_WARMUP_PROVES: usize = 28;
         const SPEC_WARMUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
         // Read once, outside the loop.
         let spec_warmup_proves = if std::env::var_os("FLOCK_NO_SPEC_WARMUP").is_some() {
@@ -1325,6 +1333,7 @@ fn speculative_main(
         }
 
         let seed_at = std::time::Instant::now();
+        TIMED_SPEC_PROVE.store(true, Ordering::Relaxed);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Inline path: nothing is materialized except the two blocks the O(1)
             // adoption gate reads. Everything else is evaluated inside witgen from
@@ -1366,6 +1375,7 @@ fn speculative_main(
             run(setup_addr, BlockSource::Slice(&blocks))
         }));
 
+        TIMED_SPEC_PROVE.store(false, Ordering::Relaxed);
         match (direct_proof_path.as_deref(), outcome) {
             (Some(path), Ok(out)) => {
                 let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
