@@ -2982,11 +2982,17 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
                 // One private octa per role: seed it before the next octa can
-                // reuse these bytes. Initialization covers the omitted final
-                // window; all live windows are overwritten by this producer.
-                #[repr(align(64))]
+                // reuse these bytes. Only the omitted final window needs an
+                // initial zero. All other windows are completely overwritten
+                // by the exact producer before seed_octa reads the input.
+                #[repr(C, align(64))]
                 struct OctaInput([F128; 8 * F128_PER_BLOCK]);
-                let mut input = OctaInput([F128::ZERO; 8 * F128_PER_BLOCK]);
+                let mut input = core::mem::MaybeUninit::<OctaInput>::uninit();
+                // repr(C) places the sole array at offset zero. Keep raw
+                // pointers throughout; never form a reference to uninitialized
+                // fields. If production unwinds, no seed read is reached.
+                let input_ptr = input.as_mut_ptr().cast::<F128>();
+                unsafe { blake3_witgen8::initialize_compact_zero_tails(input_ptr.cast::<u32>()); }
                 // The const-window rollback uses StreamProj's scratch even
                 // in the exact path. Each callback owns this aligned 1 KiB
                 // buffer until all its octas return; drains initialize every
@@ -3010,7 +3016,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     unsafe {
                         let proj = blake3_witgen8::StreamProj {
                             cross_quarter: true,
-                            compact_z: if target.is_some() { input.0.as_mut_ptr().cast::<u32>() } else { core::ptr::null_mut() },
+                            compact_z: if target.is_some() { input_ptr.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
                             out: (ab_addr as *mut u8).add(base * ab_block_bytes),
@@ -3040,7 +3046,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             if elide_z {
                                 elided_octas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            target.seed_octa(input.0.as_ptr(), kpair);
+                            target.seed_octa(input_ptr, kpair);
                         }
                     }
                 }
