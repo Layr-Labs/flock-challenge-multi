@@ -1783,6 +1783,23 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     canon: Option<&[F128]>,
     want_r4: bool,
 ) -> ((F128, F128, Round3Lookahead), Option<Round4Lookahead>) {
+    uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_with_source(a_packed,b_packed,m,k_skip,table,mlv_challenges,padding,eq_override,canon,want_r4,None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_with_source(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    eq_override: Option<&SplitEqGhash>,
+    canon: Option<&[F128]>,
+    want_r4: bool,
+    ab_source:Option<&dyn PackedAbRegen>,
+) -> ((F128, F128, Round3Lookahead), Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1986,6 +2003,11 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         None
     };
 
+    // Unsupported routes receive fully regenerated dense inputs before any
+    // original reader can observe the stale provenance-backed allocations.
+    let dense=ab_source.filter(|_|!r4_fast).map(materialize_packed_ab);
+    let (a_packed,b_packed)=dense.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
+    let ab_source=if r4_fast {ab_source} else {None};
     let (sum1_even, sum_inf_even, agg, r4_flat) = (0..hi_size)
         .into_par_iter()
         .map(|x_hi| {
@@ -2013,14 +2035,10 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && let Some(bk) = bake_arg
                 {
                     if let Some(lw) = r4_lv.as_ref() {
-                        let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
-                            a_packed.as_ptr(),
-                            b_packed.as_ptr(),
-                            row_base,
-                            lo_size,
-                            bk,
-                            lw,
-                        );
+                        let compute=|ap,bp,base|kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(ap,bp,base,lo_size,bk,lw);
+                        let (o,r4)=if let Some(source)=ab_source {
+                            with_regenerated_ab(source,row_base*8,chunk_size*8,|a,b|compute(a.as_ptr(),b.as_ptr(),0))
+                        } else {compute(a_packed.as_ptr(),b_packed.as_ptr(),row_base)};
                         r4_out = r4;
                         o
                     } else {
@@ -7120,4 +7138,100 @@ mod tests {
             );
         }
     }
+}
+
+/// Development-only equality probe for the two actual packed-A/B consumers.
+/// This is not connected to production proving or intended as a submitted API.
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+pub fn ab_regeneration_consumer_probe(a:&[u8],b:&[u8],ar:&[u8],br:&[u8],prefix_compressions:usize,mut seed:u64) {
+    use crate::zerocheck::univariate_skip::build_eq;
+    use kernels::x86_64::{round2_lookahead_chunk_baked_elide_r4_x86 as round2,
+        fold3_from_packed_lookahead_c4_lm_wtab_x86 as fold3,R4LaneWeights};
+    const BYTES:usize=32*2048;
+    const OUT:usize=BYTES/64;
+    const GUARD:F128=F128{lo:0xace0135775310eca,hi:0xfacedead01234567};
+    assert_eq!((a.len(),b.len(),ar.len(),br.len()),(BYTES,BYTES,BYTES,BYTES));
+    let saved_ar=ar.to_vec();let saved_br=br.to_vec();
+    let prefix=prefix_compressions*2048;
+    let mut ga=vec![0xa5;prefix+BYTES];let mut gb=vec![0x3c;prefix+BYTES];
+    ga[prefix..].copy_from_slice(a);gb[prefix..].copy_from_slice(b);
+    let saved_ga=ga.clone();let saved_gb=gb.clone();
+    let mut random=||{seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;let lo=seed;
+        seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;F128{lo,hi:seed}};
+    let table=UniSkipFoldTable::new(6,random());
+    let rlo:Vec<F128>=(0..12).map(|_|random()).collect();
+    let eq=build_eq(&rlo);
+    let mut bk=build_r2_eq_bake_checked(&table,&eq,&rlo,true).expect("valid tensor");
+    bk.canonical_elide=true;
+    let rho=[random(),random(),random()];let one=F128::ONE;
+    let lw=R4LaneWeights{lv4:[one+rho[2],rho[2],one+rho[2],rho[2]],lv4_odd:[F128::ZERO,one+rho[2],F128::ZERO,rho[2]]};
+    unsafe {
+        let original=round2(ga.as_ptr(),gb.as_ptr(),prefix/8,BYTES/16,&bk,&lw);
+        let regenerated=round2(ar.as_ptr(),br.as_ptr(),0,BYTES/16,&bk,&lw);
+        assert_eq!(original,regenerated,"round2 messages and all 18 deferred round4 sums");
+    }
+    let cfold=unsafe {kernels::x86_64::build_cfold_mats(&table.data,
+        [(one+rho[0])*(one+rho[1]),rho[0]*(one+rho[1]),(one+rho[0])*rho[1],rho[0]*rho[1]])};
+    let wt=build_w_pair_table(&build_eq(&rlo[..9]));
+    #[repr(C,align(64))]struct Output([F128;OUT+32]);
+    for nt in [false,true] {for lm in [false,true] {
+        let(mut oa,mut ob,mut ra,mut rb)=(Box::new(Output([GUARD;OUT+32])),Box::new(Output([GUARD;OUT+32])),Box::new(Output([GUARD;OUT+32])),Box::new(Output([GUARD;OUT+32])));
+        let mut run=|ap:*const u8,bp:*const u8,base:usize,ao:&mut [F128],bo:&mut [F128]|unsafe{
+            match (nt,lm) {
+                (false,false)=>fold3::<false,false>(ap,bp,base,ao,bo,OUT/2,&cfold,rho[2],&wt),
+                (false,true)=>fold3::<false,true>(ap,bp,base,ao,bo,OUT/2,&cfold,rho[2],&wt),
+                (true,false)=>fold3::<true,false>(ap,bp,base,ao,bo,OUT/2,&cfold,rho[2],&wt),
+                (true,true)=>fold3::<true,true>(ap,bp,base,ao,bo,OUT/2,&cfold,rho[2],&wt),
+            }
+        };
+        let original=run(ga.as_ptr(),gb.as_ptr(),prefix/64,&mut oa.0[16..OUT+16],&mut ob.0[16..OUT+16]);
+        let regenerated=run(ar.as_ptr(),br.as_ptr(),0,&mut ra.0[16..OUT+16],&mut rb.0[16..OUT+16]);
+        assert_eq!(original,regenerated,"fold3 message sums nt={nt} lm={lm}");
+        assert_eq!(oa.0,ra.0,"fold3 A output nt={nt} lm={lm}");
+        assert_eq!(ob.0,rb.0,"fold3 B output nt={nt} lm={lm}");
+        for x in [&oa.0,&ob.0,&ra.0,&rb.0] {
+            assert!(x[..16].iter().chain(x[OUT+16..].iter()).all(|v|*v==GUARD));
+        }
+    }}
+    assert_eq!(ga,saved_ga);assert_eq!(gb,saved_gb);
+    assert_eq!(ar,saved_ar);assert_eq!(br,saved_br);
+}
+
+/// Exact packed A/B source owned by one proof. Offsets are canonical byte
+/// offsets, independent of the witness producer's physical scheduling.
+pub trait PackedAbRegen: Send + Sync {
+    fn len_bytes(&self) -> usize;
+    /// Fully overwrite both equally sized output slices for this byte range.
+    fn fill(&self, byte_offset: usize, a: &mut [u8], b: &mut [u8]);
+}
+
+thread_local! {
+    // Cached capacity only; every use is overwritten from the current proof's
+    // source. Contents are never reused as witness data across proofs.
+    static AB_REGEN_SCRATCH: std::cell::RefCell<(Vec<u8>,Vec<u8>)> =
+        const { std::cell::RefCell::new((Vec::new(),Vec::new())) };
+}
+
+pub(crate) fn with_regenerated_ab<T>(source:&dyn PackedAbRegen, offset:usize, bytes:usize,
+    consume:impl FnOnce(&[u8],&[u8])->T) -> T {
+    assert!(offset.checked_add(bytes).is_some_and(|end|end<=source.len_bytes()));
+    AB_REGEN_SCRATCH.with(|slot| {
+        let mut slot=slot.borrow_mut();
+        let (a,b)=&mut *slot;
+        if a.len()<bytes {a.resize(bytes,0);b.resize(bytes,0);}
+        source.fill(offset,&mut a[..bytes],&mut b[..bytes]);
+        consume(&a[..bytes],&b[..bytes])
+    })
+}
+
+/// Genuine current dense data for any path that cannot consume local chunks.
+pub(crate) fn materialize_packed_ab(source:&dyn PackedAbRegen) -> (Vec<u8>,Vec<u8>) {
+    use rayon::prelude::*;
+    const CHUNK:usize=32*2048;
+    let n=source.len_bytes();
+    assert_eq!(n%CHUNK,0);
+    let (mut a,mut b)=(vec![0u8;n],vec![0u8;n]);
+    a.par_chunks_mut(CHUNK).zip(b.par_chunks_mut(CHUNK)).enumerate()
+        .for_each(|(i,(a,b))|source.fill(i*CHUNK,a,b));
+    (a,b)
 }
