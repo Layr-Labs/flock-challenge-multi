@@ -585,6 +585,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     };
     // Unbound identity-C inner-fold rows for the round-two canonical-window
     // elision (ranked one-row brand only; see `multilinear::CANON_ROWS`).
+    let mut packed_ab_source=precomputed_ab.as_mut().and_then(|ab|ab.take_packed_ab_source());
+    let restore_r1=packed_ab_source.is_some() && (c_identity_z.is_none()
+        || hoisted_flag!("FLOCK_AB_REGEN_FORCE_DENSE"));
+    let dense_r1=if restore_r1 {packed_ab_source.take().map(|s|multilinear::materialize_packed_ab(s.as_ref()))}else{None};
+    let (a_packed,b_packed)=dense_r1.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
     let mut r2_canon_rows: Option<Vec<F128>> = None;
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
@@ -863,9 +868,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         && r[k_skip + 4] != F128::ZERO
         && (cfg!(test) || cfg!(target_arch = "x86_64"))
         && !three_var_off();
+    let dense_r2=if !want_3var {packed_ab_source.take().map(|s|multilinear::materialize_packed_ab(s.as_ref()))}else{None};
+    let (a_packed,b_packed)=dense_r2.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
     let mut la4: Option<multilinear::Round4Lookahead> = None;
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
-        let ((m1, mi, la), r4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
+        let ((m1, mi, la), r4) = multilinear::uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq_with_source(
             a_packed,
             b_packed,
             m,
@@ -876,6 +883,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             packed_eq.as_ref(),
             r2_canon_rows.as_deref(),
             want_3var,
+            packed_ab_source.as_deref(),
         );
         la4 = r4;
         (Vec::new(), Vec::new(), m1, mi, Some(la))
@@ -940,9 +948,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     // N/4 outputs into freshly taken buffers and the scratch pair is sized for
     // the fold after it (N/8).
     let use_3var = la4.is_some();
+    let dense_tail=if !use_3var {packed_ab_source.take().map(|s|multilinear::materialize_packed_ab(s.as_ref()))}else{None};
+    let (a_packed,b_packed)=dense_tail.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
     #[cfg(test)]
     ZC_3VAR_LAST.store(use_3var, std::sync::atomic::Ordering::Relaxed);
     if use_3var && hoisted_flag!("FLOCK_ZC_3VAR_CHECK") {
+        let dense_check=packed_ab_source.as_deref().map(multilinear::materialize_packed_ab);
+        let (a_packed,b_packed)=dense_check.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
         let want = multilinear::three_var::round4_lookahead_ref(
             a_packed, b_packed, &fold_table, &mlv_arg, padding, k_skip,
         );
@@ -1116,7 +1128,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 && cfg!(target_arch = "x86_64")
                 && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
             let (m1, mi, la_next) =
-                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
+                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq_with_source(
                     a_packed,
                     b_packed,
                     m,
@@ -1129,6 +1141,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &r_next,
                     eq_override,
                     lm_out,
+                    packed_ab_source.as_deref(),
                 );
             a_mlv = a8;
             b_mlv = b8;

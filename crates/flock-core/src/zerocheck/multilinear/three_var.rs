@@ -296,6 +296,25 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    fold3_from_packed_and_round_pair_lookahead_into_with_eq_with_source(a_packed,b_packed,m,k_skip,table,padding,a_out,b_out,rho,r_next5,eq_override,out_lm,None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq_with_source(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    padding: &PaddingSpec,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho: [F128; 3],
+    r_next5: &[F128],
+    eq_override: Option<(&[F128], &[F128])>,
+    out_lm: bool,
+    ab_source:Option<&dyn PackedAbRegen>,
+) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
     assert_eq!(table.n_chunks, 8);
@@ -371,6 +390,9 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
         "lane-major 3var output needs the AVX-512 route"
     );
 
+    let dense=ab_source.filter(|_|fast.is_none()).map(materialize_packed_ab);
+    let (a_packed,b_packed)=dense.as_ref().map_or((a_packed,b_packed),|(a,b)|(a.as_slice(),b.as_slice()));
+    let ab_source=if fast.is_some() {ab_source} else {None};
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -385,26 +407,30 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                 target_feature = "vpclmulqdq"
             ))]
             let out = if let Some((c, wt, nt)) = fast.as_ref() {
-                let (ap, bp) = (a_packed.as_ptr(), b_packed.as_ptr());
+                let mut compute=|ap,bp,input_base| {
                 // SAFETY: the packed inputs expose 8 readable bytes for every
                 // row 8·out_base .. 8·(out_base + chunk_out); the cfg gate
                 // supplies every feature; lo_size is a multiple of 16.
                 unsafe {
                     match (*nt, out_lm) {
                         (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, input_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
                         (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, input_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
                         (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, input_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
                         (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, input_base, a_out, b_out, lo_size, c, rho[2], wt,
                         ),
                     }
                 }
+                };
+                if let Some(source)=ab_source {
+                    with_regenerated_ab(source,out_base*64,chunk_out*64,|a,b|compute(a.as_ptr(),b.as_ptr(),0))
+                } else {compute(a_packed.as_ptr(),b_packed.as_ptr(),out_base)}
             } else {
                 fold3_from_packed_lookahead_scalar(
                     a_packed,
