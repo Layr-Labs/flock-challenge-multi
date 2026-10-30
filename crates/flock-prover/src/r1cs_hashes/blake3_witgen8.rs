@@ -571,28 +571,23 @@ unsafe fn tr8x16_zmm(stage: *const V8, w: usize) -> [__m512i; 8] {
         let p30 = _mm512_permutex2var_epi32(x6, i10, x7);
         let p31 = _mm512_permutex2var_epi32(x6, i11, x7);
 
-        let i20 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
-        let i21 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
-        let q00 = _mm512_permutex2var_epi32(p00, i20, p10);
-        let q01 = _mm512_permutex2var_epi32(p00, i21, p10);
-        let q02 = _mm512_permutex2var_epi32(p01, i20, p11);
-        let q03 = _mm512_permutex2var_epi32(p01, i21, p11);
-        let q10 = _mm512_permutex2var_epi32(p20, i20, p30);
-        let q11 = _mm512_permutex2var_epi32(p20, i21, p30);
-        let q12 = _mm512_permutex2var_epi32(p21, i20, p31);
-        let q13 = _mm512_permutex2var_epi32(p21, i21, p31);
-
-        let i30 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
-        let i31 = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
+        let h00=_mm512_shuffle_i64x2::<0x44>(p00,p10);
+        let h01=_mm512_shuffle_i64x2::<0xee>(p00,p10);
+        let h10=_mm512_shuffle_i64x2::<0x44>(p01,p11);
+        let h11=_mm512_shuffle_i64x2::<0xee>(p01,p11);
+        let h20=_mm512_shuffle_i64x2::<0x44>(p20,p30);
+        let h21=_mm512_shuffle_i64x2::<0xee>(p20,p30);
+        let h30=_mm512_shuffle_i64x2::<0x44>(p21,p31);
+        let h31=_mm512_shuffle_i64x2::<0xee>(p21,p31);
         [
-            _mm512_permutex2var_epi32(q00, i30, q10),
-            _mm512_permutex2var_epi32(q00, i31, q10),
-            _mm512_permutex2var_epi32(q01, i30, q11),
-            _mm512_permutex2var_epi32(q01, i31, q11),
-            _mm512_permutex2var_epi32(q02, i30, q12),
-            _mm512_permutex2var_epi32(q02, i31, q12),
-            _mm512_permutex2var_epi32(q03, i30, q13),
-            _mm512_permutex2var_epi32(q03, i31, q13),
+            _mm512_shuffle_i64x2::<0x88>(h00,h20),
+            _mm512_shuffle_i64x2::<0xdd>(h00,h20),
+            _mm512_shuffle_i64x2::<0x88>(h01,h21),
+            _mm512_shuffle_i64x2::<0xdd>(h01,h21),
+            _mm512_shuffle_i64x2::<0x88>(h10,h30),
+            _mm512_shuffle_i64x2::<0xdd>(h10,h30),
+            _mm512_shuffle_i64x2::<0x88>(h11,h31),
+            _mm512_shuffle_i64x2::<0xdd>(h11,h31),
         ]
     }
 }
@@ -2332,6 +2327,21 @@ impl RankedRows {
                 stream_pair_v8(self.a.add(o), lo, hi, true);
             }
         }
+    }
+}
+
+/// Initialize only the final, unproduced window of each private compact row.
+///
+/// # Safety
+/// `z` must point to writable storage for eight full `U32_PER_BLOCK` rows.
+/// This does not initialize the other windows. Before reading them, the exact
+/// ranked closed producer must publish complete windows 0 through 30 for all
+/// eight lanes; its static and sparse publishers also store complete lines.
+#[inline(always)]
+pub(crate) unsafe fn initialize_compact_zero_tails(z: *mut u32) {
+    const { assert!(U32_PER_BLOCK == 32 * STEP_WORDS); }
+    for lane in 0..8 {
+        unsafe { z.add(lane * U32_PER_BLOCK + 31 * STEP_WORDS).write_bytes(0, STEP_WORDS); }
     }
 }
 
@@ -4718,6 +4728,14 @@ mod cross_quarter_witness_tests {
     #[test]
     fn compact_copy_actual_witness_matches_scalar_inputs_and_root_bytes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // Independent literal geometry plus leading/trailing canaries proves
+        // the actual initializer touches only eight 64-byte final windows.
+        let mut guarded = [0xa5a5_a5a5u32; 4096 + 32];
+        unsafe { initialize_compact_zero_tails(guarded.as_mut_ptr().add(16)); }
+        for (i, &word) in guarded.iter().enumerate() {
+            let tail = (16..4112).contains(&i) && (i - 16) % 512 >= 496;
+            assert_eq!(word, if tail { 0 } else { 0xa5a5_a5a5 }, "initializer offset={i}");
+        }
         let short = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
         let long = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8(1 << super::super::K_SKIP));
         let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&short, &long);
@@ -4734,6 +4752,7 @@ mod cross_quarter_witness_tests {
         let completed = AtomicUsize::new(0);
         let stripe_mask = AtomicUsize::new(0);
         for seed in [0x1234_5678_90ab_cdefu64, 0xfedc_ba09_8765_4321] {
+            let elide_global_z = seed == 0xfedc_ba09_8765_4321;
             let crate::seed_pipe::BlockSource::Closed { init, .. } = crate::seed_pipe::BlockSource::closed(18, seed) else { unreachable!() };
             for group in [0usize, 1, 2, 3, 127, 255, 511, 1023] {
                 std::thread::scope(|scope| {
@@ -4748,6 +4767,10 @@ mod cross_quarter_witness_tests {
                             let root_plan = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
                             let mut reference_stage = Box::new(Stage([0; STREAM_STAGE_WORDS]));
                             let mut stage = Box::new(Stage([0; STREAM_STAGE_WORDS]));
+                            // Match the production callback lifetime: initialize
+                            // only tails once, then reuse the input for 16 octas.
+                            let mut compact_z = Box::new(Words([0xa5a5_a5a5; 8 * U32_PER_BLOCK]));
+                            unsafe { initialize_compact_zero_tails(compact_z.0.as_mut_ptr()); }
                             for kpair in (role..32).step_by(2) {
                                 let base = group + 2 * kpair * 1024;
                                 let labels = core::array::from_fn::<_,8,_>(|lane| group + (2 * kpair + lane % 2) * (1 << 10) + (lane / 2) * (1 << 16));
@@ -4756,9 +4779,6 @@ mod cross_quarter_witness_tests {
                                 let mut zr = Box::new(Words([0; 8 * U32_PER_BLOCK]));
                                 let mut ar = zr.clone();
                                 let mut br = zr.clone();
-                                // A fully initialized fresh compact octa, including
-                                // the unproduced all-zero final window.
-                                let mut compact_z = Box::new(Words([0; 8 * U32_PER_BLOCK]));
                                 let mut abr = Box::new(Ab([0; 8 * 32 * 64]));
                                 unsafe {
                                     // Populate valid old constants from a different input, then
@@ -4780,8 +4800,22 @@ mod cross_quarter_witness_tests {
                                             }
                                         }
                                     }
+                                    // Every live word starts unequal to its independent
+                                    // scalar oracle. Any omitted producer write must fail.
+                                    for lane in 0..8 {
+                                        let row = lane * U32_PER_BLOCK;
+                                        for word in 0..31 * STEP_WORDS {
+                                            compact_z.0[row + word] = !zr.0[row + word];
+                                        }
+                                        assert!(compact_z.0[row + 31 * STEP_WORDS..row + U32_PER_BLOCK].iter().all(|&v| v == 0));
+                                    }
                                     for &logical in &labels {
                                         core::ptr::write_bytes((addresses[3] as *mut u8).add(logical*stride),0xa5,stride);
+                                    }
+                                    if elide_global_z {
+                                        for &logical in &labels {
+                                            core::ptr::write_bytes((addresses[0] as *mut u32).add(logical*U32_PER_BLOCK), 0xa5, U32_PER_BLOCK);
+                                        }
                                     }
                                     let stripe = kpair % 8;
                                     stripe_mask.fetch_or(1 << stripe, Ordering::Relaxed);
@@ -4791,7 +4825,7 @@ mod cross_quarter_witness_tests {
                                         (addresses[0] as *mut u32).add(base*U32_PER_BLOCK),
                                         (addresses[1] as *mut u32).add(base*U32_PER_BLOCK),
                                         (addresses[2] as *mut u32).add(base*U32_PER_BLOCK),
-                                        StreamProj { stage: stage.0.as_mut_ptr(), out: (addresses[3] as *mut u8).add(base*stride), out_stride: stride, cross_quarter: true, compact_z: compact_z.0.as_mut_ptr(), elide_z: false, out_bias: 2*64, inv_table, plan, one_rows_elided: true, w30_elided: true },
+                                        StreamProj { stage: stage.0.as_mut_ptr(), out: (addresses[3] as *mut u8).add(base*stride), out_stride: stride, cross_quarter: true, compact_z: compact_z.0.as_mut_ptr(), elide_z: elide_global_z, out_bias: 2*64, inv_table, plan, one_rows_elided: true, w30_elided: true },
                                         preps, [true;3], Some(root_emit::RootOctaWriter::new(&root_plan, roots.0.as_mut_ptr().add(stripe*64))), false,
                                     );
                                     _mm_sfence();
@@ -4799,7 +4833,11 @@ mod cross_quarter_witness_tests {
                                     for (lane, &logical) in labels.iter().enumerate() {
                                         for (name,(address,values)) in ["z","a","b"].into_iter().zip(addresses[..3].iter().zip([&zr.0,&ar.0,&br.0])) {
                                             let got=core::slice::from_raw_parts((*address as *const u32).add(logical*U32_PER_BLOCK),U32_PER_BLOCK);
-                                            assert_eq!(got,&values[lane*U32_PER_BLOCK..(lane+1)*U32_PER_BLOCK],"{name}: base={base}, lane={lane}, cached={}",role==0);
+                                            if name == "z" && elide_global_z {
+                                                assert!(got.iter().all(|&word| word == 0xa5a5_a5a5), "elided global Z written: base={base}, lane={lane}");
+                                            } else {
+                                                assert_eq!(got,&values[lane*U32_PER_BLOCK..(lane+1)*U32_PER_BLOCK],"{name}: base={base}, lane={lane}, cached={}",role==0);
+                                            }
                                         }
                                         let got=core::slice::from_raw_parts((addresses[3] as *const u8).add(logical*stride),stride);
                                         assert_eq!(&got[..28*64],&abr.0[lane*stride..lane*stride+28*64],"AB: base={base}, lane={lane}");
@@ -4830,6 +4868,6 @@ mod cross_quarter_witness_tests {
         }
         assert_eq!(completed.load(Ordering::Relaxed),512);
         assert_eq!(stripe_mask.load(Ordering::Relaxed),255);
-        println!("COMPACT_COPY_WITNESS cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_streamed=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true");
+        println!("TAIL_INIT_CURRENT_WITNESS initialized_bytes_per_callback=512 reused_octas_per_callback=16 poisoned_live_words=2031616 initializer_canaries=true cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_materialized_cases=256 global_z_elided_cases=256 elided_global_z_canaries=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true");
     }
 }
