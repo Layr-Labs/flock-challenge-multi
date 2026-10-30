@@ -5628,7 +5628,8 @@ pub(crate) struct R4LaneWeights {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
+unsafe fn r4_round4_batch<const SKIP: u8>(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10]) {
+    let skip = SKIP;
     use core::arch::x86_64::*;
     unsafe {
         let ld = |p: *const F128, g: usize, k: usize| -> __m512i {
@@ -5834,7 +5835,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 0);
+                r4_round4_batch::<0>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 32);
@@ -5843,7 +5844,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                r4_round4_batch::<255>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 64);
@@ -5852,7 +5853,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                r4_round4_batch::<255>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 96);
@@ -5861,7 +5862,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
-                r4_round4_batch(fa, fb, &mut acc4, 3);
+                r4_round4_batch::<3>(fa, fb, &mut acc4);
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
