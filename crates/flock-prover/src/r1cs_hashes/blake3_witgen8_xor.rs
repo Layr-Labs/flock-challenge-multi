@@ -607,16 +607,170 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
     }
 }
 
-// Keep one accumulator vector live across the outlined call. A vector ABI
-// argument and return avoid clearing the upper lanes at this AVX-512 seam.
+#[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+mod early_registers {
+use super::*;
+core::arch::global_asm!(include_str!("blake3_witgen8_xor_early_regs.S"));
+unsafe extern "C" {
+    fn flock_window_prepared_mode00_register_first();
+    fn flock_window_prepared_mode00_register_add();
+    fn flock_window_prepared_mode01_register_first();
+    fn flock_window_prepared_mode01_register_add();
+    fn flock_window_prepared_mode02_register_first();
+    fn flock_window_prepared_mode02_register_add();
+    fn flock_window_prepared_mode03_register_first();
+    fn flock_window_prepared_mode03_register_add();
+    fn flock_window_prepared_mode04_register_first();
+    fn flock_window_prepared_mode04_register_add();
+    fn flock_window_prepared_mode05_register_first();
+    fn flock_window_prepared_mode05_register_add();
+    fn flock_window_prepared_mode06_register_first();
+    fn flock_window_prepared_mode06_register_add();
+    fn flock_window_prepared_mode07_register_first();
+    fn flock_window_prepared_mode07_register_add();
+    fn flock_window_prepared_mode08_register_first();
+    fn flock_window_prepared_mode08_register_add();
+    fn flock_window_prepared_mode09_register_first();
+    fn flock_window_prepared_mode09_register_add();
+    fn flock_window_prepared_mode10_register_first();
+    fn flock_window_prepared_mode10_register_add();
+    fn flock_window_prepared_mode11_register_first();
+    fn flock_window_prepared_mode11_register_add();
+    fn flock_window_prepared_mode12_register_first();
+    fn flock_window_prepared_mode12_register_add();
+    fn flock_window_prepared_mode13_register_first();
+    fn flock_window_prepared_mode13_register_add();
+    fn flock_window_prepared_mode14_register_first();
+    fn flock_window_prepared_mode14_register_add();
+    fn flock_window_prepared_mode15_register_first();
+    fn flock_window_prepared_mode15_register_add();
+}
+// The private leaves preserve all GPRs, masks and flags. CALL still
+// exposes ordinary stack and memory effects to the compiler.
+#[inline(always)]
+pub(super) unsafe fn accumulate<const MODE:u8,const FIRST:bool>(
+    ap:*const u64,bp:*const u64,ma:*const u64,mb:*const u64,acc:&mut[__m512i;8]
+) {
+    macro_rules! invoke { ($first:path,$add:path) => { unsafe {
+        if FIRST {
+            let c0: __m512i;
+            let c1: __m512i;
+            let c2: __m512i;
+            let c3: __m512i;
+            let c4: __m512i;
+            let c5: __m512i;
+            let c6: __m512i;
+            let c7: __m512i;
+            core::arch::asm!("call {leaf}", leaf=sym $first,
+                in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+                lateout("zmm24")c0,
+                lateout("zmm25")c1,
+                lateout("zmm26")c2,
+                lateout("zmm27")c3,
+                lateout("zmm28")c4,
+                lateout("zmm29")c5,
+                lateout("zmm30")c6,
+                lateout("zmm31")c7,
+                lateout("zmm0")_,
+                lateout("zmm1")_,
+                lateout("zmm2")_,
+                lateout("zmm3")_,
+                lateout("zmm4")_,
+                lateout("zmm5")_,
+                lateout("zmm6")_,
+                lateout("zmm7")_,
+                lateout("zmm8")_,
+                lateout("zmm9")_,
+                lateout("zmm10")_,
+                lateout("zmm11")_,
+                lateout("zmm12")_,
+                lateout("zmm13")_,
+                lateout("zmm14")_,
+                lateout("zmm15")_,
+                lateout("zmm16")_,
+                lateout("zmm17")_,
+                lateout("zmm18")_,
+                lateout("zmm19")_,
+                lateout("zmm20")_,
+                lateout("zmm21")_,
+                lateout("zmm22")_,
+                lateout("zmm23")_,
+                options(preserves_flags));
+            *acc=[c0,c1,c2,c3,c4,c5,c6,c7];
+        } else {
+            let [mut c0,mut c1,mut c2,mut c3,mut c4,mut c5,mut c6,mut c7]=*acc;
+            core::arch::asm!("call {leaf}", leaf=sym $add,
+                in("rdi")ap,in("rsi")bp,in("rdx")ma,in("rcx")mb,
+                inout("zmm24")c0,
+                inout("zmm25")c1,
+                inout("zmm26")c2,
+                inout("zmm27")c3,
+                inout("zmm28")c4,
+                inout("zmm29")c5,
+                inout("zmm30")c6,
+                inout("zmm31")c7,
+                lateout("zmm0")_,
+                lateout("zmm1")_,
+                lateout("zmm2")_,
+                lateout("zmm3")_,
+                lateout("zmm4")_,
+                lateout("zmm5")_,
+                lateout("zmm6")_,
+                lateout("zmm7")_,
+                lateout("zmm8")_,
+                lateout("zmm9")_,
+                lateout("zmm10")_,
+                lateout("zmm11")_,
+                lateout("zmm12")_,
+                lateout("zmm13")_,
+                lateout("zmm14")_,
+                lateout("zmm15")_,
+                lateout("zmm16")_,
+                lateout("zmm17")_,
+                lateout("zmm18")_,
+                lateout("zmm19")_,
+                lateout("zmm20")_,
+                lateout("zmm21")_,
+                lateout("zmm22")_,
+                lateout("zmm23")_,
+                options(preserves_flags));
+            *acc=[c0,c1,c2,c3,c4,c5,c6,c7];
+        }
+    } } }
+    match MODE {
+        0 => invoke!(flock_window_prepared_mode00_register_first,flock_window_prepared_mode00_register_add),
+        1 => invoke!(flock_window_prepared_mode01_register_first,flock_window_prepared_mode01_register_add),
+        2 => invoke!(flock_window_prepared_mode02_register_first,flock_window_prepared_mode02_register_add),
+        3 => invoke!(flock_window_prepared_mode03_register_first,flock_window_prepared_mode03_register_add),
+        4 => invoke!(flock_window_prepared_mode04_register_first,flock_window_prepared_mode04_register_add),
+        5 => invoke!(flock_window_prepared_mode05_register_first,flock_window_prepared_mode05_register_add),
+        6 => invoke!(flock_window_prepared_mode06_register_first,flock_window_prepared_mode06_register_add),
+        7 => invoke!(flock_window_prepared_mode07_register_first,flock_window_prepared_mode07_register_add),
+        8 => invoke!(flock_window_prepared_mode08_register_first,flock_window_prepared_mode08_register_add),
+        9 => invoke!(flock_window_prepared_mode09_register_first,flock_window_prepared_mode09_register_add),
+        10 => invoke!(flock_window_prepared_mode10_register_first,flock_window_prepared_mode10_register_add),
+        11 => invoke!(flock_window_prepared_mode11_register_first,flock_window_prepared_mode11_register_add),
+        12 => invoke!(flock_window_prepared_mode12_register_first,flock_window_prepared_mode12_register_add),
+        13 => invoke!(flock_window_prepared_mode13_register_first,flock_window_prepared_mode13_register_add),
+        14 => invoke!(flock_window_prepared_mode14_register_first,flock_window_prepared_mode14_register_add),
+        15 => invoke!(flock_window_prepared_mode15_register_first,flock_window_prepared_mode15_register_add),
+        _ => unreachable!(),
+    }
+}
+}
+
+// Keep all eight accumulators live after the early witness publication.
 #[inline(always)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
     acc: &mut [__m512i; 8],
 ) {
+    #[cfg(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni"))]
+    unsafe { early_registers::accumulate::<MODE,FIRST>(ap,bp,ma,mb,acc); }
+    #[cfg(not(all(target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "gfni")))]
     unsafe {
         let acc0 = acc[0];
-        acc[0] = row_product_vector_abi::<MODE, FIRST>(ap, bp, ma, mb, acc, acc0);
+        acc[0] = row_product_vector_abi::<MODE,FIRST>(ap,bp,ma,mb,acc,acc0);
     }
 }
 
@@ -652,8 +806,6 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
 unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows,
-    a: [__m512i; 8],
-    b: [__m512i; 8],
     ap: &[u64; 64],
     br: *const V8,
     rw: usize,
@@ -662,7 +814,6 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool>(
     unsafe {
         let bp = pretranspose_ring::<BLK, false>(br, rw);
         let mut acc = [_mm512_setzero_si512(); 8];
-        rows.publish_dense_values(0, a[0], b[0]);
         if residual_row_live(BLK, 7) {
         match mode(BLK, 7) {
 0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
@@ -684,11 +835,8 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool>(
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(1, a[1], b[1]);
+
         if residual_row_live(BLK, 6) {
         match mode(BLK, 6) {
 0 => row_product::<0, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
@@ -710,11 +858,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(2, a[2], b[2]);
+
         if residual_row_live(BLK, 5) {
         match mode(BLK, 5) {
 0 => row_product::<0, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
@@ -736,11 +881,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(3, a[3], b[3]);
+
         if residual_row_live(BLK, 4) {
         match mode(BLK, 4) {
 0 => row_product::<0, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
@@ -762,11 +904,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(4, a[4], b[4]);
+
         if BLK == 29 {
         match mode(BLK, 3) {
 0 => row_product::<0, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
@@ -808,11 +947,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(5, a[5], b[5]);
+
         if residual_row_live(BLK, 2) {
         match mode(BLK, 2) {
 0 => row_product::<0, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
@@ -834,11 +970,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(6, a[6], b[6]);
+
         if residual_row_live(BLK, 1) {
         match mode(BLK, 1) {
 0 => row_product::<0, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
@@ -860,11 +993,8 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
-        rows.publish_dense_values(7, a[7], b[7]);
+
         if residual_row_live(BLK, 0) {
         match mode(BLK, 0) {
 0 => row_product::<0, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
@@ -886,9 +1016,7 @@ _ => unreachable!(),
 _ => unreachable!(),
 }
         }
-        // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
@@ -988,38 +1116,58 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool>(
 ) {
     let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
     unsafe {
-        let ap = pretranspose_ring::<0, true>(ar, rw);
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
+        // These disjoint witness spans are owned until the whole producer
+        // returns. Store the complete window before projection, ending both
+        // transposed-source live ranges before the outlined arithmetic calls.
+        // The existing task-level fence and release/join remain the handoff.
+        rows.publish_dense_values(0, a[0], b[0]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(1, a[1], b[1]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(2, a[2], b[2]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(3, a[3], b[3]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(4, a[4], b[4]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(5, a[5], b[5]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(6, a[6], b[6]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        rows.publish_dense_values(7, a[7], b[7]);
+        core::arch::asm!("/* witness row publication boundary */", options(nostack, preserves_flags));
+        let ap = pretranspose_ring::<0, true>(ar, rw);
         match blk {
-            2 => project_const::<2, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29, CROSS_QUARTER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, CROSS_QUARTER>(proj, rows, &ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
