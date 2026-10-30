@@ -2967,6 +2967,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             && root_plan.is_some()
             && blake3_zregen::z_elide_enabled();
         let elided_octas = std::sync::atomic::AtomicUsize::new(0);
+        // This exact branch already checked all three same-length provenance
+        // tags: the retained allocations contain initialized prior data. A
+        // proof-local exact source replaces every current raw-A/B read.
+        let elide_ab=std::env::var_os("FLOCK_NO_AB_REGEN").is_none();
         #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
         let pipelined = if let Some(context) = commit_ctx
             && context.ranked_resident()
@@ -3008,7 +3012,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     // offsets. Constants may be retained only because the
                     // enclosing exact branch verified all three scratch tags.
                     unsafe {
-                        let proj = blake3_witgen8::StreamProj {
+                        let proj = blake3_witgen8::StreamProj { elide_ab,
                             cross_quarter: true,
                             compact_z: if target.is_some() { input.0.as_mut_ptr().cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
@@ -3082,7 +3086,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         for half in 0..(n_here / SIMD) {
                             let base = GROUP * g + half * SIMD;
                             let off = half * SIMD * F128_PER_BLOCK;
-                            let proj = blake3_witgen8::StreamProj {
+                            let proj = blake3_witgen8::StreamProj { elide_ab,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: stage.as_mut_ptr().cast::<u32>(),
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
@@ -3112,6 +3116,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     }
                     flock_core::zerocheck::univariate_skip_optimized::abinner_publish_fence();
                 });
+        }
+        if elide_ab {
+            ab_inner.set_packed_ab_source(Box::new(blake3_witgen8::ClosedAbRegen {
+                init,blocks:a.len()/F128_PER_BLOCK,
+            }));
         }
         if root_enabled && root_plan.is_some() {
             // SAFETY: each octa owns complete 64-byte stripes. Both
@@ -3201,7 +3210,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
+                            blake3_witgen8::StreamProj { elide_ab:false,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: st,
                                 out: ab_out

@@ -553,6 +553,7 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 /// allocation is intentional: round 2 still needs the original A and B tables
 /// after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
+    packed_ab_source:Option<Box<dyn super::multilinear::PackedAbRegen>>,
     storage: Vec<F128>,
     /// Logical dense byte length. Ranked residual storage may physically omit
     /// the two structural-one rows and the dead padding row from every
@@ -594,6 +595,17 @@ const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
 const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
 
 impl Round1AbInner {
+    pub fn set_packed_ab_source(&mut self,source:Box<dyn super::multilinear::PackedAbRegen>) {
+        assert!(self.packed_ab_source.is_none());
+        assert_eq!(source.len_bytes(),self.dense_len_bytes);
+        assert!(self.ranked_compact && self.ranked_one_rows_elided && self.ranked_w30_elided);
+        assert_eq!(self.invalid_prefix_bytes,0);
+        self.packed_ab_source=Some(source);
+    }
+    pub(crate) fn take_packed_ab_source(&mut self)->Option<Box<dyn super::multilinear::PackedAbRegen>> {
+        self.packed_ab_source.take()
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -646,6 +658,7 @@ impl Round1AbInner {
     pub fn take_uninit(total_bytes: usize) -> Self {
         assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
         Self {
+            packed_ab_source:None,
             storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
             dense_len_bytes: total_bytes,
             invalid_prefix_bytes: 0,
@@ -674,6 +687,7 @@ impl Round1AbInner {
         let stored_bytes = blocks * RANKED_AB_COMPACT_BLOCK_BYTES;
         assert_eq!(stored_bytes % core::mem::size_of::<F128>(), 0);
         Self {
+            packed_ab_source:None,
             storage: crate::scratch::take_f128(stored_bytes / core::mem::size_of::<F128>()),
             dense_len_bytes: total_bytes,
             invalid_prefix_bytes: 0,
@@ -969,6 +983,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         );
 
     Round1AbInner {
+        packed_ab_source:None,
         storage,
         dense_len_bytes: total_bytes,
         invalid_prefix_bytes: 0,

@@ -1161,7 +1161,7 @@ mod tests {
                         let bias = 128;
                         let plan=flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&table,&output.0,true);
                         assert!(plan.bcomplement_static_eligible());
-                        let proj = StreamProj {
+                        let proj = StreamProj { elide_ab:false,
                             cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                             stage: core::ptr::null_mut(),
                             out: output.0.as_mut_ptr(),
