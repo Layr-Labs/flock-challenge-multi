@@ -47,4 +47,4 @@ pub(crate) use x86_64::{gather_transpose_stripe_x86, gather_transpose_stripe4_x8
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-pub(crate) use x86_64::gfni_fold_word_tiles4;
+pub(crate) use x86_64::{gfni_fold_word_tiles4, gfni_fold_word_tiles4_lut2, gfni_prepare_root_lut2};
