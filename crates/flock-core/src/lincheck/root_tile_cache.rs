@@ -10,6 +10,9 @@ use rayon::prelude::*;
 #[repr(C, align(64))]
 pub(super) struct Block([u8; 512]);
 
+#[repr(C, align(64))]
+struct RootByteLookupTables([core::mem::MaybeUninit<u8>; 8192]);
+
 // Only allocation capacity is recycled. take_f128 invalidates previous
 // provenance; prepare or witness generation overwrites every live block
 // before publication.
@@ -26,6 +29,7 @@ pub struct RootTileCache {
     offset: usize,
     tiles: usize,
     blocks: usize,
+    tile_stride_blocks: usize,
     word_major: bool,
     fixed_roots: bool,
     cross_quarter: bool,
@@ -36,11 +40,13 @@ pub struct RootTileCache {
 
 /// Raw read-only view of witness-produced word-major root tiles: `tiles`
 /// tiles of 176 groups x 512 bytes; group `g` of tile `t` starts at
-/// `base + (t * 176 + g) * 512`, octa `o` of that group at `+ o * 64`.
+/// `base + t * tile_stride_bytes + g * 512`, octa `o` at `+ o * 64`.
+/// Any bytes after the 176 live groups are padding and must not be read.
 #[derive(Clone, Copy, Debug)]
 pub struct WitnessTileView {
     pub base: usize,
     pub tiles: usize,
+    pub tile_stride_bytes: usize,
     pub cross_quarter: bool,
 }
 
@@ -156,6 +162,7 @@ fn prepare(
             offset,
             tiles,
             blocks,
+            tile_stride_blocks: blocks,
             word_major,
             fixed_roots: false,
             cross_quarter: false,
@@ -200,14 +207,41 @@ impl RootTileCache {
     /// Every producer must have joined and executed SFENCE before this call.
     /// The later RootFoldSource must use the same witness and root ordering.
     pub unsafe fn from_witness_storage(storage: Vec<F128>, compressions: usize) -> Self {
+        unsafe { Self::from_witness_storage_with_stride(storage, compressions, 176) }
+    }
+
+    /// Physical fields per witness tile: 176 live blocks and one unused block.
+    pub const PADDED_TILE_FIELDS: usize = 177 * 32;
+
+    /// Adopt tiles written directly with a 512-byte gap after each live tile.
+    ///
+    /// # Safety
+    /// Same live-word and producer-join requirements as `from_witness_storage`.
+    /// Tile t starts at t * PADDED_TILE_FIELDS fields in the aligned span.
+    /// Gap bytes are never read. For cross-quarter order, the physical-to-logical
+    /// mapping must satisfy `from_cross_quarter_witness_storage`'s contract.
+    pub unsafe fn from_padded_witness_storage(
+        storage: Vec<F128>, compressions: usize, cross_quarter: bool,
+    ) -> Self {
+        if cross_quarter { assert_eq!(compressions, 1 << 18); }
+        let mut result = unsafe { Self::from_witness_storage_with_stride(storage, compressions, 177) };
+        result.cross_quarter = cross_quarter;
+        result
+    }
+
+    unsafe fn from_witness_storage_with_stride(
+        storage: Vec<F128>, compressions: usize, tile_stride_blocks: usize,
+    ) -> Self {
         let storage = PooledStorage(storage);
         assert!(compressions > 0 && compressions.is_multiple_of(64));
         let tiles = compressions / 64;
         let blocks = 176;
-        let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
+        assert!(tile_stride_blocks >= blocks);
+        let fields = tiles.checked_mul(tile_stride_blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false }
+        Self { storage, offset, tiles, blocks, tile_stride_blocks, word_major: true,
+            fixed_roots: true, cross_quarter: false, z_elided: false }
     }
 
     /// Record that the witness producer did not store z for (some of) the
@@ -226,6 +260,7 @@ impl RootTileCache {
         (self.fixed_roots && self.word_major && self.blocks == 176).then(|| WitnessTileView {
             base: self.storage.0.as_ptr() as usize + self.offset * core::mem::size_of::<F128>(),
             tiles: self.tiles,
+            tile_stride_bytes: self.tile_stride_blocks * 512,
             cross_quarter: self.cross_quarter,
         })
     }
@@ -260,7 +295,7 @@ impl RootTileCache {
                         }
                     }
                 }
-                assert_eq!(self.block(tile * self.blocks + block).0, expected,
+                assert_eq!(self.tile_block(tile, block).0, expected,
                     "root cache tile {tile}, block {block}");
             }
         }
@@ -269,17 +304,16 @@ impl RootTileCache {
     #[inline(always)]
     fn block(&self, index: usize) -> &Block {
         assert!(index < self.tiles * self.blocks);
-        // SAFETY: prepare initializes every block, and from_witness_storage
-        // requires the same initialization before publication. The live
-        // span is 64-byte aligned and fits within the owned vector.
+        self.tile_block(index / self.blocks, index % self.blocks)
+    }
+
+    #[inline(always)]
+    fn tile_block(&self, tile: usize, block: usize) -> &Block {
+        assert!(tile < self.tiles && block < self.blocks);
+        // Only live initialized blocks are exposed; physical gap bytes are skipped.
         unsafe {
-            &*self
-                .storage
-                .0
-                .as_ptr()
-                .add(self.offset)
-                .cast::<Block>()
-                .add(index)
+            &*self.storage.0.as_ptr().add(self.offset).cast::<Block>()
+                .add(tile * self.tile_stride_blocks + block)
         }
     }
 
@@ -377,6 +411,7 @@ impl RootTileCache {
         let mut active = vec![0u8; workers];
         let next = std::sync::atomic::AtomicUsize::new(0);
         let dynamic = dynamic_tiles_enabled();
+        let claim_tiles = if BATCH_WORD_TILES { 8 } else { 4 };
         planes
             .par_chunks_mut(stride)
             .zip(active.par_iter_mut())
@@ -386,7 +421,8 @@ impl RootTileCache {
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
-                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 8]);
+                let mut batch_luts = BATCH_WORD_TILES.then(|| RootByteLookupTables([core::mem::MaybeUninit::uninit(); 8192]));
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -401,15 +437,15 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        lo = next.fetch_add(claim_tiles, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + 4).min(self.tiles);
+                        hi = (lo + claim_tiles).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;
-                        let count = (hi - lo).min(4);
+                        let count = (hi - lo).min(8);
                         lo += count;
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
@@ -419,10 +455,14 @@ impl RootTileCache {
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
                         }
+                        let tables = batch_luts.as_mut().expect("selected-word lookup tables");
+                        // SAFETY: every live matrix was initialized above; the
+                        // aligned table buffer is disjoint and fully written.
+                        unsafe { kernels::gfni_prepare_root_lut2(matrices.as_ptr().cast(), count, tables.0.as_mut_ptr().cast()); }
                         for block in 0..self.blocks {
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
-                            // and actual tile stride is blocks*512. Arrays of
+                            // and physical stride includes the optional gap. Arrays of
                             // u64 have contiguous layout; every live matrix
                             // slot was fully overwritten above, and the leaf
                             // reads exactly count slots. Every dst byte is
@@ -430,14 +470,14 @@ impl RootTileCache {
                             // batch the leaf initializes all sixteen planes
                             // without reading dst; later calls load them once.
                             unsafe {
-                                kernels::gfni_fold_word_tiles4(
+                                kernels::gfni_fold_word_tiles4_lut2(
                                     self.storage.0.as_ptr().add(self.offset).cast::<u8>()
-                                        .add((tile * self.blocks + block) * 512),
+                                        .add((tile * self.tile_stride_blocks + block) * 512),
                                     matrices.as_ptr().cast::<u64>(),
                                     dst.as_mut_ptr().cast::<u8>().add(block * 1024),
-                                    self.blocks * 512, count, first,
+                                    self.tile_stride_blocks * 512, count, first,
                                     WORD_TO_COLUMNS.as_ptr(),
-                                    prefetch_blocks && block + 1 < self.blocks);
+                                    prefetch_blocks && block + 1 < self.blocks, tables.0.as_ptr().cast());
                             }
                         }
                         first = false;
@@ -456,7 +496,7 @@ impl RootTileCache {
                         // subsequent tiles load their accumulators.
                         unsafe {
                             let src = self
-                                .block(tile * self.blocks + block)
+                                .tile_block(tile, block)
                                 .0
                                 .as_ptr()
                                 .cast::<__m512i>();
@@ -521,12 +561,12 @@ mod tests {
     /// WORD_TO_COLUMNS nor derives its expected planes from a SIMD transpose.
     #[test]
     fn selected_word_fold4_matches_byte_plane_oracle() {
-        const STRIDE: usize = 176 * 512;
-        let mut source = vec![0xa7u8; 4 * STRIDE];
+        const STRIDE: usize = 177 * 512;
+        let mut source = vec![0xa7u8; 8 * STRIDE];
         for group in [13usize, 175] {
-            let mut mats = [[0u64; 128]; 4];
-            let mut oracle_tiles = [[0u8; 1024]; 4];
-            for tile in 0..4 {
+            let mut mats = [[0u64; 128]; 8];
+            let mut oracle_tiles = [[0u8; 1024]; 8];
+            for tile in 0..8 {
                 for stripe in 0..8 {
                     let weights = core::array::from_fn::<_, 8, _>(|lane| {
                         let n = (tile * 64 + stripe * 8 + lane + 31) as u64;
@@ -558,16 +598,19 @@ mod tests {
                     }
                 }
             }
-            for count in 1..=4 {
+            for count in 1..=8 {
                 for seed_zero in [true, false] { for prefetch in [false, true] {
                     // Deliberately stale output, with untouched sentinels on
                     // both sides. Source group 175 ends at a true tile edge.
                     let mut expected = [0u8; 1024];
                     let mut old = vec![0x5du8; 64 + 1024 + 64];
                     let mut new = old.clone();
+                    let mut mixed = old.clone();
+                    let mut lut = RootByteLookupTables([core::mem::MaybeUninit::new(0xadu8); 8192]);
                     for i in 0..1024 {
                         old[64 + i] = (i as u8).wrapping_mul(73) ^ 0xc3;
                         new[64 + i] = old[64 + i];
+                        mixed[64 + i] = old[64 + i];
                         expected[i] = if seed_zero { 0 } else { old[64 + i] };
                         for tile in 0..count { expected[i] ^= oracle_tiles[tile][i]; }
                     }
@@ -584,26 +627,39 @@ mod tests {
                             kernels::gfni_fold_rows(&rows, &mats[tile], old.as_mut_ptr().add(64),
                                 seed_zero && tile == 0);
                         }
+                        if count <= 4 {
                         kernels::gfni_fold_word_tiles4(
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
                             new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
                             WORD_TO_COLUMNS.as_ptr(), prefetch);
+                        }
+                        kernels::gfni_prepare_root_lut2(mats.as_ptr().cast(), count, lut.0.as_mut_ptr().cast());
+                        kernels::gfni_fold_word_tiles4_lut2(source.as_ptr().add(group * 512), mats.as_ptr().cast(),
+                            mixed.as_mut_ptr().add(64), STRIDE, count, seed_zero,
+                            WORD_TO_COLUMNS.as_ptr(), prefetch, lut.0.as_ptr().cast());
                     }
                     assert_eq!(&old[64..1088], &expected,
                         "old oracle, group={group}, count={count}, first={seed_zero}");
+                    if count <= 4 {
                     assert_eq!(&new[64..1088], &expected,
                         "fold4 oracle, group={group}, count={count}, first={seed_zero}");
+                    }
                     assert!(new[..64].iter().chain(new[1088..].iter()).all(|&b| b == 0x5d));
+                    assert_eq!(&mixed[64..1088], &expected,
+                        "lookup oracle, group={group}, count={count}, first={seed_zero}");
+                    assert!(mixed[..64].iter().chain(mixed[1088..].iter()).all(|&b| b == 0x5d));
+                    assert!(lut.0[count*1024..].iter().all(|b| unsafe { b.assume_init() } == 0xad));
                     assert!(old[..64].iter().chain(old[1088..].iter()).all(|&b| b == 0x5d));
                 } }
             }
         }
     }
 
-    fn selected_word_cache_fixture(tiles: usize) -> RootTileCache {
+    fn selected_word_cache_fixture_with_layout(tiles: usize, padded: bool) -> RootTileCache {
         let blocks = 176;
-        let mut storage = crate::scratch::take_f128(tiles * blocks * 32 + 3);
-        storage.fill(F128::ZERO);
+        let physical_blocks = blocks + usize::from(padded);
+        let mut storage = crate::scratch::take_f128(tiles * physical_blocks * 32 + 3);
+        storage.fill(F128::new(u64::MAX, u64::MAX));
         let offset = storage.as_ptr().align_offset(64);
         let mut state = 0x953a81c7u64;
         for tile in 0..tiles {
@@ -618,7 +674,7 @@ mod tests {
                         if block + 1 == blocks { bits &= (1u64 << 49) - 1; }
                         unsafe {
                             let dst = storage.as_mut_ptr().add(offset).cast::<u8>()
-                                .add((tile * blocks + block) * 512 + stripe * 64).cast::<u32>();
+                                .add((tile * physical_blocks + block) * 512 + stripe * 64).cast::<u32>();
                             dst.add(lane).write(bits as u32);
                             dst.add(8 + lane).write((bits >> 32) as u32);
                         }
@@ -626,7 +682,14 @@ mod tests {
                 }
             }
         }
-        unsafe { RootTileCache::from_witness_storage(storage, tiles * 64) }
+        unsafe {
+            if padded { RootTileCache::from_padded_witness_storage(storage, tiles * 64, false) }
+            else { RootTileCache::from_witness_storage(storage, tiles * 64) }
+        }
+    }
+
+    fn selected_word_cache_fixture(tiles: usize) -> RootTileCache {
+        selected_word_cache_fixture_with_layout(tiles, false)
     }
 
     #[test]
@@ -639,11 +702,16 @@ mod tests {
         for threads in [9, 7] {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             pool.install(|| {
-                // Includes fewer tiles than workers, full four-tile ranges,
-                // and ranges requiring both a full batch and a 1..3 tile tail.
-                for tiles in [1, 3, 4, 5, 17, 29, 33, 43] {
-                    let cache = selected_word_cache_fixture(tiles);
-                    let expected = cache.fold_with_mode(&weights, false);
+                // Includes fewer tiles than workers, full eight-tile ranges,
+                // and ranges requiring both a full batch and a partial tail.
+                for tiles in [1, 3, 4, 5, 7, 8, 9, 17, 29, 33, 43, 53] {
+                    let compact = selected_word_cache_fixture(tiles);
+                    let cache = selected_word_cache_fixture_with_layout(tiles, true);
+                    assert_eq!(cache.witness_view().unwrap().tile_stride_bytes, 177 * 512);
+                    assert_eq!(compact.witness_view().unwrap().tile_stride_bytes, 176 * 512);
+                    let expected = compact.fold_with_mode(&weights, false);
+                    assert_eq!(compact.fold_with_mode(&weights, true), expected);
+                    assert_eq!(cache.fold_with_mode(&weights, false), expected);
                     let actual = cache.fold_with_mode(&weights, true);
                     assert_eq!(actual, expected, "tiles={tiles}, threads={threads}");
                     let (a, b) = rayon::join(
@@ -651,6 +719,10 @@ mod tests {
                         || cache.fold_with_mode(&weights, true));
                     assert_eq!(a, expected);
                     assert_eq!(b, expected);
+                    for tile in 0..tiles {
+                        let gap = cache.offset + (tile * 177 + 176) * 32;
+                        assert!(cache.storage.0[gap..gap + 32].iter().all(|&x| x == F128::new(u64::MAX, u64::MAX)));
+                    }
                 }
             });
         }
@@ -908,7 +980,8 @@ mod indexed_weight_tests {
             }
             let tiles = 32;
             let blocks = 176;
-            let mut storage = crate::scratch::take_f128(tiles*blocks*32+3);
+            let physical_blocks = blocks + basis;
+            let mut storage = crate::scratch::take_f128(tiles*physical_blocks*32+3);
             storage.fill(F128::new(u64::MAX,u64::MAX));
             let offset = storage.as_ptr().align_offset(64);
             let weights: Vec<_> = labels[..tiles*64].iter().map(|&i| scalar(i)).collect();
@@ -922,7 +995,7 @@ mod indexed_weight_tests {
                             if block==4 { bits |= 1; }
                             if block==175 { bits &= (1u64<<49)-1; }
                             unsafe {
-                                let dst=storage.as_mut_ptr().add(offset).cast::<u8>().add((tile*blocks+block)*512+stripe*64).cast::<u32>();
+                                let dst=storage.as_mut_ptr().add(offset).cast::<u8>().add((tile*physical_blocks+block)*512+stripe*64).cast::<u32>();
                                 dst.add(lane).write(bits as u32);dst.add(8+lane).write((bits>>32)as u32);
                             }
                             let mut remaining=bits;
@@ -939,7 +1012,7 @@ mod indexed_weight_tests {
             for column in [839,865,866,868] { expected[column]=expected[256]; }
             // A bounded32-tile fixture exercises the complete real reader;
             // the full262144-label permutation was independently checked above.
-            let mut cache=unsafe { RootTileCache::from_witness_storage(storage,tiles*64) };
+            let mut cache=unsafe { if basis == 0 { RootTileCache::from_witness_storage(storage,tiles*64) } else { RootTileCache::from_padded_witness_storage(storage,tiles*64,false) } };
             cache.cross_quarter=true;
             for threads in [7,9] {
                 let pool=rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();

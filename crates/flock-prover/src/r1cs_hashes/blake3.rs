@@ -2948,11 +2948,16 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         const GROUP: usize = 64;
         let group_f128 = GROUP * F128_PER_BLOCK;
         let group_bytes = GROUP * ab_block_bytes;
-        const ROOT_FIELDS_PER_TILE: usize = GROUP * 176 * 8 / 16;
-        let root_fields = z.len() / F128_PER_BLOCK * 176 * 8 / 16;
+        const ROOT_FIELDS_PER_TILE: usize = flock_core::lincheck::WitnessRootTiles::PADDED_TILE_FIELDS;
+        let root_fields = (z.len() / F128_PER_BLOCK / GROUP) * ROOT_FIELDS_PER_TILE;
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
+        // The producer writes live stripes directly at the padded stride. Initialize
+        // only the 512-byte gaps; no full-root copy or extra witness pass is needed.
+        for tile in root_storage[root_offset..root_offset + root_fields].chunks_mut(ROOT_FIELDS_PER_TILE) {
+            tile[176 * 32..].fill(F128::ZERO);
+        }
         let root_enabled = linear_fold_enabled()
             && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
@@ -2982,11 +2987,17 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
                 // One private octa per role: seed it before the next octa can
-                // reuse these bytes. Initialization covers the omitted final
-                // window; all live windows are overwritten by this producer.
-                #[repr(align(64))]
+                // reuse these bytes. Only the omitted final window needs an
+                // initial zero. All other windows are completely overwritten
+                // by the exact producer before seed_octa reads the input.
+                #[repr(C, align(64))]
                 struct OctaInput([F128; 8 * F128_PER_BLOCK]);
-                let mut input = OctaInput([F128::ZERO; 8 * F128_PER_BLOCK]);
+                let mut input = core::mem::MaybeUninit::<OctaInput>::uninit();
+                // repr(C) places the sole array at offset zero. Keep raw
+                // pointers throughout; never form a reference to uninitialized
+                // fields. If production unwinds, no seed read is reached.
+                let input_ptr = input.as_mut_ptr().cast::<F128>();
+                unsafe { blake3_witgen8::initialize_compact_zero_tails(input_ptr.cast::<u32>()); }
                 // The const-window rollback uses StreamProj's scratch even
                 // in the exact path. Each callback owns this aligned 1 KiB
                 // buffer until all its octas return; drains initialize every
@@ -3010,7 +3021,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     unsafe {
                         let proj = blake3_witgen8::StreamProj {
                             cross_quarter: true,
-                            compact_z: if target.is_some() { input.0.as_mut_ptr().cast::<u32>() } else { core::ptr::null_mut() },
+                            compact_z: if target.is_some() { input_ptr.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
                             out: (ab_addr as *mut u8).add(base * ab_block_bytes),
@@ -3040,7 +3051,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             if elide_z {
                                 elided_octas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            target.seed_octa(input.0.as_ptr(), kpair);
+                            target.seed_octa(input_ptr, kpair);
                         }
                     }
                 }
@@ -3115,17 +3126,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         }
         if root_enabled && root_plan.is_some() {
             // SAFETY: each octa owns complete 64-byte stripes. Both
-            // schedules overwrite every stripe, including tail padding.
+            // schedules overwrite every live stripe, including root-bit tail padding.
+            // Physical tile gaps were initialized above and are never consumed.
             // The commit entry or Rayon joins all producers and their SFENCEs
             // before this completed root-cache storage is published.
             let mut tiles = unsafe {
-                if pipelined {
-                    flock_core::lincheck::WitnessRootTiles::from_cross_quarter_witness_storage(
-                        root_storage, z.len() / F128_PER_BLOCK)
-                } else {
-                    flock_core::lincheck::WitnessRootTiles::from_witness_storage(
-                        root_storage, z.len() / F128_PER_BLOCK)
-                }
+                flock_core::lincheck::WitnessRootTiles::from_padded_witness_storage(
+                    root_storage, z.len() / F128_PER_BLOCK, pipelined)
             };
             if elided_octas.load(std::sync::atomic::Ordering::Relaxed) != 0 {
                 // Some z lines were never stored: these tiles are now the
