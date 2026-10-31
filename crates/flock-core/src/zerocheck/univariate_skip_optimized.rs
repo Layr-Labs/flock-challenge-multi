@@ -39,6 +39,8 @@ use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod ab_polynomial;
 
 /// Ranked C-drain reconstruct: 16×64 byte-planes → 64 F128. Identity-C
 /// lincheck worker-reduce has the same plane layout.
@@ -3626,6 +3628,8 @@ pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
     cached_plane_banks: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    polynomial_cache: Option<ab_polynomial::Cache>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
@@ -3636,6 +3640,8 @@ impl WorkerStateAbOnly {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
             cached_plane_banks: false,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            polynomial_cache: None,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
         }
@@ -4121,8 +4127,18 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         && zc_r1_ab_batch4_enabled();
     if batch4 {
         let prefetch_mode = if pf_windows == 0 { 0 } else if pf_spread { 1 } else { 2 };
-        unsafe { process_ranked_ab_w4_band(ab_inner, mats, x_hi, plane_first_write,
-            prefetch_mode, &mut state.plane_banks); }
+        let used_polynomial = {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            { ab_polynomial::enabled() && ab_polynomial::try_run(
+                &mut state.polynomial_cache, ab_inner, mats, x_hi,
+                prefetch_mode, &mut state.plane_banks) }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
+            { false }
+        };
+        if !used_polynomial {
+            unsafe { process_ranked_ab_w4_band(ab_inner, mats, x_hi, plane_first_write,
+                prefetch_mode, &mut state.plane_banks); }
+        }
     } else {
     let bank_mask = (1usize << bank_bits) - 1;
     for x_outer_lo in 0..big_lo_size {
