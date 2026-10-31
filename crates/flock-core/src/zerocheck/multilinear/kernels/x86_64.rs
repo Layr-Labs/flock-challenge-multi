@@ -5628,7 +5628,8 @@ pub(crate) struct R4LaneWeights {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
+unsafe fn r4_round4_batch<const SKIP: u8>(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10]) {
+    let skip = SKIP;
     use core::arch::x86_64::*;
     unsafe {
         let ld = |p: *const F128, g: usize, k: usize| -> __m512i {
@@ -5638,51 +5639,63 @@ unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhas
                 _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
             }
         };
-        let mut ops = [[_mm512_setzero_si512(); 20]; 2];
-        for set in 0..2 {
-            let (g0, g1) = (2 * set, 2 * set + 1);
-            let st = &mut ops[set];
-            let mut ca = [_mm512_setzero_si512(); 4];
-            let mut cb = [_mm512_setzero_si512(); 4];
-            for k in 0..4 {
-                let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
-                let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
-                let ao = _mm512_shuffle_i64x2::<0xDD>(xa, ya);
-                let bo = _mm512_shuffle_i64x2::<0xDD>(xb, yb);
-                if k == 0 {
-                    st[0] = ao;
-                    st[1] = bo;
-                }
-                ca[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa, ya), ao);
-                cb[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb, yb), bo);
-            }
-            let a01 = _mm512_xor_si512(ca[0], ca[1]);
-            let b01 = _mm512_xor_si512(cb[0], cb[1]);
-            let a23 = _mm512_xor_si512(ca[2], ca[3]);
-            let b23 = _mm512_xor_si512(cb[2], cb[3]);
-            st[2] = ca[0];
-            st[3] = cb[0];
-            st[4] = ca[1];
-            st[5] = cb[1];
-            st[6] = a01;
-            st[7] = b01;
-            st[8] = ca[2];
-            st[9] = cb[2];
-            st[10] = ca[3];
-            st[11] = cb[3];
-            st[12] = a23;
-            st[13] = b23;
-            st[14] = _mm512_xor_si512(ca[0], ca[2]);
-            st[15] = _mm512_xor_si512(cb[0], cb[2]);
-            st[16] = _mm512_xor_si512(ca[1], ca[3]);
-            st[17] = _mm512_xor_si512(cb[1], cb[3]);
-            st[18] = _mm512_xor_si512(a01, a23);
-            st[19] = _mm512_xor_si512(b01, b23);
+        macro_rules! pair_k {
+            ($k:expr) => {{
+                let (xa0, ya0) = (ld(fa, 0, $k), ld(fa, 1, $k));
+                let (xb0, yb0) = (ld(fb, 0, $k), ld(fb, 1, $k));
+                let (xa1, ya1) = (ld(fa, 2, $k), ld(fa, 3, $k));
+                let (xb1, yb1) = (ld(fb, 2, $k), ld(fb, 3, $k));
+                let ao0 = _mm512_shuffle_i64x2::<0xDD>(xa0, ya0);
+                let bo0 = _mm512_shuffle_i64x2::<0xDD>(xb0, yb0);
+                let ao1 = _mm512_shuffle_i64x2::<0xDD>(xa1, ya1);
+                let bo1 = _mm512_shuffle_i64x2::<0xDD>(xb1, yb1);
+                let ca = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa0, ya0), ao0);
+                let cb = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb0, yb0), bo0);
+                let da = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa1, ya1), ao1);
+                let db = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb1, yb1), bo1);
+                (ao0, bo0, ao1, bo1, ca, cb, da, db)
+            }};
         }
-        let (s0, s1) = (&ops[0], &ops[1]);
-        for k in 0..10 {
-            acc4[k].mul_acc2(s0[2 * k], s0[2 * k + 1], s1[2 * k], s1[2 * k + 1]);
-        }
+        let (ao0, bo0, ao1, bo1, ca0, cb0, da0, db0) = pair_k!(0);
+        acc4[0].mul_acc2(ao0, bo0, ao1, bo1);
+        acc4[1].mul_acc2(ca0, cb0, da0, db0);
+
+        let (_, _, _, _, ca1, cb1, da1, db1) = pair_k!(1);
+        acc4[2].mul_acc2(ca1, cb1, da1, db1);
+        let a01 = _mm512_xor_si512(ca0, ca1);
+        let b01 = _mm512_xor_si512(cb0, cb1);
+        let c01 = _mm512_xor_si512(da0, da1);
+        let d01 = _mm512_xor_si512(db0, db1);
+        acc4[3].mul_acc2(a01, b01, c01, d01);
+
+        let (_, _, _, _, ca2, cb2, da2, db2) = pair_k!(2);
+        acc4[4].mul_acc2(ca2, cb2, da2, db2);
+        acc4[7].mul_acc2(
+            _mm512_xor_si512(ca0, ca2),
+            _mm512_xor_si512(cb0, cb2),
+            _mm512_xor_si512(da0, da2),
+            _mm512_xor_si512(db0, db2),
+        );
+
+        let (_, _, _, _, ca3, cb3, da3, db3) = pair_k!(3);
+        acc4[5].mul_acc2(ca3, cb3, da3, db3);
+        acc4[8].mul_acc2(
+            _mm512_xor_si512(ca1, ca3),
+            _mm512_xor_si512(cb1, cb3),
+            _mm512_xor_si512(da1, da3),
+            _mm512_xor_si512(db1, db3),
+        );
+        let a23 = _mm512_xor_si512(ca2, ca3);
+        let b23 = _mm512_xor_si512(cb2, cb3);
+        let c23 = _mm512_xor_si512(da2, da3);
+        let d23 = _mm512_xor_si512(db2, db3);
+        acc4[6].mul_acc2(a23, b23, c23, d23);
+        acc4[9].mul_acc2(
+            _mm512_xor_si512(a01, a23),
+            _mm512_xor_si512(b01, b23),
+            _mm512_xor_si512(c01, c23),
+            _mm512_xor_si512(d01, d23),
+        );
     }
 }
 
@@ -5834,7 +5847,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 0);
+                r4_round4_batch::<0>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 32);
@@ -5843,7 +5856,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                r4_round4_batch::<255>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 64);
@@ -5852,7 +5865,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 255);
+                r4_round4_batch::<255>(fa, fb, &mut acc4);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 96);
@@ -5861,7 +5874,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
-                r4_round4_batch(fa, fb, &mut acc4, 3);
+                r4_round4_batch::<3>(fa, fb, &mut acc4);
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6068,3 +6081,496 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         ]
     }
 }
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod fold3_c8 {
+    use super::*;
+    use core::arch::x86_64::*;
+    #[repr(C,align(64))]
+    // Matrix bank, immutable boundary constants, and one pass-owned switch.
+    // The two constants are computed from actual basis entries, not assumed
+    // identity encodings. Every special input row is checked before use.
+    pub(crate) struct C8FoldMats([[u64;8];128],[F128;2],bool);
+    pub(crate) enum Fold3Mats {
+        C4(CFoldMats),
+        #[cfg(target_os="linux")]
+        C8(C8FoldMats),
+    }
+    /// Prepare one immutable table before the parallel consumer. Each of the
+    /// eight input-row coefficients already contains its third-fold weight.
+    pub(crate) fn build_fold3_mats(data:&[F128],coeffs:[F128;4],rho3:F128)->Fold3Mats {
+        #[cfg(target_os="linux")]
+        {
+            static OFF:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||
+                std::env::var_os("FLOCK_NO_ZC_FOLD3_C8").is_some());
+            if !*OFF {
+                let right=coeffs.map(|c|c*rho3);
+                static BOUNDARY_OFF:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||
+                    std::env::var_os("FLOCK_NO_ZC_FOLD3_C8_BOUNDARY").is_some());
+                let mut all_ones=F128::ZERO;let mut low49_ones=F128::ZERO;
+                for bit in 0..64 {
+                    let basis=data[(bit/8)*256+(1usize<<(bit%8))];
+                    all_ones+=basis;
+                    if bit<49 {low49_ones+=basis;}
+                }
+                let sum=coeffs.iter().copied().fold(F128::ZERO,|a,b|a+b);
+                let known=[all_ones*sum,low49_ones*(coeffs[0]+right[0])];
+                let mut out=C8FoldMats([[0u64;8];128],known,!*BOUNDARY_OFF);
+                for i in 0..8 {
+                    let c=if i<4{coeffs[i]+right[i]}else{right[i-4]};
+                    let per=build_row_fold_mats_scaled(data,c);
+                    for hh in 0..2 {for j in 0..8 {
+                        out.0[64*hh+8*i+j].copy_from_slice(&per[16*j+8*hh..16*j+8*hh+8]);
+                    }}
+                }
+                return Fold3Mats::C8(out);
+            }
+        }
+        Fold3Mats::C4(build_cfold_mats(data,coeffs))
+    }
+    #[cfg(target_os="linux")]
+    core::arch::global_asm!(include_str!("gfni_c8_register_result.S"));
+    #[cfg(target_os="linux")]
+    unsafe extern "C" {fn flock_gfni_c8_register_result();}
+#[cfg(target_os="linux")]
+#[inline(always)]
+unsafe fn c8(p:*const u8,m:&C8FoldMats)->[__m512i;2]{
+ let a:__m512i;let b:__m512i;
+ core::arch::asm!("call {kernel}",kernel=sym flock_gfni_c8_register_result,in("rdi")p,in("rsi")m.0.as_ptr(),lateout("rax")_,out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")a,out("zmm9")b,out("zmm10")_,out("zmm11")_);[a,b]
+}
+#[cfg(target_os="linux")]
+#[inline(never)]
+pub(crate) unsafe fn fold3_c8_consumer<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &C8FoldMats,
+    rho3: F128,
+    wt: &[F128],
+) -> [F128; 8] {
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(b_out.len(), 2 * lo_size);
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wt.as_ptr();
+        let (r3, r3_64) = ghash_broadcast_split(rho3);
+
+        macro_rules! fold_side {
+            ($pkt:expr,$row0:expr)=>{{
+                let [a,b]=c8($pkt.add($row0*8),cfold);
+                let [c,d]=c8($pkt.add($row0*8+512),cfold);
+                [_mm512_shuffle_i64x2::<0x88>(a,c),_mm512_shuffle_i64x2::<0x88>(b,d),
+                 _mm512_shuffle_i64x2::<0xdd>(a,c),_mm512_shuffle_i64x2::<0xdd>(b,d)]
+            }};
+        }
+
+        macro_rules! step16 {
+            ($x_expr:expr) => {{
+                let x = $x_expr;
+                let ol = 2 * x;
+                let xg = out_base + ol;
+                let row0 = 8 * xg;
+                let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+                for l in 0..8 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let [a0, a1, a2, a3] = fold_side!(a_pkt, row0);
+                for l in 8..16 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let [b0, b1, b2, b3] = fold_side!(b_pkt, row0);
+                let ap = a_out_ptr.add(ol);
+                let bp = b_out_ptr.add(ol);
+                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else {
+                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                    (s0, s1, s2, s3, t0, t1, t2, t3)
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                }
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = ghash_mul_x4_split(a0, w, w64);
+                let a1w = ghash_mul_x4_split(a1, w, w64);
+                let a2w = ghash_mul_x4_split(a2, w, w64);
+                let a3w = ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step16!(x_lo);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step16!(x_lo + 8);
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}
+
+#[cfg(target_os="linux")]
+unsafe extern "C"{fn flock_c8_boundary_gather0();}
+#[cfg(target_os="linux")]
+#[inline(always)]
+unsafe fn gather0(p:*const u8,m:&C8FoldMats)->[__m512i;2]{
+ let a:__m512i;let b:__m512i;
+ core::arch::asm!("call {kernel}",kernel=sym flock_c8_boundary_gather0,in("rdi")p,in("rsi")m.0.as_ptr(),lateout("rax")_,out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")a,out("zmm9")b,out("zmm10")_,out("zmm11")_);[a,b]
+}
+#[cfg(target_os="linux")]
+unsafe extern "C"{fn flock_c8_boundary_gather1();}
+#[cfg(target_os="linux")]
+#[inline(always)]
+unsafe fn gather1(p:*const u8,m:&C8FoldMats)->[__m512i;2]{
+ let a:__m512i;let b:__m512i;
+ core::arch::asm!("call {kernel}",kernel=sym flock_c8_boundary_gather1,in("rdi")p,in("rsi")m.0.as_ptr(),lateout("rax")_,out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")a,out("zmm9")b,out("zmm10")_,out("zmm11")_);[a,b]
+}
+#[cfg(target_os="linux")]
+unsafe extern "C"{fn flock_c8_boundary_gather2();}
+#[cfg(target_os="linux")]
+#[inline(always)]
+unsafe fn gather2(p:*const u8,m:&C8FoldMats)->[__m512i;2]{
+ let a:__m512i;let b:__m512i;
+ core::arch::asm!("call {kernel}",kernel=sym flock_c8_boundary_gather2,in("rdi")p,in("rsi")m.0.as_ptr(),lateout("rax")_,out("zmm0")_,out("zmm1")_,out("zmm2")_,out("zmm3")_,out("zmm4")_,out("zmm5")_,out("zmm6")_,out("zmm7")_,out("zmm8")a,out("zmm9")b,out("zmm10")_,out("zmm11")_);[a,b]
+}
+#[cfg(target_os="linux")]
+#[inline(always)]
+unsafe fn put(out:*mut F128,tile:usize,v:[__m512i;2]){
+ _mm512_storeu_si512(out.add(8*tile).cast(),v[0]);_mm512_storeu_si512(out.add(8*tile+4).cast(),v[1]);
+}
+#[cfg(target_os="linux")]
+#[inline(never)]
+unsafe fn boundary_base(p:*const u8,m:&C8FoldMats,out:*mut F128){
+ for t in 0..8{put(out,t,c8(p.add(t*512),m));}
+}
+#[cfg(target_os="linux")]
+#[inline(never)]
+unsafe fn boundary_body(p:*const u8,m:&C8FoldMats,known:*const F128,out:*mut F128){
+ let [a,b]=gather0(p,m);let [c,d]=gather1(p,m);let[e,f]=gather2(p,m);
+ let h=_mm512_broadcast_i32x4(_mm_loadu_si128(known.cast()));
+ let t=_mm512_broadcast_i32x4(_mm_loadu_si128(known.add(1).cast()));
+ let z=_mm512_setzero_si512();
+ put(out,0,[_mm512_alignr_epi64::<6>(a,h),_mm512_alignr_epi64::<6>(b,h)]);
+ put(out,3,[_mm512_mask_mov_epi64(_mm512_alignr_epi64::<6>(c,a),0xc0,t),_mm512_mask_mov_epi64(_mm512_alignr_epi64::<6>(d,b),0xc0,z)]);
+ put(out,4,[_mm512_alignr_epi64::<6>(_mm512_alignr_epi64::<4>(e,c),h),_mm512_alignr_epi64::<6>(_mm512_alignr_epi64::<4>(f,d),h)]);
+ put(out,7,[_mm512_alignr_epi64::<2>(t,e),_mm512_alignr_epi64::<2>(z,f)]);
+ put(out,1,c8(p.add(512),m));put(out,2,c8(p.add(1024),m));
+ put(out,5,c8(p.add(2560),m));put(out,6,c8(p.add(3072),m));
+}
+#[cfg(target_os="linux")]
+#[inline(never)]
+unsafe fn boundary_checked(p:*const u8,m:&C8FoldMats,known:*const F128,out:*mut F128)->bool{
+ let ones=_mm512_set1_epi64(-1);let zero=_mm512_setzero_si512();
+ let tail=_mm512_set_epi64(0,0,0,0,0,0,0,0x0001ffffffffffff);
+ let mut mask=255u8;
+ for block in [0usize,2048]{
+  mask&=_mm512_cmpeq_epi64_mask(_mm512_loadu_si512(p.add(block).cast()),ones);
+  mask&=_mm512_cmpeq_epi64_mask(_mm512_loadu_si512(p.add(block+64).cast()),ones);
+  mask&=_mm512_cmpeq_epi64_mask(_mm512_loadu_si512(p.add(block+1920).cast()),tail);
+  mask&=_mm512_cmpeq_epi64_mask(_mm512_loadu_si512(p.add(block+1984).cast()),zero);
+ }
+ if mask==255{boundary_body(p,m,known,out);true}else{boundary_base(p,m,out);false}
+}
+#[cfg(target_os="linux")]
+#[inline(never)]
+pub(crate) unsafe fn fold3_c8_boundary_consumer<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &C8FoldMats,
+    rho3: F128,
+    wt: &[F128],
+) -> [F128; 8] {
+    if lo_size < 32 || lo_size % 32 != 0 || out_base % 32 != 0 {
+        return unsafe {fold3_c8_consumer::<NT_OUT,OUT_LM>(a_pkt,b_pkt,out_base,a_out,b_out,lo_size,cfold,rho3,wt)};
+    }
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(b_out.len(), 2 * lo_size);
+
+    unsafe {
+        #[repr(C,align(64))]struct BStage([F128;64]);
+        // All 64 elements are written by boundary_checked, on both paths,
+        // before any read. Keep access raw until that initialization ends.
+        let mut staged=core::mem::MaybeUninit::<BStage>::uninit();
+        let staged_ptr=staged.as_mut_ptr().cast::<F128>();
+        let mut acc = [WideGhashX4::zero(); 8];
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wt.as_ptr();
+        let (r3, r3_64) = ghash_broadcast_split(rho3);
+
+        macro_rules! fold_side {
+            ($pkt:expr,$row0:expr)=>{{
+                let [a,b]=c8($pkt.add($row0*8),cfold);
+                let [c,d]=c8($pkt.add($row0*8+512),cfold);
+                [_mm512_shuffle_i64x2::<0x88>(a,c),_mm512_shuffle_i64x2::<0x88>(b,d),
+                 _mm512_shuffle_i64x2::<0xdd>(a,c),_mm512_shuffle_i64x2::<0xdd>(b,d)]
+            }};
+        }
+
+        macro_rules! step16 {
+            ($x_expr:expr) => {{
+                let x = $x_expr;
+                let ol = 2 * x;
+                let xg = out_base + ol;
+                let row0 = 8 * xg;
+                let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+                for l in 0..8 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let [a0, a1, a2, a3] = fold_side!(a_pkt, row0);
+                for l in 8..16 {
+                    _mm_prefetch(a_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    _mm_prefetch(b_pkt.wrapping_add(next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                }
+                let bp_stage=staged_ptr.add(ol%64).cast::<__m512i>();
+                let ba=_mm512_load_si512(bp_stage);let bb=_mm512_load_si512(bp_stage.add(1));
+                let bc=_mm512_load_si512(bp_stage.add(2));let bd=_mm512_load_si512(bp_stage.add(3));
+                let[b0,b1,b2,b3]=[_mm512_shuffle_i64x2::<0x88>(ba,bc),_mm512_shuffle_i64x2::<0x88>(bb,bd),_mm512_shuffle_i64x2::<0xdd>(ba,bc),_mm512_shuffle_i64x2::<0xdd>(bb,bd)];
+                let ap = a_out_ptr.add(ol);
+                let bp = b_out_ptr.add(ol);
+                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else {
+                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                    (s0, s1, s2, s3, t0, t1, t2, t3)
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                }
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = ghash_mul_x4_split(a0, w, w64);
+                let a1w = ghash_mul_x4_split(a1, w, w64);
+                let a2w = ghash_mul_x4_split(a2, w, w64);
+                let a3w = ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            if x_lo%32==0 { boundary_checked(b_pkt.add((out_base+2*x_lo)*64),cfold,cfold.1.as_ptr(),staged_ptr); }
+
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step16!(x_lo);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step16!(x_lo + 8);
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}
+
+    #[inline(always)]
+    pub(crate) unsafe fn fold3_from_packed_prepared_wtab_x86<const NT_OUT:bool,const OUT_LM:bool>(
+        a_pkt:*const u8,b_pkt:*const u8,out_base:usize,a_out:&mut[F128],b_out:&mut[F128],
+        lo_size:usize,plan:&Fold3Mats,rho3:F128,wt:&[F128],
+    )->[F128;8] {
+        match plan {
+            Fold3Mats::C4(m)=>unsafe{fold3_from_packed_lookahead_c4_lm_wtab_x86::<NT_OUT,OUT_LM>(a_pkt,b_pkt,out_base,a_out,b_out,lo_size,m,rho3,wt)},
+            #[cfg(target_os="linux")]
+            Fold3Mats::C8(m)=>unsafe{
+                if m.2 {fold3_c8_boundary_consumer::<NT_OUT,OUT_LM>(a_pkt,b_pkt,out_base,a_out,b_out,lo_size,m,rho3,wt)}
+                else {fold3_c8_consumer::<NT_OUT,OUT_LM>(a_pkt,b_pkt,out_base,a_out,b_out,lo_size,m,rho3,wt)}
+            },
+        }
+    }
+
+#[cfg(all(test,target_os="linux"))]
+mod tests {
+use super::*;
+#[repr(C,align(64))]#[derive(Clone)]struct Line([F128;4]);
+fn field128(x:u128)->F128{F128{lo:x as u64,hi:(x>>64)as u64}}
+fn bits(x:F128)->u128{x.lo as u128|((x.hi as u128)<<64)}
+fn mul(mut a:u128,mut b:u128)->u128{let mut o=0;for _ in 0..128{if b&1!=0{o^=a;}b>>=1;let hi=a>>127;a<<=1;if hi!=0{a^=0x87;}}o}
+fn fm(a:F128,b:F128)->F128{field128(mul(bits(a),bits(b)))}
+fn natural(input:&[u8],basis:&[u128;64],c:[u128;4],rho:u128,n:usize)->Vec<F128>{
+ let fields:Vec<u128>=(0..8*n).map(|row|{let x=u64::from_le_bytes(input[8*row..8*row+8].try_into().unwrap());let mut v=0;for bit in 0..64{if x&(1u64<<bit)!=0{v^=basis[bit];}}v}).collect();
+ (0..n).map(|o|{let mut q=[0u128;2];for h in 0..2{for j in 0..4{q[h]^=mul(fields[8*o+4*h+j],c[j]);}}field128(q[0]^mul(q[0]^q[1],rho))}).collect()
+}
+fn oracle(a:&[u8],b:&[u8],basis:&[u128;64],c:[u128;4],rho:u128,wt:&[F128],n:usize)->(Vec<F128>,Vec<F128>,[F128;8]){
+ let aa=natural(a,basis,c,rho,n);let bb=natural(b,basis,c,rho,n);let mut ao=vec![F128::ZERO;n];let mut bo=ao.clone();let mut msg=[F128::ZERO;8];
+ for i in 0..n{let dst=16*(i/16)+4*(i%4)+(i%16)/4;ao[dst]=aa[i];bo[dst]=bb[i];}
+ for q in 0..n/4{let [a0,a1,a2,a3]=core::array::from_fn(|i|aa[4*q+i]);let [b0,b1,b2,b3]=core::array::from_fn(|i|bb[4*q+i]);let w=wt[8*(q/4)+q%4];
+  let t=[fm(a1,b1),fm((a0+a1),(b0+b1)),fm(a3,b3),fm((a2+a3),(b2+b3)),fm(a2,b2),fm((a0+a2),(b0+b2)),fm((a1+a3),(b1+b3)),fm((a0+a1+a2+a3),(b0+b1+b2+b3))];for i in 0..8{msg[i]+=fm(w,t[i]);}}
+ (ao,bo,msg)
+}
+fn one_mode<const NT:bool,const LM:bool>(){
+ let mut seed=0x1823819573u64;let mut next=||{seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;seed};let guard=field128(0x3535353535353535abababababababab);let mut cases=0;let mut comparisons=0;
+ for trial in 0..6{let basis=core::array::from_fn(|_|(next()as u128)<<64|next()as u128);let coeff=core::array::from_fn(|_|(next()as u128)<<64|next()as u128);
+  let rho=match trial{0=>0,1=>1,2=>1u128<<127,_=>(next()as u128)<<64|next()as u128};let mut data=vec![F128::ZERO;2048];for j in 0..8{for byte in 0..256{let mut v=0;for bit in 0..8{if byte&(1<<bit)!=0{v^=basis[8*j+bit];}}data[256*j+byte]=field128(v);}}
+ let c=coeff.map(field128);let m4=build_cfold_mats(&data,c);let m8=build_fold3_mats(&data,c,field128(rho));
+ let enabled=std::env::var_os("FLOCK_NO_ZC_FOLD3_C8").is_none();assert_eq!(matches!(&m8,Fold3Mats::C8(_)),enabled);
+ let boundary_enabled=enabled&&std::env::var_os("FLOCK_NO_ZC_FOLD3_C8_BOUNDARY").is_none();
+ assert_eq!(matches!(&m8,Fold3Mats::C8(m)if m.2),boundary_enabled);
+  for lo in [16usize,32,128]{for offset in [0usize,15]{for out_base in [0usize,32]{
+   let n=2*lo;let start=out_base*64;let len=start+64*n;let mut ad=vec![0u8;offset+len+2048];let mut bd=ad.clone();for i in 0..ad.len(){ad[i]=if trial==0{0}else{next()as u8};bd[i]=if trial==1{255}else{next()as u8};}
+   if lo>=32 {
+       for pos in (offset+start..offset+len).step_by(4096) {
+           for b in [0usize,2048] {
+               bd[pos+b..pos+b+128].fill(255);
+               bd[pos+b+1920..pos+b+2048].fill(0);
+               bd[pos+b+1920..pos+b+1928].copy_from_slice(&0x0001ffffffffffffu64.to_le_bytes());
+           }
+       }
+       if trial==5 {bd[offset+start+1928]^=1;}
+   }
+   let input_a=ad.clone();let input_b=bd.clone();let a=&ad[offset..];let b=&bd[offset..];let mut wt=Vec::new();for _ in 0..n/16{let w:[F128;4]=core::array::from_fn(|_|field128((next()as u128)<<64|next()as u128));wt.extend(w);wt.extend(w.map(|x|x*field128(1u128<<64)));}
+   let (mut ea,mut eb,em)=oracle(&a[start..],&b[start..],&basis,coeff,rho,&wt,n);
+   if !LM{for expected in [&mut ea,&mut eb]{let old=expected.clone();for i in 0..n{expected[i]=old[16*(i/16)+4*(i%4)+(i%16)/4];}}}
+   let mut oa=vec![Line([guard;4]);n/4+2];let mut ob=oa.clone();let mut na=oa.clone();let mut nb=oa.clone();
+   let olds=unsafe{fold3_from_packed_lookahead_c4_lm_wtab_x86::<NT,LM>(a.as_ptr(),b.as_ptr(),out_base,core::slice::from_raw_parts_mut(oa.as_mut_ptr().add(1).cast(),n),core::slice::from_raw_parts_mut(ob.as_mut_ptr().add(1).cast(),n),lo,&m4,field128(rho),&wt)};
+   let news=unsafe{fold3_from_packed_prepared_wtab_x86::<NT,LM>(a.as_ptr(),b.as_ptr(),out_base,core::slice::from_raw_parts_mut(na.as_mut_ptr().add(1).cast(),n),core::slice::from_raw_parts_mut(nb.as_mut_ptr().add(1).cast(),n),lo,&m8,field128(rho),&wt)};
+   assert_eq!(olds,em,"baseline aggregates trial={trial} lo={lo} offset={offset} base={out_base}");assert_eq!(news,em,"candidate aggregates");
+   for (got,expected) in [(&oa,&ea),(&ob,&eb),(&na,&ea),(&nb,&eb)]{assert_eq!(got[0].0,[guard;4]);assert_eq!(got.last().unwrap().0,[guard;4]);let body=unsafe{core::slice::from_raw_parts(got.as_ptr().add(1).cast::<F128>(),n)};assert_eq!(body,expected);}
+   assert_eq!(ad,input_a);assert_eq!(bd,input_b);cases+=1;comparisons+=4*n+16;
+  }}}
+ }
+ println!("PRODUCTION_C8_BOUNDARY_ALL_MODES nt={NT} lm={LM} cases={cases} output_and_aggregate_comparisons={comparisons} both_inputs_unchanged=true all_output_guards=true nt_output={NT}");assert_eq!(cases,72);
+}
+#[test]
+fn production_fold3_c8_boundary_all_modes_match_scalar(){
+    one_mode::<false,false>();one_mode::<false,true>();one_mode::<true,false>();one_mode::<true,true>();
+    println!("PRODUCTION_C8_BOUNDARY_VALIDATED modes=4 cases=288 comparisons=139776 selected={} boundary={}",
+        std::env::var_os("FLOCK_NO_ZC_FOLD3_C8").is_none(),
+        std::env::var_os("FLOCK_NO_ZC_FOLD3_C8").is_none()&&std::env::var_os("FLOCK_NO_ZC_FOLD3_C8_BOUNDARY").is_none());
+}
+}
+
+}
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+pub(crate) use fold3_c8::{build_fold3_mats,fold3_from_packed_prepared_wtab_x86};

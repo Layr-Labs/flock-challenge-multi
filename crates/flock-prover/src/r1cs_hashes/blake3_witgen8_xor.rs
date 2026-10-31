@@ -56,17 +56,78 @@ const fn known(mode: u8) -> u8 {
     }
 }
 
+/// Broadcast one staged qword from memory. The load-port form of
+/// `vpbroadcastq` keeps the 512-bit ALU ports free for the GFNI products;
+/// a register-source broadcast takes one of their slots per input. Slots are
+/// 16 bytes apart so the staging stores stay scalar (an adjacent store chain
+/// gets SLP-packed into shuffles on the same ports).
 #[inline(always)]
-unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn bcast_staged<const J: usize>(p: *const u64) -> __m512i {
+    unsafe {
+        let o: __m512i;
+        core::arch::asm!(
+            "vpbroadcastq {o}, qword ptr [{p} + {off}]",
+            p = in(reg) p,
+            off = const 16 * J,
+            o = out(zmm_reg) o,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+        o
+    }
+}
+
+/// Byte positions feeding transformed convolution input `s`: the supersets
+/// of `s` that are not structural complement zeros.
+const fn conv_live(mode_value: u8, s: usize) -> u8 {
+    let mut set = 0u8;
+    let mut t = 0;
+    while t < 8 {
+        if t & s == s && known(mode_value) & (1 << t) == 0 {
+            set |= 1 << t;
+        }
+        t += 1;
+    }
+    set
+}
+
+/// 8 when transformed input `s` is structurally zero, else the first input
+/// with the same byte set, whose broadcast is reused.
+const fn conv_rep(mode_value: u8, s: usize) -> usize {
+    let set = conv_live(mode_value, s);
+    if set == 0 {
+        return 8;
+    }
+    let mut r = 0;
+    while r < s {
+        if conv_live(mode_value, r) == set {
+            return r;
+        }
+        r += 1;
+    }
+    s
+}
+
+#[inline(always)]
+unsafe fn affine<const MODE: u8>(p: *const u64, m: *const u64) -> [__m512i; 8] {
     unsafe {
         let z = _mm512_setzero_si512();
         let mut v = [z; 8];
+        let mut staged = core::mem::MaybeUninit::<[u64; 16]>::uninit();
+        let sp = staged.as_mut_ptr().cast::<u64>();
+        macro_rules! put {
+            ($j:expr) => {
+                if const { known(MODE) & (1 << $j) == 0 } {
+                    let w = *p.add($j);
+                    *sp.add(2 * $j) = if MODE == 0 { w } else { !w };
+                }
+            };
+        }
+        put!(0); put!(1); put!(2); put!(3); put!(4); put!(5); put!(6); put!(7);
+        let sp = sp.cast_const();
         macro_rules! add {
             ($j:expr) => {
-                if known(mode_value) & (1 << $j) == 0 {
-                    let w = *p.add($j);
-                    let w = if mode_value == 0 { w } else { !w };
-                    let x = _mm512_set1_epi64(w as i64);
+                if const { known(MODE) & (1 << $j) == 0 } {
+                    let x = bcast_staged::<$j>(sp);
                     v[0] = _mm512_xor_si512(
                         v[0],
                         _mm512_gf2p8affine_epi64_epi8::<0>(
@@ -139,21 +200,21 @@ unsafe fn affine(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
 }
 
 #[inline(always)]
-unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i; 8] {
+unsafe fn affine_conv<const MODE: u8>(p: *const u64, m: *const u64) -> [__m512i; 8] {
     unsafe {
         // For sparse complement inputs keep the direct projection: <=3*8 products.
-        if known(mode_value).count_ones() >= 5 {
-            return affine(p, m, mode_value);
+        if known(MODE).count_ones() >= 5 {
+            return affine::<MODE>(p, m);
         }
         let mut x: [u64; 8] = [
-            if known(mode_value) & (1 << 0) != 0 { 0 } else if mode_value == 0 { *p.add(0) } else { !*p.add(0) },
-            if known(mode_value) & (1 << 1) != 0 { 0 } else if mode_value == 0 { *p.add(1) } else { !*p.add(1) },
-            if known(mode_value) & (1 << 2) != 0 { 0 } else if mode_value == 0 { *p.add(2) } else { !*p.add(2) },
-            if known(mode_value) & (1 << 3) != 0 { 0 } else if mode_value == 0 { *p.add(3) } else { !*p.add(3) },
-            if known(mode_value) & (1 << 4) != 0 { 0 } else if mode_value == 0 { *p.add(4) } else { !*p.add(4) },
-            if known(mode_value) & (1 << 5) != 0 { 0 } else if mode_value == 0 { *p.add(5) } else { !*p.add(5) },
-            if known(mode_value) & (1 << 6) != 0 { 0 } else if mode_value == 0 { *p.add(6) } else { !*p.add(6) },
-            if known(mode_value) & (1 << 7) != 0 { 0 } else if mode_value == 0 { *p.add(7) } else { !*p.add(7) }
+            if known(MODE) & (1 << 0) != 0 { 0 } else if MODE == 0 { *p.add(0) } else { !*p.add(0) },
+            if known(MODE) & (1 << 1) != 0 { 0 } else if MODE == 0 { *p.add(1) } else { !*p.add(1) },
+            if known(MODE) & (1 << 2) != 0 { 0 } else if MODE == 0 { *p.add(2) } else { !*p.add(2) },
+            if known(MODE) & (1 << 3) != 0 { 0 } else if MODE == 0 { *p.add(3) } else { !*p.add(3) },
+            if known(MODE) & (1 << 4) != 0 { 0 } else if MODE == 0 { *p.add(4) } else { !*p.add(4) },
+            if known(MODE) & (1 << 5) != 0 { 0 } else if MODE == 0 { *p.add(5) } else { !*p.add(5) },
+            if known(MODE) & (1 << 6) != 0 { 0 } else if MODE == 0 { *p.add(6) } else { !*p.add(6) },
+            if known(MODE) & (1 << 7) != 0 { 0 } else if MODE == 0 { *p.add(7) } else { !*p.add(7) }
         ];
         x[0] ^= x[1];
         x[2] ^= x[3];
@@ -167,98 +228,118 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
         x[1] ^= x[5];
         x[2] ^= x[6];
         x[3] ^= x[7];
+        let mut staged = core::mem::MaybeUninit::<[u64; 16]>::uninit();
+        let sp = staged.as_mut_ptr().cast::<u64>();
+        macro_rules! put {
+            ($s:expr) => {
+                if const { conv_rep(MODE, $s) == $s } {
+                    *sp.add(2 * $s) = x[$s];
+                }
+            };
+        }
+        put!(0); put!(1); put!(2); put!(3); put!(4); put!(5); put!(6); put!(7);
+        let sp = sp.cast_const();
+        let zero = _mm512_setzero_si512();
+        let mut xb = [zero; 8];
+        macro_rules! stage {
+            ($s:expr) => {
+                let r = const { conv_rep(MODE, $s) };
+                xb[$s] = if r == 8 { zero } else if r == $s { bcast_staged::<$s>(sp) } else { xb[r] };
+            };
+        }
+        stage!(0); stage!(1); stage!(2); stage!(3); stage!(4); stage!(5); stage!(6); stage!(7);
         let mut c = [_mm512_setzero_si512(); 8];
         c[0] = _mm512_gf2p8affine_epi64_epi8::<0>(
-            _mm512_set1_epi64(x[0] as i64),
+            xb[0],
             _mm512_loadu_si512(m.add(64).cast()),
         );
         c[1] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                xb[0],
                 _mm512_loadu_si512(m.add(72).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[1] as i64),
+                xb[1],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[2] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                xb[0],
                 _mm512_loadu_si512(m.add(80).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[2] as i64),
+                xb[2],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[3] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    xb[0],
                     _mm512_loadu_si512(m.add(88).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    xb[1],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    xb[2],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[3] as i64),
+                xb[3],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[4] = _mm512_xor_si512(
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[0] as i64),
+                xb[0],
                 _mm512_loadu_si512(m.add(96).cast()),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[4] as i64),
+                xb[4],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[5] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    xb[0],
                     _mm512_loadu_si512(m.add(104).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[1] as i64),
+                    xb[1],
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    xb[4],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[5] as i64),
+                xb[5],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
         c[6] = _mm512_xor_si512(
             _mm512_ternarylogic_epi64::<0x96>(
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[0] as i64),
+                    xb[0],
                     _mm512_loadu_si512(m.add(112).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[2] as i64),
+                    xb[2],
                     _mm512_loadu_si512(m.add(96).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[4] as i64),
+                    xb[4],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[6] as i64),
+                xb[6],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
@@ -267,38 +348,38 @@ unsafe fn affine_conv(p: *const u64, m: *const u64, mode_value: u8) -> [__m512i;
                 _mm512_ternarylogic_epi64::<0x96>(
                     _mm512_ternarylogic_epi64::<0x96>(
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[0] as i64),
+                            xb[0],
                             _mm512_loadu_si512(m.add(120).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[1] as i64),
+                            xb[1],
                             _mm512_loadu_si512(m.add(112).cast()),
                         ),
                         _mm512_gf2p8affine_epi64_epi8::<0>(
-                            _mm512_set1_epi64(x[2] as i64),
+                            xb[2],
                             _mm512_loadu_si512(m.add(104).cast()),
                         ),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[3] as i64),
+                        xb[3],
                         _mm512_loadu_si512(m.add(96).cast()),
                     ),
                     _mm512_gf2p8affine_epi64_epi8::<0>(
-                        _mm512_set1_epi64(x[4] as i64),
+                        xb[4],
                         _mm512_loadu_si512(m.add(88).cast()),
                     ),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[5] as i64),
+                    xb[5],
                     _mm512_loadu_si512(m.add(80).cast()),
                 ),
                 _mm512_gf2p8affine_epi64_epi8::<0>(
-                    _mm512_set1_epi64(x[6] as i64),
+                    xb[6],
                     _mm512_loadu_si512(m.add(72).cast()),
                 ),
             ),
             _mm512_gf2p8affine_epi64_epi8::<0>(
-                _mm512_set1_epi64(x[7] as i64),
+                xb[7],
                 _mm512_loadu_si512(m.add(64).cast()),
             ),
         );
@@ -630,7 +711,7 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
 ) -> __m512i {
     unsafe {
         let av = affine_prepared(ap, ma);
-        let bv = if MODE == 0 { affine_prepared(bp, mb) } else { affine_conv(bp, mb, MODE) };
+        let bv = if MODE == 0 { affine_prepared(bp, mb) } else { affine_conv::<MODE>(bp, mb) };
         let mut result = _mm512_setzero_si512();
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
