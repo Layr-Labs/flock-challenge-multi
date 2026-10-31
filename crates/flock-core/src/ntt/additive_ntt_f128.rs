@@ -3386,6 +3386,15 @@ impl AdditiveNttF128 {
                 }
             }
         };
+        // This alternative cut is confined to the exact aligned paired route.
+        // Other shapes and the unsplit fallback retain their original4+2 path.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let two_four = if log_d == 20 && row_len == 64 && block_size == 131072
+            && sub_stride == 2048 && odd_tail == 4 && lanes4_tail == 4
+            && lanes2_tail == 4 && stage_perm && seed_odd_tail && direct_publish_zmm {
+            unsafe { kernels::prepare_seed_two_four(&tw4, &tw2) }
+        } else { None };
+
         let task = |buf: &mut Vec<F128>, r: usize| {
             let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
             let bufp = buf.as_mut_ptr();
@@ -3505,6 +3514,11 @@ impl AdditiveNttF128 {
             target_feature = "vpclmulqdq"
         ))]
         let fold4 = |bufp: *mut F128, r: usize| {
+            if let Some(plan) = &two_four {
+                // The seeded slot is exclusively held until this callback returns.
+                unsafe { kernels::seed_two_four_fold(bufp, row_lanes(r, row_len, lanes4_tail), plan); }
+                return;
+            }
             // SAFETY: `bufp` addresses the 512 seeded staging rows of task
             // `r`; this half writes nothing outside them.
             unsafe {
@@ -3525,6 +3539,13 @@ impl AdditiveNttF128 {
             // `r` are pairwise disjoint.
             unsafe {
                 let base = base_addr as *mut F128;
+                if let Some(plan) = &two_four {
+                    // The original folded Acquire precedes this callback; keep
+                    // the original final fence before publication releases a slot.
+                    kernels::seed_two_four_publish(bufp, base.add(r * row_len), lanes2, plan);
+                    core::arch::x86_64::_mm_sfence();
+                    return;
+                }
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
                         bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
@@ -8129,5 +8150,813 @@ mod octa_seed_geometry_tests {
             assert_ne!(wrong[4],expected[4]);negative_controls+=1;cases+=1;
         }}}}
         println!("OCTA_SEED_GEOMETRY full_groups={cases} fields_per_group=63488_or_65536 wrong_quarter_controls={negative_controls} input_unchanged=true guards_unchanged=true reusable_local_input=true hold4_disabled={}",ntt_seed_hold4_disabled());
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl AdditiveNttF128 {
+    #[inline(never)]
+    fn seed_two_four_actual_pair_probe(
+        &self,
+        msg: SeedInput<'_>,
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+        odd_tail: usize,
+        tasks: &[usize],
+        stage_poison: F128,
+    ) -> usize {
+        use rayon::prelude::*;
+        #[cfg(test)]
+        SEED_TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        const LAYER: usize = 3;
+        debug_assert!(log_d >= 9);
+        debug_assert_eq!(data.len(), 2 * msg.len());
+        let block_size = 1usize << (log_d - LAYER); // B, also the seed quarter
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert_eq!(msg_positions >> 2, block_size);
+        let block_bytes = block_size * num_ntts;
+        let sub_stride = block_size >> 6; // S
+        debug_assert!(sub_stride >= 1);
+        let sixteenth = block_size >> 4;
+        let quarter = sub_stride;
+        let lanes4_tail = if sixteenth.is_multiple_of(2) {
+            odd_tail
+        } else {
+            0
+        };
+        let lanes2_tail = if quarter.is_multiple_of(2) {
+            odd_tail
+        } else {
+            0
+        };
+        let row_len = num_ntts;
+
+        // Seed twiddles exactly as `seed_rate_half_layers_1_through_2`.
+        let mut seed_tw = [[F128::ZERO; 3]; 2];
+        for (block, tw) in seed_tw.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+        }
+        debug_assert_eq!(seed_tw[0][0], F128::ZERO);
+        debug_assert_eq!(seed_tw[0][1], F128::ZERO);
+        let seed_right = seed_tw[0][2];
+        let seed_dense = seed_tw[1];
+
+        let tw4: Vec<kernels::FourBlock> = (0..8)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(LAYER, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(LAYER + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(LAYER + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(LAYER + 3, 8 * block + s);
+                }
+                kernels::FourBlock::new(tw)
+            })
+            .collect();
+
+        let tw2: Vec<[[F128; 3]; 16]> = (0..8)
+            .map(|block| {
+                core::array::from_fn(|m| {
+                    let outer_block = block * 16 + m;
+                    [
+                        self.twiddle(LAYER + 4, outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block),
+                        self.twiddle(LAYER + 5, 2 * outer_block + 1),
+                    ]
+                })
+            })
+            .collect();
+
+        let src_addr = msg.as_ptr() as usize;
+        let base_addr = data.as_mut_ptr() as usize;
+        // Publish with non-temporal stores when allowed and 16-byte aligned
+        // (see `publish_row_nt`); decided once per pass.
+        #[cfg(target_arch = "x86_64")]
+        let publish_nt = Self::scatter_nt_enabled() && base_addr % 16 == 0;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let direct_publish = publish_nt
+            && direct_fused2_publish_shape(log_d, num_ntts, odd_tail)
+            && !ntt_direct_fused2_publish_disabled();
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let direct_publish_zmm = direct_publish && base_addr % 64 == 0;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let seed_odd_tail = direct_publish && odd_tail == 4 && !ntt_seed_odd_tail_disabled();
+        // Staging row order inside a block.
+        //
+        // The natural order is `k`, and the fused-four kernel then walks its
+        // sixteen rows with `sixteenth = 4`: sixteen lines EXACTLY 4 KiB apart,
+        // i.e. sixteen lines competing for ONE 12-way L1d set, on every one of
+        // its lane steps. Reordering the block's rows as
+        // `k ↦ (k mod 4)·16 + k/4` makes each fused-four group sixteen
+        // CONSECUTIVE staging rows (`sixteenth = 1`), which spreads those
+        // sixteen lines over four L1d sets, four ways each; the fused-two quads
+        // become `{m, 16+m, 32+m, 48+m}` — four lines in one set, still inside
+        // the twelve ways. Row `i` of every kernel group is the same element in
+        // the same order as before, so the transform is byte-identical; only
+        // the scratch address it lives at changes.
+        let stage_perm = Self::stage_perm_enabled();
+        // Message-gather hints, decided once per pass (see `seed_pf_params`).
+        #[cfg(target_arch = "x86_64")]
+        let (pf_dist, pf_lines, pf_spread) = seed_pf_params();
+        // Staging row for logical row `k` of a block, and the fused-four /
+        // fused-two group geometry that matches it.
+        let perm = |k: usize| seed_top_stage_row(k, stage_perm);
+        let (g4_stride, g4_base, g2_stride): (usize, usize, usize) =
+            if stage_perm { (1, 16, 16) } else { (4, 1, 1) };
+        // The seed half (`M`) of one task: 64 row groups gathered out of
+        // `msg` into the 512 staging rows. Split out from `task` so the
+        // sibling-paired schedule (see `st_fmp_run`) can run it on a different
+        // logical CPU from the fused-four fold; the unsplit `task` below opens
+        // with it and is otherwise byte for byte what it was.
+        //
+        // SAFETY: message rows `r_s + i·B` (r_s < B, i < 4) are inside `msg`;
+        // `bufp` addresses the 512 staging rows that only this task writes.
+        let seed = |bufp: *mut F128, r: usize, compact: *const F128| {
+            unsafe {
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                if !compact.is_null() {
+                    seed_compact_witness_group(
+                        bufp,
+                        compact,
+                        r,
+                        row_len,
+                        if seed_odd_tail { odd_tail } else { 0 },
+                        stage_perm,
+                        seed_right,
+                        &seed_dense,
+                    );
+                    return;
+                }
+                let src = src_addr as *const F128;
+                // Seed: 64 row groups → staging rows [block][k].
+                //
+                // The four message rows a step reads are asked for a fixed
+                // number of steps ahead. The hints move no data of their own
+                // and change no value; `FLOCK_NO_NTT_SEED_PF=1` removes them.
+                #[cfg(target_arch = "x86_64")]
+                if pf_dist != 0 {
+                    for k in 0..pf_dist.min(64) {
+                        pf_msg_rows(src, r + k * sub_stride, block_size, row_len, pf_lines);
+                    }
+                }
+                static PF2: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                    std::env::var("DIAG_PF2")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0)
+                });
+                static PF2L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                    std::env::var("DIAG_PF2L")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(16)
+                });
+                let pf2 = *PF2;
+                if pf2 != 0 {
+                    for k in 1..pf2.min(64) {
+                        for i in 0..4 {
+                            let p = src.add((i * block_size + r + k * sub_stride) * row_len)
+                                as *const i8;
+                            for l in 0..*PF2L {
+                                core::arch::x86_64::_mm_prefetch::<
+                                    { core::arch::x86_64::_MM_HINT_T1 },
+                                >(p.add(l * 64));
+                            }
+                        }
+                    }
+                }
+                for k in 0..64 {
+                    let r_s = r + k * sub_stride;
+                    let kp = perm(k);
+                    if pf2 != 0 && k + pf2 < 64 {
+                        for i in 0..4 {
+                            let p = src.add((i * block_size + r_s + pf2 * sub_stride) * row_len)
+                                as *const i8;
+                            for l in 0..*PF2L {
+                                core::arch::x86_64::_mm_prefetch::<
+                                    { core::arch::x86_64::_MM_HINT_T1 },
+                                >(p.add(l * 64));
+                            }
+                        }
+                    }
+                    // One line per lane step from inside the kernel, or the
+                    // whole burst up front; never both.
+                    let mut pf_next: *const F128 = core::ptr::null();
+                    #[cfg(target_arch = "x86_64")]
+                    if pf_dist != 0 && k + pf_dist < 64 {
+                        if pf_spread {
+                            pf_next = src.add((r_s + pf_dist * sub_stride) * row_len);
+                        } else {
+                            pf_msg_rows(
+                                src,
+                                r_s + pf_dist * sub_stride,
+                                block_size,
+                                row_len,
+                                pf_lines,
+                            );
+                        }
+                    }
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if !ntt_seed_hold4_disabled() {
+                        // `sub_stride` and `block_size` are even at the
+                        // ranked shape, so all four source rows have `r`'s
+                        // parity. On odd tasks their last four lanes are the
+                        // published zero tail. Keep the physical pitch at 64
+                        // while stopping the seed kernel at lane 60.
+                        // Yukon exact-content redraw marker: zarar-g-odd-tail-r2.
+                        let seed_active_lanes = if seed_odd_tail && r & 1 == 1 {
+                            row_len - odd_tail
+                        } else {
+                            row_len
+                        };
+                        static NOREAD: std::sync::LazyLock<bool> =
+                            std::sync::LazyLock::new(|| std::env::var_os("DIAG_NOREAD").is_some());
+                        let (q_, rs_, pf_) = if *NOREAD {
+                            (1024usize, r_s & 1023, core::ptr::null())
+                        } else {
+                            (block_size, r_s, pf_next)
+                        };
+                        kernels::butterfly_fused_2layer_row_from_sparse_dense_geo(
+                            src,
+                            q_,
+                            rs_,
+                            bufp.add(kp * row_len),
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            row_len,
+                            seed_active_lanes,
+                            seed_right,
+                            &seed_dense,
+                            pf_,
+                        );
+                    } else if pf_next.is_null() {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(kp * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    } else {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add(kp * row_len),
+                            64,
+                            0,
+                            row_len,
+                            seed_right,
+                            pf_next,
+                        );
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
+                    {
+                        if pf_next.is_null() {
+                            kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                                src,
+                                block_size,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                64,
+                                0,
+                                row_len,
+                                seed_right,
+                            );
+                        } else {
+                            kernels::butterfly_fused_2layer_row_from_sparse_geo_pf(
+                                src,
+                                block_size,
+                                r_s,
+                                bufp.add(kp * row_len),
+                                64,
+                                0,
+                                row_len,
+                                seed_right,
+                                pf_next,
+                            );
+                        }
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src,
+                            block_size,
+                            r_s,
+                            bufp.add((256 + kp) * row_len),
+                            64,
+                            0,
+                            row_len,
+                            &seed_dense,
+                        );
+                    }
+                }
+            }
+        };
+        // This alternative cut is confined to the exact aligned paired route.
+        // Other shapes and the unsplit fallback retain their original4+2 path.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let two_four = if log_d == 20
+            && row_len == 64
+            && block_size == 131072
+            && sub_stride == 2048
+            && odd_tail == 4
+            && lanes4_tail == 4
+            && lanes2_tail == 4
+            && stage_perm
+            && seed_odd_tail
+            && direct_publish_zmm
+        {
+            unsafe { kernels::prepare_seed_two_four(&tw4, &tw2) }
+        } else {
+            None
+        };
+
+        // The two halves of one task's post-seed work, split at the exact seam
+        // the co-residency measurement priced: the fused-four staging fold
+        // (`F`) and the fused-two NT publish (`P`). Only the ranked
+        // `direct_publish` geometry is split; every other shape keeps the
+        // fused `task` above verbatim.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let fold4 = |bufp: *mut F128, r: usize| {
+            if let Some(plan) = &two_four {
+                // The seeded slot is exclusively held until this callback returns.
+                unsafe {
+                    kernels::seed_two_four_fold(bufp, row_lanes(r, row_len, lanes4_tail), plan);
+                }
+                return;
+            }
+            // SAFETY: `bufp` addresses the 512 seeded staging rows of task
+            // `r`; this half writes nothing outside them.
+            unsafe {
+                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4);
+            }
+        };
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let publish2 = |bufp: *mut F128, r: usize| {
+            let lanes2 = row_lanes(r, num_ntts, lanes2_tail);
+            // SAFETY: forwarded ranked-shape contract, identical to the fused
+            // call in `task`: `bufp` holds task `r`'s 512 folded staging rows
+            // and `base` owns the disjoint codeword, whose rows for distinct
+            // `r` are pairwise disjoint.
+            unsafe {
+                let base = base_addr as *mut F128;
+                if let Some(plan) = &two_four {
+                    // The original folded Acquire precedes this callback; keep
+                    // the original final fence before publication releases a slot.
+                    kernels::seed_two_four_publish(bufp, base.add(r * row_len), lanes2, plan);
+                    core::arch::x86_64::_mm_sfence();
+                    return;
+                }
+                if direct_publish_zmm {
+                    self.seed_top_direct_publish2::<true>(
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                    );
+                } else {
+                    self.seed_top_direct_publish2::<false>(
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                    );
+                }
+                // All 512 rows of this task are published. Drain the WC
+                // buffers here, exactly as the fused path does per task; the
+                // rayon join below is the reader's happens-before edge.
+                core::arch::x86_64::_mm_sfence();
+            }
+        };
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let produce = msg.producer().map(|produce| {
+            move |group, role, output0, output1| {
+                let target = WitnessSeedTarget {
+                    output: [output0, output1],
+                    odd_tail: if seed_odd_tail { odd_tail } else { 0 },
+                    stage_perm,
+                    right: seed_right,
+                    dense: seed_dense,
+                };
+                produce(src_addr as *mut F128, group, role, Some(&target));
+            }
+        });
+
+        let expected = std::env::var_os("FLOCK_NO_NTT_TWO_FOUR").is_none();
+        assert_eq!(two_four.is_some(), expected);
+        eprintln!("ACTUAL_NTT_TWO_FOUR_SELECTED={expected}");
+        // Test-only driver for the exact production closures copied above.
+        // Owners keep both initialized allocations alive until both roles join.
+        assert!(direct_publish && direct_publish_zmm && seed_odd_tail && stage_perm);
+        assert_eq!((row_len, block_size, sub_stride), (64, 1 << 17, 1 << 11));
+        assert_eq!(
+            tasks
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            tasks.len()
+        );
+        assert!(tasks.len() >= 3 && tasks.iter().all(|&r| r < sub_stride));
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let len = 512 * row_len;
+        const SLOTS: usize = 3;
+        let mut storage: [Vec<F128>; SLOTS] = std::array::from_fn(|_| vec![stage_poison; len + 11]);
+        let offsets: [usize; SLOTS] =
+            std::array::from_fn(|s| storage[s].as_ptr().align_offset(64) + 4);
+        let pointers: [usize; SLOTS] = std::array::from_fn(|s| {
+            assert!((4..=7).contains(&offsets[s]));
+            unsafe { storage[s].as_mut_ptr().add(offsets[s]) as usize }
+        });
+        assert!(pointers.iter().all(|p| p % 64 == 0));
+        let seeded = AtomicUsize::new(0);
+        let folded = AtomicUsize::new(0);
+        let canceled = AtomicBool::new(false);
+        let max_live = AtomicUsize::new(0);
+        struct CancelOnPanic<'a>(&'a AtomicBool);
+        impl Drop for CancelOnPanic<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+        }
+        std::thread::scope(|scope| {
+            let fold_worker = scope.spawn(|| {
+                let _guard = CancelOnPanic(&canceled);
+                for (i, &r) in tasks.iter().enumerate() {
+                    while seeded.load(Ordering::Acquire) <= i {
+                        if canceled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
+                    if canceled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Acquire observes this slot's seed. The M+P role cannot
+                    // overwrite it until this fold and its own publish end.
+                    fold4(pointers[i % SLOTS] as *mut F128, r);
+                    folded.store(i + 1, Ordering::Release);
+                    if i & 1 == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            let mp_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = CancelOnPanic(&canceled);
+                let wait_folded = |count: usize| {
+                    while folded.load(Ordering::Acquire) < count {
+                        assert!(!canceled.load(Ordering::Acquire), "fold role canceled");
+                        std::thread::yield_now();
+                    }
+                };
+                let mut published = 0;
+                for (i, &r) in tasks.iter().enumerate() {
+                    if i >= SLOTS {
+                        let old = i - SLOTS;
+                        wait_folded(old + 1);
+                        // Publish reads only a folded slot and drains its NT
+                        // stores. Only after it returns is this slot free.
+                        publish2(pointers[old % SLOTS] as *mut F128, tasks[old]);
+                        published += 1;
+                    }
+                    seed(pointers[i % SLOTS] as *mut F128, r, core::ptr::null());
+                    max_live.fetch_max(i + 1 - published, Ordering::Relaxed);
+                    seeded.store(i + 1, Ordering::Release);
+                    if i & 1 != 0 {
+                        std::thread::yield_now();
+                    }
+                }
+                for old in tasks.len().saturating_sub(SLOTS)..tasks.len() {
+                    wait_folded(old + 1);
+                    publish2(pointers[old % SLOTS] as *mut F128, tasks[old]);
+                    published += 1;
+                }
+                assert_eq!(published, tasks.len());
+            }));
+            if mp_result.is_err() {
+                canceled.store(true, Ordering::Release);
+            }
+            let fold_result = fold_worker.join();
+            // Both roles have stopped before any allocation can drop, even
+            // when a kernel panics. Never return a completed partial output.
+            if let Err(error) = fold_result {
+                std::panic::resume_unwind(error);
+            }
+            if let Err(error) = mp_result {
+                std::panic::resume_unwind(error);
+            }
+        });
+        assert_eq!(seeded.load(Ordering::Relaxed), tasks.len());
+        assert_eq!(folded.load(Ordering::Relaxed), tasks.len());
+        for s in 0..SLOTS {
+            assert!(storage[s][..offsets[s]].iter().all(|&v| v == stage_poison));
+            assert!(
+                storage[s][offsets[s] + len..]
+                    .iter()
+                    .all(|&v| v == stage_poison)
+            );
+        }
+        max_live.load(Ordering::Relaxed)
+    }
+}
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+mod seed_two_four_actual_pair_tests {
+    use super::*;
+
+    fn mix(mut x: u64) -> u64 {
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+    fn value(seed: u64, row: usize, lane: usize) -> F128 {
+        if row & 1 == 1 && lane >= 60 {
+            return F128::ZERO;
+        }
+        let x = seed ^ (row as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ lane as u64;
+        F128 {
+            lo: mix(x),
+            hi: mix(x ^ 0xd1b54a32d192ed03),
+        }
+    }
+    fn bitwise_mul(a: F128, b: F128) -> F128 {
+        let mut x = (a.hi as u128) << 64 | a.lo as u128;
+        let mut y = (b.hi as u128) << 64 | b.lo as u128;
+        let mut out = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                out ^= x;
+            }
+            let carry = x >> 127;
+            x <<= 1;
+            if carry != 0 {
+                x ^= 0x87;
+            }
+            y >>= 1;
+        }
+        F128 {
+            lo: out as u64,
+            hi: (out >> 64) as u64,
+        }
+    }
+    fn reference(ntt: &AdditiveNttF128, seed: u64, r: usize) -> Vec<F128> {
+        // Full global rows are high*2^11+r. The first nine butterfly layers
+        // operate only on high (nine bits), preserving r and each lane.
+        // Start from the actual rate-half message followed by zero padding.
+        let mut out = vec![F128::ZERO; 512 * 64];
+        for q in 0..4 {
+            for k in 0..64 {
+                for lane in 0..64 {
+                    let row = q * (1 << 17) + r + k * (1 << 11);
+                    out[(q * 64 + k) * 64 + lane] = value(seed, row, lane);
+                }
+            }
+        }
+        for layer in 0..9 {
+            let block_size = 512 >> layer;
+            let half = block_size / 2;
+            for block in 0..1usize << layer {
+                let twiddle = ntt.twiddle(layer, block);
+                for row in 0..half {
+                    for lane in 0..64 {
+                        let top = (block * block_size + row) * 64 + lane;
+                        let bottom = top + half * 64;
+                        let b = out[bottom];
+                        let a = out[top] + b * twiddle;
+                        out[top] = a;
+                        out[bottom] = b + a;
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[test]
+    fn real_seed_two_four_three_slot_pair_matches_nine_layer_reference() {
+        const INPUT_ROWS: usize = 1 << 19;
+        const OUTPUT_ROWS: usize = 1 << 20;
+        const LANES: usize = 64;
+        const B: usize = 1 << 17;
+        const S: usize = 1 << 11;
+        const INPUT_POISON: F128 = F128 {
+            lo: 0xabababababababab,
+            hi: 0x3434343434343434,
+        };
+        const OUTPUT_POISON: F128 = F128 {
+            lo: 0x5a5a5a5a5a5a5a5a,
+            hi: 0xc3c3c3c3c3c3c3c3,
+        };
+        let tasks = [0usize, 1, 15, 16, 127, 1023, 2046, 2047];
+        let mut selected = [false; S];
+        for &r in &tasks {
+            assert!(!selected[r]);
+            selected[r] = true;
+        }
+        for i in 0..64 {
+            let a = value(0x12345678, i * 2, i % 60);
+            let b = value(0xfedcba98, i * 2 + 1, (i + 7) % 60);
+            assert_eq!(a * b, bitwise_mul(a, b), "independent field check {i}");
+        }
+        let mut message_storage = vec![INPUT_POISON; INPUT_ROWS * LANES + 11];
+        let mut output_storage = vec![OUTPUT_POISON; OUTPUT_ROWS * LANES + 11];
+        let message_offset = message_storage.as_ptr().align_offset(64) + 4;
+        let output_offset = output_storage.as_ptr().align_offset(64) + 4;
+        assert!((4..=7).contains(&message_offset) && (4..=7).contains(&output_offset));
+        let ntt = AdditiveNttF128::standard(20);
+        let mut field_outputs = 0usize;
+        let mut odd_zero_outputs = 0usize;
+        let mut guarded_fields = 0usize;
+        for (round, seed) in [0x123456789abcdef0u64, 0x0fedcba987654321]
+            .into_iter()
+            .enumerate()
+        {
+            let message = &mut message_storage[message_offset..message_offset + INPUT_ROWS * LANES];
+            let output = &mut output_storage[output_offset..output_offset + OUTPUT_ROWS * LANES];
+            for &r in &tasks {
+                for q in 0..4 {
+                    for k in 0..64 {
+                        for lane in 0..64 {
+                            let row = q * B + r + k * S;
+                            message[row * LANES + lane] = value(seed, row, lane);
+                        }
+                    }
+                }
+            }
+            output.fill(OUTPUT_POISON);
+            let stage_poison = F128 {
+                lo: mix(seed ^ 0x1122),
+                hi: mix(seed ^ 0x3344),
+            };
+            let max_live = ntt.seed_two_four_actual_pair_probe(
+                SeedInput::Ready(message),
+                output,
+                64,
+                20,
+                4,
+                &tasks,
+                stage_poison,
+            );
+            assert_eq!(max_live, 3);
+            for &r in &tasks {
+                let expected = reference(&ntt, seed, r);
+                for block in 0..8 {
+                    for k in 0..64 {
+                        for lane in 0..64 {
+                            let row = block * B + r + k * S;
+                            let actual = output[row * 64 + lane];
+                            assert_eq!(
+                                actual,
+                                expected[(block * 64 + k) * 64 + lane],
+                                "round={round} r={r} block={block} k={k} lane={lane}"
+                            );
+                            if r & 1 == 1 && lane >= 60 {
+                                assert_eq!(actual, F128::ZERO);
+                                odd_zero_outputs += 1;
+                            }
+                            field_outputs += 1;
+                        }
+                    }
+                }
+            }
+            // All unselected rows, including immediate neighbors of every
+            // scattered destination, must retain their initialized poison.
+            for row in 0..OUTPUT_ROWS {
+                if !selected[row % S] {
+                    assert!(
+                        output[row * 64..(row + 1) * 64]
+                            .iter()
+                            .all(|&v| v == OUTPUT_POISON),
+                        "unselected output row changed: {row}"
+                    );
+                    guarded_fields += 64;
+                }
+            }
+            // Check the whole input as well, not just the rows that the
+            // nominal gather is supposed to read.
+            for row in 0..INPUT_ROWS {
+                if selected[row % S] {
+                    for lane in 0..64 {
+                        assert_eq!(message[row * 64 + lane], value(seed, row, lane));
+                    }
+                } else {
+                    assert!(
+                        message[row * 64..(row + 1) * 64]
+                            .iter()
+                            .all(|&v| v == INPUT_POISON)
+                    );
+                }
+            }
+            println!(
+                "ACTUAL_NTT_TWO_FOUR round={round} tasks=8 max_live_slots=3 scalar_layers=9 all_input_verified=true all_unselected_output_rows_guarded=true"
+            );
+        }
+        assert!(
+            message_storage[..message_offset]
+                .iter()
+                .all(|&v| v == INPUT_POISON)
+        );
+        assert!(
+            message_storage[message_offset + INPUT_ROWS * LANES..]
+                .iter()
+                .all(|&v| v == INPUT_POISON)
+        );
+        assert!(
+            output_storage[..output_offset]
+                .iter()
+                .all(|&v| v == OUTPUT_POISON)
+        );
+        assert!(
+            output_storage[output_offset + OUTPUT_ROWS * LANES..]
+                .iter()
+                .all(|&v| v == OUTPUT_POISON)
+        );
+        assert_eq!(field_outputs, 524288);
+        assert_eq!(odd_zero_outputs, 20480);
+        assert_eq!(guarded_fields, 133693440);
+        println!(
+            "ACTUAL_NTT_TWO_FOUR_PASS rounds=2 tasks=16 field_outputs={field_outputs} odd_zero_outputs={odd_zero_outputs} guarded_output_fields={guarded_fields} independent_field_products=64 full_ranked_address_geometry=true staging_slots=3 native_speedup=false full_proof=false"
+        );
     }
 }
