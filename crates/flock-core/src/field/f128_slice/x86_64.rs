@@ -600,6 +600,36 @@ pub(super) unsafe fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     }
 }
 
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn bind_split_half_into(out: &mut [F128], lo: &[F128], hi: &[F128], r: F128) {
+    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    debug_assert!(lo.len() >= out.len() && hi.len() >= out.len());
+    // SAFETY: caller supplies target features and readable `lo`/`hi` per `out` slot.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_bcast);
+        let lanes = out.len() & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let a = _mm512_loadu_si512(lo.as_ptr().add(i) as *const __m512i);
+            let b = _mm512_loadu_si512(hi.as_ptr().add(i) as *const __m512i);
+            let new = _mm512_xor_si512(
+                a,
+                ghash_mul_x4_split(_mm512_xor_si512(a, b), r_bcast, r_x64),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, new);
+            i += 4;
+        }
+        while i < out.len() {
+            out[i] = lo[i] + r * (hi[i] + lo[i]);
+            i += 1;
+        }
+    }
+}
+
 /// Four-lane split-half product-sumcheck message:
 /// `(Σ chi[i]·zhi[i], Σ (chi[i]+clo[i])·(zhi[i]+zlo[i]))`.
 ///

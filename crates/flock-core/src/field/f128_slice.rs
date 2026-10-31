@@ -919,6 +919,34 @@ pub(crate) fn bind_split_half(lo: &mut [F128], hi: &[F128], r: F128) {
     }
 }
 
+#[inline]
+pub(crate) fn bind_split_half_into(out: &mut [F128], lo: &[F128], hi: &[F128], r: F128) {
+    assert!(
+        lo.len() >= out.len() && hi.len() >= out.len(),
+        "split bind into needs one low and high slot per output"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees readable low and high slots per output slot.
+    unsafe {
+        x86_64::bind_split_half_into(out, lo, hi, r);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    for i in 0..out.len() {
+        out[i] = lo[i] + r * (hi[i] + lo[i]);
+    }
+}
+
 /// Product-sumcheck message over a top-bit split:
 /// `(Σ chi·zhi, Σ (chi+clo)·(zhi+zlo))` over the first `n` slots.
 ///
