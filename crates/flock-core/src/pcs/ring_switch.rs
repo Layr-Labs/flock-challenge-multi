@@ -1497,17 +1497,14 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
 
     if x_inner_rest_tail.len() == 7 {
         // Ranked shape: retain six coordinates and bind the sole remaining
-        // coordinate with the characteristic-two one-multiply form. Keep the
-        // low half in the result buffer so the architecture-dispatching
-        // split-bind leaf can consume complete contiguous chunks.
+        // coordinate with the characteristic-two one-multiply form directly
+        // into an uninitialized destination buffer on the calling thread,
+        // avoiding a 128 KiB `to_vec()` memcpy and a 16-thread Rayon barrier.
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
-        let mut out = z0.to_vec();
-        let chunk_len = (half / rayon::current_num_threads().max(1)).max(64);
-        out.par_chunks_mut(chunk_len)
-            .zip(z1.par_chunks(chunk_len))
-            .for_each(|(lo, hi)| crate::field::f128_slice::bind_split_half(lo, hi, r));
+        let mut out = crate::alloc_uninit_vec::<F128>(half);
+        crate::field::f128_slice::bind_split_half_into(&mut out, z0, z1, r);
         return out;
     }
 

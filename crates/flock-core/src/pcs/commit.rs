@@ -295,7 +295,8 @@ fn finalize_commit(
     z_packed: &[F128],
     params: &PcsParams,
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let timing = *TIMING.get_or_init(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
     let ntt = AdditiveNttF128::standard(params.k_code());
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
 
@@ -346,7 +347,8 @@ fn finalize_cpu_commit(
     params: &PcsParams,
     encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    static TIMING2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let timing = *TIMING2.get_or_init(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
     // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
     // each NTT deep-pass sub-group retires (regular stores, same worker).
@@ -569,8 +571,9 @@ fn finalize_cpu_commit(
 /// CVs are reconstructed from the retained codeword only when queried during
 /// opening. `FLOCK_NO_MERKLE_CUT` restores the ordinary full tree.
 fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
+    static CUT_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if cfg!(target_arch = "x86_64")
-        && std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none()
+        && *CUT_ON.get_or_init(|| std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none())
         && params.m == 32
         && params.log_inv_rate == 1
         && params.log_batch_size == 6
@@ -1421,7 +1424,10 @@ pub fn prefault_codeword_during_with_resident<R>(
     params: &PcsParams,
     generate: impl FnOnce(Option<Vec<F128>>) -> (Option<Vec<F128>>, R),
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    static NO_PF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if rayon::current_num_threads() <= 1
+        || *NO_PF.get_or_init(|| std::env::var_os("FLOCK_NO_PREFAULT").is_some())
+    {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
