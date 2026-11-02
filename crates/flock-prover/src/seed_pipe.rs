@@ -58,7 +58,9 @@
 //! # Safety rails
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
-//! - `FLOCK_NO_SEED_PIPE=1` disables the full mechanism.
+//! - Speculation is default-off (duplicate-prove energy trap under sustained
+//!   load); `FLOCK_SEED_PIPE=1` opts in locally as the exact A/B control and
+//!   `FLOCK_NO_SEED_PIPE=1` disables the full mechanism.
 //! - `FLOCK_NO_DIRECT_PROOF_PUBLISH=1` restores immediate seed forwarding and
 //!   adoption for exact same-binary diagnostics.
 //! - The speculative body runs under `catch_unwind`; a panic forwards the
@@ -1095,7 +1097,16 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, BlockSource<
     let Some(proof_path) = ranked_worker_proof_path() else {
         return;
     };
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() {
+    // Default-off for the ranked environment: the speculative thread runs a
+    // duplicate full prove (a min-of-two wall race at ~2x energy per trial).
+    // Measured on the sibling challenge tree: cool burst -2.6% wall with
+    // speculation on, but heat-soaked sustained +2.4% wall (and worse under
+    // oversubscription). The ranked runner's clean env keeps it off;
+    // `FLOCK_SEED_PIPE=1` opts back in locally as the exact A/B control.
+    // (`FLOCK_NO_SEED_PIPE=1` also keeps it off.)
+    if std::env::var_os("FLOCK_SEED_PIPE").is_none()
+        || std::env::var_os("FLOCK_NO_SEED_PIPE").is_some()
+    {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {
