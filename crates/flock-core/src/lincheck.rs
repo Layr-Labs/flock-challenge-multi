@@ -2256,6 +2256,20 @@ unsafe fn eq8_from_factors_x4(
     // and `(outer_base + 7) >> log_b < eq_hi.len()` by the function safety contract.
     unsafe {
         let out_ptr = out.as_mut_ptr().cast::<F128>();
+        let low_base = outer_base & lo_mask;
+        // Within one factor block, low factors are contiguous and all eight
+        // high factors are equal. Avoid materializing two temporary arrays.
+        if low_base + 8 <= eq_lo.len() {
+            let h = *eq_hi.get_unchecked(outer_base >> log_b);
+            let hv = _mm512_broadcast_i32x4(_mm_set_epi64x(h.hi as i64, h.lo as i64));
+            let hx64 = crate::field::gf2_128::x86_64::ghash_shift64_x4(hv);
+            for g in 0..2 {
+                let lv = _mm512_loadu_si512(eq_lo.as_ptr().add(low_base + 4 * g).cast());
+                let product = crate::field::gf2_128::x86_64::ghash_mul_x4_split(lv, hv, hx64);
+                _mm512_storeu_si512(out_ptr.add(4 * g).cast(), product);
+            }
+            return out.assume_init();
+        }
         for g in 0..2 {
             let mut lo = core::mem::MaybeUninit::<[F128; 4]>::uninit();
             let mut hi = core::mem::MaybeUninit::<[F128; 4]>::uninit();
