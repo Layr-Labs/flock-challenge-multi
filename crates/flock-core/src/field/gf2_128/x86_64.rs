@@ -203,10 +203,21 @@ unsafe fn ghash_poly_x4() -> __m512i {
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     unsafe {
-        let poly = ghash_poly_x4();
-        t0 = _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(t1));
-        t0 = _mm512_xor_si512(t0, _mm512_clmulepi64_epi128::<0x01>(t1, poly));
-        t0
+        // Multiply the upper limb by x^7+x^2+x+1 with sparse shifts.
+        // Each 128-bit field lane is independent, including the 7 carry bits.
+        let h = _mm512_bsrli_epi128::<8>(t1);
+        let low = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_xor_si512(h, _mm512_slli_epi64::<1>(h)),
+            _mm512_slli_epi64::<2>(h),
+            _mm512_slli_epi64::<7>(h),
+        );
+        let carry = _mm512_ternarylogic_epi64::<0x96>(
+            _mm512_srli_epi64::<63>(h),
+            _mm512_srli_epi64::<62>(h),
+            _mm512_srli_epi64::<57>(h),
+        );
+        t0 = _mm512_ternarylogic_epi64::<0x96>(t0, low, _mm512_bslli_epi128::<8>(t1));
+        _mm512_xor_si512(t0, _mm512_bslli_epi128::<8>(carry))
     }
 }
 

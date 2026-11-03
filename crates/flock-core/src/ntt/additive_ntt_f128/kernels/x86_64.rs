@@ -1989,7 +1989,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 /// disjoint row storage and initialized prepared pairs for the shaped geometry.
 #[cfg(target_feature = "avx512bw")]
 #[inline(always)]
-unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, const H: u8>(
+unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, const H: u8, const ZERO_LEFT: bool>(
     ptr: *mut F128,
     prepared: *const PreparedFour,
     vector_bytes: usize,
@@ -2051,6 +2051,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             ".elseif {hint} == 2",
             "prefetcht1 [rcx+rax+{stride}*3]",
             ".endif",
+            ".if {zero_left} == 0",
             "vpclmulqdq zmm22, zmm12, zmm16, 0",
             "vpclmulqdq zmm23, zmm12, zmm17, 1",
             "vpternlogd zmm4, zmm22, zmm23, 0x96",
@@ -2119,6 +2120,20 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpxorq zmm9, zmm9, zmm1",
             "vpxorq zmm10, zmm10, zmm2",
             "vpxorq zmm11, zmm11, zmm3",
+            ".else",
+            "vpxorq zmm8, zmm8, zmm0",
+            "vpxorq zmm9, zmm9, zmm1",
+            "vpxorq zmm10, zmm10, zmm2",
+            "vpxorq zmm11, zmm11, zmm3",
+            "vpxorq zmm12, zmm12, zmm4",
+            "vpxorq zmm13, zmm13, zmm5",
+            "vpxorq zmm14, zmm14, zmm6",
+            "vpxorq zmm15, zmm15, zmm7",
+            "vpxorq zmm22, zmm22, zmm22",
+            "vpxorq zmm23, zmm23, zmm23",
+            "vpxorq zmm24, zmm24, zmm24",
+            "vpxorq zmm25, zmm25, zmm25",
+            ".endif",
             ".if {hint} == 1",
             "prefetcht0 [rcx+rax+{stride}*4]",
             ".elseif {hint} == 2",
@@ -2159,6 +2174,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm27, zmm28, zmm30, 1",
             "vpternlogd zmm11, zmm27, zmm26, 0x96",
             "vpxorq zmm15, zmm15, zmm11",
+            ".if {zero_left} == 0",
             "vpclmulqdq zmm26, zmm6, zmm18, 0",
             "vpclmulqdq zmm27, zmm6, zmm19, 1",
             "vpternlogd zmm2, zmm26, zmm27, 0x96",
@@ -2179,6 +2195,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm25, zmm25, zmm30, 1",
             "vpternlogd zmm3, zmm25, zmm24, 0x96",
             "vpxorq zmm7, zmm7, zmm3",
+            ".else",
+            "vpxorq zmm6, zmm6, zmm2",
+            "vpxorq zmm7, zmm7, zmm3",
+            ".endif",
             "vpclmulqdq zmm24, zmm12, zmm20, 0",
             "vpclmulqdq zmm25, zmm12, zmm21, 1",
             "vpternlogd zmm8, zmm24, zmm25, 0x96",
@@ -2193,6 +2213,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm26, zmm27, zmm23, 0x96",
             "vpxorq zmm12, zmm12, zmm8",
             "vpxorq zmm13, zmm13, zmm9",
+            ".if {zero_left} == 0",
             "vpclmulqdq zmm25, zmm4, zmm18, 0",
             "vpclmulqdq zmm27, zmm4, zmm19, 1",
             "vpternlogd zmm0, zmm25, zmm27, 0x96",
@@ -2207,6 +2228,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm23, zmm28, zmm29, 0x96",
             "vpxorq zmm4, zmm4, zmm0",
             "vpxorq zmm5, zmm5, zmm1",
+            ".else",
+            "vpxorq zmm4, zmm4, zmm0",
+            "vpxorq zmm5, zmm5, zmm1",
+            ".endif",
             ".if {hint} == 1",
             "prefetcht0 [rcx+rax+{stride}*8]",
             ".elseif {hint} == 2",
@@ -2246,6 +2271,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm5, zmm28, zmm27, 0x96",
             "vpxorq zmm7, zmm7, zmm5",
             "vpxorq zmm6, zmm6, zmm4",
+            ".if {zero_left} == 0",
             "vbroadcasti32x4 zmm27, [rsi+96]",
             "vbroadcasti32x4 zmm28, [rsi+112]",
             "vpclmulqdq zmm29, zmm3, zmm27, 0",
@@ -2265,6 +2291,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm1, zmm23, zmm27, 0x96",
             "vpxorq zmm3, zmm3, zmm1",
             "vpxorq zmm2, zmm2, zmm0",
+            ".else",
+            "vpxorq zmm3, zmm3, zmm1",
+            "vpxorq zmm2, zmm2, zmm0",
+            ".endif",
             "vbroadcasti32x4 zmm23, [rsi+192]",
             "vbroadcasti32x4 zmm27, [rsi+208]",
             "vpclmulqdq zmm28, zmm15, zmm23, 0",
@@ -2335,11 +2365,14 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm28, [rsi+240]",
             "vpslldq zmm29, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            ".if {zero_left} == 0",
             "vpclmulqdq zmm31, zmm1, zmm27, 0",
+            ".endif",
             "vpternlogd zmm2, zmm26, zmm29, 0x96",
             "vpxorq zmm3, zmm3, zmm2",
             "vmovdqu64 [rdi+rax+{stride}*2], zmm2",
             "vmovdqu64 [rdi+rax+{stride}*3], zmm3",
+            ".if {zero_left} == 0",
             "vpclmulqdq zmm26, zmm1, zmm28, 1",
             "vpternlogd zmm0, zmm31, zmm26, 0x96",
             "vpclmulqdq zmm26, zmm1, zmm27, 16",
@@ -2349,6 +2382,9 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
             "vpternlogd zmm0, zmm26, zmm22, 0x96",
             "vpxorq zmm1, zmm1, zmm0",
+            ".else",
+            "vpxorq zmm1, zmm1, zmm0",
+            ".endif",
             "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
             "vmovdqu64 [rdi+rax+{stride}*1], zmm1",
             "vbroadcasti32x4 zmm22, [rsi+320]",
@@ -2441,6 +2477,7 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "3:",
             stride = const S16 * NN * core::mem::size_of::<F128>(),
             hint = const H,
+            zero_left = const ZERO_LEFT as u8,
             in("rdi") ptr,
             in("rsi") prepared,
             in("rdx") vector_bytes,
@@ -2520,12 +2557,20 @@ unsafe fn butterfly_fused_4layer_row_impl<
         #[cfg(target_feature = "avx512bw")]
         if DIET && PREPARED && S16 != 0 && NN != 0 {
             let lanes = active_lanes & !3;
-            butterfly_four_fixed_registers::<S16, NN, H>(
-                ptr.add(r * num_ntts),
-                prepared,
-                lanes * core::mem::size_of::<F128>(),
-                ptr.add(pf_r * num_ntts),
-            );
+            // For the zero-index block each left-spine coefficient is zero.
+            // Validate the exact values rather than assuming a basis or shape.
+            let zero_left = [0, 1, 3, 7].iter().all(|&i| twiddles[i] == F128::ZERO);
+            if zero_left {
+                butterfly_four_fixed_registers::<S16, NN, H, true>(
+                    ptr.add(r * num_ntts), prepared,
+                    lanes * core::mem::size_of::<F128>(), ptr.add(pf_r * num_ntts),
+                );
+            } else {
+                butterfly_four_fixed_registers::<S16, NN, H, false>(
+                    ptr.add(r * num_ntts), prepared,
+                    lanes * core::mem::size_of::<F128>(), ptr.add(pf_r * num_ntts),
+                );
+            }
             if lanes < active_lanes {
                 butterfly_fused_4layer_scalar_tail(
                     ptr,
@@ -4348,12 +4393,17 @@ mod ab_ntt_tail_composition_tests {
                             F128::new(next(&mut seed), next(&mut seed));
                     }
                 }
-                let tw: [F128; 15] = std::array::from_fn(|_| match case {
-                    0 => F128::ZERO,
+                let mut tw: [F128; 15] = std::array::from_fn(|_| match case {
+                    0 | 5 => F128::ZERO,
                     1 => F128::ONE,
                     2 => F128::new(u64::MAX, u64::MAX),
                     _ => F128::new(next(&mut seed), next(&mut seed)),
                 });
+                if case == 3 {
+                    for i in [0, 1, 3, 7] {
+                        tw[i] = F128::ZERO;
+                    }
+                }
                 let original_tw = tw;
                 let mut expected = data.clone();
                 for lane in 0..lanes {
