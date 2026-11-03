@@ -335,14 +335,8 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let fast = {
-        let cfold = (zc_gfni_enabled() && cfold_bake_enabled()).then(|| {
-            let one = F128::ONE;
-            let (r1, r2) = (rho[0], rho[1]);
-            kernels::x86_64::build_cfold_mats(
-                &table.data,
-                [(one + r1) * (one + r2), r1 * (one + r2), (one + r1) * r2, r1 * r2],
-            )
-        });
+        let cfold = (zc_gfni_enabled() && cfold_bake_enabled() && cfg!(target_os = "linux"))
+            .then(|| kernels::x86_64::build_cfold3_mats(&table.data, rho));
         let wtab = (kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8))
             .then(|| build_w_pair_table(eq_lo));
         let ok = kernels::x86_64::fold2_packed_c4_lm_wtab_route_ok(

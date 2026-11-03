@@ -4686,6 +4686,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c8_register_result.S"),
 );
 
 #[cfg(all(
@@ -4699,6 +4700,7 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c8_lm_register_result();
 }
 
 
@@ -5946,22 +5948,17 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         let a_out_ptr = a_out.as_mut_ptr();
         let b_out_ptr = b_out.as_mut_ptr();
         let wt_ptr = wt.as_ptr();
-        let (r3, r3_64) = ghash_broadcast_split(rho3);
+        let _ = rho3;
 
         macro_rules! fold_side {
             ($pkt:expr, $row0:expr) => {{
-                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8 + 512), cfold);
-                let oe1 = _mm512_xor_si512(q0, ghash_mul_x4_split(_mm512_xor_si512(q0, q1), r3, r3_64));
-                let oo1 = _mm512_xor_si512(q2, ghash_mul_x4_split(_mm512_xor_si512(q2, q3), r3, r3_64));
-                let oe2 = _mm512_xor_si512(p0, ghash_mul_x4_split(_mm512_xor_si512(p0, p1), r3, r3_64));
-                let oo2 = _mm512_xor_si512(p2, ghash_mul_x4_split(_mm512_xor_si512(p2, p3), r3, r3_64));
+                let [s0, s1] = gfni_fold64_rows_c8_lm_registers($pkt.add($row0 * 8), cfold);
+                let [s2, s3] = gfni_fold64_rows_c8_lm_registers($pkt.add($row0 * 8 + 512), cfold);
                 [
-                    _mm512_shuffle_i64x2::<0x88>(oe1, oe2),
-                    _mm512_shuffle_i64x2::<0x88>(oo1, oo2),
-                    _mm512_shuffle_i64x2::<0xDD>(oe1, oe2),
-                    _mm512_shuffle_i64x2::<0xDD>(oo1, oo2),
+                    _mm512_shuffle_i64x2::<0x88>(s0, s2),
+                    _mm512_shuffle_i64x2::<0x88>(s1, s3),
+                    _mm512_shuffle_i64x2::<0xDD>(s0, s2),
+                    _mm512_shuffle_i64x2::<0xDD>(s1, s3),
                 ]
             }};
         }
@@ -6067,4 +6064,40 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
             lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
         ]
     }
+}
+
+#[cfg(all(target_arch="x86_64", target_feature="avx512f", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+pub(crate) fn build_cfold3_mats(data: &[F128], rho: [F128; 3]) -> CFoldMats {
+    let coeff: [F128; 8] = std::array::from_fn(|k| {
+        (if k & 1 == 0 { F128::ONE + rho[0] } else { rho[0] }) *
+        (if k & 2 == 0 { F128::ONE + rho[1] } else { rho[1] }) *
+        (if k & 4 == 0 { F128::ONE + rho[2] } else { rho[2] })
+    });
+    let mut out = CFoldMats([[0u64; 8]; 128], [[0u64; 8]; 64]);
+    for a in 0..8 {
+        let cols: [F128; 64] = std::array::from_fn(|i| coeff[a] * data[(i/8)*256+(1usize<<(i%8))]);
+        let per = build_row_fold_mats_from_cols(&cols);
+        for j in 0..8 {
+            out.0[8*a+j].copy_from_slice(&per[16*j..16*j+8]);
+            out.0[64+8*a+j].copy_from_slice(&per[16*j+8..16*j+16]);
+        }
+    }
+    out
+}
+
+#[cfg(all(target_arch="x86_64", target_feature="avx512f", target_feature="avx512vbmi", target_feature="gfni", target_feature="vpclmulqdq"))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c8_lm_registers(rows: *const u8, m: &CFoldMats) -> [core::arch::x86_64::__m512i; 2] {
+    #[cfg(target_os="linux")]
+    unsafe {
+        let a; let b;
+        core::arch::asm!("call {kernel}", kernel=sym flock_gfni_c8_lm_register_result,
+            in("rdi") rows, in("rsi") m.0.as_ptr(), lateout("rax") _, out("k1") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") a, out("zmm9") b, out("zmm10") _, out("zmm11") _);
+        [a,b]
+    }
+    #[cfg(not(target_os="linux"))]
+    unreachable!("eight-row register fold is Linux-only")
 }
