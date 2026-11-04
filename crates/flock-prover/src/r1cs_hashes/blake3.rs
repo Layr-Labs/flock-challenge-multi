@@ -2961,6 +2961,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 blake3_witgen8::root_emit::RootEmitPlan::new(&plan.roots)
             });
         let root_plan = &*ROOT_PLAN;
+        #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
+        let root_generator = blake3_witgen8::root_recompute::selected_generator()
+            .filter(|_| root_enabled && root_plan.is_some());
+        #[cfg(not(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq")))]
+        let root_generator: Option<(unsafe fn(u64, usize, *mut u8), Option<flock_core::lincheck::RootPairGenerator>)> = None;
         // z elision: octas seeded from their compact copy skip z's global
         // stores; the prover regenerates z exactly from the root tiles.
         let elide_z = root_enabled
@@ -3030,19 +3035,22 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             proj,
                             preps.get(),
                             [true; 3],
-                            if root_enabled {
+                            if root_enabled && root_generator.is_none() {
                                 root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
                                     plan, (root_addr as *mut u8).add(root_byte_offset)))
                             } else { None },
                         false,
                         );
                         if let Some(target) = target {
-                            if elide_z {
-                                elided_octas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
                             target.seed_octa(input.0.as_ptr(), kpair);
                         }
                     }
+                }
+                // Only presence is consumed after the encoder joins every
+                // callback. One relaxed store per producer replaces sixteen
+                // contended read-modify-writes on the same cache line.
+                if elide_z && target.is_some() {
+                    elided_octas.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // The core scheduler joins both fully seeded halves and
                 // their global-output fences before folding either r task.
@@ -3119,7 +3127,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // The commit entry or Rayon joins all producers and their SFENCEs
             // before this completed root-cache storage is published.
             let mut tiles = unsafe {
-                if pipelined {
+                if let Some((generate, pair_generator)) = root_generator.filter(|_| pipelined) {
+                    flock_core::scratch::give_f128(root_storage);
+                    flock_core::lincheck::WitnessRootTiles::from_cross_quarter_generator(init, generate, pair_generator)
+                } else if pipelined {
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_witness_storage(
                         root_storage, z.len() / F128_PER_BLOCK)
                 } else {

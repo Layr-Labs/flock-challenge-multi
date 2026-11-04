@@ -185,11 +185,15 @@ impl<'a> RootOctaWriter<'a> {
     }
 
     #[inline(always)]
-    unsafe fn emit_batch<const STATIC_B: bool>(&mut self, index: usize, a: *const V8, b: *const V8) {
+    unsafe fn emit_batch<const STATIC_B: bool, const CACHED: bool>(&mut self, index: usize, a: *const V8, b: *const V8) {
         unsafe {
             let batch = &self.plan.batches[index];
             let emit = |out: usize, value| {
-                _mm512_stream_si512(self.out.add(out).cast(), value);
+                if CACHED {
+                    _mm512_store_si512(self.out.add(out).cast(), value);
+                } else {
+                    _mm512_stream_si512(self.out.add(out).cast(), value);
+                }
             };
             let (a, b) = (a.cast::<u8>(), b.cast::<u8>());
             if batch.leading_out != u16::MAX {
@@ -223,15 +227,30 @@ impl<'a> RootOctaWriter<'a> {
         }
     }
 
+    /// Packed product words already contain z; never read a second ring.
+    pub(crate) unsafe fn emit_z_range(&mut self, base: usize, ring: usize, words: usize, z: *const V8) {
+        unsafe {
+            if base >= 32 && base <= 480 && base % 32 == 0 && ring == 0 && words == 32 {
+                self.emit_batch::<true, true>(base / 32 + 1, z, z);
+            } else if base == 0 && ring == 0 && words == 16 {
+                self.emit_batch::<true, true>(0, z, z);
+            } else if base == 16 && ring == 16 && words == 16 {
+                self.emit_batch::<true, true>(1, z.add(16), z.add(16));
+            } else {
+                panic!("unsupported packed-root band");
+            }
+        }
+    }
+
     #[inline(never)]
     pub(crate) unsafe fn emit_range(&mut self, base_word: usize, ring_word: usize, words: usize, a: *const V8, b: *const V8) {
         unsafe {
             if base_word >= 32 && base_word <= 480 && base_word % 32 == 0 && ring_word == 0 && words == 32 {
-                self.emit_batch::<false>(base_word / 32 + 1, a, b);
+                self.emit_batch::<false, false>(base_word / 32 + 1, a, b);
             } else if base_word == 0 && ring_word == 0 && words == 16 {
-                self.emit_batch::<true>(0, a, b);
+                self.emit_batch::<true, false>(0, a, b);
             } else if base_word == 16 && ring_word == 16 && words == 16 {
-                self.emit_batch::<true>(1, a.add(16), b.add(16));
+                self.emit_batch::<true, false>(1, a.add(16), b.add(16));
             } else {
                 self.emit_generic(base_word, ring_word, words, a, b);
             }

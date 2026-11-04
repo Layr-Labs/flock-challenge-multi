@@ -4833,3 +4833,7 @@ mod cross_quarter_witness_tests {
         println!("COMPACT_COPY_WITNESS cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_streamed=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true");
     }
 }
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[path = "blake3_roots_recompute.rs"]
+pub(crate) mod root_recompute;

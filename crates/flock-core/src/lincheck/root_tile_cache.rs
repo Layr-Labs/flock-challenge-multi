@@ -15,6 +15,8 @@ pub(super) struct Block([u8; 512]);
 // before publication.
 struct PooledStorage(Vec<F128>);
 
+pub type RootPairGenerator = unsafe fn(u64, usize, usize, *mut u8, *mut u8, *mut u8, *mut u8);
+
 impl Drop for PooledStorage {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.0));
@@ -32,6 +34,8 @@ pub struct RootTileCache {
     /// The witness producer skipped z's DRAM stores; this cache is then the
     /// only complete source of z (see `pcs::elided_z`).
     z_elided: bool,
+    generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
+    pair_generator: Option<RootPairGenerator>,
 }
 
 /// Raw read-only view of witness-produced word-major root tiles: `tiles`
@@ -42,7 +46,12 @@ pub struct WitnessTileView {
     pub base: usize,
     pub tiles: usize,
     pub cross_quarter: bool,
+    pub generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
+    pub pair_generator: Option<RootPairGenerator>,
 }
+
+#[repr(align(64))]
+struct GeneratedTiles([core::mem::MaybeUninit<u8>; 4 * 176 * 512]);
 
 #[derive(Clone, Copy)]
 pub(super) struct Capture {
@@ -160,6 +169,8 @@ fn prepare(
             fixed_roots: false,
             cross_quarter: false,
             z_elided: false,
+            generator: None,
+            pair_generator: None,
         },
         folded,
     )
@@ -207,7 +218,28 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false, generator: None, pair_generator: None }
+    }
+
+    /// Exact ranked root tiles generated into consumer-local scratch.
+    ///
+    /// # Safety
+    /// For each tile in 0..4096, `generate(seed, tile, dst)` must initialize
+    /// all 176*512 bytes in the cross-quarter witness encoding. `dst` is
+    /// 64-byte aligned and exclusively owned for the duration of the call.
+    /// The callback must not retain it or depend on mutable external state.
+    /// An optional pair callback initializes the two octa stripes at pair*128
+    /// in every group and writes [2][56] packed BLAKE3 dependency ZMMs plus
+    /// [2][4] low and high output ZMMs. Its three auxiliary spans are aligned,
+    /// exclusively owned and disjoint from the root tile and each other.
+    pub unsafe fn from_cross_quarter_generator(
+        seed: u64, generate: unsafe fn(u64, usize, *mut u8), pair_generator: Option<RootPairGenerator>,
+    ) -> Self {
+        Self {
+            storage: PooledStorage(Vec::new()), offset: 0, tiles: 4096,
+            blocks: 176, word_major: true, fixed_roots: true,
+            cross_quarter: true, z_elided: false, generator: Some((seed, generate)), pair_generator,
+        }
     }
 
     /// Record that the witness producer did not store z for (some of) the
@@ -227,6 +259,8 @@ impl RootTileCache {
             base: self.storage.0.as_ptr() as usize + self.offset * core::mem::size_of::<F128>(),
             tiles: self.tiles,
             cross_quarter: self.cross_quarter,
+            generator: self.generator,
+            pair_generator: self.pair_generator,
         })
     }
 
@@ -238,6 +272,20 @@ impl RootTileCache {
     /// Expensive diagnostic oracle: compare every cache byte, including tail
     /// padding, with canonical-witness capture at the same root geometry.
     pub fn assert_matches_witness(&self, z: &[F128], k_log: usize, plan: &LinearFoldPlan) {
+        if let Some((seed, generate)) = self.generator {
+            let mut storage = crate::scratch::take_f128(self.tiles * 176 * 32 + 3);
+            let offset = storage.as_ptr().align_offset(64);
+            assert!(offset <= 3);
+            unsafe {
+                let base = storage.as_mut_ptr().add(offset).cast::<u8>();
+                for tile in 0..self.tiles {
+                    generate(seed, tile, base.add(tile * 176 * 512));
+                }
+                let cache = Self::from_cross_quarter_witness_storage(storage, self.tiles * 64);
+                cache.assert_matches_witness(z, k_log, plan);
+            }
+            return;
+        }
         let splice = RootSplicePlan::new(plan, 1 << k_log).expect("root splice geometry");
         let (reference, _) = prepare(&splice, z, 1 << k_log,
             &|_| [F128::ZERO; 8], self.word_major);
@@ -268,6 +316,7 @@ impl RootTileCache {
 
     #[inline(always)]
     fn block(&self, index: usize) -> &Block {
+        assert!(self.generator.is_none());
         assert!(index < self.tiles * self.blocks);
         // SAFETY: prepare initializes every block, and from_witness_storage
         // requires the same initialization before publication. The live
@@ -382,6 +431,11 @@ impl RootTileCache {
             .zip(active.par_iter_mut())
             .enumerate()
             .for_each(|(worker, (dst, active))| {
+                // MaybeUninit bytes require no initialization; each live tile
+                // is fully overwritten by the checked generator before read.
+                let mut generated = self.generator.map(|_| unsafe {
+                    Box::<GeneratedTiles>::new_uninit().assume_init()
+                });
                 let mut mats = [0u64; 128];
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
@@ -411,6 +465,16 @@ impl RootTileCache {
                         let tile = lo;
                         let count = (hi - lo).min(4);
                         lo += count;
+                        let source = if let Some((seed, generate)) = self.generator {
+                            let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
+                            for slot in 0..count {
+                                unsafe { generate(seed, tile + slot, base.add(slot * self.blocks * 512)); }
+                            }
+                            base.cast_const()
+                        } else {
+                            unsafe { self.storage.0.as_ptr().add(self.offset).cast::<u8>()
+                                .add(tile * self.blocks * 512) }
+                        };
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
                             for t in 0..DIRECT_FOLD_TILE_STRIPES {
@@ -431,8 +495,7 @@ impl RootTileCache {
                             // without reading dst; later calls load them once.
                             unsafe {
                                 kernels::gfni_fold_word_tiles4(
-                                    self.storage.0.as_ptr().add(self.offset).cast::<u8>()
-                                        .add((tile * self.blocks + block) * 512),
+                                    source.add(block * 512),
                                     matrices.as_ptr().cast::<u64>(),
                                     dst.as_mut_ptr().cast::<u8>().add(block * 1024),
                                     self.blocks * 512, count, first,
@@ -445,6 +508,11 @@ impl RootTileCache {
                     }
                     let tile = lo;
                     lo += 1;
+                    let generated_base = self.generator.map(|(seed, generate)| {
+                        let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
+                        unsafe { generate(seed, tile, base); }
+                        base
+                    });
                     for t in 0..DIRECT_FOLD_TILE_STRIPES {
                         let eq8 = logical_eq8(8 * (tile * DIRECT_FOLD_TILE_STRIPES + t));
                         kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
@@ -455,11 +523,11 @@ impl RootTileCache {
                         // Its first tile initializes all live planes before
                         // subsequent tiles load their accumulators.
                         unsafe {
-                            let src = self
-                                .block(tile * self.blocks + block)
-                                .0
-                                .as_ptr()
-                                .cast::<__m512i>();
+                            let src = if let Some(base) = generated_base {
+                                base.add(block * 512).cast::<__m512i>()
+                            } else {
+                                self.block(tile * self.blocks + block).0.as_ptr().cast::<__m512i>()
+                            };
                             let rows = core::array::from_fn(|i| {
                                 let row = _mm512_load_si512(src.add(i));
                                 if self.word_major {

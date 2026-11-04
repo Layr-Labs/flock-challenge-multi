@@ -303,6 +303,9 @@ pub(crate) mod imp {
         out_hi: [[__m512i; 4]; 2],
     }
 
+    #[repr(align(64))]
+    struct GeneratedTile([core::mem::MaybeUninit<u8>; TILE_BYTES]);
+
     impl Scratch {
         pub(super) fn new() -> Box<Self> {
             // SAFETY: all-zero bytes are a valid value of every field. Built
@@ -708,18 +711,41 @@ pub(crate) mod imp {
         let mode = 0u8;
         thread_local! {
             // Reused across proofs: no per-task allocation/zeroing.
-            static SCRATCH: core::cell::RefCell<Option<Box<Scratch>>> =
+            static SCRATCH: core::cell::RefCell<Option<(Box<Scratch>, Box<GeneratedTile>)>> =
                 const { core::cell::RefCell::new(None) };
         }
         assert_eq!(GROUPS * 8, TILE_BYTES / 64);
         (0..view.tiles / unit).into_par_iter().for_each(|u| {
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
-                let scratch = guard.get_or_insert_with(Scratch::new);
+                let (scratch, generated_tile) = guard.get_or_insert_with(|| {
+                    // Separate allocations keep the read-only tile disjoint
+                    // from the &mut Scratch passed to the expansion kernels.
+                    (Scratch::new(), unsafe { Box::<GeneratedTile>::new_uninit().assume_init() })
+                });
                 for t in u * unit..(u + 1) * unit {
-                    let tile = (base + t * TILE_BYTES) as *const u8;
-                    let next = (t + 1 < tiles).then(|| base + (t + 1) * TILE_BYTES);
+                    let tile = if let Some((seed, generate)) = view.generator {
+                        let dst = generated_tile.0.as_mut_ptr().cast::<u8>();
+                        if view.pair_generator.is_none() {
+                            unsafe { generate(seed, t, dst); }
+                        }
+                        dst.cast_const()
+                    } else {
+                        (base + t * TILE_BYTES) as *const u8
+                    };
+                    let next = (view.generator.is_none() && t + 1 < tiles)
+                        .then(|| base + (t + 1) * TILE_BYTES);
                     for pair in 0..4 {
+                        if let Some(generate_pair) = view.pair_generator {
+                            let seed = view.generator.expect("paired generator has a seed").0;
+                            unsafe {
+                                generate_pair(seed, t, pair,
+                                    tile.cast_mut(),
+                                    scratch.deps.as_mut_ptr().cast(),
+                                    scratch.out_lo.as_mut_ptr().cast(),
+                                    scratch.out_hi.as_mut_ptr().cast());
+                            }
+                        }
                         // While octa pair `pair` of this tile is processed,
                         // the same quarter of the next tile streams into L2.
                         let mut pf = PfCur::new(next.map(|n| n + 2 * pair * (TILE_BYTES / 8)));
@@ -728,7 +754,7 @@ pub(crate) mod imp {
                         // Mode bits (tests only) skip phases.
                         unsafe {
                             pf.phase(PF_BLAKE, 1);
-                            if mode & 1 == 0 {
+                            if mode & 1 == 0 && view.pair_generator.is_none() {
                                 blake3_pair(tile, 2 * pair, scratch, &mut pf);
                             }
                             for x in 0..2 {
@@ -753,6 +779,40 @@ pub(crate) mod imp {
     /// Tests only: bit 0 skips BLAKE3, bit 1 skips staging.
     #[cfg(test)]
     pub(crate) static TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn check_generated_pair(
+        seed: u64, tile: usize,
+        generate: unsafe fn(u64, usize, *mut u8),
+        generate_pair: flock_core::lincheck::RootPairGenerator,
+    ) {
+        let mut reference = Scratch::new();
+        let mut fused = Scratch::new();
+        let mut source = unsafe { Box::<GeneratedTile>::new_uninit().assume_init() };
+        let mut rebuilt = unsafe { Box::<GeneratedTile>::new_uninit().assume_init() };
+        unsafe {
+            let src = source.0.as_mut_ptr().cast::<u8>();
+            let dst = rebuilt.0.as_mut_ptr().cast::<u8>();
+            generate(seed, tile, src);
+            for pair in 0..4 {
+                generate_pair(seed, tile, pair, dst, fused.deps.as_mut_ptr().cast(),
+                    fused.out_lo.as_mut_ptr().cast(), fused.out_hi.as_mut_ptr().cast());
+                blake3_pair(src, 2 * pair, &mut reference, &mut PfCur::new(None));
+                for (a, b, size) in [
+                    (reference.deps.as_ptr().cast::<u8>(), fused.deps.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.deps)),
+                    (reference.out_lo.as_ptr().cast::<u8>(), fused.out_lo.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.out_lo)),
+                    (reference.out_hi.as_ptr().cast::<u8>(), fused.out_hi.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.out_hi)),
+                ] {
+                    assert_eq!(core::slice::from_raw_parts(a, size), core::slice::from_raw_parts(b, size),
+                        "generated dependencies seed={seed:x} tile={tile} pair={pair}");
+                }
+                for group in 0..GROUPS {
+                    let at = group * GROUP_BYTES + pair * 128;
+                    assert_eq!(core::slice::from_raw_parts(src.add(at), 128), core::slice::from_raw_parts(dst.add(at), 128));
+                }
+            }
+        }
+    }
 
     /// `out[t] = Σ_{i<64} w[i] · z[64 t + i]` straight from the tiles.
     pub(crate) fn fold64(view: &WitnessTileView, out: &mut [F128], w: &[F128; 64]) {
@@ -823,6 +883,22 @@ pub(crate) mod imp {
 
     #[cfg(test)]
     pub(crate) fn read_only(view: &WitnessTileView) -> u64 {
+        if let Some((seed, generate)) = view.generator {
+            #[repr(align(64))]
+            struct Tile([core::mem::MaybeUninit<u8>; TILE_BYTES]);
+            return (0..view.tiles).into_par_iter().map_init(
+                || unsafe { Box::<Tile>::new_uninit().assume_init() },
+                |tile, index| unsafe {
+                    let p = tile.0.as_mut_ptr().cast::<u8>();
+                    generate(seed, index, p);
+                    let mut x = _mm512_setzero_si512();
+                    for line in 0..TILE_BYTES / 64 {
+                        x = _mm512_xor_si512(x, _mm512_load_si512(p.add(line * 64).cast()));
+                    }
+                    _mm512_reduce_or_epi64(x) as u64
+                },
+            ).reduce(|| 0, |a, b| a ^ b);
+        }
         let n = view.tiles * TILE_BYTES / 64;
         let base = view.base;
         (0..n / 4096)

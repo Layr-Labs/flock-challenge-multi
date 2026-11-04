@@ -445,7 +445,7 @@ pub use root_tile_cache::RootTileCache as WitnessRootTiles;
     target_feature = "gfni",
     target_feature = "vpclmulqdq"
 ))]
-pub use root_tile_cache::WitnessTileView;
+pub use root_tile_cache::{WitnessTileView, RootPairGenerator};
 
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
