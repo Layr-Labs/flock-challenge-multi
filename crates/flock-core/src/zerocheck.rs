@@ -662,8 +662,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 )
             };
             // SMT arm partition, built at process start in `crate::smt_split`.
-            // On the eight-core ranked host, seven cores pair AB with C and
-            // the final core serves AB on both siblings (9 AB / 7 C workers).
+            // The topology module selects the configured worker allocation;
+            // the leaf-product build defaults to 7 AB / 9 C on eight cores.
             // Other topologies keep one worker per arm on each core. The
             // closures and inputs are identical, so proof bytes are unchanged.
             // Falls back to
