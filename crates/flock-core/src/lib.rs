@@ -149,15 +149,32 @@ pub(crate) mod topology_pool {
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
-        let n = std::thread::available_parallelism().ok()?.get();
+        let mut mask = [0u64; 16];
+        // CPU numbers need not start at zero or form a contiguous range.
+        // Use the calling thread's permitted CPUs, not the number of CPUs.
+        let result = unsafe {
+            sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr())
+        };
+        if result != 0 {
+            return None;
+        }
+        let cpus: Vec<usize> = (0..1024)
+            .filter(|&cpu| mask[cpu / 64] & (1u64 << (cpu % 64)) != 0)
+            .collect();
+        if cpus.is_empty() {
+            return None;
+        }
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut seen = vec![false; n];
-        for cpu in 0..n {
+        let mut seen = [false; 1024];
+        for &cpu in &cpus {
             if seen[cpu] {
                 continue;
             }
             let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-            let list = std::fs::read_to_string(path).ok()?;
+            let Ok(list) = std::fs::read_to_string(path) else {
+                // Minimal containers may expose procfs without sysfs.
+                return proc_sibling_groups(&std::fs::read_to_string("/proc/cpuinfo").ok()?, &cpus);
+            };
             let mut g = Vec::new();
             for part in list.trim().split(',') {
                 if let Some((a, b)) = part.split_once('-') {
@@ -167,7 +184,7 @@ pub(crate) mod topology_pool {
                     g.push(part.parse().ok()?);
                 }
             }
-            g.retain(|&c| c < n);
+            g.retain(|c| cpus.binary_search(c).is_ok());
             g.sort_unstable();
             g.dedup();
             for &c in &g {
@@ -179,8 +196,68 @@ pub(crate) mod topology_pool {
     }
 
     #[cfg(target_os = "linux")]
+    fn proc_sibling_groups(cpuinfo: &str, allowed: &[usize]) -> Option<Vec<Vec<usize>>> {
+        let mut cores = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+        let mut found = std::collections::BTreeSet::new();
+        for record in cpuinfo.split("\n\n") {
+            let (mut cpu, mut package, mut core) = (None, None, None);
+            for line in record.lines() {
+                let Some((key, value)) = line.split_once(':') else { continue };
+                match key.trim() {
+                    "processor" => cpu = value.trim().parse::<usize>().ok(),
+                    "physical id" => package = value.trim().parse::<usize>().ok(),
+                    "core id" => core = value.trim().parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+            let Some(cpu) = cpu.filter(|c| allowed.binary_search(c).is_ok()) else { continue };
+            if !found.insert(cpu) {
+                return None;
+            }
+            cores.entry((package?, core?)).or_default().push(cpu);
+        }
+        if found.len() != allowed.len() {
+            return None;
+        }
+        let mut groups: Vec<Vec<usize>> = cores.into_values().collect();
+        for group in &mut groups {
+            group.sort_unstable();
+        }
+        groups.sort_unstable_by_key(|g| g[0]);
+        Some(groups)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        fn info() -> String {
+            [(2, 0, 3), (54, 0, 3), (7, 1, 3), (59, 1, 3)]
+                .into_iter()
+                .map(|(cpu, package, core)| {
+                    format!("processor : {cpu}\nphysical id : {package}\ncore id : {core}\n\n")
+                })
+                .collect()
+        }
+
+        #[test]
+        fn sparse_affinity_keeps_packages_and_siblings_distinct() {
+            assert_eq!(super::proc_sibling_groups(&info(), &[2, 7, 54, 59]),
+                       Some(vec![vec![2, 54], vec![7, 59]]));
+            assert_eq!(super::proc_sibling_groups(&info(), &[2, 7, 54]),
+                       Some(vec![vec![2, 54], vec![7]]));
+        }
+
+        #[test]
+        fn incomplete_or_duplicate_cpu_records_decline_topology() {
+            assert!(super::proc_sibling_groups(&info(), &[2, 99]).is_none());
+            assert!(super::proc_sibling_groups("processor : 2\n", &[2]).is_none());
+            assert!(super::proc_sibling_groups(&(info() + &info()), &[2, 54]).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     unsafe extern "C" {
         fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
     }
 
     #[cfg(target_os = "linux")]
@@ -305,7 +382,9 @@ pub fn ranked_pool_built() -> bool {
 /// of a core, so pairing one of each on a core is ~5% cheaper than pairing
 /// like with like. Giving each half its own 8-thread pool, pinned one thread
 /// per physical core to opposite SMT siblings, makes every core run exactly
-/// one AB thread beside one C thread.
+/// one AB thread beside one C thread under the balanced policy. These
+/// historical measurements preceded the current leaf-product AB converter;
+/// the allocation below re-evaluates its work balance.
 ///
 /// The pools are built **here, at process start, on the unpinned main
 /// thread**, from an explicit CPU list read out of
@@ -322,9 +401,10 @@ pub fn ranked_pool_built() -> bool {
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
 /// restored and no extra thread is spawned. The two env vars are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split. Four-w AB retention balances the arms on the
-/// eight-core ranked host with eight workers each. Local diagnostics can
-/// restore 9/7 with `FLOCK_ZC_R1_AB_REBALANCE=1`.
+/// default is the split. With the leaf-product AB converter enabled, the
+/// eight-core policy gives one sibling to the C arm (7 AB / 9 C workers).
+/// `FLOCK_NO_ZC_R1_C_REBALANCE=1` restores the balanced split. The existing
+/// `FLOCK_ZC_R1_AB_REBALANCE=1` diagnostic keeps precedence and selects 9/7.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -336,18 +416,31 @@ pub(crate) mod smt_split {
     /// Compile-time rollback of the eight-core 9/7 arm partition.
     const ZC_R1_AB_REBALANCE: bool = false;
 
+    /// Re-evaluate the arm allocation after reducing AB conversion work.
+    /// This is a scheduling policy, not a change to either arm's arithmetic.
+    const ZC_R1_C_REBALANCE: bool = true;
+
     static POOLS: OnceLock<Option<(ThreadPool, ThreadPool)>> = OnceLock::new();
 
     // Separate topology planning from thread creation so disjointness and
     // the eight-core rebalance can be checked without spawning a pool.
     #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
-    fn arm_cpus(groups: &[Vec<usize>], rebalance: bool) -> (Vec<usize>, Vec<usize>) {
+    fn arm_cpus(
+        groups: &[Vec<usize>],
+        rebalance_ab: bool,
+        rebalance_c: bool,
+    ) -> (Vec<usize>, Vec<usize>) {
         let mut ab: Vec<usize> = groups.iter().map(|g| g[0]).collect();
         let mut c: Vec<usize> = groups.iter().map(|g| g[1]).collect();
-        if rebalance && groups.len() == 8 {
-            // Keep heterogeneous pairs on seven cores. The last core's two
-            // siblings both serve the now-critical AB arm.
-            ab.push(c.pop().expect("eight sibling groups"));
+        if groups.len() == 8 {
+            if rebalance_ab {
+                // Preserve the existing explicit AB-oriented diagnostic.
+                ab.push(c.pop().expect("eight sibling groups"));
+            } else if rebalance_c {
+                // One physical core gives both siblings to C; the other
+                // seven still pair one AB worker with one C worker.
+                c.push(ab.pop().expect("eight sibling groups"));
+            }
         }
         (ab, c)
     }
@@ -358,18 +451,49 @@ pub(crate) mod smt_split {
         fn arm_partition_rebalances_eight_cores_without_losing_or_sharing_cpus() {
             for cores in [2usize, 4, 8, 16] {
                 let groups: Vec<Vec<usize>> = (0..cores).map(|i| vec![i, i + cores]).collect();
-                for rebalance in [false, true] {
-                    let (ab, c) = super::arm_cpus(&groups, rebalance);
-                    let moved = usize::from(rebalance && cores == 8);
-                    assert_eq!((ab.len(), c.len()), (cores + moved, cores - moved));
-                    let mut all: Vec<usize> = ab.iter().chain(&c).copied().collect();
-                    all.sort_unstable();
-                    assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
-                    assert_eq!(&ab[..cores], &(0..cores).collect::<Vec<_>>());
-                    assert_eq!(c, (cores..2 * cores - moved).collect::<Vec<_>>());
-                    if moved != 0 { assert_eq!(ab.last(), Some(&(2 * cores - 1))); }
+                for to_ab in [false, true] {
+                    for to_c in [false, true] {
+                        let (ab, c) = super::arm_cpus(&groups, to_ab, to_c);
+                        let moved_ab = usize::from(to_ab && cores == 8);
+                        let moved_c = usize::from(!to_ab && to_c && cores == 8);
+                        assert_eq!(
+                            (ab.len(), c.len()),
+                            (cores + moved_ab - moved_c, cores - moved_ab + moved_c)
+                        );
+                        let mut all: Vec<usize> = ab.iter().chain(&c).copied().collect();
+                        all.sort_unstable();
+                        assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
+                        assert_eq!(
+                            &ab[..cores - moved_c],
+                            &(0..cores - moved_c).collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            &c[..cores - moved_ab],
+                            &(cores..2 * cores - moved_ab).collect::<Vec<_>>()
+                        );
+                        if moved_ab != 0 {
+                            assert_eq!(ab.last(), Some(&(2 * cores - 1)));
+                        }
+                        if moved_c != 0 {
+                            assert_eq!(c.last(), Some(&(cores - 1)));
+                        }
+                    }
                 }
             }
+        }
+
+        #[test]
+        fn c_partition_keeps_sparse_cpu_identifiers_and_moves_one_sibling() {
+            let groups: Vec<Vec<usize>> = (0..8).map(|i| vec![10 + 2 * i, 110 + 2 * i]).collect();
+            let (ab, c) = super::arm_cpus(&groups, false, true);
+            assert_eq!(ab, (0..7).map(|i| 10 + 2 * i).collect::<Vec<_>>());
+            assert_eq!(&c[..8], &(0..8).map(|i| 110 + 2 * i).collect::<Vec<_>>());
+            assert_eq!(c[8], 24);
+            let mut actual: Vec<_> = ab.into_iter().chain(c).collect();
+            let mut expected: Vec<_> = groups.into_iter().flatten().collect();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected);
         }
     }
 
@@ -545,7 +669,21 @@ pub(crate) mod smt_split {
             let rebalance = (super::ZC_R1_AB_REBALANCE
                 || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
-            let (s0, s1) = super::arm_cpus(&groups, rebalance);
+            // The alternate allocation is restricted to builds capable of
+            // the leaf-product converter. Opting out of that converter also
+            // restores the prior pool policy. The existing AB flag wins.
+            let rebalance_c = super::ZC_R1_C_REBALANCE
+                && cfg!(all(
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))
+                && std::env::var_os("FLOCK_NO_ZC_R1_AB_LEAF_ACCUM").is_none()
+                && std::env::var_os("FLOCK_NO_ZC_R1_AB_BATCH4").is_none()
+                && std::env::var_os("FLOCK_NO_ZC_R1_C_REBALANCE").is_none();
+            let (s0, s1) = super::arm_cpus(&groups, rebalance, rebalance_c);
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
