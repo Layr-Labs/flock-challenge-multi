@@ -536,10 +536,9 @@ pub(crate) unsafe fn gfni_fold_rows(
 /// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
 /// sixteen byte-plane accumulators until the last tile has been consumed.
 ///
-/// Exactly 22 ZMM registers are used: accumulators 0..15, transformed current
-/// rows 16..17, products 18..19, permutation 20 and transpose identity 21.
-/// This outlined leaf's asm never touches the stack or spills a vector. Inspect
-/// the optimized wrapper on the measured target before enabling production.
+/// Full four-tile groups use a mixed-width register leaf when AVX-512VL is
+/// compiled in. Short groups and non-VL builds retain the 22-ZMM leaf. Both
+/// leaves keep every accumulator in registers without stack vector spills.
 ///
 /// # Safety
 /// - `count` is in 1..=4 and `tile_stride >= 512`.
@@ -565,8 +564,60 @@ pub(crate) unsafe fn gfni_fold_rows(
     target_feature = "gfni"
 ))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-#[inline(never)]
+#[inline]
 pub(crate) unsafe fn gfni_fold_word_tiles4(
+    source: *const u8,
+    mats: *const u64,
+    planes: *mut u8,
+    tile_stride: usize,
+    count: usize,
+    seed_zero: bool,
+    permutation: *const u8,
+    prefetch_next_block: bool,
+) {
+    // Keep the established narrow-batch leaf and non-VL build unchanged.
+    #[cfg(target_feature = "avx512vl")]
+    if count == 4 {
+        // SAFETY: this leaf has precisely the same source and plane contract.
+        unsafe {
+            gfni_fold_word_tiles4_mixed(
+                source,
+                mats,
+                planes,
+                tile_stride,
+                count,
+                seed_zero,
+                permutation,
+                prefetch_next_block,
+            );
+        }
+        return;
+    }
+    unsafe {
+        gfni_fold_word_tiles4_zmm(
+            source,
+            mats,
+            planes,
+            tile_stride,
+            count,
+            seed_zero,
+            permutation,
+            prefetch_next_block,
+        );
+    }
+}
+
+/// Established full-width leaf; shares the public wrapper's safety contract.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
+#[inline(never)]
+pub(crate) unsafe fn gfni_fold_word_tiles4_zmm(
     source: *const u8,
     mats: *const u64,
     planes: *mut u8,
@@ -773,6 +824,306 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             out("zmm19") _,
             out("zmm20") _,
             out("zmm21") _,
+            options(nostack),
+        );
+    }
+}
+
+/// Mixed-width selected-word fold, with the same byte-exact contract as
+/// `gfni_fold_word_tiles4`. This is selected only for a complete four-tile
+/// group on builds that also support AVX-512VL.
+///
+/// Ten planes remain full-width in ZMM0..9. Six planes are split into low/high
+/// 32-byte halves in YMM10..21. GFNI is independent in every eight-byte lane,
+/// so splitting each plane commutes with its affine map and XOR reduction.
+/// The purpose is to expose some affine operations to the 256-bit execution
+/// resources without narrowing the whole leaf or adding accumulator spills.
+///
+/// ZMM22..23 hold the two transposed source stripes; YMM24..25 their high
+/// halves. Registers 26..27 are products, 28 the byte permutation, 29 the
+/// transpose identity, and YMM30..31 coefficient broadcasts shared by both
+/// halves. All 32 vector registers are clobbered. Source traversal, matrices,
+/// initialization, destination layout and prefetch addresses are unchanged.
+///
+/// # Safety
+/// Identical pointer, length, initialization, non-aliasing and prefetch
+/// requirements to `gfni_fold_word_tiles4`; additionally requires AVX-512VL.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+#[inline(never)]
+pub(crate) unsafe fn gfni_fold_word_tiles4_mixed(
+    source: *const u8,
+    mats: *const u64,
+    planes: *mut u8,
+    tile_stride: usize,
+    count: usize,
+    seed_zero: bool,
+    permutation: *const u8,
+    prefetch_next_block: bool,
+) {
+    debug_assert!((1..=4).contains(&count));
+    debug_assert!(tile_stride >= 512);
+    // SAFETY: the caller upholds the exact byte ranges above. Every modified
+    // GPR and ZMM is explicitly an output; flags and memory are also clobbered
+    // (no preserves_flags/nomem/readonly). No callee-saved GPR is touched. The
+    // ABI may place the seventh argument on the caller's stack; this asm itself
+    // neither reads nor writes the stack and contains no call instruction.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu64 zmm28, [r10]",
+            "mov r10, r11",
+            "mov rax, 0x8040201008040201",
+            "vpbroadcastq zmm29, rax",
+            // Read-only, nonfaulting hints for the next private plane bank.
+            "test r10, r10",
+            "jz 6f",
+            "prefetcht0 [rdx + 1024]",
+            "prefetcht0 [rdx + 1088]",
+            "prefetcht0 [rdx + 1152]",
+            "prefetcht0 [rdx + 1216]",
+            "prefetcht0 [rdx + 1280]",
+            "prefetcht0 [rdx + 1344]",
+            "prefetcht0 [rdx + 1408]",
+            "prefetcht0 [rdx + 1472]",
+            "prefetcht0 [rdx + 1536]",
+            "prefetcht0 [rdx + 1600]",
+            "prefetcht0 [rdx + 1664]",
+            "prefetcht0 [rdx + 1728]",
+            "prefetcht0 [rdx + 1792]",
+            "prefetcht0 [rdx + 1856]",
+            "prefetcht0 [rdx + 1920]",
+            "prefetcht0 [rdx + 1984]",
+            "6:",
+            "test r9, r9",
+            "jz 2f",
+            "vpxord zmm0, zmm0, zmm0",
+            "vpxord zmm1, zmm1, zmm1",
+            "vpxord zmm2, zmm2, zmm2",
+            "vpxord zmm3, zmm3, zmm3",
+            "vpxord zmm4, zmm4, zmm4",
+            "vpxord zmm5, zmm5, zmm5",
+            "vpxord zmm6, zmm6, zmm6",
+            "vpxord zmm7, zmm7, zmm7",
+            "vpxord zmm8, zmm8, zmm8",
+            "vpxord zmm9, zmm9, zmm9",
+            "vpxord ymm10, ymm10, ymm10",
+            "vpxord ymm11, ymm11, ymm11",
+            "vpxord ymm12, ymm12, ymm12",
+            "vpxord ymm13, ymm13, ymm13",
+            "vpxord ymm14, ymm14, ymm14",
+            "vpxord ymm15, ymm15, ymm15",
+            "vpxord ymm16, ymm16, ymm16",
+            "vpxord ymm17, ymm17, ymm17",
+            "vpxord ymm18, ymm18, ymm18",
+            "vpxord ymm19, ymm19, ymm19",
+            "vpxord ymm20, ymm20, ymm20",
+            "vpxord ymm21, ymm21, ymm21",
+            "jmp 3f",
+            "2:",
+            "vmovdqu64 zmm0, [rdx + 0]",
+            "vmovdqu64 zmm1, [rdx + 64]",
+            "vmovdqu64 zmm2, [rdx + 128]",
+            "vmovdqu64 zmm3, [rdx + 192]",
+            "vmovdqu64 zmm4, [rdx + 256]",
+            "vmovdqu64 zmm5, [rdx + 320]",
+            "vmovdqu64 zmm6, [rdx + 384]",
+            "vmovdqu64 zmm7, [rdx + 448]",
+            "vmovdqu64 zmm8, [rdx + 512]",
+            "vmovdqu64 zmm9, [rdx + 576]",
+            "vmovdqu64 ymm10, [rdx + 640]",
+            "vmovdqu64 ymm11, [rdx + 672]",
+            "vmovdqu64 ymm12, [rdx + 704]",
+            "vmovdqu64 ymm13, [rdx + 736]",
+            "vmovdqu64 ymm14, [rdx + 768]",
+            "vmovdqu64 ymm15, [rdx + 800]",
+            "vmovdqu64 ymm16, [rdx + 832]",
+            "vmovdqu64 ymm17, [rdx + 864]",
+            "vmovdqu64 ymm18, [rdx + 896]",
+            "vmovdqu64 ymm19, [rdx + 928]",
+            "vmovdqu64 ymm20, [rdx + 960]",
+            "vmovdqu64 ymm21, [rdx + 992]",
+            "3:",
+            // Each tile's next source block is 512 bytes ahead.
+            "test r10, r10",
+            "jz 7f",
+            "prefetcht0 [rdi + 512]",
+            "prefetcht0 [rdi + 576]",
+            "prefetcht0 [rdi + 640]",
+            "prefetcht0 [rdi + 704]",
+            "prefetcht0 [rdi + 768]",
+            "prefetcht0 [rdi + 832]",
+            "prefetcht0 [rdi + 896]",
+            "prefetcht0 [rdi + 960]",
+            "7:",
+            "mov r11d, 4",
+            "4:",
+            "vpermb zmm22, zmm28, [rdi]",
+            "vpermb zmm23, zmm28, [rdi + 64]",
+            "vgf2p8affineqb zmm22, zmm29, zmm22, 0",
+            "vgf2p8affineqb zmm23, zmm29, zmm23, 0",
+            "vextracti64x4 ymm24, zmm22, 1",
+            "vextracti64x4 ymm25, zmm23, 1",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 0]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 128]{{1to8}}, 0",
+            "vpternlogq zmm0, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 8]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 136]{{1to8}}, 0",
+            "vpternlogq zmm1, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 16]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 144]{{1to8}}, 0",
+            "vpternlogq zmm2, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 24]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 152]{{1to8}}, 0",
+            "vpternlogq zmm3, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 32]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 160]{{1to8}}, 0",
+            "vpternlogq zmm4, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 40]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 168]{{1to8}}, 0",
+            "vpternlogq zmm5, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 48]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 176]{{1to8}}, 0",
+            "vpternlogq zmm6, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 56]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 184]{{1to8}}, 0",
+            "vpternlogq zmm7, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 64]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 192]{{1to8}}, 0",
+            "vpternlogq zmm8, zmm26, zmm27, 0x96",
+            "vgf2p8affineqb zmm26, zmm22, [rsi + 72]{{1to8}}, 0",
+            "vgf2p8affineqb zmm27, zmm23, [rsi + 200]{{1to8}}, 0",
+            "vpternlogq zmm9, zmm26, zmm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 80]",
+            "vpbroadcastq ymm31, [rsi + 208]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm10, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm11, ymm26, ymm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 88]",
+            "vpbroadcastq ymm31, [rsi + 216]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm12, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm13, ymm26, ymm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 96]",
+            "vpbroadcastq ymm31, [rsi + 224]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm14, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm15, ymm26, ymm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 104]",
+            "vpbroadcastq ymm31, [rsi + 232]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm16, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm17, ymm26, ymm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 112]",
+            "vpbroadcastq ymm31, [rsi + 240]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm18, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm19, ymm26, ymm27, 0x96",
+            "vpbroadcastq ymm30, [rsi + 120]",
+            "vpbroadcastq ymm31, [rsi + 248]",
+            "vgf2p8affineqb ymm26, ymm22, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm23, ymm31, 0",
+            "vpternlogq ymm20, ymm26, ymm27, 0x96",
+            "vgf2p8affineqb ymm26, ymm24, ymm30, 0",
+            "vgf2p8affineqb ymm27, ymm25, ymm31, 0",
+            "vpternlogq ymm21, ymm26, ymm27, 0x96",
+            "add rdi, 128",
+            "add rsi, 256",
+            "dec r11d",
+            "jnz 4b",
+            "dec r8",
+            "jz 5f",
+            // The stripe-pair loop has advanced source by one 512-byte block.
+            // Advance to this block in the next tile, using its actual stride.
+            // These two steps avoid transiently going past the final tile.
+            "sub rdi, 512",
+            "add rdi, rcx",
+            "jmp 3b",
+            "5:",
+            "vmovdqu64 [rdx + 0], zmm0",
+            "vmovdqu64 [rdx + 64], zmm1",
+            "vmovdqu64 [rdx + 128], zmm2",
+            "vmovdqu64 [rdx + 192], zmm3",
+            "vmovdqu64 [rdx + 256], zmm4",
+            "vmovdqu64 [rdx + 320], zmm5",
+            "vmovdqu64 [rdx + 384], zmm6",
+            "vmovdqu64 [rdx + 448], zmm7",
+            "vmovdqu64 [rdx + 512], zmm8",
+            "vmovdqu64 [rdx + 576], zmm9",
+            "vmovdqu64 [rdx + 640], ymm10",
+            "vmovdqu64 [rdx + 672], ymm11",
+            "vmovdqu64 [rdx + 704], ymm12",
+            "vmovdqu64 [rdx + 736], ymm13",
+            "vmovdqu64 [rdx + 768], ymm14",
+            "vmovdqu64 [rdx + 800], ymm15",
+            "vmovdqu64 [rdx + 832], ymm16",
+            "vmovdqu64 [rdx + 864], ymm17",
+            "vmovdqu64 [rdx + 896], ymm18",
+            "vmovdqu64 [rdx + 928], ymm19",
+            "vmovdqu64 [rdx + 960], ymm20",
+            "vmovdqu64 [rdx + 992], ymm21",
+            inout("rdi") source => _,
+            inout("rsi") mats => _,
+            in("rdx") planes,
+            in("rcx") tile_stride,
+            inout("r8") count => _,
+            in("r9") usize::from(seed_zero),
+            inout("r10") permutation => _,
+            inout("r11") usize::from(prefetch_next_block) => _,
+            out("rax") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            out("zmm2") _,
+            out("zmm3") _,
+            out("zmm4") _,
+            out("zmm5") _,
+            out("zmm6") _,
+            out("zmm7") _,
+            out("zmm8") _,
+            out("zmm9") _,
+            out("zmm10") _,
+            out("zmm11") _,
+            out("zmm12") _,
+            out("zmm13") _,
+            out("zmm14") _,
+            out("zmm15") _,
+            out("zmm16") _,
+            out("zmm17") _,
+            out("zmm18") _,
+            out("zmm19") _,
+            out("zmm20") _,
+            out("zmm21") _,
+            out("zmm22") _,
+            out("zmm23") _,
+            out("zmm24") _,
+            out("zmm25") _,
+            out("zmm26") _,
+            out("zmm27") _,
+            out("zmm28") _,
+            out("zmm29") _,
+            out("zmm30") _,
+            out("zmm31") _,
             options(nostack),
         );
     }
