@@ -3143,6 +3143,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // only complete source of z for this proof.
                 tiles.mark_z_elided();
             }
+            #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
+            if root_generator.is_some() && pipelined && blake3_witgen8::root_recompute::stage_recompute::enabled() {
+                // SAFETY: the exact closed pipeline and validated root plan
+                // brand this seed, cross-quarter tile layout and fixed shape.
+                unsafe { tiles.set_stage_generator(blake3_witgen8::root_recompute::stage_recompute::generate_stages); }
+            }
             ab_inner.set_witness_root_tiles(tiles);
         } else {
             assert_eq!(elided_octas.load(std::sync::atomic::Ordering::Relaxed), 0);

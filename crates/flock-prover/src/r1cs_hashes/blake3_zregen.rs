@@ -292,12 +292,14 @@ pub(crate) mod imp {
     #[repr(C, align(64))]
     pub(super) struct Stage(pub(super) [__m512i; NQ]);
 
-    /// Per-worker scratch (~23 KiB, L1-resident): one octa's z stage plus
-    /// the current octa pair's BLAKE3 dependent qwords (`b_new | d_new << 32`
-    /// per G) and output qwords.
+    /// Per-worker scratch (~39 KiB): two octa stages, plus dependencies and
+    /// outputs for the root expansion fallback. Direct generation writes both
+    /// stages and leaves the fallback arrays cold. All storage is reused
+    /// across proofs and completely overwritten before a consumer reads it.
     #[repr(C, align(64))]
     pub(super) struct Scratch {
         pub(super) stage: Stage,
+        second_stage: Stage,
         deps: [[__m512i; N_G]; 2],
         out_lo: [[__m512i; 4]; 2],
         out_hi: [[__m512i; 4]; 2],
@@ -736,6 +738,17 @@ pub(crate) mod imp {
                     let next = (view.generator.is_none() && t + 1 < tiles)
                         .then(|| base + (t + 1) * TILE_BYTES);
                     for pair in 0..4 {
+                        if mode == 0 && let Some(generate) = view.stage_generator {
+                            let seed=view.generator.expect("stage generator seed").0;
+                            unsafe {
+                                generate(seed,t,pair,scratch.stage.0.as_mut_ptr().cast(),scratch.second_stage.0.as_mut_ptr().cast());
+                            }
+                            let mut pf=PfCur::new(None);
+                            f(&scratch.stage,t,2*pair,&mut pf);
+                            f(&scratch.second_stage,t,2*pair+1,&mut pf);
+                            continue;
+                        }
+
                         if let Some(generate_pair) = view.pair_generator {
                             let seed = view.generator.expect("paired generator has a seed").0;
                             unsafe {

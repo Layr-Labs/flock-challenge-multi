@@ -36,6 +36,7 @@ pub struct RootTileCache {
     z_elided: bool,
     generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
     pair_generator: Option<RootPairGenerator>,
+    stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8)>,
 }
 
 /// Raw read-only view of witness-produced word-major root tiles: `tiles`
@@ -48,6 +49,7 @@ pub struct WitnessTileView {
     pub cross_quarter: bool,
     pub generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
     pub pair_generator: Option<RootPairGenerator>,
+    pub stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8)>,
 }
 
 #[repr(align(64))]
@@ -170,7 +172,7 @@ fn prepare(
             cross_quarter: false,
             z_elided: false,
             generator: None,
-            pair_generator: None,
+            pair_generator: None, stage_generator: None,
         },
         folded,
     )
@@ -218,7 +220,7 @@ impl RootTileCache {
         let fields = tiles.checked_mul(blocks).unwrap().checked_mul(32).unwrap();
         let offset = storage.0.as_ptr().align_offset(64);
         assert!(offset <= 3 && offset.checked_add(fields).unwrap() <= storage.0.len());
-        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false, generator: None, pair_generator: None }
+        Self { storage, offset, tiles, blocks, word_major: true, fixed_roots: true, cross_quarter: false, z_elided: false, generator: None, pair_generator: None, stage_generator: None }
     }
 
     /// Exact ranked root tiles generated into consumer-local scratch.
@@ -238,12 +240,22 @@ impl RootTileCache {
         Self {
             storage: PooledStorage(Vec::new()), offset: 0, tiles: 4096,
             blocks: 176, word_major: true, fixed_roots: true,
-            cross_quarter: true, z_elided: false, generator: Some((seed, generate)), pair_generator,
+            cross_quarter: true, z_elided: false, generator: Some((seed, generate)), pair_generator, stage_generator: None,
         }
     }
 
-    /// Record that the witness producer did not store z for (some of) the
-    /// compressions covered by this cache. Only witness-born tiles qualify.
+    /// Supply a proof-local full-witness pair generator for PCS folds.
+    ///
+    /// # Safety
+    /// The callback must overwrite two disjoint, 64-byte aligned arrays of
+    /// 242 ZMMs with canonical qwords for physical octas pair*2 and pair*2+1.
+    /// Its seed and tile mapping must agree with this cache's root generator.
+    pub unsafe fn set_stage_generator(&mut self, generate: unsafe fn(u64,usize,usize,*mut u8,*mut u8)) {
+        assert!(self.generator.is_some() && self.cross_quarter);
+        self.stage_generator=Some(generate);
+    }
+
+    /// Record that the producer skipped z stores for some covered compressions.
     pub fn mark_z_elided(&mut self) {
         assert!(self.fixed_roots && self.word_major);
         self.z_elided = true;
@@ -261,6 +273,7 @@ impl RootTileCache {
             cross_quarter: self.cross_quarter,
             generator: self.generator,
             pair_generator: self.pair_generator,
+            stage_generator: self.stage_generator,
         })
     }
 

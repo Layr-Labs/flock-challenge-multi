@@ -1004,3 +1004,6 @@ fn add_root16(x: V16, y: V16) -> (V16, V16) {
         (s, _mm512_ternarylogic_epi32::<0x42>(x, y, s))
     }
 }
+
+#[path = "blake3_stage_recompute.rs"]
+pub(crate) mod stage_recompute;
