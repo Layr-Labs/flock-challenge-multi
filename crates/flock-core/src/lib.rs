@@ -149,15 +149,32 @@ pub(crate) mod topology_pool {
 
     #[cfg(target_os = "linux")]
     fn sibling_groups() -> Option<Vec<Vec<usize>>> {
-        let n = std::thread::available_parallelism().ok()?.get();
+        let mut mask = [0u64; 16];
+        // CPU numbers need not start at zero or form a contiguous range.
+        // Use the calling thread's permitted CPUs, not the number of CPUs.
+        let result = unsafe {
+            sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr())
+        };
+        if result != 0 {
+            return None;
+        }
+        let cpus: Vec<usize> = (0..1024)
+            .filter(|&cpu| mask[cpu / 64] & (1u64 << (cpu % 64)) != 0)
+            .collect();
+        if cpus.is_empty() {
+            return None;
+        }
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut seen = vec![false; n];
-        for cpu in 0..n {
+        let mut seen = [false; 1024];
+        for &cpu in &cpus {
             if seen[cpu] {
                 continue;
             }
             let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-            let list = std::fs::read_to_string(path).ok()?;
+            let Ok(list) = std::fs::read_to_string(path) else {
+                // Minimal containers may expose procfs without sysfs.
+                return proc_sibling_groups(&std::fs::read_to_string("/proc/cpuinfo").ok()?, &cpus);
+            };
             let mut g = Vec::new();
             for part in list.trim().split(',') {
                 if let Some((a, b)) = part.split_once('-') {
@@ -167,7 +184,7 @@ pub(crate) mod topology_pool {
                     g.push(part.parse().ok()?);
                 }
             }
-            g.retain(|&c| c < n);
+            g.retain(|c| cpus.binary_search(c).is_ok());
             g.sort_unstable();
             g.dedup();
             for &c in &g {
@@ -179,8 +196,68 @@ pub(crate) mod topology_pool {
     }
 
     #[cfg(target_os = "linux")]
+    fn proc_sibling_groups(cpuinfo: &str, allowed: &[usize]) -> Option<Vec<Vec<usize>>> {
+        let mut cores = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+        let mut found = std::collections::BTreeSet::new();
+        for record in cpuinfo.split("\n\n") {
+            let (mut cpu, mut package, mut core) = (None, None, None);
+            for line in record.lines() {
+                let Some((key, value)) = line.split_once(':') else { continue };
+                match key.trim() {
+                    "processor" => cpu = value.trim().parse::<usize>().ok(),
+                    "physical id" => package = value.trim().parse::<usize>().ok(),
+                    "core id" => core = value.trim().parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+            let Some(cpu) = cpu.filter(|c| allowed.binary_search(c).is_ok()) else { continue };
+            if !found.insert(cpu) {
+                return None;
+            }
+            cores.entry((package?, core?)).or_default().push(cpu);
+        }
+        if found.len() != allowed.len() {
+            return None;
+        }
+        let mut groups: Vec<Vec<usize>> = cores.into_values().collect();
+        for group in &mut groups {
+            group.sort_unstable();
+        }
+        groups.sort_unstable_by_key(|g| g[0]);
+        Some(groups)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        fn info() -> String {
+            [(2, 0, 3), (54, 0, 3), (7, 1, 3), (59, 1, 3)]
+                .into_iter()
+                .map(|(cpu, package, core)| {
+                    format!("processor : {cpu}\nphysical id : {package}\ncore id : {core}\n\n")
+                })
+                .collect()
+        }
+
+        #[test]
+        fn sparse_affinity_keeps_packages_and_siblings_distinct() {
+            assert_eq!(super::proc_sibling_groups(&info(), &[2, 7, 54, 59]),
+                       Some(vec![vec![2, 54], vec![7, 59]]));
+            assert_eq!(super::proc_sibling_groups(&info(), &[2, 7, 54]),
+                       Some(vec![vec![2, 54], vec![7]]));
+        }
+
+        #[test]
+        fn incomplete_or_duplicate_cpu_records_decline_topology() {
+            assert!(super::proc_sibling_groups(&info(), &[2, 99]).is_none());
+            assert!(super::proc_sibling_groups("processor : 2\n", &[2]).is_none());
+            assert!(super::proc_sibling_groups(&(info() + &info()), &[2, 54]).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     unsafe extern "C" {
         fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
     }
 
     #[cfg(target_os = "linux")]
