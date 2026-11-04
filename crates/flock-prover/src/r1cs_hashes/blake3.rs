@@ -3037,12 +3037,15 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         if let Some(target) = target {
-                            if elide_z {
-                                elided_octas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
                             target.seed_octa(input.0.as_ptr(), kpair);
                         }
                     }
+                }
+                // Only presence is consumed after the encoder joins every
+                // callback. One relaxed store per producer replaces sixteen
+                // contended read-modify-writes on the same cache line.
+                if elide_z && target.is_some() {
+                    elided_octas.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // The core scheduler joins both fully seeded halves and
                 // their global-output fences before folding either r task.
