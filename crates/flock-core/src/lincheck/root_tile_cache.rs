@@ -10,6 +10,10 @@ use rayon::prelude::*;
 #[repr(C, align(64))]
 pub(super) struct Block([u8; 512]);
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Accumulator([core::mem::MaybeUninit<u8>; 1024]);
+
 // Only allocation capacity is recycled. take_f128 invalidates previous
 // provenance; prepare or witness generation overwrites every live block
 // before publication.
@@ -341,13 +345,89 @@ impl RootTileCache {
     }
 
     fn fold_physical_with_mode(
-        &self, logical: &(impl Fn(usize) -> [F128; 8] + Sync), batch_word_tiles: bool,
+        &self,
+        logical: &(impl Fn(usize) -> [F128; 8] + Sync),
+        batch_word_tiles: bool,
     ) -> Vec<F128> {
         if batch_word_tiles && self.word_major && self.fixed_roots {
+            let blocks_per_worker = self.blocks.div_ceil(rayon::current_num_threads().max(1));
+            if self.tiles >= 64 && blocks_per_worker <= 16 {
+                return self.fold_block_owned(logical);
+            }
             self.fold_impl::<true>(logical)
         } else {
             self.fold_impl::<false>(logical)
         }
+    }
+
+    /// Give each task a disjoint span of output blocks. Its accumulators stay
+    /// in L1 across the tile sweep, and the final conversion needs no reduction
+    /// across per-worker copies. Challenge-dependent matrices are prepared once.
+    fn fold_block_owned(&self, logical_eq8: &(impl Fn(usize) -> [F128; 8] + Sync)) -> Vec<F128> {
+        assert!(self.word_major && self.fixed_roots && self.tiles > 0);
+        static PREFETCH: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none());
+        let mut matrices = vec![[0u64; 128]; self.tiles];
+        matrices
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(tile, matrix)| {
+                for stripe in 0..DIRECT_FOLD_TILE_STRIPES {
+                    let eq8 = logical_eq8(8 * (tile * DIRECT_FOLD_TILE_STRIPES + stripe));
+                    kernels::fold_mats_from_basis(
+                        &eq8,
+                        &mut matrix[stripe * 16..(stripe + 1) * 16],
+                    );
+                }
+            });
+
+        let blocks_per_worker = self.blocks.div_ceil(rayon::current_num_threads().max(1));
+        let mut planes = crate::alloc_uninit_vec::<Accumulator>(self.blocks);
+        planes
+            .par_chunks_mut(blocks_per_worker)
+            .enumerate()
+            .for_each(|(worker, dst)| {
+                let first_block = worker * blocks_per_worker;
+                for (batch, weights) in matrices.chunks(4).enumerate() {
+                    let tile = batch * 4;
+                    let count = weights.len();
+                    let last_block = first_block + dst.len();
+                    for (offset, block_dst) in dst.iter_mut().enumerate() {
+                        let block = first_block + offset;
+                        // SAFETY: immutable source tiles and matrices are complete.
+                        // This task alone owns these 64-aligned output blocks. The
+                        // first batch initializes every byte before later loads.
+                        // The existing leaf reads exactly count matrices and tiles.
+                        unsafe {
+                            kernels::gfni_fold_word_tiles4(
+                                self.storage
+                                    .0
+                                    .as_ptr()
+                                    .add(self.offset)
+                                    .cast::<u8>()
+                                    .add((tile * self.blocks + block) * 512),
+                                weights.as_ptr().cast::<u64>(),
+                                block_dst.0.as_mut_ptr().cast::<u8>(),
+                                self.blocks * 512,
+                                count,
+                                tile == 0,
+                                WORD_TO_COLUMNS.as_ptr(),
+                                *PREFETCH && block + 1 < last_block,
+                            );
+                        }
+                    }
+                }
+            });
+        let stride = self.blocks * 1024;
+        // SAFETY: Accumulator has size 1024 with no inter-element padding.
+        // The parallel join above completes all writes before conversion.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                planes.as_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                stride,
+            )
+        };
+        self.finish_fold(bytes, stride, &[0])
     }
 
     fn fold_impl<const BATCH_WORD_TILES: bool>(
@@ -486,17 +566,28 @@ impl RootTileCache {
             .enumerate()
             .filter_map(|(i, v)| (v != 0).then_some(i))
             .collect();
+        self.finish_fold(&planes, stride, &active_workers)
+    }
+
+    fn finish_fold(
+        &self,
+        planes: &[core::mem::MaybeUninit<u8>],
+        stride: usize,
+        active_workers: &[usize],
+    ) -> Vec<F128> {
         let output_blocks = self.blocks + usize::from(self.fixed_roots);
         let mut out = vec![F128::ZERO; output_blocks * 64];
         out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
-            if self.fixed_roots && block == 14 { return; }
+            if self.fixed_roots && block == 14 {
+                return;
+            }
             let source = block - usize::from(self.fixed_roots && block > 14);
             // SAFETY: every active worker initialized this live block and
             // the Rayon producer join completed before reduction starts.
             unsafe {
-                reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
+                reduce_worker_plane_block(planes, stride, active_workers, source, dst);
             }
         });
         if self.fixed_roots {
@@ -506,7 +597,9 @@ impl RootTileCache {
             // The already-folded constant pin equals the sum of the outer
             // weights, so this also preserves arbitrary, unnormalized bases.
             let one = out[256];
-            for column in [839, 865, 866, 868] { out[column] = one; }
+            for column in [839, 865, 866, 868] {
+                out[column] = one;
+            }
         }
         out
     }
@@ -651,6 +744,59 @@ mod tests {
                         || cache.fold_with_mode(&weights, true));
                     assert_eq!(a, expected);
                     assert_eq!(b, expected);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn block_owned_fold_matches_tile_owned_with_tails() {
+        let weights = |i: usize| {
+            core::array::from_fn(|lane| {
+                let n = (i + lane + 31) as u64;
+                F128::new(
+                    n.wrapping_mul(0x9e3779b97f4a7c15),
+                    n.rotate_left(29).wrapping_mul(0xbf58476d1ce4e5b9),
+                )
+            })
+        };
+        for threads in [1, 3, 8, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for tiles in [1, 3, 4, 5, 17] {
+                    let cache = selected_word_cache_fixture(tiles);
+                    let expected = cache.fold_impl::<true>(&weights);
+                    let actual = cache.fold_block_owned(&weights);
+                    assert_eq!(actual, expected, "tiles={tiles}, threads={threads}");
+                }
+                if threads == 16 {
+                    let mut cache = selected_word_cache_fixture(65);
+                    for cross_quarter in [false, true] {
+                        cache.cross_quarter = cross_quarter;
+                        let logical = |physical| {
+                            if cross_quarter {
+                                RootTileCache::cross_quarter_indices(physical)
+                                    .map(|c| weights(c & !7)[c & 7])
+                            } else {
+                                weights(physical)
+                            }
+                        };
+                        let expected = cache.fold_impl::<true>(&logical);
+                        let (a, b) = rayon::join(
+                            || cache.fold_with_mode(&weights, true),
+                            || cache.fold_block_owned(&logical),
+                        );
+                        assert_eq!(a, expected);
+                        assert_eq!(b, expected);
+                        let indexed = |indices: [usize; 8]| indices.map(|c| weights(c & !7)[c & 7]);
+                        assert_eq!(
+                            cache.fold_indexed_with_mode(&weights, &indexed, true),
+                            expected,
+                        );
+                    }
                 }
             });
         }
