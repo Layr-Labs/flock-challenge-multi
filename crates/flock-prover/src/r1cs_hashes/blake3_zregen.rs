@@ -166,6 +166,8 @@ pub(crate) mod imp {
         pairs: Vec<PairOp>,
         rot: Vec<Lanes>,
         mask: Vec<Lanes>,
+        // True only for the complete geometry checked against the fused expansion.
+        fused_layout: bool,
     }
 
     /// Derive (and fully check) the tile -> z qword map from the linear fold
@@ -276,7 +278,9 @@ pub(crate) mod imp {
         if covered.iter().any(|&c| c != 1) || g_seen.iter().any(|&s| !s) {
             return None;
         }
-        Some(Plan { full, pairs, rot, mask })
+        let mut plan = Plan { full, pairs, rot, mask, fused_layout: false };
+        plan.fused_layout = fused_layout_matches(&plan);
+        Some(plan)
     }
 
     pub(crate) fn plan() -> Option<&'static Plan> {
@@ -669,6 +673,1064 @@ pub(crate) mod imp {
         }
     }
 
+
+    // The unrolled expansion is used only when every descriptor and all lane
+    // constants match. The ordinary staged path remains the geometry fallback.
+    fn fused_layout_matches(plan: &Plan) -> bool {
+        const FULL: [(u16,u16);119] = [(0, 0), (1, 1), (2, 2), (3, 3), (8, 4), (9, 5), (10, 6), (11, 7), (12, 8), (13, 9), (14, 10), (15, 11), (16, 12), (19, 14), (22, 16), (23, 17), (26, 19), (27, 20), (30, 22), (31, 23), (34, 25), (35, 26), (38, 28), (39, 29), (42, 31), (43, 32), (46, 34), (47, 35), (50, 37), (51, 38), (54, 40), (55, 41), (58, 43), (61, 45), (62, 46), (65, 48), (66, 49), (69, 51), (70, 52), (73, 54), (74, 55), (77, 57), (78, 58), (81, 60), (82, 61), (85, 63), (86, 64), (89, 66), (90, 67), (93, 69), (94, 70), (97, 72), (98, 73), (101, 75), (104, 77), (105, 78), (108, 80), (109, 81), (112, 83), (113, 84), (116, 86), (117, 87), (120, 89), (121, 90), (124, 92), (125, 93), (128, 95), (129, 96), (132, 98), (133, 99), (136, 101), (137, 102), (140, 104), (141, 105), (144, 107), (147, 109), (148, 110), (151, 112), (152, 113), (155, 115), (156, 116), (159, 118), (160, 119), (163, 121), (164, 122), (167, 124), (168, 125), (171, 127), (172, 128), (175, 130), (176, 131), (179, 133), (180, 134), (183, 136), (186, 138), (187, 139), (190, 141), (191, 142), (194, 144), (195, 145), (198, 147), (199, 148), (202, 150), (203, 151), (206, 153), (207, 154), (210, 156), (211, 157), (214, 159), (215, 160), (218, 162), (219, 163), (222, 165), (223, 166), (226, 168), (229, 170), (230, 171), (233, 173), (234, 174)];
+        const PAIRS: [(u16,u16,u16);55] = [(20, 15, 0), (24, 18, 1), (28, 21, 2), (32, 24, 3), (36, 27, 4), (40, 30, 5), (44, 33, 6), (48, 36, 7), (52, 39, 8), (56, 42, 9), (59, 44, 10), (63, 47, 11), (67, 50, 12), (71, 53, 13), (75, 56, 14), (79, 59, 15), (83, 62, 16), (87, 65, 17), (91, 68, 18), (95, 71, 19), (99, 74, 20), (102, 76, 21), (106, 79, 22), (110, 82, 23), (114, 85, 24), (118, 88, 25), (122, 91, 26), (126, 94, 27), (130, 97, 28), (134, 100, 29), (138, 103, 30), (142, 106, 31), (145, 108, 32), (149, 111, 33), (153, 114, 34), (157, 117, 35), (161, 120, 36), (165, 123, 37), (169, 126, 38), (173, 129, 39), (177, 132, 40), (181, 135, 41), (184, 137, 42), (188, 140, 43), (192, 143, 44), (196, 146, 45), (200, 149, 46), (204, 152, 47), (208, 155, 48), (212, 158, 49), (216, 161, 50), (220, 164, 51), (224, 167, 52), (227, 169, 53), (231, 172, 54)];
+        const ROT: [u64;55] = [59, 53, 47, 41, 35, 29, 23, 17, 11, 5, 63, 57, 51, 45, 39, 33, 27, 21, 15, 9, 3, 61, 55, 49, 43, 37, 31, 25, 19, 13, 7, 1, 59, 53, 47, 41, 35, 29, 23, 17, 11, 5, 63, 57, 51, 45, 39, 33, 27, 21, 15, 9, 3, 61, 55];
+        const MASK: [u64;55] = [576460752303423487, 9007199254740991, 140737488355327, 2199023255551, 34359738367, 536870911, 8388607, 131071, 2047, 31, 9223372036854775807, 144115188075855871, 2251799813685247, 35184372088831, 549755813887, 8589934591, 134217727, 2097151, 32767, 511, 7, 2305843009213693951, 36028797018963967, 562949953421311, 8796093022207, 137438953471, 2147483647, 33554431, 524287, 8191, 127, 1, 576460752303423487, 9007199254740991, 140737488355327, 2199023255551, 34359738367, 536870911, 8388607, 131071, 2047, 31, 9223372036854775807, 144115188075855871, 2251799813685247, 35184372088831, 549755813887, 8589934591, 134217727, 2097151, 32767, 511, 7, 2305843009213693951, 36028797018963967];
+        plan.full.len() == FULL.len() && plan.pairs.len() == PAIRS.len()
+            && plan.rot.len() == ROT.len() && plan.mask.len() == MASK.len()
+            && plan.full.iter().zip(FULL).all(|(p,(q,cg))| (p.q,p.cg)==(q,cg))
+            && plan.pairs.iter().zip(PAIRS).all(|(p,(q,cg,g))| (p.q,p.cg,p.g)==(q,cg,g))
+            && plan.rot.iter().zip(ROT).all(|(p,v)| p.0 == [v;8])
+            && plan.mask.iter().zip(MASK).all(|(p,v)| p.0 == [v;8])
+    }
+
+#[inline(never)]
+unsafe fn fused_stage_fold_prefetched(tile:*const u8,o:usize,x:usize,scratch:&Scratch,w:&Weights,pf:&mut PfCur)->[[__m512i;2];2]{unsafe{
+const PREFETCH:bool=true;
+let src=tile.add(o*64);let idxq=_mm512_setr_epi32(0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15);
+macro_rules! q64{($cg:expr)=>{_mm512_permutexvar_epi32(idxq,_mm512_load_si512(src.add($cg*GROUP_BYTES).cast::<__m512i>()))};}
+let dep=scratch.deps[x].as_ptr();let ol=&scratch.out_lo[x];let oh=&scratch.out_hi[x];
+let next=pf.cur;pf.phase(PF_FILL+PF_FOLD,121);if PREFETCH{assert!(pf.lim-next==162*64);}else{assert_eq!(pf.cur,pf.end);}let mut out=[[_mm512_setzero_si512();2];2];
+let z=_mm512_setzero_si512();let(mut le0,mut lo0,mut he0,mut ho0,mut me0,mut mo0)=(z,z,z,z,z,z);
+let z=_mm512_setzero_si512();let(mut le1,mut lo1,mut he1,mut ho1,mut me1,mut mo1)=(z,z,z,z,z,z);
+let q0=q64!(0);
+let q1=q64!(1);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+0) as *const i8);}
+let w0=w.lohi[0];let s0=w.sum[0];let x0=_mm512_xor_si512(q0,q1);
+let q2=q64!(2);
+let q3=q64!(3);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+64) as *const i8);}
+let w2=w.lohi[1];let s2=w.sum[1];let x2=_mm512_xor_si512(q2,q3);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q0,w0),_mm512_clmulepi64_epi128::<0x00>(q2,w2));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q0,w0),_mm512_clmulepi64_epi128::<0x01>(q2,w2));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q1,w0),_mm512_clmulepi64_epi128::<0x10>(q3,w2));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q1,w0),_mm512_clmulepi64_epi128::<0x11>(q3,w2));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x0,s0),_mm512_clmulepi64_epi128::<0x00>(x2,s2));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x0,s0),_mm512_clmulepi64_epi128::<0x01>(x2,s2));
+let q128=q64!(95);
+let q129=q64!(96);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+128) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+192) as *const i8);}
+let w128=w.lohi[0];let s128=w.sum[0];let x128=_mm512_xor_si512(q128,q129);
+let g28=q64!(97);let r28=_mm512_rol_epi64::<19>(*dep.add(28));let m28=_mm512_set1_epi64(524287u64 as i64);
+let q130=_mm512_ternarylogic_epi64::<0xCA>(m28,g28,r28);let q131=_mm512_ternarylogic_epi64::<0xCA>(m28,r28,g28);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+256) as *const i8);}
+let w130=w.lohi[1];let s130=w.sum[1];let x130=_mm512_xor_si512(q130,q131);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q128,w128),_mm512_clmulepi64_epi128::<0x00>(q130,w130));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q128,w128),_mm512_clmulepi64_epi128::<0x01>(q130,w130));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q129,w128),_mm512_clmulepi64_epi128::<0x10>(q131,w130));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q129,w128),_mm512_clmulepi64_epi128::<0x11>(q131,w130));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x128,s128),_mm512_clmulepi64_epi128::<0x00>(x130,s130));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x128,s128),_mm512_clmulepi64_epi128::<0x01>(x130,s130));
+let q4=ol[0];
+let q5=ol[1];
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+320) as *const i8);}
+let w4=w.lohi[2];let s4=w.sum[2];let x4=_mm512_xor_si512(q4,q5);
+let q6=ol[2];
+let q7=ol[3];
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+384) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+448) as *const i8);}
+let w6=w.lohi[3];let s6=w.sum[3];let x6=_mm512_xor_si512(q6,q7);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q4,w4),_mm512_clmulepi64_epi128::<0x00>(q6,w6));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q4,w4),_mm512_clmulepi64_epi128::<0x01>(q6,w6));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q5,w4),_mm512_clmulepi64_epi128::<0x10>(q7,w6));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q5,w4),_mm512_clmulepi64_epi128::<0x11>(q7,w6));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x4,s4),_mm512_clmulepi64_epi128::<0x00>(x6,s6));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x4,s4),_mm512_clmulepi64_epi128::<0x01>(x6,s6));
+let q132=q64!(98);
+let q133=q64!(99);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+512) as *const i8);}
+let w132=w.lohi[2];let s132=w.sum[2];let x132=_mm512_xor_si512(q132,q133);
+let g29=q64!(100);let r29=_mm512_rol_epi64::<13>(*dep.add(29));let m29=_mm512_set1_epi64(8191u64 as i64);
+let q134=_mm512_ternarylogic_epi64::<0xCA>(m29,g29,r29);let q135=_mm512_ternarylogic_epi64::<0xCA>(m29,r29,g29);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+576) as *const i8);}
+let w134=w.lohi[3];let s134=w.sum[3];let x134=_mm512_xor_si512(q134,q135);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q132,w132),_mm512_clmulepi64_epi128::<0x00>(q134,w134));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q132,w132),_mm512_clmulepi64_epi128::<0x01>(q134,w134));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q133,w132),_mm512_clmulepi64_epi128::<0x10>(q135,w134));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q133,w132),_mm512_clmulepi64_epi128::<0x11>(q135,w134));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x132,s132),_mm512_clmulepi64_epi128::<0x00>(x134,s134));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x132,s132),_mm512_clmulepi64_epi128::<0x01>(x134,s134));
+let q8=q64!(4);
+let q9=q64!(5);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+640) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+704) as *const i8);}
+let w8=w.lohi[4];let s8=w.sum[4];let x8=_mm512_xor_si512(q8,q9);
+let q10=q64!(6);
+let q11=q64!(7);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+768) as *const i8);}
+let w10=w.lohi[5];let s10=w.sum[5];let x10=_mm512_xor_si512(q10,q11);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q8,w8),_mm512_clmulepi64_epi128::<0x00>(q10,w10));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q8,w8),_mm512_clmulepi64_epi128::<0x01>(q10,w10));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q9,w8),_mm512_clmulepi64_epi128::<0x10>(q11,w10));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q9,w8),_mm512_clmulepi64_epi128::<0x11>(q11,w10));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x8,s8),_mm512_clmulepi64_epi128::<0x00>(x10,s10));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x8,s8),_mm512_clmulepi64_epi128::<0x01>(x10,s10));
+let q136=q64!(101);
+let q137=q64!(102);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+832) as *const i8);}
+let w136=w.lohi[4];let s136=w.sum[4];let x136=_mm512_xor_si512(q136,q137);
+let g30=q64!(103);let r30=_mm512_rol_epi64::<7>(*dep.add(30));let m30=_mm512_set1_epi64(127u64 as i64);
+let q138=_mm512_ternarylogic_epi64::<0xCA>(m30,g30,r30);let q139=_mm512_ternarylogic_epi64::<0xCA>(m30,r30,g30);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+896) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+960) as *const i8);}
+let w138=w.lohi[5];let s138=w.sum[5];let x138=_mm512_xor_si512(q138,q139);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q136,w136),_mm512_clmulepi64_epi128::<0x00>(q138,w138));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q136,w136),_mm512_clmulepi64_epi128::<0x01>(q138,w138));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q137,w136),_mm512_clmulepi64_epi128::<0x10>(q139,w138));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q137,w136),_mm512_clmulepi64_epi128::<0x11>(q139,w138));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x136,s136),_mm512_clmulepi64_epi128::<0x00>(x138,s138));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x136,s136),_mm512_clmulepi64_epi128::<0x01>(x138,s138));
+let q12=q64!(8);
+let q13=q64!(9);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1024) as *const i8);}
+let w12=w.lohi[6];let s12=w.sum[6];let x12=_mm512_xor_si512(q12,q13);
+let q14=q64!(10);
+let q15=q64!(11);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1088) as *const i8);}
+let w14=w.lohi[7];let s14=w.sum[7];let x14=_mm512_xor_si512(q14,q15);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q12,w12),_mm512_clmulepi64_epi128::<0x00>(q14,w14));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q12,w12),_mm512_clmulepi64_epi128::<0x01>(q14,w14));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q13,w12),_mm512_clmulepi64_epi128::<0x10>(q15,w14));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q13,w12),_mm512_clmulepi64_epi128::<0x11>(q15,w14));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x12,s12),_mm512_clmulepi64_epi128::<0x00>(x14,s14));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x12,s12),_mm512_clmulepi64_epi128::<0x01>(x14,s14));
+let q140=q64!(104);
+let q141=q64!(105);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1152) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1216) as *const i8);}
+let w140=w.lohi[6];let s140=w.sum[6];let x140=_mm512_xor_si512(q140,q141);
+let g31=q64!(106);let r31=_mm512_rol_epi64::<1>(*dep.add(31));let m31=_mm512_set1_epi64(1u64 as i64);
+let q142=_mm512_ternarylogic_epi64::<0xCA>(m31,g31,r31);let q143=_mm512_ternarylogic_epi64::<0xCA>(m31,r31,g31);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1280) as *const i8);}
+let w142=w.lohi[7];let s142=w.sum[7];let x142=_mm512_xor_si512(q142,q143);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q140,w140),_mm512_clmulepi64_epi128::<0x00>(q142,w142));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q140,w140),_mm512_clmulepi64_epi128::<0x01>(q142,w142));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q141,w140),_mm512_clmulepi64_epi128::<0x10>(q143,w142));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q141,w140),_mm512_clmulepi64_epi128::<0x11>(q143,w142));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x140,s140),_mm512_clmulepi64_epi128::<0x00>(x142,s142));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x140,s140),_mm512_clmulepi64_epi128::<0x01>(x142,s142));
+let q16=q64!(12);
+let q17=_mm512_ternarylogic_epi64::<0xEA>(q64!(13),_mm512_set1_epi64(1),_mm512_set1_epi64(Q17_CONST as i64));
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1344) as *const i8);}
+let w16=w.lohi[8];let s16=w.sum[8];let x16=_mm512_xor_si512(q16,q17);
+let q18=_mm512_andnot_si512(_mm512_set1_epi64(1),q64!(13));
+let q19=q64!(14);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1408) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1472) as *const i8);}
+let w18=w.lohi[9];let s18=w.sum[9];let x18=_mm512_xor_si512(q18,q19);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q16,w16),_mm512_clmulepi64_epi128::<0x00>(q18,w18));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q16,w16),_mm512_clmulepi64_epi128::<0x01>(q18,w18));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q17,w16),_mm512_clmulepi64_epi128::<0x10>(q19,w18));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q17,w16),_mm512_clmulepi64_epi128::<0x11>(q19,w18));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x16,s16),_mm512_clmulepi64_epi128::<0x00>(x18,s18));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x16,s16),_mm512_clmulepi64_epi128::<0x01>(x18,s18));
+let q144=q64!(107);
+let g32=q64!(108);let r32=_mm512_rol_epi64::<59>(*dep.add(32));let m32=_mm512_set1_epi64(576460752303423487u64 as i64);
+let q145=_mm512_ternarylogic_epi64::<0xCA>(m32,g32,r32);let q146=_mm512_ternarylogic_epi64::<0xCA>(m32,r32,g32);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1536) as *const i8);}
+let w144=w.lohi[8];let s144=w.sum[8];let x144=_mm512_xor_si512(q144,q145);
+let q147=q64!(109);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1600) as *const i8);}
+let w146=w.lohi[9];let s146=w.sum[9];let x146=_mm512_xor_si512(q146,q147);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q144,w144),_mm512_clmulepi64_epi128::<0x00>(q146,w146));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q144,w144),_mm512_clmulepi64_epi128::<0x01>(q146,w146));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q145,w144),_mm512_clmulepi64_epi128::<0x10>(q147,w146));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q145,w144),_mm512_clmulepi64_epi128::<0x11>(q147,w146));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x144,s144),_mm512_clmulepi64_epi128::<0x00>(x146,s146));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x144,s144),_mm512_clmulepi64_epi128::<0x01>(x146,s146));
+let g0=q64!(15);let r0=_mm512_rol_epi64::<59>(*dep.add(0));let m0=_mm512_set1_epi64(576460752303423487u64 as i64);
+let q20=_mm512_ternarylogic_epi64::<0xCA>(m0,g0,r0);let q21=_mm512_ternarylogic_epi64::<0xCA>(m0,r0,g0);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1664) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1728) as *const i8);}
+let w20=w.lohi[10];let s20=w.sum[10];let x20=_mm512_xor_si512(q20,q21);
+let q22=q64!(16);
+let q23=q64!(17);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1792) as *const i8);}
+let w22=w.lohi[11];let s22=w.sum[11];let x22=_mm512_xor_si512(q22,q23);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q20,w20),_mm512_clmulepi64_epi128::<0x00>(q22,w22));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q20,w20),_mm512_clmulepi64_epi128::<0x01>(q22,w22));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q21,w20),_mm512_clmulepi64_epi128::<0x10>(q23,w22));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q21,w20),_mm512_clmulepi64_epi128::<0x11>(q23,w22));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x20,s20),_mm512_clmulepi64_epi128::<0x00>(x22,s22));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x20,s20),_mm512_clmulepi64_epi128::<0x01>(x22,s22));
+let q148=q64!(110);
+let g33=q64!(111);let r33=_mm512_rol_epi64::<53>(*dep.add(33));let m33=_mm512_set1_epi64(9007199254740991u64 as i64);
+let q149=_mm512_ternarylogic_epi64::<0xCA>(m33,g33,r33);let q150=_mm512_ternarylogic_epi64::<0xCA>(m33,r33,g33);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1856) as *const i8);}
+let w148=w.lohi[10];let s148=w.sum[10];let x148=_mm512_xor_si512(q148,q149);
+let q151=q64!(112);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1920) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+1984) as *const i8);}
+let w150=w.lohi[11];let s150=w.sum[11];let x150=_mm512_xor_si512(q150,q151);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q148,w148),_mm512_clmulepi64_epi128::<0x00>(q150,w150));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q148,w148),_mm512_clmulepi64_epi128::<0x01>(q150,w150));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q149,w148),_mm512_clmulepi64_epi128::<0x10>(q151,w150));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q149,w148),_mm512_clmulepi64_epi128::<0x11>(q151,w150));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x148,s148),_mm512_clmulepi64_epi128::<0x00>(x150,s150));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x148,s148),_mm512_clmulepi64_epi128::<0x01>(x150,s150));
+let g1=q64!(18);let r1=_mm512_rol_epi64::<53>(*dep.add(1));let m1=_mm512_set1_epi64(9007199254740991u64 as i64);
+let q24=_mm512_ternarylogic_epi64::<0xCA>(m1,g1,r1);let q25=_mm512_ternarylogic_epi64::<0xCA>(m1,r1,g1);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2048) as *const i8);}
+let w24=w.lohi[12];let s24=w.sum[12];let x24=_mm512_xor_si512(q24,q25);
+let q26=q64!(19);
+let q27=q64!(20);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2112) as *const i8);}
+let w26=w.lohi[13];let s26=w.sum[13];let x26=_mm512_xor_si512(q26,q27);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q24,w24),_mm512_clmulepi64_epi128::<0x00>(q26,w26));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q24,w24),_mm512_clmulepi64_epi128::<0x01>(q26,w26));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q25,w24),_mm512_clmulepi64_epi128::<0x10>(q27,w26));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q25,w24),_mm512_clmulepi64_epi128::<0x11>(q27,w26));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x24,s24),_mm512_clmulepi64_epi128::<0x00>(x26,s26));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x24,s24),_mm512_clmulepi64_epi128::<0x01>(x26,s26));
+let q152=q64!(113);
+let g34=q64!(114);let r34=_mm512_rol_epi64::<47>(*dep.add(34));let m34=_mm512_set1_epi64(140737488355327u64 as i64);
+let q153=_mm512_ternarylogic_epi64::<0xCA>(m34,g34,r34);let q154=_mm512_ternarylogic_epi64::<0xCA>(m34,r34,g34);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2176) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2240) as *const i8);}
+let w152=w.lohi[12];let s152=w.sum[12];let x152=_mm512_xor_si512(q152,q153);
+let q155=q64!(115);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2304) as *const i8);}
+let w154=w.lohi[13];let s154=w.sum[13];let x154=_mm512_xor_si512(q154,q155);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q152,w152),_mm512_clmulepi64_epi128::<0x00>(q154,w154));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q152,w152),_mm512_clmulepi64_epi128::<0x01>(q154,w154));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q153,w152),_mm512_clmulepi64_epi128::<0x10>(q155,w154));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q153,w152),_mm512_clmulepi64_epi128::<0x11>(q155,w154));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x152,s152),_mm512_clmulepi64_epi128::<0x00>(x154,s154));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x152,s152),_mm512_clmulepi64_epi128::<0x01>(x154,s154));
+let g2=q64!(21);let r2=_mm512_rol_epi64::<47>(*dep.add(2));let m2=_mm512_set1_epi64(140737488355327u64 as i64);
+let q28=_mm512_ternarylogic_epi64::<0xCA>(m2,g2,r2);let q29=_mm512_ternarylogic_epi64::<0xCA>(m2,r2,g2);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2368) as *const i8);}
+let w28=w.lohi[14];let s28=w.sum[14];let x28=_mm512_xor_si512(q28,q29);
+let q30=q64!(22);
+let q31=q64!(23);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2432) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2496) as *const i8);}
+let w30=w.lohi[15];let s30=w.sum[15];let x30=_mm512_xor_si512(q30,q31);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q28,w28),_mm512_clmulepi64_epi128::<0x00>(q30,w30));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q28,w28),_mm512_clmulepi64_epi128::<0x01>(q30,w30));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q29,w28),_mm512_clmulepi64_epi128::<0x10>(q31,w30));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q29,w28),_mm512_clmulepi64_epi128::<0x11>(q31,w30));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x28,s28),_mm512_clmulepi64_epi128::<0x00>(x30,s30));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x28,s28),_mm512_clmulepi64_epi128::<0x01>(x30,s30));
+let q156=q64!(116);
+let g35=q64!(117);let r35=_mm512_rol_epi64::<41>(*dep.add(35));let m35=_mm512_set1_epi64(2199023255551u64 as i64);
+let q157=_mm512_ternarylogic_epi64::<0xCA>(m35,g35,r35);let q158=_mm512_ternarylogic_epi64::<0xCA>(m35,r35,g35);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2560) as *const i8);}
+let w156=w.lohi[14];let s156=w.sum[14];let x156=_mm512_xor_si512(q156,q157);
+let q159=q64!(118);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2624) as *const i8);}
+let w158=w.lohi[15];let s158=w.sum[15];let x158=_mm512_xor_si512(q158,q159);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q156,w156),_mm512_clmulepi64_epi128::<0x00>(q158,w158));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q156,w156),_mm512_clmulepi64_epi128::<0x01>(q158,w158));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q157,w156),_mm512_clmulepi64_epi128::<0x10>(q159,w158));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q157,w156),_mm512_clmulepi64_epi128::<0x11>(q159,w158));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x156,s156),_mm512_clmulepi64_epi128::<0x00>(x158,s158));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x156,s156),_mm512_clmulepi64_epi128::<0x01>(x158,s158));
+let g3=q64!(24);let r3=_mm512_rol_epi64::<41>(*dep.add(3));let m3=_mm512_set1_epi64(2199023255551u64 as i64);
+let q32=_mm512_ternarylogic_epi64::<0xCA>(m3,g3,r3);let q33=_mm512_ternarylogic_epi64::<0xCA>(m3,r3,g3);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2688) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2752) as *const i8);}
+let w32=w.lohi[16];let s32=w.sum[16];let x32=_mm512_xor_si512(q32,q33);
+let q34=q64!(25);
+let q35=q64!(26);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2816) as *const i8);}
+let w34=w.lohi[17];let s34=w.sum[17];let x34=_mm512_xor_si512(q34,q35);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q32,w32),_mm512_clmulepi64_epi128::<0x00>(q34,w34));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q32,w32),_mm512_clmulepi64_epi128::<0x01>(q34,w34));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q33,w32),_mm512_clmulepi64_epi128::<0x10>(q35,w34));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q33,w32),_mm512_clmulepi64_epi128::<0x11>(q35,w34));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x32,s32),_mm512_clmulepi64_epi128::<0x00>(x34,s34));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x32,s32),_mm512_clmulepi64_epi128::<0x01>(x34,s34));
+let q160=q64!(119);
+let g36=q64!(120);let r36=_mm512_rol_epi64::<35>(*dep.add(36));let m36=_mm512_set1_epi64(34359738367u64 as i64);
+let q161=_mm512_ternarylogic_epi64::<0xCA>(m36,g36,r36);let q162=_mm512_ternarylogic_epi64::<0xCA>(m36,r36,g36);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2880) as *const i8);}
+let w160=w.lohi[16];let s160=w.sum[16];let x160=_mm512_xor_si512(q160,q161);
+let q163=q64!(121);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+2944) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3008) as *const i8);}
+let w162=w.lohi[17];let s162=w.sum[17];let x162=_mm512_xor_si512(q162,q163);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q160,w160),_mm512_clmulepi64_epi128::<0x00>(q162,w162));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q160,w160),_mm512_clmulepi64_epi128::<0x01>(q162,w162));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q161,w160),_mm512_clmulepi64_epi128::<0x10>(q163,w162));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q161,w160),_mm512_clmulepi64_epi128::<0x11>(q163,w162));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x160,s160),_mm512_clmulepi64_epi128::<0x00>(x162,s162));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x160,s160),_mm512_clmulepi64_epi128::<0x01>(x162,s162));
+let g4=q64!(27);let r4=_mm512_rol_epi64::<35>(*dep.add(4));let m4=_mm512_set1_epi64(34359738367u64 as i64);
+let q36=_mm512_ternarylogic_epi64::<0xCA>(m4,g4,r4);let q37=_mm512_ternarylogic_epi64::<0xCA>(m4,r4,g4);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3072) as *const i8);}
+let w36=w.lohi[18];let s36=w.sum[18];let x36=_mm512_xor_si512(q36,q37);
+let q38=q64!(28);
+let q39=q64!(29);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3136) as *const i8);}
+let w38=w.lohi[19];let s38=w.sum[19];let x38=_mm512_xor_si512(q38,q39);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q36,w36),_mm512_clmulepi64_epi128::<0x00>(q38,w38));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q36,w36),_mm512_clmulepi64_epi128::<0x01>(q38,w38));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q37,w36),_mm512_clmulepi64_epi128::<0x10>(q39,w38));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q37,w36),_mm512_clmulepi64_epi128::<0x11>(q39,w38));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x36,s36),_mm512_clmulepi64_epi128::<0x00>(x38,s38));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x36,s36),_mm512_clmulepi64_epi128::<0x01>(x38,s38));
+let q164=q64!(122);
+let g37=q64!(123);let r37=_mm512_rol_epi64::<29>(*dep.add(37));let m37=_mm512_set1_epi64(536870911u64 as i64);
+let q165=_mm512_ternarylogic_epi64::<0xCA>(m37,g37,r37);let q166=_mm512_ternarylogic_epi64::<0xCA>(m37,r37,g37);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3200) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3264) as *const i8);}
+let w164=w.lohi[18];let s164=w.sum[18];let x164=_mm512_xor_si512(q164,q165);
+let q167=q64!(124);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3328) as *const i8);}
+let w166=w.lohi[19];let s166=w.sum[19];let x166=_mm512_xor_si512(q166,q167);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q164,w164),_mm512_clmulepi64_epi128::<0x00>(q166,w166));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q164,w164),_mm512_clmulepi64_epi128::<0x01>(q166,w166));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q165,w164),_mm512_clmulepi64_epi128::<0x10>(q167,w166));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q165,w164),_mm512_clmulepi64_epi128::<0x11>(q167,w166));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x164,s164),_mm512_clmulepi64_epi128::<0x00>(x166,s166));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x164,s164),_mm512_clmulepi64_epi128::<0x01>(x166,s166));
+let g5=q64!(30);let r5=_mm512_rol_epi64::<29>(*dep.add(5));let m5=_mm512_set1_epi64(536870911u64 as i64);
+let q40=_mm512_ternarylogic_epi64::<0xCA>(m5,g5,r5);let q41=_mm512_ternarylogic_epi64::<0xCA>(m5,r5,g5);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3392) as *const i8);}
+let w40=w.lohi[20];let s40=w.sum[20];let x40=_mm512_xor_si512(q40,q41);
+let q42=q64!(31);
+let q43=q64!(32);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3456) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3520) as *const i8);}
+let w42=w.lohi[21];let s42=w.sum[21];let x42=_mm512_xor_si512(q42,q43);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q40,w40),_mm512_clmulepi64_epi128::<0x00>(q42,w42));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q40,w40),_mm512_clmulepi64_epi128::<0x01>(q42,w42));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q41,w40),_mm512_clmulepi64_epi128::<0x10>(q43,w42));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q41,w40),_mm512_clmulepi64_epi128::<0x11>(q43,w42));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x40,s40),_mm512_clmulepi64_epi128::<0x00>(x42,s42));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x40,s40),_mm512_clmulepi64_epi128::<0x01>(x42,s42));
+let q168=q64!(125);
+let g38=q64!(126);let r38=_mm512_rol_epi64::<23>(*dep.add(38));let m38=_mm512_set1_epi64(8388607u64 as i64);
+let q169=_mm512_ternarylogic_epi64::<0xCA>(m38,g38,r38);let q170=_mm512_ternarylogic_epi64::<0xCA>(m38,r38,g38);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3584) as *const i8);}
+let w168=w.lohi[20];let s168=w.sum[20];let x168=_mm512_xor_si512(q168,q169);
+let q171=q64!(127);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3648) as *const i8);}
+let w170=w.lohi[21];let s170=w.sum[21];let x170=_mm512_xor_si512(q170,q171);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q168,w168),_mm512_clmulepi64_epi128::<0x00>(q170,w170));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q168,w168),_mm512_clmulepi64_epi128::<0x01>(q170,w170));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q169,w168),_mm512_clmulepi64_epi128::<0x10>(q171,w170));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q169,w168),_mm512_clmulepi64_epi128::<0x11>(q171,w170));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x168,s168),_mm512_clmulepi64_epi128::<0x00>(x170,s170));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x168,s168),_mm512_clmulepi64_epi128::<0x01>(x170,s170));
+let g6=q64!(33);let r6=_mm512_rol_epi64::<23>(*dep.add(6));let m6=_mm512_set1_epi64(8388607u64 as i64);
+let q44=_mm512_ternarylogic_epi64::<0xCA>(m6,g6,r6);let q45=_mm512_ternarylogic_epi64::<0xCA>(m6,r6,g6);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3712) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3776) as *const i8);}
+let w44=w.lohi[22];let s44=w.sum[22];let x44=_mm512_xor_si512(q44,q45);
+let q46=q64!(34);
+let q47=q64!(35);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3840) as *const i8);}
+let w46=w.lohi[23];let s46=w.sum[23];let x46=_mm512_xor_si512(q46,q47);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q44,w44),_mm512_clmulepi64_epi128::<0x00>(q46,w46));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q44,w44),_mm512_clmulepi64_epi128::<0x01>(q46,w46));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q45,w44),_mm512_clmulepi64_epi128::<0x10>(q47,w46));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q45,w44),_mm512_clmulepi64_epi128::<0x11>(q47,w46));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x44,s44),_mm512_clmulepi64_epi128::<0x00>(x46,s46));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x44,s44),_mm512_clmulepi64_epi128::<0x01>(x46,s46));
+let q172=q64!(128);
+let g39=q64!(129);let r39=_mm512_rol_epi64::<17>(*dep.add(39));let m39=_mm512_set1_epi64(131071u64 as i64);
+let q173=_mm512_ternarylogic_epi64::<0xCA>(m39,g39,r39);let q174=_mm512_ternarylogic_epi64::<0xCA>(m39,r39,g39);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3904) as *const i8);}
+let w172=w.lohi[22];let s172=w.sum[22];let x172=_mm512_xor_si512(q172,q173);
+let q175=q64!(130);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+3968) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4032) as *const i8);}
+let w174=w.lohi[23];let s174=w.sum[23];let x174=_mm512_xor_si512(q174,q175);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q172,w172),_mm512_clmulepi64_epi128::<0x00>(q174,w174));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q172,w172),_mm512_clmulepi64_epi128::<0x01>(q174,w174));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q173,w172),_mm512_clmulepi64_epi128::<0x10>(q175,w174));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q173,w172),_mm512_clmulepi64_epi128::<0x11>(q175,w174));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x172,s172),_mm512_clmulepi64_epi128::<0x00>(x174,s174));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x172,s172),_mm512_clmulepi64_epi128::<0x01>(x174,s174));
+let g7=q64!(36);let r7=_mm512_rol_epi64::<17>(*dep.add(7));let m7=_mm512_set1_epi64(131071u64 as i64);
+let q48=_mm512_ternarylogic_epi64::<0xCA>(m7,g7,r7);let q49=_mm512_ternarylogic_epi64::<0xCA>(m7,r7,g7);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4096) as *const i8);}
+let w48=w.lohi[24];let s48=w.sum[24];let x48=_mm512_xor_si512(q48,q49);
+let q50=q64!(37);
+let q51=q64!(38);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4160) as *const i8);}
+let w50=w.lohi[25];let s50=w.sum[25];let x50=_mm512_xor_si512(q50,q51);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q48,w48),_mm512_clmulepi64_epi128::<0x00>(q50,w50));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q48,w48),_mm512_clmulepi64_epi128::<0x01>(q50,w50));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q49,w48),_mm512_clmulepi64_epi128::<0x10>(q51,w50));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q49,w48),_mm512_clmulepi64_epi128::<0x11>(q51,w50));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x48,s48),_mm512_clmulepi64_epi128::<0x00>(x50,s50));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x48,s48),_mm512_clmulepi64_epi128::<0x01>(x50,s50));
+let q176=q64!(131);
+let g40=q64!(132);let r40=_mm512_rol_epi64::<11>(*dep.add(40));let m40=_mm512_set1_epi64(2047u64 as i64);
+let q177=_mm512_ternarylogic_epi64::<0xCA>(m40,g40,r40);let q178=_mm512_ternarylogic_epi64::<0xCA>(m40,r40,g40);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4224) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4288) as *const i8);}
+let w176=w.lohi[24];let s176=w.sum[24];let x176=_mm512_xor_si512(q176,q177);
+let q179=q64!(133);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4352) as *const i8);}
+let w178=w.lohi[25];let s178=w.sum[25];let x178=_mm512_xor_si512(q178,q179);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q176,w176),_mm512_clmulepi64_epi128::<0x00>(q178,w178));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q176,w176),_mm512_clmulepi64_epi128::<0x01>(q178,w178));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q177,w176),_mm512_clmulepi64_epi128::<0x10>(q179,w178));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q177,w176),_mm512_clmulepi64_epi128::<0x11>(q179,w178));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x176,s176),_mm512_clmulepi64_epi128::<0x00>(x178,s178));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x176,s176),_mm512_clmulepi64_epi128::<0x01>(x178,s178));
+let g8=q64!(39);let r8=_mm512_rol_epi64::<11>(*dep.add(8));let m8=_mm512_set1_epi64(2047u64 as i64);
+let q52=_mm512_ternarylogic_epi64::<0xCA>(m8,g8,r8);let q53=_mm512_ternarylogic_epi64::<0xCA>(m8,r8,g8);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4416) as *const i8);}
+let w52=w.lohi[26];let s52=w.sum[26];let x52=_mm512_xor_si512(q52,q53);
+let q54=q64!(40);
+let q55=q64!(41);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4480) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4544) as *const i8);}
+let w54=w.lohi[27];let s54=w.sum[27];let x54=_mm512_xor_si512(q54,q55);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q52,w52),_mm512_clmulepi64_epi128::<0x00>(q54,w54));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q52,w52),_mm512_clmulepi64_epi128::<0x01>(q54,w54));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q53,w52),_mm512_clmulepi64_epi128::<0x10>(q55,w54));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q53,w52),_mm512_clmulepi64_epi128::<0x11>(q55,w54));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x52,s52),_mm512_clmulepi64_epi128::<0x00>(x54,s54));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x52,s52),_mm512_clmulepi64_epi128::<0x01>(x54,s54));
+let q180=q64!(134);
+let g41=q64!(135);let r41=_mm512_rol_epi64::<5>(*dep.add(41));let m41=_mm512_set1_epi64(31u64 as i64);
+let q181=_mm512_ternarylogic_epi64::<0xCA>(m41,g41,r41);let q182=_mm512_ternarylogic_epi64::<0xCA>(m41,r41,g41);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4608) as *const i8);}
+let w180=w.lohi[26];let s180=w.sum[26];let x180=_mm512_xor_si512(q180,q181);
+let q183=q64!(136);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4672) as *const i8);}
+let w182=w.lohi[27];let s182=w.sum[27];let x182=_mm512_xor_si512(q182,q183);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q180,w180),_mm512_clmulepi64_epi128::<0x00>(q182,w182));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q180,w180),_mm512_clmulepi64_epi128::<0x01>(q182,w182));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q181,w180),_mm512_clmulepi64_epi128::<0x10>(q183,w182));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q181,w180),_mm512_clmulepi64_epi128::<0x11>(q183,w182));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x180,s180),_mm512_clmulepi64_epi128::<0x00>(x182,s182));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x180,s180),_mm512_clmulepi64_epi128::<0x01>(x182,s182));
+let g9=q64!(42);let r9=_mm512_rol_epi64::<5>(*dep.add(9));let m9=_mm512_set1_epi64(31u64 as i64);
+let q56=_mm512_ternarylogic_epi64::<0xCA>(m9,g9,r9);let q57=_mm512_ternarylogic_epi64::<0xCA>(m9,r9,g9);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4736) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4800) as *const i8);}
+let w56=w.lohi[28];let s56=w.sum[28];let x56=_mm512_xor_si512(q56,q57);
+let q58=q64!(43);
+let g10=q64!(44);let r10=_mm512_rol_epi64::<63>(*dep.add(10));let m10=_mm512_set1_epi64(9223372036854775807u64 as i64);
+let q59=_mm512_ternarylogic_epi64::<0xCA>(m10,g10,r10);let q60=_mm512_ternarylogic_epi64::<0xCA>(m10,r10,g10);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4864) as *const i8);}
+let w58=w.lohi[29];let s58=w.sum[29];let x58=_mm512_xor_si512(q58,q59);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q56,w56),_mm512_clmulepi64_epi128::<0x00>(q58,w58));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q56,w56),_mm512_clmulepi64_epi128::<0x01>(q58,w58));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q57,w56),_mm512_clmulepi64_epi128::<0x10>(q59,w58));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q57,w56),_mm512_clmulepi64_epi128::<0x11>(q59,w58));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x56,s56),_mm512_clmulepi64_epi128::<0x00>(x58,s58));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x56,s56),_mm512_clmulepi64_epi128::<0x01>(x58,s58));
+let g42=q64!(137);let r42=_mm512_rol_epi64::<63>(*dep.add(42));let m42=_mm512_set1_epi64(9223372036854775807u64 as i64);
+let q184=_mm512_ternarylogic_epi64::<0xCA>(m42,g42,r42);let q185=_mm512_ternarylogic_epi64::<0xCA>(m42,r42,g42);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4928) as *const i8);}
+let w184=w.lohi[28];let s184=w.sum[28];let x184=_mm512_xor_si512(q184,q185);
+let q186=q64!(138);
+let q187=q64!(139);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+4992) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5056) as *const i8);}
+let w186=w.lohi[29];let s186=w.sum[29];let x186=_mm512_xor_si512(q186,q187);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q184,w184),_mm512_clmulepi64_epi128::<0x00>(q186,w186));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q184,w184),_mm512_clmulepi64_epi128::<0x01>(q186,w186));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q185,w184),_mm512_clmulepi64_epi128::<0x10>(q187,w186));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q185,w184),_mm512_clmulepi64_epi128::<0x11>(q187,w186));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x184,s184),_mm512_clmulepi64_epi128::<0x00>(x186,s186));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x184,s184),_mm512_clmulepi64_epi128::<0x01>(x186,s186));
+let q61=q64!(45);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5120) as *const i8);}
+let w60=w.lohi[30];let s60=w.sum[30];let x60=_mm512_xor_si512(q60,q61);
+let q62=q64!(46);
+let g11=q64!(47);let r11=_mm512_rol_epi64::<57>(*dep.add(11));let m11=_mm512_set1_epi64(144115188075855871u64 as i64);
+let q63=_mm512_ternarylogic_epi64::<0xCA>(m11,g11,r11);let q64=_mm512_ternarylogic_epi64::<0xCA>(m11,r11,g11);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5184) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5248) as *const i8);}
+let w62=w.lohi[31];let s62=w.sum[31];let x62=_mm512_xor_si512(q62,q63);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q60,w60),_mm512_clmulepi64_epi128::<0x00>(q62,w62));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q60,w60),_mm512_clmulepi64_epi128::<0x01>(q62,w62));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q61,w60),_mm512_clmulepi64_epi128::<0x10>(q63,w62));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q61,w60),_mm512_clmulepi64_epi128::<0x11>(q63,w62));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x60,s60),_mm512_clmulepi64_epi128::<0x00>(x62,s62));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x60,s60),_mm512_clmulepi64_epi128::<0x01>(x62,s62));
+let g43=q64!(140);let r43=_mm512_rol_epi64::<57>(*dep.add(43));let m43=_mm512_set1_epi64(144115188075855871u64 as i64);
+let q188=_mm512_ternarylogic_epi64::<0xCA>(m43,g43,r43);let q189=_mm512_ternarylogic_epi64::<0xCA>(m43,r43,g43);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5312) as *const i8);}
+let w188=w.lohi[30];let s188=w.sum[30];let x188=_mm512_xor_si512(q188,q189);
+let q190=q64!(141);
+let q191=q64!(142);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5376) as *const i8);}
+let w190=w.lohi[31];let s190=w.sum[31];let x190=_mm512_xor_si512(q190,q191);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q188,w188),_mm512_clmulepi64_epi128::<0x00>(q190,w190));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q188,w188),_mm512_clmulepi64_epi128::<0x01>(q190,w190));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q189,w188),_mm512_clmulepi64_epi128::<0x10>(q191,w190));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q189,w188),_mm512_clmulepi64_epi128::<0x11>(q191,w190));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x188,s188),_mm512_clmulepi64_epi128::<0x00>(x190,s190));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x188,s188),_mm512_clmulepi64_epi128::<0x01>(x190,s190));
+let q65=q64!(48);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5440) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5504) as *const i8);}
+let w64=w.lohi[32];let s64=w.sum[32];let x64=_mm512_xor_si512(q64,q65);
+let q66=q64!(49);
+let g12=q64!(50);let r12=_mm512_rol_epi64::<51>(*dep.add(12));let m12=_mm512_set1_epi64(2251799813685247u64 as i64);
+let q67=_mm512_ternarylogic_epi64::<0xCA>(m12,g12,r12);let q68=_mm512_ternarylogic_epi64::<0xCA>(m12,r12,g12);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5568) as *const i8);}
+let w66=w.lohi[33];let s66=w.sum[33];let x66=_mm512_xor_si512(q66,q67);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q64,w64),_mm512_clmulepi64_epi128::<0x00>(q66,w66));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q64,w64),_mm512_clmulepi64_epi128::<0x01>(q66,w66));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q65,w64),_mm512_clmulepi64_epi128::<0x10>(q67,w66));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q65,w64),_mm512_clmulepi64_epi128::<0x11>(q67,w66));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x64,s64),_mm512_clmulepi64_epi128::<0x00>(x66,s66));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x64,s64),_mm512_clmulepi64_epi128::<0x01>(x66,s66));
+let g44=q64!(143);let r44=_mm512_rol_epi64::<51>(*dep.add(44));let m44=_mm512_set1_epi64(2251799813685247u64 as i64);
+let q192=_mm512_ternarylogic_epi64::<0xCA>(m44,g44,r44);let q193=_mm512_ternarylogic_epi64::<0xCA>(m44,r44,g44);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5632) as *const i8);}
+let w192=w.lohi[32];let s192=w.sum[32];let x192=_mm512_xor_si512(q192,q193);
+let q194=q64!(144);
+let q195=q64!(145);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5696) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5760) as *const i8);}
+let w194=w.lohi[33];let s194=w.sum[33];let x194=_mm512_xor_si512(q194,q195);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q192,w192),_mm512_clmulepi64_epi128::<0x00>(q194,w194));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q192,w192),_mm512_clmulepi64_epi128::<0x01>(q194,w194));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q193,w192),_mm512_clmulepi64_epi128::<0x10>(q195,w194));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q193,w192),_mm512_clmulepi64_epi128::<0x11>(q195,w194));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x192,s192),_mm512_clmulepi64_epi128::<0x00>(x194,s194));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x192,s192),_mm512_clmulepi64_epi128::<0x01>(x194,s194));
+let q69=q64!(51);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5824) as *const i8);}
+let w68=w.lohi[34];let s68=w.sum[34];let x68=_mm512_xor_si512(q68,q69);
+let q70=q64!(52);
+let g13=q64!(53);let r13=_mm512_rol_epi64::<45>(*dep.add(13));let m13=_mm512_set1_epi64(35184372088831u64 as i64);
+let q71=_mm512_ternarylogic_epi64::<0xCA>(m13,g13,r13);let q72=_mm512_ternarylogic_epi64::<0xCA>(m13,r13,g13);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5888) as *const i8);}
+let w70=w.lohi[35];let s70=w.sum[35];let x70=_mm512_xor_si512(q70,q71);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q68,w68),_mm512_clmulepi64_epi128::<0x00>(q70,w70));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q68,w68),_mm512_clmulepi64_epi128::<0x01>(q70,w70));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q69,w68),_mm512_clmulepi64_epi128::<0x10>(q71,w70));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q69,w68),_mm512_clmulepi64_epi128::<0x11>(q71,w70));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x68,s68),_mm512_clmulepi64_epi128::<0x00>(x70,s70));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x68,s68),_mm512_clmulepi64_epi128::<0x01>(x70,s70));
+let g45=q64!(146);let r45=_mm512_rol_epi64::<45>(*dep.add(45));let m45=_mm512_set1_epi64(35184372088831u64 as i64);
+let q196=_mm512_ternarylogic_epi64::<0xCA>(m45,g45,r45);let q197=_mm512_ternarylogic_epi64::<0xCA>(m45,r45,g45);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+5952) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6016) as *const i8);}
+let w196=w.lohi[34];let s196=w.sum[34];let x196=_mm512_xor_si512(q196,q197);
+let q198=q64!(147);
+let q199=q64!(148);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6080) as *const i8);}
+let w198=w.lohi[35];let s198=w.sum[35];let x198=_mm512_xor_si512(q198,q199);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q196,w196),_mm512_clmulepi64_epi128::<0x00>(q198,w198));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q196,w196),_mm512_clmulepi64_epi128::<0x01>(q198,w198));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q197,w196),_mm512_clmulepi64_epi128::<0x10>(q199,w198));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q197,w196),_mm512_clmulepi64_epi128::<0x11>(q199,w198));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x196,s196),_mm512_clmulepi64_epi128::<0x00>(x198,s198));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x196,s196),_mm512_clmulepi64_epi128::<0x01>(x198,s198));
+let q73=q64!(54);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6144) as *const i8);}
+let w72=w.lohi[36];let s72=w.sum[36];let x72=_mm512_xor_si512(q72,q73);
+let q74=q64!(55);
+let g14=q64!(56);let r14=_mm512_rol_epi64::<39>(*dep.add(14));let m14=_mm512_set1_epi64(549755813887u64 as i64);
+let q75=_mm512_ternarylogic_epi64::<0xCA>(m14,g14,r14);let q76=_mm512_ternarylogic_epi64::<0xCA>(m14,r14,g14);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6208) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6272) as *const i8);}
+let w74=w.lohi[37];let s74=w.sum[37];let x74=_mm512_xor_si512(q74,q75);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q72,w72),_mm512_clmulepi64_epi128::<0x00>(q74,w74));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q72,w72),_mm512_clmulepi64_epi128::<0x01>(q74,w74));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q73,w72),_mm512_clmulepi64_epi128::<0x10>(q75,w74));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q73,w72),_mm512_clmulepi64_epi128::<0x11>(q75,w74));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x72,s72),_mm512_clmulepi64_epi128::<0x00>(x74,s74));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x72,s72),_mm512_clmulepi64_epi128::<0x01>(x74,s74));
+let g46=q64!(149);let r46=_mm512_rol_epi64::<39>(*dep.add(46));let m46=_mm512_set1_epi64(549755813887u64 as i64);
+let q200=_mm512_ternarylogic_epi64::<0xCA>(m46,g46,r46);let q201=_mm512_ternarylogic_epi64::<0xCA>(m46,r46,g46);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6336) as *const i8);}
+let w200=w.lohi[36];let s200=w.sum[36];let x200=_mm512_xor_si512(q200,q201);
+let q202=q64!(150);
+let q203=q64!(151);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6400) as *const i8);}
+let w202=w.lohi[37];let s202=w.sum[37];let x202=_mm512_xor_si512(q202,q203);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q200,w200),_mm512_clmulepi64_epi128::<0x00>(q202,w202));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q200,w200),_mm512_clmulepi64_epi128::<0x01>(q202,w202));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q201,w200),_mm512_clmulepi64_epi128::<0x10>(q203,w202));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q201,w200),_mm512_clmulepi64_epi128::<0x11>(q203,w202));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x200,s200),_mm512_clmulepi64_epi128::<0x00>(x202,s202));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x200,s200),_mm512_clmulepi64_epi128::<0x01>(x202,s202));
+let q77=q64!(57);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6464) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6528) as *const i8);}
+let w76=w.lohi[38];let s76=w.sum[38];let x76=_mm512_xor_si512(q76,q77);
+let q78=q64!(58);
+let g15=q64!(59);let r15=_mm512_rol_epi64::<33>(*dep.add(15));let m15=_mm512_set1_epi64(8589934591u64 as i64);
+let q79=_mm512_ternarylogic_epi64::<0xCA>(m15,g15,r15);let q80=_mm512_ternarylogic_epi64::<0xCA>(m15,r15,g15);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6592) as *const i8);}
+let w78=w.lohi[39];let s78=w.sum[39];let x78=_mm512_xor_si512(q78,q79);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q76,w76),_mm512_clmulepi64_epi128::<0x00>(q78,w78));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q76,w76),_mm512_clmulepi64_epi128::<0x01>(q78,w78));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q77,w76),_mm512_clmulepi64_epi128::<0x10>(q79,w78));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q77,w76),_mm512_clmulepi64_epi128::<0x11>(q79,w78));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x76,s76),_mm512_clmulepi64_epi128::<0x00>(x78,s78));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x76,s76),_mm512_clmulepi64_epi128::<0x01>(x78,s78));
+let g47=q64!(152);let r47=_mm512_rol_epi64::<33>(*dep.add(47));let m47=_mm512_set1_epi64(8589934591u64 as i64);
+let q204=_mm512_ternarylogic_epi64::<0xCA>(m47,g47,r47);let q205=_mm512_ternarylogic_epi64::<0xCA>(m47,r47,g47);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6656) as *const i8);}
+let w204=w.lohi[38];let s204=w.sum[38];let x204=_mm512_xor_si512(q204,q205);
+let q206=q64!(153);
+let q207=q64!(154);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6720) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6784) as *const i8);}
+let w206=w.lohi[39];let s206=w.sum[39];let x206=_mm512_xor_si512(q206,q207);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q204,w204),_mm512_clmulepi64_epi128::<0x00>(q206,w206));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q204,w204),_mm512_clmulepi64_epi128::<0x01>(q206,w206));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q205,w204),_mm512_clmulepi64_epi128::<0x10>(q207,w206));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q205,w204),_mm512_clmulepi64_epi128::<0x11>(q207,w206));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x204,s204),_mm512_clmulepi64_epi128::<0x00>(x206,s206));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x204,s204),_mm512_clmulepi64_epi128::<0x01>(x206,s206));
+let q81=q64!(60);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6848) as *const i8);}
+let w80=w.lohi[40];let s80=w.sum[40];let x80=_mm512_xor_si512(q80,q81);
+let q82=q64!(61);
+let g16=q64!(62);let r16=_mm512_rol_epi64::<27>(*dep.add(16));let m16=_mm512_set1_epi64(134217727u64 as i64);
+let q83=_mm512_ternarylogic_epi64::<0xCA>(m16,g16,r16);let q84=_mm512_ternarylogic_epi64::<0xCA>(m16,r16,g16);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6912) as *const i8);}
+let w82=w.lohi[41];let s82=w.sum[41];let x82=_mm512_xor_si512(q82,q83);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q80,w80),_mm512_clmulepi64_epi128::<0x00>(q82,w82));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q80,w80),_mm512_clmulepi64_epi128::<0x01>(q82,w82));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q81,w80),_mm512_clmulepi64_epi128::<0x10>(q83,w82));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q81,w80),_mm512_clmulepi64_epi128::<0x11>(q83,w82));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x80,s80),_mm512_clmulepi64_epi128::<0x00>(x82,s82));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x80,s80),_mm512_clmulepi64_epi128::<0x01>(x82,s82));
+let g48=q64!(155);let r48=_mm512_rol_epi64::<27>(*dep.add(48));let m48=_mm512_set1_epi64(134217727u64 as i64);
+let q208=_mm512_ternarylogic_epi64::<0xCA>(m48,g48,r48);let q209=_mm512_ternarylogic_epi64::<0xCA>(m48,r48,g48);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+6976) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7040) as *const i8);}
+let w208=w.lohi[40];let s208=w.sum[40];let x208=_mm512_xor_si512(q208,q209);
+let q210=q64!(156);
+let q211=q64!(157);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7104) as *const i8);}
+let w210=w.lohi[41];let s210=w.sum[41];let x210=_mm512_xor_si512(q210,q211);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q208,w208),_mm512_clmulepi64_epi128::<0x00>(q210,w210));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q208,w208),_mm512_clmulepi64_epi128::<0x01>(q210,w210));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q209,w208),_mm512_clmulepi64_epi128::<0x10>(q211,w210));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q209,w208),_mm512_clmulepi64_epi128::<0x11>(q211,w210));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x208,s208),_mm512_clmulepi64_epi128::<0x00>(x210,s210));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x208,s208),_mm512_clmulepi64_epi128::<0x01>(x210,s210));
+let q85=q64!(63);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7168) as *const i8);}
+let w84=w.lohi[42];let s84=w.sum[42];let x84=_mm512_xor_si512(q84,q85);
+let q86=q64!(64);
+let g17=q64!(65);let r17=_mm512_rol_epi64::<21>(*dep.add(17));let m17=_mm512_set1_epi64(2097151u64 as i64);
+let q87=_mm512_ternarylogic_epi64::<0xCA>(m17,g17,r17);let q88=_mm512_ternarylogic_epi64::<0xCA>(m17,r17,g17);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7232) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7296) as *const i8);}
+let w86=w.lohi[43];let s86=w.sum[43];let x86=_mm512_xor_si512(q86,q87);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q84,w84),_mm512_clmulepi64_epi128::<0x00>(q86,w86));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q84,w84),_mm512_clmulepi64_epi128::<0x01>(q86,w86));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q85,w84),_mm512_clmulepi64_epi128::<0x10>(q87,w86));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q85,w84),_mm512_clmulepi64_epi128::<0x11>(q87,w86));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x84,s84),_mm512_clmulepi64_epi128::<0x00>(x86,s86));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x84,s84),_mm512_clmulepi64_epi128::<0x01>(x86,s86));
+let g49=q64!(158);let r49=_mm512_rol_epi64::<21>(*dep.add(49));let m49=_mm512_set1_epi64(2097151u64 as i64);
+let q212=_mm512_ternarylogic_epi64::<0xCA>(m49,g49,r49);let q213=_mm512_ternarylogic_epi64::<0xCA>(m49,r49,g49);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7360) as *const i8);}
+let w212=w.lohi[42];let s212=w.sum[42];let x212=_mm512_xor_si512(q212,q213);
+let q214=q64!(159);
+let q215=q64!(160);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7424) as *const i8);}
+let w214=w.lohi[43];let s214=w.sum[43];let x214=_mm512_xor_si512(q214,q215);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q212,w212),_mm512_clmulepi64_epi128::<0x00>(q214,w214));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q212,w212),_mm512_clmulepi64_epi128::<0x01>(q214,w214));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q213,w212),_mm512_clmulepi64_epi128::<0x10>(q215,w214));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q213,w212),_mm512_clmulepi64_epi128::<0x11>(q215,w214));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x212,s212),_mm512_clmulepi64_epi128::<0x00>(x214,s214));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x212,s212),_mm512_clmulepi64_epi128::<0x01>(x214,s214));
+let q89=q64!(66);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7488) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7552) as *const i8);}
+let w88=w.lohi[44];let s88=w.sum[44];let x88=_mm512_xor_si512(q88,q89);
+let q90=q64!(67);
+let g18=q64!(68);let r18=_mm512_rol_epi64::<15>(*dep.add(18));let m18=_mm512_set1_epi64(32767u64 as i64);
+let q91=_mm512_ternarylogic_epi64::<0xCA>(m18,g18,r18);let q92=_mm512_ternarylogic_epi64::<0xCA>(m18,r18,g18);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7616) as *const i8);}
+let w90=w.lohi[45];let s90=w.sum[45];let x90=_mm512_xor_si512(q90,q91);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q88,w88),_mm512_clmulepi64_epi128::<0x00>(q90,w90));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q88,w88),_mm512_clmulepi64_epi128::<0x01>(q90,w90));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q89,w88),_mm512_clmulepi64_epi128::<0x10>(q91,w90));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q89,w88),_mm512_clmulepi64_epi128::<0x11>(q91,w90));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x88,s88),_mm512_clmulepi64_epi128::<0x00>(x90,s90));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x88,s88),_mm512_clmulepi64_epi128::<0x01>(x90,s90));
+let g50=q64!(161);let r50=_mm512_rol_epi64::<15>(*dep.add(50));let m50=_mm512_set1_epi64(32767u64 as i64);
+let q216=_mm512_ternarylogic_epi64::<0xCA>(m50,g50,r50);let q217=_mm512_ternarylogic_epi64::<0xCA>(m50,r50,g50);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7680) as *const i8);}
+let w216=w.lohi[44];let s216=w.sum[44];let x216=_mm512_xor_si512(q216,q217);
+let q218=q64!(162);
+let q219=q64!(163);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7744) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7808) as *const i8);}
+let w218=w.lohi[45];let s218=w.sum[45];let x218=_mm512_xor_si512(q218,q219);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q216,w216),_mm512_clmulepi64_epi128::<0x00>(q218,w218));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q216,w216),_mm512_clmulepi64_epi128::<0x01>(q218,w218));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q217,w216),_mm512_clmulepi64_epi128::<0x10>(q219,w218));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q217,w216),_mm512_clmulepi64_epi128::<0x11>(q219,w218));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x216,s216),_mm512_clmulepi64_epi128::<0x00>(x218,s218));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x216,s216),_mm512_clmulepi64_epi128::<0x01>(x218,s218));
+let q93=q64!(69);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7872) as *const i8);}
+let w92=w.lohi[46];let s92=w.sum[46];let x92=_mm512_xor_si512(q92,q93);
+let q94=q64!(70);
+let g19=q64!(71);let r19=_mm512_rol_epi64::<9>(*dep.add(19));let m19=_mm512_set1_epi64(511u64 as i64);
+let q95=_mm512_ternarylogic_epi64::<0xCA>(m19,g19,r19);let q96=_mm512_ternarylogic_epi64::<0xCA>(m19,r19,g19);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+7936) as *const i8);}
+let w94=w.lohi[47];let s94=w.sum[47];let x94=_mm512_xor_si512(q94,q95);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q92,w92),_mm512_clmulepi64_epi128::<0x00>(q94,w94));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q92,w92),_mm512_clmulepi64_epi128::<0x01>(q94,w94));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q93,w92),_mm512_clmulepi64_epi128::<0x10>(q95,w94));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q93,w92),_mm512_clmulepi64_epi128::<0x11>(q95,w94));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x92,s92),_mm512_clmulepi64_epi128::<0x00>(x94,s94));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x92,s92),_mm512_clmulepi64_epi128::<0x01>(x94,s94));
+let g51=q64!(164);let r51=_mm512_rol_epi64::<9>(*dep.add(51));let m51=_mm512_set1_epi64(511u64 as i64);
+let q220=_mm512_ternarylogic_epi64::<0xCA>(m51,g51,r51);let q221=_mm512_ternarylogic_epi64::<0xCA>(m51,r51,g51);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8000) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8064) as *const i8);}
+let w220=w.lohi[46];let s220=w.sum[46];let x220=_mm512_xor_si512(q220,q221);
+let q222=q64!(165);
+let q223=q64!(166);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8128) as *const i8);}
+let w222=w.lohi[47];let s222=w.sum[47];let x222=_mm512_xor_si512(q222,q223);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q220,w220),_mm512_clmulepi64_epi128::<0x00>(q222,w222));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q220,w220),_mm512_clmulepi64_epi128::<0x01>(q222,w222));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q221,w220),_mm512_clmulepi64_epi128::<0x10>(q223,w222));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q221,w220),_mm512_clmulepi64_epi128::<0x11>(q223,w222));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x220,s220),_mm512_clmulepi64_epi128::<0x00>(x222,s222));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x220,s220),_mm512_clmulepi64_epi128::<0x01>(x222,s222));
+let q97=q64!(72);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8192) as *const i8);}
+let w96=w.lohi[48];let s96=w.sum[48];let x96=_mm512_xor_si512(q96,q97);
+let q98=q64!(73);
+let g20=q64!(74);let r20=_mm512_rol_epi64::<3>(*dep.add(20));let m20=_mm512_set1_epi64(7u64 as i64);
+let q99=_mm512_ternarylogic_epi64::<0xCA>(m20,g20,r20);let q100=_mm512_ternarylogic_epi64::<0xCA>(m20,r20,g20);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8256) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8320) as *const i8);}
+let w98=w.lohi[49];let s98=w.sum[49];let x98=_mm512_xor_si512(q98,q99);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q96,w96),_mm512_clmulepi64_epi128::<0x00>(q98,w98));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q96,w96),_mm512_clmulepi64_epi128::<0x01>(q98,w98));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q97,w96),_mm512_clmulepi64_epi128::<0x10>(q99,w98));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q97,w96),_mm512_clmulepi64_epi128::<0x11>(q99,w98));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x96,s96),_mm512_clmulepi64_epi128::<0x00>(x98,s98));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x96,s96),_mm512_clmulepi64_epi128::<0x01>(x98,s98));
+let g52=q64!(167);let r52=_mm512_rol_epi64::<3>(*dep.add(52));let m52=_mm512_set1_epi64(7u64 as i64);
+let q224=_mm512_ternarylogic_epi64::<0xCA>(m52,g52,r52);let q225=_mm512_ternarylogic_epi64::<0xCA>(m52,r52,g52);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8384) as *const i8);}
+let w224=w.lohi[48];let s224=w.sum[48];let x224=_mm512_xor_si512(q224,q225);
+let q226=q64!(168);
+let g53=q64!(169);let r53=_mm512_rol_epi64::<61>(*dep.add(53));let m53=_mm512_set1_epi64(2305843009213693951u64 as i64);
+let q227=_mm512_ternarylogic_epi64::<0xCA>(m53,g53,r53);let q228=_mm512_ternarylogic_epi64::<0xCA>(m53,r53,g53);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8448) as *const i8);}
+let w226=w.lohi[49];let s226=w.sum[49];let x226=_mm512_xor_si512(q226,q227);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q224,w224),_mm512_clmulepi64_epi128::<0x00>(q226,w226));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q224,w224),_mm512_clmulepi64_epi128::<0x01>(q226,w226));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q225,w224),_mm512_clmulepi64_epi128::<0x10>(q227,w226));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q225,w224),_mm512_clmulepi64_epi128::<0x11>(q227,w226));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x224,s224),_mm512_clmulepi64_epi128::<0x00>(x226,s226));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x224,s224),_mm512_clmulepi64_epi128::<0x01>(x226,s226));
+let q101=q64!(75);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8512) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8576) as *const i8);}
+let w100=w.lohi[50];let s100=w.sum[50];let x100=_mm512_xor_si512(q100,q101);
+let g21=q64!(76);let r21=_mm512_rol_epi64::<61>(*dep.add(21));let m21=_mm512_set1_epi64(2305843009213693951u64 as i64);
+let q102=_mm512_ternarylogic_epi64::<0xCA>(m21,g21,r21);let q103=_mm512_ternarylogic_epi64::<0xCA>(m21,r21,g21);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8640) as *const i8);}
+let w102=w.lohi[51];let s102=w.sum[51];let x102=_mm512_xor_si512(q102,q103);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q100,w100),_mm512_clmulepi64_epi128::<0x00>(q102,w102));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q100,w100),_mm512_clmulepi64_epi128::<0x01>(q102,w102));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q101,w100),_mm512_clmulepi64_epi128::<0x10>(q103,w102));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q101,w100),_mm512_clmulepi64_epi128::<0x11>(q103,w102));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x100,s100),_mm512_clmulepi64_epi128::<0x00>(x102,s102));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x100,s100),_mm512_clmulepi64_epi128::<0x01>(x102,s102));
+let q229=q64!(170);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8704) as *const i8);}
+let w228=w.lohi[50];let s228=w.sum[50];let x228=_mm512_xor_si512(q228,q229);
+let q230=q64!(171);
+let g54=q64!(172);let r54=_mm512_rol_epi64::<55>(*dep.add(54));let m54=_mm512_set1_epi64(36028797018963967u64 as i64);
+let q231=_mm512_ternarylogic_epi64::<0xCA>(m54,g54,r54);let q232=_mm512_ternarylogic_epi64::<0xCA>(m54,r54,g54);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8768) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8832) as *const i8);}
+let w230=w.lohi[51];let s230=w.sum[51];let x230=_mm512_xor_si512(q230,q231);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q228,w228),_mm512_clmulepi64_epi128::<0x00>(q230,w230));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q228,w228),_mm512_clmulepi64_epi128::<0x01>(q230,w230));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q229,w228),_mm512_clmulepi64_epi128::<0x10>(q231,w230));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q229,w228),_mm512_clmulepi64_epi128::<0x11>(q231,w230));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x228,s228),_mm512_clmulepi64_epi128::<0x00>(x230,s230));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x228,s228),_mm512_clmulepi64_epi128::<0x01>(x230,s230));
+let q104=q64!(77);
+let q105=q64!(78);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8896) as *const i8);}
+let w104=w.lohi[52];let s104=w.sum[52];let x104=_mm512_xor_si512(q104,q105);
+let g22=q64!(79);let r22=_mm512_rol_epi64::<55>(*dep.add(22));let m22=_mm512_set1_epi64(36028797018963967u64 as i64);
+let q106=_mm512_ternarylogic_epi64::<0xCA>(m22,g22,r22);let q107=_mm512_ternarylogic_epi64::<0xCA>(m22,r22,g22);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+8960) as *const i8);}
+let w106=w.lohi[53];let s106=w.sum[53];let x106=_mm512_xor_si512(q106,q107);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q104,w104),_mm512_clmulepi64_epi128::<0x00>(q106,w106));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q104,w104),_mm512_clmulepi64_epi128::<0x01>(q106,w106));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q105,w104),_mm512_clmulepi64_epi128::<0x10>(q107,w106));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q105,w104),_mm512_clmulepi64_epi128::<0x11>(q107,w106));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x104,s104),_mm512_clmulepi64_epi128::<0x00>(x106,s106));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x104,s104),_mm512_clmulepi64_epi128::<0x01>(x106,s106));
+let q233=q64!(173);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9024) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9088) as *const i8);}
+let w232=w.lohi[52];let s232=w.sum[52];let x232=_mm512_xor_si512(q232,q233);
+let q234=q64!(174);
+let q235=_mm512_ternarylogic_epi64::<0xEA>(q64!(175),_mm512_set1_epi64(((1u64<<49)-1) as i64),_mm512_slli_epi64::<49>(*dep.add(55)));
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9152) as *const i8);}
+let w234=w.lohi[53];let s234=w.sum[53];let x234=_mm512_xor_si512(q234,q235);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q232,w232),_mm512_clmulepi64_epi128::<0x00>(q234,w234));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q232,w232),_mm512_clmulepi64_epi128::<0x01>(q234,w234));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q233,w232),_mm512_clmulepi64_epi128::<0x10>(q235,w234));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q233,w232),_mm512_clmulepi64_epi128::<0x11>(q235,w234));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x232,s232),_mm512_clmulepi64_epi128::<0x00>(x234,s234));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x232,s232),_mm512_clmulepi64_epi128::<0x01>(x234,s234));
+let q108=q64!(80);
+let q109=q64!(81);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9216) as *const i8);}
+let w108=w.lohi[54];let s108=w.sum[54];let x108=_mm512_xor_si512(q108,q109);
+let g23=q64!(82);let r23=_mm512_rol_epi64::<49>(*dep.add(23));let m23=_mm512_set1_epi64(562949953421311u64 as i64);
+let q110=_mm512_ternarylogic_epi64::<0xCA>(m23,g23,r23);let q111=_mm512_ternarylogic_epi64::<0xCA>(m23,r23,g23);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9280) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9344) as *const i8);}
+let w110=w.lohi[55];let s110=w.sum[55];let x110=_mm512_xor_si512(q110,q111);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q108,w108),_mm512_clmulepi64_epi128::<0x00>(q110,w110));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q108,w108),_mm512_clmulepi64_epi128::<0x01>(q110,w110));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q109,w108),_mm512_clmulepi64_epi128::<0x10>(q111,w110));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q109,w108),_mm512_clmulepi64_epi128::<0x11>(q111,w110));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x108,s108),_mm512_clmulepi64_epi128::<0x00>(x110,s110));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x108,s108),_mm512_clmulepi64_epi128::<0x01>(x110,s110));
+let q236=_mm512_shrdi_epi64::<15>(*dep.add(55),oh[0]);
+let q237=_mm512_shrdi_epi64::<15>(oh[0],oh[1]);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9408) as *const i8);}
+let w236=w.lohi[54];let s236=w.sum[54];let x236=_mm512_xor_si512(q236,q237);
+let q238=_mm512_shrdi_epi64::<15>(oh[1],oh[2]);
+let q239=_mm512_shrdi_epi64::<15>(oh[2],oh[3]);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9472) as *const i8);}
+let w238=w.lohi[55];let s238=w.sum[55];let x238=_mm512_xor_si512(q238,q239);
+le1=_mm512_ternarylogic_epi64::<0x96>(le1,_mm512_clmulepi64_epi128::<0x00>(q236,w236),_mm512_clmulepi64_epi128::<0x00>(q238,w238));
+lo1=_mm512_ternarylogic_epi64::<0x96>(lo1,_mm512_clmulepi64_epi128::<0x01>(q236,w236),_mm512_clmulepi64_epi128::<0x01>(q238,w238));
+he1=_mm512_ternarylogic_epi64::<0x96>(he1,_mm512_clmulepi64_epi128::<0x10>(q237,w236),_mm512_clmulepi64_epi128::<0x10>(q239,w238));
+ho1=_mm512_ternarylogic_epi64::<0x96>(ho1,_mm512_clmulepi64_epi128::<0x11>(q237,w236),_mm512_clmulepi64_epi128::<0x11>(q239,w238));
+me1=_mm512_ternarylogic_epi64::<0x96>(me1,_mm512_clmulepi64_epi128::<0x00>(x236,s236),_mm512_clmulepi64_epi128::<0x00>(x238,s238));
+mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,_mm512_clmulepi64_epi128::<0x01>(x236,s236),_mm512_clmulepi64_epi128::<0x01>(x238,s238));
+let q112=q64!(83);
+let q113=q64!(84);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9536) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9600) as *const i8);}
+let w112=w.lohi[56];let s112=w.sum[56];let x112=_mm512_xor_si512(q112,q113);
+let g24=q64!(85);let r24=_mm512_rol_epi64::<43>(*dep.add(24));let m24=_mm512_set1_epi64(8796093022207u64 as i64);
+let q114=_mm512_ternarylogic_epi64::<0xCA>(m24,g24,r24);let q115=_mm512_ternarylogic_epi64::<0xCA>(m24,r24,g24);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9664) as *const i8);}
+let w114=w.lohi[57];let s114=w.sum[57];let x114=_mm512_xor_si512(q114,q115);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q112,w112),_mm512_clmulepi64_epi128::<0x00>(q114,w114));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q112,w112),_mm512_clmulepi64_epi128::<0x01>(q114,w114));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q113,w112),_mm512_clmulepi64_epi128::<0x10>(q115,w114));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q113,w112),_mm512_clmulepi64_epi128::<0x11>(q115,w114));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x112,s112),_mm512_clmulepi64_epi128::<0x00>(x114,s114));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x112,s112),_mm512_clmulepi64_epi128::<0x01>(x114,s114));
+let q240=_mm512_srli_epi64::<15>(oh[3]);
+let q241=_mm512_setzero_si512();
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9728) as *const i8);}
+let w240=w.lohi[56];let s240=w.sum[56];let x240=_mm512_xor_si512(q240,q241);
+le1=_mm512_xor_si512(le1,_mm512_clmulepi64_epi128::<0x00>(q240,w240));
+lo1=_mm512_xor_si512(lo1,_mm512_clmulepi64_epi128::<0x01>(q240,w240));
+he1=_mm512_xor_si512(he1,_mm512_clmulepi64_epi128::<0x10>(q241,w240));
+ho1=_mm512_xor_si512(ho1,_mm512_clmulepi64_epi128::<0x11>(q241,w240));
+me1=_mm512_xor_si512(me1,_mm512_clmulepi64_epi128::<0x00>(x240,s240));
+mo1=_mm512_xor_si512(mo1,_mm512_clmulepi64_epi128::<0x01>(x240,s240));
+let q116=q64!(86);
+let q117=q64!(87);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9792) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9856) as *const i8);}
+let w116=w.lohi[58];let s116=w.sum[58];let x116=_mm512_xor_si512(q116,q117);
+let g25=q64!(88);let r25=_mm512_rol_epi64::<37>(*dep.add(25));let m25=_mm512_set1_epi64(137438953471u64 as i64);
+let q118=_mm512_ternarylogic_epi64::<0xCA>(m25,g25,r25);let q119=_mm512_ternarylogic_epi64::<0xCA>(m25,r25,g25);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9920) as *const i8);}
+let w118=w.lohi[59];let s118=w.sum[59];let x118=_mm512_xor_si512(q118,q119);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q116,w116),_mm512_clmulepi64_epi128::<0x00>(q118,w118));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q116,w116),_mm512_clmulepi64_epi128::<0x01>(q118,w118));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q117,w116),_mm512_clmulepi64_epi128::<0x10>(q119,w118));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q117,w116),_mm512_clmulepi64_epi128::<0x11>(q119,w118));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x116,s116),_mm512_clmulepi64_epi128::<0x00>(x118,s118));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x116,s116),_mm512_clmulepi64_epi128::<0x01>(x118,s118));
+let q120=q64!(89);
+let q121=q64!(90);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+9984) as *const i8);}
+let w120=w.lohi[60];let s120=w.sum[60];let x120=_mm512_xor_si512(q120,q121);
+let g26=q64!(91);let r26=_mm512_rol_epi64::<31>(*dep.add(26));let m26=_mm512_set1_epi64(2147483647u64 as i64);
+let q122=_mm512_ternarylogic_epi64::<0xCA>(m26,g26,r26);let q123=_mm512_ternarylogic_epi64::<0xCA>(m26,r26,g26);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+10048) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+10112) as *const i8);}
+let w122=w.lohi[61];let s122=w.sum[61];let x122=_mm512_xor_si512(q122,q123);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q120,w120),_mm512_clmulepi64_epi128::<0x00>(q122,w122));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q120,w120),_mm512_clmulepi64_epi128::<0x01>(q122,w122));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q121,w120),_mm512_clmulepi64_epi128::<0x10>(q123,w122));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q121,w120),_mm512_clmulepi64_epi128::<0x11>(q123,w122));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x120,s120),_mm512_clmulepi64_epi128::<0x00>(x122,s122));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x120,s120),_mm512_clmulepi64_epi128::<0x01>(x122,s122));
+let q124=q64!(92);
+let q125=q64!(93);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+10176) as *const i8);}
+let w124=w.lohi[62];let s124=w.sum[62];let x124=_mm512_xor_si512(q124,q125);
+let g27=q64!(94);let r27=_mm512_rol_epi64::<25>(*dep.add(27));let m27=_mm512_set1_epi64(33554431u64 as i64);
+let q126=_mm512_ternarylogic_epi64::<0xCA>(m27,g27,r27);let q127=_mm512_ternarylogic_epi64::<0xCA>(m27,r27,g27);
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+10240) as *const i8);}
+if PREFETCH{_mm_prefetch::<_MM_HINT_T1>((next+10304) as *const i8);}
+let w126=w.lohi[63];let s126=w.sum[63];let x126=_mm512_xor_si512(q126,q127);
+le0=_mm512_ternarylogic_epi64::<0x96>(le0,_mm512_clmulepi64_epi128::<0x00>(q124,w124),_mm512_clmulepi64_epi128::<0x00>(q126,w126));
+lo0=_mm512_ternarylogic_epi64::<0x96>(lo0,_mm512_clmulepi64_epi128::<0x01>(q124,w124),_mm512_clmulepi64_epi128::<0x01>(q126,w126));
+he0=_mm512_ternarylogic_epi64::<0x96>(he0,_mm512_clmulepi64_epi128::<0x10>(q125,w124),_mm512_clmulepi64_epi128::<0x10>(q127,w126));
+ho0=_mm512_ternarylogic_epi64::<0x96>(ho0,_mm512_clmulepi64_epi128::<0x11>(q125,w124),_mm512_clmulepi64_epi128::<0x11>(q127,w126));
+me0=_mm512_ternarylogic_epi64::<0x96>(me0,_mm512_clmulepi64_epi128::<0x00>(x124,s124),_mm512_clmulepi64_epi128::<0x00>(x126,s126));
+mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,_mm512_clmulepi64_epi128::<0x01>(x124,s124),_mm512_clmulepi64_epi128::<0x01>(x126,s126));
+let me0=_mm512_ternarylogic_epi64::<0x96>(me0,le0,he0);let mo0=_mm512_ternarylogic_epi64::<0x96>(mo0,lo0,ho0);out[0][0]=flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(le0,me0,he0);out[0][1]=flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(lo0,mo0,ho0);
+let me1=_mm512_ternarylogic_epi64::<0x96>(me1,le1,he1);let mo1=_mm512_ternarylogic_epi64::<0x96>(mo1,lo1,ho1);out[1][0]=flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(le1,me1,he1);out[1][1]=flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(lo1,mo1,ho1);
+pf.cur=pf.lim;pf.acc=0;out
+}}
+
+    // A real next tile supplies a complete 162-line span per octa. The final
+    // tile and any unexpected span use the existing fill/fold implementation;
+    // this avoids duplicating the large unrolled kernel for the cold tail.
+    #[inline(always)]
+    unsafe fn fold_octa_with_plan(plan: &Plan, tile: *const u8, o: usize, x: usize,
+        scratch: &mut Scratch, weights: &Weights, pf: &mut PfCur) -> [[__m512i;2];2] {
+        unsafe {
+            if plan.fused_layout && pf.end.saturating_sub(pf.cur) >= (PF_FILL+PF_FOLD)*64 {
+                fused_stage_fold_prefetched(tile,o,x,scratch,weights,pf)
+            } else {
+                pf.phase(PF_FILL,FILL_OPS);
+                fill_stage(plan,tile,o,x,scratch,pf);
+                pf.flush();
+                pf.phase(PF_FOLD,1);
+                let result=fold_stage(&scratch.stage,weights,pf);
+                pf.flush();
+                result
+            }
+        }
+    }
+
+fn for_each_folded_octa(view: &WitnessTileView, weights: &Weights, f: impl Fn([[__m512i;2];2], usize, usize) + Sync) {
+        let plan = plan().expect("z regeneration plan");
+        assert!(view.tiles > 0);
+        if view.cross_quarter {
+            assert_eq!(view.tiles * 64, 1 << 18);
+        }
+        let unit = if view.tiles % 8 == 0 { 8 } else { 1 };
+        let base = view.base;
+        let tiles = view.tiles;
+        #[cfg(test)]
+        let mode = TEST_MODE.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let mode = 0u8;
+        // Existing timing-only test hooks retain their old semantics.
+        #[cfg(test)]
+        if mode != 0 {
+            for_each_octa(view, |stage,t,o,pf| unsafe { f(fold_stage(stage,weights,pf),t,o) });
+            return;
+        }
+        thread_local! {
+            // Reused across proofs: no per-task allocation/zeroing.
+            static SCRATCH: core::cell::RefCell<Option<Box<Scratch>>> =
+                const { core::cell::RefCell::new(None) };
+        }
+        assert_eq!(GROUPS * 8, TILE_BYTES / 64);
+        (0..view.tiles / unit).into_par_iter().for_each(|u| {
+            SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let scratch = guard.get_or_insert_with(Scratch::new);
+                for t in u * unit..(u + 1) * unit {
+                    let tile = (base + t * TILE_BYTES) as *const u8;
+                    let next = (t + 1 < tiles).then(|| base + (t + 1) * TILE_BYTES);
+                    for pair in 0..4 {
+                        // While octa pair `pair` of this tile is processed,
+                        // the same quarter of the next tile streams into L2.
+                        let mut pf = PfCur::new(next.map(|n| n + 2 * pair * (TILE_BYTES / 8)));
+                        // SAFETY: tiles are complete, initialized, 64-byte
+                        // aligned; prefetch hints stay within the tile span.
+                        // Mode bits (tests only) skip phases.
+                        unsafe {
+                            pf.phase(PF_BLAKE, 1);
+                            if mode & 1 == 0 {
+                                blake3_pair(tile, 2 * pair, scratch, &mut pf);
+                            }
+                            for x in 0..2 {
+                                let o = 2 * pair + x;
+                                pf.flush();
+                                let result=fold_octa_with_plan(plan,tile,o,x,scratch,weights,&mut pf);
+                                f(result,t,o);
+                            }
+                            pf.flush();
+                        }
+                    }
+                }
+            })
+        });
+    }
+#[cfg(test)]
+mod fused_tests {
+use super::*;
+#[inline(never)]
+unsafe fn baseline(plan:&Plan,tile:*const u8,o:usize,x:usize,scratch:&mut Scratch,w:&Weights,pf:&mut PfCur)->[[__m512i;2];2]{unsafe{
+ pf.phase(PF_FILL,FILL_OPS);fill_stage(plan,tile,o,x,scratch,pf);pf.flush();pf.phase(PF_FOLD,1);let out=fold_stage(&scratch.stage,w,pf);pf.flush();out
+}}
+fn rng(s:&mut u64)->u64{*s=s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);*s}
+#[inline(never)]fn scalar_mul(mut a:u128,mut b:u128)->u128{let mut c=0;for _ in 0..128{c^=a.wrapping_mul(b&1);let bit=a>>127;a=(a<<1)^0x87u128.wrapping_mul(bit);b>>=1;}c}
+#[repr(C,align(64))]struct Tile([u64;11264]);
+fn bits(out:[[__m512i;2];2])->[[[u64;8];2];2]{unsafe{core::mem::transmute(out)}}
+#[test]
+fn fused_stage_fold_matches_control_and_scalar(){unsafe{
+ let roots:Vec<usize>=(0..15409).filter(|&i|!(256..512).contains(&i)&&!(15153..15409).contains(&i)&&!(0..56).any(|g|(1153+250*g+186..1153+250*g+250).contains(&i))).collect();
+ let mut plan=build_plan(&roots).expect("actual public plan");assert!(plan.fused_layout);
+ assert_eq!(plan.full.iter().map(|p|(p.q as usize,p.cg as usize)).collect::<Vec<_>>(),vec![(0, 0), (1, 1), (2, 2), (3, 3), (8, 4), (9, 5), (10, 6), (11, 7), (12, 8), (13, 9), (14, 10), (15, 11), (16, 12), (19, 14), (22, 16), (23, 17), (26, 19), (27, 20), (30, 22), (31, 23), (34, 25), (35, 26), (38, 28), (39, 29), (42, 31), (43, 32), (46, 34), (47, 35), (50, 37), (51, 38), (54, 40), (55, 41), (58, 43), (61, 45), (62, 46), (65, 48), (66, 49), (69, 51), (70, 52), (73, 54), (74, 55), (77, 57), (78, 58), (81, 60), (82, 61), (85, 63), (86, 64), (89, 66), (90, 67), (93, 69), (94, 70), (97, 72), (98, 73), (101, 75), (104, 77), (105, 78), (108, 80), (109, 81), (112, 83), (113, 84), (116, 86), (117, 87), (120, 89), (121, 90), (124, 92), (125, 93), (128, 95), (129, 96), (132, 98), (133, 99), (136, 101), (137, 102), (140, 104), (141, 105), (144, 107), (147, 109), (148, 110), (151, 112), (152, 113), (155, 115), (156, 116), (159, 118), (160, 119), (163, 121), (164, 122), (167, 124), (168, 125), (171, 127), (172, 128), (175, 130), (176, 131), (179, 133), (180, 134), (183, 136), (186, 138), (187, 139), (190, 141), (191, 142), (194, 144), (195, 145), (198, 147), (199, 148), (202, 150), (203, 151), (206, 153), (207, 154), (210, 156), (211, 157), (214, 159), (215, 160), (218, 162), (219, 163), (222, 165), (223, 166), (226, 168), (229, 170), (230, 171), (233, 173), (234, 174)]);
+assert_eq!(plan.pairs.iter().map(|p|(p.q as usize,p.cg as usize,p.g as usize)).collect::<Vec<_>>(),vec![(20, 15, 0), (24, 18, 1), (28, 21, 2), (32, 24, 3), (36, 27, 4), (40, 30, 5), (44, 33, 6), (48, 36, 7), (52, 39, 8), (56, 42, 9), (59, 44, 10), (63, 47, 11), (67, 50, 12), (71, 53, 13), (75, 56, 14), (79, 59, 15), (83, 62, 16), (87, 65, 17), (91, 68, 18), (95, 71, 19), (99, 74, 20), (102, 76, 21), (106, 79, 22), (110, 82, 23), (114, 85, 24), (118, 88, 25), (122, 91, 26), (126, 94, 27), (130, 97, 28), (134, 100, 29), (138, 103, 30), (142, 106, 31), (145, 108, 32), (149, 111, 33), (153, 114, 34), (157, 117, 35), (161, 120, 36), (165, 123, 37), (169, 126, 38), (173, 129, 39), (177, 132, 40), (181, 135, 41), (184, 137, 42), (188, 140, 43), (192, 143, 44), (196, 146, 45), (200, 149, 46), (204, 152, 47), (208, 155, 48), (212, 158, 49), (216, 161, 50), (220, 164, 51), (224, 167, 52), (227, 169, 53), (231, 172, 54)]);
+assert_eq!(plan.rot.iter().map(|p|p.0[0]).collect::<Vec<_>>(),vec![59, 53, 47, 41, 35, 29, 23, 17, 11, 5, 63, 57, 51, 45, 39, 33, 27, 21, 15, 9, 3, 61, 55, 49, 43, 37, 31, 25, 19, 13, 7, 1, 59, 53, 47, 41, 35, 29, 23, 17, 11, 5, 63, 57, 51, 45, 39, 33, 27, 21, 15, 9, 3, 61, 55]);
+assert_eq!(plan.mask.iter().map(|p|p.0[0]).collect::<Vec<_>>(),vec![576460752303423487, 9007199254740991, 140737488355327, 2199023255551, 34359738367, 536870911, 8388607, 131071, 2047, 31, 9223372036854775807, 144115188075855871, 2251799813685247, 35184372088831, 549755813887, 8589934591, 134217727, 2097151, 32767, 511, 7, 2305843009213693951, 36028797018963967, 562949953421311, 8796093022207, 137438953471, 2147483647, 33554431, 524287, 8191, 127, 1, 576460752303423487, 9007199254740991, 140737488355327, 2199023255551, 34359738367, 536870911, 8388607, 131071, 2047, 31, 9223372036854775807, 144115188075855871, 2251799813685247, 35184372088831, 549755813887, 8589934591, 134217727, 2097151, 32767, 511, 7, 2305843009213693951, 36028797018963967]);
+
+ for field in 0..4 {
+  let mut bad=build_plan(&roots).unwrap();
+  match field {0=>bad.full[0].cg^=1,1=>bad.pairs[0].q^=1,2=>bad.rot[0].0[3]^=1,_=>bad.mask[0].0[7]^=1}
+  assert!(!fused_layout_matches(&bad));
+ }
+ let mut tile=Box::<Tile>::new_zeroed().assume_init();let prefetch=Box::<Tile>::new_zeroed().assume_init();
+ let mut scratch=Box::<Scratch>::new_zeroed().assume_init();let mut random=0x6d9b999u64;let mut cases=0;
+ for fixture in 0..8 {
+  for v in &mut tile.0{*v=if fixture==0{0}else if fixture==1{u64::MAX}else{rng(&mut random)};}
+  let raw=core::slice::from_raw_parts_mut((&mut *scratch as *mut Scratch).cast::<u64>(),core::mem::size_of::<Scratch>()/8);
+  for v in raw{*v=rng(&mut random);}
+  let original_tile=tile.0;let original_deps:Vec<u8>=core::slice::from_raw_parts(scratch.deps.as_ptr().cast::<u8>(),core::mem::size_of::<Scratch>()-core::mem::size_of::<Stage>()).to_vec();
+  let w:[F128;64]=core::array::from_fn(|i|match fixture{0=>F128{lo:0,hi:0},1=>F128{lo:1,hi:0},2=>F128{lo:0,hi:1},3=>F128{lo:1u64<<(i%64),hi:1u64<<((i*7)%64)},_=>F128{lo:rng(&mut random),hi:rng(&mut random)}});
+  let weights=Weights::new(&w);
+  for o in 0..8 {
+   let x=o%2;let mut pa=PfCur::new(((fixture+o)&1==0).then_some(prefetch.0.as_ptr() as usize));pa.cur+=if (fixture+o)&1==0{PF_BLAKE*64}else{0};pa.lim=pa.cur;
+   let mut pb=PfCur::new(((fixture+o)&1==0).then_some(prefetch.0.as_ptr() as usize));pb.cur+=if (fixture+o)&1==0{PF_BLAKE*64}else{0};pb.lim=pb.cur;
+   let expected=bits(baseline(&plan,tile.0.as_ptr().cast(),o,x,&mut scratch,&weights,&mut pa));
+   let mut pc=PfCur{cur:pb.cur,lim:pb.lim,end:pb.end,num:pb.num,den:pb.den,acc:pb.acc};
+   let got=bits(fold_octa_with_plan(&plan,tile.0.as_ptr().cast(),o,x,&mut scratch,&weights,&mut pb));
+   plan.fused_layout=false;
+   let fallback=bits(fold_octa_with_plan(&plan,tile.0.as_ptr().cast(),o,x,&mut scratch,&weights,&mut pc));
+   plan.fused_layout=true;assert_eq!(fallback,expected);assert_eq!(pc.cur,pa.cur);
+   assert_eq!(got,expected,"fused mismatch fixture={fixture} octa={o}");
+   assert_eq!(pa.cur,pb.cur);assert_eq!(pa.cur,if (fixture+o)&1==0{prefetch.0.as_ptr() as usize+(PF_BLAKE+PF_FILL+PF_FOLD)*64}else{0});
+   let stage=&*scratch.stage.0.as_ptr().cast::<[[u64;8];NQ]>();
+   for h in 0..2 {for lane in 0..8 {
+    let mut total=0u128;for e in 0..64{let q=128*h+2*e;let a=if q<NQ{stage[q][lane]as u128}else{0};let b=if q+1<NQ{stage[q+1][lane]as u128}else{0};total^=scalar_mul(a|(b<<64),(w[e].lo as u128)|((w[e].hi as u128)<<64));}
+    let parity=lane%2;let vectorlane=lane/2;assert_eq!(got[h][parity][2*vectorlane]as u128|((got[h][parity][2*vectorlane+1]as u128)<<64),total);
+   }}
+   assert_eq!(tile.0,original_tile);assert_eq!(core::slice::from_raw_parts(scratch.deps.as_ptr().cast::<u8>(),original_deps.len()),original_deps.as_slice());
+   cases+=1;
+  }
+ }
+ assert_eq!(cases,64);println!("FUSED_ZREGEN_PASS cases={cases} field_outputs={} all_octa_offsets=true raw_tiles_deps_and_weights_arbitrary=true scalar_bitserial=true production_fill_and_fold_control=true input_immutable=true prefetch_span_exact=true full_and_no_next_tile=true forced_geometry_fallback=true four_guard_mutants_rejected=true",cases*16);
+}}
+
+}
+
     /// Original compression index of physical slot `p` in a tile view.
     #[inline(always)]
     fn compression(cross_quarter: bool, p: usize) -> usize {
@@ -760,13 +1822,12 @@ pub(crate) mod imp {
         let weights = Weights::new(w);
         let dst = SendPtr(out.as_mut_ptr());
         let cq = view.cross_quarter;
-        for_each_octa(view, |stage, t, o, pf| {
+        for_each_folded_octa(view, &weights, |r, t, o| {
             let dst = dst;
             // SAFETY: AVX-512/VPCLMULQDQ are cfg preconditions; every
             // (compression, half) slot is written by exactly one octa; the
             // prefetch hints stay within the tile span.
             unsafe {
-                let r = fold_stage(stage, &weights, pf);
                 let base = 64 * t + 8 * o;
                 for (h, halves) in r.iter().enumerate() {
                     for (parity, v) in halves.iter().enumerate() {

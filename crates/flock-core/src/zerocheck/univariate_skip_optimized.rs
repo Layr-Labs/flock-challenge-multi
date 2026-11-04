@@ -39,6 +39,8 @@ use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+mod ab_leaf_accum;
 
 /// Ranked C-drain reconstruct: 16×64 byte-planes → 64 F128. Identity-C
 /// lincheck worker-reduce has the same plane layout.
@@ -3626,6 +3628,8 @@ pub(crate) struct WorkerStateAbOnly {
     partial_ab: [F128; ELL],
     plane_banks: Vec<u8>,
     cached_plane_banks: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    leaf_cache: Option<ab_leaf_accum::Cache>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
 }
@@ -3636,6 +3640,8 @@ impl WorkerStateAbOnly {
             partial_ab: [F128::ZERO; ELL],
             plane_banks: Vec::new(),
             cached_plane_banks: false,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            leaf_cache: None,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
         }
@@ -4121,8 +4127,18 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         && zc_r1_ab_batch4_enabled();
     if batch4 {
         let prefetch_mode = if pf_windows == 0 { 0 } else if pf_spread { 1 } else { 2 };
-        unsafe { process_ranked_ab_w4_band(ab_inner, mats, x_hi, plane_first_write,
-            prefetch_mode, &mut state.plane_banks); }
+        let used_leaf_accum = {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            { ab_leaf_accum::enabled() && ab_leaf_accum::try_run(
+                &mut state.leaf_cache, ab_inner, mats, x_hi,
+                prefetch_mode, &mut state.plane_banks) }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
+            { false }
+        };
+        if !used_leaf_accum {
+            unsafe { process_ranked_ab_w4_band(ab_inner, mats, x_hi, plane_first_write,
+                prefetch_mode, &mut state.plane_banks); }
+        }
     } else {
     let bank_mask = (1usize << bank_bits) - 1;
     for x_outer_lo in 0..big_lo_size {
@@ -4508,6 +4524,25 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             );
         }
     };
+    // All workers consume this call's same checked matrix key. Initialize its
+    // immutable tables at most once, retaining separate scratch in every worker.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    let shared_leaf = std::sync::OnceLock::new();
+    let new_state = || {
+        #[allow(unused_mut)]
+        let mut state = WorkerStateAbOnly::new();
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+        if direct_ab && plane_cache && ab_leaf_accum::enabled() {
+            if let Some((_, mats, _)) = &eq_fold_state {
+                let prepared = shared_leaf.get_or_init(|| {
+                    ab_leaf_accum::prepare(mats).expect("ranked matrix extent checked")
+                });
+                state.leaf_cache = Some(ab_leaf_accum::Cache::from_prepared(
+                    std::sync::Arc::clone(prepared)));
+            }
+        }
+        state
+    };
     let res_ab = if zc_r1ab_claim_enabled() && rayon::current_thread_index().is_some() {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_threads = rayon::current_num_threads();
@@ -4520,7 +4555,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 if x_hi >= hi_size {
                     break;
                 }
-                band(state.get_or_insert_with(WorkerStateAbOnly::new), x_hi);
+                band(state.get_or_insert_with(&new_state), x_hi);
             }
             if let Some(state) = state {
                 *slots[ctx.index()].lock().unwrap() = Some(state.local_res_ab);
@@ -4538,7 +4573,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     } else {
         (0..hi_size)
             .into_par_iter()
-            .fold(WorkerStateAbOnly::new, |mut state, x_hi| {
+            .fold(&new_state, |mut state, x_hi| {
                 band(&mut state, x_hi);
                 state
             })
