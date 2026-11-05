@@ -1595,9 +1595,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
         // SAFETY: the shared implementation already carries the geometry,
         // feature and twiddle-form contract; the caller keeps buffers disjoint.
         unsafe {
-            seed_sparse_dense_compact::<OUTER_LOW>(
+            seed_sparse_dense_compact::<OUTER_LOW, false>(
                 src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
-                num_ntts, active_lanes, right_twiddle, dense_tw, pf_src,
+                num_ntts, active_lanes, right_twiddle, dense_tw, pf_src, core::ptr::null(), num_ntts,
             );
         }
         return;
@@ -4412,7 +4412,7 @@ mod ab_ntt_tail_composition_tests {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
-unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
+unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool, const PREPARED:bool>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -4424,17 +4424,22 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
+    prepared: *const F128,
+    source_cols:usize,
 ) {
     const DIET: bool = true;
     use core::arch::x86_64::*;
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     unsafe {
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
-        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
-        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let load_pair=|i:usize,low:bool| {let t=_mm512_broadcast_i32x4(_mm_loadu_si128(prepared.add(2*i).cast()));let companion=if low{t}else{_mm512_broadcast_i32x4(_mm_loadu_si128(prepared.add(2*i+1).cast()))};(t,companion)};
+        let sparse_b = if PREPARED {load_pair(0,false)}else{tw_x4::<false, DIET>(right_twiddle)};
+        let outer = if PREPARED {load_pair(1,OUTER_LOW)}else{tw_x4::<OUTER_LOW, DIET>(t_outer)};
+        let inner_a = if PREPARED {load_pair(2,false)}else{tw_x4::<false, DIET>(t_inner_a)};
+        let inner_b = if PREPARED {load_pair(3,false)}else{tw_x4::<false, DIET>(t_inner_b)};
+        let src_num_ntts=if PREPARED {source_cols}else{num_ntts};
+        debug_assert!(!PREPARED||active_lanes.is_multiple_of(4));
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * src_num_ntts);
         let sp_row = |i: usize| dst_sparse.add((i * dst_quarter) * num_ntts);
         let dn_row = |i: usize| dst_dense.add((i * dst_quarter) * num_ntts);
         let lanes = active_lanes & !3;
@@ -4643,13 +4648,13 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
             "vmovdqu64 [rcx + rax + 0], zmm3",
             "9:",
             inout("rdi") src_row(0) => _,
-            in("rsi") src_quarter * num_ntts * 16,
+            in("rsi") src_quarter * src_num_ntts * 16,
             inout("rdx") dst_sparse => _,
             inout("rcx") dst_dense => _,
             in("r8") dst_quarter * num_ntts * 16,
             inout("r9") lanes => _,
             inout("r10") pf_src => _,
-            in("r11") src_quarter * num_ntts * 48,
+            in("r11") src_quarter * src_num_ntts * 48,
             in("rax") dst_quarter * num_ntts * 48,
             in("zmm16") sparse_b.0, in("zmm17") sparse_b.1,
             in("zmm18") outer.0, in("zmm19") outer.1,
@@ -4899,13 +4904,13 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
             "vmovdqu64 [rcx + rax + 0], zmm3",
             "9:",
             inout("rdi") src_row(0) => _,
-            in("rsi") src_quarter * num_ntts * 16,
+            in("rsi") src_quarter * src_num_ntts * 16,
             inout("rdx") dst_sparse => _,
             inout("rcx") dst_dense => _,
             in("r8") dst_quarter * num_ntts * 16,
             inout("r9") lanes => _,
             inout("r10") pf_src => _,
-            in("r11") src_quarter * num_ntts * 48,
+            in("r11") src_quarter * src_num_ntts * 48,
             in("rax") dst_quarter * num_ntts * 48,
             in("zmm16") sparse_b.0, in("zmm17") sparse_b.1,
             in("zmm18") outer.0, in("zmm19") outer.1,
@@ -5032,3 +5037,16 @@ mod seed_compact_address_oracle_tests {
         println!("576 production compact-address seed cases match independent bitwise products, guards, source and twiddle immutability");
     }
 }
+
+
+/// Seed a four-aligned window with independent source/destination pitches.
+/// All demanded source fields are initialized; destination ranges are exclusive.
+#[cfg(target_feature="avx512bw")]
+#[inline]
+#[target_feature(enable="avx512f,avx512bw,vpclmulqdq")]
+pub(super) unsafe fn seed_window_prepared(src:*const F128,src_quarter:usize,src_r:usize,dst_sparse:*mut F128,dst_dense:*mut F128,source_cols:usize,active:usize,prepared:&[F128;8]){unsafe{
+ assert!(matches!(source_cols,8|16|32|64));
+ let dense=[prepared[2],prepared[4],prepared[6]];
+ if dense[0].hi==0 {seed_sparse_dense_compact::<true,true>(src,src_quarter,src_r,dst_sparse,dst_dense,64,64,active,prepared[0],&dense,core::ptr::null(),prepared.as_ptr(),source_cols);}
+ else{seed_sparse_dense_compact::<false,true>(src,src_quarter,src_r,dst_sparse,dst_dense,64,64,active,prepared[0],&dense,core::ptr::null(),prepared.as_ptr(),source_cols);}
+}}
