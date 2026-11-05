@@ -1,5 +1,16 @@
 use crate::field::F128;
 
+// The SysV kernels use only call-clobbered registers and no stack memory.
+#[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+core::arch::global_asm!(include_str!("three_registers.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+unsafe extern "C" {
+    fn flock_ntt_three_64_0(ptr: *mut F128, tw: *const F128, dense: usize);
+    fn flock_ntt_three_64_1(ptr: *mut F128, tw: *const F128, dense: usize);
+    fn flock_ntt_three_64_2(ptr: *mut F128, tw: *const F128, dense: usize);
+}
+
+
 /// `FLOCK_NO_NTT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
 /// at DIET-controlled call sites, including the fused-two OUTER_LOW path.
 /// The independent fused-three high-one specialization has its own rollback
@@ -2807,6 +2818,34 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     // assuming a particular basis or a fixed fraction of eligible blocks.
     let low_outer = short_twiddles && !low_outer_fused3_disabled() && twiddles[0].hi == 0;
     let high_one_outer = short_twiddles && twiddles[0].hi == 1 && !high_one_fused3_disabled();
+    // The ranked final group has a fixed row stride and short inner
+    // twiddles. Schedule its data and delayed x^64 halves explicitly, so
+    // one four-element chunk needs no vector spill storage. The
+    // zero-odd tail retains the same butterflies.
+    #[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+    if NN == 64 && dense_lanes <= NN && dense_lanes.is_multiple_of(4)
+        && low_inner && !mul_diet_disabled()
+    {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_NTT_THREE_REG").is_some()
+        });
+        if !*OFF {
+            // SAFETY: NN pins the eight 64-lane row spans; the caller
+            // supplies exclusive rows and the zero-odd tail. Inspection
+            // proves all six inner high limbs are zero and selects each
+            // outer form from its actual high limb and rollback gates.
+            unsafe {
+                if low_outer {
+                    flock_ntt_three_64_0(ptr, twiddles.as_ptr(), dense_lanes);
+                } else if high_one_outer {
+                    flock_ntt_three_64_1(ptr, twiddles.as_ptr(), dense_lanes);
+                } else {
+                    flock_ntt_three_64_2(ptr, twiddles.as_ptr(), dense_lanes);
+                }
+            }
+            return;
+        }
+    }
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]`; low_outer/high_one_outer establish
     // their respective outer preconditions. NN equals the runtime stride.
@@ -4145,6 +4184,40 @@ mod ab_ntt_tail_composition_tests {
                         data[u] = xor(data[u], multiply(data[v], t));
                         data[v] = xor(data[v], data[u]);
                     }
+                }
+            }
+        }
+    }
+
+
+    #[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+    #[test]
+    fn three_registers_match_bitwise_oracle_and_guards() {
+        let mut seed=0x62da_153f_91e8_c70bu64;
+        let guard=F128::new(0xfeed_cafe,0xdead_beef);
+        for dense in (0..=64).step_by(4) {
+            for offset in 1..=4 {
+                for high in [0,1,22,23,u64::MAX] {
+                    let mut data=vec![guard;offset+8*64+4];
+                    for row in 0..8 { for lane in 0..64 {
+                        data[offset+row*64+lane]=if row%2==1 && lane>=dense { F128::ZERO }
+                            else { F128::new(next(&mut seed),next(&mut seed)) };
+                    }}
+                    let mut tw:[F128;7]=std::array::from_fn(|_| F128::new(next(&mut seed),0));
+                    tw[0].hi=high;
+                    let original_tw=tw;
+                    let mut expected=data.clone();
+                    oracle_rows(&mut expected,offset,64,64,&tw,3);
+                    unsafe {
+                        let p=data.as_mut_ptr().add(offset);
+                        match high {
+                            0=>flock_ntt_three_64_0(p,tw.as_ptr(),dense),
+                            1=>flock_ntt_three_64_1(p,tw.as_ptr(),dense),
+                            _=>flock_ntt_three_64_2(p,tw.as_ptr(),dense),
+                        }
+                    }
+                    assert_eq!(data,expected,"dense={dense} offset={offset} high={high}");
+                    assert_eq!(tw,original_tw);
                 }
             }
         }
