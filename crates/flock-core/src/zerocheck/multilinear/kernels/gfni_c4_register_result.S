@@ -41,274 +41,84 @@ flock_gfni_c4_lm_register_result:
     flock_c4_result_gather 0
     flock_c4_result_gather 1
 
-    vpbroadcastq zmm0, [rsp + 0]
-    vgf2p8affineqb zmm1, zmm0, [rsi + 2048], 0
-    vgf2p8affineqb zmm0, zmm0, [rsi + 0], 0
-    vpbroadcastq zmm2, [rsp + 8]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2112], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 64], 0
-    vpbroadcastq zmm4, [rsp + 16]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2176], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 128], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 24]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2240], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 192], 0
-    vpbroadcastq zmm4, [rsp + 32]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2304], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 256], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 40]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2368], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 320], 0
-    vpbroadcastq zmm4, [rsp + 48]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2432], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 384], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 56]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2496], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 448], 0
-    vpbroadcastq zmm4, [rsp + 64]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2560], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 512], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 72]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2624], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 576], 0
-    vpbroadcastq zmm4, [rsp + 80]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2688], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 640], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 88]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2752], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 704], 0
-    vpbroadcastq zmm4, [rsp + 96]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2816], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 768], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 104]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2880], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 832], 0
-    vpbroadcastq zmm4, [rsp + 112]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2944], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 896], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 120]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3008], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 960], 0
-    vpbroadcastq zmm4, [rsp + 128]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3072], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1024], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 136]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3136], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1088], 0
-    vpbroadcastq zmm4, [rsp + 144]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3200], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1152], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 152]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3264], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1216], 0
-    vpbroadcastq zmm4, [rsp + 160]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3328], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1280], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 168]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3392], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1344], 0
-    vpbroadcastq zmm4, [rsp + 176]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3456], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1408], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 184]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3520], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1472], 0
-    vpbroadcastq zmm4, [rsp + 192]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3584], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1536], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 200]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3648], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1600], 0
-    vpbroadcastq zmm4, [rsp + 208]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3712], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1664], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 216]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3776], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1728], 0
-    vpbroadcastq zmm4, [rsp + 224]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3840], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1792], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 232]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3904], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1856], 0
-    vpbroadcastq zmm4, [rsp + 240]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3968], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1920], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 248]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 4032], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
-    vpxorq zmm0, zmm0, zmm2
-    vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm8, [rip + .Lflock_c4_result_out_even]
-    vpermi2b zmm8, zmm0, zmm1
-    vmovdqa64 zmm9, [rip + .Lflock_c4_result_out_odd]
-    vpermi2b zmm9, zmm0, zmm1
-    vpbroadcastq zmm0, [rsp + 256]
-    vgf2p8affineqb zmm1, zmm0, [rsi + 2048], 0
-    vgf2p8affineqb zmm0, zmm0, [rsi + 0], 0
-    vpbroadcastq zmm2, [rsp + 264]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2112], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 64], 0
-    vpbroadcastq zmm4, [rsp + 272]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2176], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 128], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 280]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2240], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 192], 0
-    vpbroadcastq zmm4, [rsp + 288]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2304], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 256], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 296]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2368], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 320], 0
-    vpbroadcastq zmm4, [rsp + 304]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2432], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 384], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 312]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2496], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 448], 0
-    vpbroadcastq zmm4, [rsp + 320]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2560], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 512], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 328]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2624], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 576], 0
-    vpbroadcastq zmm4, [rsp + 336]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2688], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 640], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 344]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2752], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 704], 0
-    vpbroadcastq zmm4, [rsp + 352]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2816], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 768], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 360]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 2880], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 832], 0
-    vpbroadcastq zmm4, [rsp + 368]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 2944], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 896], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 376]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3008], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 960], 0
-    vpbroadcastq zmm4, [rsp + 384]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3072], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1024], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 392]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3136], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1088], 0
-    vpbroadcastq zmm4, [rsp + 400]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3200], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1152], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 408]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3264], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1216], 0
-    vpbroadcastq zmm4, [rsp + 416]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3328], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1280], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 424]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3392], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1344], 0
-    vpbroadcastq zmm4, [rsp + 432]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3456], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1408], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 440]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3520], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1472], 0
-    vpbroadcastq zmm4, [rsp + 448]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3584], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1536], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 456]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3648], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1600], 0
-    vpbroadcastq zmm4, [rsp + 464]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3712], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1664], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 472]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3776], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1728], 0
-    vpbroadcastq zmm4, [rsp + 480]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3840], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1792], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 488]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 3904], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1856], 0
-    vpbroadcastq zmm4, [rsp + 496]
-    vgf2p8affineqb zmm5, zmm4, [rsi + 3968], 0
-    vgf2p8affineqb zmm4, zmm4, [rsi + 1920], 0
-    vpternlogq zmm0, zmm2, zmm4, 0x96
-    vpternlogq zmm1, zmm3, zmm5, 0x96
-    vpbroadcastq zmm2, [rsp + 504]
-    vgf2p8affineqb zmm3, zmm2, [rsi + 4032], 0
-    vgf2p8affineqb zmm2, zmm2, [rsi + 1984], 0
-    vpxorq zmm0, zmm0, zmm2
-    vpxorq zmm1, zmm1, zmm3
-    vmovdqa64 zmm10, [rip + .Lflock_c4_result_out_even]
-    vpermi2b zmm10, zmm0, zmm1
-    vmovdqa64 zmm11, [rip + .Lflock_c4_result_out_odd]
-    vpermi2b zmm11, zmm0, zmm1
+// Accumulate both passes together. The first octet of a pair shares BOTH
+// matrix loads; the second shares the low-half load. Its two high-half
+// memory operands leave one temporary for the paired XORs. This needs only
+// ZMM0..11 and 80 matrix-line loads, versus the old 128, with the same 128
+// GFNI operations and the same 512-byte initialized scratch.
+// Accumulators: ZMM8/9 = low/high of pass 0, ZMM10/11 = low/high of pass 1.
+.macro flock_c4_result_pair j
+    vpbroadcastq zmm4, [rsp + 8*\j]
+    vpbroadcastq zmm5, [rsp + 256 + 8*\j]
+    vmovdqu64 zmm6, [rsi + 64*\j]
+    vmovdqu64 zmm7, [rsi + 2048 + 64*\j]
+    vgf2p8affineqb zmm0, zmm4, zmm6, 0
+    vgf2p8affineqb zmm1, zmm4, zmm7, 0
+    vgf2p8affineqb zmm2, zmm5, zmm6, 0
+    vgf2p8affineqb zmm3, zmm5, zmm7, 0
+    vpbroadcastq zmm4, [rsp + 8*(\j+1)]
+    vpbroadcastq zmm5, [rsp + 256 + 8*(\j+1)]
+    vmovdqu64 zmm6, [rsi + 64*(\j+1)]
+    vgf2p8affineqb zmm7, zmm4, zmm6, 0
+.if \j == 0
+    vpxorq zmm8, zmm0, zmm7
+.else
+    vpternlogq zmm8, zmm0, zmm7, 0x96
+.endif
+    vgf2p8affineqb zmm7, zmm4, [rsi + 2048 + 64*(\j+1)], 0
+.if \j == 0
+    vpxorq zmm9, zmm1, zmm7
+.else
+    vpternlogq zmm9, zmm1, zmm7, 0x96
+.endif
+    vgf2p8affineqb zmm7, zmm5, zmm6, 0
+.if \j == 0
+    vpxorq zmm10, zmm2, zmm7
+.else
+    vpternlogq zmm10, zmm2, zmm7, 0x96
+.endif
+    vgf2p8affineqb zmm7, zmm5, [rsi + 2048 + 64*(\j+1)], 0
+.if \j == 0
+    vpxorq zmm11, zmm3, zmm7
+.else
+    vpternlogq zmm11, zmm3, zmm7, 0x96
+.endif
+.endm
+    flock_c4_result_pair 0
+    flock_c4_result_pair 2
+    flock_c4_result_pair 4
+    flock_c4_result_pair 6
+    flock_c4_result_pair 8
+    flock_c4_result_pair 10
+    flock_c4_result_pair 12
+    flock_c4_result_pair 14
+    flock_c4_result_pair 16
+    flock_c4_result_pair 18
+    flock_c4_result_pair 20
+    flock_c4_result_pair 22
+    flock_c4_result_pair 24
+    flock_c4_result_pair 26
+    flock_c4_result_pair 28
+    flock_c4_result_pair 30
+
+    // Finish each pass before overwriting either of its input accumulators.
+    vmovdqa64 zmm0, [rip + .Lflock_c4_result_out_even]
+    vmovdqa64 zmm1, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm0, zmm8, zmm9
+    vpermi2b zmm1, zmm8, zmm9
+    vmovdqa64 zmm8, zmm0
+    vmovdqa64 zmm9, zmm1
+    vmovdqa64 zmm0, [rip + .Lflock_c4_result_out_even]
+    vmovdqa64 zmm1, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm0, zmm10, zmm11
+    vpermi2b zmm1, zmm10, zmm11
+    vmovdqa64 zmm10, zmm0
+    vmovdqa64 zmm11, zmm1
     mov rsp, rax
     ret
 .size flock_gfni_c4_lm_register_result, .-flock_gfni_c4_lm_register_result
 .purgem flock_c4_result_gather
+.purgem flock_c4_result_pair
 .section .rodata
 
 .p2align 6
@@ -326,3 +136,107 @@ flock_gfni_c4_lm_register_result:
 .p2align 6
 .Lflock_c4_result_out_odd:
     .byte 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105, 113, 121, 3, 11, 19, 27, 35, 43, 51, 59, 67, 75, 83, 91, 99, 107, 115, 123, 5, 13, 21, 29, 37, 45, 53, 61, 69, 77, 85, 93, 101, 109, 117, 125, 7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87, 95, 103, 111, 119, 127
+
+// Two 512-byte inputs: RDI and RDX, with common matrix frame RSI.
+// Returns input zero in ZMM8..11 and input one in ZMM12..15.
+// Clobbers RAX, flags, ZMM0..15; preserves all other GPRs and ZMM16..31.
+// Private register ABI only; no vzeroupper and no escaping stack scratch.
+
+.text
+.p2align 6
+.globl flock_gfni_c4_lm_register_result_dual
+.hidden flock_gfni_c4_lm_register_result_dual
+.type flock_gfni_c4_lm_register_result_dual,@function
+flock_gfni_c4_lm_register_result_dual:
+    mov rax, rsp
+    and rsp, -64
+    sub rsp, 1024
+    vmovdqa64 zmm9, [rip + .Lflock_c4_result_oct_odd]
+.macro flock_dual_c4_gather src, p, off
+    vmovdqu64 zmm0, [\src + 64*\p]
+    vmovdqu64 zmm1, [\src + 64*\p + 128]
+    vmovdqu64 zmm2, [\src + 64*\p + 256]
+    vmovdqu64 zmm3, [\src + 64*\p + 384]
+    vshufi64x2 zmm4, zmm0, zmm1, 0x88
+    vshufi64x2 zmm0, zmm0, zmm1, 0xdd
+    vshufi64x2 zmm5, zmm2, zmm3, 0x88
+    vshufi64x2 zmm2, zmm2, zmm3, 0xdd
+    vmovdqa64 zmm6, [rip + .Lflock_c4_result_oct_even]
+    vpermi2b zmm6, zmm4, zmm5
+    vpermt2b zmm4, zmm9, zmm5
+    vmovdqa64 [rsp + \off + 256*\p], zmm6
+    vmovdqa64 [rsp + \off + 256*\p + 64], zmm4
+    vmovdqa64 zmm6, [rip + .Lflock_c4_result_oct_even]
+    vpermi2b zmm6, zmm0, zmm2
+    vpermt2b zmm0, zmm9, zmm2
+    vmovdqa64 [rsp + \off + 256*\p + 128], zmm6
+    vmovdqa64 [rsp + \off + 256*\p + 192], zmm0
+.endm
+    flock_dual_c4_gather rdi, 0, 0
+    flock_dual_c4_gather rdi, 1, 0
+    flock_dual_c4_gather rdx, 0, 512
+    flock_dual_c4_gather rdx, 1, 512
+.macro flock_dual_c4_pass j, off, low, high
+    vpbroadcastq zmm0, [rsp + \off + 8*\j]
+    vgf2p8affineqb zmm1, zmm0, zmm4, 0
+    vgf2p8affineqb zmm2, zmm0, zmm5, 0
+    vpbroadcastq zmm0, [rsp + \off + 8*(\j+1)]
+    vgf2p8affineqb zmm3, zmm0, zmm6, 0
+.if \j == 0
+    vpxorq \low, zmm1, zmm3
+.else
+    vpternlogq \low, zmm1, zmm3, 0x96
+.endif
+    vgf2p8affineqb zmm3, zmm0, zmm7, 0
+.if \j == 0
+    vpxorq \high, zmm2, zmm3
+.else
+    vpternlogq \high, zmm2, zmm3, 0x96
+.endif
+.endm
+.macro flock_dual_c4_pair j
+    vmovdqu64 zmm4, [rsi + 64*\j]
+    vmovdqu64 zmm5, [rsi + 2048 + 64*\j]
+    vmovdqu64 zmm6, [rsi + 64*(\j+1)]
+    vmovdqu64 zmm7, [rsi + 2048 + 64*(\j+1)]
+    flock_dual_c4_pass \j, 0, zmm8, zmm9
+    flock_dual_c4_pass \j, 256, zmm10, zmm11
+    flock_dual_c4_pass \j, 512, zmm12, zmm13
+    flock_dual_c4_pass \j, 768, zmm14, zmm15
+.endm
+    flock_dual_c4_pair 0
+    flock_dual_c4_pair 2
+    flock_dual_c4_pair 4
+    flock_dual_c4_pair 6
+    flock_dual_c4_pair 8
+    flock_dual_c4_pair 10
+    flock_dual_c4_pair 12
+    flock_dual_c4_pair 14
+    flock_dual_c4_pair 16
+    flock_dual_c4_pair 18
+    flock_dual_c4_pair 20
+    flock_dual_c4_pair 22
+    flock_dual_c4_pair 24
+    flock_dual_c4_pair 26
+    flock_dual_c4_pair 28
+    flock_dual_c4_pair 30
+
+.macro flock_dual_c4_finish low, high
+    vmovdqa64 zmm0, [rip + .Lflock_c4_result_out_even]
+    vmovdqa64 zmm1, [rip + .Lflock_c4_result_out_odd]
+    vpermi2b zmm0, \low, \high
+    vpermi2b zmm1, \low, \high
+    vmovdqa64 \low, zmm0
+    vmovdqa64 \high, zmm1
+.endm
+    flock_dual_c4_finish zmm8, zmm9
+    flock_dual_c4_finish zmm10, zmm11
+    flock_dual_c4_finish zmm12, zmm13
+    flock_dual_c4_finish zmm14, zmm15
+    mov rsp, rax
+    ret
+.size flock_gfni_c4_lm_register_result_dual, .-flock_gfni_c4_lm_register_result_dual
+.purgem flock_dual_c4_gather
+.purgem flock_dual_c4_pass
+.purgem flock_dual_c4_pair
+.purgem flock_dual_c4_finish
