@@ -1007,3 +1007,6 @@ fn add_root16(x: V16, y: V16) -> (V16, V16) {
 
 #[path = "blake3_stage_recompute.rs"]
 pub(crate) mod stage_recompute;
+
+#[path="blake3_fused_fold.rs"]
+pub(crate) mod fused_fold;
