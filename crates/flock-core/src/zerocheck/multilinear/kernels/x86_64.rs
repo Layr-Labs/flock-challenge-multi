@@ -2661,10 +2661,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                let [a0, a1, a2, a3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
-                let [b0, b1, b2, b3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
+                let [[a0, a1, a2, a3], [b0, b1, b2, b3]] =
+                    gfni_fold64_rows_c4_dual_registers(
+                        a_pkt.add(4 * xg * 8), b_pkt.add(4 * xg * 8), cfold);
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -4686,6 +4685,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c4_dual_result.S"),
 );
 
 #[cfg(all(
@@ -4699,8 +4699,49 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c4_dual_register_result();
 }
 
+
+
+/// Fold two complete 512-byte inputs with one shared immutable matrix frame.
+/// The private helper returns eight vectors and preserves ZMM16..31, including
+/// six registers borrowed inside its independently checked stack frame.
+///
+/// # Safety
+/// Both input ranges and the CFoldMats are initialized and readable throughout
+/// the call. The native module guards supply the instruction-set requirements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_dual_registers(
+    first: *const u8, second: *const u8, m: &CFoldMats,
+) -> [[core::arch::x86_64::__m512i; 4]; 2] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let (a,b,c,d,e,f,g,h): (__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i);
+        core::arch::asm!(
+            "call {kernel}", kernel = sym flock_gfni_c4_dual_register_result,
+            in("rdi") first, in("rsi") second, in("rdx") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            out("zmm12") e, out("zmm13") f, out("zmm14") g, out("zmm15") h,
+        );
+        [[a,b,c,d],[e,f,g,h]]
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        [gfni_fold64_rows_c4_lm_registers(first,m), gfni_fold64_rows_c4_lm_registers(second,m)]
+    }
+}
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -5950,9 +5991,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
 
         macro_rules! fold_side {
             ($pkt:expr, $row0:expr) => {{
-                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8 + 512), cfold);
+                let [[q0, q1, q2, q3], [p0, p1, p2, p3]] =
+                    gfni_fold64_rows_c4_dual_registers(
+                        $pkt.add($row0 * 8), $pkt.add($row0 * 8 + 512), cfold);
                 let oe1 = _mm512_xor_si512(q0, ghash_mul_x4_split(_mm512_xor_si512(q0, q1), r3, r3_64));
                 let oo1 = _mm512_xor_si512(q2, ghash_mul_x4_split(_mm512_xor_si512(q2, q3), r3, r3_64));
                 let oe2 = _mm512_xor_si512(p0, ghash_mul_x4_split(_mm512_xor_si512(p0, p1), r3, r3_64));
@@ -6066,5 +6107,50 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         [
             lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
         ]
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+mod dual_c4_abi_tests {
+    use super::*;
+
+    #[test]
+    fn dual_c4_register_abi_matches_single_calls() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut draw = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for offset in 0..64 {
+            let first: [u8; 576] = core::array::from_fn(|_| draw() as u8);
+            let second: [u8; 576] = core::array::from_fn(|_| draw() as u8);
+            let before = (first, second);
+            let mats = CFoldMats(
+                [[0; 8]; 128],
+                core::array::from_fn(|_| core::array::from_fn(|_| draw())),
+            );
+            unsafe {
+                let a = first.as_ptr().add(offset);
+                let b = second.as_ptr().add(63 - offset);
+                let expected = [
+                    gfni_fold64_rows_c4_lm_registers(a, &mats),
+                    gfni_fold64_rows_c4_lm_registers(b, &mats),
+                ];
+                let got = gfni_fold64_rows_c4_dual_registers(a, b, &mats);
+                let expected: [[[u64; 8]; 4]; 2] = core::mem::transmute(expected);
+                let got: [[[u64; 8]; 4]; 2] = core::mem::transmute(got);
+                assert_eq!(got, expected, "input offsets {offset}/{}", 63 - offset);
+            }
+            assert_eq!((first, second), before, "read-only inputs");
+        }
     }
 }
