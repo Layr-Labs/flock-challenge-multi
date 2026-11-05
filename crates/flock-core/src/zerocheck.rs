@@ -842,7 +842,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     // peak zerocheck footprint drops by 2 GiB. The pass always emits the
     // round-five lookahead too, so it needs `r[k_skip+3] ≠ 0` (β₀ at the
     // ranked shape). Kill switch: FLOCK_NO_ZC_SWEEP_NOMAT.
-    let use_nomat = use_lookahead && r[k_skip + 3] != F128::ZERO && !nomat_off();
+    // For the 2^26-row packed sweep, keep the two folded tables (2 GiB)
+    // so the following composed rounds can consume them directly.
+    let retain_round2_tables = k_skip == K_SKIP && n_mlv == 26;
+    let use_nomat =
+        use_lookahead && r[k_skip + 3] != F128::ZERO && !retain_round2_tables && !nomat_off();
     #[cfg(test)]
     ZC_NOMAT_LAST.store(use_nomat, std::sync::atomic::Ordering::Relaxed);
 
