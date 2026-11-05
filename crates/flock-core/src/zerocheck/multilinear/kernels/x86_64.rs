@@ -2661,10 +2661,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let x = $x_expr;
                 let ol = 2 * x;
                 let xg = out_base + ol;
-                let [a0, a1, a2, a3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
-                let [b0, b1, b2, b3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
+                let [[a0, a1, a2, a3], [b0, b1, b2, b3]] =
+                    gfni_fold64_rows_c4_dual_registers(
+                        a_pkt.add(4 * xg * 8), b_pkt.add(4 * xg * 8), cfold);
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -4686,6 +4685,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c4_dual_result.S"),
 );
 
 #[cfg(all(
@@ -4699,8 +4699,49 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c4_dual_register_result();
 }
 
+
+
+/// Fold two complete 512-byte inputs with one shared immutable matrix frame.
+/// The private helper returns eight vectors and preserves ZMM16..31, including
+/// six registers borrowed inside its independently checked stack frame.
+///
+/// # Safety
+/// Both input ranges and the CFoldMats are initialized and readable throughout
+/// the call. The native module guards supply the instruction-set requirements.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_dual_registers(
+    first: *const u8, second: *const u8, m: &CFoldMats,
+) -> [[core::arch::x86_64::__m512i; 4]; 2] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let (a,b,c,d,e,f,g,h): (__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i);
+        core::arch::asm!(
+            "call {kernel}", kernel = sym flock_gfni_c4_dual_register_result,
+            in("rdi") first, in("rsi") second, in("rdx") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            out("zmm12") e, out("zmm13") f, out("zmm14") g, out("zmm15") h,
+        );
+        [[a,b,c,d],[e,f,g,h]]
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        [gfni_fold64_rows_c4_lm_registers(first,m), gfni_fold64_rows_c4_lm_registers(second,m)]
+    }
+}
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -5619,6 +5660,149 @@ pub(crate) struct R4LaneWeights {
     target_feature = "gfni",
     target_feature = "vpclmulqdq"
 ))]
+
+#[derive(Clone, Copy)]
+struct R4Corners {
+    a: [core::arch::x86_64::__m512i; 4],
+    b: [core::arch::x86_64::__m512i; 4],
+    odd: [core::arch::x86_64::__m512i; 2],
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+
+// Branded partial from a first canonical batch: only upper 128-bit lanes live.
+struct R4Partial(R4Corners);
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+
+#[inline(always)]
+unsafe fn r4_corners<const SET: usize, const SKIP: u8>(fa: *const F128, fb: *const F128) -> R4Corners {
+    use core::arch::x86_64::*;
+    unsafe {
+        let ld = |p: *const F128, g: usize, k: usize| {
+            if g as u8 == SKIP { _mm512_setzero_si512() }
+            else { _mm512_loadu_si512(p.add(16*k+4*g).cast::<__m512i>()) }
+        };
+        let mut a=[_mm512_setzero_si512();4];
+        let mut b=[_mm512_setzero_si512();4];
+        let mut odd=[_mm512_setzero_si512();2];
+        for k in 0..4 {
+            let (x,y)=(ld(fa,2*SET,k),ld(fa,2*SET+1,k));
+            let (u,v)=(ld(fb,2*SET,k),ld(fb,2*SET+1,k));
+            let ao=_mm512_shuffle_i64x2::<0xDD>(x,y);
+            let bo=_mm512_shuffle_i64x2::<0xDD>(u,v);
+            if k==0 {odd=[ao,bo];}
+            a[k]=_mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x,y),ao);
+            b[k]=_mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(u,v),bo);
+        }
+        R4Corners{a,b,odd}
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+
+#[inline(always)]
+unsafe fn r4_add_corners<const TWO: bool>(first: &R4Corners, second: &R4Corners, acc4: &mut [WideGhashX4;10]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        if TWO {acc4[0].mul_acc2(first.odd[0],first.odd[1],second.odd[0],second.odd[1]);}
+        else {acc4[0].mul_acc(first.odd[0],first.odd[1]);}
+        macro_rules! term {($idx:literal,$map:expr)=>{{
+            let map=$map;
+            if TWO {acc4[$idx].mul_acc2(map(&first.a),map(&first.b),map(&second.a),map(&second.b));}
+            else {acc4[$idx].mul_acc(map(&first.a),map(&first.b));}
+        }}}
+        term!(1,|v:&[__m512i;4]|v[0]);
+        term!(2,|v:&[__m512i;4]|v[1]);
+        term!(3,|v:&[__m512i;4]|_mm512_xor_si512(v[0],v[1]));
+        term!(4,|v:&[__m512i;4]|v[2]);
+        term!(5,|v:&[__m512i;4]|v[3]);
+        term!(6,|v:&[__m512i;4]|_mm512_xor_si512(v[2],v[3]));
+        term!(7,|v:&[__m512i;4]|_mm512_xor_si512(v[0],v[2]));
+        term!(8,|v:&[__m512i;4]|_mm512_xor_si512(v[1],v[3]));
+        term!(9,|v:&[__m512i;4]|_mm512_ternarylogic_epi64::<0x96>(v[0],v[1],_mm512_xor_si512(v[2],v[3])));
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+
+unsafe fn r4_round4_first(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4;10]) -> R4Partial {
+    unsafe {
+        let partial=r4_corners::<0,0>(fa,fb);
+        let full=r4_corners::<1,0>(fa,fb);
+        r4_add_corners::<false>(&full,&full,acc4);
+        R4Partial(partial)
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+
+// The saved first-set lower lanes and last-set upper lanes are zero. Keeping
+// the original lane positions makes all cross products vanish lane by lane;
+// the full unreduced sum is unchanged for arbitrary subsequent lane weights.
+unsafe fn r4_round4_last(fa: *const F128, fb: *const F128, saved: &R4Partial, acc4: &mut [WideGhashX4;10]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let full=r4_corners::<0,3>(fa,fb);
+        let mut partial=r4_corners::<1,3>(fa,fb);
+        for k in 0..4 {
+            partial.a[k]=_mm512_xor_si512(partial.a[k],saved.0.a[k]);
+            partial.b[k]=_mm512_xor_si512(partial.b[k],saved.0.b[k]);
+        }
+        for k in 0..2 {partial.odd[k]=_mm512_xor_si512(partial.odd[k],saved.0.odd[k]);}
+        r4_add_corners::<true>(&full,&partial,acc4);
+    }
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 #[cfg_attr(
     target_feature = "avx512bw",
     target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
@@ -5824,7 +6008,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
-            {
+            let partial_r4 = {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
                 gfni_fold64_rows_tr_bcast_skip_group::<true>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
@@ -5834,8 +6018,8 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch(fa, fb, &mut acc4, 0);
-            }
+                r4_round4_first(fa, fb, &mut acc4)
+            };
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
@@ -5861,7 +6045,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
-                r4_round4_batch(fa, fb, &mut acc4, 3);
+                r4_round4_last(fa, fb, &partial_r4, &mut acc4);
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5950,9 +6134,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
 
         macro_rules! fold_side {
             ($pkt:expr, $row0:expr) => {{
-                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8 + 512), cfold);
+                let [[q0, q1, q2, q3], [p0, p1, p2, p3]] =
+                    gfni_fold64_rows_c4_dual_registers(
+                        $pkt.add($row0 * 8), $pkt.add($row0 * 8 + 512), cfold);
                 let oe1 = _mm512_xor_si512(q0, ghash_mul_x4_split(_mm512_xor_si512(q0, q1), r3, r3_64));
                 let oo1 = _mm512_xor_si512(q2, ghash_mul_x4_split(_mm512_xor_si512(q2, q3), r3, r3_64));
                 let oe2 = _mm512_xor_si512(p0, ghash_mul_x4_split(_mm512_xor_si512(p0, p1), r3, r3_64));
@@ -6066,5 +6250,100 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         [
             lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
         ]
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+mod dual_c4_abi_tests {
+    use super::*;
+
+    #[test]
+    fn dual_c4_register_abi_matches_single_calls() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut draw = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for offset in 0..64 {
+            let first: [u8; 576] = core::array::from_fn(|_| draw() as u8);
+            let second: [u8; 576] = core::array::from_fn(|_| draw() as u8);
+            let before = (first, second);
+            let mats = CFoldMats(
+                [[0; 8]; 128],
+                core::array::from_fn(|_| core::array::from_fn(|_| draw())),
+            );
+            unsafe {
+                let a = first.as_ptr().add(offset);
+                let b = second.as_ptr().add(63 - offset);
+                let expected = [
+                    gfni_fold64_rows_c4_lm_registers(a, &mats),
+                    gfni_fold64_rows_c4_lm_registers(b, &mats),
+                ];
+                let got = gfni_fold64_rows_c4_dual_registers(a, b, &mats);
+                let expected: [[[u64; 8]; 4]; 2] = core::mem::transmute(expected);
+                let got: [[[u64; 8]; 4]; 2] = core::mem::transmute(got);
+                assert_eq!(got, expected, "input offsets {offset}/{}", 63 - offset);
+            }
+            assert_eq!((first, second), before, "read-only inputs");
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+mod r4_partial_product_tests {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    #[test]
+    fn complementary_partial_sets_match_every_unreduced_lane() {
+        unsafe {
+            let mut state=0x1319_8a2e_0370_7344u64;
+            let mut draw=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+            for case in 0..64 {
+                let fa:[F128;72]=core::array::from_fn(|_|F128::new(draw(),draw()));
+                let fb:[F128;72]=core::array::from_fn(|_|F128::new(draw(),draw()));
+                let la:[F128;72]=core::array::from_fn(|_|F128::new(draw(),draw()));
+                let lb:[F128;72]=core::array::from_fn(|_|F128::new(draw(),draw()));
+                let before=(fa,fb,la,lb);
+                let offset=case%5;
+                let (fap,fbp,lap,lbp)=(fa.as_ptr().add(offset),fb.as_ptr().add(offset),la.as_ptr().add(offset),lb.as_ptr().add(offset));
+                let mut vector=||{
+                    let words:[u64;8]=core::array::from_fn(|_|draw());
+                    _mm512_loadu_si512(words.as_ptr().cast::<__m512i>())
+                };
+                let initial:[WideGhashX4;10]=core::array::from_fn(|_|WideGhashX4{lo:vector(),hi:vector(),mid:vector()});
+                let mut expected=initial;
+                let mut got=initial;
+                r4_round4_batch(fap,fbp,&mut expected,0);
+                r4_round4_batch(lap,lbp,&mut expected,3);
+                let saved=r4_round4_first(fap,fbp,&mut got);
+                let tail=r4_corners::<1,3>(lap,lbp);
+                for value in saved.0.a.into_iter().chain(saved.0.b).chain(saved.0.odd) {
+                    let words:[u64;8]=core::mem::transmute(value);
+                    assert_eq!(&words[..4],&[0;4],"first partial lower lanes case={case}");
+                }
+                for value in tail.a.into_iter().chain(tail.b).chain(tail.odd) {
+                    let words:[u64;8]=core::mem::transmute(value);
+                    assert_eq!(&words[4..],&[0;4],"last partial upper lanes case={case}");
+                }
+                r4_round4_last(lap,lbp,&saved,&mut got);
+                for k in 0..10 {
+                    let a:[[_;8];3]=[expected[k].lo,expected[k].hi,expected[k].mid].map(|v|core::mem::transmute::<__m512i,[u64;8]>(v));
+                    let b:[[_;8];3]=[got[k].lo,got[k].hi,got[k].mid].map(|v|core::mem::transmute::<__m512i,[u64;8]>(v));
+                    assert_eq!(a,b,"all unreduced coefficients case={case} product={k}");
+                }
+                assert_eq!((fa,fb,la,lb),before,"inputs and guards unchanged");
+            }
+        }
     }
 }
