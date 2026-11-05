@@ -674,6 +674,150 @@ pub(crate) mod imp {
         }
     }
 
+    // A generated stage has 64 field elements in the first half and 57
+    // in the second. Both halves use the same prefix of the weights.
+    #[inline(always)]
+    unsafe fn add_two_stage_elements(
+        acc: &mut [__m512i; 6], base: *const __m512i,
+        w0: __m512i, w1: __m512i, s0: __m512i, s1: __m512i,
+    ) {
+        unsafe {
+            let a0 = *base.add(0);
+            let b0 = *base.add(1);
+            let a1 = *base.add(2);
+            let b1 = *base.add(3);
+            let x0 = _mm512_xor_si512(a0, b0);
+            let x1 = _mm512_xor_si512(a1, b1);
+            acc[0] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[0],
+                _mm512_clmulepi64_epi128::<0x00>(a0, w0),
+                _mm512_clmulepi64_epi128::<0x00>(a1, w1),
+            );
+            acc[1] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[1],
+                _mm512_clmulepi64_epi128::<0x01>(a0, w0),
+                _mm512_clmulepi64_epi128::<0x01>(a1, w1),
+            );
+            acc[2] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[2],
+                _mm512_clmulepi64_epi128::<0x10>(b0, w0),
+                _mm512_clmulepi64_epi128::<0x10>(b1, w1),
+            );
+            acc[3] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[3],
+                _mm512_clmulepi64_epi128::<0x11>(b0, w0),
+                _mm512_clmulepi64_epi128::<0x11>(b1, w1),
+            );
+            acc[4] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[4],
+                _mm512_clmulepi64_epi128::<0x00>(x0, s0),
+                _mm512_clmulepi64_epi128::<0x00>(x1, s1),
+            );
+            acc[5] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[5],
+                _mm512_clmulepi64_epi128::<0x01>(x0, s0),
+                _mm512_clmulepi64_epi128::<0x01>(x1, s1),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn add_last_stage_element(
+        acc: &mut [__m512i; 6], base: *const __m512i, w0: __m512i, s0: __m512i,
+    ) {
+        unsafe {
+            let a = *base.add(0);
+            let b = *base.add(1);
+            let x = _mm512_xor_si512(a, b);
+            acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(a, w0));
+            acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x01>(a, w0));
+            acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x10>(b, w0));
+            acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(b, w0));
+            acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(x, s0));
+            acc[5] = _mm512_xor_si512(acc[5], _mm512_clmulepi64_epi128::<0x01>(x, s0));
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn fold_generated_stage(stage: &Stage, w: &Weights) -> [[__m512i; 2]; 2] {
+        unsafe {
+            const { assert!(NQ == 242); }
+            let first = stage.0.as_ptr();
+            let second = first.add(128);
+            let mut low = [_mm512_setzero_si512(); 6];
+            let mut high = low;
+            for e in (0..56).step_by(2) {
+                let (w0, w1) = (w.lohi[e], w.lohi[e + 1]);
+                let (s0, s1) = (w.sum[e], w.sum[e + 1]);
+                add_two_stage_elements(&mut low, first.add(2 * e), w0, w1, s0, s1);
+                add_two_stage_elements(&mut high, second.add(2 * e), w0, w1, s0, s1);
+            }
+            // Element 56 ends the second half. The first half continues to 63.
+            add_two_stage_elements(&mut low, first.add(112),
+                w.lohi[56], w.lohi[57], w.sum[56], w.sum[57]);
+            add_last_stage_element(&mut high, second.add(112), w.lohi[56], w.sum[56]);
+            for e in (58..64).step_by(2) {
+                add_two_stage_elements(&mut low, first.add(2 * e),
+                    w.lohi[e], w.lohi[e + 1], w.sum[e], w.sum[e + 1]);
+            }
+            [low, high].map(|[le, lo, he, ho, me, mo]| {
+                let me = _mm512_ternarylogic_epi64::<0x96>(me, le, he);
+                let mo = _mm512_ternarylogic_epi64::<0x96>(mo, lo, ho);
+                [
+                    flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(le, me, he),
+                    flock_core::field::gf2_128::x86_64::ghash_reduce_acc_x4(lo, mo, ho),
+                ]
+            })
+        }
+    }
+
+    #[cfg(all(test, target_feature = "avx512vl", target_feature = "avx512dq"))]
+    #[test]
+    fn generated_stage_halves_match_original_and_scalar() {
+        use super::super::blake3_witgen8::root_recompute::stage_recompute::generate_stages;
+        unsafe {
+            let zero = _mm512_setzero_si512();
+            for (seed, tile, pair) in [(0, 0, 0), (0x15d03, 127, 1), (u64::MAX, 4095, 3)] {
+                let mut stages = [Stage([zero; NQ]), Stage([zero; NQ])];
+                let [a, b] = &mut stages;
+                generate_stages(seed, tile, pair, a.0.as_mut_ptr().cast(), b.0.as_mut_ptr().cast());
+                for stage in &stages {
+                    let words = &*stage.0.as_ptr().cast::<[[u64; 8]; NQ]>();
+                    assert_eq!(words[NQ - 1], [0; 8]);
+                    for focus in [None, Some(0), Some(55), Some(56), Some(57), Some(63)] {
+                        let w = core::array::from_fn(|i| {
+                            let v = (i as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15) ^ seed;
+                            if focus.is_none() || focus == Some(i) {
+                                F128::new(v, v.rotate_left(29) ^ 0xd6e8feb86659fd93)
+                            } else { F128::ZERO }
+                        });
+                        let weights = Weights::new(&w);
+                        let reference = fold_stage(stage, &weights, &mut PfCur::new(None));
+                        let actual = fold_generated_stage(stage, &weights);
+                        for h in 0..2 {
+                            for parity in 0..2 {
+                                let mut old = [F128::ZERO; 4];
+                                let mut got = old;
+                                _mm512_storeu_si512(old.as_mut_ptr().cast(), reference[h][parity]);
+                                _mm512_storeu_si512(got.as_mut_ptr().cast(), actual[h][parity]);
+                                assert_eq!(got, old);
+                                for (l, value) in got.iter().enumerate() {
+                                    let lane = 2*l + parity;
+                                    let mut expected = F128::ZERO;
+                                    for e in 0..if h == 0 {64} else {57} {
+                                        let q = 128*h + 2*e;
+                                        expected += F128::new(words[q][lane], words[q+1][lane]) * w[e];
+                                    }
+                                    assert_eq!(*value, expected, "tile={tile} pair={pair} h={h} lane={lane} focus={focus:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Original compression index of physical slot `p` in a tile view.
     #[inline(always)]
     fn compression(cross_quarter: bool, p: usize) -> usize {
@@ -839,7 +983,11 @@ pub(crate) mod imp {
             // (compression, half) slot is written by exactly one octa; the
             // prefetch hints stay within the tile span.
             unsafe {
-                let r = fold_stage(stage, &weights, pf);
+                let r = if view.stage_generator.is_some() && pf.cur == pf.end {
+                    fold_generated_stage(stage, &weights)
+                } else {
+                    fold_stage(stage, &weights, pf)
+                };
                 let base = 64 * t + 8 * o;
                 for (h, halves) in r.iter().enumerate() {
                     for (parity, v) in halves.iter().enumerate() {
