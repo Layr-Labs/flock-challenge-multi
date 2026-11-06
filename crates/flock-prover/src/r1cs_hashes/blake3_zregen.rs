@@ -28,6 +28,13 @@ pub(crate) static REGEN_FOLDS: std::sync::atomic::AtomicUsize = std::sync::atomi
 pub(crate) static REGEN_MATERIALIZES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Direct field folding for exact generated witness pairs; rollback keeps
+/// the promoted full-stage generation and field-fold path.
+pub(crate) fn fused_fold_enabled()->bool {
+    static ON:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_FUSED_Z_FOLD").is_none());
+    *ON
+}
+
 /// Production gate for skipping z's DRAM stores (`FLOCK_NO_Z_ELIDE=1`
 /// restores the dense witness). Requires the exact regeneration plan.
 pub(crate) fn z_elide_enabled() -> bool {
@@ -741,7 +748,7 @@ pub(crate) mod imp {
                         if mode == 0 && let Some(generate) = view.stage_generator {
                             let seed=view.generator.expect("stage generator seed").0;
                             unsafe {
-                                generate(seed,t,pair,scratch.stage.0.as_mut_ptr().cast(),scratch.second_stage.0.as_mut_ptr().cast());
+                                generate(seed,t,pair,scratch.stage.0.as_mut_ptr().cast(),scratch.second_stage.0.as_mut_ptr().cast(),core::ptr::null());
                             }
                             let mut pf=PfCur::new(None);
                             f(&scratch.stage,t,2*pair,&mut pf);
@@ -828,9 +835,80 @@ pub(crate) mod imp {
     }
 
     /// `out[t] = Σ_{i<64} w[i] · z[64 t + i]` straight from the tiles.
+    fn fold64_generated(
+        view: &WitnessTileView,
+        out: &mut [F128],
+        weights: &Weights,
+        generate: unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8),
+    ) {
+        const {
+            assert!(core::mem::size_of::<Weights>() == 8192);
+            assert!(core::mem::align_of::<Weights>() == 64);
+        }
+        assert!(view.cross_quarter && view.tiles == 4096);
+        let seed = view.generator.expect("fold generator seed").0;
+        let dst = SendPtr(out.as_mut_ptr());
+        #[repr(C, align(64))]
+        struct FoldOut([__m512i; 8]);
+        thread_local! {static OUTPUT:core::cell::RefCell<Option<Box<FoldOut>>>=const {core::cell::RefCell::new(None)};}
+        (0..view.tiles / 8).into_par_iter().for_each(|u| {
+            let dst = dst;
+            OUTPUT.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let output = guard
+                    .get_or_insert_with(|| unsafe { Box::<FoldOut>::new_zeroed().assume_init() });
+                for tile in u * 8..(u + 1) * 8 {
+                    for pair in 0..4 {
+                        unsafe {
+                            generate(
+                                seed,
+                                tile,
+                                pair,
+                                output.0.as_mut_ptr().cast(),
+                                core::ptr::null_mut(),
+                                (weights as *const Weights).cast(),
+                            );
+                            let base = 64 * tile + 16 * pair;
+                            for octa in 0..2 {
+                                for parity in 0..2 {
+                                    let lo = output.0[2 * octa + parity];
+                                    let hi = output.0[4 + 2 * octa + parity];
+                                    macro_rules! store {
+                                        ($l:literal) => {{
+                                            let c = compression(
+                                                true,
+                                                base + 8 * octa + 2 * $l + parity,
+                                            );
+                                            let value = _mm256_inserti128_si256::<1>(
+                                                _mm256_castsi128_si256(
+                                                    _mm512_extracti32x4_epi32::<$l>(lo),
+                                                ),
+                                                _mm512_extracti32x4_epi32::<$l>(hi),
+                                            );
+                                            _mm256_storeu_si256(dst.0.add(2 * c).cast(), value);
+                                        }};
+                                    }
+                                    store!(0);
+                                    store!(1);
+                                    store!(2);
+                                    store!(3);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     pub(crate) fn fold64(view: &WitnessTileView, out: &mut [F128], w: &[F128; 64]) {
         assert_eq!(out.len(), view.tiles * 64 * 2);
         let weights = Weights::new(w);
+        if super::fused_fold_enabled() && let Some(generate)=view.stage_generator {
+            fold64_generated(view,out,&weights,generate);
+            return;
+        }
+
         let dst = SendPtr(out.as_mut_ptr());
         let cq = view.cross_quarter;
         for_each_octa(view, |stage, t, o, pf| {
