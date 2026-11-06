@@ -2185,8 +2185,11 @@ impl AdditiveNttF128 {
     /// `q*2^17 + k*2^11 + r` each contain 64 fields. Every field must remain
     /// initialized, including any proven constant-elision regions.
     /// A Some `seed_target` owns two reserved staging blocks for this group.
-    /// For every owned kpair, fully initialize a private q-major octa input
-    /// and call seed_octa once before reusing it. Both roles join before any
+    /// For every owned kpair, either initialize a private q-major octa and
+    /// call seed_octa once, or use prepared seed_range_full calls whose
+    /// disjoint field ranges partition all 128 fields. Every range must be
+    /// initialized before its call; its storage cannot be reused until the
+    /// call returns. Both roles join before any
     /// folding or slot reuse. The materialize-first fallback passes None and
     /// requires only the complete global witness. The encoder joins every
     /// producer on unwinding too; no input or target pointer may escape.
@@ -8130,4 +8133,97 @@ mod octa_seed_geometry_tests {
         }}}}
         println!("OCTA_SEED_GEOMETRY full_groups={cases} fields_per_group=63488_or_65536 wrong_quarter_controls={negative_controls} input_unchanged=true guards_unchanged=true reusable_local_input=true hold4_disabled={}",ntt_seed_hold4_disabled());
     }
+}
+
+/// Proof-local immutable coefficient preparation for incremental witness seeding.
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+pub struct WitnessWindowSeed<'a>{target:&'a WitnessSeedTarget,prepared:[F128;8]}
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+impl WitnessSeedTarget{
+ #[inline(always)]
+ pub fn prepare_windows(&self)->WitnessWindowSeed<'_>{
+  let ts=[self.right,self.dense[0],self.dense[1],self.dense[2]];
+  WitnessWindowSeed{target:self,prepared:core::array::from_fn(|i|if i%2==0{ts[i/2]}else{ts[i/2]*F128{lo:0,hi:1}})}
+ }
+}
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+impl WitnessWindowSeed<'_>{
+ /// Seed a fully initialized range of the ordinary complete-octa buffer.
+ ///
+ /// # Safety
+ /// The caller owns kpair exactly as for seed_octa. Calls must partition all
+ /// 128 source fields into nonoverlapping four-aligned ranges. Input has
+ /// eight 128-field rows; every demanded range is initialized before the call.
+ /// Output access remains exclusive until the producer callback returns.
+ #[inline(always)]
+ pub unsafe fn seed_range_full(&self,input:*const F128,kpair:usize,first:usize,count:usize){unsafe{
+  assert!(kpair<32&&first<128&&first.is_multiple_of(4)&&count>0&&count<=64&&count.is_multiple_of(4)&&first+count<=128&&first/64==(first+count-1)/64);
+  let parity=first/64;let col=first%64;let limit=if parity==1{64-self.target.odd_tail}else{64};let active=count.min(limit.saturating_sub(col));
+  assert!(active.is_multiple_of(4));if active==0{return;}
+  for kbit in 0..2 {let kp=seed_top_stage_row(2*kpair+kbit,self.target.stage_perm);let dst=self.target.output[parity].add(kp*64+col);
+   kernels::seed_window_prepared(input.add(col),4,2*kbit+parity,dst,dst.add(256*64),64,active,&self.prepared);
+  }
+ }}
+}
+
+
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+impl WitnessWindowSeed<'_>{
+ /// Seed one ready window from eight rows of eight fields. The window begins
+ /// at first modulo eight within each row. The final four padding fields are
+ /// synthesized as zero when the ordinary seed route would consume them.
+ ///
+ /// # Safety
+ /// All demanded nonpadding fields are initialized in this exclusive 64-field
+ /// tile. Calls partition fields 0..128 for one exclusively owned kpair.
+ /// The tile may be reused only after this call returns. No pointer escapes.
+ #[inline(always)]
+ pub unsafe fn seed_range_tile(&self,input:*mut F128,kpair:usize,first:usize,count:usize,source_cols:usize){unsafe{
+  assert!(matches!(source_cols,8|16|32|64));
+  assert!(kpair<32&&first<128&&first.is_multiple_of(4)&&count>0&&count<=64&&count.is_multiple_of(4)&&first+count<=128&&first/64==(first+count-1)/64&&first%source_cols+count<=source_cols);
+  if first+count==128&&self.target.odd_tail==0 {for row in 0..8{input.add(row*source_cols+source_cols-4).write_bytes(0,4);}}
+  let parity=first/64;let col=first%64;let limit=if parity==1{64-self.target.odd_tail}else{64};let active=count.min(limit.saturating_sub(col));
+  assert!(active.is_multiple_of(4));if active==0{return;}
+  for kbit in 0..2{let kp=seed_top_stage_row(2*kpair+kbit,self.target.stage_perm);let dst=self.target.output[parity].add(kp*64+col);
+   kernels::seed_window_prepared(input.add(first%source_cols),2,kbit,dst,dst.add(256*64),source_cols,active,&self.prepared);
+  }
+ }}
+}
+
+#[cfg(all(test,target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+mod witness_window_tests{
+ use super::*;
+ #[test] fn window_seed_matches_complete_octa_and_preserves_unowned_rows(){unsafe{
+  let mut state=0xd1ceaf784143u64;let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+  let mut input:Vec<F128>=(0..8*128).map(|_|F128{lo:next(),hi:next()}).collect();for row in 0..8{input[row*128+124..row*128+128].fill(F128::ZERO);}
+  let poison=F128{lo:0xa5a5a5a5a5a5a5a5,hi:0x5a5a5a5a5a5a5a5a};
+  for low in[false,true]{for odd_tail in[0,4]{for stage_perm in[false,true]{for kpair in[0,1,15,31]{
+   let mut old:[Vec<F128>;2]=core::array::from_fn(|_|vec![poison;512*64]);let mut new=old.clone();
+   let right=F128{lo:next(),hi:next()};let dense=[F128{lo:next(),hi:if low{0}else{next()}},F128{lo:next(),hi:next()},F128{lo:next(),hi:next()}];
+   let target=|out:&mut[Vec<F128>;2]|WitnessSeedTarget{output:[out[0].as_mut_ptr(),out[1].as_mut_ptr()],odd_tail,stage_perm,right,dense};
+   target(&mut old).seed_octa(input.as_ptr(),kpair);
+   let new_target=target(&mut new);let windows=new_target.prepare_windows();
+   for(first,count)in core::iter::once((4,4)).chain((8..120).step_by(8).map(|first|(first,8))).chain([(120,8),(0,4)]){windows.seed_range_full(input.as_ptr(),kpair,first,count);}
+   assert!(old==new,"full low={low} odd={odd_tail} perm={stage_perm} kpair={kpair}");
+   for cols in[8,16,32,64]{for merge in[false,true]{
+    for out in &mut new{out.fill(poison);}
+    let new_target=target(&mut new);let windows=new_target.prepare_windows();let mut tile=vec![poison;8*cols];let mut saved=[[poison;4];8];
+    for(first,count)in core::iter::once((4,4)).chain((8..120).step_by(8).map(|first|(first,8))).chain([(120,8),(0,4)]){
+     if first==120{for row in 0..8{tile[row*cols+cols-4..row*cols+cols].fill(poison);}}
+     let live=count.min(124usize.saturating_sub(first));
+     for row in 0..8{core::ptr::copy_nonoverlapping(input.as_ptr().add(row*128+first),tile.as_mut_ptr().add(row*cols+first%cols),live);}
+     if merge&&first==4{for row in 0..8{saved[row].copy_from_slice(&tile[row*cols+4..row*cols+8]);}continue;}
+     if first==0{
+      if merge{for row in 0..8{tile[row*cols+4..row*cols+8].copy_from_slice(&saved[row]);}}
+      windows.seed_range_tile(tile.as_mut_ptr(),kpair,0,if merge{8}else{count},cols);
+     }else if (first+count)&(cols-1)==0{
+      let start=(first+count-cols).max(if merge{8}else{4});
+      windows.seed_range_tile(tile.as_mut_ptr(),kpair,start,first+count-start,cols);
+     }
+    }
+    assert!(old==new,"cols={cols} merge={merge} low={low} odd={odd_tail} perm={stage_perm} kpair={kpair}");
+   }}
+  }}}}
+  println!("WINDOW_SEED_ORACLE_OK 32 geometries x9 source/schedule layouts =288 poisoned-output comparisons");
+ }}
 }
