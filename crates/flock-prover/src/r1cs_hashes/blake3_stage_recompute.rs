@@ -246,12 +246,13 @@ fn full_stage_matches_scalar_packed_witness() {
                 core::array::from_fn(|_| Box::new(Stages([[SENTINEL; 8]; 244])));
             let [first, second] = &mut stages;
             unsafe {
-                generate_stages(
+                generate_pair_provider(
                     init,
                     tile,
                     pair,
                     first.0.as_mut_ptr().add(1).cast(),
                     second.0.as_mut_ptr().add(1).cast(),
+                    core::ptr::null(),
                 );
             }
             for stage in &stages {
@@ -295,3 +296,15 @@ pub(crate) fn enabled() -> bool {
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DIRECT_Z_STAGE").is_none());
     *ON
 }
+
+/// Exact ranked witness provider; a null weight pointer requests full stages.
+///
+/// # Safety
+/// In stage mode both outputs are aligned arrays of242ZMMs. In fold mode,
+/// weights is an aligned8192-byte immutable weight frame, first is an aligned
+/// writable512-byte fold result, and second is unused. All spans are disjoint.
+/// See RootTileCache::set_stage_generator for the complete layout contract.
+pub(crate) unsafe fn generate_pair_provider(init:u64,tile:usize,pair:usize,first:*mut u8,second:*mut u8,weights:*const u8){unsafe{
+    if weights.is_null(){generate_stages(init,tile,pair,first,second);}
+    else{super::fused_fold::generate_pair_fold(init,tile,pair,weights,first);}
+}}
