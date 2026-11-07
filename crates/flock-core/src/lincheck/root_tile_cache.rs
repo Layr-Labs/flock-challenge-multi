@@ -36,7 +36,7 @@ pub struct RootTileCache {
     z_elided: bool,
     generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
     pair_generator: Option<RootPairGenerator>,
-    stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8)>,
+    stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8)>,
 }
 
 /// Raw read-only view of witness-produced word-major root tiles: `tiles`
@@ -49,11 +49,11 @@ pub struct WitnessTileView {
     pub cross_quarter: bool,
     pub generator: Option<(u64, unsafe fn(u64, usize, *mut u8))>,
     pub pair_generator: Option<RootPairGenerator>,
-    pub stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8)>,
+    pub stage_generator: Option<unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8)>,
 }
 
 #[repr(align(64))]
-struct GeneratedTiles([core::mem::MaybeUninit<u8>; 4 * 176 * 512]);
+struct GeneratedTiles([core::mem::MaybeUninit<u8>; 2 * 176 * 512]);
 
 #[derive(Clone, Copy)]
 pub(super) struct Capture {
@@ -247,10 +247,15 @@ impl RootTileCache {
     /// Supply a proof-local full-witness pair generator for PCS folds.
     ///
     /// # Safety
-    /// The callback must overwrite two disjoint, 64-byte aligned arrays of
-    /// 242 ZMMs with canonical qwords for physical octas pair*2 and pair*2+1.
-    /// Its seed and tile mapping must agree with this cache's root generator.
-    pub unsafe fn set_stage_generator(&mut self, generate: unsafe fn(u64,usize,usize,*mut u8,*mut u8)) {
+    /// With a null final argument, overwrite two disjoint, 64-byte aligned
+    /// arrays of 242 ZMMs with canonical qwords for physical octas pair*2 and
+    /// pair*2+1. With a nonnull final argument, read 8192 immutable aligned
+    /// bytes (64 repeated-F128 weight ZMMs, then 64 low/high-XOR ZMMs), ignore
+    /// the second output pointer, and overwrite 512 aligned bytes at the first
+    /// output in [half][octa][parity] order, four canonical F128 lanes per ZMM.
+    /// Lane l represents compression 2*l+parity within that octa. Weights and
+    /// output must be disjoint; seed/tile mapping must agree with the cache.
+    pub unsafe fn set_stage_generator(&mut self, generate: unsafe fn(u64,usize,usize,*mut u8,*mut u8,*const u8)) {
         assert!(self.generator.is_some() && self.cross_quarter);
         self.stage_generator=Some(generate);
     }
@@ -419,6 +424,9 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Generated roots use a shorter scratch working set. Stored roots
+        // retain their four-tile reader and its existing scheduling policy.
+        let batch_size = if BATCH_WORD_TILES && self.generator.is_some() { 2 } else { 4 };
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -468,15 +476,15 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        lo = next.fetch_add(batch_size, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + 4).min(self.tiles);
+                        hi = (lo + batch_size).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;
-                        let count = (hi - lo).min(4);
+                        let count = (hi - lo).min(batch_size);
                         lo += count;
                         let source = if let Some((seed, generate)) = self.generator {
                             let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
