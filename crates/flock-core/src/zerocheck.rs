@@ -861,7 +861,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     let want_3var = use_nomat
         && n_mlv >= 9
         && r[k_skip + 4] != F128::ZERO
-        && (cfg!(test) || cfg!(target_arch = "x86_64"))
+        // The two-variable route avoids the extra round-four products in
+        // round two. Retain the three-variable route for native diagnostics
+        // and reference tests, where both schedules must remain equivalent.
+        && (cfg!(test)
+            || (cfg!(target_arch = "x86_64") && hoisted_flag!("FLOCK_ZC_3VAR")))
         && !three_var_off();
     let mut la4: Option<multilinear::Round4Lookahead> = None;
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {

@@ -6068,3 +6068,77 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         ]
     }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+mod shared_c4_checks {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    #[repr(align(64))]
+    struct Rows([u8; 512]);
+    #[repr(align(64))]
+    struct Guarded([u64; 48]);
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn shared_c4_register_kernel_matches_rust_reference() {
+        let mut state = 0x1357_9bdf_2468_ace0;
+        let mut rows = Rows([0; 512]);
+        let mut mats = CFoldMats([[0; 8]; 128], [[0; 8]; 64]);
+        for word in mats.1.iter_mut().flatten() {
+            *word = next(&mut state);
+        }
+        const SENTINEL: u64 = 0xdead_beef_0123_4567;
+        for case in 0..4608 {
+            if case < 4096 {
+                rows.0.fill(0);
+                rows.0[case / 8] = 1 << (case % 8);
+            } else {
+                for byte in &mut rows.0 {
+                    *byte = next(&mut state) as u8;
+                }
+                for word in mats.1.iter_mut().flatten() {
+                    *word = next(&mut state);
+                }
+            }
+            let saved_rows = rows.0;
+            let saved_mats = mats.1;
+            let mut reference = Guarded([SENTINEL; 48]);
+            let mut actual = [0u64; 32];
+            // SAFETY: each input has exactly the initialized extent required
+            // by the production private ABI. The reference destination is
+            // aligned, disjoint and surrounded by full guard cache lines.
+            unsafe {
+                gfni_fold64_rows_masked_c4_bcast_lm_rust(
+                    rows.0.as_ptr(),
+                    &mats,
+                    reference.0.as_mut_ptr().add(8).cast(),
+                    0,
+                );
+                let got = gfni_fold64_rows_c4_lm_registers(rows.0.as_ptr(), &mats);
+                for (i, vector) in got.into_iter().enumerate() {
+                    _mm512_storeu_si512(actual.as_mut_ptr().add(8 * i).cast(), vector);
+                }
+            }
+            assert_eq!(actual, reference.0[8..40], "case={case}");
+            assert_eq!(reference.0[..8], [SENTINEL; 8]);
+            assert_eq!(reference.0[40..], [SENTINEL; 8]);
+            assert_eq!(rows.0, saved_rows, "input changed, case={case}");
+            assert_eq!(mats.1, saved_mats, "matrices changed, case={case}");
+        }
+    }
+}

@@ -2986,6 +2986,47 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
+                #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw",
+                    target_feature = "avx512vl", target_feature = "avx512vbmi",
+                    target_feature = "avx512vbmi2", target_feature = "avx512dq",
+                    target_feature = "gfni", target_feature = "vpclmulqdq"))]
+                if root_generator.is_some()
+                    && blake3_witgen8::root_recompute::witness16::enabled()
+                    && let Some(target) = target
+                {
+                    #[repr(align(64))]
+                    struct PairInput([[F128; 8 * F128_PER_BLOCK]; 2]);
+                    let mut input = PairInput([[F128::ZERO; 8 * F128_PER_BLOCK]; 2]);
+                    let mut stages: [core::mem::MaybeUninit<[AbWinLine; STAGE_LINES]>; 2] =
+                        core::array::from_fn(|_| core::mem::MaybeUninit::uninit());
+                    // Each role pairs its consecutive owned octas. The two
+                    // roles still own exactly the original disjoint k pairs.
+                    for kpair in (role..32).step_by(4) {
+                        let bases = [2 * kpair * 1024 + group, 2 * (kpair + 2) * 1024 + group];
+                        unsafe {
+                            let zs = core::array::from_fn(|i| z_base.add(bases[i] * F128_PER_BLOCK).cast::<u32>());
+                            let aa = core::array::from_fn(|i| (a_addr as *mut F128).add(bases[i] * F128_PER_BLOCK).cast::<u32>());
+                            let bb = core::array::from_fn(|i| (b_addr as *mut F128).add(bases[i] * F128_PER_BLOCK).cast::<u32>());
+                            let projs = core::array::from_fn(|i| blake3_witgen8::StreamProj {
+                                cross_quarter: true,
+                                compact_z: input.0[i].as_mut_ptr().cast::<u32>(),
+                                elide_z,
+                                stage: stages[i].as_mut_ptr().cast::<u32>(),
+                                out: (ab_addr as *mut u8).add(bases[i] * ab_block_bytes),
+                                out_stride: ab_block_bytes,
+                                out_bias: 2 * 64,
+                                inv_table, plan: win_plan, one_rows_elided: true, w30_elided: true,
+                            });
+                            blake3_witgen8::root_recompute::witness16::build_pair(
+                                init, bases, zs, aa, bb, projs, preps.get(),
+                            );
+                            target.seed_octa(input.0[0].as_ptr(), kpair);
+                            target.seed_octa(input.0[1].as_ptr(), kpair + 2);
+                        }
+                    }
+                    if elide_z { elided_octas.store(1, std::sync::atomic::Ordering::Relaxed); }
+                    return;
+                }
                 // One private octa per role: seed it before the next octa can
                 // reuse these bytes. Initialization covers the omitted final
                 // window; all live windows are overwritten by this producer.
