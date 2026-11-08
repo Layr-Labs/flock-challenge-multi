@@ -356,7 +356,9 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
             && eighth >= (1 << 23)
             && (a_out.as_ptr() as usize) % 16 == 0
             && (b_out.as_ptr() as usize) % 16 == 0;
-        if ok { Some((cfold.unwrap(), wtab.unwrap(), nt_out)) } else { None }
+        let c8 = (ok && std::env::var_os("FLOCK_NO_ZC_C8_FOLD").is_none())
+            .then(|| kernels::x86_64::c8_fold::Mats::new(&table.data, rho));
+        if ok { Some((cfold.unwrap(), wtab.unwrap(), nt_out, c8)) } else { None }
     };
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -365,7 +367,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
         target_feature = "gfni",
         target_feature = "vpclmulqdq"
     )))]
-    let fast: Option<((), (), bool)> = None;
+    let fast: Option<((), (), bool, ())> = None;
     assert!(
         !out_lm || fast.is_some(),
         "lane-major 3var output needs the AVX-512 route"
@@ -384,7 +386,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                 target_feature = "gfni",
                 target_feature = "vpclmulqdq"
             ))]
-            let out = if let Some((c, wt, nt)) = fast.as_ref() {
+            let out = if let Some((c, wt, nt, c8)) = fast.as_ref() {
                 let (ap, bp) = (a_packed.as_ptr(), b_packed.as_ptr());
                 // SAFETY: the packed inputs expose 8 readable bytes for every
                 // row 8·out_base .. 8·(out_base + chunk_out); the cfg gate
@@ -392,16 +394,16 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                 unsafe {
                     match (*nt, out_lm) {
                         (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], c8.as_ref(), wt,
                         ),
                         (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], c8.as_ref(), wt,
                         ),
                         (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], c8.as_ref(), wt,
                         ),
                         (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], c8.as_ref(), wt,
                         ),
                     }
                 }
