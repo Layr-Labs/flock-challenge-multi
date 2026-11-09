@@ -2984,14 +2984,25 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let b_addr = b.as_mut_ptr() as usize;
             let ab_addr = ab_inner_bytes.as_mut_ptr() as usize;
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
+            let window_tile_cols=std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
+            let merge_prefix=std::env::var_os("FLOCK_WITNESS_SEED_MERGE_PREFIX").is_some();
+            let window_tile_enabled=std::env::var_os("FLOCK_NO_WITNESS_SEED_TILE").is_none();
+            let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
-                // One private octa per role: seed it before the next octa can
-                // reuse these bytes. Initialization covers the omitted final
-                // window; all live windows are overwritten by this producer.
+                let windows=target.filter(|_|window_seed_enabled&&elide_z).map(|t|t.prepare_windows());
+                let compact_tile=window_tile_enabled&&windows.is_some();
+                // The window route uses only the first 8*window_tile_cols
+                // fields as a rolling tile. Every read follows publication of
+                // its complete range; the final padding is synthesized by the
+                // seed helper when required. The fallback initializes a whole
+                // octa and seeds it once before these bytes can be reused.
                 #[repr(align(64))]
                 struct OctaInput([F128; 8 * F128_PER_BLOCK]);
-                let mut input = OctaInput([F128::ZERO; 8 * F128_PER_BLOCK]);
+                let mut input=core::mem::MaybeUninit::<OctaInput>::uninit();
+                let input_base=input.as_mut_ptr().cast::<F128>();
+                let mut saved_prefix=core::mem::MaybeUninit::<[F128;32]>::uninit();let prefix_base=saved_prefix.as_mut_ptr().cast::<F128>();
+                unsafe{input_base.write_bytes(0,if compact_tile{8*window_tile_cols}else{8*F128_PER_BLOCK});}
                 // The const-window rollback uses StreamProj's scratch even
                 // in the exact path. Each callback owns this aligned 1 KiB
                 // buffer until all its octas return; drains initialize every
@@ -3013,9 +3024,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     // offsets. Constants may be retained only because the
                     // enclosing exact branch verified all three scratch tags.
                     unsafe {
-                        let proj = blake3_witgen8::StreamProj {
+                        let seed_context=windows.as_ref().map(|window|blake3_witgen8::SeedWindowContext{window,input:input_base,prefix:prefix_base,kpair,merge_prefix});
+                        let proj = blake3_witgen8::StreamProj { compact_z_tile_words: if compact_tile{window_tile_cols*4}else{0}, seed_window: seed_context.as_ref(),
                             cross_quarter: true,
-                            compact_z: if target.is_some() { input.0.as_mut_ptr().cast::<u32>() } else { core::ptr::null_mut() },
+                            compact_z: if target.is_some() { input_base.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
                             out: (ab_addr as *mut u8).add(base * ab_block_bytes),
@@ -3026,6 +3038,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             one_rows_elided: true,
                             w30_elided: true,
                         };
+                        if compact_tile {
+                            macro_rules! emit_window {($cols:literal)=>{blake3_witgen8::build_octa_witness_ab_stream_ranked_window::<$cols>(init,base,z_base.add(field_offset).cast::<u32>(),(a_addr as *mut F128).add(field_offset).cast::<u32>(),(b_addr as *mut F128).add(field_offset).cast::<u32>(),proj,preps.get())};}
+                            match window_tile_cols {8=>emit_window!(8),16=>emit_window!(16),32=>emit_window!(32),_=>emit_window!(64)}
+                        }else{
                         blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
                             init,
                             base,
@@ -3041,8 +3057,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             } else { None },
                         false,
                         );
-                        if let Some(target) = target {
-                            target.seed_octa(input.0.as_ptr(), kpair);
+                        }
+                        if windows.is_none() && let Some(target) = target {
+                            target.seed_octa(input_base, kpair);
                         }
                     }
                 }
@@ -3090,7 +3107,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         for half in 0..(n_here / SIMD) {
                             let base = GROUP * g + half * SIMD;
                             let off = half * SIMD * F128_PER_BLOCK;
-                            let proj = blake3_witgen8::StreamProj {
+                            let proj = blake3_witgen8::StreamProj { compact_z_tile_words: 0, seed_window: None,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: stage.as_mut_ptr().cast::<u32>(),
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
@@ -3144,10 +3161,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 tiles.mark_z_elided();
             }
             #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
-            if root_generator.is_some() && pipelined && blake3_witgen8::root_recompute::stage_recompute::enabled() {
+            if root_generator.is_some() && pipelined && (blake3_witgen8::root_recompute::stage_recompute::enabled() || blake3_zregen::fused_fold_enabled()) {
                 // SAFETY: the exact closed pipeline and validated root plan
                 // brand this seed, cross-quarter tile layout and fixed shape.
-                unsafe { tiles.set_stage_generator(blake3_witgen8::root_recompute::stage_recompute::generate_stages); }
+                unsafe { tiles.set_stage_generator(blake3_witgen8::root_recompute::stage_recompute::generate_pair_provider); }
             }
             ab_inner.set_witness_root_tiles(tiles);
         } else {
@@ -3218,7 +3235,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         // round-1 window as it is produced, straight into
                         // this octa's ab_inner blocks.
                         let proj = stage.map(|st| {
-                            blake3_witgen8::StreamProj {
+                            blake3_witgen8::StreamProj { compact_z_tile_words: 0, seed_window: None,
                                 cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
                                 stage: st,
                                 out: ab_out

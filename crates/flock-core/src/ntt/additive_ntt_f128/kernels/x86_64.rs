@@ -1,5 +1,16 @@
 use crate::field::F128;
 
+// The SysV kernels use only call-clobbered registers and no stack memory.
+#[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+core::arch::global_asm!(include_str!("three_registers.S"));
+#[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+unsafe extern "C" {
+    fn flock_ntt_three_64_0(ptr: *mut F128, tw: *const F128, dense: usize);
+    fn flock_ntt_three_64_1(ptr: *mut F128, tw: *const F128, dense: usize);
+    fn flock_ntt_three_64_2(ptr: *mut F128, tw: *const F128, dense: usize);
+}
+
+
 /// `FLOCK_NO_NTT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
 /// at DIET-controlled call sites, including the fused-two OUTER_LOW path.
 /// The independent fused-three high-one specialization has its own rollback
@@ -1595,9 +1606,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
         // SAFETY: the shared implementation already carries the geometry,
         // feature and twiddle-form contract; the caller keeps buffers disjoint.
         unsafe {
-            seed_sparse_dense_compact::<OUTER_LOW>(
+            seed_sparse_dense_compact::<OUTER_LOW, false>(
                 src, src_quarter, src_r, dst_sparse, dst_dense, dst_quarter,
-                num_ntts, active_lanes, right_twiddle, dense_tw, pf_src,
+                num_ntts, active_lanes, right_twiddle, dense_tw, pf_src, core::ptr::null(), num_ntts,
             );
         }
         return;
@@ -2520,22 +2531,42 @@ unsafe fn butterfly_fused_4layer_row_impl<
         #[cfg(target_feature = "avx512bw")]
         if DIET && PREPARED && S16 != 0 && NN != 0 {
             let lanes = active_lanes & !3;
+            // The hinted window may start inside this row group and spill
+            // into its valid successor. Lead <= NN and pf_r < sixteenth
+            // keep every hinted row/column address inside the same block.
+            let mut pf_index=pf_r*num_ntts;
+            if H!=0 && pf_r>r && pf_r<sixteenth {
+                let lead=((*prepared).prefetch_lines as usize*4).min(num_ntts);
+                pf_index-=num_ntts-lead;
+            }
             butterfly_four_fixed_registers::<S16, NN, H>(
                 ptr.add(r * num_ntts),
                 prepared,
                 lanes * core::mem::size_of::<F128>(),
-                ptr.add(pf_r * num_ntts),
+                ptr.add(pf_index),
             );
             if lanes < active_lanes {
-                butterfly_fused_4layer_scalar_tail(
-                    ptr,
-                    sixteenth,
-                    num_ntts,
-                    r,
-                    lanes,
-                    active_lanes,
-                    twiddles,
-                );
+                if lanes + 4 <= num_ntts && !masked_tail_disabled() {
+                    butterfly_fused_4layer_masked_group(
+                        ptr,
+                        sixteenth,
+                        num_ntts,
+                        r,
+                        lanes,
+                        active_lanes,
+                        prepared,
+                    );
+                } else {
+                    butterfly_fused_4layer_scalar_tail(
+                        ptr,
+                        sixteenth,
+                        num_ntts,
+                        r,
+                        lanes,
+                        active_lanes,
+                        twiddles,
+                    );
+                }
             }
             return;
         }
@@ -2695,6 +2726,84 @@ unsafe fn butterfly_fused_4layer_row_impl<
     }
 }
 
+/// `FLOCK_NO_NTT_MASKED_TAIL=1` restores the portable scalar lane tails of the
+/// fused-four and fused-three deep kernels (same-binary A/B).
+#[inline]
+fn masked_tail_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MASKED_TAIL").is_some())
+}
+
+/// One four-lane group `lane..lane+4` of a fused-four row group whose live
+/// lanes end at `active_lanes` (`lane < active_lanes < lane + 4 <= num_ntts`).
+/// Lanes `active_lanes..` are statically zero on these rows (the zero odd
+/// tail), so they are loaded as zero (masked load), run through the same
+/// network, and never written back (masked store): only lanes below
+/// `active_lanes` change, with the same field values the scalar tail writes.
+///
+/// # Safety
+/// `avx512f` + `vpclmulqdq`; the sixteen rows cover `lane + 4` lanes;
+/// `prepared` holds `(t, t·x^64 mod p)` for the fifteen twiddles.
+#[inline(never)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn butterfly_fused_4layer_masked_group(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    lane: usize,
+    active_lanes: usize,
+    prepared: *const PreparedFour,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let live = active_lanes - lane;
+        let mask: __mmask8 = ((1u32 << (2 * live)) - 1) as __mmask8;
+        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts + lane);
+        let tw = |i: usize| -> TwX4 {
+            let p = (*prepared).pairs[i];
+            (
+                _mm512_broadcast_i32x4(_mm_set_epi64x(p[0].hi as i64, p[0].lo as i64)),
+                _mm512_broadcast_i32x4(_mm_set_epi64x(p[1].hi as i64, p[1].lo as i64)),
+            )
+        };
+        let mut values = [_mm512_setzero_si512(); 16];
+        for (i, value) in values.iter_mut().enumerate() {
+            *value = _mm512_maskz_loadu_epi64(mask, row(i) as *const i64);
+        }
+        macro_rules! butterfly {
+            ($u:expr, $v:expr, $t:expr) => {{
+                let new_u = _mm512_xor_si512(values[$u], mul_x4::<false, true>($t, values[$v]));
+                values[$v] = _mm512_xor_si512(values[$v], new_u);
+                values[$u] = new_u;
+            }};
+        }
+        let t0 = tw(0);
+        for i in 0..8 {
+            butterfly!(i, i + 8, t0);
+        }
+        for s in 0..2 {
+            let t = tw(1 + s);
+            for i in 0..4 {
+                butterfly!(8 * s + i, 8 * s + i + 4, t);
+            }
+        }
+        for s in 0..4 {
+            let t = tw(3 + s);
+            for i in 0..2 {
+                butterfly!(4 * s + i, 4 * s + i + 2, t);
+            }
+        }
+        for s in 0..8 {
+            let t = tw(7 + s);
+            butterfly!(2 * s, 2 * s + 1, t);
+        }
+        for (i, value) in values.iter().enumerate() {
+            _mm512_mask_storeu_epi64(row(i) as *mut i64, mask, *value);
+        }
+    }
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn butterfly_fused_4layer_scalar_tail(
@@ -2807,6 +2916,34 @@ pub(super) unsafe fn butterfly_fused_3layer_rows_shaped<const NN: usize>(
     // assuming a particular basis or a fixed fraction of eligible blocks.
     let low_outer = short_twiddles && !low_outer_fused3_disabled() && twiddles[0].hi == 0;
     let high_one_outer = short_twiddles && twiddles[0].hi == 1 && !high_one_fused3_disabled();
+    // The ranked final group has a fixed row stride and short inner
+    // twiddles. Schedule its data and delayed x^64 halves explicitly, so
+    // one four-element chunk needs no vector spill storage. The
+    // zero-odd tail retains the same butterflies.
+    #[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+    if NN == 64 && dense_lanes <= NN && dense_lanes.is_multiple_of(4)
+        && low_inner && !mul_diet_disabled()
+    {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_NTT_THREE_REG").is_some()
+        });
+        if !*OFF {
+            // SAFETY: NN pins the eight 64-lane row spans; the caller
+            // supplies exclusive rows and the zero-odd tail. Inspection
+            // proves all six inner high limbs are zero and selects each
+            // outer form from its actual high limb and rollback gates.
+            unsafe {
+                if low_outer {
+                    flock_ntt_three_64_0(ptr, twiddles.as_ptr(), dense_lanes);
+                } else if high_one_outer {
+                    flock_ntt_three_64_1(ptr, twiddles.as_ptr(), dense_lanes);
+                } else {
+                    flock_ntt_three_64_2(ptr, twiddles.as_ptr(), dense_lanes);
+                }
+            }
+            return;
+        }
+    }
     // SAFETY: forwarded caller contract; `low_inner` proves the LOW
     // precondition for `twiddles[1..]`; low_outer/high_one_outer establish
     // their respective outer preconditions. NN equals the runtime stride.
@@ -3113,6 +3250,69 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             let mut values = [zero; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
+            }
+
+            let outer = tw[0];
+            let mut pending = [zero; 8];
+            for i in 0..4 {
+                lazy_butterfly!(
+                    values,
+                    pending,
+                    i,
+                    i + 4,
+                    outer,
+                    LOW_OUTER,
+                    HIGH_ONE_OUTER,
+                    i & 2 != 0
+                );
+            }
+            for s in 0..2 {
+                let twiddle = tw[1 + s];
+                for i in 0..2 {
+                    lazy_butterfly!(
+                        values,
+                        pending,
+                        4 * s + i,
+                        4 * s + i + 2,
+                        twiddle,
+                        LOW_INNER,
+                        false,
+                        i & 1 != 0
+                    );
+                }
+            }
+            for s in 0..4 {
+                lazy_butterfly!(
+                    values,
+                    pending,
+                    2 * s,
+                    2 * s + 1,
+                    tw[3 + s],
+                    LOW_INNER,
+                    false,
+                    true
+                );
+            }
+
+            for (i, value) in values.iter().enumerate() {
+                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
+            }
+            lane += 4;
+        }
+        // Mixed group straddling `dense_lanes` (ranked: lanes 56..59 with
+        // dense_lanes = 57): one vector group instead of eight portable
+        // scalar lanes. Same butterflies, same twiddles, same values.
+        if NNC != 0 && lane < dense_lanes && lane + 4 <= num_ntts && !masked_tail_disabled() {
+            // Rows 1, 3, 5, 7 are zero on lanes `dense_lanes..`: load them
+            // masked, so the dense network sees exactly the true inputs.
+            let odd_mask: __mmask8 = ((1u32 << (2 * (dense_lanes - lane))) - 1) as __mmask8;
+            let mut values = [zero; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = if i & 1 == 0 {
+                    _mm512_loadu_si512(row(i).add(lane) as *const __m512i)
+                } else {
+                    _mm512_maskz_loadu_epi64(odd_mask, row(i).add(lane) as *const i64)
+                };
             }
 
             let outer = tw[0];
@@ -3916,6 +4116,10 @@ mod diet_tests {
 #[repr(C, align(16))]
 pub(crate) struct PreparedFour {
     pairs: [[F128; 2]; 15],
+    // Kept after pairs: fixed-register assembly uses the unchanged offsets.
+    zero_chain: bool,
+    // Uses existing trailing padding; the assembly coefficient prefix stays fixed.
+    prefetch_lines: u8,
 }
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -3928,8 +4132,14 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
     if mul_diet_disabled() {
         return None;
     }
+    static ZERO_CHAIN:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_NTT_ZERO_CHAIN").is_none());
+    static PF_LINES:std::sync::LazyLock<u8>=std::sync::LazyLock::new(||
+        std::env::var("FLOCK_NTT_PREFETCH_LINES").ok().and_then(|v|v.parse::<u8>().ok())
+            .filter(|&v|(1..=16).contains(&v)).unwrap_or(4));
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
+        zero_chain: *ZERO_CHAIN && zero_chain_twiddles(t),
+        prefetch_lines:*PF_LINES,
     };
     for i in (0..12).step_by(4) {
         unsafe {
@@ -3994,6 +4204,10 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
                         );
                     }
                     1 => {
+                        #[cfg(target_feature="avx512bw")]
+                        if H==0 && p.zero_chain {
+                            return zero_chain_contiguous_rows(ptr.add(r*64),lanes,p);
+                        }
                         return butterfly_fused_4layer_row_impl::<true, true, H, 1, 64>(
                             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
                         );
@@ -4145,6 +4359,40 @@ mod ab_ntt_tail_composition_tests {
                         data[u] = xor(data[u], multiply(data[v], t));
                         data[v] = xor(data[v], data[u]);
                     }
+                }
+            }
+        }
+    }
+
+
+    #[cfg(all(target_os = "linux", target_feature = "avx512bw"))]
+    #[test]
+    fn three_registers_match_bitwise_oracle_and_guards() {
+        let mut seed=0x62da_153f_91e8_c70bu64;
+        let guard=F128::new(0xfeed_cafe,0xdead_beef);
+        for dense in (0..=64).step_by(4) {
+            for offset in 1..=4 {
+                for high in [0,1,22,23,u64::MAX] {
+                    let mut data=vec![guard;offset+8*64+4];
+                    for row in 0..8 { for lane in 0..64 {
+                        data[offset+row*64+lane]=if row%2==1 && lane>=dense { F128::ZERO }
+                            else { F128::new(next(&mut seed),next(&mut seed)) };
+                    }}
+                    let mut tw:[F128;7]=std::array::from_fn(|_| F128::new(next(&mut seed),0));
+                    tw[0].hi=high;
+                    let original_tw=tw;
+                    let mut expected=data.clone();
+                    oracle_rows(&mut expected,offset,64,64,&tw,3);
+                    unsafe {
+                        let p=data.as_mut_ptr().add(offset);
+                        match high {
+                            0=>flock_ntt_three_64_0(p,tw.as_ptr(),dense),
+                            1=>flock_ntt_three_64_1(p,tw.as_ptr(),dense),
+                            _=>flock_ntt_three_64_2(p,tw.as_ptr(),dense),
+                        }
+                    }
+                    assert_eq!(data,expected,"dense={dense} offset={offset} high={high}");
+                    assert_eq!(tw,original_tw);
                 }
             }
         }
@@ -4412,7 +4660,7 @@ mod ab_ntt_tail_composition_tests {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
-unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
+unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool, const PREPARED:bool>(
     src: *const F128,
     src_quarter: usize,
     src_r: usize,
@@ -4424,17 +4672,22 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
     right_twiddle: F128,
     dense_tw: &[F128; 3],
     pf_src: *const F128,
+    prepared: *const F128,
+    source_cols:usize,
 ) {
     const DIET: bool = true;
     use core::arch::x86_64::*;
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
     unsafe {
         debug_assert!(!OUTER_LOW || t_outer.hi == 0);
-        let sparse_b = tw_x4::<false, DIET>(right_twiddle);
-        let outer = tw_x4::<OUTER_LOW, DIET>(t_outer);
-        let inner_a = tw_x4::<false, DIET>(t_inner_a);
-        let inner_b = tw_x4::<false, DIET>(t_inner_b);
-        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let load_pair=|i:usize,low:bool| {let t=_mm512_broadcast_i32x4(_mm_loadu_si128(prepared.add(2*i).cast()));let companion=if low{t}else{_mm512_broadcast_i32x4(_mm_loadu_si128(prepared.add(2*i+1).cast()))};(t,companion)};
+        let sparse_b = if PREPARED {load_pair(0,false)}else{tw_x4::<false, DIET>(right_twiddle)};
+        let outer = if PREPARED {load_pair(1,OUTER_LOW)}else{tw_x4::<OUTER_LOW, DIET>(t_outer)};
+        let inner_a = if PREPARED {load_pair(2,false)}else{tw_x4::<false, DIET>(t_inner_a)};
+        let inner_b = if PREPARED {load_pair(3,false)}else{tw_x4::<false, DIET>(t_inner_b)};
+        let src_num_ntts=if PREPARED {source_cols}else{num_ntts};
+        debug_assert!(!PREPARED||active_lanes.is_multiple_of(4));
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * src_num_ntts);
         let sp_row = |i: usize| dst_sparse.add((i * dst_quarter) * num_ntts);
         let dn_row = |i: usize| dst_dense.add((i * dst_quarter) * num_ntts);
         let lanes = active_lanes & !3;
@@ -4643,13 +4896,13 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
             "vmovdqu64 [rcx + rax + 0], zmm3",
             "9:",
             inout("rdi") src_row(0) => _,
-            in("rsi") src_quarter * num_ntts * 16,
+            in("rsi") src_quarter * src_num_ntts * 16,
             inout("rdx") dst_sparse => _,
             inout("rcx") dst_dense => _,
             in("r8") dst_quarter * num_ntts * 16,
             inout("r9") lanes => _,
             inout("r10") pf_src => _,
-            in("r11") src_quarter * num_ntts * 48,
+            in("r11") src_quarter * src_num_ntts * 48,
             in("rax") dst_quarter * num_ntts * 48,
             in("zmm16") sparse_b.0, in("zmm17") sparse_b.1,
             in("zmm18") outer.0, in("zmm19") outer.1,
@@ -4899,13 +5152,13 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool>(
             "vmovdqu64 [rcx + rax + 0], zmm3",
             "9:",
             inout("rdi") src_row(0) => _,
-            in("rsi") src_quarter * num_ntts * 16,
+            in("rsi") src_quarter * src_num_ntts * 16,
             inout("rdx") dst_sparse => _,
             inout("rcx") dst_dense => _,
             in("r8") dst_quarter * num_ntts * 16,
             inout("r9") lanes => _,
             inout("r10") pf_src => _,
-            in("r11") src_quarter * num_ntts * 48,
+            in("r11") src_quarter * src_num_ntts * 48,
             in("rax") dst_quarter * num_ntts * 48,
             in("zmm16") sparse_b.0, in("zmm17") sparse_b.1,
             in("zmm18") outer.0, in("zmm19") outer.1,
@@ -5031,4 +5284,151 @@ mod seed_compact_address_oracle_tests {
         assert_eq!(cases,576);
         println!("576 production compact-address seed cases match independent bitwise products, guards, source and twiddle immutability");
     }
+}
+
+
+/// Seed a four-aligned window with independent source/destination pitches.
+/// All demanded source fields are initialized; destination ranges are exclusive.
+#[cfg(target_feature="avx512bw")]
+#[inline]
+#[target_feature(enable="avx512f,avx512bw,vpclmulqdq")]
+pub(super) unsafe fn seed_window_prepared(src:*const F128,src_quarter:usize,src_r:usize,dst_sparse:*mut F128,dst_dense:*mut F128,source_cols:usize,active:usize,prepared:&[F128;8]){unsafe{
+ assert!(matches!(source_cols,8|16|32|64));
+ let dense=[prepared[2],prepared[4],prepared[6]];
+ if dense[0].hi==0 {seed_sparse_dense_compact::<true,true>(src,src_quarter,src_r,dst_sparse,dst_dense,64,64,active,prepared[0],&dense,core::ptr::null(),prepared.as_ptr(),source_cols);}
+ else{seed_sparse_dense_compact::<false,true>(src,src_quarter,src_r,dst_sparse,dst_dense,64,64,active,prepared[0],&dense,core::ptr::null(),prepared.as_ptr(),source_cols);}
+}}
+
+
+#[inline]
+fn zero_chain_twiddles(t:&[F128;15])->bool {
+    [0usize,1,3,7].into_iter().all(|i|t[i]==F128::ZERO)
+}
+
+// The checked zero path has fifteen identity butterflies. Retaining those
+// as XORs avoids their field products without changing the four-layer order.
+#[cfg(target_feature="avx512bw")]
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,vpclmulqdq")]
+unsafe fn zero_chain_contiguous_rows(ptr:*mut F128,lanes:usize,prepared:*const PreparedFour){unsafe{
+    use core::arch::x86_64::*;
+    let zero=_mm512_setzero_si512();
+    let mut lane=0;
+    let wide=lanes&!3;
+    while lane<wide {
+        let mut v=[zero;16];
+        v[0]=_mm512_loadu_si512(ptr.add(0*64+lane).cast());
+        v[1]=_mm512_loadu_si512(ptr.add(1*64+lane).cast());
+        v[2]=_mm512_loadu_si512(ptr.add(2*64+lane).cast());
+        v[3]=_mm512_loadu_si512(ptr.add(3*64+lane).cast());
+        v[4]=_mm512_loadu_si512(ptr.add(4*64+lane).cast());
+        v[5]=_mm512_loadu_si512(ptr.add(5*64+lane).cast());
+        v[6]=_mm512_loadu_si512(ptr.add(6*64+lane).cast());
+        v[7]=_mm512_loadu_si512(ptr.add(7*64+lane).cast());
+        v[8]=_mm512_loadu_si512(ptr.add(8*64+lane).cast());
+        v[9]=_mm512_loadu_si512(ptr.add(9*64+lane).cast());
+        v[10]=_mm512_loadu_si512(ptr.add(10*64+lane).cast());
+        v[11]=_mm512_loadu_si512(ptr.add(11*64+lane).cast());
+        v[12]=_mm512_loadu_si512(ptr.add(12*64+lane).cast());
+        v[13]=_mm512_loadu_si512(ptr.add(13*64+lane).cast());
+        v[14]=_mm512_loadu_si512(ptr.add(14*64+lane).cast());
+        v[15]=_mm512_loadu_si512(ptr.add(15*64+lane).cast());
+        macro_rules! bf {($u:literal,$v:literal,$tw:literal)=>{{
+            let pair=(*prepared).pairs.as_ptr().add($tw).cast::<__m128i>();
+            let t=_mm512_broadcast_i32x4(_mm_loadu_si128(pair));
+            let c=_mm512_broadcast_i32x4(_mm_loadu_si128(pair.add(1)));
+            let lo=_mm512_xor_si512(_mm512_clmulepi64_epi128::<0>(v[$v],t),_mm512_clmulepi64_epi128::<1>(v[$v],c));
+            let hi=_mm512_xor_si512(_mm512_clmulepi64_epi128::<16>(v[$v],t),_mm512_clmulepi64_epi128::<17>(v[$v],c));
+            let poly=_mm512_setr_epi64(0x87,0,0x87,0,0x87,0,0x87,0);
+            let product=_mm512_ternarylogic_epi64::<0x96>(lo,_mm512_bslli_epi128::<8>(hi),_mm512_clmulepi64_epi128::<1>(hi,poly));
+            v[$u]=_mm512_xor_si512(v[$u],product);v[$v]=_mm512_xor_si512(v[$v],v[$u]);
+        }}}
+        v[8]=_mm512_xor_si512(v[8],v[0]);
+        v[9]=_mm512_xor_si512(v[9],v[1]);
+        v[10]=_mm512_xor_si512(v[10],v[2]);
+        v[11]=_mm512_xor_si512(v[11],v[3]);
+        v[12]=_mm512_xor_si512(v[12],v[4]);
+        v[13]=_mm512_xor_si512(v[13],v[5]);
+        v[14]=_mm512_xor_si512(v[14],v[6]);
+        v[15]=_mm512_xor_si512(v[15],v[7]);
+        v[4]=_mm512_xor_si512(v[4],v[0]);
+        v[5]=_mm512_xor_si512(v[5],v[1]);
+        v[6]=_mm512_xor_si512(v[6],v[2]);
+        v[7]=_mm512_xor_si512(v[7],v[3]);
+        bf!(8,12,2);
+        bf!(9,13,2);
+        bf!(10,14,2);
+        bf!(11,15,2);
+        v[2]=_mm512_xor_si512(v[2],v[0]);
+        v[3]=_mm512_xor_si512(v[3],v[1]);
+        bf!(4,6,4);
+        bf!(5,7,4);
+        bf!(8,10,5);
+        bf!(9,11,5);
+        bf!(12,14,6);
+        bf!(13,15,6);
+        v[1]=_mm512_xor_si512(v[1],v[0]);
+        bf!(2,3,8);
+        bf!(4,5,9);
+        bf!(6,7,10);
+        bf!(8,9,11);
+        bf!(10,11,12);
+        bf!(12,13,13);
+        bf!(14,15,14);
+        _mm512_storeu_si512(ptr.add(0*64+lane).cast(),v[0]);
+        _mm512_storeu_si512(ptr.add(1*64+lane).cast(),v[1]);
+        _mm512_storeu_si512(ptr.add(2*64+lane).cast(),v[2]);
+        _mm512_storeu_si512(ptr.add(3*64+lane).cast(),v[3]);
+        _mm512_storeu_si512(ptr.add(4*64+lane).cast(),v[4]);
+        _mm512_storeu_si512(ptr.add(5*64+lane).cast(),v[5]);
+        _mm512_storeu_si512(ptr.add(6*64+lane).cast(),v[6]);
+        _mm512_storeu_si512(ptr.add(7*64+lane).cast(),v[7]);
+        _mm512_storeu_si512(ptr.add(8*64+lane).cast(),v[8]);
+        _mm512_storeu_si512(ptr.add(9*64+lane).cast(),v[9]);
+        _mm512_storeu_si512(ptr.add(10*64+lane).cast(),v[10]);
+        _mm512_storeu_si512(ptr.add(11*64+lane).cast(),v[11]);
+        _mm512_storeu_si512(ptr.add(12*64+lane).cast(),v[12]);
+        _mm512_storeu_si512(ptr.add(13*64+lane).cast(),v[13]);
+        _mm512_storeu_si512(ptr.add(14*64+lane).cast(),v[14]);
+        _mm512_storeu_si512(ptr.add(15*64+lane).cast(),v[15]);
+        lane+=4;
+    }
+    if wide<lanes {zero_chain_contiguous_scalar_tail(ptr,wide,lanes,prepared);}
+}}
+
+#[cfg(target_feature="avx512bw")]
+#[cold]
+#[inline(never)]
+unsafe fn zero_chain_contiguous_scalar_tail(ptr:*mut F128,first:usize,end:usize,prepared:*const PreparedFour){unsafe{
+    let tw=core::array::from_fn(|i|(*prepared).pairs[i][0]);
+    butterfly_fused_4layer_scalar_tail(ptr,1,64,0,first,end,&tw);
+}}
+
+#[cfg(all(test,target_feature="avx512bw"))]
+mod zero_chain_tests {
+    use super::*;
+    #[test]
+    fn zero_chain_contiguous_matches_portable_for_live_prefixes(){unsafe{
+        let mut state=0x48da91de18u64;
+        let mut next=|| {state^=state<<13;state^=state>>7;state^=state<<17;state};
+        for case in 0..4 {
+            let mut tw=core::array::from_fn(|_|F128::new(next(),next()));
+            for i in [0usize,1,3,7] {tw[i]=F128::ZERO;}
+            assert!(zero_chain_twiddles(&tw));
+            for i in [0usize,1,3,7] {let mut changed=tw;changed[i]=F128::ONE;assert!(!zero_chain_twiddles(&changed));}
+            let mut prepared=prepare_four(&tw).unwrap();prepared.zero_chain=true;
+            for lanes in [0usize,1,2,3,4,7,8,15,16,31,32,56,57,60,63,64] {
+                let original:Vec<F128>=(0..16*64+8).map(|_|F128::new(next(),next())).collect();
+                let mut expected=original.clone();let mut got=original;
+                for lane in 0..lanes {
+                    let mut values=core::array::from_fn(|row|expected[4+row*64+lane]);
+                    super::super::portable::butterfly_fused_4layer(&mut values,&tw);
+                    for row in 0..16 {expected[4+row*64+lane]=values[row];}
+                }
+                zero_chain_contiguous_rows(got.as_mut_ptr().add(4),lanes,&prepared);
+                assert!(got==expected,"zero-chain case={case} live={lanes}");
+            }
+        }
+        println!("ZERO_CHAIN_ORACLE_OK 64completebuffercomparisons fourguardpositions inactivefields+outerguards");
+    }}
 }

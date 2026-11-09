@@ -38,8 +38,7 @@ fn class_slot(size: usize) -> usize {
 #[inline]
 fn retained_size(size: usize) -> bool {
     const TAIL: usize = flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
-    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL
-        && (size - TAIL).is_power_of_two()
+    size >= flock_core::UNINIT_VEC_LARGE_MIN_BYTES + TAIL && (size - TAIL).is_power_of_two()
 }
 
 #[inline]
@@ -91,42 +90,67 @@ fn align64_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ALIGN64").is_none())
 }
 
-/// Every large prover buffer historically landed `16 mod 64` (glibc mmap
-/// chunk header), which the hot kernels pay for three ways: every wide
-/// load/store on these buffers is a cache-line split, non-temporal 64-byte
-/// writes straddle two lines (partial write-combining flushes are DRAM
-/// read-modify-writes), and single-uop ZMM streaming stores are illegal.
-/// For the recyclable class, over-allocate by `ALIGN_SLACK` and return
-/// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
-/// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
-/// never collide with the freelist link word at `aligned + 0`.
-const ALIGN_SLACK: usize = 64;
-
+/// Large allocations preserve the existing 64-byte alignment. The raw
+/// 512 MiB witness class additionally uses a page frame with rotating line
+/// offsets, separating concurrently read packed A/B buffers in the L1 sets.
+/// The extra slack and original-base offset stay outside the user span.
 #[inline]
-fn adjusted(layout: &Layout) -> Layout {
-    // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
-    // caller could have constructed, and 16 is a power of two.
-    Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
+fn witness_color_enabled(layout: &Layout) -> bool {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        || layout.size() != (512usize << 20) + flock_core::UNINIT_VEC_TAIL_PAGES * 4096
+    {
+        return false;
+    }
+    // Environment lookup allocates only small buffers, which cannot enter
+    // this exact large-size branch and therefore cannot reenter the latch.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITNESS_COLOR").is_none())
 }
-
 #[inline]
-unsafe fn align_up(base: *mut u8) -> *mut u8 {
+fn alignment_slack(layout: &Layout) -> usize {
+    if witness_color_enabled(layout) {
+        8192
+    } else {
+        64
+    }
+}
+#[inline]
+fn adjusted(layout: &Layout) -> Option<Layout> {
+    Layout::from_size_align(
+        layout.size().checked_add(alignment_slack(layout))?,
+        MAX_ALIGN,
+    )
+    .ok()
+}
+#[inline]
+unsafe fn align_up_color(base: *mut u8, alignment: usize, color: usize) -> *mut u8 {
     if base.is_null() {
         return base;
     }
-    let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
-    // over-allocated, and aligned - 8 >= base.
-    unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
+    let aligned = (((base as usize + 8 + alignment - 1) & !(alignment - 1)) + color) as *mut u8;
+    // The header and complete payload are within size+alignment+color.
+    unsafe {
+        *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize;
+    }
     aligned
 }
-
 #[inline]
-unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
-    // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
-    // intact (freelist links live at ptr + 0 and never touch it).
+unsafe fn align_up(base: *mut u8, layout: &Layout) -> *mut u8 {
+    let (alignment, color) = if witness_color_enabled(layout) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        (
+            4096,
+            (NEXT.fetch_add(31, std::sync::atomic::Ordering::Relaxed) % 64) * 64,
+        )
+    } else {
+        (64, 0)
+    };
+    unsafe { align_up_color(base, alignment, color) }
+}
+#[inline]
+unsafe fn align_base(ptr: *mut u8, layout: &Layout) -> *mut u8 {
     let off = unsafe { *(ptr.sub(8) as *const usize) };
-    debug_assert!((8..=ALIGN_SLACK).contains(&off));
+    debug_assert!((8..=alignment_slack(layout)).contains(&off));
     unsafe { ptr.sub(off) }
 }
 
@@ -160,7 +184,8 @@ pub struct RecycleAlloc;
 // SAFETY: every recycled block came from this allocator with the exact same
 // size class. With align64 on, every recyclable-class block System sees uses
 // the `adjusted` layout on both alloc and dealloc, and the user pointer is
-// recovered to its System base via the offset word `align_up` stored.
+// recovered to its System base via the offset word `align_up` stored. The latched witness-color policy
+// makes the adjusted layout identical for allocation and deallocation.
 // glibc/mimalloc and the macOS allocator provide at least 16-byte alignment
 // at these sizes; layouts requiring larger alignment bypass the recycler.
 unsafe impl GlobalAlloc for RecycleAlloc {
@@ -175,7 +200,10 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                let Some(system_layout) = adjusted(&layout) else {
+                    return core::ptr::null_mut();
+                };
+                return unsafe { align_up(System.alloc(system_layout), &layout) };
             }
         }
         unsafe { System.alloc(layout) }
@@ -193,7 +221,10 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                let Some(system_layout) = adjusted(&layout) else {
+                    return core::ptr::null_mut();
+                };
+                return unsafe { align_up(System.alloc_zeroed(system_layout), &layout) };
             }
         }
         unsafe { System.alloc_zeroed(layout) }
@@ -209,7 +240,10 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // handed out with align64 on came from align_up; recover the
                 // System base and the adjusted layout it was allocated with.
                 unsafe {
-                    return System.dealloc(align_base(ptr), adjusted(&layout));
+                    return System.dealloc(
+                        align_base(ptr, &layout),
+                        adjusted(&layout).expect("live allocation layout"),
+                    );
                 }
             }
         }
@@ -238,7 +272,15 @@ mod tests {
             assert!(!retained_size(payload));
             assert!(Layout::from_size_align(size, 8).is_ok());
         }
-        for size in [0, RECYCLE_MIN, 64 * 1024, 128 * 1024, MIN, MIN + TAIL - 1, usize::MAX] {
+        for size in [
+            0,
+            RECYCLE_MIN,
+            64 * 1024,
+            128 * 1024,
+            MIN,
+            MIN + TAIL - 1,
+            usize::MAX,
+        ] {
             assert!(!retained_size(size));
             assert!(find_class(size, true).is_none());
         }
@@ -261,33 +303,56 @@ mod tests {
                             let block = RecycleAlloc.alloc(layout);
                             assert!(!block.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(block as usize % 64, 0);
                             let value = (lane + 1 + round * 8) as u8;
                             core::ptr::write_bytes(block, value, size);
                             barrier.wait();
-                            assert!(core::slice::from_raw_parts(block, size).iter().all(|&v| v == value));
+                            assert!(
+                                core::slice::from_raw_parts(block, size)
+                                    .iter()
+                                    .all(|&v| v == value)
+                            );
                             barrier.wait();
                             RecycleAlloc.dealloc(block, layout);
                             let zeroed = RecycleAlloc.alloc_zeroed(layout);
                             assert!(!zeroed.is_null());
                             let hit = flock_core::LAST_ALLOC_RECYCLED.with(|c| c.get());
-                            if hit { assert!(admitted); reused.fetch_add(1, Relaxed); }
-                            if !admitted { assert!(!hit); bypassed.fetch_add(1, Relaxed); }
+                            if hit {
+                                assert!(admitted);
+                                reused.fetch_add(1, Relaxed);
+                            }
+                            if !admitted {
+                                assert!(!hit);
+                                bypassed.fetch_add(1, Relaxed);
+                            }
                             assert_eq!(zeroed as usize % 64, 0);
-                            assert!(core::slice::from_raw_parts(zeroed, size).iter().all(|&v| v == 0));
+                            assert!(
+                                core::slice::from_raw_parts(zeroed, size)
+                                    .iter()
+                                    .all(|&v| v == 0)
+                            );
                             RecycleAlloc.dealloc(zeroed, layout);
                         }
                     }
                 });
             }
         });
-        let occupied = CLASSES.iter().filter(|c| {
-            let size = c.size.load(Acquire);
-            assert!(size == 0 || retained_size(size));
-            size != 0
-        }).count();
+        let occupied = CLASSES
+            .iter()
+            .filter(|c| {
+                let size = c.size.load(Acquire);
+                assert!(size == 0 || retained_size(size));
+                size != 0
+            })
+            .count();
         assert!(occupied <= (usize::BITS - 1 - 21) as usize);
         assert_eq!(bypassed.load(Relaxed), 64);
         eprintln!("REUSED_ALLOCATIONS={}", reused.load(Relaxed));
@@ -320,4 +385,43 @@ mod tests {
         assert!(g[..48 * 1024].iter().all(|&b| b == 0xA5));
         assert!(g[48 * 1024..].iter().all(|&b| b == 0x5A));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn witness_color_offset_and_scope_contract() {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    for color in (0..4096).step_by(64) {
+        let size = 32768;
+        let layout = Layout::from_size_align(size + 8192, 16).unwrap();
+        unsafe {
+            let base = System.alloc(layout);
+            assert!(!base.is_null());
+            let ptr = align_up_color(base, 4096, color);
+            assert_eq!(ptr as usize % 4096, color);
+            assert!(ptr as usize + size <= base as usize + layout.size());
+            core::ptr::write_bytes(ptr, 0x5a, size);
+            let off = *(ptr.sub(8) as *const usize);
+            assert!((8..=8192).contains(&off));
+            assert_eq!(ptr.sub(off), base);
+            assert!(
+                core::slice::from_raw_parts(ptr, size)
+                    .iter()
+                    .all(|&b| b == 0x5a)
+            );
+            System.dealloc(base, layout);
+        }
+    }
+    for exponent in 15..35 {
+        let layout = Layout::from_size_align(
+            (1usize << exponent) + flock_core::UNINIT_VEC_TAIL_PAGES * 4096,
+            8,
+        )
+        .unwrap();
+        if exponent != 29 {
+            assert!(!witness_color_enabled(&layout));
+            assert_eq!(alignment_slack(&layout), 64);
+        }
+    }
+    assert!(adjusted(&Layout::from_size_align(isize::MAX as usize, 1).unwrap()).is_none());
 }
