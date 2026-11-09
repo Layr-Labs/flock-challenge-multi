@@ -4144,14 +4144,16 @@ flock_blake3_contiguous_1024:
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+11232], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
-        prefetcht0 [rdi+rdx+128]
-        prefetcht0 [rdi+rdx+8320]
-        prefetcht0 [rdi+rdx+1152]
-        prefetcht0 [rdi+rdx+9344]
-        prefetcht0 [rdi+rdx+2176]
-        prefetcht0 [rdi+rdx+10368]
-        prefetcht0 [rdi+rdx+3200]
-        prefetcht0 [rdi+rdx+11392]
+        // RDX already points one block ahead; prefetch the next cache line
+        // of each message while its current block is being compressed.
+        prefetcht0 [rdi+rdx+0]
+        prefetcht0 [rdi+rdx+8192]
+        prefetcht0 [rdi+rdx+1024]
+        prefetcht0 [rdi+rdx+9216]
+        prefetcht0 [rdi+rdx+2048]
+        prefetcht0 [rdi+rdx+10240]
+        prefetcht0 [rdi+rdx+3072]
+        prefetcht0 [rdi+rdx+11264]
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+4064]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+12256], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+5088]
@@ -4164,14 +4166,14 @@ flock_blake3_contiguous_1024:
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+15328], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
-        prefetcht0 [rdi+rdx+4224]
-        prefetcht0 [rdi+rdx+12416]
-        prefetcht0 [rdi+rdx+5248]
-        prefetcht0 [rdi+rdx+13440]
-        prefetcht0 [rdi+rdx+6272]
-        prefetcht0 [rdi+rdx+14464]
-        prefetcht0 [rdi+rdx+7296]
-        prefetcht0 [rdi+rdx+15488]
+        prefetcht0 [rdi+rdx+4096]
+        prefetcht0 [rdi+rdx+12288]
+        prefetcht0 [rdi+rdx+5120]
+        prefetcht0 [rdi+rdx+13312]
+        prefetcht0 [rdi+rdx+6144]
+        prefetcht0 [rdi+rdx+14336]
+        prefetcht0 [rdi+rdx+7168]
+        prefetcht0 [rdi+rdx+15360]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
         vmovdqa32 zmm28, zmm24
