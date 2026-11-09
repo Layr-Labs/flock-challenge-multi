@@ -5628,8 +5628,108 @@ pub(crate) struct R4LaneWeights {
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
 #[inline(never)]
-unsafe fn r4_round4_batch<const SKIP: u8>(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10]) {
-    let skip = SKIP;
+unsafe fn r4_round4_batch(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R4_STREAM").is_some()
+    });
+    unsafe {
+        if *OFF {
+            return r4_round4_batch_staged(fa, fb, acc4, skip);
+        }
+        match skip {
+            0 => r4_round4_batch_stream::<0>(fa, fb, acc4),
+            3 => r4_round4_batch_stream::<3>(fa, fb, acc4),
+            255 => r4_round4_batch_stream::<255>(fa, fb, acc4),
+            _ => r4_round4_batch_staged(fa, fb, acc4, skip),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn r4_round4_batch_stream<const SKIP: u8>(
+    fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let ld = |p: *const F128, g: usize, k: usize| {
+            if g as u8 == SKIP { _mm512_setzero_si512() }
+            else { _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>()) }
+        };
+        // Only the four canonical corners survive. Consume all product
+        // corners as they are formed instead of storing 40 operand ZMMs
+        // and loading them in a second sweep. Literal indices also let
+        // each canonical-skip variant discard its dead cache reads.
+        macro_rules! corner {
+            ($k:literal) => {{
+                let (x0, x1, x2, x3) = (ld(fa, 0, $k), ld(fa, 1, $k), ld(fa, 2, $k), ld(fa, 3, $k));
+                let (y0, y1, y2, y3) = (ld(fb, 0, $k), ld(fb, 1, $k), ld(fb, 2, $k), ld(fb, 3, $k));
+                let a = _mm512_shuffle_i64x2::<0xDD>(x0, x1);
+                let b = _mm512_shuffle_i64x2::<0xDD>(y0, y1);
+                let c = _mm512_shuffle_i64x2::<0xDD>(x2, x3);
+                let d = _mm512_shuffle_i64x2::<0xDD>(y2, y3);
+                if $k == 0 { acc4[0].mul_acc2(a, b, c, d); }
+                (
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x0, x1), a),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(y0, y1), b),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x2, x3), c),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(y2, y3), d),
+                )
+            }};
+        }
+        macro_rules! product {
+            ($i:literal, $q:expr) => {{ let (a,b,c,d)=$q; acc4[$i].mul_acc2(a,b,c,d); }};
+        }
+        macro_rules! plus {
+            ($x:expr, $y:expr) => {{
+                let (a,b,c,d)=$x; let (e,f,g,h)=$y;
+                (_mm512_xor_si512(a,e), _mm512_xor_si512(b,f),
+                 _mm512_xor_si512(c,g), _mm512_xor_si512(d,h))
+            }};
+        }
+        let q0=corner!(0); product!(1,q0);
+        let q1=corner!(1); product!(2,q1);
+        let q2=corner!(2); product!(4,q2);
+        let q3=corner!(3); product!(5,q3);
+        let e=plus!(q0,q1); product!(3,e);
+        let f=plus!(q2,q3); product!(6,f);
+        product!(7,plus!(q0,q2));
+        product!(8,plus!(q1,q3));
+        product!(9,plus!(e,f));
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn r4_round4_batch_staged(fa: *const F128, fb: *const F128, acc4: &mut [WideGhashX4; 10], skip: u8) {
     use core::arch::x86_64::*;
     unsafe {
         let ld = |p: *const F128, g: usize, k: usize| -> __m512i {
@@ -5639,63 +5739,111 @@ unsafe fn r4_round4_batch<const SKIP: u8>(fa: *const F128, fb: *const F128, acc4
                 _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
             }
         };
-        macro_rules! pair_k {
-            ($k:expr) => {{
-                let (xa0, ya0) = (ld(fa, 0, $k), ld(fa, 1, $k));
-                let (xb0, yb0) = (ld(fb, 0, $k), ld(fb, 1, $k));
-                let (xa1, ya1) = (ld(fa, 2, $k), ld(fa, 3, $k));
-                let (xb1, yb1) = (ld(fb, 2, $k), ld(fb, 3, $k));
-                let ao0 = _mm512_shuffle_i64x2::<0xDD>(xa0, ya0);
-                let bo0 = _mm512_shuffle_i64x2::<0xDD>(xb0, yb0);
-                let ao1 = _mm512_shuffle_i64x2::<0xDD>(xa1, ya1);
-                let bo1 = _mm512_shuffle_i64x2::<0xDD>(xb1, yb1);
-                let ca = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa0, ya0), ao0);
-                let cb = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb0, yb0), bo0);
-                let da = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa1, ya1), ao1);
-                let db = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb1, yb1), bo1);
-                (ao0, bo0, ao1, bo1, ca, cb, da, db)
+        let mut ops = [[_mm512_setzero_si512(); 20]; 2];
+        for set in 0..2 {
+            let (g0, g1) = (2 * set, 2 * set + 1);
+            let st = &mut ops[set];
+            let mut ca = [_mm512_setzero_si512(); 4];
+            let mut cb = [_mm512_setzero_si512(); 4];
+            for k in 0..4 {
+                let (xa, ya) = (ld(fa, g0, k), ld(fa, g1, k));
+                let (xb, yb) = (ld(fb, g0, k), ld(fb, g1, k));
+                let ao = _mm512_shuffle_i64x2::<0xDD>(xa, ya);
+                let bo = _mm512_shuffle_i64x2::<0xDD>(xb, yb);
+                if k == 0 {
+                    st[0] = ao;
+                    st[1] = bo;
+                }
+                ca[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xa, ya), ao);
+                cb[k] = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(xb, yb), bo);
+            }
+            let a01 = _mm512_xor_si512(ca[0], ca[1]);
+            let b01 = _mm512_xor_si512(cb[0], cb[1]);
+            let a23 = _mm512_xor_si512(ca[2], ca[3]);
+            let b23 = _mm512_xor_si512(cb[2], cb[3]);
+            st[2] = ca[0];
+            st[3] = cb[0];
+            st[4] = ca[1];
+            st[5] = cb[1];
+            st[6] = a01;
+            st[7] = b01;
+            st[8] = ca[2];
+            st[9] = cb[2];
+            st[10] = ca[3];
+            st[11] = cb[3];
+            st[12] = a23;
+            st[13] = b23;
+            st[14] = _mm512_xor_si512(ca[0], ca[2]);
+            st[15] = _mm512_xor_si512(cb[0], cb[2]);
+            st[16] = _mm512_xor_si512(ca[1], ca[3]);
+            st[17] = _mm512_xor_si512(cb[1], cb[3]);
+            st[18] = _mm512_xor_si512(a01, a23);
+            st[19] = _mm512_xor_si512(b01, b23);
+        }
+        let (s0, s1) = (&ops[0], &ops[1]);
+        for k in 0..10 {
+            acc4[k].mul_acc2(s0[2 * k], s0[2 * k + 1], s1[2 * k], s1[2 * k + 1]);
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn r4_canonical_set(
+    fa0: *const F128, fb0: *const F128, g0: usize,
+    fa1: *const F128, fb1: *const F128, g1: usize,
+    acc: &mut [WideGhashX4; 10],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        macro_rules! product {
+            ($i:literal,$q:expr) => {{
+                let (a,b)=$q; let dst=&mut acc[$i];
+                dst.lo=_mm512_xor_si512(dst.lo,_mm512_clmulepi64_epi128::<0x00>(a,b));
+                dst.hi=_mm512_xor_si512(dst.hi,_mm512_clmulepi64_epi128::<0x11>(a,b));
+                dst.mid=_mm512_ternarylogic_epi64::<0x96>(dst.mid,
+                    _mm512_clmulepi64_epi128::<0x01>(a,b),
+                    _mm512_clmulepi64_epi128::<0x10>(a,b));
             }};
         }
-        let (ao0, bo0, ao1, bo1, ca0, cb0, da0, db0) = pair_k!(0);
-        acc4[0].mul_acc2(ao0, bo0, ao1, bo1);
-        acc4[1].mul_acc2(ca0, cb0, da0, db0);
-
-        let (_, _, _, _, ca1, cb1, da1, db1) = pair_k!(1);
-        acc4[2].mul_acc2(ca1, cb1, da1, db1);
-        let a01 = _mm512_xor_si512(ca0, ca1);
-        let b01 = _mm512_xor_si512(cb0, cb1);
-        let c01 = _mm512_xor_si512(da0, da1);
-        let d01 = _mm512_xor_si512(db0, db1);
-        acc4[3].mul_acc2(a01, b01, c01, d01);
-
-        let (_, _, _, _, ca2, cb2, da2, db2) = pair_k!(2);
-        acc4[4].mul_acc2(ca2, cb2, da2, db2);
-        acc4[7].mul_acc2(
-            _mm512_xor_si512(ca0, ca2),
-            _mm512_xor_si512(cb0, cb2),
-            _mm512_xor_si512(da0, da2),
-            _mm512_xor_si512(db0, db2),
-        );
-
-        let (_, _, _, _, ca3, cb3, da3, db3) = pair_k!(3);
-        acc4[5].mul_acc2(ca3, cb3, da3, db3);
-        acc4[8].mul_acc2(
-            _mm512_xor_si512(ca1, ca3),
-            _mm512_xor_si512(cb1, cb3),
-            _mm512_xor_si512(da1, da3),
-            _mm512_xor_si512(db1, db3),
-        );
-        let a23 = _mm512_xor_si512(ca2, ca3);
-        let b23 = _mm512_xor_si512(cb2, cb3);
-        let c23 = _mm512_xor_si512(da2, da3);
-        let d23 = _mm512_xor_si512(db2, db3);
-        acc4[6].mul_acc2(a23, b23, c23, d23);
-        acc4[9].mul_acc2(
-            _mm512_xor_si512(a01, a23),
-            _mm512_xor_si512(b01, b23),
-            _mm512_xor_si512(c01, c23),
-            _mm512_xor_si512(d01, d23),
-        );
+        macro_rules! corner {
+            ($k:literal) => {{
+                let x = _mm512_loadu_si512(fa0.add(16*$k+4*g0).cast::<__m512i>());
+                let y = _mm512_loadu_si512(fa1.add(16*$k+4*g1).cast::<__m512i>());
+                let u = _mm512_loadu_si512(fb0.add(16*$k+4*g0).cast::<__m512i>());
+                let v = _mm512_loadu_si512(fb1.add(16*$k+4*g1).cast::<__m512i>());
+                let a = _mm512_shuffle_i64x2::<0xDD>(x,y);
+                let b = _mm512_shuffle_i64x2::<0xDD>(u,v);
+                if $k == 0 { product!(0,(a,b)); }
+                (_mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x,y),a),
+                 _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(u,v),b))
+            }};
+        }
+        macro_rules! plus {
+            ($x:expr,$y:expr) => {{ let (a,b)=$x;let (c,d)=$y;
+                (_mm512_xor_si512(a,c),_mm512_xor_si512(b,d)) }};
+        }
+        let q0=corner!(0);product!(1,q0);
+        let q1=corner!(1);product!(2,q1);
+        let q2=corner!(2);product!(4,q2);
+        let q3=corner!(3);product!(5,q3);
+        let e=plus!(q0,q1);product!(3,e);
+        let f=plus!(q2,q3);product!(6,f);
+        product!(7,plus!(q0,q2));product!(8,plus!(q1,q3));product!(9,plus!(e,f));
     }
 }
 
@@ -5728,6 +5876,42 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     bk: &R2EqBake,
     lw: &R4LaneWeights,
 ) -> ([F128; 8], [F128; 18]) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
+    });
+    // The contraction moves each partial set by two F128 lanes. It is
+    // valid exactly when the final lane weights repeat after two lanes.
+    let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
+    unsafe {
+        if pair { round2_lookahead_chunk_baked_elide_r4_impl::<true>(a_pkt,b_pkt,row_base,lo_size,bk,lw) }
+        else { round2_lookahead_chunk_baked_elide_r4_impl::<false>(a_pkt,b_pkt,row_base,lo_size,bk,lw) }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+) -> ([F128; 8], [F128; 18]) {
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
     debug_assert_eq!(row_base & 255, 0);
@@ -5737,8 +5921,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
         let mut acc4 = [WideGhashX4::zero(); 10];
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
         let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
-        let fa = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
-        let fb = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        let fa_work = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
+        let fb_work = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        // A distinct first-quarter cache survives until the last quarter.
+        // PAIR=false leaves these unused and removes them at compile time.
+        let mut fa_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa_first = core::ptr::addr_of_mut!((*fa_first_store.as_mut_ptr()).0).cast::<F128>();
+        let fb_first = core::ptr::addr_of_mut!((*fb_first_store.as_mut_ptr()).0).cast::<F128>();
+        let mut fa = fa_work;
+        let mut fb = fb_work;
         let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
         let b_mats_slice = bk.b_mats.as_ptr();
 
@@ -5837,6 +6029,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
         let mut x_lo = 0;
         while x_lo + 128 <= lo_size {
             let batch_base = x_lo >> 5;
+            if PAIR { fa=fa_first; fb=fb_first; }
             {
                 let g0 = row_base + 2 * x_lo;
                 let bm = &(*b_mats_slice.add(batch_base)).0;
@@ -5847,8 +6040,9 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 accum1!(g0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch::<0>(fa, fb, &mut acc4);
+                if !PAIR { r4_round4_batch(fa, fb, &mut acc4, 0); }
             }
+            fa=fa_work; fb=fb_work;
             {
                 let g0 = row_base + 2 * (x_lo + 32);
                 let bm = &(*b_mats_slice.add(batch_base + 1)).0;
@@ -5856,7 +6050,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch::<255>(fa, fb, &mut acc4);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 64);
@@ -5865,7 +6059,7 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_masked_tr_bcast(b_pkt.add(g0 * 8), bm, fb, 0);
                 accum2!(g0, 0, 1);
                 accum2!(g0, 2, 3);
-                r4_round4_batch::<255>(fa, fb, &mut acc4);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
             }
             {
                 let g0 = row_base + 2 * (x_lo + 96);
@@ -5874,7 +6068,16 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
                 gfni_fold64_rows_tr_bcast_skip_group::<false>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
                 accum2!(g0, 0, 1);
                 accum1!(g0, 2);
-                r4_round4_batch::<3>(fa, fb, &mut acc4);
+                if PAIR {
+                    // First-quarter group 0 and last-quarter group 3
+                    // were elided by the GFNI producers. Read only the
+                    // initialized groups: the two full sets plus one set
+                    // combining the two surviving partial halves.
+                    // This replaces four sets of ten products with three.
+                    r4_canonical_set(fa_first,fb_first,2,fa_first,fb_first,3,&mut acc4);
+                    r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
+                    r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4);
+                } else { r4_round4_batch(fa, fb, &mut acc4, 3); }
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
                 R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6079,5 +6282,70 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         [
             lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
         ]
+    }
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",
+    target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod r4_stream_tests {
+    use super::*;
+    fn next(s:&mut u64)->u64 { *s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s }
+    #[test]
+    fn r4_stream_matches_staged_unreduced() {
+        use crate::field::gf2_128::x86_64::f128x4_extract;
+        let mut s=0x1fea_35c6_7812_ef93;
+        for _ in 0..4096 {
+            let a:[F128;64]=std::array::from_fn(|_|F128::new(next(&mut s),next(&mut s)));
+            let b:[F128;64]=std::array::from_fn(|_|F128::new(next(&mut s),next(&mut s)));
+            for skip in [0,3,255] {
+                unsafe {
+                    let mut want=[WideGhashX4::zero();10];
+                    let mut got=want;
+                    r4_round4_batch_staged(a.as_ptr(),b.as_ptr(),&mut want,skip);
+                    match skip {
+                        0=>r4_round4_batch_stream::<0>(a.as_ptr(),b.as_ptr(),&mut got),
+                        3=>r4_round4_batch_stream::<3>(a.as_ptr(),b.as_ptr(),&mut got),
+                        _=>r4_round4_batch_stream::<255>(a.as_ptr(),b.as_ptr(),&mut got),
+                    }
+                    for k in 0..10 {
+                        for (x,y) in [(got[k].lo,want[k].lo),(got[k].hi,want[k].hi),(got[k].mid,want[k].mid)] {
+                            assert_eq!(f128x4_extract(x),f128x4_extract(y),"skip={skip} corner={k}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",
+    target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod r4_canonical_pair_tests {
+    use super::*;
+    fn next(s:&mut u64)->u64 { *s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s }
+    #[test]
+    fn r4_canonical_pair_matches_complete_chunk() {
+        let mut s=0xa30b_e153_76fc_905d;
+        for lo in [128usize,256,512,4096] { for row_base in [0usize,256] { for _ in 0..8 {
+            let bytes=(row_base+2*lo)*8;
+            let a:Vec<u8>=(0..bytes).map(|_|next(&mut s) as u8).collect();
+            let b:Vec<u8>=(0..bytes).map(|_|next(&mut s) as u8).collect();
+            let mut field=||F128::new(next(&mut s),next(&mut s));
+            let lane=std::array::from_fn(|_|field());
+            let even=field();let odd=field();
+            let lw=R4LaneWeights { lv4:[even,odd,even,odd],lv4_odd:std::array::from_fn(|_|field()) };
+            let am=std::array::from_fn(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s))));
+            let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
+            let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
+            unsafe {
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                assert_eq!(got,want,"lo={lo} row_base={row_base}");
+                let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                assert_eq!(got,want,"non-periodic lane weights must retain the original route");
+            }
+        }}}
     }
 }

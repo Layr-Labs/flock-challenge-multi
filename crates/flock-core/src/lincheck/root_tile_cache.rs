@@ -424,6 +424,14 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Resolve the tile group once, outside the parallel reader. Two-tile
+        // groups reduced measured lincheck latency on the ranked CPU shape.
+        static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ROOT_FOLD_BATCH")
+                .ok().and_then(|s| s.parse().ok())
+                .filter(|n| (1..=4).contains(n)).unwrap_or(2)
+        });
+        let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -473,15 +481,15 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                        lo = next.fetch_add(word_batch, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + 4).min(self.tiles);
+                        hi = (lo + word_batch).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;
-                        let count = (hi - lo).min(4);
+                        let count = (hi - lo).min(word_batch);
                         lo += count;
                         let source = if let Some((seed, generate)) = self.generator {
                             let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();

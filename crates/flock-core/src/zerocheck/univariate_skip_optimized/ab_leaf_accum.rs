@@ -1,4 +1,3 @@
-// Re-filed composition (X1+, 202611091815); see the submission note for credits.
 //! Accumulate the 78 sparse Karatsuba leaves across all 32 windows before
 //! interpolation. Small groups of six or nine leaves stay in registers
 //! across all 32 windows. The complete leaf vector is then interpolated

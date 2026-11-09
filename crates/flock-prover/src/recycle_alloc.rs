@@ -96,37 +96,65 @@ fn align64_enabled() -> bool {
 /// load/store on these buffers is a cache-line split, non-temporal 64-byte
 /// writes straddle two lines (partial write-combining flushes are DRAM
 /// read-modify-writes), and single-uop ZMM streaming stores are illegal.
-/// For the recyclable class, over-allocate by `ALIGN_SLACK` and return
-/// `round_up(base + 8, 64)`: a 64-aligned pointer with room for the
+/// Ordinary recyclable classes over-allocate by `ALIGN_SLACK` and return
+/// `round_up(base + 8, 64)`. The selected witness class instead reserves
+/// `COLOR_SLACK` for a page frame and a cache-line color. Both leave room for the
 /// back-offset word stored at `aligned - 8` — BEFORE the block, so it can
 /// never collide with the freelist link word at `aligned + 0`.
 const ALIGN_SLACK: usize = 64;
+const COLOR_SLACK: usize = 8192;
+static COLOR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
-fn adjusted(layout: &Layout) -> Layout {
-    // SAFETY of unwrap: size + 64 cannot overflow isize for any layout the
-    // caller could have constructed, and 16 is a power of two.
-    Layout::from_size_align(layout.size() + ALIGN_SLACK, MAX_ALIGN).unwrap()
+fn colored_layout(layout: &Layout) -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        const WITNESS: usize = (512 << 20) + flock_core::UNINIT_VEC_TAIL_PAGES * 4096;
+        if layout.size() != WITNESS { return false; }
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITNESS_COLOR").is_none())
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    { let _ = layout; false }
 }
 
 #[inline]
-unsafe fn align_up(base: *mut u8) -> *mut u8 {
-    if base.is_null() {
-        return base;
+fn slack(layout: &Layout) -> usize {
+    if colored_layout(layout) { COLOR_SLACK } else { ALIGN_SLACK }
+}
+
+#[inline]
+fn adjusted(layout: &Layout) -> Option<Layout> {
+    Layout::from_size_align(layout.size().checked_add(slack(layout))?, MAX_ALIGN).ok()
+}
+
+#[inline]
+fn aligned_address(base: usize, color: Option<usize>) -> usize {
+    if let Some(color) = color {
+        ((base + 8 + 4095) & !4095) + (color & 63) * 64
+    } else {
+        (base + 8 + 63) & !63
     }
-    let aligned = ((base as usize + 8 + 63) & !63) as *mut u8;
-    // SAFETY: aligned - base is in [8, 64] ⊂ the ALIGN_SLACK the caller
-    // over-allocated, and aligned - 8 >= base.
-    unsafe { *(aligned.sub(8) as *mut usize) = aligned as usize - base as usize };
+}
+
+#[inline]
+unsafe fn align_up(base: *mut u8, layout: &Layout) -> *mut u8 {
+    if base.is_null() { return base; }
+    let color = colored_layout(layout).then(|| {
+        COLOR_COUNTER.fetch_add(31, std::sync::atomic::Ordering::Relaxed) & 63
+    });
+    let offset = aligned_address(base as usize, color) - base as usize;
+    debug_assert!((8..=slack(layout)).contains(&offset));
+    // The offset and complete payload fit in the reserved System allocation.
+    let aligned = unsafe { base.add(offset) };
+    unsafe { *(aligned.sub(8) as *mut usize) = offset };
     aligned
 }
 
 #[inline]
-unsafe fn align_base(ptr: *mut u8) -> *mut u8 {
-    // SAFETY: ptr was produced by align_up, so the offset word at ptr - 8 is
-    // intact (freelist links live at ptr + 0 and never touch it).
+unsafe fn align_base(ptr: *mut u8, layout: &Layout) -> *mut u8 {
     let off = unsafe { *(ptr.sub(8) as *const usize) };
-    debug_assert!((8..=ALIGN_SLACK).contains(&off));
+    debug_assert!((8..=slack(layout)).contains(&off));
     unsafe { ptr.sub(off) }
 }
 
@@ -175,7 +203,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
             }
             if align64_enabled() {
                 // SAFETY: adjusted() reserves the slack align_up consumes.
-                return unsafe { align_up(System.alloc(adjusted(&layout))) };
+                let Some(system_layout) = adjusted(&layout) else { return core::ptr::null_mut(); };
+                return unsafe { align_up(System.alloc(system_layout), &layout) };
             }
         }
         unsafe { System.alloc(layout) }
@@ -193,7 +222,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // The user range [aligned, aligned + size) is inside the
                 // zeroed System block; the offset word sits before it.
                 // SAFETY: as for alloc.
-                return unsafe { align_up(System.alloc_zeroed(adjusted(&layout))) };
+                let Some(system_layout) = adjusted(&layout) else { return core::ptr::null_mut(); };
+                return unsafe { align_up(System.alloc_zeroed(system_layout), &layout) };
             }
         }
         unsafe { System.alloc_zeroed(layout) }
@@ -209,7 +239,8 @@ unsafe impl GlobalAlloc for RecycleAlloc {
                 // handed out with align64 on came from align_up; recover the
                 // System base and the adjusted layout it was allocated with.
                 unsafe {
-                    return System.dealloc(align_base(ptr), adjusted(&layout));
+                    return System.dealloc(align_base(ptr, &layout),
+                        adjusted(&layout).expect("layout accepted at allocation"));
                 }
             }
         }
@@ -219,6 +250,50 @@ unsafe impl GlobalAlloc for RecycleAlloc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn colored_offsets_preserve_bounds_and_layout_scope() {
+        use super::*;
+        const PAYLOAD: usize = 128;
+        for base in (0x100000usize..0x101000).step_by(16) {
+            for color in 0..64 {
+                let ptr = aligned_address(base, Some(color));
+                assert_eq!(ptr % 64, 0);
+                assert!((8..=COLOR_SLACK).contains(&(ptr - base)));
+                assert!(ptr + PAYLOAD <= base + PAYLOAD + COLOR_SLACK);
+            }
+            let ptr = aligned_address(base, None);
+            assert_eq!(ptr % 64, 0);
+            assert!((8..=ALIGN_SLACK).contains(&(ptr - base)));
+        }
+        let huge = Layout::from_size_align(isize::MAX as usize - 15, 16).unwrap();
+        assert!(adjusted(&huge).is_none());
+        let ordinary = Layout::from_size_align(2 << 20,16).unwrap();
+        assert!(!colored_layout(&ordinary));
+        assert_eq!(adjusted(&ordinary).unwrap().size(), ordinary.size()+ALIGN_SLACK);
+        #[cfg(all(target_os="linux",target_arch="x86_64"))]
+        unsafe {
+            let witness = Layout::from_size_align(
+                (512 << 20)+flock_core::UNINIT_VEC_TAIL_PAGES*4096,16).unwrap();
+            assert!(colored_layout(&witness));
+            assert_eq!(adjusted(&witness).unwrap().size(),witness.size()+COLOR_SLACK);
+            // Exercise real metadata roundtrips without reserving a batch-sized
+            // payload: align_up only needs the slack and a small live suffix.
+            let backing = Layout::from_size_align(PAYLOAD+COLOR_SLACK,16).unwrap();
+            let mut colors=[false;64];
+            for round in 0..64 {
+                let base=System.alloc(backing); assert!(!base.is_null());
+                let ptr=align_up(base,&witness);
+                assert_eq!(align_base(ptr,&witness),base);
+                assert!(ptr as usize + PAYLOAD <= base as usize + backing.size());
+                colors[(ptr as usize %4096)/64]=true;
+                core::ptr::write_bytes(ptr,round as u8,PAYLOAD);
+                assert!(core::slice::from_raw_parts(ptr,PAYLOAD).iter().all(|&x|x==round as u8));
+                System.dealloc(base,backing);
+            }
+            assert!(colors.into_iter().all(|x|x));
+        }
+    }
+
 
     #[test]
     fn padded_only_retention_preserves_real_layouts_and_bypass() {

@@ -2520,34 +2520,29 @@ unsafe fn butterfly_fused_4layer_row_impl<
         #[cfg(target_feature = "avx512bw")]
         if DIET && PREPARED && S16 != 0 && NN != 0 {
             let lanes = active_lanes & !3;
+            // Keep the hint within the current group or its checked successor.
+            // A short rolling lead covers the next columns without fetching
+            // a whole 1024-byte row ahead on the 64-column geometry.
+            let pf_index = if H != 0 && pf_r > r && pf_r < sixteenth {
+                let lead = ((*prepared).prefetch_lines * 4).min(num_ntts);
+                pf_r * num_ntts - (num_ntts - lead)
+            } else { pf_r * num_ntts };
             butterfly_four_fixed_registers::<S16, NN, H>(
                 ptr.add(r * num_ntts),
                 prepared,
                 lanes * core::mem::size_of::<F128>(),
-                ptr.add(pf_r * num_ntts),
+                ptr.add(pf_index),
             );
             if lanes < active_lanes {
-                if lanes + 4 <= num_ntts && !masked_tail_disabled() {
-                    butterfly_fused_4layer_masked_group(
-                        ptr,
-                        sixteenth,
-                        num_ntts,
-                        r,
-                        lanes,
-                        active_lanes,
-                        prepared,
-                    );
-                } else {
-                    butterfly_fused_4layer_scalar_tail(
-                        ptr,
-                        sixteenth,
-                        num_ntts,
-                        r,
-                        lanes,
-                        active_lanes,
-                        twiddles,
-                    );
-                }
+                butterfly_fused_4layer_scalar_tail(
+                    ptr,
+                    sixteenth,
+                    num_ntts,
+                    r,
+                    lanes,
+                    active_lanes,
+                    twiddles,
+                );
             }
             return;
         }
@@ -2703,84 +2698,6 @@ unsafe fn butterfly_fused_4layer_row_impl<
                 active_lanes,
                 twiddles,
             );
-        }
-    }
-}
-
-/// `FLOCK_NO_NTT_MASKED_TAIL=1` restores the portable scalar lane tails of the
-/// fused-four and fused-three deep kernels (same-binary A/B).
-#[inline]
-fn masked_tail_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MASKED_TAIL").is_some())
-}
-
-/// One four-lane group `lane..lane+4` of a fused-four row group whose live
-/// lanes end at `active_lanes` (`lane < active_lanes < lane + 4 <= num_ntts`).
-/// Lanes `active_lanes..` are statically zero on these rows (the zero odd
-/// tail), so they are loaded as zero (masked load), run through the same
-/// network, and never written back (masked store): only lanes below
-/// `active_lanes` change, with the same field values the scalar tail writes.
-///
-/// # Safety
-/// `avx512f` + `vpclmulqdq`; the sixteen rows cover `lane + 4` lanes;
-/// `prepared` holds `(t, t·x^64 mod p)` for the fifteen twiddles.
-#[inline(never)]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn butterfly_fused_4layer_masked_group(
-    ptr: *mut F128,
-    sixteenth: usize,
-    num_ntts: usize,
-    r: usize,
-    lane: usize,
-    active_lanes: usize,
-    prepared: *const PreparedFour,
-) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let live = active_lanes - lane;
-        let mask: __mmask8 = ((1u32 << (2 * live)) - 1) as __mmask8;
-        let row = |i: usize| ptr.add((i * sixteenth + r) * num_ntts + lane);
-        let tw = |i: usize| -> TwX4 {
-            let p = (*prepared).pairs[i];
-            (
-                _mm512_broadcast_i32x4(_mm_set_epi64x(p[0].hi as i64, p[0].lo as i64)),
-                _mm512_broadcast_i32x4(_mm_set_epi64x(p[1].hi as i64, p[1].lo as i64)),
-            )
-        };
-        let mut values = [_mm512_setzero_si512(); 16];
-        for (i, value) in values.iter_mut().enumerate() {
-            *value = _mm512_maskz_loadu_epi64(mask, row(i) as *const i64);
-        }
-        macro_rules! butterfly {
-            ($u:expr, $v:expr, $t:expr) => {{
-                let new_u = _mm512_xor_si512(values[$u], mul_x4::<false, true>($t, values[$v]));
-                values[$v] = _mm512_xor_si512(values[$v], new_u);
-                values[$u] = new_u;
-            }};
-        }
-        let t0 = tw(0);
-        for i in 0..8 {
-            butterfly!(i, i + 8, t0);
-        }
-        for s in 0..2 {
-            let t = tw(1 + s);
-            for i in 0..4 {
-                butterfly!(8 * s + i, 8 * s + i + 4, t);
-            }
-        }
-        for s in 0..4 {
-            let t = tw(3 + s);
-            for i in 0..2 {
-                butterfly!(4 * s + i, 4 * s + i + 2, t);
-            }
-        }
-        for s in 0..8 {
-            let t = tw(7 + s);
-            butterfly!(2 * s, 2 * s + 1, t);
-        }
-        for (i, value) in values.iter().enumerate() {
-            _mm512_mask_storeu_epi64(row(i) as *mut i64, mask, *value);
         }
     }
 }
@@ -3203,69 +3120,6 @@ unsafe fn butterfly_fused_3layer_rows_impl<
             let mut values = [zero; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = _mm512_loadu_si512(row(i).add(lane) as *const __m512i);
-            }
-
-            let outer = tw[0];
-            let mut pending = [zero; 8];
-            for i in 0..4 {
-                lazy_butterfly!(
-                    values,
-                    pending,
-                    i,
-                    i + 4,
-                    outer,
-                    LOW_OUTER,
-                    HIGH_ONE_OUTER,
-                    i & 2 != 0
-                );
-            }
-            for s in 0..2 {
-                let twiddle = tw[1 + s];
-                for i in 0..2 {
-                    lazy_butterfly!(
-                        values,
-                        pending,
-                        4 * s + i,
-                        4 * s + i + 2,
-                        twiddle,
-                        LOW_INNER,
-                        false,
-                        i & 1 != 0
-                    );
-                }
-            }
-            for s in 0..4 {
-                lazy_butterfly!(
-                    values,
-                    pending,
-                    2 * s,
-                    2 * s + 1,
-                    tw[3 + s],
-                    LOW_INNER,
-                    false,
-                    true
-                );
-            }
-
-            for (i, value) in values.iter().enumerate() {
-                _mm512_storeu_si512(row(i).add(lane) as *mut __m512i, *value);
-            }
-            lane += 4;
-        }
-        // Mixed group straddling `dense_lanes` (ranked: lanes 56..59 with
-        // dense_lanes = 57): one vector group instead of eight portable
-        // scalar lanes. Same butterflies, same twiddles, same values.
-        if NNC != 0 && lane < dense_lanes && lane + 4 <= num_ntts && !masked_tail_disabled() {
-            // Rows 1, 3, 5, 7 are zero on lanes `dense_lanes..`: load them
-            // masked, so the dense network sees exactly the true inputs.
-            let odd_mask: __mmask8 = ((1u32 << (2 * (dense_lanes - lane))) - 1) as __mmask8;
-            let mut values = [zero; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = if i & 1 == 0 {
-                    _mm512_loadu_si512(row(i).add(lane) as *const __m512i)
-                } else {
-                    _mm512_maskz_loadu_epi64(odd_mask, row(i).add(lane) as *const i64)
-                };
             }
 
             let outer = tw[0];
@@ -4071,6 +3925,7 @@ pub(crate) struct PreparedFour {
     pairs: [[F128; 2]; 15],
     // Kept after pairs: fixed-register assembly uses the unchanged offsets.
     zero_chain: bool,
+    prefetch_lines: usize,
 }
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -4084,9 +3939,15 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
         return None;
     }
     static ZERO_CHAIN:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_NTT_ZERO_CHAIN").is_none());
+    static PREFETCH_LINES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_PREFETCH_LINES")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| (1..=64).contains(n)).unwrap_or(4)
+    });
     let mut result = PreparedFour {
         pairs: [[F128::ZERO; 2]; 15],
         zero_chain: *ZERO_CHAIN && zero_chain_twiddles(t),
+        prefetch_lines: *PREFETCH_LINES,
     };
     for i in (0..12).step_by(4) {
         unsafe {

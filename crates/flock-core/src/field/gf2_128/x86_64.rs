@@ -84,26 +84,44 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     unsafe {
-        let p0 = pmull(a.lo, b.lo);
-        let p1 = pmull(a.hi, b.hi);
-        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
-        let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
-        let mut t0 = p0;
+        let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let y = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let low = _mm_clmulepi64_si128::<0x00>(x, y);
+        let high = _mm_clmulepi64_si128::<0x11>(x, y);
+        let xs = _mm_xor_si128(x, _mm_shuffle_epi32::<0x4e>(x));
+        let ys = _mm_xor_si128(y, _mm_shuffle_epi32::<0x4e>(y));
+        let middle = _mm_xor_si128(
+            _mm_xor_si128(_mm_clmulepi64_si128::<0x00>(xs, ys), low), high);
+        reduce_register_product(low, middle, high)
+    }
+}
 
-        let t2_shifted = _mm_slli_si128::<8>(p1); // {0, p1.lo}
-        t1 = _mm_xor_si128(t1, t2_shifted);
-        let t2_red = pmull(lane1(p1), 0x87);
-        t1 = _mm_xor_si128(t1, t2_red);
+/// Reduce the three Karatsuba limbs without moving intermediates to GPRs.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+unsafe fn reduce_register_product(low: __m128i, middle: __m128i, high: __m128i) -> F128 {
+    unsafe {
+        let polynomial = _mm_set_epi64x(0, 0x87);
+        let middle = _mm_xor_si128(middle, _mm_xor_si128(
+            _mm_slli_si128::<8>(high),
+            _mm_clmulepi64_si128::<0x01>(high, polynomial)));
+        let result = _mm_xor_si128(low, _mm_xor_si128(
+            _mm_slli_si128::<8>(middle),
+            _mm_clmulepi64_si128::<0x01>(middle, polynomial)));
+        F128 { lo: lane0(result), hi: lane1(result) }
+    }
+}
 
-        let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
-        t0 = _mm_xor_si128(t0, t1_shifted);
-        let t1_red = pmull(lane1(t1), 0x87);
-        t0 = _mm_xor_si128(t0, t1_red);
-
-        F128 {
-            lo: lane0(t0),
-            hi: lane1(t0),
-        }
+/// Squaring has no cross term in characteristic two.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_square_register(a: F128) -> F128 {
+    unsafe {
+        let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        reduce_register_product(
+            _mm_clmulepi64_si128::<0x00>(x, x),
+            _mm_setzero_si128(),
+            _mm_clmulepi64_si128::<0x11>(x, x))
     }
 }
 
