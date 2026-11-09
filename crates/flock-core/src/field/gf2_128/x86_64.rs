@@ -84,26 +84,49 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     unsafe {
-        let p0 = pmull(a.lo, b.lo);
-        let p1 = pmull(a.hi, b.hi);
-        let pm = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
-        let mut t1 = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
-        let mut t0 = p0;
+        let av = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let bv = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+        let p0 = _mm_clmulepi64_si128::<0x00>(av, bv);
+        let p1 = _mm_clmulepi64_si128::<0x11>(av, bv);
+        let ax = _mm_xor_si128(av, _mm_shuffle_epi32::<0x4e>(av));
+        let bx = _mm_xor_si128(bv, _mm_shuffle_epi32::<0x4e>(bv));
+        let pm = _mm_clmulepi64_si128::<0x00>(ax, bx);
+        let cross = _mm_xor_si128(_mm_xor_si128(pm, p0), p1);
+        let poly = _mm_set_epi64x(0, 0x87);
+        // Fold the high product and then the cross product without moving
+        // their high qwords through general-purpose registers. Selector 0x01
+        // takes the high qword of the first operand and low qword of poly.
+        let middle = _mm_xor_si128(
+            _mm_xor_si128(cross, _mm_slli_si128::<8>(p1)),
+            _mm_clmulepi64_si128::<0x01>(p1, poly),
+        );
+        let result = _mm_xor_si128(
+            _mm_xor_si128(p0, _mm_slli_si128::<8>(middle)),
+            _mm_clmulepi64_si128::<0x01>(middle, poly),
+        );
+        F128 { lo: lane0(result), hi: lane1(result) }
+    }
+}
 
-        let t2_shifted = _mm_slli_si128::<8>(p1); // {0, p1.lo}
-        t1 = _mm_xor_si128(t1, t2_shifted);
-        let t2_red = pmull(lane1(p1), 0x87);
-        t1 = _mm_xor_si128(t1, t2_red);
-
-        let t1_shifted = _mm_slli_si128::<8>(t1); // {0, t1.lo}
-        t0 = _mm_xor_si128(t0, t1_shifted);
-        let t1_red = pmull(lane1(t1), 0x87);
-        t0 = _mm_xor_si128(t0, t1_red);
-
-        F128 {
-            lo: lane0(t0),
-            hi: lane1(t0),
-        }
+/// Square a canonical polynomial-basis field value. The cross products
+/// cancel in characteristic two, leaving two independent limb squares.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_square_vec(value: F128) -> F128 {
+    unsafe {
+        let v = _mm_set_epi64x(value.hi as i64, value.lo as i64);
+        let lo = _mm_clmulepi64_si128::<0x00>(v, v);
+        let hi = _mm_clmulepi64_si128::<0x11>(v, v);
+        let poly = _mm_set_epi64x(0, 0x87);
+        let middle = _mm_xor_si128(
+            _mm_slli_si128::<8>(hi),
+            _mm_clmulepi64_si128::<0x01>(hi, poly),
+        );
+        let result = _mm_xor_si128(
+            _mm_xor_si128(lo, _mm_slli_si128::<8>(middle)),
+            _mm_clmulepi64_si128::<0x01>(middle, poly),
+        );
+        F128 { lo: lane0(result), hi: lane1(result) }
     }
 }
 

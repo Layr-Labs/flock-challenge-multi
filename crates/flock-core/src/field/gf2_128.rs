@@ -54,17 +54,38 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
-    pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
-        let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
-        for _ in 1..128 {
-            r *= cur;
-            cur = cur * cur;
+    /// Field squaring, with the cross products omitted on native x86.
+    #[inline]
+    pub fn square(self) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: same compile-time ISA contract as F128::mul.
+            unsafe { x86_64::ghash_square_vec(self) }
         }
-        r
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            self * self
+        }
+    }
+
+    /// Multiplicative inverse via Fermat, using a short addition chain.
+    /// Preserves the convention that the inverse of zero is zero.
+    pub fn inv(self) -> Self {
+        let mut r = self;
+        // If r = self^(2^n - 1), first form self^(2^(2n) - 1),
+        // then square and multiply by self to reach self^(2^(2n+1) - 1).
+        // The six stages reach n = 3, 7, 15, 31, 63, 127; a final square
+        // gives self^(2^128 - 2). This uses 127 squarings and 12 products.
+        for n in [1, 3, 7, 15, 31, 63] {
+            let mut power = r;
+            for _ in 0..n {
+                power = power.square();
+            }
+            r *= power;
+            r = r.square();
+            r *= self;
+        }
+        r.square()
     }
 }
 
@@ -360,6 +381,49 @@ mod tests {
     }
 
     #[test]
+    fn square_matches_software() {
+        for i in 0..128 {
+            let bits = 1u128 << i;
+            let value = F128::new(bits as u64, (bits >> 64) as u64);
+            assert_eq!(value.square(), software::ghash_mul(value, value));
+        }
+        for value in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+            assert_eq!(value.square(), software::ghash_mul(value, value));
+        }
+        let mut rng = Rng::new(0x39b625f817d);
+        for _ in 0..1024 {
+            let value = rng.next_f128();
+            assert_eq!(value.square(), software::ghash_mul(value, value));
+        }
+    }
+
+    #[test]
+    fn inverse_addition_chain_matches_fermat() {
+        fn reference(x: F128) -> F128 {
+            let mut r = F128::ONE;
+            let mut power = x * x;
+            for _ in 1..128 {
+                r *= power;
+                power *= power;
+            }
+            r
+        }
+        for x in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX),
+                  F128::new(0, 1u64 << 63)] {
+            assert_eq!(x.inv(), reference(x));
+        }
+        let mut rng = Rng::new(0x8173937297a13);
+        for _ in 0..1024 {
+            let x = rng.next_f128();
+            let inverse = x.inv();
+            assert_eq!(inverse, reference(x));
+            if !x.is_zero() {
+                assert_eq!(x * inverse, F128::ONE);
+            }
+        }
+    }
+
+    #[test]
     fn inverse_roundtrip() {
         let mut rng = Rng::new(6);
         for _ in 0..16 {
@@ -483,6 +547,28 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
+    fn vector_karatsuba_all_basis_products() {
+        // Check all 128 x 128 basis pairs against the bitwise field oracle.
+        for i in 0..128 {
+            let a = F128::new(if i < 64 { 1u64 << i } else { 0 },
+                              if i >= 64 { 1u64 << (i - 64) } else { 0 });
+            for j in 0..128 {
+                let b = F128::new(if j < 64 { 1u64 << j } else { 0 },
+                                  if j >= 64 { 1u64 << (j - 64) } else { 0 });
+                assert_eq!(unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) },
+                           software::ghash_mul(a, b), "basis {i} {j}");
+            }
+        }
+        for a in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+            for b in [F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)] {
+                assert_eq!(unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) },
+                           software::ghash_mul(a, b));
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
     fn all_x86_variants_agree() {
         let mut rng = Rng::new(8);
         for _ in 0..128 {
@@ -493,12 +579,14 @@ mod tests {
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let kv = unsafe { x86_64::ghash_mul_karatsuba_vec(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
+            assert_eq!(sw, kv, "karatsuba_vec");
             assert_eq!(sw, un, "unreduced");
         }
     }

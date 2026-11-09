@@ -235,8 +235,10 @@ pub fn commit_into(
 /// must have disjoint ownership and stay exclusively borrowed until return.
 /// The fourth argument is None on materialize-first fallback. Otherwise it
 /// supplies two exclusive staging outputs for this group. The producer must
-/// call seed_octa exactly once for each of its kpair values, using a private
-/// initialized octa input with q-major lanes. Roles own disjoint output rows;
+/// use a private q-major octa and seed each owned kpair either once through
+/// seed_octa or through prepared seed_range_full calls that partition all
+/// 128 fields into disjoint ranges. Each range is initialized before its
+/// seed call, and remains available until that call returns. Roles own disjoint output rows;
 /// both join before folding, publication, slot reuse or deallocation. Neither
 /// input nor target pointers may escape the callback.
 /// No shared view of z may coexist with these writes. Unwinding joins all
