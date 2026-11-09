@@ -424,12 +424,14 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
-        // Resolve the tile group once, outside the parallel reader. Two-tile
-        // groups reduced measured lincheck latency on the ranked CPU shape.
+        // Resolve the tile group once, outside the parallel reader. Candidate
+        // default of three tiles per claim, composed with the grouped-AB and
+        // C4/stripes pieces; two-tile behaviour remains available via
+        // FLOCK_ROOT_FOLD_BATCH=2.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
             std::env::var("FLOCK_ROOT_FOLD_BATCH")
                 .ok().and_then(|s| s.parse().ok())
-                .filter(|n| (1..=4).contains(n)).unwrap_or(2)
+                .filter(|n| (1..=4).contains(n)).unwrap_or(3)
         });
         let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));

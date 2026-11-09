@@ -42,9 +42,9 @@ flock_gfni_c4_lm_register_result:
     flock_c4_result_gather 1
 
 // Accumulate both passes together. The first octet of a pair shares BOTH
-// matrix loads; the second shares the low-half load. Its two high-half
-// memory operands leave one temporary for the paired XORs. This needs only
-// ZMM0..11 and 80 matrix-line loads, versus the old 128, with the same 128
+// matrix loads. After consuming its first low result, ZMM0 is free and
+// holds the second high-half matrix for both passes. This needs only
+// ZMM0..11 and 64 matrix-line loads, versus the original 128, with the same 128
 // GFNI operations and the same 512-byte initialized scratch.
 // Accumulators: ZMM8/9 = low/high of pass 0, ZMM10/11 = low/high of pass 1.
 .macro flock_c4_result_pair j
@@ -65,7 +65,8 @@ flock_gfni_c4_lm_register_result:
 .else
     vpternlogq zmm8, zmm0, zmm7, 0x96
 .endif
-    vgf2p8affineqb zmm7, zmm4, [rsi + 2048 + 64*(\j+1)], 0
+    vmovdqu64 zmm0, [rsi + 2048 + 64*(\j+1)]
+    vgf2p8affineqb zmm7, zmm4, zmm0, 0
 .if \j == 0
     vpxorq zmm9, zmm1, zmm7
 .else
@@ -77,7 +78,7 @@ flock_gfni_c4_lm_register_result:
 .else
     vpternlogq zmm10, zmm2, zmm7, 0x96
 .endif
-    vgf2p8affineqb zmm7, zmm5, [rsi + 2048 + 64*(\j+1)], 0
+    vgf2p8affineqb zmm7, zmm5, zmm0, 0
 .if \j == 0
     vpxorq zmm11, zmm3, zmm7
 .else
