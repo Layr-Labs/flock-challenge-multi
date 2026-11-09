@@ -424,14 +424,22 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
-        // Resolve the tile group once, outside the parallel reader. Two-tile
-        // groups reduced measured lincheck latency on the ranked CPU shape.
+        // Resolve the tile group once, outside the parallel reader. Groups of
+        // three scored above the two-tile default on the ranked runner
+        // (submission ed38976a); FLOCK_ROOT_FOLD_BATCH=2 restores the old width.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
             std::env::var("FLOCK_ROOT_FOLD_BATCH")
                 .ok().and_then(|s| s.parse().ok())
-                .filter(|n| (1..=4).contains(n)).unwrap_or(2)
+                .filter(|n| (1..=4).contains(n)).unwrap_or(3)
         });
         let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
+        // Lookup-assisted leaf: sixteen of each tile's 128 GFNI maps become
+        // byte shuffles on the port the affine cannot use. Resolved once;
+        // FLOCK_NO_ROOT_FOLD_LUT=1 restores the all-GFNI leaf for diagnostics.
+        static LUT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_FOLD_LUT").is_none()
+        });
+        let lut = BATCH_WORD_TILES && *LUT;
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -466,7 +474,9 @@ impl RootTileCache {
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
-                let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut batch_mats = (BATCH_WORD_TILES && !lut).then(|| [[0u64; 128]; 4]);
+                // Lookup-leaf records: 128 matrices, then 512 table bytes.
+                let mut batch_luts = lut.then(|| [[0u64; 192]; 4]);
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -501,6 +511,37 @@ impl RootTileCache {
                             unsafe { self.storage.0.as_ptr().add(self.offset).cast::<u8>()
                                 .add(tile * self.blocks * 512) }
                         };
+                        if let Some(records) = batch_luts.as_mut() {
+                            for (slot, record) in records[..count].iter_mut().enumerate() {
+                                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                                    let eq8 = logical_eq8(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));
+                                    kernels::fold_mats_from_basis(&eq8,
+                                        &mut record[t * 16..(t + 1) * 16]);
+                                }
+                                // SAFETY: the module's cfg supplies the leaf's
+                                // target features; all 128 matrices of this
+                                // record were written just above.
+                                unsafe { kernels::fold_word_tile_luts(record); }
+                            }
+                            for block in 0..self.blocks {
+                                // SAFETY: as for the all-GFNI leaf below. The
+                                // record array is contiguous, each live record
+                                // has its 128 matrices and 512 table bytes
+                                // fully written above, and the leaf reads
+                                // exactly count records of 192 u64.
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_lut(
+                                        source.add(block * 512),
+                                        records.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first,
+                                        WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                            }
+                            first = false;
+                            continue;
+                        }
                         let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
                             for t in 0..DIRECT_FOLD_TILE_STRIPES {

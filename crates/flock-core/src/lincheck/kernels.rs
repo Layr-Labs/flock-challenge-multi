@@ -48,3 +48,11 @@ pub(crate) use x86_64::{gather_transpose_stripe_x86, gather_transpose_stripe4_x8
     target_feature = "gfni"
 ))]
 pub(crate) use x86_64::gfni_fold_word_tiles4;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+pub(crate) use x86_64::{fold_word_tile_luts, gfni_fold_word_tiles4_lut};
