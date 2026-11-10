@@ -648,6 +648,91 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool>(
 const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
+
+/// `FLOCK_NO_WITGEN_ROW_PAIR=1` restores one accumulation per row.
+#[inline(always)]
+fn row_pair_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_ROW_PAIR").is_none());
+    *ON
+}
+
+/// Greedy pairing of adjacent dense (mode 0) rows in processing order 7..0:
+/// 1 = first row of a pair (deferred), 2 = second row (the pair is computed
+/// here), 0 = unpaired. A function of the window's structural modes only.
+const fn pair_role(blk: usize, k: usize) -> u8 {
+    let mut j = 8;
+    while j > 0 {
+        let hi = j - 1;
+        if !residual_row_live(blk, hi) {
+            j -= 1;
+            continue;
+        }
+        if hi >= 1 && residual_row_live(blk, hi - 1) && mode(blk, hi) == 0 && mode(blk, hi - 1) == 0 {
+            if k == hi {
+                return 1;
+            }
+            if k == hi - 1 {
+                return 2;
+            }
+            j -= 2;
+        } else {
+            if k == hi {
+                return 0;
+            }
+            j -= 1;
+        }
+    }
+    0
+}
+
+/// Whether the pair ending at row `k_lo` starts the window's accumulators.
+const fn pair_first(blk: usize, k_lo: usize) -> bool {
+    if blk == 29 { k_lo + 1 == 3 } else { k_lo + 1 == 7 }
+}
+
+#[inline(always)]
+unsafe fn row_product_pair<const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8],
+) {
+    unsafe {
+        let acc0 = acc[0];
+        acc[0] = row_product_pair_vector_abi::<FIRST>(ap, bp, ma, mb, acc, acc0);
+    }
+}
+
+// Two adjacent dense rows. `ap`, `bp` and `ma` address the HIGHER row; the
+// lower row sits one row (8 qwords) and one matrix bank (128 qwords) below.
+// Each output accumulates both products with one three-way XOR, so a pair
+// spends 8 accumulation operations and 7 accumulator stores where two single
+// calls spend 16 and 14. Field arithmetic is the single-row kernel's.
+#[inline(never)]
+#[allow(improper_ctypes_definitions)]
+unsafe extern "C" fn row_product_pair_vector_abi<const FIRST: bool>(
+    ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
+    acc: &mut [__m512i; 8], acc0: __m512i,
+) -> __m512i {
+    unsafe {
+        let av1 = affine_prepared(ap, ma);
+        let bv1 = affine_prepared(bp, mb);
+        let av2 = affine_prepared(ap.sub(8), ma.sub(128));
+        let bv2 = affine_prepared(bp.sub(8), mb);
+        let mut result = _mm512_setzero_si512();
+        for i in 0..8 {
+            let v1 = _mm512_gf2p8mul_epi8(av1[i], bv1[i]);
+            let v2 = _mm512_gf2p8mul_epi8(av2[i], bv2[i]);
+            let previous = if i == 0 { acc0 } else { acc[i] };
+            let value = if FIRST {
+                _mm512_xor_si512(v1, v2)
+            } else {
+                _mm512_ternarylogic_epi64::<0x96>(previous, v1, v2)
+            };
+            if i == 0 { result = value; } else { acc[i] = value; }
+        }
+        result
+    }
+}
 #[inline(always)]
 unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize>(
     proj: &StreamProj<'_>,
@@ -662,8 +747,17 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
     unsafe {
         let bp = pretranspose_ring::<BLK, false>(br, rw);
         let mut acc = [_mm512_setzero_si512(); 8];
+        let pair_on = row_pair_enabled();
         rows.publish_dense_values(0, a[0], b[0]);
-        if residual_row_live(BLK, 7) {
+        if pair_on && const { pair_role(BLK, 7) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 7) == 2 } {
+            if const { pair_first(BLK, 7) } {
+                row_product_pair::<true>(ap.as_ptr().add(8 * 8), bp.as_ptr().add(8 * 8), m.add(8 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(8 * 8), bp.as_ptr().add(8 * 8), m.add(8 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 7) {
         match mode(BLK, 7) {
 0 => row_product::<0, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
 1 => row_product::<1, true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc),
@@ -689,7 +783,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(1, a[1], b[1]);
-        if residual_row_live(BLK, 6) {
+        if pair_on && const { pair_role(BLK, 6) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 6) == 2 } {
+            if const { pair_first(BLK, 6) } {
+                row_product_pair::<true>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 6) {
         match mode(BLK, 6) {
 0 => row_product::<0, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc),
@@ -715,7 +817,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(2, a[2], b[2]);
-        if residual_row_live(BLK, 5) {
+        if pair_on && const { pair_role(BLK, 5) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 5) == 2 } {
+            if const { pair_first(BLK, 5) } {
+                row_product_pair::<true>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 5) {
         match mode(BLK, 5) {
 0 => row_product::<0, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc),
@@ -741,7 +851,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(3, a[3], b[3]);
-        if residual_row_live(BLK, 4) {
+        if pair_on && const { pair_role(BLK, 4) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 4) == 2 } {
+            if const { pair_first(BLK, 4) } {
+                row_product_pair::<true>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 4) {
         match mode(BLK, 4) {
 0 => row_product::<0, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc),
@@ -767,7 +885,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(4, a[4], b[4]);
-        if BLK == 29 {
+        if pair_on && const { pair_role(BLK, 3) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 3) == 2 } {
+            if const { pair_first(BLK, 3) } {
+                row_product_pair::<true>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, &mut acc);
+            }
+        } else if BLK == 29 {
         match mode(BLK, 3) {
 0 => row_product::<0, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
 1 => row_product::<1, true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc),
@@ -813,7 +939,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(5, a[5], b[5]);
-        if residual_row_live(BLK, 2) {
+        if pair_on && const { pair_role(BLK, 2) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 2) == 2 } {
+            if const { pair_first(BLK, 2) } {
+                row_product_pair::<true>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 2) {
         match mode(BLK, 2) {
 0 => row_product::<0, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc),
@@ -839,7 +973,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(6, a[6], b[6]);
-        if residual_row_live(BLK, 1) {
+        if pair_on && const { pair_role(BLK, 1) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 1) == 2 } {
+            if const { pair_first(BLK, 1) } {
+                row_product_pair::<true>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 1) {
         match mode(BLK, 1) {
 0 => row_product::<0, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc),
@@ -865,7 +1007,15 @@ _ => unreachable!(),
         core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
 
         rows.publish_dense_values(7, a[7], b[7]);
-        if residual_row_live(BLK, 0) {
+        if pair_on && const { pair_role(BLK, 0) == 1 } {
+            // Deferred: computed together with the next row.
+        } else if pair_on && const { pair_role(BLK, 0) == 2 } {
+            if const { pair_first(BLK, 0) } {
+                row_product_pair::<true>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc);
+            } else {
+                row_product_pair::<false>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, &mut acc);
+            }
+        } else if residual_row_live(BLK, 0) {
         match mode(BLK, 0) {
 0 => row_product::<0, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),
 1 => row_product::<1, false>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, &mut acc),

@@ -1745,17 +1745,20 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS:usize=0> {
+struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS:usize=0, const PAIR: bool = false> {
+    /// `PAIR` only: the completed even word waiting for its odd partner.
+    half: V8,
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
 }
 
-impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> W8<'t, FLUSH, RANKED_CLOSED, WINDOW_COLS> {
+impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize, const PAIR: bool> W8<'t, FLUSH, RANKED_CLOSED, WINDOW_COLS, PAIR> {
     #[inline(always)]
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
+            half: pending,
             pending,
             stage,
             drain,
@@ -1778,6 +1781,33 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
                 && is_ranked_static;
             if !static_b {
+                #[cfg(target_feature = "avx512f")]
+                if PAIR {
+                    // The round stream completes words in ascending order,
+                    // starting at an even word, and every drain boundary and
+                    // static-B boundary is even. So each even word is followed
+                    // by its odd partner before anything reads the ring, and
+                    // the pair is exactly the 64-byte line the drains load:
+                    // one 512-bit store instead of two 256-bit stores.
+                    const {
+                        assert!(RING_WORDS.is_multiple_of(2));
+                        assert!((16 + PROLOGUE_WORDS).is_multiple_of(2));
+                        assert!(RANKED_STATIC_B_PREFIX_END.is_multiple_of(2));
+                        assert!(RANKED_STATIC_B_TAIL_START.is_multiple_of(2));
+                        assert!(LAST_WORD % 2 == 1);
+                    }
+                    if WORD % 2 == 0 {
+                        self.half = v;
+                    } else {
+                        _mm512_store_si512(
+                            self.stage.add((WORD - 1) & (RING_WORDS - 1)).cast::<__m512i>(),
+                            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(self.half), v),
+                        );
+                    }
+                } else {
+                    store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
+                }
+                #[cfg(not(target_feature = "avx512f"))]
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
@@ -3085,7 +3115,7 @@ unsafe fn dump_elide_win(
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,const WINDOW_COLS:usize>(
+unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,const WINDOW_COLS:usize,const PAIR:bool>(
     prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
@@ -3139,8 +3169,12 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
         ];
 
         let zero = dup_u32(0);
-        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        // Cache-line aligned: the drains load ring word pairs as 512-bit
+        // lines, and the paired writer stores them as such.
+        #[repr(align(64))]
+        struct Ring([V8; RING_WORDS]);
+        let mut ast = core::mem::MaybeUninit::<Ring>::uninit();
+        let mut bs = core::mem::MaybeUninit::<Ring>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 
@@ -3204,11 +3238,11 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::<false, RANKED_CLOSED, WINDOW_COLS>::at(ast, pending_bit, drain_ptr, false);
+        let mut wa = W8::<false, RANKED_CLOSED, WINDOW_COLS, PAIR>::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
         let mut wb =
-            W8::<true, RANKED_CLOSED, WINDOW_COLS>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
+            W8::<true, RANKED_CLOSED, WINDOW_COLS, PAIR>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -3431,7 +3465,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
-        build_octa_witness_ab_stream_prepared_elide::<false,0>(
+        build_octa_witness_ab_stream_prepared_elide::<false,0,false>(
             &prepared,
             z,
             a,
@@ -3494,7 +3528,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(widen_maddubs_enabled());
         let ranked_static = proj.plan.offsets_eligible(2);
         let prepared = prepare_closed_inputs_ordered(init, base, proj.cross_quarter);
-        build_octa_witness_ab_stream_prepared_elide::<true,0>(
+        build_octa_witness_ab_stream_prepared_elide::<true,0,false>(
             &prepared,
             z,
             a,
@@ -4905,7 +4939,14 @@ impl SeedWindowContext<'_>{#[inline(always)] unsafe fn apply<const COLS:usize>(&
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_window<const COLS:usize>(init:u64,base:usize,z:*mut u32,a:*mut u32,b:*mut u32,proj:StreamProj<'_>,preps:&RankedClosedWindowPreps){unsafe{
  debug_assert!(matches!(COLS,8|16|32|64));debug_assert!(proj.seed_window.is_some());debug_assert_eq!(proj.compact_z_tile_words,COLS*4);debug_assert!(proj.elide_z);
  let prepared=prepare_closed_inputs_ordered(init,base,proj.cross_quarter);let ranked_static=proj.plan.offsets_eligible(2);
- build_octa_witness_ab_stream_prepared_elide::<true,COLS>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false);
+ // One 512-bit store per staging-ring word pair; `FLOCK_NO_WITGEN_RING_PAIR=1`
+ // restores the two 256-bit stores in the same binary.
+ static PAIR_ON:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_WITGEN_RING_PAIR").is_none());
+ if *PAIR_ON {
+  build_octa_witness_ab_stream_prepared_elide::<true,COLS,true>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false);
+ } else {
+  build_octa_witness_ab_stream_prepared_elide::<true,COLS,false>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false);
+ }
 }}
 
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
