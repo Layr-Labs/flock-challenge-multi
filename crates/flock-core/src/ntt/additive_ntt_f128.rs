@@ -1656,7 +1656,30 @@ fn st_fmp_run_claimed(
             );
         }
     }
-    let stride = 512 * row_len;
+    // A 512 KiB slot is an exact multiple of the L1 set period. Offset
+    // adjacent slots by whole cache lines so sibling roles processing
+    // different slots do not always address the same sets at each lane step.
+    static SLOT_PAD_LINES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_SLOT_PAD_LINES")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| *n <= 4).unwrap_or(0)
+    });
+    let slot_pad = *SLOT_PAD_LINES * (64 / core::mem::size_of::<F128>());
+    let stride = 512 * row_len + slot_pad;
+    static HUGE_STAGE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_ST_HUGE_STAGE").is_none()
+    });
+    static STAGE_ALIGN_LOG: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_STAGE_ALIGN_LOG")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| matches!(n, 6 | 12 | 21)).unwrap_or(21)
+    });
+    static STAGE_COLOR: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_STAGE_COLOR")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| *n < 64).unwrap_or(7)
+    });
+    let huge_stage = produce.is_some() && nbuf == 3 && row_len == 64 && *HUGE_STAGE;
     let states: Vec<StFmpPair> = (0..n_pairs).map(|_| StFmpPair::new()).collect();
     let next = AtomicUsize::new(0);
     let states = &states;
@@ -1768,8 +1791,22 @@ fn st_fmp_run_claimed(
         // them at a time.
         // Producers seed directly into the reserved staging pair from their
         // private 16 KiB octa scratch. No group-sized input allocation exists.
-        let mut staging = staging_block(512 * nbuf, row_len);
-        let bufp = staging.as_mut_ptr();
+        let extra_rows = (nbuf * slot_pad).div_ceil(row_len);
+        // A 4 MiB reservation contains a complete aligned 2 MiB frame.
+        // alloc_uninit_vec advises the large allocation before any stage
+        // write. A small cache-line color leaves the complete three-slot
+        // payload inside that frame while offsetting its L1 set mapping.
+        let mut staging = staging_block(
+            if huge_stage { 4096 } else { 512 * nbuf + extra_rows }, row_len);
+        let stage_offset = if huge_stage {
+            staging.as_mut_ptr().align_offset(1usize << *STAGE_ALIGN_LOG)
+                + *STAGE_COLOR * (64 / core::mem::size_of::<F128>())
+        } else { 0 };
+        debug_assert!(stage_offset <= staging.len());
+        debug_assert!(staging.len() - stage_offset >= nbuf * stride);
+        // SAFETY: the reservation bounds above cover the complete payload;
+        // consumers only receive pointers inside these same owned slots.
+        let bufp = unsafe { staging.as_mut_ptr().add(stage_offset) };
         st.bufp.store(bufp as usize, Ordering::Release);
         // Declared AFTER the staging allocation so it drops BEFORE it: on a
         // panic the fold sibling may still be reading a published block, and
