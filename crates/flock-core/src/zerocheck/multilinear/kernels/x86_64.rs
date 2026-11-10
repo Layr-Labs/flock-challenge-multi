@@ -2246,6 +2246,19 @@ pub(crate) fn zc_tail_nt_enabled() -> bool {
 
 pub(crate) const ZC_TAIL_NT_LOG: u32 = 20;
 
+/// `FLOCK_NO_ZC_R345_B_CANON=1` makes the three-variable composed pass fold
+/// the ranked brand's four static B lines again instead of using their
+/// constants. Same transcript either way.
+pub(crate) fn zc_r345_b_canon_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R345_B_CANON").is_none());
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) static R345_B_CANON_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn zc_wtab_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WTAB").is_none());
@@ -4686,6 +4699,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c4_pass4_register_result.S"),
 );
 
 #[cfg(all(
@@ -4699,6 +4713,51 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c4_pass4_register_result();
+}
+
+/// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
+/// lines (32 packed rows): `[rows 0..4 folds, rows 4..8 folds]` of each line,
+/// lane `t` = line `t`. Half the two-pass kernel's GFNI work.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold32_rows_c4_lm_registers(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let lo: __m512i;
+        let hi: __m512i;
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_pass4_register_result,
+            in("rdi") rows,
+            in("rsi") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") lo, out("zmm9") hi,
+        );
+        [lo, hi]
+    }
+    // Same definition through the two-pass fold: its even line slots are one pass.
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut wide = [0u8; 512];
+        for t in 0..4 {
+            core::ptr::copy_nonoverlapping(rows.add(64 * t), wide.as_mut_ptr().add(128 * t), 64);
+        }
+        let [lo, hi, _, _] = gfni_fold64_rows_c4_lm_registers(wide.as_ptr(), m);
+        [lo, hi]
+    }
 }
 
 
@@ -5812,12 +5871,8 @@ unsafe fn r4_canonical_set(
     unsafe {
         macro_rules! product {
             ($i:literal,$q:expr) => {{
-                let (a,b)=$q; let dst=&mut acc[$i];
-                dst.lo=_mm512_xor_si512(dst.lo,_mm512_clmulepi64_epi128::<0x00>(a,b));
-                dst.hi=_mm512_xor_si512(dst.hi,_mm512_clmulepi64_epi128::<0x11>(a,b));
-                dst.mid=_mm512_ternarylogic_epi64::<0x96>(dst.mid,
-                    _mm512_clmulepi64_epi128::<0x01>(a,b),
-                    _mm512_clmulepi64_epi128::<0x10>(a,b));
+                let (a, b) = $q;
+                r4_karatsuba_mul_acc(&mut acc[$i], a, b);
             }};
         }
         macro_rules! corner {
@@ -6285,6 +6340,284 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
     }
 }
 
+/// [`fold3_from_packed_lookahead_c4_lm_wtab_x86`] for the ranked witness
+/// brand, whose B side is static on four of every block's 32 lines: lines 0
+/// and 1 (rows 0..16) are all ones, line 30 is the static row-240 word over
+/// zero rows, and line 31 is zero. Their three-variable folds are the
+/// per-pass constants `b_canon` (lines 0, 1, 30, 31; see
+/// `three_var::fold3_b_canonical_lines`), so B folds lines 2..30 only: three
+/// two-pass calls and one single pass, seven passes for the incumbent's
+/// eight, and the four static lines are never loaded.
+///
+/// One loop iteration is one 256-row block, so `out_base` must be a multiple
+/// of 32 (it is: the driver's chunks hold `2·lo_size` outputs).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+    b_canon: &[F128; 4],
+) -> [F128; 8] {
+    use super::super::lane_select;
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+    debug_assert!(out_base.is_multiple_of(32));
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(b_out.len(), 2 * lo_size);
+    #[cfg(test)]
+    R345_B_CANON_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Lane sources for `_mm512_permutex2var_epi64(a, idx, b)`: (0, l) is lane
+    // `l` of `a`, (1, l) lane `l` of `b`.
+    const B0_A0_A1_A2: [u64; 8] = lane_select([(1, 0), (0, 0), (0, 1), (0, 2)]);
+    const A3_B1_B3_B3: [u64; 8] = lane_select([(0, 3), (1, 1), (1, 3), (1, 3)]);
+    const A0_A1_A2_B2: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 2)]);
+    const A0_A1_A2_B3: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 3)]);
+    const A0_A2_B0_B0: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 0), (1, 0)]);
+    const A0_A2_B1_B1: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 1), (1, 1)]);
+    // Prefetch targets sit `ZC_PKT_PF_TILES` half-blocks ahead, so an odd
+    // lead makes a block's first half prefetch a second half and vice versa.
+    const PF_FLIPS_HALF: bool = ZC_PKT_PF_TILES % 2 == 1;
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wt.as_ptr();
+        let (r3, r3_64) = ghash_broadcast_split(rho3);
+        let (c0, _) = ghash_broadcast_split(b_canon[0]);
+        let (c1, _) = ghash_broadcast_split(b_canon[1]);
+        let (c30, _) = ghash_broadcast_split(b_canon[2]);
+        let (c31, _) = ghash_broadcast_split(b_canon[3]);
+        let ix = |t: &[u64; 8]| _mm512_loadu_si512(t.as_ptr().cast::<__m512i>());
+        let i_b0_a012 = ix(&B0_A0_A1_A2);
+        let i_a3_b1_b3 = ix(&A3_B1_B3_B3);
+        let i_a012_b2 = ix(&A0_A1_A2_B2);
+        let i_a012_b3 = ix(&A0_A1_A2_B3);
+        let i_a02_b0 = ix(&A0_A2_B0_B0);
+        let i_a02_b1 = ix(&A0_A2_B1_B1);
+
+        // The rho3 level: (rows 0..4 fold) + rho3·(rows 0..4 fold + rows 4..8 fold).
+        macro_rules! fold_r3 {
+            ($e:expr, $o:expr) => {{
+                let e = $e;
+                _mm512_xor_si512(e, ghash_mul_x4_split(_mm512_xor_si512(e, $o), r3, r3_64))
+            }};
+        }
+
+        // A: the incumbent's 16-line half-block, lane-major [4i, 4i+1, 4i+2, 4i+3].
+        macro_rules! fold_a_half {
+            ($row0:expr) => {{
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
+                let [p0, p1, p2, p3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                let oe1 = fold_r3!(q0, q1);
+                let oo1 = fold_r3!(q2, q3);
+                let oe2 = fold_r3!(p0, p1);
+                let oo2 = fold_r3!(p2, p3);
+                [
+                    _mm512_shuffle_i64x2::<0x88>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0x88>(oo1, oo2),
+                    _mm512_shuffle_i64x2::<0xDD>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0xDD>(oo1, oo2),
+                ]
+            }};
+        }
+
+        // B: eight lines from `$row`; returns the folds of its lines
+        // (0, 2, 4, 6) and (1, 3, 5, 7).
+        macro_rules! fold_b_window {
+            ($row:expr) => {{
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                (fold_r3!(q0, q1), fold_r3!(q2, q3))
+            }};
+        }
+
+        // `$b_first..$b_last` are the half-block lines of B worth prefetching.
+        macro_rules! prefetch_half {
+            ($next:expr, $lines:expr, $b_first:expr, $b_last:expr) => {{
+                for l in $lines {
+                    _mm_prefetch(a_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    if l >= $b_first && l < $b_last {
+                        _mm_prefetch(b_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    }
+                }
+            }};
+        }
+
+        // Store one 16-output tile and return its message operands.
+        macro_rules! emit_tile {
+            ($x:expr, $a:expr, $b:expr) => {{
+                let x = $x;
+                let ol = 2 * x;
+                let [a0, a1, a2, a3] = $a;
+                let [b0, b1, b2, b3] = $b;
+                let ap = a_out_ptr.add(ol);
+                let bp = b_out_ptr.add(ol);
+                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else {
+                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                    (s0, s1, s2, s3, t0, t1, t2, t3)
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                }
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = ghash_mul_x4_split(a0, w, w64);
+                let a1w = ghash_mul_x4_split(a1, w, w64);
+                let a2w = ghash_mul_x4_split(a2, w, w64);
+                let a3w = ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            // First packed row of this block; B's live lines are 2..30.
+            let row0 = 8 * (out_base + 2 * x_lo);
+            debug_assert!(row0.is_multiple_of(256));
+            let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
+                (0, 14, 2, 16)
+            } else {
+                (2, 16, 0, 14)
+            };
+
+            // Lines 0..16.
+            let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+            prefetch_half!(next, 0..8, pf1_first, pf1_last);
+            let a_tile = fold_a_half!(row0);
+            prefetch_half!(next, 8..16, pf1_first, pf1_last);
+            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
+            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
+            let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
+            let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
+            let b_tile = [
+                _mm512_permutex2var_epi64(te, i_b0_a012, c0), // lines 0, 4, 8, 12
+                _mm512_permutex2var_epi64(to, i_b0_a012, c1), // lines 1, 5, 9, 13
+                _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
+                _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
+            ];
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = emit_tile!(x_lo, a_tile, b_tile);
+
+            // Lines 16..32.
+            let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
+            prefetch_half!(next, 0..8, pf2_first, pf2_last);
+            let c_tile = fold_a_half!(row0 + 128);
+            prefetch_half!(next, 8..16, pf2_first, pf2_last);
+            let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
+            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
+            let d_tile = [
+                // lines 16, 20, 24, 28
+                _mm512_permutex2var_epi64(
+                    _mm512_permutex2var_epi64(te, i_a3_b1_b3, e3),
+                    i_a012_b2,
+                    f4,
+                ),
+                // lines 17, 21, 25, 29
+                _mm512_permutex2var_epi64(
+                    _mm512_permutex2var_epi64(to, i_a3_b1_b3, o3),
+                    i_a012_b3,
+                    f4,
+                ),
+                // lines 18, 22, 26, 30
+                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(e3, i_a02_b0, f4), c30),
+                // lines 19, 23, 27, 31
+                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(o3, i_a02_b1, f4), c31),
+            ];
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = emit_tile!(x_lo + 8, c_tile, d_tile);
+
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}
+
 #[cfg(all(test,target_arch="x86_64",target_feature="avx512f",
     target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
 mod r4_stream_tests {
@@ -6347,5 +6680,90 @@ mod r4_canonical_pair_tests {
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
         }}}
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn r4_karatsuba_mul_acc(
+    dst: &mut WideGhashX4,
+    a: core::arch::x86_64::__m512i,
+    b: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let low = _mm512_clmulepi64_epi128::<0x00>(a, b);
+        let high = _mm512_clmulepi64_epi128::<0x11>(a, b);
+        let a_sum = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4e>(a));
+        let b_sum = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4e>(b));
+        let all = _mm512_clmulepi64_epi128::<0x00>(a_sum, b_sum);
+        dst.lo = _mm512_xor_si512(dst.lo, low);
+        dst.hi = _mm512_xor_si512(dst.hi, high);
+        // all = low + high + both cross-products over GF(2).
+        dst.mid = _mm512_ternarylogic_epi64::<0x96>(
+            dst.mid, all, _mm512_xor_si512(low, high),
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+mod r4_karatsuba_tests {
+    use super::*;
+
+    #[test]
+    fn r4_karatsuba_matches_schoolbook_unreduced() {
+        use crate::field::gf2_128::x86_64::{f128x4_extract, f128x4_loadu};
+        let mut state = 0x510e527fade682d1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let basis = |bit: usize| {
+            if bit < 64 { F128::new(1u64 << bit, 0) }
+            else { F128::new(0, 1u64 << (bit - 64)) }
+        };
+        let mut cases = 0;
+        for kind in 0..3 {
+            let count = match kind { 0 => 128 * 128, 1 => 1024, _ => 16 };
+            for index in 0..count {
+                let a: [F128; 4] = std::array::from_fn(|lane| match kind {
+                    0 => basis((index / 128 + lane * 29) % 128),
+                    1 => F128::new(next(), next()),
+                    _ => [F128::ZERO, F128::ONE, basis(127), F128::new(!0, !0)][index / 4],
+                });
+                let b: [F128; 4] = std::array::from_fn(|lane| match kind {
+                    0 => basis((index % 128 + lane * 31) % 128),
+                    1 => F128::new(next(), next()),
+                    _ => [F128::ZERO, F128::ONE, basis(127), F128::new(!0, !0)][index % 4],
+                });
+                let seed_a: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+                let seed_b: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+                unsafe {
+                    let va = f128x4_loadu(a.as_ptr());
+                    let vb = f128x4_loadu(b.as_ptr());
+                    let mut expected = WideGhashX4::from_mul(
+                        f128x4_loadu(seed_a.as_ptr()), f128x4_loadu(seed_b.as_ptr()),
+                    );
+                    let mut actual = expected;
+                    expected.mul_acc(va, vb);
+                    r4_karatsuba_mul_acc(&mut actual, va, vb);
+                    for (got, want) in [
+                        (actual.lo, expected.lo),
+                        (actual.hi, expected.hi),
+                        (actual.mid, expected.mid),
+                    ] {
+                        assert_eq!(f128x4_extract(got), f128x4_extract(want),
+                            "kind={kind} case={index}");
+                    }
+                }
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 17424);
+        eprintln!("R4 Karatsuba raw-product cases={cases} lanes=4");
     }
 }
