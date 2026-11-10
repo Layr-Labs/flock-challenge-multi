@@ -215,6 +215,34 @@ pub(crate) fn marginalize_eq_low3(eq: &[F128]) -> Vec<F128> {
         .collect()
 }
 
+/// Three-variable folds of the four static B lines of a ranked block, in line
+/// order `[0, 1, 30, 31]` (a line is eight packed rows, one output of the
+/// pass).
+///
+/// Ranked witness brand, per 256-row block (the same facts
+/// [`round2_canonical_window_deltas`] uses): B rows `0..16` are all ones, row
+/// 240 is the static word `0x0001_ffff_ffff_ffff`, rows `241..256` are zero.
+/// With `v0 = Σ_s col_s` and `v1 = Σ_{s<49} col_s` the images of those two
+/// row words, the composed coefficients of an all-ones line sum to one, so
+/// lines 0 and 1 fold to `v0`; line 30 holds one live row at coefficient
+/// `(1+ρ₁)(1+ρ₂)(1+ρ₃)`; line 31 is zero. Exact field identities, so these
+/// are the elements the sweep would compute from the rows.
+pub(crate) fn fold3_b_canonical_lines(table: &UniSkipFoldTable, rho: [F128; 3]) -> [F128; 4] {
+    assert_eq!(table.n_chunks, 8);
+    let col = |s: usize| table.data[(s / 8) * 256 + (1usize << (s % 8))];
+    let mut v1 = F128::ZERO;
+    for s in 0..49 {
+        v1 += col(s);
+    }
+    let mut v0 = v1;
+    for s in 49..64 {
+        v0 += col(s);
+    }
+    let one = F128::ONE;
+    let row240 = ((one + rho[0]) * (one + rho[1])) * v1;
+    [v0, v0, row240 + rho[2] * row240, F128::ZERO]
+}
+
 /// Portable leaf of the three-variable packed pass for one worker chunk:
 /// output `x` ← packed rows `8x..8x+8` folded at `ρ₁, ρ₂, ρ₃`, then the
 /// round-five message and round-six lookahead partials in the same eight-sum
@@ -281,6 +309,10 @@ pub(crate) fn fold3_from_packed_lookahead_scalar(
 /// The AVX-512 route reuses the incumbent rounds-3+4 c4 register fold
 /// (`ρ₁, ρ₂` baked into the GFNI matrices) and applies the `ρ₃` level in
 /// registers before the store.
+///
+/// `b_canonical` asserts the ranked witness brand on `b_packed` (see
+/// [`fold3_b_canonical_lines`]); the AVX-512 route then takes B's four
+/// static lines per block from constants instead of folding them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
     a_packed: &[u8],
@@ -295,6 +327,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
     r_next5: &[F128],
     eq_override: Option<(&[F128], &[F128])>,
     out_lm: bool,
+    b_canonical: bool,
 ) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
@@ -370,6 +403,26 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
         !out_lm || fast.is_some(),
         "lane-major 3var output needs the AVX-512 route"
     );
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let b_canon = (b_canonical
+        && fast.is_some()
+        && n.is_multiple_of(256)
+        && kernels::x86_64::zc_r345_b_canon_enabled())
+    .then(|| fold3_b_canonical_lines(table, rho));
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    let _ = b_canonical;
 
     let (sum1_even, sum_inf_even, agg) = a_out
         .par_chunks_mut(chunk_out)
@@ -390,19 +443,36 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                 // row 8·out_base .. 8·(out_base + chunk_out); the cfg gate
                 // supplies every feature; lo_size is a multiple of 16.
                 unsafe {
-                    match (*nt, out_lm) {
-                        (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
-                        ),
-                        (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
-                        ),
-                        (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
-                        ),
-                        (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                            ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
-                        ),
+                    if let Some(bc) = b_canon.as_ref() {
+                        match (*nt, out_lm) {
+                            (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<true, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt, bc,
+                            ),
+                            (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<true, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt, bc,
+                            ),
+                            (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<false, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt, bc,
+                            ),
+                            (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<false, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt, bc,
+                            ),
+                        }
+                    } else {
+                        match (*nt, out_lm) {
+                            (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ),
+                            (true, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ),
+                            (false, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ),
+                            (false, false) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
+                                ap, bp, out_base, a_out, b_out, lo_size, c, rho[2], wt,
+                            ),
+                        }
                     }
                 }
             } else {
