@@ -496,8 +496,9 @@ fn initial16(x: V16) -> V16 {
 fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
     unsafe { _mm512_ror_epi32::<N>(xor16(x, y)) }
 }
+#[cfg(any(test,not(target_feature="avx512dq")))]
 #[inline(always)]
-unsafe fn prepare16(init: u64, base: usize) -> Prepared16 {
+unsafe fn prepare16_legacy(init: u64, base: usize) -> Prepared16 {
     unsafe {
         let a = prepare_closed_inputs_ordered(init, base, true);
         let b = prepare_closed_inputs_ordered(init, base + 2048, true);
@@ -511,6 +512,18 @@ unsafe fn prepare16(init: u64, base: usize) -> Prepared16 {
             flags: join(a.flags, b.flags),
         }
     }
+}
+
+#[cfg(target_feature="avx512dq")]
+#[path="blake3_roots_prepare16.rs"]
+mod prepare16_fused;
+
+#[inline(always)]
+unsafe fn prepare16(init:u64,base:usize)->Prepared16 {
+    #[cfg(target_feature="avx512dq")]
+    {unsafe {prepare16_fused::prepare(init,base)}}
+    #[cfg(not(target_feature="avx512dq"))]
+    {unsafe {prepare16_legacy(init,base)}}
 }
 
 #[derive(Clone, Copy)]
