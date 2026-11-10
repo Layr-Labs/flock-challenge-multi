@@ -1154,6 +1154,32 @@ pub(crate) fn plain_cascade_lo_size(n: usize) -> usize {
     1usize << (n_vars - tail_split_n_hi(n_vars).min(n_vars))
 }
 
+/// Qword index vector for a two-source 512-bit lane select (`vpermi2q`):
+/// output lane `i` is lane `sel[i].1` of the first source when `sel[i].0 == 0`
+/// and of the second source when it is 1.
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )),
+    allow(dead_code)
+)]
+pub(crate) const fn lane_select(sel: [(u8, u8); 4]) -> [u64; 8] {
+    let mut idx = [0u64; 8];
+    let mut i = 0;
+    while i < 4 {
+        let (src, lane) = sel[i];
+        assert!(src < 2 && lane < 4);
+        idx[2 * i] = (8 * src + 2 * lane) as u64;
+        idx[2 * i + 1] = (8 * src + 2 * lane + 1) as u64;
+        i += 1;
+    }
+    idx
+}
+
 /// Whether cascade level buffers may be handed over lane-major (see
 /// `kernels::x86_64::zc_lm_handoff_enabled`). The lane-major reader is the
 /// deferred composed fold, so the handoff also needs that route.
@@ -5277,6 +5303,174 @@ mod tests {
                     );
                 });
             }
+        }
+    }
+
+    /// The four B constants of the three-variable pass are the portable
+    /// leaf's own folds of the ranked brand's static lines, in every block.
+    /// Runs on every target.
+    #[test]
+    fn fold3_b_canonical_lines_are_the_static_line_folds() {
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (mask, useful) = round2_pair_skip(&padding, K_SKIP);
+        let n_rows = 4 * 256;
+        let mut rng = Rng::new(0x3CA0);
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let rho = [rng.f128(), rng.f128(), rng.f128()];
+        let (a, b) = ranked_canonical_witness(&mut rng, n_rows);
+        let n_out = n_rows / 8;
+        let mut a_out = vec![F128::ZERO; n_out];
+        let mut b_out = vec![F128::ZERO; n_out];
+        let eq_lo = vec![F128::ONE; n_out / 2];
+        three_var::fold3_from_packed_lookahead_scalar(
+            &a, &b, &table, 0, &mut a_out, &mut b_out, rho, &eq_lo, mask, useful,
+        );
+        let consts = three_var::fold3_b_canonical_lines(&table, rho);
+        assert_ne!(consts[0], F128::ZERO);
+        assert_ne!(consts[2], F128::ZERO);
+        for blk in 0..n_rows / 256 {
+            for (k, line) in [0usize, 1, 30, 31].into_iter().enumerate() {
+                assert_eq!(b_out[32 * blk + line], consts[k], "block {blk} line {line}");
+            }
+        }
+    }
+
+    /// `lane_select` against the `vpermi2q` definition: qword `i` of the
+    /// result is `idx[i] & 7` of the source `idx[i] >> 3` picks.
+    #[test]
+    fn lane_select_indexes_whole_lanes() {
+        let a: [u64; 8] = std::array::from_fn(|i| 100 + i as u64);
+        let b: [u64; 8] = std::array::from_fn(|i| 200 + i as u64);
+        let sel = [(1u8, 0u8), (0, 3), (1, 2), (0, 1)];
+        let idx = lane_select(sel);
+        let got: [u64; 8] =
+            std::array::from_fn(|i| if idx[i] & 8 == 0 { a } else { b }[(idx[i] & 7) as usize]);
+        for (i, &(src, lane)) in sel.iter().enumerate() {
+            let from = if src == 0 { a } else { b };
+            let lane = lane as usize;
+            assert_eq!(got[2 * i..2 * i + 2], from[2 * lane..2 * lane + 2], "lane {i}");
+        }
+    }
+
+    /// Three-variable pass with B's static lines taken from constants is
+    /// bit-identical to the incumbent AVX-512 pass (driver and leaf, every
+    /// store variant), and its row-major tables are the portable leaf's.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fold3_b_canon_elide_matches_incumbent() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (mask, useful) = round2_pair_skip(&padding, K_SKIP);
+        for &(blocks_log, n_hi) in &[(4usize, 2usize), (4, 4), (5, 1), (6, 5)] {
+            let m = K_SKIP + 8 + blocks_log;
+            let n_rows = 1usize << (m - K_SKIP);
+            let n_out = n_rows / 8;
+            let mut rng = Rng::new(0x3CA1 + (blocks_log * 16 + n_hi) as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            let rho = [rng.f128(), rng.f128(), rng.f128()];
+            let mut r_next5: Vec<F128> = (0..m - K_SKIP - 3).map(|_| rng.f128()).collect();
+            r_next5[0] = F128::ONE;
+            let (a, b) = ranked_canonical_witness(&mut rng, n_rows);
+            let eq = SplitEqGhash::with_n_hi(&r_next5[1..], n_hi);
+            let lo = eq.lo.len();
+            assert!(lo >= 16 && lo.is_multiple_of(16));
+            let case = format!("blocks_log={blocks_log} n_hi={n_hi}");
+
+            let mut a_ref = vec![F128::ZERO; n_out];
+            let mut b_ref = vec![F128::ZERO; n_out];
+            three_var::fold3_from_packed_lookahead_scalar(
+                &a, &b, &table, 0, &mut a_ref, &mut b_ref, rho,
+                &vec![F128::ONE; n_out / 2], mask, useful,
+            );
+
+            for out_lm in [false, true] {
+                let run = |b_canonical: bool| {
+                    let mut a_out = vec![F128::ZERO; n_out];
+                    let mut b_out = vec![F128::ZERO; n_out];
+                    let msg = three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
+                        &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho,
+                        &r_next5, Some((&eq.lo[..], &eq.hi[..])), out_lm, b_canonical,
+                    );
+                    (msg, a_out, b_out)
+                };
+                let incumbent = run(false);
+                let hits = kernels::x86_64::R345_B_CANON_HITS.load(Relaxed);
+                let elided = run(true);
+                assert!(
+                    kernels::x86_64::R345_B_CANON_HITS.load(Relaxed) > hits,
+                    "elision never engaged {case}"
+                );
+                assert!(incumbent == elided, "driver {case} out_lm={out_lm}");
+                if !out_lm {
+                    assert!(elided.1 == a_ref, "a table vs portable {case}");
+                    assert!(elided.2 == b_ref, "b table vs portable {case}");
+                }
+            }
+
+            // Leaf level, so the streaming-store variants run too (the driver
+            // only streams at 2^23 outputs).
+            let one = F128::ONE;
+            let cfold = kernels::x86_64::build_cfold_mats(
+                &table.data,
+                [
+                    (one + rho[0]) * (one + rho[1]),
+                    rho[0] * (one + rho[1]),
+                    (one + rho[0]) * rho[1],
+                    rho[0] * rho[1],
+                ],
+            );
+            let wt = build_w_pair_table(&eq.lo);
+            let consts = three_var::fold3_b_canonical_lines(&table, rho);
+            macro_rules! leaf_pair {
+                ($nt:literal, $lm:literal) => {{
+                    let mut want = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                    let mut got = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                    let aligned = [&want.0, &want.1, &got.0, &got.1]
+                        .iter()
+                        .all(|v| (v.as_ptr() as usize).is_multiple_of(16));
+                    if !$nt || aligned {
+                        for (x_hi, out_base) in (0..n_out).step_by(2 * lo).enumerate() {
+                            let r = out_base..out_base + 2 * lo;
+                            // SAFETY: both leaves read rows 8·out_base .. 8·(out_base + 2·lo)
+                            // of the packed inputs and write exactly these output chunks.
+                            let (w, g) = unsafe {
+                                (
+                                    kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_x86::<$nt, $lm>(
+                                        a.as_ptr(), b.as_ptr(), out_base,
+                                        &mut want.0[r.clone()], &mut want.1[r.clone()],
+                                        lo, &cfold, rho[2], &wt,
+                                    ),
+                                    kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<$nt, $lm>(
+                                        a.as_ptr(), b.as_ptr(), out_base,
+                                        &mut got.0[r.clone()], &mut got.1[r],
+                                        lo, &cfold, rho[2], &wt, &consts,
+                                    ),
+                                )
+                            };
+                            assert_eq!(g, w, "leaf sums {case} nt={} lm={} chunk={x_hi}", $nt, $lm);
+                        }
+                        assert!(got == want, "leaf tables {case} nt={} lm={}", $nt, $lm);
+                    }
+                }};
+            }
+            leaf_pair!(false, false);
+            leaf_pair!(false, true);
+            leaf_pair!(true, false);
+            leaf_pair!(true, true);
         }
     }
 
