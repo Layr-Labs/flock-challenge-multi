@@ -23,6 +23,7 @@ pub mod gf2_kernels;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;
+pub mod rstrace;
 pub mod gpu;
 pub mod hash;
 pub mod lincheck;
@@ -698,14 +699,82 @@ pub mod r1_owner_awake {
     }
 
     fn hold(epoch: u64) {
+        hold_for(epoch, HOLD_LIMIT, false);
+    }
+
+    /// The holder loop: stay on CPU until [`HOLD_EPOCH`] moves past `epoch` or
+    /// `limit` passes. `yielding` adds a `sched_yield` per lap so a holder never
+    /// keeps another runnable thread (one still finishing the commit, or the
+    /// serial path into zerocheck) off its CPU.
+    fn hold_for(epoch: u64, limit: Duration, yielding: bool) {
         let t0 = Instant::now();
         while HOLD_EPOCH.load(Ordering::Relaxed) == epoch {
+            if yielding {
+                std::thread::yield_now();
+            }
             for _ in 0..32 {
                 core::hint::spin_loop();
             }
-            if t0.elapsed() > HOLD_LIMIT {
+            if t0.elapsed() > limit {
                 break;
             }
+        }
+    }
+
+    // ---- Lane rl item 3: round-one ENTRY pre-wake ----
+    //
+    // Round one's two SMT-split pools are asleep when the round starts, and
+    // their threads come on CPU 0.10-0.15 ms after the work is injected. The
+    // same holder as the exit core-warm is broadcast to both pools while the
+    // commit's last deep-pass workers finish (`prewake_arrive`), so the
+    // threads are already on CPU, yielding, when round one injects its two
+    // arms; `run_both` releases them (one `HOLD_EPOCH` bump) right after both
+    // arms are injected. Same closures, pools and inputs: proof bytes are
+    // unchanged. `FLOCK_NO_RL_PREWAKE=1` disables it; `FLOCK_RL_PREWAKE_AT=k`
+    // fires it when the k-th deep-pass worker has finished (default 4 of 16:
+    // measured best of 1/4/12/16; the holders yield, so the twelve workers still
+    // in the deep pass keep their CPUs).
+
+    const PREWAKE_LIMIT: Duration = Duration::from_micros(1500);
+    static PREWAKE_ARRIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PREWAKE_LIVE: AtomicBool = AtomicBool::new(false);
+
+    /// 0 = off, else the deep-pass arrival count that fires the pre-wake.
+    /// Read once per process; callers resolve it once per pass.
+    pub fn prewake_at() -> usize {
+        static AT: LazyLock<usize> = LazyLock::new(|| {
+            if std::env::var_os("FLOCK_NO_RL_PREWAKE").is_some() || !enabled() {
+                return 0;
+            }
+            std::env::var("FLOCK_RL_PREWAKE_AT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&k| k >= 1)
+                .unwrap_or(4)
+        });
+        *AT
+    }
+
+    /// Start of a commit pass that will report its deep-pass arrivals.
+    pub fn prewake_reset() {
+        PREWAKE_ARRIVED.store(0, Ordering::Relaxed);
+    }
+
+    /// One deep-pass worker has finished; the `at`-th arrival fires the pre-wake.
+    pub fn prewake_arrive(at: usize) {
+        if PREWAKE_ARRIVED.fetch_add(1, Ordering::AcqRel) + 1 == at {
+            prewake();
+        }
+    }
+
+    fn prewake() {
+        let Some((ab_pool, c_pool)) = crate::smt_split::zc_r1_pools() else {
+            return;
+        };
+        let epoch = HOLD_EPOCH.load(Ordering::Acquire);
+        PREWAKE_LIVE.store(true, Ordering::Release);
+        for pool in [ab_pool, c_pool] {
+            pool.spawn_broadcast(move |_| hold_for(epoch, PREWAKE_LIMIT, true));
         }
     }
 
@@ -754,6 +823,11 @@ pub mod r1_owner_awake {
                             });
                         }
                     });
+                    // Both arms are injected: release any pre-woken holders
+                    // so they pick the arms up without a wake-up.
+                    if PREWAKE_LIVE.swap(false, Ordering::AcqRel) {
+                        HOLD_EPOCH.fetch_add(1, Ordering::Release);
+                    }
                 });
                 let t0 = Instant::now();
                 while !c_done_ref.load(Ordering::Acquire) {

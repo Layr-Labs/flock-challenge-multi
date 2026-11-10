@@ -1242,6 +1242,23 @@ const PACKED_SPLIT_MAX_N_HI: usize = 13;
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
+/// [`build_w_pair_table`] for the deeper-cascade (`CASC`) passes: lanes `2h`
+/// and `2h + 1` of a tile (the two halves of an eight-group) both carry the
+/// odd lane's weight `eq_lo[8g + 4h + 3]`.
+fn build_w_pair_table_casc(eq_lo: &[F128]) -> Vec<F128> {
+    debug_assert!(eq_lo.len().is_multiple_of(8));
+    let x64 = F128::new(0, 1);
+    let mut t = crate::alloc_uninit_f128_vec(eq_lo.len());
+    for g in 0..eq_lo.len() / 8 {
+        for k in 0..4 {
+            let w = eq_lo[8 * g + 2 * (k | 1) + 1];
+            t[8 * g + k] = w;
+            t[8 * g + 4 + k] = w * x64;
+        }
+    }
+    t
+}
+
 fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
     debug_assert!(eq_lo.len().is_multiple_of(8));
     let x64 = F128::new(0, 1);
@@ -3375,7 +3392,70 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
     in_lm: bool,
     out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
+    let (m1, mi, la, _) = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+        a, b, a_out, b_out, rho_a, rho_b, r_next, in_lm, out_lm, false,
+    );
+    (m1, mi, la)
+}
+
+/// Whether the plain two-variable level can run the deeper cascade (`casc`)
+/// for an input of `n` elements: the AVX-512 deferred-fold route with eight-
+/// group chunks.
+pub(crate) fn fold2_plain_casc_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        let lo_size = plain_cascade_lo_size(n);
+        kernels::x86_64::zc_c3_enabled()
+            && kernels::x86_64::zc_wtab_enabled()
+            && kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+                kernels::x86_64::zc_defer_split_enabled(),
+                lo_size,
+                true,
+            )
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+/// [`fold2_plain_and_round_pair_lookahead_into_lm`] plus, with `casc`, the
+/// deeper tail cascade: the tables are stored in octet layout (for
+/// [`fold3_oct_plain_and_round_pair_lookahead_into`]; `out_lm` ignored) and
+/// the round two ahead of this level's message is returned as a biquadratic in
+/// `(ρ_c, ρ_d)` — this level's message variable and the next one. Needs
+/// [`fold2_plain_casc_route_ok`] and `r_next[1], r_next[2] ≠ 0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    r_next: &[F128],
+    in_lm: bool,
+    out_lm: bool,
+    casc: bool,
+) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
+    assert!(!casc || fold2_plain_casc_route_ok(a.len()), "casc route unavailable");
+    let out_lm = out_lm && !casc;
+    if casc {
+        assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
+    }
+    // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
+    // κ restores the even lanes' own weight in the message sums.
+    let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
     let n = a.len();
     assert_eq!(b.len(), n);
     assert!(n.is_power_of_two() && n >= 16);
@@ -3426,6 +3506,12 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         target_feature = "vpclmulqdq"
     ))]
     let wtab_arg = wtab_vec.as_deref();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wtab_casc = casc.then(|| build_w_pair_table_casc(eq_lo));
 
     // Non-temporal publish of the fold outputs, for the levels whose outputs
     // are too large to still be cache-resident when the next level reads
@@ -3458,11 +3544,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
         wtab_arg.is_some(),
     );
 
-    let (sum1_even, sum_inf_even, agg) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            let mut la7 = [F128::ZERO; 18];
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -3474,7 +3557,21 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
             // SAFETY: chunk geometry supplies four inputs per output and two
             // outputs per eq_lo value; features are guaranteed by the cfg.
             let out = unsafe {
-                if fast_plain && let Some(wt) = wtab_arg {
+                if casc && let Some(wt) = wtab_arg {
+                    let ap = a_in.as_ptr();
+                    let bp = b_in.as_ptr();
+                    let aop = a_out.as_mut_ptr();
+                    let bop = b_out.as_mut_ptr();
+                    let l7 = &mut la7;
+                    let _ = wt;
+                    let wt = wtab_casc.as_deref().unwrap();
+                    match (nt_out, in_lm) {
+                        (true, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<true, true, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
+                        (true, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<true, false, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
+                        (false, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<false, true, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
+                        (false, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<false, false, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
+                    }
+                } else if fast_plain && let Some(wt) = wtab_arg {
                     let ap = a_in.as_ptr();
                     let bp = b_in.as_ptr();
                     let aop = a_out.as_mut_ptr();
@@ -3564,23 +3661,215 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
                     eq_h * out[6],
                     eq_h * out[7],
                 ],
+                if casc { la7.map(|v| eq_h * v) } else { la7 },
             )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
+    };
+    let it = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate();
+    type Sums = (F128, F128, [F128; 6], [F128; 18]);
+    let id = || -> Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
+    let op = |(s1, sinf, sa, sl): Sums, (c1, cinf, ca, cl): Sums| -> Sums {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        let mut l = sl;
+        for (x, y) in l.iter_mut().zip(cl.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a, l)
+    };
+    let (sum1_even, sum_inf_even, agg, la7_acc) = it.map(leaf).reduce(id, op);
 
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
+    let la7 = casc.then(|| {
+        assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
+        Round4Lookahead::from_flat(&la7_acc).scaled((r_next[1] * r_next[2]).inv())
+    });
+    (r_next[0] * sum1, sum_inf, la, la7)
+}
+
+/// Deeper tail cascade level (`FLOCK_NO_ZC_C3`): folds three variables
+/// (`rho = [ρa, ρb, ρc]`) of the rounds 3+4+5 pass's **octet-layout** tables
+/// (see `fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86`) into
+/// eighth-size tables, and returns the next round's message plus the deferred
+/// quadratic for the round after it, with exactly the conventions of
+/// [`fold2_plain_and_round_pair_lookahead_into_lm`] (which equals folding
+/// `X_a` first and then running that two-variable level). `out_lm` stores
+/// lane-major tiles for a following lookahead level.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho: [F128; 3],
+    r_next: &[F128],
+    out_lm: bool,
+) -> (F128, F128, Round3Lookahead) {
+    use rayon::prelude::*;
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 32);
+    let eighth = n / 8;
+    assert_eq!(a_out.len(), eighth);
+    assert_eq!(b_out.len(), eighth);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 3);
+    let r = r_next[1];
+    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2);
+    assert_eq!(lo_size * hi_size * 2, eighth);
+    assert!(
+        !out_lm || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major tiles need eight-group chunks"
+    );
+    let (kappa, r_inv) = lookahead_inv_factors(r);
+    let chunk_in = 16 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fast = (lo_size >= 16 && lo_size.is_multiple_of(16)).then(|| {
+        let nt = kernels::x86_64::zc_tail_nt_enabled()
+            && eighth >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
+            && (a_out.as_ptr() as usize) % 16 == 0
+            && (b_out.as_ptr() as usize) % 16 == 0;
+        (build_w_pair_table(eq_lo), nt)
+    });
+
+    let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            let out = if let Some((wt, nt)) = fast.as_ref() {
+                let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
+                let (aop, bop) = (a_out.as_mut_ptr(), b_out.as_mut_ptr());
+                // SAFETY: the chunk holds eight inputs per output and two
+                // outputs per eq_lo entry; lo_size is a multiple of 16.
+                unsafe {
+                    match (*nt, out_lm) {
+                        (true, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, true>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (true, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, false>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (false, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, true>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (false, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, false>(ap, bp, aop, bop, rho, lo_size, wt),
+                    }
+                }
+            } else {
+                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm)
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            let out =
+                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm);
+            let eq_h = eq_hi[x_hi];
+            (
+                eq_h * out[0],
+                eq_h * out[1],
+                [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ],
+            )
+    };
+    let it = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate();
+    let id = || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
+    let op = |(s1, sinf, sa): (F128, F128, [F128; 6]), (c1, cinf, ca): (F128, F128, [F128; 6])| {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a)
+    };
+    let (sum1_even, sum_inf_even, agg) = it.map(leaf).reduce(id, op);
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next[0] * sum1, sum_inf, la)
+}
+
+/// Portable leaf of [`fold3_oct_plain_and_round_pair_lookahead_into`]: octet
+/// input element `32B + 8g + j` sits at `32B + 4j + g`.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    allow(dead_code)
+)]
+pub(crate) fn fold3_oct_and_message_lookahead_scalar(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho: [F128; 3],
+    eq_lo: &[F128],
+    out_lm: bool,
+) -> [F128; 8] {
+    let fold8 = |v: &[F128], o: usize| -> F128 {
+        let x: [F128; 8] = std::array::from_fn(|j| v[32 * (o / 4) + 4 * j + o % 4]);
+        let t: [F128; 4] = std::array::from_fn(|h| x[2 * h] + rho[0] * (x[2 * h] + x[2 * h + 1]));
+        let u0 = t[0] + rho[1] * (t[0] + t[1]);
+        let u1 = t[2] + rho[1] * (t[2] + t[3]);
+        u0 + rho[2] * (u0 + u1)
+    };
+    let n_out = a_out.len();
+    let a_rm: Vec<F128> = (0..n_out).map(|o| fold8(a_in, o)).collect();
+    let b_rm: Vec<F128> = (0..n_out).map(|o| fold8(b_in, o)).collect();
+    for o in 0..n_out {
+        // Lane-major tiles: tile element 4k + g holds group g's element k.
+        let dst = if out_lm { (o & !15) + 4 * (o % 4) + (o % 16) / 4 } else { o };
+        a_out[dst] = a_rm[o];
+        b_out[dst] = b_rm[o];
+    }
+    let mut acc = [F256Unreduced::ZERO; 8];
+    for u in 0..eq_lo.len() / 2 {
+        let o = 4 * u;
+        let (a0, a1, a2, a3) = (a_rm[o], a_rm[o + 1], a_rm[o + 2], a_rm[o + 3]);
+        let (b0, b1, b2, b3) = (b_rm[o], b_rm[o + 1], b_rm[o + 2], b_rm[o + 3]);
+        let wt = eq_lo[2 * u + 1];
+        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        acc[0] ^= a1w.mul_unreduced(b1);
+        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        acc[2] ^= a3w.mul_unreduced(b3);
+        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+        acc[4] ^= a2w.mul_unreduced(b2);
+        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+        acc[5] ^= e_aw.mul_unreduced(e_b);
+        acc[6] ^= o_aw.mul_unreduced(o_b);
+        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+    acc.map(|x| x.reduce())
 }
 
 /// Portable leaf of [`fold2_plain_and_round_pair_lookahead_into`] for one
@@ -5335,6 +5624,184 @@ mod tests {
         for blk in 0..n_rows / 256 {
             for (k, line) in [0usize, 1, 30, 31].into_iter().enumerate() {
                 assert_eq!(b_out[32 * blk + line], consts[k], "block {blk} line {line}");
+            }
+        }
+    }
+
+    /// Deeper cascade, r345 side: same message and lookahead as the incumbent
+    /// pass, octet tables = the row-major tables permuted, and the round-seven
+    /// biquadratic equal to its definition over the row-major tables.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fold3_casc_round7_lookahead_matches_definition() {
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        for &(blocks_log, n_hi) in &[(4usize, 2usize), (4, 4), (5, 1), (6, 5)] {
+            let m = K_SKIP + 8 + blocks_log;
+            let n_rows = 1usize << (m - K_SKIP);
+            let n_out = n_rows / 8;
+            let mut rng = Rng::new(0xC3C3 + (blocks_log * 16 + n_hi) as u64);
+            let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+            let rho = [rng.f128(), rng.f128(), rng.f128()];
+            let mut r_next5: Vec<F128> = (0..m - K_SKIP - 3).map(|_| rng.f128()).collect();
+            r_next5[0] = F128::ONE;
+            let (a, b) = ranked_canonical_witness(&mut rng, n_rows);
+            let eq = SplitEqGhash::with_n_hi(&r_next5[1..], n_hi);
+            let case = format!("blocks_log={blocks_log} n_hi={n_hi}");
+            let run = |casc: bool| {
+                let mut a_out = vec![F128::ZERO; n_out];
+                let mut b_out = vec![F128::ZERO; n_out];
+                let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                    &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho, &r_next5,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc,
+                );
+                (msg, a_out, b_out)
+            };
+            let (inc, a_rm, b_rm) = run(false);
+            let (got, a_oct, b_oct) = run(true);
+            assert!(inc.3.is_none());
+            assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message {case}");
+            for e in 0..n_out {
+                let pos = 32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8;
+                assert_eq!(a_oct[pos], a_rm[e], "a oct {case} e={e}");
+                assert_eq!(b_oct[pos], b_rm[e], "b oct {case} e={e}");
+            }
+            let w = build_eq(&r_next5[3..]);
+            assert_eq!(w.len() * 8, n_out);
+            let mut want = Round4Lookahead::ZERO;
+            for (q, &om) in w.iter().enumerate() {
+                let x = &a_rm[8 * q..8 * q + 8];
+                let y = &b_rm[8 * q..8 * q + 8];
+                let (pa, pb) = (three_var::corners9(&x[4..8]), three_var::corners9(&y[4..8]));
+                let c: [F128; 4] = std::array::from_fn(|k| x[k] + x[k + 4]);
+                let d: [F128; 4] = std::array::from_fn(|k| y[k] + y[k + 4]);
+                let (pc, pd) = (three_var::corners9(&c), three_var::corners9(&d));
+                for k in 0..9 {
+                    want.v1[k] += om * (pa[k] * pb[k]);
+                    want.vinf[k] += om * (pc[k] * pd[k]);
+                }
+            }
+            assert_eq!(got.3.unwrap(), want, "round-seven lookahead {case}");
+        }
+    }
+
+    /// Deeper cascade emitted by a plain two-variable level: same message and
+    /// lookahead as the incumbent level, octet tables = its row-major tables
+    /// permuted, biquadratic equal to its definition.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold2_plain_casc_matches_definition() {
+        for &log_n in &[16usize, 17, 18] {
+            let n = 1usize << log_n;
+            if !fold2_plain_casc_route_ok(n) {
+                continue;
+            }
+            let mut rng = Rng::new(0x2C30 + log_n as u64);
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let (ra, rb) = (rng.f128(), rng.f128());
+            let mut r_next = rng.f128_vec(log_n - 2);
+            r_next[0] = F128::ONE;
+            let mut a_rm = vec![F128::ZERO; n / 4];
+            let mut b_rm = vec![F128::ZERO; n / 4];
+            let inc = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                &a, &b, &mut a_rm, &mut b_rm, ra, rb, &r_next, false, false, false,
+            );
+            let mut a_oct = vec![F128::ZERO; n / 4];
+            let mut b_oct = vec![F128::ZERO; n / 4];
+            let got = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true,
+            );
+            assert!(inc.3.is_none());
+            assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message log_n={log_n}");
+            for e in 0..n / 4 {
+                let pos = 32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8;
+                assert_eq!(a_oct[pos], a_rm[e], "a oct log_n={log_n} e={e}");
+                assert_eq!(b_oct[pos], b_rm[e], "b oct log_n={log_n} e={e}");
+            }
+            let w = build_eq(&r_next[3..]);
+            assert_eq!(w.len() * 8, n / 4);
+            let mut want = Round4Lookahead::ZERO;
+            for (q, &om) in w.iter().enumerate() {
+                let x = &a_rm[8 * q..8 * q + 8];
+                let y = &b_rm[8 * q..8 * q + 8];
+                let (pa, pb) = (three_var::corners9(&x[4..8]), three_var::corners9(&y[4..8]));
+                let c: [F128; 4] = std::array::from_fn(|k| x[k] + x[k + 4]);
+                let d: [F128; 4] = std::array::from_fn(|k| y[k] + y[k + 4]);
+                let (pc, pd) = (three_var::corners9(&c), three_var::corners9(&d));
+                for k in 0..9 {
+                    want.v1[k] += om * (pa[k] * pb[k]);
+                    want.vinf[k] += om * (pc[k] * pd[k]);
+                }
+            }
+            assert_eq!(got.3.unwrap(), want, "biquadratic log_n={log_n}");
+        }
+    }
+
+    /// Deeper cascade, plain side: the three-variable octet level equals
+    /// folding X_a and then running the two-variable lookahead level.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[test]
+    fn fold3_oct_level_matches_fold_then_fold2() {
+        for &log_n in &[10usize, 16, 17, 18] {
+            let mut rng = Rng::new(0x0C70 + log_n as u64);
+            let n = 1usize << log_n;
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let rho = [rng.f128(), rng.f128(), rng.f128()];
+            let mut r_next = rng.f128_vec(log_n - 3);
+            r_next[0] = F128::ONE;
+            let oct = |v: &[F128]| {
+                let mut o = vec![F128::ZERO; v.len()];
+                for e in 0..v.len() {
+                    o[32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8] = v[e];
+                }
+                o
+            };
+            let fold1 = |v: &[F128]| -> Vec<F128> {
+                (0..v.len() / 2).map(|i| v[2 * i] + rho[0] * (v[2 * i] + v[2 * i + 1])).collect()
+            };
+            let (a1, b1) = (fold1(&a), fold1(&b));
+            let mut a_ref = vec![F128::ZERO; n / 8];
+            let mut b_ref = vec![F128::ZERO; n / 8];
+            let want = fold2_plain_and_round_pair_lookahead_into(
+                &a1, &b1, &mut a_ref, &mut b_ref, rho[1], rho[2], &r_next,
+            );
+            let (ao, bo) = (oct(&a), oct(&b));
+            for out_lm in [false, true] {
+                if out_lm && !(zc_lane_major_handoff_on() && log_n >= 16) {
+                    continue;
+                }
+                let mut a_got = vec![F128::ZERO; n / 8];
+                let mut b_got = vec![F128::ZERO; n / 8];
+                let got = fold3_oct_plain_and_round_pair_lookahead_into(
+                    &ao, &bo, &mut a_got, &mut b_got, rho, &r_next, out_lm,
+                );
+                assert_eq!(got, want, "message log_n={log_n} lm={out_lm}");
+                if out_lm {
+                    assert!(lane_major_tiles(&a_got) == a_ref, "a lm log_n={log_n}");
+                    assert!(lane_major_tiles(&b_got) == b_ref, "b lm log_n={log_n}");
+                } else {
+                    assert!(a_got == a_ref, "a log_n={log_n}");
+                    assert!(b_got == b_ref, "b log_n={log_n}");
+                }
             }
         }
     }

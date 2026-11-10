@@ -1439,7 +1439,7 @@ pub(crate) fn fold2_plain_defer_wtab_route_ok(
     )),
     target_feature(enable = "avx512f,vpclmulqdq")
 )]
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
     const NT_OUT: bool,
@@ -1454,6 +1454,58 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
     rho_b: F128,
     lo_size: usize,
     wt: &[F128],
+) -> [F128; 8] {
+    let mut unused = [F128::ZERO; 18];
+    unsafe {
+        fold2_and_message_lookahead_defer_wtab_casc_x86::<NT_OUT, IN_LM, OUT_LM, false>(
+            a_in, b_in, a_out, b_out, rho_a, rho_b, lo_size, wt, &mut unused, F128::ZERO,
+        )
+    }
+}
+
+/// [`fold2_and_message_lookahead_defer_wtab_x86`] with the deeper tail
+/// cascade (`CASC`, see `casc_block`): the outputs go out in octet layout
+/// (`OUT_LM` ignored) and `la7` receives the per-chunk biquadratic of the
+/// round two ahead of this level's message, on the odd-lane weight.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_casc_x86<
+    const NT_OUT: bool,
+    const IN_LM: bool,
+    const OUT_LM: bool,
+    const CASC: bool,
+>(
+    a_in: *const F128,
+    b_in: *const F128,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    rho_a: F128,
+    rho_b: F128,
+    lo_size: usize,
+    wt: &[F128],
+    la7: &mut [F128; 18],
+    kappa6: F128,
 ) -> [F128; 8] {
     use core::arch::x86_64::*;
     debug_assert!(lo_size.is_multiple_of(16));
@@ -1494,7 +1546,15 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
                 }
                 let ap = a_out.add(output);
                 let bp = b_out.add(output);
-                let (a0, a1, a2, a3, b0, b1, b2, b3) = if OUT_LM {
+                let (a0, a1, a2, a3, b0, b1, b2, b3) = if CASC {
+                    let [a0, a1, a2, a3] = transpose4_lanes(oa0, oa1, oa2, oa3);
+                    let [b0, b1, b2, b3] = transpose4_lanes(ob0, ob1, ob2, ob3);
+                    for l in 8..16 {
+                        _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                        _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                    }
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else if OUT_LM {
                     let [a0, a1, a2, a3] = transpose4_lanes(oa0, oa1, oa2, oa3);
                     let [b0, b1, b2, b3] = transpose4_lanes(ob0, ob1, ob2, ob3);
                     if NT_OUT {
@@ -1541,6 +1601,220 @@ pub(crate) unsafe fn fold2_and_message_lookahead_defer_wtab_x86<
                     }
                     (a0, a1, a2, a3, b0, b1, b2, b3)
                 };
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64);
+                let a1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64);
+                let a2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64);
+                let a3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3, [a0, a1, a2, a3], (w, w64))
+            }};
+        }
+
+        let mut acc7 = [WideGhashX4::zero(); 10];
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, a_t, wa) = step8_fast!(x_lo);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3, c_t, wc) = step8_fast!(x_lo + 8);
+            if CASC {
+                let _ = (wa, wc);
+                casc_block::<NT_OUT>(
+                    a_t, c_t, [a0w, a1w, a2w, a3w], [c0w, c1w, c2w, c3w],
+                    [b0, b1, b2, b3], [d0, d1, d2, d3],
+                    a_out.add(2 * x_lo), b_out.add(2 * x_lo), &mut acc7,
+                );
+            }
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        if CASC {
+            let (sums, l7) = casc_finish(&acc, &acc7, kappa6);
+            *la7 = l7;
+            return sums;
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}
+
+/// Three-variable fold of one octet block (32 inputs, see
+/// [`fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86`]): lane `g` of
+/// the result is the block's group `g` folded at `(ρa, ρb, ρc)` (Möbius
+/// expansion, one deferred reduction). `r = [ρa, ρb, ρaρb, ρc, ρaρc, ρbρc, ρaρbρc]`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn fold32_oct_to_4(
+    src: *const F128,
+    r: &[core::arch::x86_64::__m512i; 7],
+) -> core::arch::x86_64::__m512i {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    unsafe {
+        let x: [__m512i; 8] =
+            core::array::from_fn(|j| _mm512_loadu_si512(src.add(4 * j).cast::<__m512i>()));
+        let x01 = _mm512_xor_si512(x[0], x[1]);
+        let x02 = _mm512_xor_si512(x[0], x[2]);
+        let x04 = _mm512_xor_si512(x[0], x[4]);
+        let x0123 = _mm512_ternarylogic_epi64::<0x96>(x01, x[2], x[3]);
+        let x0145 = _mm512_ternarylogic_epi64::<0x96>(x01, x[4], x[5]);
+        let x0246 = _mm512_ternarylogic_epi64::<0x96>(x02, x[4], x[6]);
+        let x4567 = _mm512_ternarylogic_epi64::<0x96>(x[4], x[5], _mm512_xor_si512(x[6], x[7]));
+        let xall = _mm512_xor_si512(x0123, x4567);
+        let mut acc = WideGhashX4::from_mul(r[0], x01);
+        acc.mul_acc2(r[1], x02, r[2], x0123);
+        acc.mul_acc2(r[3], x04, r[4], x0145);
+        acc.mul_acc2(r[5], x0246, r[6], xall);
+        _mm512_xor_si512(x[0], acc.reduce_lanes())
+    }
+}
+
+/// Deeper-cascade plain level: folds `X_a, X_b, X_c` of octet-layout inputs
+/// (eight inputs per output) and accumulates the next round's message plus its
+/// deferred quadratic exactly like [`fold2_and_message_lookahead_defer_wtab_x86`]
+/// (same eight per-chunk sums, same tile/lane conventions for the outputs).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_in: *const F128,
+    b_in: *const F128,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    rho: [F128; 3],
+    lo_size: usize,
+    wt: &[F128],
+) -> [F128; 8] {
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+
+    unsafe {
+        let bc = |t: F128| _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let [ra, rb, rc] = rho;
+        let r = [
+            bc(ra),
+            bc(rb),
+            bc(ra * rb),
+            bc(rc),
+            bc(ra * rc),
+            bc(rb * rc),
+            bc(ra * rb * rc),
+        ];
+        let mut acc = [WideGhashX4::zero(); 8];
+        let wt_ptr = wt.as_ptr();
+        const PF_OFF: usize = 2 * ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
+
+        macro_rules! step8_fast {
+            ($x_lo:expr) => {{
+                let x = $x_lo;
+                let output = 2 * x;
+                let input = 8 * output;
+                let a_src = a_in.add(input);
+                let b_src = b_in.add(input);
+                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+                for l in 0..16 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+                let oa0 = fold32_oct_to_4(a_src, &r);
+                let oa1 = fold32_oct_to_4(a_src.add(32), &r);
+                let oa2 = fold32_oct_to_4(a_src.add(64), &r);
+                let oa3 = fold32_oct_to_4(a_src.add(96), &r);
+                for l in 16..32 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+                let ob0 = fold32_oct_to_4(b_src, &r);
+                let ob1 = fold32_oct_to_4(b_src.add(32), &r);
+                let ob2 = fold32_oct_to_4(b_src.add(64), &r);
+                let ob3 = fold32_oct_to_4(b_src.add(96), &r);
+                let ap = a_out.add(output);
+                let bp = b_out.add(output);
+                let [a0, a1, a2, a3] = transpose4_lanes(oa0, oa1, oa2, oa3);
+                let [b0, b1, b2, b3] = transpose4_lanes(ob0, ob1, ob2, ob3);
+                let (s, t) = if OUT_LM {
+                    ([a0, a1, a2, a3], [b0, b1, b2, b3])
+                } else {
+                    ([oa0, oa1, oa2, oa3], [ob0, ob1, ob2, ob3])
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s[0], s[1], s[2], s[3]);
+                    stream_tile_as_xmm16(bp, t[0], t[1], t[2], t[3]);
+                } else {
+                    for k in 0..4 {
+                        _mm512_storeu_si512(ap.add(4 * k).cast::<__m512i>(), s[k]);
+                        _mm512_storeu_si512(bp.add(4 * k).cast::<__m512i>(), t[k]);
+                    }
+                }
                 let wp = wt_ptr.add(x) as *const __m512i;
                 let w = _mm512_loadu_si512(wp);
                 let w64 = _mm512_loadu_si512(wp.add(1));
@@ -6370,7 +6644,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
     const NT_OUT: bool,
@@ -6386,6 +6660,221 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
     rho3: F128,
     wt: &[F128],
     b_canon: &[F128; 4],
+) -> [F128; 8] {
+    let mut unused = [F128::ZERO; 18];
+    unsafe {
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false>(
+            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
+            F128::ZERO,
+        )
+    }
+}
+
+/// One 32-output block of the deeper-cascade (`CASC`) message pass, shared by
+/// the rounds 3+4+5 pass and the plain two-variable level. Inputs are the
+/// block's two lane-major tiles (`t0` = outputs 0..16, `t1` = 16..32; ZMM `k`
+/// lane `i` = output `16·tile + 4i + k`), the weighted `k = 0` operands, and
+/// each tile's `(w, w·x⁶⁴)` lane weights. Stores the block in octet layout
+/// (ZMM `j = x_a + 2x_b + 4x_c`, lane = eight-group) and accumulates the
+/// deferred two-round-ahead biquadratic: `acc7[0]` = corner (0,0) at `t = 1`
+/// (odd lanes packed), `acc7[1 + k]` = corner `k` at `t = ∞`, on the odd
+/// lane weight.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn casc_block<const NT_OUT: bool>(
+    a_t0: [core::arch::x86_64::__m512i; 4],
+    a_t1: [core::arch::x86_64::__m512i; 4],
+    aw_t0: [core::arch::x86_64::__m512i; 4],
+    aw_t1: [core::arch::x86_64::__m512i; 4],
+    b_t0: [core::arch::x86_64::__m512i; 4],
+    b_t1: [core::arch::x86_64::__m512i; 4],
+    ap: *mut F128,
+    bp: *mut F128,
+    acc7: &mut [WideGhashX4; 10],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let ev = |p: __m512i, q: __m512i| _mm512_shuffle_i64x2::<0x88>(p, q);
+        let od = |p: __m512i, q: __m512i| _mm512_shuffle_i64x2::<0xDD>(p, q);
+        let eb: [__m512i; 4] = core::array::from_fn(|k| ev(b_t0[k], b_t1[k]));
+        let ob: [__m512i; 4] = core::array::from_fn(|k| od(b_t0[k], b_t1[k]));
+        if NT_OUT {
+            stream_tile_as_xmm16(
+                ap,
+                ev(a_t0[0], a_t1[0]),
+                ev(a_t0[1], a_t1[1]),
+                ev(a_t0[2], a_t1[2]),
+                ev(a_t0[3], a_t1[3]),
+            );
+            stream_tile_as_xmm16(
+                ap.add(16),
+                od(a_t0[0], a_t1[0]),
+                od(a_t0[1], a_t1[1]),
+                od(a_t0[2], a_t1[2]),
+                od(a_t0[3], a_t1[3]),
+            );
+            stream_tile_as_xmm16(bp, eb[0], eb[1], eb[2], eb[3]);
+            stream_tile_as_xmm16(bp.add(16), ob[0], ob[1], ob[2], ob[3]);
+        } else {
+            for k in 0..4 {
+                _mm512_storeu_si512(ap.add(4 * k).cast::<__m512i>(), ev(a_t0[k], a_t1[k]));
+                _mm512_storeu_si512(ap.add(16 + 4 * k).cast::<__m512i>(), od(a_t0[k], a_t1[k]));
+                _mm512_storeu_si512(bp.add(4 * k).cast::<__m512i>(), eb[k]);
+                _mm512_storeu_si512(bp.add(16 + 4 * k).cast::<__m512i>(), ob[k]);
+            }
+        }
+        // Both lanes of an eight-group carry the same (odd-lane) weight, so
+        // the weighted x_c = 0 and x_c = 1 halves add up to the weighted
+        // t = ∞ operand without another multiplication.
+        let aw_o0 = od(aw_t0[0], aw_t1[0]);
+        // t = 1 corner (0, 0) on the packed odd lanes.
+        acc7[0].mul_acc(aw_o0, ob[0]);
+        let z0 = _mm512_xor_si512(ev(aw_t0[0], aw_t1[0]), aw_o0);
+        let z1 = _mm512_xor_si512(ev(aw_t0[1], aw_t1[1]), od(aw_t0[1], aw_t1[1]));
+        let z2 = _mm512_xor_si512(ev(aw_t0[2], aw_t1[2]), od(aw_t0[2], aw_t1[2]));
+        let z3 = _mm512_xor_si512(ev(aw_t0[3], aw_t1[3]), od(aw_t0[3], aw_t1[3]));
+        let y0 = _mm512_xor_si512(eb[0], ob[0]);
+        let y1 = _mm512_xor_si512(eb[1], ob[1]);
+        let y2 = _mm512_xor_si512(eb[2], ob[2]);
+        let y3 = _mm512_xor_si512(eb[3], ob[3]);
+        let z01 = _mm512_xor_si512(z0, z1);
+        let z23 = _mm512_xor_si512(z2, z3);
+        let y01 = _mm512_xor_si512(y0, y1);
+        let y23 = _mm512_xor_si512(y2, y3);
+        // acc7[1 + k] = corner k in [i + 3j] order: (0,0) (1,0) (∞,0)
+        // (0,1) (1,1) (∞,1) (0,∞) (1,∞) (∞,∞).
+        acc7[1].mul_acc(z0, y0);
+        acc7[2].mul_acc(z1, y1);
+        acc7[3].mul_acc(z01, y01);
+        acc7[4].mul_acc(z2, y2);
+        acc7[5].mul_acc(z3, y3);
+        acc7[6].mul_acc(z23, y23);
+        acc7[7].mul_acc(_mm512_xor_si512(z0, z2), _mm512_xor_si512(y0, y2));
+        acc7[8].mul_acc(_mm512_xor_si512(z1, z3), _mm512_xor_si512(y1, y3));
+        acc7[9].mul_acc(_mm512_xor_si512(z01, z23), _mm512_xor_si512(y01, y23));
+    }
+}
+
+/// Finish a `CASC` pass. Its weight table gives both lanes of an eight-group
+/// the odd lane's weight (`build_w_pair_table_casc`), so the eight message
+/// sums are `odd + κ·even` with `κ = (1 + r_c)/r_c` restoring the even
+/// lanes' own weight; the deferred biquadratic (Round4Lookahead flat layout
+/// `[v1; 9] ++ [vinf; 9]`) takes the `t = 1` corners other than (0,0) from
+/// the odd lanes of the eight message accumulators.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(always)]
+unsafe fn casc_finish(
+    acc: &[WideGhashX4; 8],
+    acc7: &[WideGhashX4; 10],
+    kappa: F128,
+) -> ([F128; 8], [F128; 18]) {
+    use crate::field::gf2_128::x86_64::f128x4_extract;
+    use core::arch::x86_64::*;
+    unsafe {
+        let lanes = |v: WideGhashX4, m: u8| WideGhashX4 {
+            lo: _mm512_maskz_mov_epi64(m, v.lo),
+            hi: _mm512_maskz_mov_epi64(m, v.hi),
+            mid: _mm512_maskz_mov_epi64(m, v.mid),
+        };
+        let sums = |m: u8| -> [F128; 8] {
+            let x = f128x4_extract(WideGhashX4::fold4_and_reduce(
+                lanes(acc[0], m),
+                lanes(acc[1], m),
+                lanes(acc[2], m),
+                lanes(acc[3], m),
+            ));
+            let y = f128x4_extract(WideGhashX4::fold4_and_reduce(
+                lanes(acc[4], m),
+                lanes(acc[5], m),
+                lanes(acc[6], m),
+                lanes(acc[7], m),
+            ));
+            [x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]]
+        };
+        let odd = sums(0xCC);
+        let even = sums(0x33);
+        let msg: [F128; 8] = core::array::from_fn(|k| odd[k] + kappa * even[k]);
+        let z = WideGhashX4::zero();
+        let q0 = f128x4_extract(WideGhashX4::fold4_and_reduce(acc7[0], acc7[1], acc7[2], acc7[3]));
+        let q1 = f128x4_extract(WideGhashX4::fold4_and_reduce(acc7[4], acc7[5], acc7[6], acc7[7]));
+        let q2 = f128x4_extract(WideGhashX4::fold4_and_reduce(acc7[8], acc7[9], z, z));
+        // t = 1 corners [i + 3j] (i ↔ x_a, j ↔ x_b), then t = ∞.
+        (
+            msg,
+            [
+                q0[0], odd[0], odd[1], odd[4], odd[2], odd[3], odd[5], odd[6], odd[7],
+                q0[1], q0[2], q0[3], q1[0], q1[1], q1[2], q1[3], q2[0], q2[1],
+            ],
+        )
+    }
+}
+
+/// `FLOCK_NO_ZC_C3=1` turns off the deeper tail cascade: the rounds 3+4+5
+/// pass no longer emits the round-seven biquadratic, and the first plain
+/// cascade level folds two variables instead of three.
+pub(crate) fn zc_c3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_C3").is_none());
+    *ON
+}
+
+/// [`fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86`] with the deeper
+/// tail cascade (`CASC`): besides the round-five message and round-six
+/// lookahead it accumulates the **round-seven** message as a biquadratic in
+/// `(ρ₄, ρ₅)` (Round4Lookahead layout `[v1; 9] ++ [vinf; 9]`, per chunk,
+/// reduced, on the odd lane weight `r₅·r₆·ω`) into `la7`, and stores the
+/// tables in the octet layout the three-variable plain cascade level reads:
+/// per 32-output block, ZMM `j` (`j = x₄ + 2x₅ + 4x₆`) holds element `j` of the
+/// block's four eight-groups (lane `g` = group `g`).
+///
+/// Round-seven terms, per eight-group `(x₄, x₅, x₆)` with `x₆` the lane
+/// parity of the message tiles: `t = 1` uses the `x₆ = 1` lanes, whose eight
+/// products the round-five/six accumulators already hold per lane (plus
+/// `A(0,0,1)·B(0,0,1)`); `t = ∞` takes the nine `{0,1,∞}²` corner products of
+/// `A(·,·,0) + A(·,·,1)` weighted by the `x₆ = 1` weight.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+    const CASC: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+    b_canon: &[F128; 4],
+    la7: &mut [F128; 18],
+    kappa6: F128,
 ) -> [F128; 8] {
     use super::super::lane_select;
     use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
@@ -6477,34 +6966,37 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
             }};
         }
 
-        // Store one 16-output tile and return its message operands.
+        // Store one 16-output tile and return its message operands. With
+        // CASC the store waits for the block's second tile (octet layout).
         macro_rules! emit_tile {
             ($x:expr, $a:expr, $b:expr) => {{
                 let x = $x;
                 let ol = 2 * x;
                 let [a0, a1, a2, a3] = $a;
                 let [b0, b1, b2, b3] = $b;
-                let ap = a_out_ptr.add(ol);
-                let bp = b_out_ptr.add(ol);
-                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
-                    (a0, a1, a2, a3, b0, b1, b2, b3)
-                } else {
-                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
-                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
-                    (s0, s1, s2, s3, t0, t1, t2, t3)
-                };
-                if NT_OUT {
-                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
-                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
-                } else {
-                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
-                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
-                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
-                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
-                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
-                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
-                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
-                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                if !CASC {
+                    let ap = a_out_ptr.add(ol);
+                    let bp = b_out_ptr.add(ol);
+                    let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                        (a0, a1, a2, a3, b0, b1, b2, b3)
+                    } else {
+                        let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                        let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                        (s0, s1, s2, s3, t0, t1, t2, t3)
+                    };
+                    if NT_OUT {
+                        stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                        stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                    } else {
+                        _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                        _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                        _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                        _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                        _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                        _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                        _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                        _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                    }
                 }
                 let wp = wt_ptr.add(x) as *const __m512i;
                 let w = _mm512_loadu_si512(wp);
@@ -6513,9 +7005,12 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
                 let a1w = ghash_mul_x4_split(a1, w, w64);
                 let a2w = ghash_mul_x4_split(a2, w, w64);
                 let a3w = ghash_mul_x4_split(a3, w, w64);
-                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3, w, w64)
             }};
         }
+        // Round-seven accumulators (CASC only): [0] = A(0,0,1)·B(0,0,1) on
+        // packed odd lanes, [1..10] = the t = ∞ corner products.
+        let mut acc7 = [WideGhashX4::zero(); 10];
 
         let mut x_lo = 0;
         while x_lo + 16 <= lo_size {
@@ -6543,7 +7038,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
                 _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
                 _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
             ];
-            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = emit_tile!(x_lo, a_tile, b_tile);
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, wa, wa64) = emit_tile!(x_lo, a_tile, b_tile);
 
             // Lines 16..32.
             let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
@@ -6571,7 +7066,17 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
                 // lines 19, 23, 27, 31
                 _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(o3, i_a02_b1, f4), c31),
             ];
-            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = emit_tile!(x_lo + 8, c_tile, d_tile);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3, wc, wc64) =
+                emit_tile!(x_lo + 8, c_tile, d_tile);
+
+            if CASC {
+                let _ = (wa, wa64, wc, wc64);
+                casc_block::<NT_OUT>(
+                    a_tile, c_tile, [a0w, a1w, a2w, a3w], [c0w, c1w, c2w, c3w],
+                    [b0, b1, b2, b3], [d0, d1, d2, d3],
+                    a_out_ptr.add(2 * x_lo), b_out_ptr.add(2 * x_lo), &mut acc7,
+                );
+            }
 
             acc[0].mul_acc2(a1w, b1, c1w, d1);
             acc[1].mul_acc2(
@@ -6609,6 +7114,11 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
 
         if NT_OUT {
             _mm_sfence();
+        }
+        if CASC {
+            let (sums, l7) = casc_finish(&acc, &acc7, kappa6);
+            *la7 = l7;
+            return sums;
         }
         let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
             WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),

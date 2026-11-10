@@ -997,7 +997,9 @@ pub(crate) fn fused_encode_leaves_subtree(
         let out = unsafe {
             core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(range.start), range.len())
         };
+        crate::rstrace::evd("cb:start", range.start as u32);
         merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+        crate::rstrace::evd("cb:leaves", range.start as u32);
         if !subtree_parents {
             return;
         }
@@ -1049,6 +1051,7 @@ pub(crate) fn fused_encode_leaves_subtree(
             lvl_read_off = write_off;
             lvl_read_len = write_len;
         }
+        crate::rstrace::evd("cb:end", range.start as u32);
     });
     match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,

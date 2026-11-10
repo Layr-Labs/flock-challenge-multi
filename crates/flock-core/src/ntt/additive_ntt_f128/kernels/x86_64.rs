@@ -768,6 +768,58 @@ unsafe fn butterfly_fused_2layer_publish_nt_impl<
     }
 }
 
+/// Lane rs: one half of the rate-seed's fused-two output. Rows
+/// `i·src_quarter + src_r` (i < 4) of the message pair as the seed does
+/// (layer k: (0,2), (1,3) with `t_outer`; layer k+1 on the pair selected by
+/// `h` with `t_inner`), and only that pair's two outputs are stored at
+/// `dst_r` and `dst_quarter + dst_r`. Exactly the values the full seed kernel
+/// writes to its rows 2h and 2h+1; 3 products per 2 rows.
+///
+/// # Safety
+/// Requires `avx512f` + `vpclmulqdq`; valid, non-aliasing rows; `num_ntts`
+/// a multiple of 4.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn seed_half_rows_from_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    t_outer: F128,
+    t_inner: F128,
+    h: usize,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let outer = tw_x4::<false, true>(t_outer);
+        let inner = tw_x4::<false, true>(t_inner);
+        let src_row = |i: usize| src.add((i * src_quarter + src_r) * num_ntts);
+        let d0 = dst.add(dst_r * num_ntts);
+        let d1 = dst.add((dst_quarter + dst_r) * num_ntts);
+        let mut lane = 0;
+        while lane < num_ntts {
+            let m0 = _mm512_loadu_si512(src_row(0).add(lane) as *const __m512i);
+            let m1 = _mm512_loadu_si512(src_row(1).add(lane) as *const __m512i);
+            let m2 = _mm512_loadu_si512(src_row(2).add(lane) as *const __m512i);
+            let m3 = _mm512_loadu_si512(src_row(3).add(lane) as *const __m512i);
+            let mut a = _mm512_xor_si512(m0, mul_x4::<false, true>(outer, m2));
+            let mut b = _mm512_xor_si512(m1, mul_x4::<false, true>(outer, m3));
+            if h == 1 {
+                a = _mm512_xor_si512(m2, a);
+                b = _mm512_xor_si512(m3, b);
+            }
+            let x0 = _mm512_xor_si512(a, mul_x4::<false, true>(inner, b));
+            let x1 = _mm512_xor_si512(b, x0);
+            _mm512_storeu_si512(d0.add(lane) as *mut __m512i, x0);
+            _mm512_storeu_si512(d1.add(lane) as *mut __m512i, x1);
+            lane += 4;
+        }
+    }
+}
+
 /// Out-of-place fused two-layer forward butterfly (layers 1–2 seed).
 /// Same algebra as [`butterfly_fused_2layer`], loads from `src` and stores
 /// to `dst`. Source and destination must not overlap.
@@ -5399,4 +5451,96 @@ mod zero_chain_tests {
         }
         println!("ZERO_CHAIN_ORACLE_OK 64completebuffercomparisons fourguardpositions inactivefields+outerguards");
     }}
+}
+
+/// Fold the four real trailing fields of the S8 odd groups together.
+/// The caller guarantees 128 rows of 64 initialized fields and seven zero
+/// trailing fields on every odd row. No callback may read the block until
+/// this function returns. Returns false without changing data on rollback.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) unsafe fn rows_raw7_s8(ptr: *mut F128, t: &[F128; 15], hint: u8) -> bool {
+    if !super::super::ntt_shaped_enabled() {
+        return false;
+    }
+    let Some(p) = (unsafe { prepare_four(t) }) else {
+        return false;
+    };
+    let ordered = super::super::ntt_alias_load_order_enabled();
+    unsafe {
+        match (hint, ordered) {
+            (0, false) => rows_raw7_s8_impl::<0, 0>(ptr, &p),
+            (0, true) => rows_raw7_s8_impl::<0, 1>(ptr, &p),
+            (1, false) => rows_raw7_s8_impl::<1, 0>(ptr, &p),
+            (1, true) => rows_raw7_s8_impl::<1, 1>(ptr, &p),
+            (_, false) => rows_raw7_s8_impl::<2, 0>(ptr, &p),
+            (_, true) => rows_raw7_s8_impl::<2, 1>(ptr, &p),
+        }
+    }
+    #[cfg(test)]
+    RAW7_PACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+#[cfg(all(
+    test,
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) static RAW7_PACK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &PreparedFour) {
+    #[repr(C, align(64))]
+    struct Tail([F128; 64]);
+    let mut storage = core::mem::MaybeUninit::<Tail>::uninit();
+    let tail = storage.as_mut_ptr().cast::<F128>();
+    let lead = (p.prefetch_lines * 4).min(64);
+    unsafe {
+        for r in 0..8 {
+            let odd = r & 1 == 1;
+            let lanes = if odd { 56 } else { 64 };
+            if r == 7 || H == 0 {
+                butterfly_four_fixed_registers::<8, 64, 0, ORD>(
+                    ptr.add(r * 64),
+                    p,
+                    lanes * 16,
+                    ptr,
+                );
+            } else {
+                butterfly_four_fixed_registers::<8, 64, H, ORD>(
+                    ptr.add(r * 64),
+                    p,
+                    lanes * 16,
+                    ptr.add(r * 64 + lead),
+                );
+            }
+            if odd {
+                // Four odd r values each initialize one column in all 16
+                // compact rows. Every one of the 64 fields is written.
+                for i in 0..16 {
+                    tail.add(i * 4 + (r >> 1))
+                        .write(ptr.add((i * 8 + r) * 64 + 56).read());
+                }
+            }
+        }
+        // All compact fields are initialized. Columns have the identical
+        // twiddles of their original r groups; the butterfly is lane-local.
+        butterfly_four_fixed_registers::<1, 4, 0, 0>(tail, p, 64, tail);
+        for i in 0..16 {
+            for j in 0..4 {
+                ptr.add((i * 8 + 2 * j + 1) * 64 + 56)
+                    .write(tail.add(i * 4 + j).read());
+            }
+        }
+    }
 }

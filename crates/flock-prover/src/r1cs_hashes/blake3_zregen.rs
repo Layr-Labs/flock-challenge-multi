@@ -853,6 +853,7 @@ pub(crate) mod imp {
         thread_local! {static OUTPUT:core::cell::RefCell<Option<Box<FoldOut>>>=const {core::cell::RefCell::new(None)};}
         (0..view.tiles / 8).into_par_iter().for_each(|u| {
             let dst = dst;
+            flock_core::rstrace::evd("z:task", u as u32);
             OUTPUT.with(|cell| {
                 let mut guard = cell.borrow_mut();
                 let output = guard
