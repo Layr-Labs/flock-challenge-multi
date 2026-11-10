@@ -226,8 +226,10 @@ pub fn commit_into(
 ///
 /// # Safety
 /// The callback must initialize every field of `z_packed` using only the
-/// supplied pointer. For group 0..1024 and role 0..2, its octa kpair values
-/// are `(role..32).step_by(2)`. It owns rows `q*2^17+k*2^11+r` for all
+/// supplied pointer. For group 0..1024, the role 0 and role 1 calls between
+/// them run every octa kpair in 0..32 exactly once: `(role..32).step_by(2)`
+/// each on the materialize-first fallback, any split when a staging target
+/// is supplied. A kpair owns rows `q*2^17+k*2^11+r` for all
 /// q=0..4, k in {2*kpair,2*kpair+1}, and r in {2*group,2*group+1}; every
 /// row contains 64 fields. Proven initialized constants may be retained, but stale
 /// data-dependent fields must be overwritten. Calls can overlap. They may
@@ -885,7 +887,7 @@ pub(crate) fn subtree_parents_enabled() -> bool {
 }
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
-const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
+const RANKED_PARENT_SUBGROUP_LEAVES: usize = 1024;
 
 /// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
 /// every 2048-leaf subgroup. Regroup only that exact production shape; every
