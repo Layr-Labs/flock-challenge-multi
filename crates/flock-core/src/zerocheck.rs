@@ -1115,6 +1115,16 @@ fn prove_packed_padded_inner<C: Challenger>(
             let lm_out = lm_reader_ok
                 && cfg!(target_arch = "x86_64")
                 && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
+            // The ranked brand round two's canonical-window elision ran on:
+            // the same static B rows let this pass skip them too.
+            let b_canonical = r2_canon_rows.is_some()
+                && padding.k_log == 14
+                && padding.useful_bits_per_block == 15_409
+                && m >= k_skip + 8
+                && multilinear::round2_canonical_elide_enabled();
+            if zc_timing {
+                eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical}");
+            }
             let (m1, mi, la_next) =
                 multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                     a_packed,
@@ -1129,6 +1139,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &r_next,
                     eq_override,
                     lm_out,
+                    b_canonical,
                 );
             a_mlv = a8;
             b_mlv = b8;
