@@ -320,11 +320,14 @@ pub fn ranked_pool_built() -> bool {
 /// Rollback is compile-time, because `run_trial` calls `env_clear()` and no
 /// `FLOCK_*` variable reaches the ranked worker: set
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
-/// restored and no extra thread is spawned. The two env vars are local
+/// restored and no extra thread is spawned. Environment overrides are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split. Four-w AB retention balances the arms on the
-/// eight-core ranked host with eight workers each. Local diagnostics can
+/// default is the split. Grouped AB leaves reduce the AB arm's work, so the
+/// eight-core ranked host assigns seven workers to AB and nine to C. Local
+/// diagnostics select an explicit AB count with `FLOCK_ZC_R1_AB_WORKERS` or
 /// restore 9/7 with `FLOCK_ZC_R1_AB_REBALANCE=1`.
+// Re-measurement checkpoint: the b8697c1 stack restored after the
+// negative lookup-leaf, packet-prefetch-4 and split-disabled variants.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
     use std::sync::OnceLock;
@@ -350,6 +353,35 @@ pub(crate) mod smt_split {
             ab.push(c.pop().expect("eight sibling groups"));
         }
         (ab, c)
+    }
+
+    // Keep the original planner as the exact eight/eight and nine/seven
+    // controls. Only the already-validated eight-core production topology
+    // selects an explicit partition.
+    #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+    fn arm_cpus_for_workers(groups: &[Vec<usize>], ab_workers: usize) -> (Vec<usize>, Vec<usize>) {
+        assert!(ab_workers > 0 && ab_workers < 2 * groups.len());
+        let (mut ab, mut c) = arm_cpus(groups, false);
+        while ab.len() < ab_workers { ab.push(c.pop().unwrap()); }
+        while ab.len() > ab_workers { c.push(ab.pop().unwrap()); }
+        (ab, c)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn explicit_partitions_preserve_every_cpu_once() {
+        let groups: Vec<Vec<usize>> = (0..8).map(|i| vec![100 + 3 * i, 101 + 3 * i]).collect();
+        let mut expected: Vec<usize> = groups.iter().flatten().copied().collect();
+        expected.sort_unstable();
+        for workers in 1..16 {
+            let (ab, c) = arm_cpus_for_workers(&groups, workers);
+            assert_eq!(ab.len(), workers);
+            assert_eq!(c.len(), 16 - workers);
+            let mut actual = ab;
+            actual.extend(c);
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[cfg(test)]
@@ -546,6 +578,14 @@ pub(crate) mod smt_split {
                 || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
+            let (s0, s1) = if cores == 8 {
+                match std::env::var("FLOCK_ZC_R1_AB_WORKERS").ok()
+                    .and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..16).contains(n)) {
+                    Some(workers) => super::arm_cpus_for_workers(&groups, workers),
+                    None if rebalance => (s0, s1),
+                    None => super::arm_cpus_for_workers(&groups, 7),
+                }
+            } else { (s0, s1) };
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
