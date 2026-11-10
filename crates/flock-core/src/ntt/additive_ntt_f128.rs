@@ -729,6 +729,29 @@ fn deep_pf_hint() -> u8 {
     *H
 }
 
+/// Aliasing-aware load order of the prepared fused-four kernel in the deep
+/// sweeps (see the `ord` comment in `butterfly_four_fixed_registers`).
+/// `FLOCK_NO_NTT_ALIAS_LOAD_ORDER=1` restores the original order. Read once.
+pub(crate) fn ntt_alias_load_order_enabled() -> bool {
+    static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_ALIAS_LOAD_ORDER").is_none()
+    });
+    *V
+}
+
+/// Line-hint level for the UNPAIRED sub-group drivers (recursive Ligerito
+/// commits, small transforms). `FLOCK_NTT_SUB_PF_HINT` = 0/1/2. Read once.
+fn sub_pf_hint() -> u8 {
+    static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_SUB_PF_HINT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 2)
+            .unwrap_or(1)
+    });
+    *H
+}
+
 /// Test-only latch forcing the generic (un-shaped) row-kernel dispatch, so a
 /// test can compare the shaped and generic forms in one process (the same
 /// pattern as [`KERNEL_DIET_TEST_OFF`]).
@@ -1264,6 +1287,42 @@ fn st_fmp_bufs() -> usize {
     *N
 }
 
+/// Balanced hand-off for generated input on the three-slot ring (default on).
+///
+/// Under the plain split M+P publishes both tasks of a group and F folds
+/// both, so per group one sibling waits for the other by the difference
+/// between a fold and a publish: F for the next announcement when publishing
+/// is the longer stage, M+P for the first fold when folding is. Balanced, F
+/// folds and publishes the group's first task while M+P publishes the
+/// previous group's second task and folds this group's second task. Each
+/// sibling then does one fold and one publish per group, and one of them is
+/// always publishing while the other folds. Every task is still folded once
+/// and published once by the same kernels, so the codeword is byte-identical.
+/// `FLOCK_NO_NTT_ST_FMP_BALANCED=1` restores the plain split in the same
+/// binary. Read once per process.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn st_fmp_balanced_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_ST_FMP_BALANCED").is_none()
+    });
+    *ON
+}
+
+/// Staging blocks the balanced hand-off is defined for: the two free slots
+/// of a group are exactly those of the two tasks published one cycle earlier.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+const ST_FMP_BALANCED_BUFS: usize = 3;
+
 /// Handoff state for one physical core under the `F ‖ (M+P)` split.
 ///
 /// **There is no ring and no completion flag.** Three monotone counters, each
@@ -1271,6 +1330,8 @@ fn st_fmp_bufs() -> usize {
 ///
 /// * `seeded` — tasks the M+P sibling has finished seeding. Written by MP only.
 /// * `folded` — tasks the F sibling has finished folding. Written by F only.
+///   Under the balanced hand-off F handles even tasks only and stores
+///   `task + 1` once that task is folded AND published.
 /// * `total`  — `seeded`'s FINAL value, `usize::MAX` until MP has claimed its
 ///   last task. Written by MP only, once, after its last `seeded` store.
 ///
@@ -1555,7 +1616,10 @@ fn st_fmp_run(
     let Some(claim) = StFmpClaim::take() else {
         return false;
     };
-    st_fmp_run_claimed(n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf, claim)
+    st_fmp_run_claimed(
+        n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf,
+        st_fmp_balanced_enabled(), claim,
+    )
 }
 
 /// The same body is exercised with explicit CPUs by correctness tests; only
@@ -1572,6 +1636,7 @@ fn st_fmp_run_claimed(
     after: Option<&(dyn Fn(usize) + Sync)>,
     pairs: &[(usize, usize)],
     nbuf: usize,
+    balanced: bool,
     _claim: StFmpClaim,
 ) -> bool {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1579,6 +1644,7 @@ fn st_fmp_run_claimed(
     assert_eq!(n_pairs * 2, rayon::current_num_threads());
     assert!((2..=ST_FMP_CAP).contains(&nbuf));
     assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
+    let balanced = balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
     {
@@ -1586,7 +1652,7 @@ fn st_fmp_run_claimed(
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ST_FMP_DEBUG").is_some());
         if *DBG {
             eprintln!(
-                "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len}"
+                "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len} balanced={balanced}"
             );
         }
     }
@@ -1600,6 +1666,8 @@ fn st_fmp_run_claimed(
             return;
         }
         // Sibling `.0` of each core seeds and publishes; sibling `.1` folds.
+        // Under the balanced hand-off each also runs the other's stage once
+        // per group.
         let is_mp = idx < n_pairs;
         let slot = if is_mp { idx } else { idx - n_pairs };
         let st = &states[slot];
@@ -1620,7 +1688,8 @@ fn st_fmp_run_claimed(
         affinity::pin(cpu);
 
         if !is_mp {
-            // ---- the F sibling: fold only ----
+            // ---- the F sibling: fold only, or fold and publish its own
+            // task under the balanced hand-off ----
             // Announces its exit on EVERY path, including a panic, so the M+P
             // sibling can never wait on a fold that will not arrive and can
             // never free the staging under a live reader.
@@ -1678,6 +1747,17 @@ fn st_fmp_run_claimed(
                 unsafe {
                     fold(bufp.add(s * stride), *st.slot_r[s].get());
                 }
+                if balanced {
+                    // SAFETY: this sibling just folded the slot and still
+                    // owns it; M+P reuses it only after the release below.
+                    unsafe {
+                        publish(bufp.add(s * stride), *st.slot_r[s].get());
+                    }
+                    st.folded.store(i + 1, Ordering::Release);
+                    // The group's second task is M+P's to fold and publish.
+                    i += 2;
+                    continue;
+                }
                 st.folded.store(i + 1, Ordering::Release);
                 i += 1;
             }
@@ -1727,16 +1807,38 @@ fn st_fmp_run_claimed(
             }
             true
         };
+        // One balanced cycle with `seeded` tasks handed over (even, >= 2).
+        // Task `seeded - 2` is F's. Task `seeded - 1` is folded here now and
+        // published here one cycle later, which is what happens to task
+        // `seeded - 3` first. On return every task below `seeded - 1` is
+        // published, so the slots of tasks `seeded - 3` and `seeded - 2` are
+        // free: on the three-slot ring those are the next group's two slots.
+        let balanced_cycle = |seeded: usize| {
+            // SAFETY: both slots hold tasks this sibling seeded and that F
+            // never touches (odd tasks); the older one was folded here.
+            unsafe {
+                if seeded >= 4 {
+                    let s = (seeded - 3) % nbuf;
+                    publish(bufp.add(s * stride), *st.slot_r[s].get());
+                }
+                let s = (seeded - 1) % nbuf;
+                fold(bufp.add(s * stride), *st.slot_r[s].get());
+            }
+            st.wait_folded(seeded - 1)
+        };
         loop {
             let first_r = next.fetch_add(group_width, Ordering::Relaxed);
             if first_r >= n_tasks {
                 break;
             }
             if let Some(produce) = produce {
+                if balanced {
+                    if i >= 2 && !balanced_cycle(i) { return; }
+                }
                 // Both output slots must be published before either producer
                 // may seed them. With two slots this joins the previous group;
                 // larger rings can retain old slots while producing new ones.
-                while i + 2 - published > nbuf {
+                while !balanced && i + 2 - published > nbuf {
                     if !publish_ready(published) { return; }
                     published += 1;
                 }
@@ -1759,7 +1861,7 @@ fn st_fmp_run_claimed(
                 }
             }
             for r in first_r..(first_r + group_width).min(n_tasks) {
-                if i - published == nbuf {
+                if !balanced && i - published == nbuf {
                     if !publish_ready(published) {
                         return;
                     }
@@ -1781,6 +1883,17 @@ fn st_fmp_run_claimed(
             // fold and callback before the staging allocation is released.
         }
         st.total.store(i, Ordering::Release);
+        if balanced {
+            if i >= 2 {
+                if !balanced_cycle(i) { return; }
+                let s = (i - 1) % nbuf;
+                // SAFETY: the last task, folded by the cycle above.
+                unsafe {
+                    publish(bufp.add(s * stride), *st.slot_r[s].get());
+                }
+            }
+            return;
+        }
         while published < i {
             if !publish_ready(published) {
                 return;
@@ -2179,8 +2292,10 @@ impl AdditiveNttF128 {
     ///
     /// # Safety
     /// `produce(base, group, role, seed_target)` must use the supplied base, not a raw
-    /// pointer derived before the exclusive `msg` borrow. For group 0..1024
-    /// and role 0..2, it owns kpair in (role..32).step_by(2), all q=0..4,
+    /// pointer derived before the exclusive `msg` borrow. For group 0..1024,
+    /// the role 0 and role 1 calls between them run every kpair in 0..32
+    /// exactly once: `(role..32).step_by(2)` each when `seed_target` is None,
+    /// any split when it is Some. A kpair owns all q=0..4,
     /// both k=2*kpair and k+1, and both r=2*group and r+1. These rows at
     /// `q*2^17 + k*2^11 + r` each contain 64 fields. Every field must remain
     /// initialized, including any proven constant-elision regions.
@@ -4413,7 +4528,7 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, sub_pf_hint()) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
@@ -4443,7 +4558,7 @@ impl AdditiveNttF128 {
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
                             .for_each(|(i, sub_data)| {
-                                deep_sub(sub_cursor + i, sub_data, None, 0);
+                                deep_sub(sub_cursor + i, sub_data, None, sub_pf_hint());
                             });
                         on_chunk(
                             c,
@@ -4540,7 +4655,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None, 0);
+                    deep_sub(i, sub_data, None, sub_pf_hint());
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
@@ -7912,14 +8027,22 @@ mod generated_pair_dispatch_tests {
         let pairs = [(cpus[0],cpus[1]),(cpus[2],cpus[3])];
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let mut normal_runs=0;let mut injected_panics=0;let mut reuse_checks=0;
-        let cases = [
+        let plain = [
             (0,true,2),(1,true,2),(0,true,2),(2,true,2),(0,true,2),
             (3,true,2),(0,true,2),(4,true,2),(0,true,2),(5,true,2),(0,true,2),
             (0,true,3),(0,true,4),(6,true,2),(0,true,2),(7,true,2),(0,true,2),
             (8,true,2),(0,true,2),(9,true,2),(0,true,2),(10,true,2),(0,true,2),
             (0,false,2),(0,false,3),(0,false,4),
         ];
-        for (round,(injection,generating,nbuf)) in cases.into_iter().enumerate() {
+        // The balanced hand-off engages only for generated input on three
+        // slots. Every injection point is followed by a clean run, as above;
+        // the last three rows check that the flag is inert everywhere else.
+        let balanced = (0..=10).flat_map(|injection|[(injection,true,3),(0,true,3)])
+            .chain([(0,true,2),(0,true,4),(0,false,3)]);
+        let cases = plain.into_iter().map(|case|(case,false))
+            .chain(balanced.map(|case|(case,true)));
+        let mut balanced_runs=0;
+        for (round,((injection,generating,nbuf),balanced)) in cases.enumerate() {
             let counts:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
             let published:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
             let seeded:Vec<_>=(0..2048).map(|_|AtomicUsize::new(0)).collect();
@@ -7994,7 +8117,7 @@ mod generated_pair_dispatch_tests {
             let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
             let claim=StFmpClaim::take().expect("previous call leaked its claim");
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
-                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,claim))));
+                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
             assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
             if injection==0 {
                 assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
@@ -8002,6 +8125,7 @@ mod generated_pair_dispatch_tests {
                 assert!(seeded.iter().all(|v|v.load(Relaxed)==2));
                 if generating{assert_eq!(reused.load(Relaxed),2048-previous.lock().unwrap().len());}
                 reuse_checks+=reused.load(Relaxed);normal_runs+=1;
+                if balanced && generating && nbuf==ST_FMP_BALANCED_BUFS {balanced_runs+=1;}
             } else {
                 let payload=result.expect_err("injected panic was swallowed");
                 let message=payload.downcast_ref::<String>().map(String::as_str).or_else(||payload.downcast_ref::<&str>().copied()).unwrap_or("");
@@ -8009,7 +8133,8 @@ mod generated_pair_dispatch_tests {
                 assert!(injected.load(Acquire));assert_eq!(after_count.load(Relaxed),0);injected_panics+=1;
             }
         }
-        println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true");
+        assert_eq!(balanced_runs,12);
+        println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} balanced_runs={balanced_runs} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true");
     }
 }
 

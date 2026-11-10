@@ -586,6 +586,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Unbound identity-C inner-fold rows for the round-two canonical-window
     // elision (ranked one-row brand only; see `multilinear::CANON_ROWS`).
     let mut r2_canon_rows: Option<Vec<F128>> = None;
+    // Round-one exit warm-up (`hot_pool::r1_exit_warm_enabled`): this pool's keep-warm guard, taken as
+    // soon as the two round-one arms have joined instead of after the round-one message is observed.
+    let mut r1_exit_warm: Option<crate::hot_pool::HotPool> = None;
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -675,6 +678,15 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }
                     None => rayon::join(ab_closure, c_closure),
                 };
+            // Both arms are done and their workers are going idle, which lets whole cores drop into a deep
+            // idle state. Wake this pool's sleeping workers NOW, so that they are back on their CPUs while
+            // this thread finishes the round-one message (C_s restore, transcript, fold table, ~0.1 ms)
+            // instead of only after it, when round two already needs them. Same guard, same lifetime as
+            // the one it replaces below; scheduling only, no value depends on it.
+            // `FLOCK_NO_ZC_R1_EXIT_WARM=1` restores the original place (exact same-binary A/B).
+            if crate::hot_pool::r1_exit_warm_enabled() {
+                r1_exit_warm = crate::hot_pool::HotPool::start();
+            }
             if w30_elided {
                 let rows = canon
                     .as_ref()
@@ -790,7 +802,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128_slice(&round1_c);
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
-    let _hot_pool = crate::hot_pool::HotPool::start();
+    let _hot_pool = match r1_exit_warm.take() {
+        Some(warm) => Some(warm),
+        None => crate::hot_pool::HotPool::start(),
+    };
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -1115,6 +1130,16 @@ fn prove_packed_padded_inner<C: Challenger>(
             let lm_out = lm_reader_ok
                 && cfg!(target_arch = "x86_64")
                 && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
+            // The ranked brand round two's canonical-window elision ran on:
+            // the same static B rows let this pass skip them too.
+            let b_canonical = r2_canon_rows.is_some()
+                && padding.k_log == 14
+                && padding.useful_bits_per_block == 15_409
+                && m >= k_skip + 8
+                && multilinear::round2_canonical_elide_enabled();
+            if zc_timing {
+                eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical}");
+            }
             let (m1, mi, la_next) =
                 multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                     a_packed,
@@ -1129,6 +1154,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &r_next,
                     eq_override,
                     lm_out,
+                    b_canonical,
                 );
             a_mlv = a8;
             b_mlv = b8;
