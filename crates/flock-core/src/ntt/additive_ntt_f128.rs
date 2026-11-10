@@ -729,6 +729,19 @@ fn deep_pf_hint() -> u8 {
     *H
 }
 
+/// Line-hint level for the UNPAIRED sub-group drivers (recursive Ligerito
+/// commits, small transforms). `FLOCK_NTT_SUB_PF_HINT` = 0/1/2. Read once.
+fn sub_pf_hint() -> u8 {
+    static H: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_SUB_PF_HINT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 2)
+            .unwrap_or(1)
+    });
+    *H
+}
+
 /// Test-only latch forcing the generic (un-shaped) row-kernel dispatch, so a
 /// test can compare the shaped and generic forms in one process (the same
 /// pattern as [`KERNEL_DIET_TEST_OFF`]).
@@ -4413,7 +4426,7 @@ impl AdditiveNttF128 {
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
-                        if !deep_sub(sub_idx, sub_data, on_sub_done, 0) {
+                        if !deep_sub(sub_idx, sub_data, on_sub_done, sub_pf_hint()) {
                             if let Some(cb) = on_sub_done {
                                 let lo = sub_idx * sub_size_positions;
                                 cb(lo..lo + sub_size_positions, sub_data);
@@ -4443,7 +4456,7 @@ impl AdditiveNttF128 {
                         cur.par_chunks_mut(sub_bytes)
                             .enumerate()
                             .for_each(|(i, sub_data)| {
-                                deep_sub(sub_cursor + i, sub_data, None, 0);
+                                deep_sub(sub_cursor + i, sub_data, None, sub_pf_hint());
                             });
                         on_chunk(
                             c,
@@ -4540,7 +4553,7 @@ impl AdditiveNttF128 {
                             sub_bytes,
                         )
                     };
-                    deep_sub(i, sub_data, None, 0);
+                    deep_sub(i, sub_data, None, sub_pf_hint());
                     let c = bounds.partition_point(|&b| b <= i) - 1;
                     if remaining[c].fetch_sub(1, Ordering::AcqRel) == 1 {
                         drain(false);
