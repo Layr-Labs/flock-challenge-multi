@@ -749,6 +749,15 @@ pub mod r1_owner_awake {
                             let epoch = HOLD_EPOCH.load(Ordering::Acquire);
                             ab_pool.spawn_broadcast(move |ctx| {
                                 if Some(ctx.index()) != owner_idx {
+                                    // Awake and idle until the C arm ends:
+                                    // first take a share of its root-tile
+                                    // reader (claims from the same counter,
+                                    // own planes, owner waits for us), then
+                                    // hold as before. Only while round one
+                                    // is still running.
+                                    if HOLD_EPOCH.load(Ordering::Acquire) == epoch {
+                                        crate::lincheck::help_open_root_reader_here();
+                                    }
                                     hold(epoch);
                                 }
                             });

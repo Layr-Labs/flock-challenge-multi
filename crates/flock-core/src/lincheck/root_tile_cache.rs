@@ -435,8 +435,14 @@ impl RootTileCache {
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
+        let dynamic = dynamic_tiles_enabled();
+        // Extra planes for workers of the other round-one arm pool that join
+        // this dynamic reader after their own arm finishes (see `help`).
+        let help_slots = if dynamic && help::enabled() { help::SLOTS } else { 0 };
+        let total_planes = workers + help_slots;
         #[cfg(not(test))]
-        let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride);
+        let mut planes =
+            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(total_planes * stride);
         // The ranked prover's global recycler aligns allocations >=32 KiB to
         // 64 bytes. Core-only test binaries use System instead, so emulate that
         // alignment for the complete-reader premise rather than timing extra
@@ -444,19 +450,19 @@ impl RootTileCache {
         // separately exercises unaligned raw buffers.
         #[cfg(test)]
         let mut plane_storage =
-            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride + 63);
+            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(total_planes * stride + 63);
         #[cfg(test)]
         let plane_offset = plane_storage.as_ptr().align_offset(64);
         #[cfg(test)]
-        let mut planes = &mut plane_storage[plane_offset..plane_offset + workers * stride];
+        let mut planes = &mut plane_storage[plane_offset..plane_offset + total_planes * stride];
         let mut active = vec![0u8; workers];
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let dynamic = dynamic_tiles_enabled();
-        planes
-            .par_chunks_mut(stride)
-            .zip(active.par_iter_mut())
-            .enumerate()
-            .for_each(|(worker, (dst, active))| {
+        // One worker's whole reader loop: claims tiles from `next` (dynamic)
+        // or its fixed range, folds them into its exclusively owned `dst`
+        // planes, and reports whether it initialized them. Shared verbatim by
+        // this pool's workers and by helpers, so a tile is processed by
+        // whoever claimed it, exactly once.
+        let work = |worker: usize, dst: &mut [core::mem::MaybeUninit<u8>]| -> bool {
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
                 let mut generated = self.generator.map(|_| unsafe {
@@ -573,12 +579,47 @@ impl RootTileCache {
                     }
                     first = false;
                 }
-                *active = u8::from(!first);
-            });
+                !first
+        };
+        let help_active: Vec<std::sync::atomic::AtomicBool> =
+            (0..help_slots).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        {
+            let (main_planes, help_planes) = planes.split_at_mut(workers * stride);
+            let help_base = help_planes.as_mut_ptr() as usize;
+            // Helper slot `slot` owns plane `workers + slot`; slots are handed
+            // out once each by `help::Ctx::slots`, so no two writers share one.
+            let run_helper = |slot: usize| {
+                debug_assert!(slot < help_slots);
+                // SAFETY: `slot < help_slots`, so the range lies inside
+                // `help_planes`, which nothing else borrows while the help
+                // window is open; the slot is exclusive (see above).
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (help_base as *mut core::mem::MaybeUninit<u8>).add(slot * stride),
+                        stride,
+                    )
+                };
+                let initialized = work(workers + slot, dst);
+                help_active[slot].store(initialized, std::sync::atomic::Ordering::Relaxed);
+            };
+            let window = (help_slots != 0).then(|| help::Window::open(&run_helper, help_slots)).flatten();
+            main_planes
+                .par_chunks_mut(stride)
+                .zip(active.par_iter_mut())
+                .enumerate()
+                .for_each(|(worker, (dst, active))| {
+                    *active = u8::from(work(worker, dst));
+                });
+            // Close before reducing: waits for every helper that entered.
+            drop(window);
+        }
         let active_workers: Vec<usize> = active
             .into_iter()
             .enumerate()
             .filter_map(|(i, v)| (v != 0).then_some(i))
+            .chain(help_active.iter().enumerate().filter_map(|(i, v)| {
+                v.load(std::sync::atomic::Ordering::Relaxed).then_some(workers + i)
+            }))
             .collect();
         let output_blocks = self.blocks + usize::from(self.fixed_roots);
         let mut out = vec![F128::ZERO; output_blocks * 64];
@@ -603,6 +644,156 @@ impl RootTileCache {
             for column in [839, 865, 866, 868] { out[column] = one; }
         }
         out
+    }
+}
+
+/// Cross-pool help for the dynamic root-tile reader.
+///
+/// Round one runs AB and C on two disjoint pinned pools; C's arm is this
+/// reader. When the AB arm finishes first, its idle workers may join the
+/// reader that is currently open: they claim tiles from the same `next`
+/// counter and fold them into planes of their own, which the owner adds to
+/// its reduction. Field addition of the byte planes is XOR, so which worker
+/// folded a tile never changes the result.
+///
+/// Protocol (one owner at a time, any number of helpers):
+/// * `OWNER` is taken by CAS; a reader that cannot take it (another reader is
+///   open) simply runs without help.
+/// * The owner publishes `CTX`, then sets the `OPEN` bit of `STATE`.
+/// * A helper enters only by CAS `STATE: s -> s + ENTER` while `OPEN` is set,
+///   so the owner never misses one; it then takes a unique slot, runs, and
+///   leaves with `fetch_sub(ENTER)`.
+/// * The owner clears `OPEN` after its own workers finish and waits for
+///   `STATE == 0` before reducing, unpublishing and releasing `OWNER`.
+/// Helpers never wait on the owner, and the owner waits only on helpers that
+/// already entered and whose work is bounded by the remaining tiles, so the
+/// window introduces no owner/helper wait cycle for finite callbacks. The
+/// entry guard also releases an entered helper during unwinding.
+pub(super) mod help {
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+    /// Maximum auxiliary planes; excess helpers return without doing work.
+    pub(super) const SLOTS: usize = 8;
+    const OPEN: usize = 1;
+    const ENTER: usize = 2;
+
+    static OWNER: AtomicBool = AtomicBool::new(false);
+    static STATE: AtomicUsize = AtomicUsize::new(0);
+    static CTX: AtomicPtr<Ctx> = AtomicPtr::new(core::ptr::null_mut());
+
+    struct Ctx {
+        run: *const (dyn Fn(usize) + Sync + 'static),
+        slots: AtomicUsize,
+        max: usize,
+    }
+
+    /// `FLOCK_NO_R1_ROOT_HELP=1` disables publishing (local A/B only; the
+    /// ranked harness clears the environment).
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_ROOT_HELP").is_none());
+        *ON
+    }
+
+    pub(super) struct Window<'a> {
+        ctx: Box<Ctx>,
+        _run: core::marker::PhantomData<&'a (dyn Fn(usize) + Sync)>,
+    }
+
+    impl<'a> Window<'a> {
+        /// Publish `run` for helpers; `None` if another reader owns the window.
+        pub(super) fn open(run: &'a (dyn Fn(usize) + Sync + 'a), max: usize) -> Option<Self> {
+            if OWNER.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                return None;
+            }
+            debug_assert_eq!(STATE.load(Ordering::Relaxed), 0);
+            // SAFETY: only the lifetime is erased. `Drop` waits until every
+            // helper that could dereference this pointer has left, and the
+            // caller keeps `run` alive until the window is dropped.
+            let run: *const (dyn Fn(usize) + Sync + 'static) = unsafe {
+                core::mem::transmute::<*const (dyn Fn(usize) + Sync + 'a), _>(run)
+            };
+            let mut ctx = Box::new(Ctx { run, slots: AtomicUsize::new(0), max });
+            CTX.store(&mut *ctx, Ordering::Release);
+            STATE.store(OPEN, Ordering::Release);
+            Some(Self { ctx, _run: core::marker::PhantomData })
+        }
+    }
+
+    impl Drop for Window<'_> {
+        fn drop(&mut self) {
+            // Stop new entries; helpers already inside keep running.
+            STATE.fetch_and(!OPEN, Ordering::AcqRel);
+            let mut spins = 0u32;
+            while STATE.load(Ordering::Acquire) != 0 {
+                spins = spins.wrapping_add(1);
+                if spins % 64 == 0 { std::thread::yield_now(); } else { core::hint::spin_loop(); }
+            }
+            CTX.store(core::ptr::null_mut(), Ordering::Relaxed);
+            let _ = &self.ctx;
+            OWNER.store(false, Ordering::Release);
+        }
+    }
+
+    // Keep the entry counted until the callback returns or unwinds. A plain
+    // fetch_sub after the callback would strand the owner if it panicked.
+    struct Entry<'a>(&'a AtomicUsize);
+
+    impl Drop for Entry<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(ENTER, Ordering::Release);
+        }
+    }
+
+    /// Join the open reader once, if any. Returns immediately when no reader
+    /// is open or its helper slots are taken.
+    pub(super) fn help_once() {
+        let mut s = STATE.load(Ordering::Acquire);
+        loop {
+            if s & OPEN == 0 {
+                return;
+            }
+            match STATE.compare_exchange_weak(s, s + ENTER, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => s = now,
+            }
+        }
+        let _entry = Entry(&STATE);
+        let ctx = CTX.load(Ordering::Acquire);
+        debug_assert!(!ctx.is_null());
+        // SAFETY: entered while OPEN, so the owner's `Drop` (which frees the
+        // context and invalidates `run`) waits for our entry guard to drop; the
+        // context was published before OPEN was set (Release/Acquire).
+        unsafe {
+            let slot = (*ctx).slots.fetch_add(1, Ordering::Relaxed);
+            if slot < (*ctx).max {
+                (*(*ctx).run)(slot);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn entry_guard_releases_count_on_unwind() {
+        // Use a private counter so parallel reader tests cannot interfere.
+        let state = AtomicUsize::new(OPEN + ENTER);
+        let result = std::panic::catch_unwind(|| {
+            let _entry = Entry(&state);
+            panic!("injected helper failure");
+        });
+        assert!(result.is_err());
+        assert_eq!(state.load(Ordering::Acquire), OPEN);
+        state.fetch_and(!OPEN, Ordering::AcqRel);
+        assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+}
+
+/// Join the currently open root-tile reader once from the calling thread
+/// (an already running worker of another pool). Returns at once when no
+/// reader is open, the helper slots are taken, or help is disabled.
+pub(super) fn help_open_reader_here() {
+    if help::enabled() {
+        help::help_once();
     }
 }
 

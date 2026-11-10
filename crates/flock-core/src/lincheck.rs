@@ -447,6 +447,22 @@ pub use root_tile_cache::RootTileCache as WitnessRootTiles;
 ))]
 pub use root_tile_cache::{WitnessTileView, RootPairGenerator};
 
+/// Round-one hook: the calling thread joins the C arm's currently open
+/// root-tile reader (see `root_tile_cache::help`) once. Meant for a worker
+/// that is already awake and idle, i.e. a round-one AB worker held on CPU
+/// until the C arm ends. Returns at once when no reader is open.
+pub fn help_open_root_reader_here() {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    root_tile_cache::help_open_reader_here();
+}
+
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
     source: RootFoldStorage,
