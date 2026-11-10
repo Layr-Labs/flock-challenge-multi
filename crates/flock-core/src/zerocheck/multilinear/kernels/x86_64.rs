@@ -5870,39 +5870,46 @@ unsafe fn r4_canonical_set(
     use core::arch::x86_64::*;
     unsafe {
         macro_rules! product {
-            ($i:literal,$q:expr) => {{
-                let (a,b)=$q; let dst=&mut acc[$i];
-                dst.lo=_mm512_xor_si512(dst.lo,_mm512_clmulepi64_epi128::<0x00>(a,b));
-                dst.hi=_mm512_xor_si512(dst.hi,_mm512_clmulepi64_epi128::<0x11>(a,b));
-                dst.mid=_mm512_ternarylogic_epi64::<0x96>(dst.mid,
-                    _mm512_clmulepi64_epi128::<0x01>(a,b),
-                    _mm512_clmulepi64_epi128::<0x10>(a,b));
+            ($i:literal, $q:expr) => {{
+                let (a, b, a_sum, b_sum) = $q;
+                r4_karatsuba_mul_acc_prepared(&mut acc[$i], a, b, a_sum, b_sum);
             }};
         }
         macro_rules! corner {
             ($k:literal) => {{
-                let x = _mm512_loadu_si512(fa0.add(16*$k+4*g0).cast::<__m512i>());
-                let y = _mm512_loadu_si512(fa1.add(16*$k+4*g1).cast::<__m512i>());
-                let u = _mm512_loadu_si512(fb0.add(16*$k+4*g0).cast::<__m512i>());
-                let v = _mm512_loadu_si512(fb1.add(16*$k+4*g1).cast::<__m512i>());
-                let a = _mm512_shuffle_i64x2::<0xDD>(x,y);
-                let b = _mm512_shuffle_i64x2::<0xDD>(u,v);
-                if $k == 0 { product!(0,(a,b)); }
-                (_mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x,y),a),
-                 _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(u,v),b))
+                let x = _mm512_loadu_si512(fa0.add(16 * $k + 4 * g0).cast::<__m512i>());
+                let y = _mm512_loadu_si512(fa1.add(16 * $k + 4 * g1).cast::<__m512i>());
+                let u = _mm512_loadu_si512(fb0.add(16 * $k + 4 * g0).cast::<__m512i>());
+                let v = _mm512_loadu_si512(fb1.add(16 * $k + 4 * g1).cast::<__m512i>());
+                let a = _mm512_shuffle_i64x2::<0xDD>(x, y);
+                let b = _mm512_shuffle_i64x2::<0xDD>(u, v);
+                if $k == 0 { r4_karatsuba_mul_acc(&mut acc[0], a, b); }
+                let a = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x, y), a);
+                let b = _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(u, v), b);
+                let a_sum = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4e>(a));
+                let b_sum = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4e>(b));
+                (a, b, a_sum, b_sum)
             }};
         }
         macro_rules! plus {
-            ($x:expr,$y:expr) => {{ let (a,b)=$x;let (c,d)=$y;
-                (_mm512_xor_si512(a,c),_mm512_xor_si512(b,d)) }};
+            ($x:expr, $y:expr) => {{
+                let (a, b, a_sum, b_sum) = $x;
+                let (c, d, c_sum, d_sum) = $y;
+                (
+                    _mm512_xor_si512(a, c), _mm512_xor_si512(b, d),
+                    _mm512_xor_si512(a_sum, c_sum), _mm512_xor_si512(b_sum, d_sum),
+                )
+            }};
         }
-        let q0=corner!(0);product!(1,q0);
-        let q1=corner!(1);product!(2,q1);
-        let q2=corner!(2);product!(4,q2);
-        let q3=corner!(3);product!(5,q3);
-        let e=plus!(q0,q1);product!(3,e);
-        let f=plus!(q2,q3);product!(6,f);
-        product!(7,plus!(q0,q2));product!(8,plus!(q1,q3));product!(9,plus!(e,f));
+        let q0 = corner!(0); product!(1, q0);
+        let q1 = corner!(1); product!(2, q1);
+        let q2 = corner!(2); product!(4, q2);
+        let q3 = corner!(3); product!(5, q3);
+        let e = plus!(q0, q1); product!(3, e);
+        let f = plus!(q2, q3); product!(6, f);
+        product!(7, plus!(q0, q2));
+        product!(8, plus!(q1, q3));
+        product!(9, plus!(e, f));
     }
 }
 
@@ -6684,5 +6691,105 @@ mod r4_canonical_pair_tests {
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
         }}}
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn r4_karatsuba_mul_acc(
+    dst: &mut WideGhashX4,
+    a: core::arch::x86_64::__m512i,
+    b: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let a_sum = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4e>(a));
+        let b_sum = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4e>(b));
+        r4_karatsuba_mul_acc_prepared(dst, a, b, a_sum, b_sum);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+mod r4_karatsuba_tests {
+    use super::*;
+
+    #[test]
+    fn r4_karatsuba_matches_schoolbook_unreduced() {
+        use crate::field::gf2_128::x86_64::{f128x4_extract, f128x4_loadu};
+        let mut state = 0x510e527fade682d1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let basis = |bit: usize| {
+            if bit < 64 { F128::new(1u64 << bit, 0) }
+            else { F128::new(0, 1u64 << (bit - 64)) }
+        };
+        let mut cases = 0;
+        for kind in 0..3 {
+            let count = match kind { 0 => 128 * 128, 1 => 1024, _ => 16 };
+            for index in 0..count {
+                let a: [F128; 4] = std::array::from_fn(|lane| match kind {
+                    0 => basis((index / 128 + lane * 29) % 128),
+                    1 => F128::new(next(), next()),
+                    _ => [F128::ZERO, F128::ONE, basis(127), F128::new(!0, !0)][index / 4],
+                });
+                let b: [F128; 4] = std::array::from_fn(|lane| match kind {
+                    0 => basis((index % 128 + lane * 31) % 128),
+                    1 => F128::new(next(), next()),
+                    _ => [F128::ZERO, F128::ONE, basis(127), F128::new(!0, !0)][index % 4],
+                });
+                let seed_a: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+                let seed_b: [F128; 4] = std::array::from_fn(|_| F128::new(next(), next()));
+                unsafe {
+                    let va = f128x4_loadu(a.as_ptr());
+                    let vb = f128x4_loadu(b.as_ptr());
+                    let mut expected = WideGhashX4::from_mul(
+                        f128x4_loadu(seed_a.as_ptr()), f128x4_loadu(seed_b.as_ptr()),
+                    );
+                    let mut actual = expected;
+                    expected.mul_acc(va, vb);
+                    r4_karatsuba_mul_acc(&mut actual, va, vb);
+                    for (got, want) in [
+                        (actual.lo, expected.lo),
+                        (actual.hi, expected.hi),
+                        (actual.mid, expected.mid),
+                    ] {
+                        assert_eq!(f128x4_extract(got), f128x4_extract(want),
+                            "kind={kind} case={index}");
+                    }
+                }
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 17424);
+        eprintln!("R4 Karatsuba raw-product cases={cases} lanes=4");
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+unsafe fn r4_karatsuba_mul_acc_prepared(
+    dst: &mut WideGhashX4,
+    a: core::arch::x86_64::__m512i,
+    b: core::arch::x86_64::__m512i,
+    a_sum: core::arch::x86_64::__m512i,
+    b_sum: core::arch::x86_64::__m512i,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let low = _mm512_clmulepi64_epi128::<0x00>(a, b);
+        let high = _mm512_clmulepi64_epi128::<0x11>(a, b);
+        let all = _mm512_clmulepi64_epi128::<0x00>(a_sum, b_sum);
+        dst.lo = _mm512_xor_si512(dst.lo, low);
+        dst.hi = _mm512_xor_si512(dst.hi, high);
+        dst.mid = _mm512_ternarylogic_epi64::<0x96>(
+            dst.mid, all, _mm512_xor_si512(low, high),
+        );
     }
 }
