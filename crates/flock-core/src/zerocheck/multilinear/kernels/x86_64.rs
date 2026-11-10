@@ -2246,6 +2246,33 @@ pub(crate) fn zc_tail_nt_enabled() -> bool {
 
 pub(crate) const ZC_TAIL_NT_LOG: u32 = 20;
 
+/// `FLOCK_NO_ZC_R345_B_CANON=1` makes the three-variable composed pass fold
+/// the ranked brand's four static B lines again instead of using their
+/// constants. Same transcript either way.
+pub(crate) fn zc_r345_b_canon_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R345_B_CANON").is_none());
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) static R345_B_CANON_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `FLOCK_NO_ZC_R345_A_PAIR=1` makes the ranked-brand three-variable pass
+/// fold every A line of every block again (eight passes per block) instead
+/// of pairing two blocks' lines 28/29 in one pass and taking line 30 from
+/// the row-240 table fold. Same transcript either way.
+pub(crate) fn zc_r345_a_pair_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R345_A_PAIR").is_none());
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) static R345_A_PAIR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn zc_wtab_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WTAB").is_none());
@@ -4686,6 +4713,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c4_pass4_register_result.S"),
 );
 
 #[cfg(all(
@@ -4699,6 +4727,51 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c4_pass4_register_result();
+}
+
+/// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
+/// lines (32 packed rows): `[rows 0..4 folds, rows 4..8 folds]` of each line,
+/// lane `t` = line `t`. Half the two-pass kernel's GFNI work.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold32_rows_c4_lm_registers(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    use core::arch::x86_64::*;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let lo: __m512i;
+        let hi: __m512i;
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_pass4_register_result,
+            in("rdi") rows,
+            in("rsi") m.1.as_ptr(),
+            lateout("rax") _,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") lo, out("zmm9") hi,
+        );
+        [lo, hi]
+    }
+    // Same definition through the two-pass fold: its even line slots are one pass.
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut wide = [0u8; 512];
+        for t in 0..4 {
+            core::ptr::copy_nonoverlapping(rows.add(64 * t), wide.as_mut_ptr().add(128 * t), 64);
+        }
+        let [lo, hi, _, _] = gfni_fold64_rows_c4_lm_registers(wide.as_ptr(), m);
+        [lo, hi]
+    }
 }
 
 
@@ -6236,6 +6309,370 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
         while x_lo + 16 <= lo_size {
             let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = step16!(x_lo);
             let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = step16!(x_lo + 8);
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let lo4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[0], acc[1], acc[2], acc[3]),
+        );
+        let hi4 = crate::field::gf2_128::x86_64::f128x4_extract(
+            WideGhashX4::fold4_and_reduce(acc[4], acc[5], acc[6], acc[7]),
+        );
+        [
+            lo4[0], lo4[1], lo4[2], lo4[3], hi4[0], hi4[1], hi4[2], hi4[3],
+        ]
+    }
+}
+
+/// [`fold3_from_packed_lookahead_c4_lm_wtab_x86`] for the ranked witness
+/// brand, whose B side is static on four of every block's 32 lines: lines 0
+/// and 1 (rows 0..16) are all ones, line 30 is the static row-240 word over
+/// zero rows, and line 31 is zero. Their three-variable folds are the
+/// per-pass constants `b_canon` (lines 0, 1, 30, 31; see
+/// `three_var::fold3_b_canonical_lines`), so B folds lines 2..30 only: three
+/// two-pass calls and one single pass, seven passes for the incumbent's
+/// eight, and the four static lines are never loaded.
+///
+/// One loop iteration is one 256-row block, so `out_base` must be a multiple
+/// of 32 (it is: the driver's chunks hold `2·lo_size` outputs).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+    b_canon: &[F128; 4],
+    a240_tab: &[F128],
+    a240_k: F128,
+) -> [F128; 8] {
+    use super::super::lane_select;
+    use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+    debug_assert!(out_base.is_multiple_of(32));
+    debug_assert_eq!(a_out.len(), 2 * lo_size);
+    debug_assert_eq!(b_out.len(), 2 * lo_size);
+    #[cfg(test)]
+    R345_B_CANON_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Lane sources for `_mm512_permutex2var_epi64(a, idx, b)`: (0, l) is lane
+    // `l` of `a`, (1, l) lane `l` of `b`.
+    const B0_A0_A1_A2: [u64; 8] = lane_select([(1, 0), (0, 0), (0, 1), (0, 2)]);
+    const A3_B1_B3_B3: [u64; 8] = lane_select([(0, 3), (1, 1), (1, 3), (1, 3)]);
+    const A0_A1_A2_B2: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 2)]);
+    const A0_A1_A2_B3: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 3)]);
+    const A0_A2_B0_B0: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 0), (1, 0)]);
+    const A0_A2_B1_B1: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 1), (1, 1)]);
+    // Paired-A lane sources (see `a_half2_paired` below).
+    const A1_A3_B2_B2: [u64; 8] = lane_select([(0, 1), (0, 3), (1, 2), (1, 2)]);
+    const A1_A3_B3_B3: [u64; 8] = lane_select([(0, 1), (0, 3), (1, 3), (1, 3)]);
+    const A0_A1_A2_B0: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 0)]);
+    const A0_A1_A2_B1: [u64; 8] = lane_select([(0, 0), (0, 1), (0, 2), (1, 1)]);
+    // Prefetch targets sit `ZC_PKT_PF_TILES` half-blocks ahead, so an odd
+    // lead makes a block's first half prefetch a second half and vice versa.
+    const PF_FLIPS_HALF: bool = ZC_PKT_PF_TILES % 2 == 1;
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+        let wt_ptr = wt.as_ptr();
+        let (r3, r3_64) = ghash_broadcast_split(rho3);
+        let (c0, _) = ghash_broadcast_split(b_canon[0]);
+        let (c1, _) = ghash_broadcast_split(b_canon[1]);
+        let (c30, _) = ghash_broadcast_split(b_canon[2]);
+        let (c31, _) = ghash_broadcast_split(b_canon[3]);
+        let ix = |t: &[u64; 8]| _mm512_loadu_si512(t.as_ptr().cast::<__m512i>());
+        let i_b0_a012 = ix(&B0_A0_A1_A2);
+        let i_a3_b1_b3 = ix(&A3_B1_B3_B3);
+        let i_a012_b2 = ix(&A0_A1_A2_B2);
+        let i_a012_b3 = ix(&A0_A1_A2_B3);
+        let i_a02_b0 = ix(&A0_A2_B0_B0);
+        let i_a02_b1 = ix(&A0_A2_B1_B1);
+        let i_a13_b2 = ix(&A1_A3_B2_B2);
+        let i_a13_b3 = ix(&A1_A3_B3_B3);
+        let i_a012_b0 = ix(&A0_A1_A2_B0);
+        let i_a012_b1 = ix(&A0_A1_A2_B1);
+        // Paired A route: needs the eight 256-entry byte tables of the fold
+        // (`UniSkipFoldTable::data`, `n_chunks = 8`) for the row-240 fold.
+        let a_pair_on = zc_r345_a_pair_enabled() && a240_tab.len() >= 8 * 256;
+        let a240_ptr = a240_tab.as_ptr();
+        let (k30, k30_64) = ghash_broadcast_split(a240_k);
+        // Lines 28, 29 of an even block (lanes 0, 1) and of the following odd
+        // block (lanes 2, 3), folded by the pair's first block, consumed by both.
+        let mut s_pair = _mm512_setzero_si512();
+        #[repr(align(64))]
+        struct PairLines([u8; 256]);
+        let mut pair_buf = PairLines([0u8; 256]);
+
+        // The rho3 level: (rows 0..4 fold) + rho3·(rows 0..4 fold + rows 4..8 fold).
+        macro_rules! fold_r3 {
+            ($e:expr, $o:expr) => {{
+                let e = $e;
+                _mm512_xor_si512(e, ghash_mul_x4_split(_mm512_xor_si512(e, $o), r3, r3_64))
+            }};
+        }
+
+        // A: the incumbent's 16-line half-block, lane-major [4i, 4i+1, 4i+2, 4i+3].
+        macro_rules! fold_a_half {
+            ($row0:expr) => {{
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
+                let [p0, p1, p2, p3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                let oe1 = fold_r3!(q0, q1);
+                let oo1 = fold_r3!(q2, q3);
+                let oe2 = fold_r3!(p0, p1);
+                let oo2 = fold_r3!(p2, p3);
+                [
+                    _mm512_shuffle_i64x2::<0x88>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0x88>(oo1, oo2),
+                    _mm512_shuffle_i64x2::<0xDD>(oe1, oe2),
+                    _mm512_shuffle_i64x2::<0xDD>(oo1, oo2),
+                ]
+            }};
+        }
+
+        // Ranked-brand A of an even/odd block pair: rows 241..256 of every
+        // block are zero on A as on B (the brand round two's canonical
+        // elision already relies on, see `round2_canonical_window_deltas`),
+        // so line 30 holds the single row 240 and line 31 is zero. One pass
+        // folds lines 28/29 of both blocks (`s_pair`, filled by the even
+        // block); line 30 is the one-row fold `(1+ρ₁)(1+ρ₂)(1+ρ₃)·Σ_j
+        // T_j[byte_j(row 240)]` (the identity `fold3_b_canonical_lines` uses
+        // for B's static row-240 word, applied to A's row word). Output layout
+        // equals `fold_a_half!(row0 + 128)`:
+        // [16,20,24,28], [17,21,25,29], [18,22,26,30], [19,23,27,31].
+        // `$second` selects the odd block's lanes 2/3 of `s_pair`.
+        macro_rules! a_half2_paired {
+            ($row0:expr, $second:expr) => {{
+                let r0: usize = $row0;
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(a_pkt.add((r0 + 128) * 8), cfold);
+                let oe = fold_r3!(q0, q1); // lines 16, 18, 20, 22
+                let oo = fold_r3!(q2, q3); // lines 17, 19, 21, 23
+                let [g0, g1] = gfni_fold32_rows_c4_lm_registers(a_pkt.add((r0 + 192) * 8), cfold);
+                let f = fold_r3!(g0, g1); // lines 24, 25, 26, 27
+                let w240 = a_pkt.add((r0 + 240) * 8);
+                let mut phi = _mm_setzero_si128();
+                for j in 0..8 {
+                    let e = a240_ptr.add(j * 256 + *w240.add(j) as usize);
+                    phi = _mm_xor_si128(phi, _mm_loadu_si128(e.cast::<__m128i>()));
+                }
+                let l30 = ghash_mul_x4_split(_mm512_broadcast_i32x4(phi), k30, k30_64);
+                let (i28, i29) = if $second { (i_a012_b2, i_a012_b3) } else { (i_a012_b0, i_a012_b1) };
+                [
+                    // lines 16, 20, 24, 28
+                    _mm512_permutex2var_epi64(_mm512_permutex2var_epi64(oe, i_a02_b0, f), i28, s_pair),
+                    // lines 17, 21, 25, 29
+                    _mm512_permutex2var_epi64(_mm512_permutex2var_epi64(oo, i_a02_b1, f), i29, s_pair),
+                    // lines 18, 22, 26, 30
+                    _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(oe, i_a13_b2, f), l30),
+                    // lines 19, 23, 27, 31 (line 31 is zero)
+                    _mm512_maskz_mov_epi64(0x3F, _mm512_permutex2var_epi64(oo, i_a13_b3, f)),
+                ]
+            }};
+        }
+
+        // B: eight lines from `$row`; returns the folds of its lines
+        // (0, 2, 4, 6) and (1, 3, 5, 7).
+        macro_rules! fold_b_window {
+            ($row:expr) => {{
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                (fold_r3!(q0, q1), fold_r3!(q2, q3))
+            }};
+        }
+
+        // `$b_first..$b_last` are the half-block lines of B worth prefetching.
+        macro_rules! prefetch_half {
+            ($next:expr, $lines:expr, $b_first:expr, $b_last:expr) => {{
+                for l in $lines {
+                    _mm_prefetch(a_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    if l >= $b_first && l < $b_last {
+                        _mm_prefetch(b_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
+                    }
+                }
+            }};
+        }
+
+        // Store one 16-output tile and return its message operands.
+        macro_rules! emit_tile {
+            ($x:expr, $a:expr, $b:expr) => {{
+                let x = $x;
+                let ol = 2 * x;
+                let [a0, a1, a2, a3] = $a;
+                let [b0, b1, b2, b3] = $b;
+                let ap = a_out_ptr.add(ol);
+                let bp = b_out_ptr.add(ol);
+                let (s0, s1, s2, s3, t0, t1, t2, t3) = if OUT_LM {
+                    (a0, a1, a2, a3, b0, b1, b2, b3)
+                } else {
+                    let [s0, s1, s2, s3] = transpose4_lanes(a0, a1, a2, a3);
+                    let [t0, t1, t2, t3] = transpose4_lanes(b0, b1, b2, b3);
+                    (s0, s1, s2, s3, t0, t1, t2, t3)
+                };
+                if NT_OUT {
+                    stream_tile_as_xmm16(ap, s0, s1, s2, s3);
+                    stream_tile_as_xmm16(bp, t0, t1, t2, t3);
+                } else {
+                    _mm512_storeu_si512(ap.cast::<__m512i>(), s0);
+                    _mm512_storeu_si512(ap.add(4).cast::<__m512i>(), s1);
+                    _mm512_storeu_si512(ap.add(8).cast::<__m512i>(), s2);
+                    _mm512_storeu_si512(ap.add(12).cast::<__m512i>(), s3);
+                    _mm512_storeu_si512(bp.cast::<__m512i>(), t0);
+                    _mm512_storeu_si512(bp.add(4).cast::<__m512i>(), t1);
+                    _mm512_storeu_si512(bp.add(8).cast::<__m512i>(), t2);
+                    _mm512_storeu_si512(bp.add(12).cast::<__m512i>(), t3);
+                }
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = ghash_mul_x4_split(a0, w, w64);
+                let a1w = ghash_mul_x4_split(a1, w, w64);
+                let a2w = ghash_mul_x4_split(a2, w, w64);
+                let a3w = ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3)
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            // First packed row of this block; B's live lines are 2..30.
+            let row0 = 8 * (out_base + 2 * x_lo);
+            debug_assert!(row0.is_multiple_of(256));
+            let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
+                (0, 14, 2, 16)
+            } else {
+                (2, 16, 0, 14)
+            };
+
+            // Lines 0..16.
+            let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+            prefetch_half!(next, 0..8, pf1_first, pf1_last);
+            let a_tile = fold_a_half!(row0);
+            prefetch_half!(next, 8..16, pf1_first, pf1_last);
+            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
+            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
+            let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
+            let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
+            let b_tile = [
+                _mm512_permutex2var_epi64(te, i_b0_a012, c0), // lines 0, 4, 8, 12
+                _mm512_permutex2var_epi64(to, i_b0_a012, c1), // lines 1, 5, 9, 13
+                _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
+                _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
+            ];
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = emit_tile!(x_lo, a_tile, b_tile);
+
+            // Lines 16..32.
+            let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
+            prefetch_half!(next, 0..8, pf2_first, pf2_last);
+            // Blocks pair as (even, odd) indices of this chunk; a final
+            // unpaired block keeps the incumbent eight-pass A fold.
+            let blk_odd = (x_lo / 16) % 2 == 1;
+            let pair_first = a_pair_on && !blk_odd && x_lo + 32 <= lo_size;
+            let pair_second = a_pair_on && blk_odd;
+            if pair_first {
+                // Lines 28/29 are rows 224..240: 128 contiguous bytes per block.
+                let src0 = a_pkt.add((row0 + 224) * 8);
+                let src1 = a_pkt.add((row0 + 256 + 224) * 8);
+                let dst = pair_buf.0.as_mut_ptr();
+                _mm512_storeu_si512(dst.cast::<__m512i>(), _mm512_loadu_si512(src0.cast::<__m512i>()));
+                _mm512_storeu_si512(dst.add(64).cast::<__m512i>(), _mm512_loadu_si512(src0.add(64).cast::<__m512i>()));
+                _mm512_storeu_si512(dst.add(128).cast::<__m512i>(), _mm512_loadu_si512(src1.cast::<__m512i>()));
+                _mm512_storeu_si512(dst.add(192).cast::<__m512i>(), _mm512_loadu_si512(src1.add(64).cast::<__m512i>()));
+                let [s0, s1] = gfni_fold32_rows_c4_lm_registers(pair_buf.0.as_ptr(), cfold);
+                s_pair = fold_r3!(s0, s1); // lines 28, 29 (even block), 28, 29 (odd block)
+                #[cfg(test)]
+                R345_A_PAIR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let c_tile = if pair_first || pair_second {
+                a_half2_paired!(row0, pair_second)
+            } else {
+                fold_a_half!(row0 + 128)
+            };
+            prefetch_half!(next, 8..16, pf2_first, pf2_last);
+            let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
+            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
+            let d_tile = [
+                // lines 16, 20, 24, 28
+                _mm512_permutex2var_epi64(
+                    _mm512_permutex2var_epi64(te, i_a3_b1_b3, e3),
+                    i_a012_b2,
+                    f4,
+                ),
+                // lines 17, 21, 25, 29
+                _mm512_permutex2var_epi64(
+                    _mm512_permutex2var_epi64(to, i_a3_b1_b3, o3),
+                    i_a012_b3,
+                    f4,
+                ),
+                // lines 18, 22, 26, 30
+                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(e3, i_a02_b0, f4), c30),
+                // lines 19, 23, 27, 31
+                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(o3, i_a02_b1, f4), c31),
+            ];
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = emit_tile!(x_lo + 8, c_tile, d_tile);
+
             acc[0].mul_acc2(a1w, b1, c1w, d1);
             acc[1].mul_acc2(
                 _mm512_xor_si512(a0w, a1w),
