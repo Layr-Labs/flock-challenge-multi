@@ -920,19 +920,28 @@ fn staging_block(rows: usize, row_len: usize) -> Vec<F128> {
 /// the transform output is unchanged, only the instruction stream shrinks.
 #[inline]
 pub(crate) fn ranked_zero_odd_tail_lanes(log_d: usize, num_ntts: usize) -> usize {
+    ranked_zero_odd_tail_snapshot(log_d, num_ntts).0
+}
+// Capture raw and rounded guarantees together before worker callbacks start.
+fn ranked_zero_odd_tail_snapshot(log_d: usize, num_ntts: usize) -> (usize, usize) {
     if log_d != ZERO_TAIL_LOG_D || num_ntts != ZERO_TAIL_NUM_NTTS || zero_lane_skip_disabled() {
-        return 0;
+        return (0, 0);
     }
-    let tail = ZERO_ODD_TAIL_LANES.load(std::sync::atomic::Ordering::Relaxed);
-    if tail >= num_ntts {
-        return 0;
+    let raw = ZERO_ODD_TAIL_LANES.load(std::sync::atomic::Ordering::Relaxed);
+    if raw >= num_ntts {
+        return (0, 0);
     }
-    // `num_ntts` is 64 here, so `num_ntts - (tail & !3)` is a multiple of 4.
-    if ntt_lane_round_disabled() {
-        tail
+    let lanes = if ntt_lane_round_disabled() {
+        raw
     } else {
-        tail & !3
-    }
+        raw & !3
+    };
+    (lanes, raw)
+}
+fn ntt_raw7_pack_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RAW7_PACK").is_none());
+    *ON
 }
 
 /// Scoped publication of the zero-odd-tail-lane count, restoring the previous
@@ -1656,7 +1665,30 @@ fn st_fmp_run_claimed(
             );
         }
     }
-    let stride = 512 * row_len;
+    // A 512 KiB slot is an exact multiple of the L1 set period. Offset
+    // adjacent slots by whole cache lines so sibling roles processing
+    // different slots do not always address the same sets at each lane step.
+    static SLOT_PAD_LINES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_SLOT_PAD_LINES")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| *n <= 4).unwrap_or(0)
+    });
+    let slot_pad = *SLOT_PAD_LINES * (64 / core::mem::size_of::<F128>());
+    let stride = 512 * row_len + slot_pad;
+    static HUGE_STAGE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_ST_HUGE_STAGE").is_none()
+    });
+    static STAGE_ALIGN_LOG: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_STAGE_ALIGN_LOG")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| matches!(n, 6 | 12 | 21)).unwrap_or(21)
+    });
+    static STAGE_COLOR: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NTT_ST_STAGE_COLOR")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|n| *n < 64).unwrap_or(7)
+    });
+    let huge_stage = produce.is_some() && nbuf == 3 && row_len == 64 && *HUGE_STAGE;
     let states: Vec<StFmpPair> = (0..n_pairs).map(|_| StFmpPair::new()).collect();
     let next = AtomicUsize::new(0);
     let states = &states;
@@ -1768,8 +1800,22 @@ fn st_fmp_run_claimed(
         // them at a time.
         // Producers seed directly into the reserved staging pair from their
         // private 16 KiB octa scratch. No group-sized input allocation exists.
-        let mut staging = staging_block(512 * nbuf, row_len);
-        let bufp = staging.as_mut_ptr();
+        let extra_rows = (nbuf * slot_pad).div_ceil(row_len);
+        // A 4 MiB reservation contains a complete aligned 2 MiB frame.
+        // alloc_uninit_vec advises the large allocation before any stage
+        // write. A small cache-line color leaves the complete three-slot
+        // payload inside that frame while offsetting its L1 set mapping.
+        let mut staging = staging_block(
+            if huge_stage { 4096 } else { 512 * nbuf + extra_rows }, row_len);
+        let stage_offset = if huge_stage {
+            staging.as_mut_ptr().align_offset(1usize << *STAGE_ALIGN_LOG)
+                + *STAGE_COLOR * (64 / core::mem::size_of::<F128>())
+        } else { 0 };
+        debug_assert!(stage_offset <= staging.len());
+        debug_assert!(staging.len() - stage_offset >= nbuf * stride);
+        // SAFETY: the reservation bounds above cover the complete payload;
+        // consumers only receive pointers inside these same owned slots.
+        let bufp = unsafe { staging.as_mut_ptr().add(stage_offset) };
         st.bufp.store(bufp as usize, Ordering::Release);
         // Declared AFTER the staging allocation so it drops BEFORE it: on a
         // panic the fold sibling may still be reading a published block, and
@@ -3873,7 +3919,15 @@ impl AdditiveNttF128 {
         // this buffer (ranked commit only; 0 everywhere else). Each sweep
         // below re-guards it on its own sub-block stride being even, which is
         // what keeps a row group single-parity.
-        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        let (odd_tail, raw_tail) = ranked_zero_odd_tail_snapshot(log_d, num_ntts);
+        let raw7_pack = cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "vpclmulqdq"
+        )) && odd_tail == 4
+            && raw_tail == 7
+            && ntt_raw7_pack_enabled();
 
         let mut n_top = Self::interleaved_n_top(log_d, num_ntts);
         // A lone top layer (`n_top == start_layer + 1`) would run as one
@@ -3984,6 +4038,7 @@ impl AdditiveNttF128 {
                         log_d,
                         num_ntts,
                         odd_tail,
+                        raw7_pack,
                         sub_size_positions,
                         hint,
                     )
@@ -4001,6 +4056,7 @@ impl AdditiveNttF128 {
                     log_d,
                     num_ntts,
                     odd_tail,
+                    raw7_pack,
                     sub_size_positions,
                     hint,
                 );
@@ -4951,6 +5007,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         num_ntts: usize,
         odd_tail: usize,
+        raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
     ) -> bool {
@@ -4962,6 +5019,7 @@ impl AdditiveNttF128 {
             log_d,
             num_ntts,
             odd_tail,
+            raw7_pack,
             sub_size_positions,
             hint,
         )
@@ -4978,6 +5036,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         num_ntts: usize,
         odd_tail: usize,
+        raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
     ) -> bool {
@@ -5037,7 +5096,7 @@ impl AdditiveNttF128 {
                 tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
             }
             let blk = &mut sub_data[b * block_bytes4..(b + 1) * block_bytes4];
-            butterfly_interleaved_fused_4layer_rows(
+            butterfly_interleaved_fused_4layer_rows_raw7(
                 blk,
                 &tw,
                 sixteenth4,
@@ -5048,6 +5107,7 @@ impl AdditiveNttF128 {
                     0
                 },
                 hint,
+                raw7_pack,
             );
             for j in 0..16usize {
                 let g8 = g4 * 16 + j;
@@ -5263,6 +5323,34 @@ fn butterfly_interleaved_fused_4layer_par_rows(
             };
         });
     }
+}
+
+// Only the captured raw-seven guarantee may enable this route. A raw-four
+// caller can have live fields 57..59 and must retain the original 60-field pass.
+#[inline]
+fn butterfly_interleaved_fused_4layer_rows_raw7(
+    block: &mut [F128],
+    t: &[F128; 15],
+    sixteenth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    hint: u8,
+    raw7: bool,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    if raw7 && sixteenth == 8 && num_ntts == 64 && odd_tail == 4 && block.len() == 128 * 64 {
+        // The geometry bounds every access; the captured brand guarantees
+        // that fields57..63 of all odd rows already contain zero.
+        if unsafe { kernels::rows_raw7_s8(block.as_mut_ptr(), t, hint) } {
+            return;
+        }
+    }
+    butterfly_interleaved_fused_4layer_rows(block, t, sixteenth, num_ntts, odd_tail, hint);
 }
 
 /// Sequential row driver for a fused-four block. The caller already runs one
@@ -5877,7 +5965,7 @@ mod tests {
                 let lo = sub_idx * 2048 * columns;
                 assert!(ntt.deep_sub_fused_blocks_fallback(
                     sub_idx, &mut data[lo..lo + 2048 * columns], &callback,
-                    2, 13, columns, 0, 2048, 0,
+                    2, 13, columns, 0, false, 2048, 0,
                 ));
                 let snapshots = snapshots.into_inner().unwrap();
                 assert_eq!(snapshots.len(), 16);
@@ -8351,4 +8439,170 @@ mod witness_window_tests{
   }}}}
   println!("WINDOW_SEED_ORACLE_OK 32 geometries x9 source/schedule layouts =288 poisoned-output comparisons");
  }}
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+mod raw7_packed_tail_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    #[test]
+    fn raw7_snapshot_preserves_the_raw_four_distinction() {
+        {
+            let _g = ZeroOddTailLanes::scope(64, 7);
+            assert_eq!(ranked_zero_odd_tail_snapshot(20, 64), (4, 7));
+            assert_eq!(ranked_zero_odd_tail_snapshot(19, 64), (0, 0));
+            assert_eq!(ranked_zero_odd_tail_snapshot(20, 8), (0, 0));
+        }
+        {
+            let _g = ZeroOddTailLanes::scope(64, 4);
+            assert_eq!(ranked_zero_odd_tail_snapshot(20, 64), (4, 4));
+        }
+    }
+    #[test]
+    fn raw7_packed_driver_matches_parent_and_preserves_unbranded_fields() {
+        let mut state = 0x6a09e667f3bcc909u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let guard = F128::new(0x3ca98546b721936d, 0xcaa9d173985e4693);
+        for sixteenth in [8usize, 128] {
+            for raw7 in [false, true] {
+                for hint in 0..=2 {
+                    for case in 0..4 {
+                        let count = 16 * sixteenth * 64;
+                        let mut input = vec![guard; count + 8];
+                        for x in &mut input[4..4 + count] {
+                            *x = F128::new(next(), next());
+                        }
+                        let tail = if raw7 { 7 } else { 4 };
+                        for row in 0..16 * sixteenth {
+                            if row & 1 == 1 {
+                                input[4 + row * 64 + 64 - tail..4 + (row + 1) * 64]
+                                    .fill(F128::ZERO);
+                            }
+                        }
+                        if !raw7 {
+                            assert_ne!(input[4 + 64 + 57], F128::ZERO);
+                        }
+                        let tw: [F128; 15] = std::array::from_fn(|_| match case {
+                            0 => F128::ZERO,
+                            1 => F128::ONE,
+                            2 => F128::new(!0, !0),
+                            _ => F128::new(next(), next()),
+                        });
+                        let mut expected = input.clone();
+                        let mut got = input.clone();
+                        butterfly_interleaved_fused_4layer_rows(
+                            &mut expected[4..4 + count],
+                            &tw,
+                            sixteenth,
+                            64,
+                            4,
+                            hint,
+                        );
+                        let before = kernels::RAW7_PACK_HITS.load(Ordering::Relaxed);
+                        butterfly_interleaved_fused_4layer_rows_raw7(
+                            &mut got[4..4 + count],
+                            &tw,
+                            sixteenth,
+                            64,
+                            4,
+                            hint,
+                            raw7,
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "s={sixteenth} raw7={raw7} hint={hint} case={case}"
+                        );
+                        let after = kernels::RAW7_PACK_HITS.load(Ordering::Relaxed);
+                        if raw7 && sixteenth == 8 {
+                            assert_eq!(after, before + 1);
+                        } else {
+                            assert_eq!(after, before);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#[test]
+#[ignore = "ranked encoder oracle: about3GiB resident, requires exclusive native16-thread pool"]
+fn raw7_ranked_encoder_and_callback_match_parent() {
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+    crate::init_perf_thread_pool();
+    assert_eq!(rayon::current_num_threads(), 16);
+    let ntt = AdditiveNttF128::standard(20);
+    assert_eq!(AdditiveNttF128::interleaved_n_top(20, 64), 9);
+    let count = (1usize << 19) * 64;
+    let mut state = 0xb35a8a9136c4d7efu64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut msg: Vec<F128> = (0..count).map(|_| F128::new(next(), next())).collect();
+    for row in (1..(1usize << 19)).step_by(2) {
+        msg[row * 64 + 57..(row + 1) * 64].fill(F128::ZERO);
+    }
+    fn digest(block: &[F128]) -> u64 {
+        let mut v = 0x6a09e667f3bcc909u64;
+        for row in block.chunks_exact(64) {
+            for x in &row[56..64] {
+                v = v.rotate_left(9) ^ x.lo;
+                v = v.rotate_left(7) ^ x.hi;
+            }
+        }
+        v
+    }
+    let encode = |out: &mut [F128], raw: usize| {
+        let seen: Vec<AtomicU8> = (0..8192).map(|_| AtomicU8::new(0)).collect();
+        let hashes: Vec<AtomicU64> = (0..8192).map(|_| AtomicU64::new(0)).collect();
+        let callback = |range: core::ops::Range<usize>, block: &[F128]| {
+            assert_eq!(range.len(), 128);
+            assert_eq!(range.start % 128, 0);
+            assert_eq!(block.len(), 128 * 64);
+            assert!(range.end <= 1 << 20);
+            let i = range.start / 128;
+            hashes[i].store(digest(block), Ordering::Relaxed);
+            assert_eq!(
+                seen[i].fetch_add(1, Ordering::Release),
+                0,
+                "duplicate callback"
+            );
+        };
+        let before = kernels::RAW7_PACK_HITS.load(Ordering::Relaxed);
+        {
+            let _scope = ZeroOddTailLanes::scope(64, raw);
+            ntt.rs_encode_interleaved_on_range_done(&msg, out, 64, &callback);
+        }
+        for (i, block) in out.chunks_exact(128 * 64).enumerate() {
+            assert_eq!(seen[i].load(Ordering::Acquire), 1, "missing callback");
+            assert_eq!(
+                hashes[i].load(Ordering::Relaxed),
+                digest(block),
+                "field changed after callback"
+            );
+        }
+        kernels::RAW7_PACK_HITS.load(Ordering::Relaxed) - before
+    };
+    let poison = F128::new(!0, !0);
+    let mut parent = vec![poison; 2 * count];
+    assert_eq!(encode(&mut parent, 4), 0);
+    let mut candidate = vec![poison; 2 * count];
+    assert_eq!(encode(&mut candidate, 7), 8192);
+    assert!(
+        parent == candidate,
+        "raw-seven packing changed the complete ranked codeword"
+    );
+}
 }

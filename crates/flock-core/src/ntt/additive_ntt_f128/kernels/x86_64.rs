@@ -5400,3 +5400,95 @@ mod zero_chain_tests {
         println!("ZERO_CHAIN_ORACLE_OK 64completebuffercomparisons fourguardpositions inactivefields+outerguards");
     }}
 }
+
+/// Fold the four real trailing fields of the S8 odd groups together.
+/// The caller guarantees 128 rows of 64 initialized fields and seven zero
+/// trailing fields on every odd row. No callback may read the block until
+/// this function returns. Returns false without changing data on rollback.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) unsafe fn rows_raw7_s8(ptr: *mut F128, t: &[F128; 15], hint: u8) -> bool {
+    if !super::super::ntt_shaped_enabled() {
+        return false;
+    }
+    let Some(p) = (unsafe { prepare_four(t) }) else {
+        return false;
+    };
+    let ordered = super::super::ntt_alias_load_order_enabled();
+    unsafe {
+        match (hint, ordered) {
+            (0, false) => rows_raw7_s8_impl::<0, 0>(ptr, &p),
+            (0, true) => rows_raw7_s8_impl::<0, 1>(ptr, &p),
+            (1, false) => rows_raw7_s8_impl::<1, 0>(ptr, &p),
+            (1, true) => rows_raw7_s8_impl::<1, 1>(ptr, &p),
+            (_, false) => rows_raw7_s8_impl::<2, 0>(ptr, &p),
+            (_, true) => rows_raw7_s8_impl::<2, 1>(ptr, &p),
+        }
+    }
+    #[cfg(test)]
+    RAW7_PACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+#[cfg(all(
+    test,
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) static RAW7_PACK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &PreparedFour) {
+    #[repr(C, align(64))]
+    struct Tail([F128; 64]);
+    let mut storage = core::mem::MaybeUninit::<Tail>::uninit();
+    let tail = storage.as_mut_ptr().cast::<F128>();
+    let lead = (p.prefetch_lines * 4).min(64);
+    unsafe {
+        for r in 0..8 {
+            let odd = r & 1 == 1;
+            let lanes = if odd { 56 } else { 64 };
+            if r == 7 || H == 0 {
+                butterfly_four_fixed_registers::<8, 64, 0, ORD>(
+                    ptr.add(r * 64),
+                    p,
+                    lanes * 16,
+                    ptr,
+                );
+            } else {
+                butterfly_four_fixed_registers::<8, 64, H, ORD>(
+                    ptr.add(r * 64),
+                    p,
+                    lanes * 16,
+                    ptr.add(r * 64 + lead),
+                );
+            }
+            if odd {
+                // Four odd r values each initialize one column in all 16
+                // compact rows. Every one of the 64 fields is written.
+                for i in 0..16 {
+                    tail.add(i * 4 + (r >> 1))
+                        .write(ptr.add((i * 8 + r) * 64 + 56).read());
+                }
+            }
+        }
+        // All compact fields are initialized. Columns have the identical
+        // twiddles of their original r groups; the butterfly is lane-local.
+        butterfly_four_fixed_registers::<1, 4, 0, 0>(tail, p, 64, tail);
+        for i in 0..16 {
+            for j in 0..4 {
+                ptr.add((i * 8 + 2 * j + 1) * 64 + 56)
+                    .write(tail.add(i * 4 + j).read());
+            }
+        }
+    }
+}
