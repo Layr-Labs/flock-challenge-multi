@@ -4450,6 +4450,31 @@ struct FoldCache([F128; 64]);
 #[repr(C, align(64))]
 pub(crate) struct CFoldMats(pub(crate) [[u64; 8]; 128], pub(crate) [[u64; 8]; 64]);
 
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[repr(C,align(64))]
+pub(crate) struct CFold8Mats(pub(crate) [[u64;8];128]);
+
+pub(crate) fn zc_c8_shared_enabled()->bool {
+    static ON:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||cfg!(target_os="linux") && std::env::var_os("FLOCK_NO_C8_SHARED").is_none());
+    *ON
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+pub(crate) fn build_cfold8_mats(data:&[F128],coeff:[F128;4],rho3:F128)->CFold8Mats {
+    // Published C8 identity: absorb the third interpolation into each row map.
+    let right=coeff.map(|c|c*rho3);
+    let mut out=CFold8Mats([[0;8];128]);
+    for c in 0..8 {
+        let k=if c<4 {coeff[c]+right[c]}else{right[c-4]};
+        let row=build_row_fold_mats_scaled(data,k);
+        for j in 0..8 {
+            out.0[8*c+j].copy_from_slice(&row[16*j..16*j+8]);
+            out.0[64+8*c+j].copy_from_slice(&row[16*j+8..16*j+16]);
+        }
+    }
+    out
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -4973,6 +4998,7 @@ const C4_LM_OUT_ODD: [i8; 64] = c4_lm_output_index(1);
 core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
+    include_str!("gfni_c8_ab_register_result.S"),
     include_str!("gfni_c4_pass4_register_result.S"),
 );
 
@@ -4987,6 +5013,7 @@ core::arch::global_asm!(
 unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
+    fn flock_gfni_c8_ab_register_result();
     fn flock_gfni_c4_pass4_register_result();
 }
 
@@ -6663,8 +6690,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
 ) -> [F128; 8] {
     let mut unused = [F128::ZERO; 18];
     unsafe {
-        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false>(
-            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false>(
+            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, None, rho3, wt, b_canon, &mut unused,
             F128::ZERO,
         )
     }
@@ -6862,6 +6889,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
     const CASC: bool,
+    const C8: bool,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -6870,6 +6898,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     b_out: &mut [F128],
     lo_size: usize,
     cfold: &CFoldMats,
+    cfold8: Option<&CFold8Mats>,
     rho3: F128,
     wt: &[F128],
     b_canon: &[F128; 4],
@@ -7026,17 +7055,34 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             // Lines 0..16.
             let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
-            let a_tile = fold_a_half!(row0);
-            prefetch_half!(next, 8..16, pf1_first, pf1_last);
-            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
-            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
-            let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
-            let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
+            #[cfg(target_os="linux")]
+            let (a_tile,b2,b3,te,to)=if C8 {
+                prefetch_half!(next,8..16,pf1_first,pf1_last);
+                let [a0,a1,a2,a3,b2,b3,te,to]=gfni_fold128_ab_c8_registers(
+                    a_pkt.add(row0*8),b_pkt.add((row0+16)*8),cfold8.expect("C8 coefficients"));
+                ([a0,a1,a2,a3],b2,b3,te,to)
+            }else{
+                let a_tile=fold_a_half!(row0);
+                prefetch_half!(next,8..16,pf1_first,pf1_last);
+                let(e1,o1)=fold_b_window!(row0+16);
+                let(e2,o2)=fold_b_window!(row0+80);
+                (a_tile,_mm512_shuffle_i64x2::<0x88>(e1,e2),_mm512_shuffle_i64x2::<0x88>(o1,o2),
+                    _mm512_shuffle_i64x2::<0xDD>(e1,e2),_mm512_shuffle_i64x2::<0xDD>(o1,o2))
+            };
+            #[cfg(not(target_os="linux"))]
+            let (a_tile,b2,b3,te,to)={
+                let a_tile=fold_a_half!(row0);
+                prefetch_half!(next,8..16,pf1_first,pf1_last);
+                let(e1,o1)=fold_b_window!(row0+16);
+                let(e2,o2)=fold_b_window!(row0+80);
+                (a_tile,_mm512_shuffle_i64x2::<0x88>(e1,e2),_mm512_shuffle_i64x2::<0x88>(o1,o2),
+                    _mm512_shuffle_i64x2::<0xDD>(e1,e2),_mm512_shuffle_i64x2::<0xDD>(o1,o2))
+            };
             let b_tile = [
                 _mm512_permutex2var_epi64(te, i_b0_a012, c0), // lines 0, 4, 8, 12
                 _mm512_permutex2var_epi64(to, i_b0_a012, c1), // lines 1, 5, 9, 13
-                _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
-                _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
+                b2, // lines 2,6,10,14
+                b3, // lines 3,7,11,15
             ];
             let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, wa, wa64) = emit_tile!(x_lo, a_tile, b_tile);
 
@@ -7196,3 +7242,35 @@ mod r4_canonical_pair_tests {
         }}}
     }
 }
+
+#[cfg(all(target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(always)]
+unsafe fn gfni_fold128_ab_c8_registers(a:*const u8,b:*const u8,m:&CFold8Mats)->[core::arch::x86_64::__m512i;8]{unsafe{
+use core::arch::x86_64::*;
+ let(v0,v1,v2,v3,v4,v5,v6,v7):(__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i);
+ core::arch::asm!("call {kernel}",kernel=sym flock_gfni_c8_ab_register_result,in("rdi") a,in("rdx") b,in("rsi") m.0.as_ptr(),lateout("rax") _,
+ out("zmm0") _,out("zmm1") _,out("zmm2") _,out("zmm3") _,out("zmm4") _,out("zmm5") _,out("zmm6") _,out("zmm7") _,out("zmm8") v0,out("zmm9") v1,out("zmm10") v2,out("zmm11") v3,out("zmm12") v4,out("zmm13") v5,out("zmm14") v6,out("zmm15") v7);
+ [v0,v1,v2,v3,v4,v5,v6,v7]
+}}
+
+#[cfg(all(test,target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+core::arch::global_asm!(include_str!("gfni_c4_pair_register_result.S"));
+#[cfg(all(test,target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+unsafe extern "C"{fn flock_gfni_c4_pair_lm_register_result();}
+#[cfg(all(test,target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[inline(always)]
+unsafe fn gfni_fold128_rows_c4_pair_registers(rows:*const u8,m:&CFoldMats)->[core::arch::x86_64::__m512i;8]{unsafe{
+ use core::arch::x86_64::*;
+ let (a,b,c,d,e,f,g,h):(__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i,__m512i);
+ core::arch::asm!("call {kernel}",kernel=sym flock_gfni_c4_pair_lm_register_result,
+ in("rdi") rows,in("rsi") m.1.as_ptr(),lateout("rax") _,
+ out("zmm0") _,out("zmm1") _,out("zmm2") _,out("zmm3") _,out("zmm4") _,out("zmm5") _,out("zmm6") _,out("zmm7") _,
+ out("zmm8") a,out("zmm9") b,out("zmm10") c,out("zmm11") d,out("zmm12") e,out("zmm13") f,out("zmm14") g,out("zmm15") h);
+ [a,b,c,d,e,f,g,h]
+}}
+#[cfg(all(test,target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[path="gfni_c4_pair_probe.rs"]
+mod c4_pair_probe;
+#[cfg(all(test,target_os="linux",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+#[path="gfni_c8_direct_probe.rs"]
+mod c8_direct_probe;

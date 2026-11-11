@@ -498,8 +498,21 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     if casc {
         assert_ne!(r_next5[2], F128::ZERO, "round-seven lookahead needs r6 != 0");
     }
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="vpclmulqdq",target_feature="gfni"))]
+    let cfold8=(casc && kernels::x86_64::zc_c8_shared_enabled()).then(||{
+        let one=F128::ONE;let(r1,r2)=(rho[0],rho[1]);
+        kernels::x86_64::build_cfold8_mats(&table.data,
+            [(one+r1)*(one+r2),r1*(one+r2),(one+r1)*r2,r1*r2],rho[2])
+    });
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
     // weight; κ₆ restores the even lanes' own weight in the message sums.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     let wtab_casc = casc.then(|| build_w_pair_table_casc(eq_lo));
     let kappa6 = if casc { (F128::ONE + r_next5[2]) * r_next5[2].inv() } else { F128::ZERO };
     #[cfg(not(all(
@@ -534,10 +547,15 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                     if casc && let Some(bc) = b_canon.as_ref() {
                         macro_rules! casc {
                             ($nt:literal) => {
-                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true>(
-                                    ap, bp, out_base, a_out, b_out, lo_size, c, rho[2],
-                                    wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6,
-                                )
+                                if let Some(c8)=cfold8.as_ref() {
+                                    kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt,true,true,true>(
+                                        ap,bp,out_base,a_out,b_out,lo_size,c,Some(c8),rho[2],
+                                        wtab_casc.as_deref().unwrap(),bc,&mut la7,kappa6)
+                                }else{
+                                    kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt,true,true,false>(
+                                        ap,bp,out_base,a_out,b_out,lo_size,c,None,rho[2],
+                                        wtab_casc.as_deref().unwrap(),bc,&mut la7,kappa6)
+                                }
                             };
                         }
                         let _ = wt;
