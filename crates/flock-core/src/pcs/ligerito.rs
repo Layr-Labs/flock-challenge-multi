@@ -4226,7 +4226,6 @@ pub(crate) fn ligero_commit(
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
 
     if crate::pcs::commit::lig_fused_commit_enabled() && !crate::gpu::merkle::available() {
-        crate::rstrace::ev("lc:start", log_block_len as u32);
         let faults_before = if ot { minor_faults() } else { 0 };
         let mat_cap = mat.capacity();
         let t_encode = std::time::Instant::now();
@@ -4243,9 +4242,7 @@ pub(crate) fn ligero_commit(
         );
         let fused_ms = t_encode.elapsed().as_secs_f64() * 1e3;
         let t_upper = std::time::Instant::now();
-        crate::rstrace::ev("lc:fused", log_block_len as u32);
         crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
-        crate::rstrace::ev("lc:end", log_block_len as u32);
         if ot {
             eprintln!(
                 "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
@@ -6873,16 +6870,6 @@ fn direct_fold8_b_overlap_enabled() -> bool {
     *ON
 }
 
-/// Lane rs: `FLOCK_NO_RS_F8_REBAL=1` (or `FLOCK_NO_RS_SEED6=1`) restores
-/// the fold64 ‖ basis, then commit ‖ message schedule. Read once.
-fn rs_f8_rebal_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_RS_F8_REBAL").is_none()
-            && std::env::var_os("FLOCK_NO_RS_SEED6").is_none()
-    });
-    *ON
-}
-
 fn direct_fold8_l1_precommit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none());
@@ -7183,12 +7170,7 @@ fn direct_fold8_msg_par(folded_f: &[F128], folded_b: &[F128], block_len: usize) 
     let stats = folded_f
         .par_chunks(block_len)
         .zip(folded_b.par_chunks(block_len))
-        .map(|(f, b)| {
-            crate::rstrace::evd("msg:s", 0);
-            let r = unsafe { msg_reduce_avx512(f, b) };
-            crate::rstrace::evd("msg:e", 0);
-            r
-        })
+        .map(|(f, b)| unsafe { msg_reduce_avx512(f, b) })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
@@ -7263,13 +7245,8 @@ fn materialize_direct_fold8(
                 out_len,
                 (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
             );
-            // Lane rs: with the seed6 L1 commit (CLMUL + NT publish, then
-            // hash) the GFNI basis fold (+ its fused message) overlaps the
-            // commit better than it overlaps fold64 (both p0/p5-heavy), so
-            // the sequential-fold schedule below wins; see rs RESULT.md.
-            if direct_fold8_b_overlap_enabled() && !rs_f8_rebal_enabled() {
+            if direct_fold8_b_overlap_enabled() {
                 let t_f8 = std::time::Instant::now();
-                crate::rstrace::ev("f8:start", 0);
                 let mut folded_f = crate::scratch::take_f128(out_len);
                 let folded_b = crate::scratch::take_f128(out_len);
                 let ((), (folded_b, _)) = rayon::join(
@@ -7281,18 +7258,14 @@ fn materialize_direct_fold8(
                             &fold16_weight,
                             r4,
                             r5,
-                        );
-                        crate::rstrace::ev("f8:fold64:end", 0);
+                        )
                     },
                     || {
-                        let r = materialize_direct_fold8_b_gfni_impl(
+                        materialize_direct_fold8_b_gfni_impl(
                             None, folded_b, claims, challenges, block_len,
-                        );
-                        crate::rstrace::ev("f8:basis:end", 0);
-                        r
+                        )
                     },
                 );
-                crate::rstrace::ev("f8:join1", 0);
                 let t_f8a = t_f8.elapsed();
                 crate::scratch::give_f128(packed_witness);
                 crate::scratch::give_f128(ordinary_basis);
@@ -7310,13 +7283,8 @@ fn materialize_direct_fold8(
                             precommit.kind,
                         )
                     },
-                    || {
-                        let m = direct_fold8_msg_par(&folded_f, &folded_b, block_len);
-                        crate::rstrace::ev("f8:msg:end", 0);
-                        m
-                    },
+                    || direct_fold8_msg_par(&folded_f, &folded_b, block_len),
                 );
-                crate::rstrace::ev("f8:join2", 0);
                 if open_timing() {
                     eprintln!(
                         "[f8] overlap: f-fold+basis {:.3} ms, commit+msg {:.3} ms",
@@ -7327,7 +7295,6 @@ fn materialize_direct_fold8(
                 return (folded_f, folded_b, msg, Some(precommitted));
             }
             let t_f8 = std::time::Instant::now();
-            crate::rstrace::ev("f8s:start", 0);
             let mut folded_f = crate::scratch::take_f128(out_len);
             let t_f8a = t_f8.elapsed();
             materialize_direct_fold8_f_for_precommit(
@@ -7342,7 +7309,6 @@ fn materialize_direct_fold8(
                 eprintln!("[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
                     t_f8a.as_secs_f64()*1e3, (t_f8.elapsed()-t_f8a).as_secs_f64()*1e3, packed_witness.len()*16>>20);
             }
-            crate::rstrace::ev("f8s:fold64", 0);
             let t_f8 = std::time::Instant::now();
             let folded_b = crate::scratch::take_f128(out_len);
             crate::scratch::give_f128(packed_witness);
@@ -7362,14 +7328,11 @@ fn materialize_direct_fold8(
                     )
                 },
                 || {
-                    let r = materialize_direct_fold8_b_gfni_for_precommit(
+                    materialize_direct_fold8_b_gfni_for_precommit(
                         &folded_f, folded_b, claims, challenges, block_len,
-                    );
-                    crate::rstrace::ev("f8s:basis", 0);
-                    r
+                    )
                 },
             );
-            crate::rstrace::ev("f8s:join", 0);
             if open_timing() {
                 eprintln!("[f8] give+join {:.3} ms", t_f8.elapsed().as_secs_f64()*1e3);
             }
@@ -8563,7 +8526,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut t_ood = std::time::Duration::ZERO;
 
     let t_total = std::time::Instant::now();
-    crate::rstrace::ev("lig:start", 0);
 
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
@@ -8692,7 +8654,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             fold_grinding_nonces.push(challenger.grind_pow(bits));
         }
         let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
-        crate::rstrace::ev("r:grind", j as u32);
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
         let msg = if direct_fold8_mode && j < 6 {
@@ -8841,7 +8802,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
-        crate::rstrace::ev("r:fold", j as u32);
         r_lane_fold.push(r);
     }
     if trace {
@@ -8869,7 +8829,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
     };
     challenger.observe_bytes(&wtns_1.root());
-    crate::rstrace::ev("L1:root", 0);
 
     let lazy_l1_ood = ranked_l1_lazy_ood_eq_enabled(
         config,
@@ -8908,9 +8867,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
     }
 
-    crate::rstrace::ev("L1:ood", 0);
     let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
-    crate::rstrace::ev("L1:qgrind", 0);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
 
     let num_queries_0 = config.queries[0];
@@ -8992,7 +8949,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         ));
     }
 
-    crate::rstrace::ev("L1:open+induce", 0);
     let initial_proof = RecursiveProof {
         opened_rows: opened_rows_0,
         merkle_proof: merkle_proof_0,
@@ -9037,7 +8993,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         t_intro_glue += _t.elapsed();
     }
 
-    crate::rstrace::ev("L1:intro+glue", 0);
     let mut wtns_prev = wtns_1;
     let mut recursive_roots: Vec<Hash> = vec![wtns_prev.root()];
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
@@ -9052,7 +9007,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             if bits > 0 {
                 fold_grinding_nonces.push(challenger.grind_pow(bits));
             }
-            crate::rstrace::ev("lv:fgrind", (i * 16 + j) as u32);
             let ri = challenger.sample_f128();
             let mut msg = sc_prover.fold(ri);
             let mut materialized_dual = None;
@@ -9104,7 +9058,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             }
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
-            crate::rstrace::ev("lv:fold", (i * 16 + j) as u32);
             level_rs.push(ri);
         }
         if trace {
@@ -9116,9 +9069,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             for v in &yr {
                 challenger.observe_f128(*v);
             }
-            crate::rstrace::ev("fin:yr", 0);
             let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
-            crate::rstrace::ev("fin:qgrind", 0);
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
             let queries_last =
@@ -9128,8 +9079,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
-            crate::rstrace::ev("fin:open", 0);
-            crate::rstrace::dump("ligerito open");
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9213,7 +9162,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let root_next = wtns_next.root();
         challenger.observe_bytes(&root_next);
-        crate::rstrace::ev("lv:root", i as u32);
         recursive_roots.push(root_next);
 
         let lazy_deep_ood = ranked_deep_lazy_ood_eq_enabled(
@@ -9253,9 +9201,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             }
         }
 
-        crate::rstrace::ev("lv:ood", i as u32);
         let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
-        crate::rstrace::ev("lv:qgrind", i as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
@@ -9346,7 +9292,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             ));
         }
 
-        crate::rstrace::ev("lv:open+induce", i as u32);
         recursive_proofs.push(RecursiveProof {
             opened_rows: opened_rows_i,
             merkle_proof: merkle_proof_i,
@@ -9389,7 +9334,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             t_intro_glue += _t.elapsed();
         }
 
-        crate::rstrace::ev("lv:intro+glue", i as u32);
         wtns_prev = wtns_next;
     }
 

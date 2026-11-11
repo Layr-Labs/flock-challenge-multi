@@ -2718,61 +2718,6 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
     (z, a, b, ab_inner)
 }
 
-/// Octas (`kpair` values) in one ranked witness group.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
-const OCTAS_PER_GROUP: usize = 32;
-
-/// Next unclaimed octa of one ranked group. Neighbouring groups are produced
-/// by different cores at the same time, so each counter has its own line.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
-#[derive(Default)]
-#[repr(align(64))]
-struct OctaClaim(std::sync::atomic::AtomicUsize);
-
-/// The octas one producer call runs.
-///
-/// Under `Parity` the two sibling calls of a group own sixteen octas each.
-/// A sibling that starts late (it is still folding or publishing the
-/// previous group) then leaves the other spinning at the join once its own
-/// half is done. `Shared` hands every octa to whichever call asks next, so
-/// both calls stay busy until the group is complete. An octa is self-contained
-/// (own rows of both staging slots, per-call scratch), so the bytes produced
-/// do not depend on which call runs it.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
-enum OctaOrder<'a> {
-    Parity(usize),
-    Shared(&'a OctaClaim),
-}
-
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
-impl Iterator for OctaOrder<'_> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<usize> {
-        let kpair = match self {
-            Self::Parity(next) => {
-                let kpair = *next;
-                *next += 2;
-                kpair
-            }
-            // Atomicity alone gives each value to one caller. The octa's
-            // writes reach the fold through the encoder's existing join.
-            Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        };
-        (kpair < OCTAS_PER_GROUP).then_some(kpair)
-    }
-}
-
-/// `FLOCK_NO_WITNESS_OCTA_CLAIM=1` restores the fixed parity split in the
-/// same binary. Read once per process.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
-fn witness_octa_claim_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITNESS_OCTA_CLAIM").is_none());
-    *ON
-}
-
 /// One 64-byte line of a rayon task's fused a/b projection windows. A task
 /// holds `2 · 8 · (K/8) / 64` of them: eight blocks × `K/8` bytes per side,
 /// laid out exactly like the main a/b buffers (`K/32`-word row stride). 32 KiB
@@ -3043,10 +2988,6 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let merge_prefix=std::env::var_os("FLOCK_WITNESS_SEED_MERGE_PREFIX").is_some();
             let window_tile_enabled=std::env::var_os("FLOCK_NO_WITNESS_SEED_TILE").is_none();
             let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
-            let octa_claims: Option<Vec<OctaClaim>> = witness_octa_claim_enabled().then(|| {
-                let groups = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
-                (0..groups).map(|_| OctaClaim::default()).collect()
-            });
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
                 let windows=target.filter(|_|window_seed_enabled&&elide_z).map(|t|t.prepare_windows());
@@ -3071,22 +3012,14 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // Each octa spans four quarters and adjacent k values. Root
                 // storage follows physical octa order, so each writer still
                 // owns one full64-byte stripe without scattered partial stores.
-                // Only the sibling-paired encoder passes a target, and it
-                // runs both role calls of a group concurrently and joins
-                // them; the materialize-first fallback keeps the parity split.
-                let octas = match (octa_claims.as_ref(), target) {
-                    (Some(claims), Some(_)) => OctaOrder::Shared(&claims[group]),
-                    _ => OctaOrder::Parity(role),
-                };
-                for kpair in octas {
+                for kpair in (role..32).step_by(2) {
                     let base = (2 * kpair) * 1024 + group;
                     let field_offset = base * F128_PER_BLOCK;
                     let physical_base = group * 256 + kpair * 8;
                     let root_byte_offset = (physical_base / GROUP) * ROOT_FIELDS_PER_TILE * 16
                         + ((physical_base % GROUP) / SIMD) * 64;
-                    // SAFETY: every ranked octa is run exactly once, by its
-                    // role's parity or by one claim from its group's counter.
-                    // z/a/b and compact AB spans are disjoint; each root
+                    // SAFETY: group/role partition every ranked octa exactly
+                    // once. z/a/b and compact AB spans are disjoint; each root
                     // octa owns complete 64-byte stripes at the physical tile
                     // offsets. Constants may be retained only because the
                     // enclosing exact branch verified all three scratch tags.
@@ -6827,68 +6760,6 @@ mod tests {
         };
         census(b_bytes, "b");
         census(a_bytes, "a");
-    }
-}
-
-#[cfg(test)]
-mod octa_order_tests {
-    use super::{OCTAS_PER_GROUP, OctaClaim, OctaOrder};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn parity_order_is_the_fixed_role_split() {
-        for role in 0..2 {
-            let got: Vec<usize> = OctaOrder::Parity(role).collect();
-            let want: Vec<usize> = (role..OCTAS_PER_GROUP).step_by(2).collect();
-            assert_eq!(got, want, "role={role}");
-        }
-    }
-
-    /// Whatever the interleaving, the calls sharing one group's counter run
-    /// each octa exactly once between them, and a call that arrives after
-    /// the group is exhausted runs none.
-    #[test]
-    fn shared_order_hands_every_octa_out_exactly_once() {
-        for callers in [1usize, 2, 3] {
-            for round in 0..2000 {
-                let claim = OctaClaim::default();
-                let runs: Vec<AtomicUsize> =
-                    (0..OCTAS_PER_GROUP).map(|_| AtomicUsize::new(0)).collect();
-                std::thread::scope(|scope| {
-                    for caller in 0..callers {
-                        let (claim, runs) = (&claim, &runs);
-                        scope.spawn(move || {
-                            // Stagger the arrivals: the late sibling is the
-                            // case this order exists for.
-                            for _ in 0..(caller * (round % 7) * 50) {
-                                std::hint::spin_loop();
-                            }
-                            for kpair in OctaOrder::Shared(claim) {
-                                runs[kpair].fetch_add(1, Ordering::Relaxed);
-                            }
-                        });
-                    }
-                });
-                for (kpair, n) in runs.iter().enumerate() {
-                    assert_eq!(
-                        n.load(Ordering::Relaxed),
-                        1,
-                        "callers={callers} round={round} kpair={kpair}"
-                    );
-                }
-                assert_eq!(OctaOrder::Shared(&claim).count(), 0, "late call ran an octa");
-            }
-        }
-    }
-
-    #[test]
-    fn claims_do_not_share_a_cache_line() {
-        let claims: Vec<OctaClaim> = (0..4).map(|_| OctaClaim::default()).collect();
-        for pair in claims.windows(2) {
-            let a = core::ptr::addr_of!(pair[0]) as usize;
-            let b = core::ptr::addr_of!(pair[1]) as usize;
-            assert_ne!(a / 64, b / 64);
-        }
     }
 }
 

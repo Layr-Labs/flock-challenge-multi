@@ -23,7 +23,6 @@ pub mod gf2_kernels;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;
-pub mod rstrace;
 pub mod gpu;
 pub mod hash;
 pub mod lincheck;
@@ -321,11 +320,10 @@ pub fn ranked_pool_built() -> bool {
 /// Rollback is compile-time, because `run_trial` calls `env_clear()` and no
 /// `FLOCK_*` variable reaches the ranked worker: set
 /// [`ZC_R1_SMT_SPLIT`] to `false` and the incumbent `rayon::join` is
-/// restored and no extra thread is spawned. Environment overrides are local
+/// restored and no extra thread is spawned. The two env vars are local
 /// diagnostics only and are absent on the ranked runner, so the shipped
-/// default is the split. Grouped AB leaves reduce the AB arm's work, so the
-/// eight-core ranked host assigns seven workers to AB and nine to C. Local
-/// diagnostics select an explicit AB count with `FLOCK_ZC_R1_AB_WORKERS` or
+/// default is the split. Four-w AB retention balances the arms on the
+/// eight-core ranked host with eight workers each. Local diagnostics can
 /// restore 9/7 with `FLOCK_ZC_R1_AB_REBALANCE=1`.
 pub(crate) mod smt_split {
     use rayon::ThreadPool;
@@ -352,35 +350,6 @@ pub(crate) mod smt_split {
             ab.push(c.pop().expect("eight sibling groups"));
         }
         (ab, c)
-    }
-
-    // Keep the original planner as the exact eight/eight and nine/seven
-    // controls. Only the already-validated eight-core production topology
-    // selects an explicit partition.
-    #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
-    fn arm_cpus_for_workers(groups: &[Vec<usize>], ab_workers: usize) -> (Vec<usize>, Vec<usize>) {
-        assert!(ab_workers > 0 && ab_workers < 2 * groups.len());
-        let (mut ab, mut c) = arm_cpus(groups, false);
-        while ab.len() < ab_workers { ab.push(c.pop().unwrap()); }
-        while ab.len() > ab_workers { c.push(ab.pop().unwrap()); }
-        (ab, c)
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn explicit_partitions_preserve_every_cpu_once() {
-        let groups: Vec<Vec<usize>> = (0..8).map(|i| vec![100 + 3 * i, 101 + 3 * i]).collect();
-        let mut expected: Vec<usize> = groups.iter().flatten().copied().collect();
-        expected.sort_unstable();
-        for workers in 1..16 {
-            let (ab, c) = arm_cpus_for_workers(&groups, workers);
-            assert_eq!(ab.len(), workers);
-            assert_eq!(c.len(), 16 - workers);
-            let mut actual = ab;
-            actual.extend(c);
-            actual.sort_unstable();
-            assert_eq!(actual, expected);
-        }
     }
 
     #[cfg(test)]
@@ -577,14 +546,6 @@ pub(crate) mod smt_split {
                 || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
-            let (s0, s1) = if cores == 8 {
-                match std::env::var("FLOCK_ZC_R1_AB_WORKERS").ok()
-                    .and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..16).contains(n)) {
-                    Some(workers) => super::arm_cpus_for_workers(&groups, workers),
-                    None if rebalance => (s0, s1),
-                    None => super::arm_cpus_for_workers(&groups, 7),
-                }
-            } else { (s0, s1) };
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
@@ -651,203 +612,6 @@ fn advise_hugepages(ptr: *mut u8, bytes: usize) {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 /// Prewarm marker ab
 fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
-
-/// Round one's two arms run in the SMT-split pools while the calling worker waits for both.
-///
-/// `rayon::join(|| ab_pool.install(..), || c_pool.install(..))` leaves that worker in rayon's
-/// sleeping wait. While the AB arm's thread shares its CPU it stays awake (each `sched_yield`
-/// hands the CPU back), but once the shorter AB arm has ended its idle rounds run out and it is
-/// asleep, its core halted, when the longer C arm finishes; when the join's second closure was
-/// taken by another global worker the end of round one is even relayed through two such
-/// wake-ups, and the C arm only starts once that worker has been woken.
-///
-/// Here the caller hands both closures to their pools itself (C first). It waits for the AB arm
-/// with rayon's own wait, exactly as before, and only from the AB arm's end until the C arm's end
-/// (about 0.4 ms, when no arm thread uses its CPU) does it stay on CPU with a bounded
-/// `sched_yield` + PAUSE spin. The closures, their pools and their inputs are the same, so proof
-/// bytes are unchanged. `FLOCK_NO_R1_OWNER_AWAKE=1` restores the join.
-///
-/// Second, separate switch (`FLOCK_NO_R1_EXIT_COREWARM=1`): when the AB arm's closure ends, the AB
-/// pool's own threads (first hyperthread of cores 0-6) have nothing left to do and would go to
-/// sleep; with the C threads on the sibling hyperthreads finishing shortly after, those cores are
-/// fully halted when round two fans out, and its wake-ups pay the idle state's exit latency. The
-/// AB pool's threads instead wait in a PAUSE loop (no system calls, no global-pool thread is woken,
-/// nothing runs on a CPU the C arm uses) until the caller releases them at the end of round one,
-/// bounded at 1.5 ms. The thread that shares the caller's CPU is left out.
-pub mod r1_owner_awake {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::LazyLock;
-    use std::time::{Duration, Instant};
-
-    /// After this long the caller stops spinning and rayon's sleeping wait takes over.
-    const SPIN_LIMIT: Duration = Duration::from_millis(5);
-
-    pub fn enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_OWNER_AWAKE").is_none());
-        *ON
-    }
-
-    /// Bumped by the caller when round one's last arm has ended; releases the holders.
-    static HOLD_EPOCH: AtomicU64 = AtomicU64::new(0);
-    const HOLD_LIMIT: Duration = Duration::from_micros(1500);
-
-    pub fn corewarm_enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_EXIT_COREWARM").is_none());
-        *ON
-    }
-
-    fn hold(epoch: u64) {
-        hold_for(epoch, HOLD_LIMIT, false);
-    }
-
-    /// The holder loop: stay on CPU until [`HOLD_EPOCH`] moves past `epoch` or
-    /// `limit` passes. `yielding` adds a `sched_yield` per lap so a holder never
-    /// keeps another runnable thread (one still finishing the commit, or the
-    /// serial path into zerocheck) off its CPU.
-    fn hold_for(epoch: u64, limit: Duration, yielding: bool) {
-        let t0 = Instant::now();
-        while HOLD_EPOCH.load(Ordering::Relaxed) == epoch {
-            if yielding {
-                std::thread::yield_now();
-            }
-            for _ in 0..32 {
-                core::hint::spin_loop();
-            }
-            if t0.elapsed() > limit {
-                break;
-            }
-        }
-    }
-
-    // ---- Lane rl item 3: round-one ENTRY pre-wake ----
-    //
-    // Round one's two SMT-split pools are asleep when the round starts, and
-    // their threads come on CPU 0.10-0.15 ms after the work is injected. The
-    // same holder as the exit core-warm is broadcast to both pools while the
-    // commit's last deep-pass workers finish (`prewake_arrive`), so the
-    // threads are already on CPU, yielding, when round one injects its two
-    // arms; `run_both` releases them (one `HOLD_EPOCH` bump) right after both
-    // arms are injected. Same closures, pools and inputs: proof bytes are
-    // unchanged. `FLOCK_NO_RL_PREWAKE=1` disables it; `FLOCK_RL_PREWAKE_AT=k`
-    // fires it when the k-th deep-pass worker has finished (default 4 of 16:
-    // measured best of 1/4/12/16; the holders yield, so the twelve workers still
-    // in the deep pass keep their CPUs).
-
-    const PREWAKE_LIMIT: Duration = Duration::from_micros(1500);
-    static PREWAKE_ARRIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static PREWAKE_LIVE: AtomicBool = AtomicBool::new(false);
-
-    /// 0 = off, else the deep-pass arrival count that fires the pre-wake.
-    /// Read once per process; callers resolve it once per pass.
-    pub fn prewake_at() -> usize {
-        static AT: LazyLock<usize> = LazyLock::new(|| {
-            if std::env::var_os("FLOCK_NO_RL_PREWAKE").is_some() || !enabled() {
-                return 0;
-            }
-            std::env::var("FLOCK_RL_PREWAKE_AT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&k| k >= 1)
-                .unwrap_or(4)
-        });
-        *AT
-    }
-
-    /// Start of a commit pass that will report its deep-pass arrivals.
-    pub fn prewake_reset() {
-        PREWAKE_ARRIVED.store(0, Ordering::Relaxed);
-    }
-
-    /// One deep-pass worker has finished; the `at`-th arrival fires the pre-wake.
-    pub fn prewake_arrive(at: usize) {
-        if PREWAKE_ARRIVED.fetch_add(1, Ordering::AcqRel) + 1 == at {
-            prewake();
-        }
-    }
-
-    fn prewake() {
-        let Some((ab_pool, c_pool)) = crate::smt_split::zc_r1_pools() else {
-            return;
-        };
-        let epoch = HOLD_EPOCH.load(Ordering::Acquire);
-        PREWAKE_LIVE.store(true, Ordering::Release);
-        for pool in [ab_pool, c_pool] {
-            pool.spawn_broadcast(move |_| hold_for(epoch, PREWAKE_LIMIT, true));
-        }
-    }
-
-    struct Done<'a>(&'a AtomicBool);
-    impl Drop for Done<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    pub fn run_both<A, B, RA, RB>(
-        ab_pool: &rayon::ThreadPool,
-        c_pool: &rayon::ThreadPool,
-        ab: A,
-        c: B,
-    ) -> (RA, RB)
-    where
-        A: FnOnce() -> RA + Send,
-        B: FnOnce() -> RB + Send,
-        RA: Send,
-        RB: Send,
-    {
-        let c_done = AtomicBool::new(false);
-        let mut ra = None;
-        let mut rb = None;
-        // The AB pool's thread i runs on the same CPU as global worker i.
-        let owner_idx = rayon::current_thread_index();
-        {
-            let (ra_slot, rb_slot, c_done_ref) = (&mut ra, &mut rb, &c_done);
-            c_pool.in_place_scope(|sc| {
-                // The longer arm first.
-                sc.spawn(move |_| {
-                    let _d = Done(c_done_ref);
-                    *rb_slot = Some(c());
-                });
-                // rayon's own wait until the AB arm has finished.
-                ab_pool.in_place_scope(|sa| {
-                    sa.spawn(move |_| {
-                        *ra_slot = Some(ab());
-                        if corewarm_enabled() {
-                            let epoch = HOLD_EPOCH.load(Ordering::Acquire);
-                            ab_pool.spawn_broadcast(move |ctx| {
-                                if Some(ctx.index()) != owner_idx {
-                                    hold(epoch);
-                                }
-                            });
-                        }
-                    });
-                    // Both arms are injected: release any pre-woken holders
-                    // so they pick the arms up without a wake-up.
-                    if PREWAKE_LIVE.swap(false, Ordering::AcqRel) {
-                        HOLD_EPOCH.fetch_add(1, Ordering::Release);
-                    }
-                });
-                let t0 = Instant::now();
-                while !c_done_ref.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                    for _ in 0..32 {
-                        core::hint::spin_loop();
-                    }
-                    if t0.elapsed() > SPIN_LIMIT {
-                        break;
-                    }
-                }
-                HOLD_EPOCH.fetch_add(1, Ordering::Release);
-            });
-        }
-        (
-            ra.expect("round-one AB arm finished"),
-            rb.expect("round-one C arm finished"),
-        )
-    }
-}
 
 pub mod hot_pool {
     use std::sync::Arc;

@@ -226,10 +226,8 @@ pub fn commit_into(
 ///
 /// # Safety
 /// The callback must initialize every field of `z_packed` using only the
-/// supplied pointer. For group 0..1024, the role 0 and role 1 calls between
-/// them run every octa kpair in 0..32 exactly once: `(role..32).step_by(2)`
-/// each on the materialize-first fallback, any split when a staging target
-/// is supplied. A kpair owns rows `q*2^17+k*2^11+r` for all
+/// supplied pointer. For group 0..1024 and role 0..2, its octa kpair values
+/// are `(role..32).step_by(2)`. It owns rows `q*2^17+k*2^11+r` for all
 /// q=0..4, k in {2*kpair,2*kpair+1}, and r in {2*group,2*group+1}; every
 /// row contains 64 fields. Proven initialized constants may be retained, but stale
 /// data-dependent fields must be overwritten. Calls can overlap. They may
@@ -997,9 +995,7 @@ pub(crate) fn fused_encode_leaves_subtree(
         let out = unsafe {
             core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(range.start), range.len())
         };
-        crate::rstrace::evd("cb:start", range.start as u32);
         merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
-        crate::rstrace::evd("cb:leaves", range.start as u32);
         if !subtree_parents {
             return;
         }
@@ -1051,7 +1047,6 @@ pub(crate) fn fused_encode_leaves_subtree(
             lvl_read_off = write_off;
             lvl_read_len = write_len;
         }
-        crate::rstrace::evd("cb:end", range.start as u32);
     });
     match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,

@@ -98,18 +98,6 @@ pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
 /// same-binary control; the ranked worker's cleared environment never sets
 /// it. Cascade level 2 requires the lookahead itself to be on.
 #[inline]
-/// Cascade level of the deeper tail cascade (`FLOCK_ZC_C3_AT`, 1 or 2;
-/// default 2). `FLOCK_NO_ZC_C3=1` turns the deeper cascade off.
-fn zc_c3_at() -> usize {
-    static AT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        match std::env::var("FLOCK_ZC_C3_AT").ok().as_deref() {
-            Some("1") => 1,
-            _ => 2,
-        }
-    });
-    *AT
-}
-
 fn cascade2_off() -> bool {
     #[cfg(test)]
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
@@ -682,9 +670,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             // the incumbent `rayon::join` whenever the pools are absent.
             let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
-                    Some((ab_pool, c_pool)) if crate::r1_owner_awake::enabled() => {
-                        crate::r1_owner_awake::run_both(ab_pool, c_pool, ab_closure, c_closure)
-                    }
                     Some((ab_pool, c_pool)) => {
                         rayon::join(|| ab_pool.install(ab_closure), || c_pool.install(c_closure))
                     }
@@ -1014,58 +999,30 @@ fn prove_packed_padded_inner<C: Challenger>(
         && n_mlv >= 7 + off
         && r[k_skip + 3 + off] != F128::ZERO
         && !cascade2_off();
-    // Deeper tail cascade (`FLOCK_NO_ZC_C3`): the level before cascade level
-    // `c3_at` also defers the round two ahead of its message as a biquadratic
-    // (`casc`), so level `c3_at` folds three variables and every later level
-    // sits one more variable on (`off2`). `c3_at = 1`
-    // (`FLOCK_ZC_C3_AT=1`): the rounds 3+4+5 pass emits round seven and the
-    // first plain level folds (ρ₄, ρ₅, ρ₆); `c3_at = 2` (default): the first
-    // plain level emits round nine and the second one folds (ρ₆, ρ₇, ρ₈).
-    let r345_b_canonical = r2_canon_rows.is_some()
-        && padding.k_log == 14
-        && padding.useful_bits_per_block == 15_409
-        && m >= k_skip + 8
-        && multilinear::round2_canonical_elide_enabled();
-    let c3_at = zc_c3_at();
-    let c3_r345 = c3_at == 1
-        && use_cascade2
-        && use_3var
-        && r345_b_canonical
-        && n_mlv >= 16
-        && r[k_skip + 5] != F128::ZERO
-        && multilinear::three_var::casc_route_enabled();
     let use_cascade3 = use_cascade2
-        && n_mlv >= 8 + off + c3_r345 as usize
-        && r[k_skip + 5 + off + c3_r345 as usize] != F128::ZERO
+        && n_mlv >= 8 + off
+        && r[k_skip + 5 + off] != F128::ZERO
         && !cascade3_off();
-    let c3_tail = c3_at == 2
-        && use_cascade3
-        && use_3var
-        && n_mlv >= 16
-        && r[k_skip + 6 + off] != F128::ZERO
-        && multilinear::fold2_plain_casc_route_ok(1usize << (n_mlv - 3));
-    let c3 = c3_r345 || c3_tail;
-    let off2 = off + c3 as usize;
     // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain; with
     // ZC-3VAR every level sits one variable later (`off`).
     let use_cascade4 = use_cascade3
-        && n_mlv >= 10 + off2
-        && r[k_skip + 7 + off2] != F128::ZERO
+        && n_mlv >= 10 + off
+        && r[k_skip + 7 + off] != F128::ZERO
         && !cascade4_off();
     let use_cascade5 = use_cascade4
-        && n_mlv >= 12 + off2
-        && r[k_skip + 9 + off2] != F128::ZERO
+        && n_mlv >= 12 + off
+        && r[k_skip + 9 + off] != F128::ZERO
         && !cascade5_off();
     let use_cascade6 = use_cascade5
-        && n_mlv >= 14 + off2
-        && r[k_skip + 11 + off2] != F128::ZERO
+        && n_mlv >= 14 + off
+        && r[k_skip + 11 + off] != F128::ZERO
         && !deep_cascade_off();
-    let use_cascade7 = use_cascade6 && n_mlv >= 16 + off2 && r[k_skip + 13 + off2] != F128::ZERO;
-    let use_cascade8 = use_cascade7 && n_mlv >= 18 + off2 && r[k_skip + 15 + off2] != F128::ZERO;
-    let use_cascade9 = use_cascade8 && n_mlv >= 20 + off2 && r[k_skip + 17 + off2] != F128::ZERO;
-    let use_cascade10 = use_cascade9 && n_mlv >= 22 + off2 && r[k_skip + 19 + off2] != F128::ZERO;
-    let use_cascade11 = use_cascade10 && n_mlv >= 24 + off2 && r[k_skip + 21 + off2] != F128::ZERO;
-    let use_cascade12 = use_cascade11 && n_mlv >= 26 + off2 && r[k_skip + 23 + off2] != F128::ZERO;
+    let use_cascade7 = use_cascade6 && n_mlv >= 16 + off && r[k_skip + 13 + off] != F128::ZERO;
+    let use_cascade8 = use_cascade7 && n_mlv >= 18 + off && r[k_skip + 15 + off] != F128::ZERO;
+    let use_cascade9 = use_cascade8 && n_mlv >= 20 + off && r[k_skip + 17 + off] != F128::ZERO;
+    let use_cascade10 = use_cascade9 && n_mlv >= 22 + off && r[k_skip + 19 + off] != F128::ZERO;
+    let use_cascade11 = use_cascade10 && n_mlv >= 24 + off && r[k_skip + 21 + off] != F128::ZERO;
+    let use_cascade12 = use_cascade11 && n_mlv >= 26 + off && r[k_skip + 23 + off] != F128::ZERO;
     let n_levels = match (
         use_lookahead,
         use_cascade2,
@@ -1101,7 +1058,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2·levels needs no other change.
     let mut la = lookahead;
-    let mut la7: Option<multilinear::Round4Lookahead> = None;
     // Lane-major level handoff (`zc_lane_major_handoff_on`), resolved once;
     // `lm_in` carries the layout the previous level stored.
     let lm_handoff = zc_lane_major_handoff_on();
@@ -1109,17 +1065,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Level offset: with ZC-3VAR, levels ≥ 1 sit one variable later.
-        let lo_off = if level == 0 {
-            0
-        } else if level <= c3_at {
-            off
-        } else {
-            off2
-        };
-        // Cascade level `c3_at` folds three variables; the level before it
-        // emits the biquadratic (`casc`).
-        let c3_level = c3 && level == c3_at;
-        let casc_level = c3_tail && level + 1 == c3_at;
+        let lo_off = if level == 0 { 0 } else { off };
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
         multilinear_msgs.push((m_odd_1, m_odd_inf));
@@ -1134,19 +1080,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             challenger.observe_f128(ginf);
             mlv_rhos.push(challenger.sample_f128());
         }
-        if c3_level {
-            // Round seven from the r345 pass's biquadratic at (ρ₄, ρ₅). No pass.
-            let la = la7.take().expect("deeper cascade without its round-seven lookahead");
-            let (g1, ginf) = eval_round4_lookahead(
-                &la,
-                mlv_rhos[2 * level + lo_off],
-                mlv_rhos[2 * level + 1 + lo_off],
-            );
-            multilinear_msgs.push((g1, ginf));
-            challenger.observe_f128(g1);
-            challenger.observe_f128(ginf);
-            mlv_rhos.push(challenger.sample_f128());
-        }
 
         // Rounds 2L+3 and 2L+4 fold together in one pass (ρ_{2L+1} and
         // ρ_{2L+2} at once), replacing tail iterations i = 2L and i = 2L+1.
@@ -1156,8 +1089,8 @@ fn prove_packed_padded_inner<C: Challenger>(
         let t_round = std::time::Instant::now();
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         let log_n_cur = n_cur.trailing_zeros() as usize;
-        let quarter = if (level == 0 && use_3var) || c3_level { n_cur / 8 } else { n_cur / 4 };
-        let shift = if (level == 0 && use_3var) || c3_level { 3 } else { 2 };
+        let quarter = if level == 0 && use_3var { n_cur / 8 } else { n_cur / 4 };
+        let shift = if level == 0 && use_3var { 3 } else { 2 };
         let mut r_next = vec![F128::ONE; log_n_cur - shift];
         r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 1 + shift + lo_off..]);
         // This level may store lane-major tiles only for another lookahead
@@ -1182,19 +1115,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             let lm_out = lm_reader_ok
                 && cfg!(target_arch = "x86_64")
                 && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
-            // The ranked brand round two's canonical-window elision ran on:
-            // the same static B rows let this pass skip them too.
-            let b_canonical = r2_canon_rows.is_some()
-                && padding.k_log == 14
-                && padding.useful_bits_per_block == 15_409
-                && m >= k_skip + 8
-                && multilinear::round2_canonical_elide_enabled();
-            if zc_timing {
-                eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical} c3={c3}");
-            }
-            debug_assert!(!c3_r345 || b_canonical == r345_b_canonical);
-            let (m1, mi, la_next, la7_next) =
-                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+            let (m1, mi, la_next) =
+                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
                     a_packed,
                     b_packed,
                     m,
@@ -1206,19 +1128,14 @@ fn prove_packed_padded_inner<C: Challenger>(
                     [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]],
                     &r_next,
                     eq_override,
-                    lm_out && !c3_r345,
-                    b_canonical,
-                    c3_r345,
+                    lm_out,
                 );
-            assert_eq!(la7_next.is_some(), c3_r345, "deeper cascade route did not run");
-            la7 = la7_next;
             a_mlv = a8;
             b_mlv = b8;
             if level + 1 < n_levels {
                 la = Some(la_next);
             }
-            // With c3_r345 the tables are octet-layout; level 1 reads them as such.
-            (m1, mi, lm_out && !c3_r345)
+            (m1, mi, lm_out)
         } else if level == 0 && use_nomat {
             // Rounds 3+4 straight from the packed witness (see above); the
             // outputs land in freshly taken N/4 buffers, and the old (empty)
@@ -1253,40 +1170,20 @@ fn prove_packed_padded_inner<C: Challenger>(
                 la = Some(la_next);
             }
             (m1, mi, lm_out)
-        } else if c3_level {
-            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
-            let (m1, mi, la_next) = multilinear::fold3_oct_plain_and_round_pair_lookahead_into(
+        } else if level + 1 < n_levels {
+            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0;
+            let (m1, mi, la_next) = fold2_plain_and_round_pair_lookahead_into_lm(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..quarter],
                 &mut b_nxt[..quarter],
-                [mlv_rhos[2 * level + lo_off], mlv_rhos[2 * level + 1 + lo_off], mlv_rhos[2 * level + 2 + lo_off]],
+                mlv_rhos[2 * level + lo_off],
+                mlv_rhos[2 * level + 1 + lo_off],
                 &r_next,
+                lm_in,
                 lm_out,
             );
-            if level + 1 < n_levels {
-                la = Some(la_next);
-            }
-            (m1, mi, lm_out)
-        } else if level + 1 < n_levels {
-            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
-            let (m1, mi, la_next, la7_next) =
-                multilinear::fold2_plain_and_round_pair_lookahead_into_lm_casc(
-                    &a_mlv,
-                    &b_mlv,
-                    &mut a_nxt[..quarter],
-                    &mut b_nxt[..quarter],
-                    mlv_rhos[2 * level + lo_off],
-                    mlv_rhos[2 * level + 1 + lo_off],
-                    &r_next,
-                    lm_in,
-                    lm_out,
-                    casc_level,
-                );
             la = Some(la_next);
-            if casc_level {
-                la7 = la7_next;
-            }
             (m1, mi, lm_out)
         } else {
             debug_assert!(!lm_in, "the last composed level reads row-major pairs");
@@ -1319,9 +1216,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
     }
-    let loop_start = 2 * n_levels
-        + if n_levels > 0 { off } else { 0 }
-        + if n_levels > c3_at { c3 as usize } else { 0 };
+    let loop_start = 2 * n_levels + if n_levels > 0 { off } else { 0 };
 
     for i in loop_start..(n_mlv - 1) {
         let t_round = std::time::Instant::now();

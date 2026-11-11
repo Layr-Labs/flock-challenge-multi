@@ -429,7 +429,7 @@ impl RootTileCache {
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
             std::env::var("FLOCK_ROOT_FOLD_BATCH")
                 .ok().and_then(|s| s.parse().ok())
-                .filter(|n| (1..=4).contains(n)).unwrap_or(3)
+                .filter(|n| (1..=4).contains(n)).unwrap_or(2)
         });
         let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));

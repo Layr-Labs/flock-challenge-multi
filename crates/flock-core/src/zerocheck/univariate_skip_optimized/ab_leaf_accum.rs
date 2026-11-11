@@ -1,8 +1,8 @@
 //! Accumulate the 78 sparse Karatsuba leaves across all 32 windows before
-//! interpolation. The selected groups contain 24 or 27 leaves; the original
-//! six/nine-leaf grouping remains available as a diagnostic control.
-//! Each complete leaf vector is interpolated and converted to GHASH byte
-//! planes once per bank.
+//! interpolation. Small groups of six or nine leaves stay in registers
+//! across all 32 windows. The complete leaf vector is then interpolated
+//! and converted to GHASH planes once per bank.
+//! each bank is interpolated and converted to GHASH byte planes once.
 //! The matrix-family guard and basis conversion come from the declared
 //! polynomial predecessor. Every window contributes its own weighted leaves.
 //! The complete matrix key is checked; incompatible linear maps use the caller's fallback.
@@ -16,7 +16,7 @@ const GROUPS2: [usize; 9] = [6, 9, 9, 9, 9, 9, 9, 9, 9];
 
 // Each group's 32 coefficient rows are contiguous for the register loop.
 // This is an exact permutation of the already-validated coefficient table.
-fn pack_groups(windows: Vec<u64>, groups: &[usize]) -> Vec<u64> {
+fn pack_groups(windows: Vec<u64>, groups: &[usize; 9]) -> Vec<u64> {
     assert_eq!(windows.len(), 32 * 78);
     let mut packed = Vec::with_capacity(windows.len());
     let mut start = 0;
@@ -37,19 +37,9 @@ pub(super) fn enabled() -> bool {
     *ON
 }
 
-// The layout is fixed once per process. Keep one coefficient allocation
-// pair, in the selected grouping, while retaining an exact diagnostic rollback.
-fn grouped_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_AB_MERGED").is_none()
-    });
-    *ON
-}
-
 pub(super) struct Cache {
     key: Vec<u64>,
     tables: Option<(Vec<u64>, Vec<u64>)>,
-    merged: Option<(Vec<u64>, Vec<u64>)>,
     scratch: Vec<u8>,
 }
 
@@ -67,7 +57,6 @@ impl Cache {
         let mut cache = Self {
             key: mats.to_vec(),
             tables: None,
-            merged: None,
             scratch: Vec::new(),
         };
         let mut m0 = Vec::with_capacity(32 * 78);
@@ -103,11 +92,7 @@ impl Cache {
                 }
             }
         }
-        if grouped_enabled() {
-            cache.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
-        } else {
-            cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
-        }
+        cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
         // Keep both leaf banks and the temporary polynomial cache-line aligned.
         cache.scratch = vec![0; SCRATCH_DATA_BYTES + 63];
         cache
@@ -139,9 +124,7 @@ pub(super) fn try_run(
         *cache = Some(Cache::new(mats));
     }
     let cache = cache.as_mut().unwrap();
-    let merged = grouped_enabled();
-    let tables = if merged { &cache.merged } else { &cache.tables };
-    let Some((m0, m2)) = tables else {
+    let Some((m0, m2)) = &cache.tables else {
         return false;
     };
     let raw = cache.scratch.as_mut_ptr();
@@ -160,7 +143,6 @@ pub(super) fn try_run(
             scratch,
             planes.as_mut_ptr(),
             mode,
-            merged,
         );
     }
     true
@@ -182,12 +164,6 @@ unsafe extern "C" {
     fn flock_ab_leaf_interpolate0(leaves: *const u8, polynomial: *mut u8);
     fn flock_ab_leaf_interpolate2(leaves: *const u8, polynomial: *mut u8);
     fn flock_ab_poly_finalize(polynomial: *const u8, basis: *const u64, planes: *mut u8);
-    fn flock_ab_merged_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
-    fn flock_ab_merged_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
-    fn flock_ab_merged_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
-    fn flock_ab_merged_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
-    fn flock_ab_merged_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
-    fn flock_ab_merged_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
 }
 
 #[unsafe(no_mangle)]
@@ -200,19 +176,15 @@ unsafe extern "C" fn flock_ab_poly_band(
     scratch: *mut u8,
     out: *mut u8,
     mode: usize,
-    merged: bool,
 ) {
     // The public caller checked the complete source, tables and output.
     // All leaf accumulators start from zero in registers. The scratch bank
     // is completely overwritten before interpolation, independent of reuse.
     unsafe {
-        let (bank0, bank2): (Bank, Bank) = match (merged, mode) {
-            (false, 0) => (flock_ab_register_bank0_m0, flock_ab_register_bank2_m0),
-            (false, 1) => (flock_ab_register_bank0_m1, flock_ab_register_bank2_m1),
-            (false, 2) => (flock_ab_register_bank0_m2, flock_ab_register_bank2_m2),
-            (true, 0) => (flock_ab_merged_bank0_m0, flock_ab_merged_bank2_m0),
-            (true, 1) => (flock_ab_merged_bank0_m1, flock_ab_merged_bank2_m1),
-            (true, 2) => (flock_ab_merged_bank0_m2, flock_ab_merged_bank2_m2),
+        let (bank0, bank2): (Bank, Bank) = match mode {
+            0 => (flock_ab_register_bank0_m0, flock_ab_register_bank2_m0),
+            1 => (flock_ab_register_bank0_m1, flock_ab_register_bank2_m1),
+            2 => (flock_ab_register_bank0_m2, flock_ab_register_bank2_m2),
             _ => unreachable!(),
         };
         let leaves = scratch;

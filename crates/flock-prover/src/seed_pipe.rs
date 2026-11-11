@@ -537,34 +537,6 @@ const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 // the ranked worker has one serial proof owner, not concurrent sessions.
 static PRESEED_EPOCH: AtomicU64 = AtomicU64::new(0);
 const PRESEED_SPINS_PER_JOB: usize = 2048;
-/// Workers (other than the owner) that have started running the newest spinner broadcast. Reset by each
-/// `preseed_spin_start`; read only by [`wait_spinners_up`].
-static PRESEED_ARRIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// True from just before the final hot wait until the seed line has been read: the pre-seed spinners then stay in
-/// their callback instead of re-spawning (see `preseed_spinner`). Never set when ready-when-hot is disabled.
-static PRESEED_HOLD: AtomicBool = AtomicBool::new(false);
-
-/// Ready-when-hot (system lane): should readiness be announced only once the pre-seed spinners are running?
-/// `FLOCK_NO_READY_WHEN_HOT=1` restores the original order (announce, then start the hot wait).
-fn ready_when_hot_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_READY_WHEN_HOT").is_none()
-}
-
-/// Called by the hot-wait owner right after `preseed_spin_start`: wait, spinning, until every other pool worker
-/// has started its spinner (bounded; UNTIMED, the ready file has not been written yet).
-fn wait_spinners_up() {
-    let want = rayon::current_num_threads().saturating_sub(1);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-    let mut turns = 0u32;
-    while PRESEED_ARRIVED.load(Ordering::Acquire) < want {
-        turns = turns.wrapping_add(1);
-        if turns % 1024 == 0 && std::time::Instant::now() >= deadline {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-}
 
 /// Release the pre-seed spinners. Called once the witness phase is done (and
 /// unconditionally after every body that started them).
@@ -587,8 +559,7 @@ fn preseed_spinner(epoch: u64, owner: usize, backoff: usize) {
     // Even a current callback must return: it can be entered by yield_now
     // above a suspended parallel continuation. Admission also prevents a
     // rescheduled callback from nesting indefinitely inside another spinner.
-    let mut spins = 0usize;
-    loop {
+    for _ in 0..PRESEED_SPINS_PER_JOB {
         if PRESEED_EPOCH.load(Ordering::Acquire) != epoch {
             return;
         }
@@ -596,15 +567,6 @@ fn preseed_spinner(epoch: u64, owner: usize, backoff: usize) {
             for _ in 0..backoff {
                 core::hint::spin_loop();
             }
-        }
-        spins += 1;
-        // Before the seed (PRESEED_HOLD) the callback does not hand over to a re-spawned copy: a re-spawned job
-        // sits on this worker's deque, where another spinner's `yield_now` steals it, runs it nested, fails the
-        // admission check above and drops it, so the chain ends and this worker goes to sleep. Measured: within
-        // about a millisecond most workers were asleep again (7-13 of 16 CPUs halted when the seed arrived).
-        // This callback runs at the top of the worker's stack (admission), so staying in it suspends nothing.
-        if spins >= PRESEED_SPINS_PER_JOB && !PRESEED_HOLD.load(Ordering::Relaxed) {
-            break;
         }
     }
     if PRESEED_EPOCH.load(Ordering::Acquire) == epoch {
@@ -625,11 +587,9 @@ fn preseed_spin_start() {
         return;
     };
     let epoch = (previous + 2) & !1;
-    PRESEED_ARRIVED.store(0, Ordering::Release);
     rayon::spawn_broadcast(move |ctx| {
         let me = ctx.index();
         if me != owner {
-            PRESEED_ARRIVED.fetch_add(1, Ordering::AcqRel);
             preseed_spinner(epoch, owner, if me == sibling { 64 } else { 8 });
         }
     });
@@ -1337,35 +1297,15 @@ fn speculative_main(
             }));
         }
     }
-    // Ready-when-hot. The protected main thread writes the ready file as soon as this signal arrives, and the
-    // harness sends the seed within one poll of seeing it. In the original order (signal, THEN enter the hot wait)
-    // the seed regularly arrived while the pool was still being woken: measured under the ranked harness, 7-12 of
-    // the 16 CPUs were asleep at the seed's arrival in half the trials (whole cores in their deep idle state),
-    // and their first worker got on CPU 0.10-0.24 ms into the timed proof. Signalling from inside the hot wait,
-    // after every spinner has started, moves only the moment readiness is announced; nothing inside the timed
-    // proof changes, and keeping the pool spinning before the seed is what this wait already does.
-    let late_signal = hot && ready_when_hot_enabled();
-    let signal_warm = move || {
+    {
         let (lock, cv) = &*warm;
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
         cv.notify_all();
-    };
-    let mut signal_warm = Some(signal_warm);
-    PRESEED_HOLD.store(late_signal, Ordering::Release);
-    if !late_signal {
-        if let Some(f) = signal_warm.take() {
-            f();
-        }
     }
+    drop(warm);
 
     on_hot_worker(hot, move || {
-        if let Some(f) = signal_warm.take() {
-            wait_spinners_up();
-            f();
-        }
         let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
-        // From here on the spinners behave exactly as before (bounded callbacks that re-spawn).
-        PRESEED_HOLD.store(false, Ordering::Release);
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);

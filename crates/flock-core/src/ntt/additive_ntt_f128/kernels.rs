@@ -225,36 +225,6 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     }
 }
 
-/// Lane rs: half of the rate seed (see the x86 kernel). x86 AVX-512 only.
-///
-/// # Safety
-/// Same contract as the x86 kernel.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(super) unsafe fn seed_half_rows_from_geo(
-    src: *const F128,
-    src_quarter: usize,
-    src_r: usize,
-    dst: *mut F128,
-    dst_quarter: usize,
-    dst_r: usize,
-    num_ntts: usize,
-    t_outer: F128,
-    t_inner: F128,
-    h: usize,
-) {
-    unsafe {
-        x86_64::seed_half_rows_from_geo(
-            src, src_quarter, src_r, dst, dst_quarter, dst_r, num_ntts, t_outer, t_inner, h,
-        )
-    }
-}
-
 /// Process one fused-two-layer row group from a separate source buffer.
 ///
 /// # Safety
@@ -1187,19 +1157,3 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
 #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
 #[inline(always)]
 pub(super) unsafe fn seed_window_prepared(src:*const F128,src_quarter:usize,src_r:usize,dst_sparse:*mut F128,dst_dense:*mut F128,source_cols:usize,active:usize,prepared:&[F128;8]){unsafe{x86_64::seed_window_prepared(src,src_quarter,src_r,dst_sparse,dst_dense,source_cols,active,prepared)}}
-
-#[cfg(all(
-    test,
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "vpclmulqdq"
-))]
-pub(super) use x86_64::RAW7_PACK_HITS;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "vpclmulqdq"
-))]
-pub(super) use x86_64::rows_raw7_s8;
