@@ -636,7 +636,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
-    flock_core::gaptime::mark("open: begin");
+    flock_core::gaptime::mark("open: begin"); flock_core::rstrace::ev("open:begin", 0);
     // Publish-prefix pre-encode: commitment / zerocheck / lincheck are
     // transcript-final here, so their serialization (plus the 460 kB output
     // allocation) runs on a detached helper thread concurrently with the
@@ -685,10 +685,13 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
             &lig_config,
             challenger,
         );
+        flock_core::rstrace::ev("pv:opened", 0);
         flock_core::gaptime::abs("open done");
         crate::seed_pipe::tail_spin_start();
+        flock_core::rstrace::ev("pv:spin", 0);
         opened
     });
+    flock_core::rstrace::ev("pv:inpool", 0);
     // The open consumed (or densified) any elided-z registration; drop a
     // stale one defensively so a recycled buffer can never match it.
     flock_core::pcs::elided_z::forget(z_key.0, z_key.1);
@@ -952,11 +955,14 @@ fn build_root_source(
             TileRegen::owned(tiles.take().expect("elided z keeps its tiles")).materialize(z_packed);
             return None;
         };
+        flock_core::rstrace::ev("br:tiles", 0);
         if !lincheck::RootFoldSource::splice_eligible(z_packed.len(), k_log, plan) {
             zr_trace("splice ineligible");
             TileRegen::owned(tiles.take().expect("elided z keeps its tiles")).materialize(z_packed);
         }
+        flock_core::rstrace::ev("br:eligible", 0);
         let source = lincheck::RootFoldSource::new(z_packed, k_log, plan);
+        flock_core::rstrace::ev("br:new", 0);
         let mut installed = false;
         if let Some(tiles) = tiles {
             match source.try_install_witness_root_tiles(z_packed, tiles) {
@@ -967,6 +973,7 @@ fn build_root_source(
                 }
             }
         }
+        flock_core::rstrace::ev("br:installed", 0);
         let source = std::sync::Arc::new(source);
         if installed {
             flock_core::pcs::elided_z::install(
@@ -1103,6 +1110,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // start today's one-shot fold. Guard keeps `z_packed` live until
     // lincheck waits (before fold_alpha). Stripe path does not prepare.
     let mut z_packed = z_packed;
+    flock_core::rstrace::ev("tz:roots0", 0);
     let roots = if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
         build_root_source(
             &mut z_packed,
@@ -1113,6 +1121,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     } else {
         None
     };
+    flock_core::rstrace::ev("pv:roots", 0);
     // Elided witness: zerocheck must take the identity-C root fold, the
     // only round-one route that never reads z itself.
     if flock_core::pcs::elided_z::is_elided(&z_packed)
@@ -1126,6 +1135,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         flock_core::pcs::elided_z::ensure_dense(&mut z_packed, "zerocheck");
     }
     let z_packed = z_packed;
+    flock_core::rstrace::ev("tz:roots1", 0);
     // The handoff slot is thread-local and zerocheck/lincheck run on other
     // workers, so on the incumbent (non-worker caller) path the kick and wait
     // never see this prepare and lincheck folds inline. A pool-owner caller
@@ -1151,9 +1161,11 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // row-major drain): round one folds the packed witness directly.
     let c_identity_z: Option<&[F128]> =
         ranked_identity_c_fold_enabled(r1cs).then_some(z_packed.as_slice());
+    flock_core::rstrace::ev("tz:lastrho", 0);
     let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
+        flock_core::rstrace::ev("tz:zcpool", 0);
         flock_core::in_pool(|| {
-            flock_core::gaptime::mark("zerocheck: pool entered");
+            flock_core::gaptime::mark("zerocheck: pool entered"); flock_core::rstrace::ev("zc:enter", 0);
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
                 std::slice::from_raw_parts(
@@ -1198,7 +1210,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     flock_core::gaptime::mark("a/b recycled to scratch pool");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-    flock_core::gaptime::mark("x_ab built");
+    flock_core::gaptime::mark("x_ab built"); flock_core::rstrace::ev("xab", 0);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
@@ -1209,7 +1221,9 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
     let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| {
+        flock_core::rstrace::ev("lc:inpool", 0);
         let _hot = flock_core::hot_pool::HotPool::start();
+        flock_core::rstrace::ev("lc:hot", 0);
         match lincheck_input {
             FastLincheckInput::Stripe(z_packed_lincheck) => {
                 let result = lincheck::prove_padded_capture_z_vec_mode(
@@ -1245,7 +1259,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         }
     });
     drop(roots);
-    flock_core::gaptime::mark("lincheck: done");
+    flock_core::gaptime::mark("lincheck: done"); flock_core::rstrace::ev("lc:done", 0);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

@@ -1349,7 +1349,7 @@ pub(crate) fn prepare_ranked_closed_window_preps(
             target_feature = "avx512vbmi",
             target_feature = "gfni"
         ))]
-        tables: xor_projection::Tables::new(inv_table),
+        tables: xor_projection::Tables::cached(inv_table),
     }
 }
 

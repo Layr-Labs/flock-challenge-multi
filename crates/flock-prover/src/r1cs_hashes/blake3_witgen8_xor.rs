@@ -8,6 +8,24 @@ use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_
 #[repr(align(64))]
 pub(super) struct Tables([u64; 8 * 128]);
 impl Tables {
+    /// Lane v2: [`Self::new`] is a pure function of the inverse-NTT table,
+    /// which the ranked path shares process-wide; derive it once (in the
+    /// untimed warm-up) instead of serially at the start of every prove,
+    /// before the first parallel work. Keyed by the table's data pointer;
+    /// any other table falls back to `new`. `FLOCK_NO_V2_XTAB_CACHE=1`
+    /// restores the per-prove build.
+    pub(super) fn cached(table: &InvNttTableByteSingleGf8) -> Self {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_V2_XTAB_CACHE").is_some());
+        static C: std::sync::OnceLock<(usize, Tables)> = std::sync::OnceLock::new();
+        if *OFF {
+            return Self::new(table);
+        }
+        let key = table.data_ptr() as usize;
+        let c = C.get_or_init(|| (key, Self::new(table)));
+        if c.0 == key { Self(c.1.0) } else { Self::new(table) }
+    }
+
     pub(super) fn new(table: &InvNttTableByteSingleGf8) -> Self {
         assert_eq!(table.ell, 64);
         // Bank k absorbs the Horner weight 2^k into the linear A map.

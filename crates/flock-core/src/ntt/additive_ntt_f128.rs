@@ -499,6 +499,29 @@ fn merged_pass_enabled() -> bool {
     *ON
 }
 
+/// Lane v2: deep-pass tail block stealing. The last `2 * pairs` sub-groups
+/// publish their sixteen post-sweep-1 blocks through a per-producer claim
+/// word, so a producer that has run out of sub-groups runs the remaining
+/// per-block layers (and the block's leaf hash) of a sub-group still in
+/// flight instead of idling on the last owner. Same butterflies, twiddles
+/// and per-block order; leaves are written by index and subgroup parents are
+/// folded by whichever worker retires the last block, so the bytes are
+/// identical. `FLOCK_NO_V2_DSTEAL=1` restores the incumbent tail;
+/// `FLOCK_V2_DSTEAL_ALL=1` lets the hash workers steal too (diagnostic).
+#[cfg(target_os = "linux")]
+fn v2_dsteal_mode() -> u8 {
+    static M: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_V2_DSTEAL").is_some() {
+            0
+        } else if std::env::var_os("FLOCK_V2_DSTEAL_ALL").is_some() {
+            2
+        } else {
+            1
+        }
+    });
+    *M
+}
+
 #[cfg(target_os = "linux")]
 fn deep_split_depth() -> usize {
     static D: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -1654,6 +1677,7 @@ fn st_fmp_run_claimed(
     assert!((2..=ST_FMP_CAP).contains(&nbuf));
     assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
     let balanced = balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
+    crate::rstrace::ev("st:setup", 0);
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
     {
@@ -1697,6 +1721,7 @@ fn st_fmp_run_claimed(
         if idx >= 2 * n_pairs {
             return;
         }
+        crate::rstrace::evd("st:body", idx as u32);
         // Sibling `.0` of each core seeds and publishes; sibling `.1` folds.
         // Under the balanced hand-off each also runs the other's stage once
         // per group.
@@ -1750,11 +1775,13 @@ fn st_fmp_run_claimed(
                     }
                     epoch += 1;
                     let group = st.group.load(Ordering::Relaxed);
+                    crate::rstrace::evd("f:ann", group as u32);
                     produce(group, 1,
                         st.producer_output[0].load(Ordering::Relaxed) as *mut F128,
                         st.producer_output[1].load(Ordering::Relaxed) as *mut F128);
                     unsafe { core::arch::x86_64::_mm_sfence() };
                     st.witness_done.store(epoch, Ordering::Release);
+                    crate::rstrace::evd("f:prod", group as u32);
                 }
                 loop {
                     if st.seeded.load(Ordering::Acquire) > i {
@@ -1776,15 +1803,18 @@ fn st_fmp_run_claimed(
                 // task `i`, so every staging byte this fold reads is
                 // published; and that sibling cannot reuse slot `s` until it
                 // acquires the `folded` release below.
+                crate::rstrace::evd("f:seeded", i as u32);
                 unsafe {
                     fold(bufp.add(s * stride), *st.slot_r[s].get());
                 }
+                crate::rstrace::evd("f:fold", i as u32);
                 if balanced {
                     // SAFETY: this sibling just folded the slot and still
                     // owns it; M+P reuses it only after the release below.
                     unsafe {
                         publish(bufp.add(s * stride), *st.slot_r[s].get());
                     }
+                    crate::rstrace::evd("f:pub", i as u32);
                     st.folded.store(i + 1, Ordering::Release);
                     // The group's second task is M+P's to fold and publish.
                     i += 2;
@@ -1816,6 +1846,7 @@ fn st_fmp_run_claimed(
         // SAFETY: the reservation bounds above cover the complete payload;
         // consumers only receive pointers inside these same owned slots.
         let bufp = unsafe { staging.as_mut_ptr().add(stage_offset) };
+        crate::rstrace::evd("st:staged", idx as u32);
         st.bufp.store(bufp as usize, Ordering::Release);
         // Declared AFTER the staging allocation so it drops BEFORE it: on a
         // panic the fold sibling may still be reading a published block, and
@@ -1866,17 +1897,22 @@ fn st_fmp_run_claimed(
                 if seeded >= 4 {
                     let s = (seeded - 3) % nbuf;
                     publish(bufp.add(s * stride), *st.slot_r[s].get());
+                    crate::rstrace::evd("mp:pub", (seeded - 3) as u32);
                 }
                 let s = (seeded - 1) % nbuf;
                 fold(bufp.add(s * stride), *st.slot_r[s].get());
+                crate::rstrace::evd("mp:fold", (seeded - 1) as u32);
             }
-            st.wait_folded(seeded - 1)
+            let ok = st.wait_folded(seeded - 1);
+            crate::rstrace::evd("mp:fwait", (seeded - 1) as u32);
+            ok
         };
         loop {
             let first_r = next.fetch_add(group_width, Ordering::Relaxed);
             if first_r >= n_tasks {
                 break;
             }
+            crate::rstrace::evd("mp:claim", first_r as u32);
             if let Some(produce) = produce {
                 if balanced {
                     if i >= 2 && !balanced_cycle(i) { return; }
@@ -1897,6 +1933,7 @@ fn st_fmp_run_claimed(
                 st.announced.store(epoch, Ordering::Release);
                 produce(first_r / 2, 0, output0, output1);
                 unsafe { core::arch::x86_64::_mm_sfence() };
+                crate::rstrace::evd("mp:prod", (first_r / 2) as u32);
                 while st.witness_done.load(Ordering::Acquire) < epoch {
                     if st.f_gone.load(Ordering::Acquire) {
                         // A callback on F unwound. Broadcast propagates it;
@@ -1905,6 +1942,7 @@ fn st_fmp_run_claimed(
                     }
                     std::hint::spin_loop();
                 }
+                crate::rstrace::evd("mp:pjoin", (first_r / 2) as u32);
             }
             for r in first_r..(first_r + group_width).min(n_tasks) {
                 if !balanced && i - published == nbuf {
@@ -1937,6 +1975,7 @@ fn st_fmp_run_claimed(
                 unsafe {
                     publish(bufp.add(s * stride), *st.slot_r[s].get());
                 }
+                crate::rstrace::evd("mp:pub", (i - 1) as u32);
             }
             return;
         }
@@ -1964,6 +2003,7 @@ fn st_fmp_run_claimed(
     if prewake_at != 0 {
         crate::r1_owner_awake::prewake_reset();
     }
+    crate::rstrace::ev("st:bcast", 0);
     rayon::broadcast(|ctx| {
         let idx = ctx.index();
         if idx >= n_workers {
@@ -1977,6 +2017,7 @@ fn st_fmp_run_claimed(
         impl Drop for Arrive<'_> {
             fn drop(&mut self) {
                 use std::sync::atomic::Ordering;
+                crate::rstrace::evd("st:arrive", 0);
                 if std::thread::panicking() {
                     self.poisoned.store(true, Ordering::Release);
                 }
@@ -1996,12 +2037,14 @@ fn st_fmp_run_claimed(
         while arrived.load(Ordering::Acquire) < n_workers {
             std::hint::spin_loop();
         }
+        crate::rstrace::evd("dp:go", idx as u32);
         // A seed+top worker panicked: skip the deep pass; the panic
         // propagates out of this broadcast and no proof is produced.
         if poisoned.load(Ordering::Acquire) {
             return;
         }
         after(idx);
+        crate::rstrace::evd("dp:ret", idx as u32);
         if prewake_at != 0 {
             crate::r1_owner_awake::prewake_arrive(prewake_at);
         }
@@ -2489,13 +2532,21 @@ impl AdditiveNttF128 {
                 // that transforms and hashes it (no seed pass, no NT round
                 // trip through DRAM). The half case costs 3 products per 2
                 // rows instead of 2.
-                let n_top = Self::interleaved_n_top(log_d, num_ntts);
+                let mut n_top = Self::interleaved_n_top(log_d, num_ntts);
+                // Lane lf1 (`FLOCK_LF1_SMALL_NTOP=k`, off by default): the
+                // log_d 10-11 commit as 2^k seed-in-sub deep tasks.
+                let mut force = None;
+                let small = lf1_small_ntop();
+                if small != 0 && n_top == 0 && (10..12).contains(&log_d) {
+                    n_top = small;
+                    force = Some(small);
+                }
                 if rs_seed_sub_enabled()
-                    && log_d >= 12
+                    && (log_d >= 12 || force.is_some())
                     && n_top >= 1
                     && n_top <= log_inv_rate + 1
                     && num_ntts == 8
-                    && msg.len() / num_ntts >= 32
+                    && msg.len() / num_ntts >= if force.is_some() { 8 } else { 32 }
                 {
                     crate::rstrace::ev("seed:start", log_d as u32);
                     crate::rstrace::ev("seed:end", log_d as u32);
@@ -2506,7 +2557,7 @@ impl AdditiveNttF128 {
                         None,
                         Some(on_range_done),
                         None,
-                        None,
+                        force,
                         Some((msg, log_inv_rate)),
                     );
                     return;
@@ -2740,7 +2791,12 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ))]
-        let use_nt = dst % 16 == 0 && num_ntts.is_multiple_of(4) && seed_nt_enabled();
+        // Lane lf1: a cache-sized codeword (the 128 KiB last recursive commit)
+        // is read back at once by the next layer: keep it in cache.
+        let use_nt = dst % 16 == 0
+            && num_ntts.is_multiple_of(4)
+            && seed_nt_enabled()
+            && !(codeword.len() <= (1 << 16) && lf1_small_enabled());
         let twiddles = &twiddles;
         let seed_row = |r| unsafe {
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -4098,6 +4154,28 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Lane lf1: [`Self::forward_transform_interleaved_scalar_from_layer`]
+    /// with each block's row pair through the SIMD row-pair kernel (same
+    /// butterflies, twiddles and per-lane order). The smallest recursive
+    /// commit (2^10 positions, one layer after its seed) ran 4096 scalar
+    /// butterflies here.
+    pub(crate) fn forward_transform_interleaved_rows_from_layer(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        for layer in start_layer..log_d {
+            let block_size_bytes = num_ntts << (log_d - layer);
+            let half = block_size_bytes >> 1;
+            for (block, chunk) in data.chunks_exact_mut(block_size_bytes).enumerate() {
+                let (top, bot) = chunk.split_at_mut(half);
+                kernels::butterfly_row_pair(top, bot, self.twiddle(layer, block));
+            }
+        }
+    }
+
     /// Parallel + NEON interleaved forward NTT. Cache-blocks the same way as
     /// `forward_transform_batched`: top layers process the full SoA buffer with
     /// per-block parallelism; deep layers process each sub-NTT-group in cache.
@@ -4298,7 +4376,11 @@ impl AdditiveNttF128 {
             self.seed_rate_half_layers_1_through_2(msg, data, num_ntts);
         }
         if n_top == 0 || log_d < 8 {
-            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            if lf1_small_enabled() {
+                self.forward_transform_interleaved_rows_from_layer(data, num_ntts, start_layer);
+            } else {
+                self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            }
             let n_positions = n_total / num_ntts;
             if let Some(cb) = on_sub_done {
                 cb(0..n_positions, data);
@@ -4642,6 +4724,66 @@ impl AdditiveNttF128 {
             .map(|(pairs, _)| DeepSplitState::new(pairs.len()));
         #[cfg(target_os = "linux")]
         let deep_base_addr = data.as_mut_ptr() as usize;
+        // Lane v2 tail stealing: one claim word per producer slot,
+        // `sub << 8 | next_block`, or NONE while no sub-group is open.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let dsteal = if split_claim.is_some() && fuse_blocks && seed_sub.is_none() && deep_share_enabled() {
+            v2_dsteal_mode()
+        } else {
+            0
+        };
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let dsteal = 0u8;
+        const DSTEAL_NONE: u64 = u64::MAX;
+        #[cfg(target_os = "linux")]
+        let dsteal_words: Vec<std::sync::atomic::AtomicU64> = if dsteal != 0 {
+            split_claim
+                .as_ref()
+                .map(|(p, _)| (0..p.len()).map(|_| std::sync::atomic::AtomicU64::new(DSTEAL_NONE)).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        #[cfg(target_os = "linux")]
+        let dsteal_words = &dsteal_words;
+        // Sweep-1 row chunks completed per open sub-group (per slot).
+        #[cfg(target_os = "linux")]
+        let dsteal_done: Vec<std::sync::atomic::AtomicU32> =
+            (0..dsteal_words.len()).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        #[cfg(target_os = "linux")]
+        let dsteal_done = &dsteal_done;
+        // Word = sub << 16 | phase << 8 | next. Phase 0: sweep-1 row chunks
+        // (DSTEAL_NCH of them); phase 1: the sixteen per-block passes.
+        const DSTEAL_NCH: u64 = 8;
+        const DSTEAL_BLK: u64 = 1 << 8;
+        #[cfg(target_os = "linux")]
+        let dsteal_claim = |w: &std::sync::atomic::AtomicU64| -> Option<(usize, bool, usize)> {
+            use std::sync::atomic::Ordering;
+            let mut cur = w.load(Ordering::Acquire);
+            loop {
+                if cur == DSTEAL_NONE {
+                    return None;
+                }
+                let blk = cur & DSTEAL_BLK != 0;
+                if (cur & 0xff) >= if blk { 16 } else { DSTEAL_NCH } {
+                    return None;
+                }
+                match w.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Some(((cur >> 16) as usize, blk, (cur & 0xff) as usize)),
+                    Err(v) => cur = v,
+                }
+            }
+        };
         #[cfg(target_os = "linux")]
         let deep_role = |idx: usize| {
             use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4710,11 +4852,51 @@ impl AdditiveNttF128 {
                 // this read.
                 let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
+                crate::rstrace::evd("hb:s", (b.lo / DeepBlock::ROWS) as u32);
                 cb(b.lo..b.lo + DeepBlock::ROWS, blk);
+                crate::rstrace::evd("hb:e", (b.lo / DeepBlock::ROWS) as u32);
             };
             // Shared drain: own ring first, then every other pair's, until
             // all producers are done and every ring is empty.
+            let steal_here = dsteal == 2 || (dsteal == 1 && producer);
             let help = |own: usize| loop {
+                if steal_here {
+                    let mut got = None;
+                    for k in 0..n_pairs {
+                        let ws = (own + k) % n_pairs;
+                        if let Some(c) = dsteal_claim(&dsteal_words[ws]) {
+                            got = Some((ws, c));
+                            break;
+                        }
+                    }
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    if let Some((ws, (i, blk, b))) = got {
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(i * sub_bytes) };
+                        if blk {
+                            crate::rstrace::evd("ds:steal", (i * 16 + b) as u32);
+                            // SAFETY: block `b` of sub-group `i` was claimed by
+                            // exactly one worker after its sweep 1 joined
+                            // (release on the claim word, acquire in the claim).
+                            unsafe {
+                                self.v2_deep_block_x86(
+                                    i, b, sp, cb,
+                                    n_top, log_d, num_ntts, odd_tail, raw7_pack, sub_size_positions, hint,
+                                );
+                            }
+                        } else {
+                            crate::rstrace::evd("ds:chunk", (i * 16 + b) as u32);
+                            let per = (sub_size_positions >> 4) / DSTEAL_NCH as usize;
+                            // SAFETY: rows b*per..(b+1)*per of sweep 1, claimed
+                            // exactly once; the owner joins on the count below.
+                            unsafe {
+                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                            }
+                            dsteal_done[ws].fetch_add(1, std::sync::atomic::Ordering::Release);
+                        }
+                        continue;
+                    }
+                    let _ = got;
+                }
                 if let Some(b) = queues[own].try_pop() {
                     run(b);
                     continue;
@@ -4756,6 +4938,49 @@ impl AdditiveNttF128 {
                     if i >= n_subs {
                         break;
                     }
+                    crate::rstrace::evd("dp:claim", i as u32);
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    if dsteal != 0 && i + 2 * n_pairs >= n_subs {
+                        use std::sync::atomic::Ordering;
+                        let w = &dsteal_words[slot];
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(i * sub_bytes) };
+                        // SAFETY: sub-group `i` is this worker's alone until
+                        // the claim word below opens its rows / blocks.
+                        if unsafe { self.v2_sweep1_prepared(i, n_top) } {
+                            let per = (sub_size_positions >> 4) / DSTEAL_NCH as usize;
+                            dsteal_done[slot].store(0, Ordering::Relaxed);
+                            w.store((i as u64) << 16, Ordering::Release);
+                            let mut mine = 0u32;
+                            while let Some((si, blk, c)) = dsteal_claim(w) {
+                                debug_assert!(si == i && !blk);
+                                unsafe {
+                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                }
+                                mine += 1;
+                            }
+                            while dsteal_done[slot].load(Ordering::Acquire) + mine < DSTEAL_NCH as u32 {
+                                std::hint::spin_loop();
+                            }
+                        } else {
+                            unsafe {
+                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint);
+                            }
+                        }
+                        w.store((i as u64) << 16 | DSTEAL_BLK, Ordering::Release);
+                        while let Some((si, _, b)) = dsteal_claim(w) {
+                            debug_assert_eq!(si, i);
+                            // SAFETY: block `b` claimed exactly once.
+                            unsafe {
+                                self.v2_deep_block_x86(
+                                    si, b, sp, &enqueue, n_top, log_d, num_ntts, odd_tail, raw7_pack,
+                                    sub_size_positions, hint,
+                                );
+                            }
+                        }
+                        w.store(DSTEAL_NONE, Ordering::Release);
+                        crate::rstrace::evd("dp:subend", i as u32);
+                        continue;
+                    }
                     // SAFETY: `i` is claimed by exactly one worker, so the
                     // sub-group slices are disjoint and in bounds of the
                     // codeword.
@@ -4771,15 +4996,18 @@ impl AdditiveNttF128 {
                             sub_data,
                         );
                     }
+                    crate::rstrace::evd("dp:subend", i as u32);
                 }
                 if share {
                     q.done.store(true, Ordering::Release);
                     guard.counted.set(true);
                     prod_done.fetch_add(1, Ordering::AcqRel);
                     help(slot);
+                    crate::rstrace::evd("dp:hend", 0);
                 }
             } else if share {
                 help(slot);
+                crate::rstrace::evd("dp:hend", 1);
             } else {
                 while let Some(b) = q.pop() {
                     run(b);
@@ -5412,6 +5640,216 @@ impl AdditiveNttF128 {
         )
     }
 
+    /// Lane v2: sweep 1 of [`Self::deep_sub_fused_blocks_fallback`] alone.
+    ///
+    /// # Safety
+    /// `sub_ptr` addresses sub-group `sub_idx` (`sub_size_positions *
+    /// num_ntts` lanes), exclusively owned for the duration of the call.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn v2_deep_sweep1_x86(
+        &self,
+        sub_idx: usize,
+        sub_ptr: *mut F128,
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        sub_size_positions: usize,
+        hint: u8,
+    ) {
+        let sub_data = unsafe { core::slice::from_raw_parts_mut(sub_ptr, sub_size_positions * num_ntts) };
+        let layer = n_top;
+        let block_size = 1usize << (log_d - layer);
+        let sixteenth = block_size >> 4;
+        let global_block = sub_idx;
+        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+        tw[0] = self.twiddle(layer, global_block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+        }
+        butterfly_interleaved_fused_4layer_rows(
+            sub_data,
+            &tw,
+            sixteenth,
+            num_ntts,
+            if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
+            hint,
+        );
+    }
+
+    /// Lane v2: does sweep 1 of sub-group `sub_idx` take the prepared
+    /// fused-four path (the one [`Self::v2_sweep1_rows_x86`] splits)?
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    unsafe fn v2_sweep1_prepared(&self, sub_idx: usize, n_top: usize) -> bool {
+        let layer = n_top;
+        let global_block = sub_idx;
+        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+        tw[0] = self.twiddle(layer, global_block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+        }
+        unsafe { kernels::prepare_four(&tw).is_some() }
+    }
+
+    /// Lane v2: rows `r0..r1` (of `sixteenth`) of sweep 1 on the prepared
+    /// path: the same `row_prepared` calls, hints and order per row as
+    /// `butterfly_interleaved_fused_4layer_rows_x86`.
+    ///
+    /// # Safety
+    /// As [`Self::v2_deep_sweep1_x86`], for the sixteen-row groups `r0..r1`;
+    /// [`Self::v2_sweep1_prepared`] returned true for this sub-group.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn v2_sweep1_rows_x86(
+        &self,
+        sub_idx: usize,
+        sub_ptr: *mut F128,
+        r0: usize,
+        r1: usize,
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        hint: u8,
+    ) {
+        let layer = n_top;
+        let block_size = 1usize << (log_d - layer);
+        let sixteenth = block_size >> 4;
+        let global_block = sub_idx;
+        let mut t = [F128 { lo: 0, hi: 0 }; 15];
+        t[0] = self.twiddle(layer, global_block);
+        for s in 0..2 {
+            t[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+        }
+        for s in 0..4 {
+            t[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+        }
+        for s in 0..8 {
+            t[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+        }
+        let odd_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        let prepared = unsafe { kernels::prepare_four(&t) }.expect("v2_sweep1_prepared checked");
+        let base = sub_ptr;
+        for r in r0..r1 {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            unsafe {
+                if hint == 0 || r + 1 >= sixteenth {
+                    kernels::row_prepared::<0>(base, sixteenth, num_ntts, lanes, r, &t, 0, &prepared);
+                } else if hint == 1 {
+                    kernels::row_prepared::<1>(base, sixteenth, num_ntts, lanes, r, &t, r + 1, &prepared);
+                } else {
+                    kernels::row_prepared::<2>(base, sixteenth, num_ntts, lanes, r, &t, r + 1, &prepared);
+                }
+            }
+        }
+    }
+
+    /// Lane v2: one block (`b` of 16) of the per-block pass of
+    /// [`Self::deep_sub_fused_blocks_fallback`], then its leaf callback.
+    ///
+    /// # Safety
+    /// `sub_ptr` addresses sub-group `sub_idx`; sweep 1 has completed and
+    /// happens-before this call; block `b` is exclusively owned here.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn v2_deep_block_x86(
+        &self,
+        sub_idx: usize,
+        b: usize,
+        sub_ptr: *mut F128,
+        cb: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        raw7_pack: bool,
+        sub_size_positions: usize,
+        hint: u8,
+    ) {
+        let layer4 = n_top + 4;
+        let block_size4 = 1usize << (log_d - layer4);
+        let block_bytes4 = block_size4 * num_ntts;
+        let sixteenth4 = block_size4 >> 4;
+        let layer3 = n_top + 8;
+        let dense_lanes = num_ntts - odd_tail;
+        let g4 = sub_idx * 16 + b;
+        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+        tw[0] = self.twiddle(layer4, g4);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer4 + 1, 2 * g4 + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer4 + 2, 4 * g4 + s);
+        }
+        for s in 0..8 {
+            tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
+        }
+        let blk = unsafe { core::slice::from_raw_parts_mut(sub_ptr.add(b * block_bytes4), block_bytes4) };
+        butterfly_interleaved_fused_4layer_rows_raw7(
+            blk,
+            &tw,
+            sixteenth4,
+            num_ntts,
+            if sixteenth4.is_multiple_of(2) { odd_tail } else { 0 },
+            hint,
+            raw7_pack,
+        );
+        for j in 0..16usize {
+            let g8 = g4 * 16 + j;
+            let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
+            tw3[0] = self.twiddle(layer3, g8);
+            for s in 0..2 {
+                tw3[1 + s] = self.twiddle(layer3 + 1, 2 * g8 + s);
+            }
+            for s in 0..4 {
+                tw3[3 + s] = self.twiddle(layer3 + 2, 4 * g8 + s);
+            }
+            let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
+            // SAFETY: as in deep_sub_fused_blocks_fallback.
+            unsafe {
+                kernels::butterfly_fused_3layer_rows(eight.as_mut_ptr(), num_ntts, dense_lanes, &tw3);
+            }
+        }
+        let lo = sub_idx * sub_size_positions + b * block_size4;
+        cb(lo..lo + block_size4, blk);
+    }
+
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn deep_sub_fused_blocks_fallback(
@@ -5912,6 +6350,29 @@ fn rs_f33_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_F33").is_none());
     *ON
+}
+
+/// Lane lf1 (`FLOCK_NO_LF1_SMALL=1` restores both): the small-transform
+/// fallback runs the SIMD row-pair kernel instead of scalar butterflies, and
+/// the seed of a <= 1 MiB codeword uses regular stores instead of NT.
+/// Read once per process (per commit call, never per row).
+fn lf1_small_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LF1_SMALL").is_none());
+    *ON
+}
+
+/// Lane lf1: the log_d 10-11 commit runs as 2^k seed-in-sub deep tasks
+/// (default k = 3, measured best of 1/2/3; `FLOCK_LF1_SMALL_NTOP=k` picks
+/// 1..4, `FLOCK_NO_LF1_SMALL=1` keeps it serial). Read once.
+fn lf1_small_ntop() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_LF1_SMALL").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_LF1_SMALL_NTOP").ok().and_then(|s| s.parse().ok()).filter(|v| (1..=4).contains(v)).unwrap_or(3)
+    });
+    *V
 }
 
 /// `FLOCK_NO_RS_SEED_SUB=1`: recursive commits whose deep sub-groups hold

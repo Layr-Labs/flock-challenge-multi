@@ -208,6 +208,19 @@ pub(crate) fn round4_canonical_window_deltas(
 
 /// Remove the three least-significant coordinates from an eq tensor (each
 /// eight-entry group of a rank-one tensor XORs to its suffix weight).
+/// Lane gl1 (`FLOCK_NO_GL1_R345_PRE`): the rounds 3+4+5 pass's challenge-
+/// independent tables from round two's low eq tensor — the marginalized
+/// low tensor and its `(w, w·x⁶⁴)` pair table — so round one's idle AB
+/// thread can build them. Same functions as the pass's own setup.
+pub(crate) fn r345_pre_tables(peq_lo: &[F128]) -> (Vec<F128>, Option<Vec<F128>>) {
+    let lo = marginalize_eq_low3(peq_lo);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    let w = lo.len().is_multiple_of(8).then(|| build_w_pair_table(&lo));
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+    let w = None;
+    (lo, w)
+}
+
 pub(crate) fn marginalize_eq_low3(eq: &[F128]) -> Vec<F128> {
     assert!(eq.len().is_power_of_two() && eq.len() >= 8);
     eq.chunks_exact(8)
@@ -331,7 +344,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
 ) -> (F128, F128, Round3Lookahead) {
     let (m1, mi, la, _) = fold3_from_packed_and_round_pair_lookahead_casc(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho, r_next5, eq_override,
-        out_lm, b_canonical, false,
+        out_lm, b_canonical, false, None,
     );
     (m1, mi, la)
 }
@@ -389,6 +402,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     out_lm: bool,
     b_canonical: bool,
     casc: bool,
+    pre_wtab: Option<&[F128]>,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
@@ -417,9 +431,11 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     let hi_size = eq_hi.len();
     assert!(lo_size >= 2);
     assert_eq!(lo_size * hi_size * 2, eighth);
+    crate::rstrace::ev("r345:s0", 0);
     let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_out = 2 * lo_size;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    crate::rstrace::ev("r345:s1", 0);
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -437,8 +453,13 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 [(one + r1) * (one + r2), r1 * (one + r2), (one + r1) * r2, r1 * r2],
             )
         });
-        let wtab = (kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8))
-            .then(|| build_w_pair_table(eq_lo));
+        let wtab = (kernels::x86_64::zc_wtab_enabled() && lo_size.is_multiple_of(8)).then(|| {
+            match pre_wtab {
+                // Lane gl1: built from the same eq_lo during round one.
+                Some(w) if w.len() == eq_lo.len() => w.to_vec(),
+                _ => build_w_pair_table(eq_lo),
+            }
+        });
         let ok = kernels::x86_64::fold2_packed_c4_lm_wtab_route_ok(
             cfold.is_some(),
             kernels::x86_64::zc_c4_lm_enabled(),
@@ -452,6 +473,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
             && (b_out.as_ptr() as usize) % 16 == 0;
         if ok { Some((cfold.unwrap(), wtab.unwrap(), nt_out)) } else { None }
     };
+    crate::rstrace::ev("r345:s2", 0);
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -500,6 +522,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     }
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
     // weight; κ₆ restores the even lanes' own weight in the message sums.
+    crate::rstrace::ev("r345:s3", 0);
     let wtab_casc = casc.then(|| build_w_pair_table_casc(eq_lo));
     let kappa6 = if casc { (F128::ONE + r_next5[2]) * r_next5[2].inv() } else { F128::ZERO };
     #[cfg(not(all(
@@ -511,11 +534,9 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     )))]
     let _ = b_canonical;
 
-    let (sum1_even, sum_inf_even, agg, la7_acc) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    crate::rstrace::ev("r345:par0", 0);
+    let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            crate::rstrace::item_start();
             let out_base = x_hi * chunk_out;
             let mut la7 = [F128::ZERO; 18];
             #[cfg(all(
@@ -611,6 +632,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 )
             };
             let eq_h = eq_hi[x_hi];
+            crate::rstrace::item_end();
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -624,10 +646,10 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 ],
                 if casc { la7.map(|v| eq_h * v) } else { la7 },
             )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]),
-            |(s1, sinf, sa, sl), (c1, cinf, ca, cl)| {
+    };
+    type R345Sums = (F128, F128, [F128; 6], [F128; 18]);
+    let id = || -> R345Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
+    let op = |(s1, sinf, sa, sl): R345Sums, (c1, cinf, ca, cl): R345Sums| -> R345Sums {
                 let mut a = sa;
                 for (x, y) in a.iter_mut().zip(ca.iter()) {
                     *x += *y;
@@ -637,8 +659,21 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                     *x += *y;
                 }
                 (s1 + c1, sinf + cinf, a, l)
-            },
-        );
+            };
+    // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `super::flat_tail`.
+    let (sum1_even, sum_inf_even, agg, la7_acc) =
+        if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
+            super::flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+        } else {
+            a_out
+                .par_chunks_mut(chunk_out)
+                .zip(b_out.par_chunks_mut(chunk_out))
+                .enumerate()
+                .map(leaf)
+                .reduce(id, op)
+        };
+    crate::rstrace::ev("r345:par1", 0);
+    crate::rstrace::flush_items("r345:first", "r345:last");
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);

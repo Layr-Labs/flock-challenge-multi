@@ -42,7 +42,8 @@ pub fn begin(label: &str) {
 }
 
 /// Record a boundary: prints `+delta_ms @offset_ms label`.
-pub fn mark(label: &str) {
+pub fn mark(label: &'static str) {
+    crate::rstrace::ev(label, 0);
     if !enabled() {
         return;
     }
@@ -51,7 +52,20 @@ pub fn mark(label: &str) {
     let begin = BEGIN_NS.load(Ordering::Relaxed);
     let d_ms = now.saturating_sub(last) as f64 / 1e6;
     let t_ms = now.saturating_sub(begin) as f64 / 1e6;
+    if who_enabled() {
+        let owner = crate::is_pool_owner();
+        let name = std::thread::current().name().map(str::to_owned).unwrap_or_default();
+        eprintln!("[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}  [who idx={:?} owner={owner} thr={name}]", rayon::current_thread_index());
+        return;
+    }
     eprintln!("[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}");
+}
+
+/// Lane hot1 diagnostics: `FLOCK_HOT1_WHO` appends the calling thread's rayon
+/// index / pool-owner flag to every gap mark.
+pub fn who_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_HOT1_WHO").is_some());
+    *ON
 }
 
 // TEMP-ABS-TRACE
@@ -64,6 +78,7 @@ pub fn abs_enabled() -> bool {
 }
 static ABS_BUF: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
 pub fn abs(label: &'static str) {
+    crate::rstrace::ev(label, 1);
     if !abs_enabled() { return; }
     let mut t = Ts { s: 0, ns: 0 };
     unsafe { clock_gettime(1, &mut t) };

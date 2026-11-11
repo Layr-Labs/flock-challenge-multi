@@ -452,11 +452,13 @@ impl RootTileCache {
         let mut active = vec![0u8; workers];
         let next = std::sync::atomic::AtomicUsize::new(0);
         let dynamic = dynamic_tiles_enabled();
+        crate::rstrace::ev("rf:par0", workers as u32);
         planes
             .par_chunks_mut(stride)
             .zip(active.par_iter_mut())
             .enumerate()
             .for_each(|(worker, (dst, active))| {
+                crate::rstrace::evd("rf:w0", worker as u32);
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
                 let mut generated = self.generator.map(|_| unsafe {
@@ -574,7 +576,9 @@ impl RootTileCache {
                     first = false;
                 }
                 *active = u8::from(!first);
+                crate::rstrace::evd("rf:w1", worker as u32);
             });
+        crate::rstrace::ev("rf:red0", 0);
         let active_workers: Vec<usize> = active
             .into_iter()
             .enumerate()
@@ -593,6 +597,7 @@ impl RootTileCache {
                 reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
             }
         });
+        crate::rstrace::ev("lcf:reduced", 0);
         if self.fixed_roots {
             out.copy_within(833..896, 897);
             out[833..897].fill(F128::ZERO);
@@ -602,6 +607,7 @@ impl RootTileCache {
             let one = out[256];
             for column in [839, 865, 866, 868] { out[column] = one; }
         }
+        crate::rstrace::ev("rf:red1", 0);
         out
     }
 }

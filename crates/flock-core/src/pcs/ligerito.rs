@@ -2591,7 +2591,422 @@ fn inverse_ntt_final_layers_local(
     }
 }
 
+/// Lane gl2: `FLOCK_NO_GL2_STREAM=1` keeps the sparse dual's per-query work
+/// after query sampling (incumbent). Default: the alpha-independent part of
+/// every query (lane fold of its codeword block, the staged inverse-NTT
+/// snapshot rows, the scale factors and the stage-0 values) runs on helper
+/// workers WHILE the owner is still drawing the later queries; after alpha
+/// only the alpha-weighted sums and the move into sorted order remain.
+/// Read once.
+fn gl2_stream_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_STREAM").is_none());
+    *ON
+}
+
+/// Shared state of one streamed sparse dual (see [`gl2_stream_enabled`]).
+/// Slots are indexed by DRAW order (the order distinct queries were sampled).
+/// Aligned so the `Arc` counts (bumped by spinners when they re-read the
+/// side list) never share a line with the fields the owner reads per draw.
+#[repr(align(128))]
+struct Gl2DualStream {
+    count: usize,
+    log_d: usize,
+    depth: usize,
+    cache_len: usize,
+    stride: usize,
+    num_interleaved: usize,
+    lane_x4: bool,
+    ntt: AdditiveNttF128,
+    lane_weights: Vec<F128>,
+    codeword: Gl2Ptr<F128>,
+    /// Draw slot d holds the d-th distinct query once `produced > d`. The
+    /// owner publishes whole 64-byte lines (8 slots) at a time, so it never
+    /// stores into a line a helper has read; helpers poll `produced` with a
+    /// pause backoff so the owner's publishing store rarely meets sharers.
+    qlines: std::cell::UnsafeCell<Vec<Gl2Line>>,
+    produced: Gl2Pad,
+    next: Gl2Pad,
+    done: Gl2Pad,
+    poll: usize,
+    side: std::sync::Mutex<Option<crate::hot_pool::side::Task>>,
+    /// Per draw slot: `stride` snapshot rows, then (cached[qoff], f0, f0+f1, qscale0).
+    rows: std::cell::UnsafeCell<Vec<[F128; 16]>>,
+    vals: std::cell::UnsafeCell<Vec<[F128; 4]>>,
+    owner_sibling: Option<usize>,
+}
+
+// SAFETY: every draw slot of `rows` / `vals` is written by exactly one thread
+// (the one that claimed its index from `next`) and read by the owner only
+// after `done == count` (acquire); the codeword outlives the stream's use
+// (the owner waits for `done == count` before returning).
+unsafe impl Sync for Gl2DualStream {}
+unsafe impl Send for Gl2DualStream {}
+
+impl Gl2DualStream {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        depth: usize,
+        log_d: usize,
+        codeword: &[F128],
+        num_interleaved: usize,
+        lane_challenges: &[F128],
+        count: usize,
+    ) -> std::sync::Arc<Self> {
+        assert!((1..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
+        assert_eq!(num_interleaved, 1usize << lane_challenges.len());
+        assert_eq!(codeword.len(), (1usize << log_d) * num_interleaved);
+        let cache_len = 1usize << (depth + 1);
+        let stride = sparse_dual_row_stride(depth);
+        let owner = rayon::current_thread_index();
+        let n = rayon::current_num_threads();
+        let st = std::sync::Arc::new(Self {
+            count,
+            log_d,
+            depth,
+            cache_len,
+            stride,
+            num_interleaved,
+            lane_x4: lig_sparse_dual_lane_x4_enabled(),
+            ntt: AdditiveNttF128::standard(log_d),
+            lane_weights: build_eq_table(lane_challenges),
+            codeword: Gl2Ptr::of(codeword),
+            qlines: std::cell::UnsafeCell::new(vec![Gl2Line([0; 8]); count.div_ceil(8)]),
+            produced: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
+            next: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
+            done: Gl2Pad(std::sync::atomic::AtomicUsize::new(0)),
+            poll: gl2_stream_knobs().1,
+            side: std::sync::Mutex::new(None),
+            rows: std::cell::UnsafeCell::new(crate::alloc_uninit_vec::<[F128; 16]>(count * stride)),
+            vals: std::cell::UnsafeCell::new(crate::alloc_uninit_vec::<[F128; 4]>(count)),
+            owner_sibling: owner.map(|o| (o + n / 2) % n.max(1)),
+        });
+        let helpers = n.saturating_sub(2).min(count).min(gl2_stream_knobs().0);
+        if gl2_side_enabled() {
+            // Joined by idle hot-pool spinners (not the owner's sibling: the
+            // draws are a latency-bound BLAKE3 chain on the owner's core).
+            let active = std::sync::Arc::new(Gl2Pad(std::sync::atomic::AtomicUsize::new(0)));
+            let h = st.clone();
+            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |sib: bool| {
+                use std::sync::atomic::Ordering;
+                // Loads only until there is work: a finished stream costs a
+                // spinner one shared-line load per poll.
+                if sib || h.next.0.load(Ordering::Relaxed) >= h.count {
+                    return;
+                }
+                if active.0.fetch_add(1, Ordering::AcqRel) < helpers {
+                    h.work(true);
+                }
+                active.0.fetch_sub(1, Ordering::AcqRel);
+            });
+            *st.side.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
+            crate::hot_pool::side::register(t);
+        } else {
+            for _ in 0..helpers {
+                let h = st.clone();
+                rayon::spawn(move || {
+                    if h.owner_sibling.is_some() && rayon::current_thread_index() == h.owner_sibling {
+                        return;
+                    }
+                    h.work(true);
+                });
+            }
+        }
+        st
+    }
+
+    /// Record distinct query number `d` (owner only, draw order); publish
+    /// every completed 64-byte line. The owner keeps `d` itself: a counter
+    /// in this struct would share a line with fields every helper reads.
+    #[inline]
+    fn push(&self, d: usize, q: usize) {
+        use std::sync::atomic::Ordering;
+        // SAFETY: unpublished lines are touched only by the owner; helpers
+        // read a line only after its release below.
+        unsafe {
+            (*self.qlines.get()).as_mut_ptr().add(d / 8).cast::<usize>().add(d % 8).write(q);
+            if (d + 1) % 8 == 0 || d + 1 == self.count {
+                self.produced.0.store(d + 1, Ordering::Release);
+            }
+        }
+    }
+
+    /// Claim and process draw slots until all are claimed.
+    fn work(&self, helper: bool) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let d = self.next.0.load(Ordering::Relaxed);
+            if d >= self.count {
+                return;
+            }
+            if self.produced.0.load(Ordering::Acquire) <= d {
+                for _ in 0..self.poll {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+            if self.next.0.compare_exchange_weak(d, d + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            // SAFETY: slot d < produced (acquire above): its line is final.
+            let q = unsafe { (*self.qlines.get()).as_ptr().add(d / 8).cast::<usize>().add(d % 8).read() };
+            self.one(d, q);
+            self.done.0.fetch_add(1, Ordering::AcqRel);
+            if helper {
+                crate::rstrace::evd("ds:q", d as u32);
+            }
+        }
+    }
+
+    fn one(&self, d: usize, query: usize) {
+        let (cache_len, ni, log_d) = (self.cache_len, self.num_interleaved, self.log_d);
+        // SAFETY: see the `Sync` impl.
+        let cw = unsafe { self.codeword.get() };
+        let base = query & !(cache_len - 1);
+        let qoff = query - base;
+        let block = &cw[base * ni..(base + cache_len) * ni];
+        let mut cached = [F128::ZERO; 32];
+        sparse_dual_lane_fold_block(block, &self.lane_weights, &mut cached[..cache_len], self.lane_x4);
+        let c = cached[qoff];
+        let mut qscales = [F128::ZERO; 4];
+        for (s, slot) in qscales.iter_mut().enumerate().take((self.depth + 1).min(4)) {
+            *slot = sparse_dual_one_plus_scale(&self.ntt, log_d, s, query);
+        }
+        // SAFETY: slot `d` is this thread's (claimed from `next`).
+        let out_rows = unsafe {
+            let rows = &mut *self.rows.get();
+            std::slice::from_raw_parts_mut(rows.as_mut_ptr().add(d * self.stride), self.stride)
+        };
+        let (f0, f1) = inverse_ntt_final_layers_local_staged_raw(
+            &self.ntt,
+            log_d,
+            base,
+            &mut cached[..cache_len],
+            qoff,
+            self.depth,
+            &qscales,
+            out_rows,
+        );
+        unsafe { (&mut *self.vals.get())[d] = [c, f0, f0 + f1, qscales[0]] };
+    }
+
+    /// Owner, after the last draw: help with unclaimed slots, then wait.
+    fn finish(&self) {
+        use std::sync::atomic::Ordering;
+        self.work(false);
+        while self.done.0.load(Ordering::Acquire) < self.count {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The side-list entry, for one batched removal at the end of the open.
+    fn take_side(&self) -> Option<crate::hot_pool::side::Task> {
+        self.side.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// [`inverse_ntt_final_layers_local_staged`] without the alpha-dependent
+/// stage-0 sums: returns the stage-0 pair `(f0, f1)` instead. Same layers,
+/// same snapshot rows.
+#[allow(clippy::too_many_arguments)]
+fn inverse_ntt_final_layers_local_staged_raw(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    global_base: usize,
+    data: &mut [F128],
+    qoff: usize,
+    depth: usize,
+    qscales: &[F128; 4],
+    out_rows: &mut [[F128; 16]],
+) -> (F128, F128) {
+    let log_s = data.len().trailing_zeros() as usize;
+    debug_assert!(depth < log_s && depth <= SPARSE_DUAL_MAX_DEPTH);
+    out_rows[0][12..16].copy_from_slice(qscales);
+    let (mut f0, mut f1) = (F128::ZERO, F128::ZERO);
+    for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
+        let block_size = 1usize << (log_d - layer);
+        let half = block_size >> 1;
+        let mut handled = false;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        if data.len() >= 8 && (half == 1 || half == 2) {
+            unsafe {
+                if half == 1 {
+                    inverse_ntt_layer_half1_avx512(ntt, layer, global_base, data);
+                } else {
+                    inverse_ntt_layer_half2_avx512(ntt, layer, global_base, data);
+                }
+            }
+            handled = true;
+        }
+        if !handled {
+            for off in (0..data.len()).step_by(block_size) {
+                let block = (global_base + off) / block_size;
+                let twiddle = ntt.twiddle(layer, block);
+                let (top, bot) = data[off..off + block_size].split_at_mut(half);
+                inverse_ntt_butterfly_local(top, bot, twiddle);
+            }
+        }
+        let len = 2usize << stage;
+        let start = qoff & !(len - 1);
+        match stage {
+            0 => {
+                f0 = data[start];
+                f1 = data[start + 1];
+            }
+            1 => out_rows[0][0..4].copy_from_slice(&data[start..start + 4]),
+            2 => out_rows[0][4..12].copy_from_slice(&data[start..start + 8]),
+            3 => out_rows[1].copy_from_slice(&data[start..start + 16]),
+            4 => {
+                out_rows[2].copy_from_slice(&data[start..start + 16]);
+                out_rows[3].copy_from_slice(&data[start + 16..start + 32]);
+            }
+            _ => unreachable!(),
+        }
+    }
+    (f0, f1)
+}
+
+/// Lane gl2: [`sample_distinct_queries`] that also publishes each new
+/// distinct query to `stream` in draw order. Same draws, same result; also
+/// returns, per sorted position, the query's draw slot.
+fn sample_distinct_queries_streamed<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    stream: &Gl2DualStream,
+) -> (Vec<usize>, Vec<u32>) {
+    assert!(count <= block_len);
+    assert_eq!(stream.count, count);
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut out: Vec<(usize, u32)> = Vec::with_capacity(count);
+    let small = count <= 256 && block_len < u32::MAX as usize;
+    if small {
+        Gl2QSet::with(|seen| {
+            crate::rstrace::evd("qs:begin", count as u32);
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                if seen.insert(q) {
+                    stream.push(out.len(), q);
+                    out.push((q, out.len() as u32));
+                }
+            }
+            crate::rstrace::evd("qs:drawn", count as u32);
+        });
+    } else {
+        SEEN.with(|cell| {
+            let mut seen = cell.borrow_mut();
+            let words = block_len.div_ceil(64);
+            if seen.len() < words {
+                seen.resize(words, 0);
+            }
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                let (w, b) = (q >> 6, 1u64 << (q & 63));
+                if seen[w] & b == 0 {
+                    seen[w] |= b;
+                    stream.push(out.len(), q);
+                    out.push((q, out.len() as u32));
+                }
+            }
+            for &(q, _) in &out {
+                seen[q >> 6] = 0;
+            }
+        });
+    }
+    out.sort_unstable();
+    crate::rstrace::evd("qs:sorted", count as u32);
+    out.into_iter().unzip()
+}
+
 impl SparseDualL0 {
+    /// Lane gl2: the [`Self::new`] result (snapshot path) from a finished
+    /// [`Gl2DualStream`]: identical fields and enforced sum, since every
+    /// alpha-weighted term is the same field product, summed in F256 before
+    /// one reduction exactly as in `new`.
+    #[allow(clippy::too_many_arguments)]
+    fn from_stream(
+        stream: &Gl2DualStream,
+        log_inv_rate: usize,
+        queries: Vec<usize>,
+        perm: &[u32],
+        alpha: &[F128],
+    ) -> (Self, F128) {
+        use rayon::prelude::*;
+        let (depth, log_d, stride, n_queries) = (stream.depth, stream.log_d, stream.stride, stream.count);
+        assert!(log_inv_rate + depth <= log_d);
+        assert_eq!(queries.len(), n_queries);
+        let alpha_pows: Vec<F128> = if queries.is_empty() {
+            Vec::new()
+        } else {
+            let mut table = build_eq_table(alpha);
+            table.truncate(queries.len());
+            table
+        };
+        assert_eq!(alpha_pows.len(), n_queries);
+        stream.finish();
+        crate::rstrace::evd("ds:done", 0);
+        // SAFETY: `finish` observed `done == count` (acquire): every slot is written.
+        let (src_rows, vals) = unsafe { (&*stream.rows.get(), &*stream.vals.get()) };
+        let mut rows = crate::alloc_uninit_vec::<[F128; 16]>(n_queries * stride);
+        let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
+        const CH: usize = 16;
+        let zero = crate::field::F256Unreduced::ZERO;
+        let (enf_acc, u0_acc, u2_acc) = rows
+            .par_chunks_mut(stride * CH)
+            .zip(w2_pows.par_chunks_mut(CH))
+            .enumerate()
+            .map(|(c, (rows_c, w2_c))| {
+                let (mut e, mut u0, mut u2) = (zero, zero, zero);
+                for (j, w2) in w2_c.iter_mut().enumerate() {
+                    let i = c * CH + j;
+                    let d = perm[i] as usize;
+                    rows_c[j * stride..(j + 1) * stride]
+                        .copy_from_slice(&src_rows[d * stride..(d + 1) * stride]);
+                    let [cq, f0, s, qs0] = vals[d];
+                    let a = alpha_pows[i];
+                    e ^= a.mul_unreduced(cq);
+                    u0 ^= a.mul_unreduced(f0);
+                    u2 ^= (a * s).mul_unreduced(qs0);
+                    *w2 = a * qs0;
+                }
+                (e, u0, u2)
+            })
+            .reduce(|| (zero, zero, zero), |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2));
+        let enforced_sum = enf_acc.reduce();
+        let round0_msg = SumcheckMessage {
+            u_0: u0_acc.reduce(),
+            u_2: u2_acc.reduce(),
+        };
+        (
+            Self {
+                ntt: AdditiveNttF128::standard(log_d),
+                log_d,
+                log_inv_rate,
+                depth,
+                cache_len: stream.cache_len,
+                queries,
+                w0_pows: alpha_pows.clone(),
+                alpha_pows,
+                w2_pows,
+                folded_k: 0,
+                inverse_local_blocks: Vec::new(),
+                rows,
+                round0_msg,
+                snapshots: true,
+                lane_x4: stream.lane_x4,
+            },
+            enforced_sum,
+        )
+    }
+
     fn new(
         depth: usize,
         log_d: usize,
@@ -2651,6 +3066,7 @@ impl SparseDualL0 {
                     .zip(&alpha_pows)
                     .zip(w2_pows.par_iter_mut())
                     .zip(rows.par_chunks_exact_mut(stride))
+                    .with_min_len(lf1_dual_minlen())
                     .map(|(((&query, &alpha), w2_slot), out_rows)| {
                         let base = query & !(cache_len - 1);
                         let qoff = query - base;
@@ -8016,6 +8432,33 @@ fn serial_par_enabled() -> bool {
 
 const ROW_GATHER_PAR_MIN_ELEMS: usize = 512;
 
+/// Lane lf1: `FLOCK_LF1_QS_HASHSET=1` restores the SipHash set in
+/// `sample_distinct_queries` (default: bitmap). Read once.
+fn lf1_qs_bitmap() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_LF1_QS_HASHSET").is_none());
+    *ON
+}
+
+/// Lane lf1: the recursive levels' opened rows and multiproof siblings
+/// (~100 rows of 128 B, ~1K hashes) are gathered serially on the joined
+/// thread; `FLOCK_NO_LF1_OPEN_SERIAL=1` restores the rayon gathers. Read once.
+fn lf1_open_par() -> bool {
+    static PAR: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LF1_OPEN_SERIAL").is_some());
+    serial_par_enabled() && *PAR
+}
+
+/// Lane lf1: the sparse dual's query split takes at least 8 queries per
+/// rayon task (`FLOCK_LF1_DUAL_MINLEN=k` overrides, 1 = rayon adaptive as
+/// before). Read once.
+fn lf1_dual_minlen() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LF1_DUAL_MINLEN").ok().and_then(|s| s.parse().ok()).filter(|&v| v >= 1).unwrap_or(8)
+    });
+    *V
+}
+
 fn gather_opened_rows<'a, F>(queries: &[usize], row: F, par: bool) -> Vec<Vec<F128>>
 where
     F: Fn(usize) -> &'a [F128] + Sync,
@@ -8033,6 +8476,200 @@ const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
 
 const MULTIPROOF_PAR_CHUNK: usize = 64;
 
+/// Lane gl2: `FLOCK_NO_GL2_DEFER=1` keeps the opened-row + multiproof gathers
+/// of L1 and the recursive levels inside the `rayon::join` with the sparse
+/// dual (incumbent). Default: they run as detached jobs off the open's
+/// critical path -- neither enters the transcript, so they only have to be
+/// complete when the proof is assembled. Read once per open.
+fn gl2_defer_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_DEFER").is_none());
+    *ON
+}
+
+type Gl2Opened = (Vec<Vec<F128>>, Vec<Hash>);
+
+/// Lane gl2: `FLOCK_NO_GL2_SIDE=1` dispatches the deferred gathers and the
+/// streamed-dual helpers with `rayon::spawn` (onto the owner's deque, where
+/// the owner's own join waits can pop them) instead of the hot-pool side
+/// list. Read once.
+fn gl2_side_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_SIDE").is_none());
+    *ON
+}
+
+/// Lane gl2: streamed-dual tuning, read once: helper count (default
+/// threads - 2) and the pause count between a waiting helper's polls of the
+/// owner's publication counter (default 16).
+fn gl2_stream_knobs() -> (usize, usize) {
+    static K: std::sync::LazyLock<(usize, usize)> = std::sync::LazyLock::new(|| {
+        let h = std::env::var("FLOCK_GL2_STREAM_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let p = std::env::var("FLOCK_GL2_STREAM_POLL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        (h, p)
+    });
+    *K
+}
+
+#[repr(align(128))]
+struct Gl2Pad(std::sync::atomic::AtomicUsize);
+
+#[repr(align(64))]
+#[derive(Clone, Copy)]
+struct Gl2Line([usize; 8]);
+
+/// A detached open-arm gather. Claimed exactly once (by the rayon job or by
+/// the waiter, whichever comes first), so a waiter never blocks on a job that
+/// no worker has started.
+#[repr(align(128))]
+struct Gl2Deferred {
+    state: std::sync::atomic::AtomicU8,
+    job: std::cell::UnsafeCell<Option<Box<dyn FnOnce() -> Gl2Opened + Send>>>,
+    out: std::cell::UnsafeCell<Option<Gl2Opened>>,
+    side: std::sync::Mutex<Option<crate::hot_pool::side::Task>>,
+}
+
+// SAFETY: `job` is taken only by the thread that wins the 0 -> 1 claim, `out`
+// is written by that thread before the release store of 2 and read only after
+// an acquire load of 2.
+unsafe impl Sync for Gl2Deferred {}
+unsafe impl Send for Gl2Deferred {}
+
+impl Gl2Deferred {
+    fn spawn(job: Box<dyn FnOnce() -> Gl2Opened + Send>) -> std::sync::Arc<Self> {
+        let d = std::sync::Arc::new(Self {
+            state: std::sync::atomic::AtomicU8::new(0),
+            job: std::cell::UnsafeCell::new(Some(job)),
+            out: std::cell::UnsafeCell::new(None),
+            side: std::sync::Mutex::new(None),
+        });
+        if gl2_side_enabled() {
+            // Run by an idle hot-pool spinner; never popped by the owner's
+            // own join waits (a `rayon::spawn` lands on the owner's deque).
+            let d2 = d.clone();
+            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |_sib: bool| {
+                if d2.state.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    d2.run();
+                }
+            });
+            *d.side.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
+            crate::hot_pool::side::register(t);
+        } else {
+            let d2 = d.clone();
+            rayon::spawn(move || d2.run());
+        }
+        d
+    }
+
+    fn run(&self) {
+        use std::sync::atomic::Ordering;
+        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        // SAFETY: claim won above; see the `Sync` impl.
+        let job = unsafe { (*self.job.get()).take() }.expect("deferred job claimed twice");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).ok();
+        unsafe { *self.out.get() = r };
+        self.state.store(2, Ordering::Release);
+    }
+
+    fn take_side(&self) -> Option<crate::hot_pool::side::Task> {
+        self.side.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn wait(&self) -> Option<Gl2Opened> {
+        use std::sync::atomic::Ordering;
+        self.run();
+        while self.state.load(Ordering::Acquire) != 2 {
+            std::hint::spin_loop();
+        }
+        // SAFETY: state 2 observed with acquire; only the single waiter takes.
+        unsafe { (*self.out.get()).take() }
+    }
+}
+
+/// Waits for every pending deferred gather when dropped (also on unwind), so
+/// no job can outlive the witnesses / L0 buffers its raw pointers refer to.
+/// Declare it AFTER the storage those jobs read.
+struct Gl2DeferSet(Vec<std::sync::Arc<Gl2Deferred>>);
+
+impl Drop for Gl2DeferSet {
+    fn drop(&mut self) {
+        for d in &self.0 {
+            let _ = d.wait();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Gl2Ptr<T>(*const T, usize);
+// SAFETY: only ever dereferenced as a shared slice while the owner is kept
+// alive by `Gl2DeferSet`'s ordering contract.
+unsafe impl<T> Send for Gl2Ptr<T> {}
+impl<T> Gl2Ptr<T> {
+    fn of(s: &[T]) -> Self {
+        Self(s.as_ptr(), s.len())
+    }
+    /// # Safety
+    /// The slice this was made from must still be alive and unmodified.
+    unsafe fn get<'a>(self) -> &'a [T] {
+        unsafe { std::slice::from_raw_parts(self.0, self.1) }
+    }
+}
+
+/// Lane gl2: the dedupe set of query sampling. A 4 KiB open-addressing table
+/// (thread-local, cache-resident, reset after use) instead of a block_len-bit
+/// bitmap: the L1 bitmap is 128 KiB, a fresh calloc is an mmap + page faults
+/// + munmap, and a reused one is cache-cold at every probe.
+struct Gl2QSet {
+    slots: [u32; 1024],
+}
+
+impl Gl2QSet {
+    const EMPTY: u32 = u32::MAX;
+
+    /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and
+    /// fewer than 1024 members.
+    #[inline]
+    fn insert(&mut self, q: usize) -> bool {
+        let key = q as u32;
+        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
+        loop {
+            let s = self.slots[i];
+            if s == key {
+                return false;
+            }
+            if s == Self::EMPTY {
+                self.slots[i] = key;
+                return true;
+            }
+            i = (i + 1) & 1023;
+        }
+    }
+
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        thread_local! {
+            static SET: std::cell::RefCell<Box<Gl2QSet>> =
+                std::cell::RefCell::new(Box::new(Gl2QSet { slots: [Gl2QSet::EMPTY; 1024] }));
+        }
+        SET.with(|c| {
+            let mut set = c.borrow_mut();
+            let r = f(&mut set);
+            set.slots.fill(Self::EMPTY);
+            r
+        })
+    }
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_QS_REUSE=1` restores lf1's per-call calloc'd
+/// query bitmap (default: [`Gl2QSet`] when `count <= 256` and
+/// `block_len < 2^32`). Read once.
+fn gl2_qs_reuse() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_QS_REUSE").is_none());
+    *ON
+}
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -8042,8 +8679,42 @@ fn sample_distinct_queries<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(count);
+    if gl2_qs_reuse() && count <= 256 && block_len < u32::MAX as usize {
+        // Lane gl2: same draws, same first-occurrence dedupe, small hash set.
+        Gl2QSet::with(|seen| {
+            crate::rstrace::evd("qs:begin", count as u32);
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                if seen.insert(q) {
+                    out.push(q);
+                }
+            }
+            crate::rstrace::evd("qs:drawn", count as u32);
+        });
+        out.sort_unstable();
+        return out;
+    }
+    if lf1_qs_bitmap() {
+        // Lane lf1: same draws, same first-occurrence dedupe, bitmap
+        // membership instead of a SipHash set.
+        let mut seen = vec![0u64; block_len.div_ceil(64)];
+        crate::rstrace::evd("qs:begin", count as u32);
+        while out.len() < count {
+            let v = challenger.sample_f128();
+            let q = (v.lo as usize) % block_len;
+            let (w, b) = (q >> 6, 1u64 << (q & 63));
+            if seen[w] & b == 0 {
+                seen[w] |= b;
+                out.push(q);
+            }
+        }
+        crate::rstrace::evd("qs:drawn", count as u32);
+        out.sort_unstable();
+        return out;
+    }
+    let mut seen = std::collections::HashSet::new();
     while out.len() < count {
         let v = challenger.sample_f128();
         let q = (v.lo as usize) % block_len;
@@ -8909,31 +9580,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     }
 
     crate::rstrace::ev("L1:ood", 0);
+    // Lane gl2: retired level witnesses stay alive until every deferred
+    // gather has been waited for (`gl2_jobs` is dropped first).
+    let gl2_defer = gl2_defer_enabled();
+    let mut gl2_retired: Vec<LigeroWitness> = Vec::new();
+    let mut gl2_jobs = Gl2DeferSet(Vec::new());
+    let mut gl2_l1_job: Option<std::sync::Arc<Gl2Deferred>> = None;
+    let mut gl2_level_jobs: Vec<(usize, std::sync::Arc<Gl2Deferred>)> = Vec::new();
+    let mut gl2_side_done: Vec<crate::hot_pool::side::Task> = Vec::new();
     let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
     crate::rstrace::ev("L1:qgrind", 0);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
 
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let open_l0 = || {
-        let opened_rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
-        let merkle_proof = merkle_multi_proof_for_l0(
-            l0_tree,
-            l0_codeword,
-            l0_block_len,
-            l0_num_interleaved,
-            &queries_0,
-            config.merkle_hash,
-        );
-        (opened_rows, merkle_proof)
-    };
-
-    let sks_vks_n1 = if induce_lazy_sks_enabled() {
-        None
-    } else {
-        Some(eval_sk_at_vks(n1))
-    };
     let sparse_dual_depth = ranked_sparse_dual_l0_depth(
         config,
         log_n,
@@ -8944,12 +9603,86 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         lazy_l1_ood,
         direct_fold8_mode,
     );
+    let gl2_s0 = match sparse_dual_depth {
+        Some(depth) if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() => {
+            Some(Gl2DualStream::start(
+                depth,
+                n1 + log_inv_rate_0,
+                l0_codeword,
+                l0_num_interleaved,
+                &r_lane_fold,
+                num_queries_0,
+            ))
+        }
+        _ => None,
+    };
+    let (queries_0, gl2_perm0) = match &gl2_s0 {
+        Some(st) => sample_distinct_queries_streamed(challenger, l0_block_len, num_queries_0, st),
+        None => (sample_distinct_queries(challenger, l0_block_len, num_queries_0), Vec::new()),
+    };
+    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    crate::rstrace::evd("L1:qs", queries_0.len() as u32);
+    let open_l0 = || {
+        let opened_rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+        crate::rstrace::evd("L1:rows", 0);
+        let merkle_proof = merkle_multi_proof_for_l0(
+            l0_tree,
+            l0_codeword,
+            l0_block_len,
+            l0_num_interleaved,
+            &queries_0,
+            config.merkle_hash,
+        );
+        crate::rstrace::evd("L1:mp", 0);
+        (opened_rows, merkle_proof)
+    };
+
+    let sks_vks_n1 = if induce_lazy_sks_enabled() {
+        None
+    } else {
+        Some(eval_sk_at_vks(n1))
+    };
     let _t = std::time::Instant::now();
     let ((opened_rows_0, merkle_proof_0), (basis_0_induced, sparse_dual_0, enforced_sum_0)) =
-        if let Some(depth) = sparse_dual_depth {
+        if let (Some(depth), true) = (sparse_dual_depth, gl2_defer) {
+            let (tree_p, cw_p) = (Gl2Ptr::of(l0_tree), Gl2Ptr::of(l0_codeword));
+            let (bl, ni, kind) = (l0_block_len, l0_num_interleaved, config.merkle_hash);
+            let qs = queries_0.clone();
+            let job = Gl2Deferred::spawn(Box::new(move || {
+                // SAFETY: the L0 tree / codeword are borrowed for the whole
+                // open; `gl2_jobs` waits for this job before it returns.
+                let (tree, cw) = unsafe { (tree_p.get(), cw_p.get()) };
+                let rows = gather_opened_rows(&qs, |q| &cw[q * ni..(q + 1) * ni], serial_par_enabled());
+                let mp = merkle_multi_proof_for_l0(tree, cw, bl, ni, &qs, kind);
+                crate::rstrace::evd("L1:deferred", 0);
+                (rows, mp)
+            }));
+            gl2_jobs.0.push(job.clone());
+            gl2_l1_job = Some(job);
+            crate::rstrace::evd("L1:dual0", 0);
+            let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_deref() {
+                let r = SparseDualL0::from_stream(st, log_inv_rate_0, queries_0.clone(), &gl2_perm0, &alpha_0);
+                gl2_side_done.extend(st.take_side());
+                r
+            } else {
+                SparseDualL0::new(
+                    depth,
+                    n1 + log_inv_rate_0,
+                    log_inv_rate_0,
+                    l0_codeword,
+                    l0_num_interleaved,
+                    &r_lane_fold,
+                    &queries_0,
+                    &alpha_0,
+                )
+            };
+            crate::rstrace::evd("L1:dual1", 0);
+            ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
+        } else if let Some(depth) = sparse_dual_depth {
             let ((dual, enforced_sum), opened) = rayon::join(
                 || {
-                    SparseDualL0::new(
+                    crate::rstrace::evd("L1:dual0", 0);
+                    let r = SparseDualL0::new(
                         depth,
                         n1 + log_inv_rate_0,
                         log_inv_rate_0,
@@ -8958,7 +9691,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         &r_lane_fold,
                         &queries_0,
                         &alpha_0,
-                    )
+                    );
+                    crate::rstrace::evd("L1:dual1", 0);
+                    r
                 },
                 open_l0,
             );
@@ -9043,7 +9778,24 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
     let mut active_deep_duals: Vec<(SparseDualL0, Vec<F128>)> = Vec::with_capacity(2);
 
+    let mut gl2_tail: Option<crate::hot_pool::side::Task> = None;
     for i in 0..r {
+        if i + 2 == r || r == 1 {
+            // Lane gl2: the publisher's tail hook, run by an idle spinner
+            // during the last two (small) levels so it is done well before
+            // the publish (see `GL2_TAIL_HOOK`).
+            gl2_tail = crate::GL2_TAIL_HOOK.get().copied().map(|h| {
+                let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |_sib: bool| {
+                    if !once.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        h();
+                        crate::rstrace::evd("fin:hook", 0);
+                    }
+                });
+                crate::hot_pool::side::register(t.clone());
+                t
+            });
+        }
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
         let _t = std::time::Instant::now();
@@ -9124,12 +9876,39 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> =
-                gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            crate::rstrace::evd("fin:qs", 0);
+            // Lane gl2: rows and multiproof of the final level side by side
+            // (`FLOCK_NO_GL2_FIN_JOIN=1`: one after the other, incumbent).
+            static FIN_JOIN: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_FIN_JOIN").is_none());
+            let (opened_rows_last, merkle_proof_last): (Vec<Vec<F128>>, Vec<Hash>) = if *FIN_JOIN {
+                rayon::join(
+                    || gather_opened_rows(&queries_last, |q| wtns_prev.row(q), false),
+                    || multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, false),
+                )
+            } else {
+                let rows = gather_opened_rows(&queries_last, |q| wtns_prev.row(q), lf1_open_par());
+                crate::rstrace::evd("fin:rows", 0);
+                let mp = multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, lf1_open_par());
+                (rows, mp)
+            };
             crate::rstrace::ev("fin:open", 0);
-            crate::rstrace::dump("ligerito open");
+            let mut initial_proof = initial_proof;
+            if let Some(job) = gl2_l1_job.take() {
+                gl2_side_done.extend(job.take_side());
+                let (rows, mp) = job.wait().expect("deferred L1 open gather panicked");
+                initial_proof.opened_rows = rows;
+                initial_proof.merkle_proof = mp;
+            }
+            for (k, job) in gl2_level_jobs.drain(..) {
+                gl2_side_done.extend(job.take_side());
+                let (rows, mp) = job.wait().expect("deferred level open gather panicked");
+                recursive_proofs[k].opened_rows = rows;
+                recursive_proofs[k].merkle_proof = mp;
+            }
+            gl2_side_done.extend(gl2_tail.take());
+            crate::hot_pool::side::unregister_many(&gl2_side_done);
+            crate::rstrace::ev("fin:joined", 0);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9229,6 +10008,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
+                crate::rstrace::evd("lv:oodz", i as u32);
                 let (intro, y) = if lazy_deep_ood {
                     sc_prover
                         .introduce_new_ood_factorized(&z)
@@ -9237,6 +10017,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     let eq_z = build_eq_table_split(&z);
                     sc_prover.introduce_new_with_eval(eq_z)
                 };
+                crate::rstrace::evd("lv:oodi", i as u32);
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
@@ -9258,22 +10039,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         crate::rstrace::ev("lv:qgrind", i as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let open_i = || {
-            let opened_rows =
-                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
-            let merkle_proof =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
-            (opened_rows, merkle_proof)
-        };
-
-        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
-            None
-        } else {
-            Some(eval_sk_at_vks(n_next))
-        };
-        let _t = std::time::Instant::now();
         let remaining_folds: usize = config.recursive_ks[i + 1..].iter().sum();
         let deep_dual_depth = ranked_sparse_dual_deep_depth(
             config,
@@ -9286,11 +10051,89 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_fold8_mode,
             remaining_folds,
         );
+        let gl2_si = match deep_dual_depth {
+            Some(depth) if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() => {
+                Some(Gl2DualStream::start(
+                    depth,
+                    n_next + config.log_inv_rates[i + 1],
+                    &wtns_prev.mat,
+                    wtns_prev.num_interleaved,
+                    &level_rs,
+                    num_queries_i,
+                ))
+            }
+            _ => None,
+        };
+        let (queries_i, gl2_permi) = match &gl2_si {
+            Some(st) => sample_distinct_queries_streamed(challenger, wtns_prev.block_len, num_queries_i, st),
+            None => (sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i), Vec::new()),
+        };
+        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        crate::rstrace::evd("lv:qs", i as u32);
+        let open_i = || {
+            let opened_rows =
+                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), lf1_open_par());
+            crate::rstrace::evd("lv:rows", i as u32);
+            let merkle_proof =
+                multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_i, lf1_open_par());
+            crate::rstrace::evd("lv:mp", i as u32);
+            (opened_rows, merkle_proof)
+        };
+
+        let sks_vks_i = if induce_sched_enabled() && induce_lazy_sks_enabled() {
+            None
+        } else {
+            Some(eval_sk_at_vks(n_next))
+        };
+        let _t = std::time::Instant::now();
         let ((opened_rows_i, merkle_proof_i), (basis_i_induced, deep_dual_i, enforced_sum_i)) =
-            if let Some(depth) = deep_dual_depth {
+            if let (Some(depth), true) = (deep_dual_depth, gl2_defer) {
+                let (mat_p, tree_p) = (Gl2Ptr::of(&wtns_prev.mat), Gl2Ptr::of(&wtns_prev.tree));
+                let (bl, ni) = (wtns_prev.block_len, wtns_prev.num_interleaved);
+                let qs = queries_i.clone();
+                let lvl = i as u32;
+                let job = Gl2Deferred::spawn(Box::new(move || {
+                    // SAFETY: this level's witness moves into `gl2_retired`
+                    // (heap buffers unchanged) and outlives `gl2_jobs`.
+                    let (mat, tree) = unsafe { (mat_p.get(), tree_p.get()) };
+                    let rows = gather_opened_rows(&qs, |q| &mat[q * ni..(q + 1) * ni], false);
+                    crate::rstrace::evd("lv:rows", lvl);
+                    let mp = multi_proof_gather(tree, bl, &qs, false);
+                    crate::rstrace::evd("lv:mp", lvl);
+                    (rows, mp)
+                }));
+                gl2_jobs.0.push(job.clone());
+                gl2_level_jobs.push((recursive_proofs.len(), job));
+                crate::rstrace::evd("lv:dual0", i as u32);
+                let (dual, enforced_sum) = if let Some(st) = gl2_si.as_deref() {
+                    let r = SparseDualL0::from_stream(
+                        st,
+                        config.log_inv_rates[i + 1],
+                        queries_i.clone(),
+                        &gl2_permi,
+                        &alpha_i,
+                    );
+                    gl2_side_done.extend(st.take_side());
+                    r
+                } else {
+                    SparseDualL0::new(
+                        depth,
+                        n_next + config.log_inv_rates[i + 1],
+                        config.log_inv_rates[i + 1],
+                        &wtns_prev.mat,
+                        wtns_prev.num_interleaved,
+                        &level_rs,
+                        &queries_i,
+                        &alpha_i,
+                    )
+                };
+                crate::rstrace::evd("lv:dual1", i as u32);
+                ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
+            } else if let Some(depth) = deep_dual_depth {
                 let ((dual, enforced_sum), opened) = rayon::join(
                     || {
-                        SparseDualL0::new(
+                        crate::rstrace::evd("lv:dual0", i as u32);
+                        let r = SparseDualL0::new(
                             depth,
                             n_next + config.log_inv_rates[i + 1],
                             config.log_inv_rates[i + 1],
@@ -9299,7 +10142,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             &level_rs,
                             &queries_i,
                             &alpha_i,
-                        )
+                        );
+                        crate::rstrace::evd("lv:dual1", i as u32);
+                        r
                     },
                     open_i,
                 );
@@ -9390,7 +10235,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         crate::rstrace::ev("lv:intro+glue", i as u32);
-        wtns_prev = wtns_next;
+        let retired = std::mem::replace(&mut wtns_prev, wtns_next);
+        if gl2_defer {
+            gl2_retired.push(retired);
+        } else {
+            drop(retired);
+        }
     }
 
     unreachable!()

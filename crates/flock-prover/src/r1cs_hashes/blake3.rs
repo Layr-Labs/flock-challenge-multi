@@ -2465,6 +2465,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
+    flock_core::rstrace::ev("wg:takes", 0);
     const {
         assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
     }
@@ -2511,6 +2512,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
     };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     let ranked_compact = false;
+    flock_core::rstrace::ev("wg:plan", 0);
     let mut ab_inner = if ranked_compact {
         flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
             n_total * BYTES_PER_BLOCK,
@@ -2521,6 +2523,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         )
     };
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
+    flock_core::rstrace::ev("wg:abinner", 0);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2742,6 +2745,10 @@ struct OctaClaim(std::sync::atomic::AtomicUsize);
 enum OctaOrder<'a> {
     Parity(usize),
     Shared(&'a OctaClaim),
+    /// Lane gl2: a process-lifetime claim counter tagged with this prove's
+    /// epoch in its high half; a counter still carrying an older epoch
+    /// counts as 0, so nothing has to be reset between proves.
+    Epoch(&'a OctaClaim, usize),
 }
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
@@ -2759,9 +2766,37 @@ impl Iterator for OctaOrder<'_> {
             // Atomicity alone gives each value to one caller. The octa's
             // writes reach the fold through the encoder's existing join.
             Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            Self::Epoch(claim, epoch) => loop {
+                use std::sync::atomic::Ordering::Relaxed;
+                let v = claim.0.load(Relaxed);
+                let n = if v >> 32 == *epoch { v & 0xffff_ffff } else { 0 };
+                if n >= OCTAS_PER_GROUP {
+                    break n;
+                }
+                if claim.0.compare_exchange_weak(v, (*epoch << 32) | (n + 1), Relaxed, Relaxed).is_ok() {
+                    break n;
+                }
+            },
         };
         (kpair < OCTAS_PER_GROUP).then_some(kpair)
     }
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_OCTA_EPOCH=1` builds the per-prove claim vector
+/// (1024 padded counters, 5-14 us on the serial prove entry) as before;
+/// default: one process-lifetime vector with epoch-tagged counters. Read once.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+fn gl2_octa_epoch_claims(groups: usize) -> Option<(&'static [OctaClaim], usize)> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_OCTA_EPOCH").is_none());
+    static CLAIMS: std::sync::OnceLock<Box<[OctaClaim]>> = std::sync::OnceLock::new();
+    static EPOCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if !*ON || groups != 1024 {
+        return None;
+    }
+    let claims = CLAIMS.get_or_init(|| (0..1024).map(|_| OctaClaim::default()).collect());
+    let epoch = EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    (epoch < 1 << 31).then_some((&claims[..], epoch))
 }
 
 /// `FLOCK_NO_WITNESS_OCTA_CLAIM=1` restores the fixed parity split in the
@@ -2916,6 +2951,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         ab_inner.as_bytes_mut(),
         abinner_nt,
     );
+    flock_core::rstrace::evd("oc:plan", 0);
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
     let one_rows_elided = ab_stream
@@ -2948,6 +2984,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ab1_hole = flock_core::zerocheck::univariate_skip_optimized::ab1_hole_layout_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
@@ -2983,6 +3020,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             ))
         }
     };
+    flock_core::rstrace::evd("oc:preps", 0);
     let ranked_closed_init = match (ranked_closed_preps.as_ref(), blocks) {
         (Some(_), crate::seed_pipe::BlockSource::Closed { init, .. }) => Some(init),
         _ => None,
@@ -3008,6 +3046,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         let mut root_storage = flock_core::scratch::take_f128(root_fields + 3);
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
+        flock_core::rstrace::evd("oc:root", 0);
         let root_enabled = linear_fold_enabled()
             && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
@@ -3038,15 +3077,26 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let a_addr = a.as_mut_ptr() as usize;
             let b_addr = b.as_mut_ptr() as usize;
             let ab_addr = ab_inner_bytes.as_mut_ptr() as usize;
+            // Lane ab1: hole-free compact layout for round one's leaf kernels
+            // (switch read once here; `FLOCK_NO_AB1_HOLE=1` keeps `base * 1856`).
+            // The pipelined producer never writes window 30 (w30 elided) or 31,
+            // so every store of a lane lands inside its row's 28 live lines.
+            let ab1_hole = ab1_hole && ab_block_bytes == 29 * 64;
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
             let window_tile_cols=std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
             let merge_prefix=std::env::var_os("FLOCK_WITNESS_SEED_MERGE_PREFIX").is_some();
             let window_tile_enabled=std::env::var_os("FLOCK_NO_WITNESS_SEED_TILE").is_none();
             let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
-            let octa_claims: Option<Vec<OctaClaim>> = witness_octa_claim_enabled().then(|| {
-                let groups = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
-                (0..groups).map(|_| OctaClaim::default()).collect()
-            });
+            flock_core::rstrace::evd("oc:gen", 0);
+            let groups_n = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
+            let epoch_claims = witness_octa_claim_enabled()
+                .then(|| gl2_octa_epoch_claims(groups_n))
+                .flatten();
+            let octa_claims: Option<Vec<OctaClaim>> =
+                (witness_octa_claim_enabled() && epoch_claims.is_none()).then(|| {
+                    (0..groups_n).map(|_| OctaClaim::default()).collect()
+                });
+            flock_core::rstrace::evd("oc:claims", 0);
             let produce = |z_base: *mut F128, group: usize, role: usize,
                            target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
                 let windows=target.filter(|_|window_seed_enabled&&elide_z).map(|t|t.prepare_windows());
@@ -3074,8 +3124,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // Only the sibling-paired encoder passes a target, and it
                 // runs both role calls of a group concurrently and joins
                 // them; the materialize-first fallback keeps the parity split.
-                let octas = match (octa_claims.as_ref(), target) {
-                    (Some(claims), Some(_)) => OctaOrder::Shared(&claims[group]),
+                let octas = match (epoch_claims, octa_claims.as_ref(), target) {
+                    (Some((claims, epoch)), _, Some(_)) => OctaOrder::Epoch(&claims[group], epoch),
+                    (None, Some(claims), Some(_)) => OctaOrder::Shared(&claims[group]),
                     _ => OctaOrder::Parity(role),
                 };
                 for kpair in octas {
@@ -3097,7 +3148,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             compact_z: if target.is_some() { input_base.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
-                            out: (ab_addr as *mut u8).add(base * ab_block_bytes),
+                            out: (ab_addr as *mut u8).add(if ab1_hole {
+                                flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(base)
+                            } else {
+                                base * ab_block_bytes
+                            }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
                             inv_table,
@@ -3143,6 +3198,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 context.params.num_ntts(), context.odd_tail,
             );
             let codeword = context.codeword.take().unwrap();
+            flock_core::rstrace::evd("oc:commit", 0);
             // SAFETY: the callback implements the documented full ranked
             // partition and uses the currently borrowed z pointer. All other
             // output allocations stay exclusively held here until every
@@ -3237,6 +3293,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         } else {
             assert_eq!(elided_octas.load(std::sync::atomic::Ordering::Relaxed), 0);
             flock_core::scratch::give_f128(root_storage);
+        }
+        if pipelined && ab1_hole && ab_block_bytes == 29 * 64 {
+            ab_inner.set_ab1_hole_layout();
         }
         return;
     }
@@ -4840,6 +4899,9 @@ impl Blake3Setup {
         blocks: crate::seed_pipe::BlockSource<'_>,
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        if !crate::seed_pipe::is_timed_speculative_prove() {
+            flock_core::rstrace::reset();
+        }
         flock_core::gaptime::abs("inner begin");
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {

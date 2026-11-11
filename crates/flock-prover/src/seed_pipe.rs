@@ -920,7 +920,44 @@ fn setup_sized_set(path: &Path, bundle: &R1csProofBundleLigerito) -> bool {
         return false;
     }
     *SIZED_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(set);
+    if gl2_rn_warm() {
+        let mut w = path.as_os_str().to_owned();
+        w.push(".gl2w");
+        let w = PathBuf::from(w);
+        if std::fs::write(&w, b"w").is_ok() {
+            let _ = GL2_PUB_PATH.set(path.to_path_buf());
+            let _ = flock_core::GL2_TAIL_HOOK.set(gl2_rn_warm_hook);
+        }
+    }
     true
+}
+
+/// Lane gl2: a tail hook that touches the publish directory's kernel state
+/// (stat of the directory and of the not-yet-existing proof path, a rename
+/// pair of a private dummy file in the same directory) on an idle worker
+/// shortly before the publish, so the timed rename does not run with every
+/// cache cold. `FLOCK_NO_GL2_RN_WARM=1` disables it. Read once.
+fn gl2_rn_warm() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_RN_WARM").is_none());
+    *ON
+}
+
+static GL2_PUB_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn gl2_rn_warm_hook() {
+    let Some(path) = GL2_PUB_PATH.get() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::metadata(dir);
+    }
+    let _ = std::fs::symlink_metadata(path);
+    let mut a = path.as_os_str().to_owned();
+    a.push(".gl2w");
+    let mut b = path.as_os_str().to_owned();
+    b.push(".gl2x");
+    if std::fs::rename(&a, &b).is_ok() {
+        let _ = std::fs::rename(&b, &a);
+    }
 }
 
 fn drop_sized_set(set: SizedSet) {
@@ -929,6 +966,22 @@ fn drop_sized_set(set: SizedSet) {
         unsafe { munmap(f.base as *mut u8, f.len) };
         let _ = std::fs::remove_file(&f.path);
     }
+}
+
+/// Lane gl2 experiment: `FLOCK_GL2_PUB_LINK=1` publishes with `link` instead
+/// of `rename` (same atomic appearance of the complete file). Read once.
+fn gl2_pub_link() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GL2_PUB_LINK").is_some());
+    *ON
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_ENC_WIN=1` restores the planned parallel encode
+/// (`write_par`); default: windowed parallel encode (`write_win`). Read once.
+fn gl2_enc_win() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_ENC_WIN").is_none());
+    *ON
 }
 
 /// Timed: publish through the sized set. `Ok(result)` when this path
@@ -948,7 +1001,9 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
     // SAFETY: the mapping covers exactly `enc.len()` bytes of a file of that
     // length; the bundle is ordinary heap memory.
     unsafe {
-        if par {
+        if par && gl2_enc_win() {
+            enc.write_win(bundle, f.base as *mut u8, rayon::current_num_threads().clamp(1, 64));
+        } else if par {
             enc.write_par(bundle, f.base as *mut u8);
         } else {
             enc.write(bundle, f.base as *mut u8);
@@ -957,6 +1012,10 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
     flock_core::gaptime::abs("encoded");
     if std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none() {
         preseed_spin_end();
+    }
+    flock_core::gaptime::abs("pub:spinend");
+    if gl2_pub_link() {
+        return Some(Ok(std::fs::hard_link(&f.path, path)));
     }
     Some(Ok(std::fs::rename(&f.path, path)))
 }
@@ -993,6 +1052,7 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let bytes = match publish_sized(path, &bundle) {
         Some(Ok(result)) => {
             flock_core::gaptime::abs("renamed");
+            flock_core::rstrace::dump("timed prove");
             flock_core::gaptime::abs_flush();
             return result;
         }
@@ -1015,6 +1075,7 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     flock_core::gaptime::abs("renamed");
     drop(bytes);
     flock_core::gaptime::abs("bytes dropped");
+    flock_core::rstrace::dump("timed prove");
     flock_core::gaptime::abs_flush();
     r
 }
@@ -1366,6 +1427,7 @@ fn speculative_main(
         let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
         // From here on the spinners behave exactly as before (bounded callbacks that re-spawn).
         PRESEED_HOLD.store(false, Ordering::Release);
+        flock_core::rstrace::reset();
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);
