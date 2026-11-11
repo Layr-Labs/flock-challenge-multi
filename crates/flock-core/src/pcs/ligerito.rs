@@ -2651,6 +2651,7 @@ impl SparseDualL0 {
                     .zip(&alpha_pows)
                     .zip(w2_pows.par_iter_mut())
                     .zip(rows.par_chunks_exact_mut(stride))
+                    .with_min_len(lf1_dual_minlen())
                     .map(|(((&query, &alpha), w2_slot), out_rows)| {
                         let base = query & !(cache_len - 1);
                         let qoff = query - base;
@@ -8016,6 +8017,33 @@ fn serial_par_enabled() -> bool {
 
 const ROW_GATHER_PAR_MIN_ELEMS: usize = 512;
 
+/// Lane lf1: `FLOCK_LF1_QS_HASHSET=1` restores the SipHash set in
+/// `sample_distinct_queries` (default: bitmap). Read once.
+fn lf1_qs_bitmap() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_LF1_QS_HASHSET").is_none());
+    *ON
+}
+
+/// Lane lf1: the recursive levels' opened rows and multiproof siblings
+/// (~100 rows of 128 B, ~1K hashes) are gathered serially on the joined
+/// thread; `FLOCK_NO_LF1_OPEN_SERIAL=1` restores the rayon gathers. Read once.
+fn lf1_open_par() -> bool {
+    static PAR: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LF1_OPEN_SERIAL").is_some());
+    serial_par_enabled() && *PAR
+}
+
+/// Lane lf1: the sparse dual's query split takes at least 8 queries per
+/// rayon task (`FLOCK_LF1_DUAL_MINLEN=k` overrides, 1 = rayon adaptive as
+/// before). Read once.
+fn lf1_dual_minlen() -> usize {
+    static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LF1_DUAL_MINLEN").ok().and_then(|s| s.parse().ok()).filter(|&v| v >= 1).unwrap_or(8)
+    });
+    *V
+}
+
 fn gather_opened_rows<'a, F>(queries: &[usize], row: F, par: bool) -> Vec<Vec<F128>>
 where
     F: Fn(usize) -> &'a [F128] + Sync,
@@ -8033,6 +8061,106 @@ const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
 
 const MULTIPROOF_PAR_CHUNK: usize = 64;
 
+/// Lane gl2: `FLOCK_NO_GL2_DEFER=1` keeps the opened-row + multiproof gathers
+/// of L1 and the recursive levels inside the `rayon::join` with the sparse
+/// dual (incumbent). Default: they run as detached jobs off the open's
+/// critical path -- neither enters the transcript, so they only have to be
+/// complete when the proof is assembled. Read once per open.
+fn gl2_defer_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_DEFER").is_none());
+    *ON
+}
+
+type Gl2Opened = (Vec<Vec<F128>>, Vec<Hash>);
+
+/// A detached open-arm gather. Claimed exactly once (by the rayon job or by
+/// the waiter, whichever comes first), so a waiter never blocks on a job that
+/// no worker has started.
+struct Gl2Deferred {
+    state: std::sync::atomic::AtomicU8,
+    job: std::cell::UnsafeCell<Option<Box<dyn FnOnce() -> Gl2Opened + Send>>>,
+    out: std::cell::UnsafeCell<Option<Gl2Opened>>,
+}
+
+// SAFETY: `job` is taken only by the thread that wins the 0 -> 1 claim, `out`
+// is written by that thread before the release store of 2 and read only after
+// an acquire load of 2.
+unsafe impl Sync for Gl2Deferred {}
+unsafe impl Send for Gl2Deferred {}
+
+impl Gl2Deferred {
+    fn spawn(job: Box<dyn FnOnce() -> Gl2Opened + Send>) -> std::sync::Arc<Self> {
+        let d = std::sync::Arc::new(Self {
+            state: std::sync::atomic::AtomicU8::new(0),
+            job: std::cell::UnsafeCell::new(Some(job)),
+            out: std::cell::UnsafeCell::new(None),
+        });
+        let d2 = d.clone();
+        rayon::spawn(move || d2.run());
+        d
+    }
+
+    fn run(&self) {
+        use std::sync::atomic::Ordering;
+        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        // SAFETY: claim won above; see the `Sync` impl.
+        let job = unsafe { (*self.job.get()).take() }.expect("deferred job claimed twice");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).ok();
+        unsafe { *self.out.get() = r };
+        self.state.store(2, Ordering::Release);
+    }
+
+    fn wait(&self) -> Option<Gl2Opened> {
+        use std::sync::atomic::Ordering;
+        self.run();
+        while self.state.load(Ordering::Acquire) != 2 {
+            std::hint::spin_loop();
+        }
+        // SAFETY: state 2 observed with acquire; only the single waiter takes.
+        unsafe { (*self.out.get()).take() }
+    }
+}
+
+/// Waits for every pending deferred gather when dropped (also on unwind), so
+/// no job can outlive the witnesses / L0 buffers its raw pointers refer to.
+/// Declare it AFTER the storage those jobs read.
+struct Gl2DeferSet(Vec<std::sync::Arc<Gl2Deferred>>);
+
+impl Drop for Gl2DeferSet {
+    fn drop(&mut self) {
+        for d in &self.0 {
+            let _ = d.wait();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Gl2Ptr<T>(*const T, usize);
+// SAFETY: only ever dereferenced as a shared slice while the owner is kept
+// alive by `Gl2DeferSet`'s ordering contract.
+unsafe impl<T> Send for Gl2Ptr<T> {}
+impl<T> Gl2Ptr<T> {
+    fn of(s: &[T]) -> Self {
+        Self(s.as_ptr(), s.len())
+    }
+    /// # Safety
+    /// The slice this was made from must still be alive and unmodified.
+    unsafe fn get<'a>(self) -> &'a [T] {
+        unsafe { std::slice::from_raw_parts(self.0, self.1) }
+    }
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_QS_REUSE=1` restores lf1's per-call calloc'd
+/// query bitmap. Read once.
+fn gl2_qs_reuse() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_QS_REUSE").is_none());
+    *ON
+}
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -8042,8 +8170,58 @@ fn sample_distinct_queries<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(count);
+    if lf1_qs_bitmap() && gl2_qs_reuse() {
+        // Lane gl2: same draws and dedupe as below, but the membership bitmap
+        // is a reused thread-local (zeroed again word by word after use)
+        // instead of a fresh calloc: the 128 KiB L1 bitmap was an mmap +
+        // munmap pair (~0.012 ms) on the open's critical path.
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SEEN.with(|cell| {
+            let mut seen = cell.borrow_mut();
+            let words = block_len.div_ceil(64);
+            if seen.len() < words {
+                seen.resize(words, 0);
+            }
+            crate::rstrace::evd("qs:begin", count as u32);
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                let (w, b) = (q >> 6, 1u64 << (q & 63));
+                if seen[w] & b == 0 {
+                    seen[w] |= b;
+                    out.push(q);
+                }
+            }
+            crate::rstrace::evd("qs:drawn", count as u32);
+            for &q in &out {
+                seen[q >> 6] = 0;
+            }
+        });
+        out.sort_unstable();
+        return out;
+    }
+    if lf1_qs_bitmap() {
+        // Lane lf1: same draws, same first-occurrence dedupe, bitmap
+        // membership instead of a SipHash set.
+        let mut seen = vec![0u64; block_len.div_ceil(64)];
+        crate::rstrace::evd("qs:begin", count as u32);
+        while out.len() < count {
+            let v = challenger.sample_f128();
+            let q = (v.lo as usize) % block_len;
+            let (w, b) = (q >> 6, 1u64 << (q & 63));
+            if seen[w] & b == 0 {
+                seen[w] |= b;
+                out.push(q);
+            }
+        }
+        crate::rstrace::evd("qs:drawn", count as u32);
+        out.sort_unstable();
+        return out;
+    }
+    let mut seen = std::collections::HashSet::new();
     while out.len() < count {
         let v = challenger.sample_f128();
         let q = (v.lo as usize) % block_len;
@@ -8909,6 +9087,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     }
 
     crate::rstrace::ev("L1:ood", 0);
+    // Lane gl2: retired level witnesses stay alive until every deferred
+    // gather has been waited for (`gl2_jobs` is dropped first).
+    let gl2_defer = gl2_defer_enabled();
+    let mut gl2_retired: Vec<LigeroWitness> = Vec::new();
+    let mut gl2_jobs = Gl2DeferSet(Vec::new());
+    let mut gl2_l1_job: Option<std::sync::Arc<Gl2Deferred>> = None;
+    let mut gl2_level_jobs: Vec<(usize, std::sync::Arc<Gl2Deferred>)> = Vec::new();
     let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
     crate::rstrace::ev("L1:qgrind", 0);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
@@ -8916,8 +9101,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    crate::rstrace::evd("L1:qs", queries_0.len() as u32);
     let open_l0 = || {
         let opened_rows = gather_opened_rows(&queries_0, l0_row, serial_par_enabled());
+        crate::rstrace::evd("L1:rows", 0);
         let merkle_proof = merkle_multi_proof_for_l0(
             l0_tree,
             l0_codeword,
@@ -8926,6 +9113,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             &queries_0,
             config.merkle_hash,
         );
+        crate::rstrace::evd("L1:mp", 0);
         (opened_rows, merkle_proof)
     };
 
@@ -8946,10 +9134,39 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     );
     let _t = std::time::Instant::now();
     let ((opened_rows_0, merkle_proof_0), (basis_0_induced, sparse_dual_0, enforced_sum_0)) =
-        if let Some(depth) = sparse_dual_depth {
+        if let (Some(depth), true) = (sparse_dual_depth, gl2_defer) {
+            let (tree_p, cw_p) = (Gl2Ptr::of(l0_tree), Gl2Ptr::of(l0_codeword));
+            let (bl, ni, kind) = (l0_block_len, l0_num_interleaved, config.merkle_hash);
+            let qs = queries_0.clone();
+            let job = Gl2Deferred::spawn(Box::new(move || {
+                // SAFETY: the L0 tree / codeword are borrowed for the whole
+                // open; `gl2_jobs` waits for this job before it returns.
+                let (tree, cw) = unsafe { (tree_p.get(), cw_p.get()) };
+                let rows = gather_opened_rows(&qs, |q| &cw[q * ni..(q + 1) * ni], serial_par_enabled());
+                let mp = merkle_multi_proof_for_l0(tree, cw, bl, ni, &qs, kind);
+                crate::rstrace::evd("L1:deferred", 0);
+                (rows, mp)
+            }));
+            gl2_jobs.0.push(job.clone());
+            gl2_l1_job = Some(job);
+            crate::rstrace::evd("L1:dual0", 0);
+            let (dual, enforced_sum) = SparseDualL0::new(
+                depth,
+                n1 + log_inv_rate_0,
+                log_inv_rate_0,
+                l0_codeword,
+                l0_num_interleaved,
+                &r_lane_fold,
+                &queries_0,
+                &alpha_0,
+            );
+            crate::rstrace::evd("L1:dual1", 0);
+            ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
+        } else if let Some(depth) = sparse_dual_depth {
             let ((dual, enforced_sum), opened) = rayon::join(
                 || {
-                    SparseDualL0::new(
+                    crate::rstrace::evd("L1:dual0", 0);
+                    let r = SparseDualL0::new(
                         depth,
                         n1 + log_inv_rate_0,
                         log_inv_rate_0,
@@ -8958,7 +9175,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         &r_lane_fold,
                         &queries_0,
                         &alpha_0,
-                    )
+                    );
+                    crate::rstrace::evd("L1:dual1", 0);
+                    r
                 },
                 open_l0,
             );
@@ -9124,12 +9343,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
+            crate::rstrace::evd("fin:qs", 0);
             let opened_rows_last: Vec<Vec<F128>> =
-                gather_opened_rows(&queries_last, |q| wtns_prev.row(q), serial_par_enabled());
+                gather_opened_rows(&queries_last, |q| wtns_prev.row(q), lf1_open_par());
+            crate::rstrace::evd("fin:rows", 0);
             let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+                multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, lf1_open_par());
             crate::rstrace::ev("fin:open", 0);
-            crate::rstrace::dump("ligerito open");
+            let mut initial_proof = initial_proof;
+            if let Some(job) = gl2_l1_job.take() {
+                let (rows, mp) = job.wait().expect("deferred L1 open gather panicked");
+                initial_proof.opened_rows = rows;
+                initial_proof.merkle_proof = mp;
+            }
+            for (k, job) in gl2_level_jobs.drain(..) {
+                let (rows, mp) = job.wait().expect("deferred level open gather panicked");
+                recursive_proofs[k].opened_rows = rows;
+                recursive_proofs[k].merkle_proof = mp;
+            }
+            crate::rstrace::ev("fin:joined", 0);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9229,6 +9461,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
+                crate::rstrace::evd("lv:oodz", i as u32);
                 let (intro, y) = if lazy_deep_ood {
                     sc_prover
                         .introduce_new_ood_factorized(&z)
@@ -9237,6 +9470,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     let eq_z = build_eq_table_split(&z);
                     sc_prover.introduce_new_with_eval(eq_z)
                 };
+                crate::rstrace::evd("lv:oodi", i as u32);
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
@@ -9260,11 +9494,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        crate::rstrace::evd("lv:qs", i as u32);
         let open_i = || {
             let opened_rows =
-                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), serial_par_enabled());
+                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), lf1_open_par());
+            crate::rstrace::evd("lv:rows", i as u32);
             let merkle_proof =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+                multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_i, lf1_open_par());
+            crate::rstrace::evd("lv:mp", i as u32);
             (opened_rows, merkle_proof)
         };
 
@@ -9287,10 +9524,41 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             remaining_folds,
         );
         let ((opened_rows_i, merkle_proof_i), (basis_i_induced, deep_dual_i, enforced_sum_i)) =
-            if let Some(depth) = deep_dual_depth {
+            if let (Some(depth), true) = (deep_dual_depth, gl2_defer) {
+                let (mat_p, tree_p) = (Gl2Ptr::of(&wtns_prev.mat), Gl2Ptr::of(&wtns_prev.tree));
+                let (bl, ni) = (wtns_prev.block_len, wtns_prev.num_interleaved);
+                let qs = queries_i.clone();
+                let lvl = i as u32;
+                let job = Gl2Deferred::spawn(Box::new(move || {
+                    // SAFETY: this level's witness moves into `gl2_retired`
+                    // (heap buffers unchanged) and outlives `gl2_jobs`.
+                    let (mat, tree) = unsafe { (mat_p.get(), tree_p.get()) };
+                    let rows = gather_opened_rows(&qs, |q| &mat[q * ni..(q + 1) * ni], false);
+                    crate::rstrace::evd("lv:rows", lvl);
+                    let mp = multi_proof_gather(tree, bl, &qs, false);
+                    crate::rstrace::evd("lv:mp", lvl);
+                    (rows, mp)
+                }));
+                gl2_jobs.0.push(job.clone());
+                gl2_level_jobs.push((recursive_proofs.len(), job));
+                crate::rstrace::evd("lv:dual0", i as u32);
+                let (dual, enforced_sum) = SparseDualL0::new(
+                    depth,
+                    n_next + config.log_inv_rates[i + 1],
+                    config.log_inv_rates[i + 1],
+                    &wtns_prev.mat,
+                    wtns_prev.num_interleaved,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                );
+                crate::rstrace::evd("lv:dual1", i as u32);
+                ((Vec::new(), Vec::new()), (None, Some(dual), enforced_sum))
+            } else if let Some(depth) = deep_dual_depth {
                 let ((dual, enforced_sum), opened) = rayon::join(
                     || {
-                        SparseDualL0::new(
+                        crate::rstrace::evd("lv:dual0", i as u32);
+                        let r = SparseDualL0::new(
                             depth,
                             n_next + config.log_inv_rates[i + 1],
                             config.log_inv_rates[i + 1],
@@ -9299,7 +9567,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             &level_rs,
                             &queries_i,
                             &alpha_i,
-                        )
+                        );
+                        crate::rstrace::evd("lv:dual1", i as u32);
+                        r
                     },
                     open_i,
                 );
@@ -9390,7 +9660,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         crate::rstrace::ev("lv:intro+glue", i as u32);
-        wtns_prev = wtns_next;
+        let retired = std::mem::replace(&mut wtns_prev, wtns_next);
+        if gl2_defer {
+            gl2_retired.push(retired);
+        } else {
+            drop(retired);
+        }
     }
 
     unreachable!()

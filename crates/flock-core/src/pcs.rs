@@ -793,6 +793,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     );
 
     challenger.observe_label(b"flock-pcs-open-batch-v0");
+    crate::rstrace::ev("rs:open", 0);
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
@@ -828,6 +829,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         (Vec::new(), Vec::new())
     };
     crate::gaptime::mark("open: ring_switch done");
+    crate::rstrace::ev("rsw:done", 0);
     if trace {
         eprintln!(
             "  [open_batch] ring_switch::prove_batched ×{}: {:6.2} ms",

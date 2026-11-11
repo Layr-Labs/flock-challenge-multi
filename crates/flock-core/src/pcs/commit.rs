@@ -537,6 +537,7 @@ fn finalize_cpu_commit(
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
+    crate::rstrace::ev("cm:encoded", 0);
     let t_merkle = std::time::Instant::now();
     let folded = match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,
@@ -549,6 +550,7 @@ fn finalize_cpu_commit(
         kind,
     );
     let root = merkle_tree[2 * stored_leaves - 2];
+    crate::rstrace::ev("cm:root", 0);
     if timing {
         eprintln!(
             "[commit-timing] merkle: {:.2} ms (subtree levels folded in-callback: {})",

@@ -9,6 +9,9 @@
 use super::F128;
 use core::arch::global_asm;
 global_asm!(include_str!("ab_leaf_accum.S"), options(raw));
+// Lane ab1: pair-major copies of the merged banks (window stride one row).
+global_asm!(include_str!("ab_leaf_accum_pmaj.S"), options(raw));
+global_asm!(include_str!("ab_leaf_accum_ns.S"), options(raw));
 
 const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
 const GROUPS0: [usize; 9] = [9, 9, 9, 9, 6, 9, 9, 9, 9];
@@ -44,6 +47,12 @@ fn grouped_enabled() -> bool {
         std::env::var_os("FLOCK_NO_AB_MERGED").is_none()
     });
     *ON
+}
+
+/// Lane ab1: true when [`try_run`] will take the merged leaf path for these
+/// matrices (same key check as the per-worker cache).
+pub(super) fn would_run(mats: &[u64]) -> bool {
+    grouped_enabled() && mats.len() == 32 * 256 && Cache::new(mats).merged.is_some()
 }
 
 pub(super) struct Cache {
@@ -121,18 +130,22 @@ pub(super) fn try_run(
     x_hi: usize,
     mode: usize,
     planes: &mut [u8],
+    layout: usize,
 ) -> bool {
     const BAND_BYTES: usize = 2048 * 29 * 64;
     if mats.len() != 32 * 256 || planes.len() != 128 * 1024 || mode > 2 {
         return false;
     }
+    // Probe only: the padded split-half layout spans more than one band.
+    let x_hi = if layout == 65 { x_hi % 120 } else { x_hi };
+    let end_pad = if layout == 65 { 32 * 15 * 4096 * 2 + 4096 - BAND_BYTES } else { 0 };
     let Some(start) = x_hi.checked_mul(BAND_BYTES) else {
         return false;
     };
     let Some(end) = start.checked_add(BAND_BYTES) else {
         return false;
     };
-    let Some(rows) = source.get(start..end) else {
+    let Some(rows) = source.get(start..end + end_pad) else {
         return false;
     };
     if cache.as_ref().is_none_or(|c| c.key.as_slice() != mats) {
@@ -161,6 +174,7 @@ pub(super) fn try_run(
             planes.as_mut_ptr(),
             mode,
             merged,
+            if merged { layout } else { 0 },
         );
     }
     true
@@ -188,6 +202,48 @@ unsafe extern "C" {
     fn flock_ab_merged_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
     fn flock_ab_merged_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
     fn flock_ab_merged_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_pmaj_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns16_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsh_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_ns32p_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nsla_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank0_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank2_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank2_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
+    fn flock_ab_nshp_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
 }
 
 #[unsafe(no_mangle)]
@@ -201,6 +257,7 @@ unsafe extern "C" fn flock_ab_poly_band(
     out: *mut u8,
     mode: usize,
     merged: bool,
+    layout: usize,
 ) {
     // The public caller checked the complete source, tables and output.
     // All leaf accumulators start from zero in registers. The scratch bank
@@ -215,14 +272,59 @@ unsafe extern "C" fn flock_ab_poly_band(
             (true, 2) => (flock_ab_merged_bank0_m2, flock_ab_merged_bank2_m2),
             _ => unreachable!(),
         };
+        // Lane ab1: pair-major band layout. Row `w*64 + pair` of the band sits
+        // at row position `pair*32 + w`, so one pair's 32 window rows are one
+        // contiguous 59 KiB span and the band is read as ONE sequential stream.
+        let (bank0, bank2, pair_bytes, half): (Bank, Bank, usize, usize) = match layout {
+            0 => (bank0, bank2, 1856, 896),
+            1 => match mode {
+                0 => (flock_ab_pmaj_bank0_m0, flock_ab_pmaj_bank2_m0, 32 * 1856, 896),
+                1 => (flock_ab_pmaj_bank0_m1, flock_ab_pmaj_bank2_m1, 32 * 1856, 896),
+                _ => (flock_ab_pmaj_bank0_m2, flock_ab_pmaj_bank2_m2, 32 * 1856, 896),
+            },
+            32 => match mode {
+                0 => (flock_ab_ns32_bank0_m0, flock_ab_ns32_bank2_m0, 1792, 896),
+                1 => (flock_ab_ns32_bank0_m1, flock_ab_ns32_bank2_m1, 1792, 896),
+                _ => (flock_ab_ns32_bank0_m2, flock_ab_ns32_bank2_m2, 1792, 896),
+            },
+            16 => match mode {
+                0 => (flock_ab_ns16_bank0_m0, flock_ab_ns16_bank2_m0, 2 * 1792, 2 * 896),
+                1 => (flock_ab_ns16_bank0_m1, flock_ab_ns16_bank2_m1, 2 * 1792, 2 * 896),
+                _ => (flock_ab_ns16_bank0_m2, flock_ab_ns16_bank2_m2, 2 * 1792, 2 * 896),
+            },
+            // split halves: 64 streams of 896 B per pair
+            64 => match mode {
+                0 => (flock_ab_nsh_bank0_m0, flock_ab_nsh_bank2_m0, 896, 32 * 64 * 896),
+                1 => (flock_ab_nsh_bank0_m1, flock_ab_nsh_bank2_m1, 896, 32 * 64 * 896),
+                _ => (flock_ab_nsh_bank0_m2, flock_ab_nsh_bank2_m2, 896, 32 * 64 * 896),
+            },
+            65 => match mode {
+                0 => (flock_ab_nshp_bank0_m0, flock_ab_nshp_bank2_m0, 896, 32 * 15 * 4096 + 2048),
+                1 => (flock_ab_nshp_bank0_m1, flock_ab_nshp_bank2_m1, 896, 32 * 15 * 4096 + 2048),
+                _ => (flock_ab_nshp_bank0_m2, flock_ab_nshp_bank2_m2, 896, 32 * 15 * 4096 + 2048),
+            },
+            // 32 streams, hole-free 1792 B pairs, stream stride 29 pages
+            33 => match mode {
+                0 => (flock_ab_ns32p_bank0_m0, flock_ab_ns32p_bank2_m0, 1792, 896),
+                1 => (flock_ab_ns32p_bank0_m1, flock_ab_ns32p_bank2_m1, 1792, 896),
+                _ => (flock_ab_ns32p_bank0_m2, flock_ab_ns32p_bank2_m2, 1792, 896),
+            },
+            // incumbent layout, software prefetch one half-row ahead
+            2 => match mode {
+                0 => (flock_ab_nsla_bank0_m0, flock_ab_nsla_bank2_m0, 1856, 896),
+                1 => (flock_ab_nsla_bank0_m1, flock_ab_nsla_bank2_m1, 1856, 896),
+                _ => (flock_ab_nsla_bank0_m2, flock_ab_nsla_bank2_m2, 1856, 896),
+            },
+            _ => unreachable!(),
+        };
         let leaves = scratch;
         let polynomial = scratch.add(78 * 64);
         for pair in 0..64 {
-            let source = rows.add(pair * 1856);
+            let source = rows.add(pair * pair_bytes);
             bank2(source, mats2, leaves);
             flock_ab_leaf_interpolate2(leaves, polynomial);
             flock_ab_poly_finalize(polynomial.add(128), basis.add(32), out.add(2 * pair * 1024));
-            bank0(source.add(896), mats0, leaves);
+            bank0(source.add(half), mats0, leaves);
             flock_ab_leaf_interpolate0(leaves, polynomial);
             flock_ab_poly_finalize(polynomial, basis, out.add((2 * pair + 1) * 1024));
         }

@@ -225,6 +225,124 @@ pub struct LevelSched {
     k: usize,
     children: Box<[[u32; 2]]>,
     outputs: Box<[(u32, u32)]>,
+    /// Lane hot1: register-allocated u16 form of the same schedule (see [`CompactSched`]).
+    compact: Option<CompactSched>,
+}
+
+/// Lane hot1: the level schedule with every internal node given a *home*
+/// instead of its own row of a 55K-entry table. An output node lives in its
+/// (first) output column; any other consumed node lives in a slot of a small
+/// pool, reused once its last consumer (in level order) has read it. The
+/// reconstruct was DRAM-bound (0.11-0.13 ms cold vs 0.034-0.044 ms warm on
+/// the same thread): its 880 KiB node table is fresh memory and the 311 KiB
+/// u32 schedule plus the 90 KiB usize root list were evicted by the fold.
+/// Here the table is `k + 1 + slots` entries and every index is a u16, so
+/// the cold traffic roughly halves. Each node is still the XOR of the same
+/// two values, so every reconstructed wire is bit-identical.
+struct CompactSched {
+    /// Root columns, in `plan.roots` order.
+    roots: Box<[u16]>,
+    /// `table[dst] = table[a] + table[b]`, level order.
+    ops: Box<[[u16; 3]]>,
+    /// `table[col] = table[src]` for outputs whose node lives elsewhere.
+    copies: Box<[(u16, u16)]>,
+    /// `k + 1 + slots`.
+    table_len: usize,
+}
+
+impl CompactSched {
+    fn build(roots: &[usize], k: usize, children: &[[u32; 2]], outputs: &[(u32, u32)]) -> Option<Self> {
+        let base = k + 1;
+        let n = children.len();
+        if base > u16::MAX as usize {
+            return None;
+        }
+        let mut last_use: Vec<Option<usize>> = vec![None; n];
+        for (i, &[a, b]) in children.iter().enumerate() {
+            for x in [a as usize, b as usize] {
+                if x >= base {
+                    last_use[x - base] = Some(i);
+                }
+            }
+        }
+        let mut home_col: Vec<Option<u16>> = vec![None; n];
+        let mut pending: Vec<(u16, u32)> = Vec::new();
+        for &(col, node) in outputs {
+            let node_u = node as usize;
+            if node_u >= base && home_col[node_u - base].is_none() {
+                home_col[node_u - base] = Some(col as u16);
+            } else {
+                pending.push((col as u16, node));
+            }
+        }
+        let mut loc: Vec<u32> = vec![u32::MAX; n];
+        let mut free: Vec<u32> = Vec::new();
+        let mut slots = 0usize;
+        let mut ops = Vec::with_capacity(n);
+        for (i, &[a, b]) in children.iter().enumerate() {
+            let map = |x: u32, loc: &[u32]| -> Option<u32> {
+                let x = x as usize;
+                if x < base {
+                    Some(x as u32)
+                } else {
+                    let l = loc[x - base];
+                    (l != u32::MAX).then_some(l)
+                }
+            };
+            let (ma, mb) = (map(a, &loc)?, map(b, &loc)?);
+            // Free the operand slots whose last reader is this op (the
+            // destination may take one of them: read-then-write in one op).
+            let operands: &[(usize, u32)] =
+                if a == b { &[(a as usize, ma)][..] } else { &[(a as usize, ma), (b as usize, mb)][..] };
+            for &(x, m) in operands {
+                if x >= base && last_use[x - base] == Some(i) && home_col[x - base].is_none() && m as usize >= base {
+                    free.push(m);
+                }
+            }
+            let dst = if let Some(col) = home_col[i] {
+                col as u32
+            } else if last_use[i].is_some() {
+                match free.pop() {
+                    Some(s) => s,
+                    None => {
+                        slots += 1;
+                        (base + slots - 1) as u32
+                    }
+                }
+            } else {
+                // Neither an output nor read by any node: cannot reach a wire.
+                continue;
+            };
+            if dst as usize > u16::MAX as usize {
+                return None;
+            }
+            loc[i] = dst;
+            ops.push([dst as u16, ma as u16, mb as u16]);
+        }
+        let mut copies = Vec::with_capacity(pending.len());
+        for (col, node) in pending {
+            let src = if (node as usize) < base { node } else { loc[node as usize - base] };
+            if src == u32::MAX || src as usize >= base {
+                // Only output-homed nodes (columns) outlive the ops.
+                return None;
+            }
+            copies.push((col, src as u16));
+        }
+        let roots: Option<Vec<u16>> =
+            roots.iter().map(|&c| (c < k).then_some(c as u16)).collect();
+        Some(Self {
+            roots: roots?.into_boxed_slice(),
+            ops: ops.into_boxed_slice(),
+            copies: copies.into_boxed_slice(),
+            table_len: base + slots,
+        })
+    }
+}
+
+fn rc_compact_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT1_RC_COMPACT").is_none());
+    *ON
 }
 
 impl LevelSched {
@@ -248,8 +366,24 @@ impl LevelSched {
             };
             level[i] = 1 + depth(a)?.max(depth(b)?);
         }
+        if std::env::var_os("FLOCK_V1_STATS").is_some() {
+            let maxl = level.iter().copied().max().unwrap_or(0) as usize;
+            let mut h = vec![0usize; maxl + 1];
+            for &l in &level {
+                h[l as usize] += 1;
+            }
+            eprintln!("[v1] level sched: nodes {n}, depth {maxl}, per level {:?}", h);
+        }
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by_key(|&i| (level[i as usize], i));
+        if crate::gaptime::who_enabled() {
+            let maxl = level.iter().copied().max().unwrap_or(0) as usize;
+            let mut w = vec![0usize; maxl + 1];
+            for &l in &level {
+                w[l as usize] += 1;
+            }
+            eprintln!("[hot1] levelsched k={k} nodes={n} outputs={} roots={} levels={maxl} widths={:?}", plan.outputs.len(), plan.roots.len(), &w[1..]);
+        }
         let mut pos = vec![0u32; n];
         for (new, &old) in order.iter().enumerate() {
             pos[old as usize] = (base + new) as u32;
@@ -261,7 +395,7 @@ impl LevelSched {
                 pos[x as usize - base]
             }
         };
-        let children = order
+        let children: Box<[[u32; 2]]> = order
             .iter()
             .map(|&old| {
                 let [a, b] = plan.children[old as usize];
@@ -275,12 +409,26 @@ impl LevelSched {
             }
             outputs.push((col as u32, map(node)));
         }
+        let compact = CompactSched::build(&plan.roots, k, &children, &outputs);
+        if crate::gaptime::who_enabled() {
+            match &compact {
+                Some(c) => eprintln!("[hot1] compact ops={} copies={} table={} (slots {})", c.ops.len(), c.copies.len(), c.table_len, c.table_len - k - 1),
+                None => eprintln!("[hot1] compact: not applicable"),
+            }
+        }
         Some(Self {
             k,
             children,
             outputs: outputs.into_boxed_slice(),
+            compact,
         })
     }
+}
+
+fn hot1_rc_rerun() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_HOT1_RC_RERUN").is_some());
+    *ON
 }
 
 fn level_sched_enabled() -> bool {
@@ -332,6 +480,7 @@ impl LinearFoldPlan {
                     k: usize::MAX,
                     children: Box::new([]),
                     outputs: Box::new([]),
+                    compact: None,
                 })
             });
             if sched.k == k {
@@ -376,7 +525,42 @@ impl LinearFoldPlan {
     }
 
     #[inline(always)]
+    fn reconstruct_compact(&self, c: &CompactSched, folded: &[F128], k: usize) -> Vec<F128> {
+        let live_cols = self.roots.len() + self.outputs.len();
+        let mut t = if live_cols <= k {
+            let mut v = crate::alloc_uninit_vec::<F128>(c.table_len);
+            v[live_cols..=k].fill(F128::ZERO);
+            v
+        } else {
+            vec![F128::ZERO; c.table_len]
+        };
+        crate::rstrace::ev("rc:alloc", live_cols as u32);
+        let tp = t.as_mut_ptr();
+        // SAFETY: every index was range-checked against `table_len` / `k`
+        // when the schedule was built; `folded` covers the roots (asserted).
+        assert!(folded.len() >= c.roots.len());
+        unsafe {
+            for (&col, &value) in c.roots.iter().zip(folded) {
+                *tp.add(col as usize) = value;
+            }
+            crate::rstrace::ev("rc:roots", 0);
+            for &[d, a, b] in c.ops.iter() {
+                *tp.add(d as usize) = *tp.add(a as usize) + *tp.add(b as usize);
+            }
+            crate::rstrace::ev("rc:children", 0);
+            for &(col, src) in c.copies.iter() {
+                *tp.add(col as usize) = *tp.add(src as usize);
+            }
+        }
+        t.truncate(k);
+        t
+    }
+
+    #[inline(always)]
     fn reconstruct_level(&self, sched: &LevelSched, folded: &[F128], k: usize) -> Vec<F128> {
+        if let Some(c) = sched.compact.as_ref().filter(|_| rc_compact_enabled()) {
+            return self.reconstruct_compact(c, folded, k);
+        }
         let total = k + 1 + sched.children.len();
         let live_cols = self.roots.len() + self.outputs.len();
         let mut nodes = if live_cols <= k {
@@ -386,6 +570,7 @@ impl LinearFoldPlan {
         } else {
             vec![F128::ZERO; total]
         };
+        crate::rstrace::ev("rc:alloc", live_cols as u32);
         debug_assert!(folded.len() >= self.roots.len());
         for (&col, &value) in self.roots.iter().zip(folded) {
             debug_assert!(col < k);
@@ -394,6 +579,7 @@ impl LinearFoldPlan {
             }
         }
         let base = k + 1;
+        crate::rstrace::ev("rc:roots", 0);
         for (i, &[a, b]) in sched.children.iter().enumerate() {
             let a = a as usize;
             let b = b as usize;
@@ -403,6 +589,7 @@ impl LinearFoldPlan {
                 *nodes.get_unchecked_mut(base + i) = sum;
             }
         }
+        crate::rstrace::ev("rc:children", 0);
         for &(col, node) in sched.outputs.iter() {
             let (col, node) = (col as usize, node as usize);
             debug_assert!(col < k && node < total);
@@ -413,6 +600,7 @@ impl LinearFoldPlan {
         nodes.truncate(k);
         nodes
     }
+
 }
 
 /// Root fold preparation, shared by C and AB at their distinct Fiat-Shamir
@@ -545,7 +733,7 @@ impl RootFoldSource {
                 && z_len / stride >= 64
                 && (z_len / stride) % 64 == 0
                 && block_major_gfni_enabled()
-                && RootSplicePlan::new(plan, k).is_some()
+                && RootSplicePlan::cached(plan, k).is_some()
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -566,10 +754,9 @@ impl RootFoldSource {
         let stride = k / 128;
         assert_eq!(z.len() % stride, 0);
         assert!(!plan.roots.is_empty());
-        assert!(plan.roots.windows(2).all(|w| w[0] < w[1]));
         // Derive and check the small selector plan on portable hosts too, so
         // the witness reconstruction oracle also exercises its column map.
-        let splice = RootSplicePlan::new(plan, k);
+        let splice = RootSplicePlan::cached(plan, k);
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -713,6 +900,7 @@ impl RootFoldSource {
         assert_eq!(x_outer.len(), m - k_log);
         let k = 1usize << k_log;
         assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
+        crate::rstrace::ev("rf:fold0", 0);
         let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
             let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
             let eq_lo = build_eq_table(lo);
@@ -736,7 +924,18 @@ impl RootFoldSource {
             let eq = build_eq_table(x_outer);
             self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]), |indices| indices.map(|i| eq[i]))
         };
-        self.plan.reconstruct(&folded, k)
+        crate::rstrace::ev("rf:recon0", self.plan.children.len() as u32);
+        let r = self.plan.reconstruct(&folded, k);
+        crate::rstrace::ev("rf:end", 0);
+        if hot1_rc_rerun() {
+            // Lane hot1 timing experiment (proof unchanged): the same reconstruct twice more, caches now warm.
+            for _ in 0..2 {
+                crate::rstrace::ev("rc:rep0", 0);
+                std::hint::black_box(self.plan.reconstruct(&folded, k));
+                crate::rstrace::ev("rc:rep1", 0);
+            }
+        }
+        r
     }
 }
 
@@ -766,6 +965,32 @@ struct RootSplicePlan {
 }
 
 impl RootSplicePlan {
+    /// Lane ru: the selector plan (and the sortedness check of `plan.roots`)
+    /// is a pure function of the static circuit plan, but was rebuilt and
+    /// re-checked twice per proof (`splice_eligible` + `RootFoldSource::new`,
+    /// ~0.06 ms serial between the commit and zerocheck). Built once per
+    /// process here; the clone is the same value. `FLOCK_NO_RU_SPLICE_CACHE=1`
+    /// rebuilds it per call.
+    fn cached(plan: &LinearFoldPlan, k: usize) -> Option<Self> {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RU_SPLICE_CACHE").is_some());
+        let build = || {
+            assert!(plan.roots.windows(2).all(|w| w[0] < w[1]));
+            Self::new(plan, k)
+        };
+        if *OFF {
+            return build();
+        }
+        static CACHE: std::sync::OnceLock<(usize, usize, Option<RootSplicePlan>)> =
+            std::sync::OnceLock::new();
+        let (addr, ck, splice) = CACHE.get_or_init(|| (plan as *const LinearFoldPlan as usize, k, build()));
+        if *addr == plan as *const LinearFoldPlan as usize && *ck == k {
+            splice.clone()
+        } else {
+            build()
+        }
+    }
+
     fn new(plan: &LinearFoldPlan, k: usize) -> Option<Self> {
         // Accept only the BLAKE3 geometry: each complete root group is either
         // one aligned source block, or two adjacent blocks with exactly one
@@ -4432,6 +4657,83 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
+/// Lane gl1 (`FLOCK_NO_GL1_LC_TEAM`, size floor `FLOCK_GL1_LC_MIN` on the
+/// quarter length, default 2048): the first product-sumcheck rounds run on
+/// the hot pool's spinning team (16 contiguous chunks) instead of serially on
+/// the caller (19.5 / 16 / 5 µs at 2^14 / 2^13 / 2^12 tables, cold from the
+/// fold workers' caches). Bound values are per-slot and the message terms
+/// XOR-summed, so any chunking gives the same field elements. Returns the
+/// quarter-length floor, 0 = off; resolved once per sumcheck.
+fn gl1_lc_team_min() -> usize {
+    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_GL1_LC_TEAM").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_GL1_LC_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+    });
+    if *MIN != 0 && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
+        *MIN
+    } else {
+        0
+    }
+}
+
+const GL1_LC_CHUNKS: usize = 16;
+
+/// [`sumcheck_round_eval_par`] on the spinning team (x4 leaves).
+fn gl1_round_eval_team(c: &[F128], z: &[F128]) -> (F128, F128) {
+    let half = c.len() / 2;
+    let (clo, chi) = c.split_at(half);
+    let (zlo, zhi) = z.split_at(half);
+    let ch = half / GL1_LC_CHUNKS;
+    crate::flat_par::team_map_reduce(
+        GL1_LC_CHUNKS,
+        |i| {
+            let s = i * ch;
+            crate::field::f128_slice::msg_split_half(
+                &chi[s..s + ch], &clo[s..s + ch], &zhi[s..s + ch], &zlo[s..s + ch], ch,
+            )
+        },
+        || (F128::ZERO, F128::ZERO),
+        |a, b| (a.0 + b.0, a.1 + b.1),
+    )
+}
+
+/// [`sumcheck_bind_both_and_eval_next`] on the spinning team (x4 leaves).
+fn gl1_bind_both_and_eval_next_team(comb: &mut Vec<F128>, z: &mut Vec<F128>, r: F128) -> (F128, F128) {
+    let len = comb.len();
+    debug_assert_eq!(z.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    let ch = half2 / GL1_LC_CHUNKS;
+    let (cp, zp) = (comb.as_mut_ptr() as usize, z.as_mut_ptr() as usize);
+    let out = crate::flat_par::team_map_reduce(
+        GL1_LC_CHUNKS,
+        |i| {
+            let s = i * ch;
+            // SAFETY: chunk `i` writes only slots [s, s+ch) of the two low
+            // quarters and reads [s, s+ch) of the two high quarters; chunks
+            // are disjoint and both tables outlive `team_map_reduce`.
+            unsafe {
+                let c = cp as *mut F128;
+                let zz = zp as *mut F128;
+                let m = |p: *mut F128, o: usize| core::slice::from_raw_parts_mut(p.add(o), ch);
+                let r_ = |p: *mut F128, o: usize| core::slice::from_raw_parts(p.add(o) as *const F128, ch);
+                crate::field::f128_slice::bind_both_and_msg_split(
+                    m(c, s), m(c, half2 + s), r_(c, half + s), r_(c, half + half2 + s),
+                    m(zz, s), m(zz, half2 + s), r_(zz, half + s), r_(zz, half + half2 + s),
+                    r, ch,
+                )
+            }
+        },
+        || (F128::ZERO, F128::ZERO),
+        |a, b| (a.0 + b.0, a.1 + b.1),
+    );
+    comb.truncate(half);
+    z.truncate(half);
+    out
+}
+
 /// Ranked default routes the lincheck product-sumcheck rounds through the
 /// four-lane split-half leaves in `field::f128_slice`, with chunk-granular
 /// rayon instead of one item per element. `FLOCK_NO_LC_SUMCHECK_X4=1` restores
@@ -5087,7 +5389,9 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
+    crate::rstrace::ev("lc:start", 0);
     let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    crate::rstrace::ev("lc:eqin", 0);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -5115,6 +5419,7 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             None
         };
+        crate::rstrace::ev("lc:zf:start", 0);
         let z_vec = match (kicked, z_packed) {
             (Some(z), PackedZ::BlockMajor(_, _)) => z,
             (kicked, z_packed) => {
@@ -5139,6 +5444,7 @@ fn prove_padded_inner<Ch: Challenger>(
                 }
             }
         };
+        crate::rstrace::ev("lc:zf:end", 0);
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -5159,7 +5465,9 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             None
         };
+        crate::rstrace::ev("lc:alpha0", 0);
         let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+        crate::rstrace::ev("lc:alpha1", 0);
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -5245,6 +5553,7 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         Some(z_vec.clone())
     };
+    crate::rstrace::ev("lc:sc0", 0);
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -5262,7 +5571,17 @@ fn prove_padded_inner<Ch: Challenger>(
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
+        crate::rstrace::ev("lc:sc:start", 0);
+        let gl1_min = if sumcheck_x4_enabled() { gl1_lc_team_min() } else { 0 };
+        let gl1_ok = |len: usize| {
+            gl1_min != 0 && len / 4 >= gl1_min && (len / 4).is_multiple_of(GL1_LC_CHUNKS) && len.is_power_of_two()
+        };
+        let (mut e1, mut einf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
+            gl1_round_eval_team(&comb_vec, &z_vec)
+        } else {
+            sumcheck_round_eval_par(&comb_vec, &z_vec)
+        };
+        crate::rstrace::ev("lc:sc:r0", 0);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -5271,7 +5590,11 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
+                    gl1_bind_both_and_eval_next_team(&mut comb_vec, &mut z_vec, r)
+                } else {
+                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
+                };
                 e1 = ne1;
                 einf = neinf;
             } else {
@@ -5283,6 +5606,7 @@ fn prove_padded_inner<Ch: Challenger>(
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
                 captured_z_vec = Some(z_vec.clone());
             }
+            crate::rstrace::ev("lc:sc:rnd", t as u32);
         }
     }
     if let Some(t) = t_sumcheck_start {
@@ -5293,6 +5617,7 @@ fn prove_padded_inner<Ch: Challenger>(
         );
     }
 
+    crate::rstrace::ev("lc:sc1", 0);
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
     let z_partial = z_vec;
     challenger.observe_f128_slice(&z_partial);
@@ -5321,6 +5646,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
+    crate::rstrace::ev("lc:end", 0);
     (proof, claim, captured_z_vec, actual_capture)
 }
 

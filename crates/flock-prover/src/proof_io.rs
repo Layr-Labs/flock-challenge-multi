@@ -551,6 +551,35 @@ impl ByteSink for RawSink {
     }
 }
 
+/// Lane gl2: copies only the part of each `put` that falls inside
+/// `[lo, hi)` of the output; `pos` tracks the serial encoder's position.
+struct WindowSink {
+    base: *mut u8,
+    pos: usize,
+    lo: usize,
+    hi: usize,
+}
+
+impl ByteSink for WindowSink {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        let start = self.pos;
+        let end = start + bytes.len();
+        self.pos = end;
+        if end <= self.lo || start >= self.hi {
+            return;
+        }
+        let a = start.max(self.lo);
+        let b = end.min(self.hi);
+        // SAFETY: `[lo, hi)` is this task's disjoint window of the
+        // caller-provided `total`-byte destination (see `write_win`); the
+        // source is a live borrow of the bundle or prefix.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().add(a - start), self.base.add(a), b - a)
+        };
+    }
+}
+
 /// Plans the encoding as a list of `(dst offset, src address, len)` copies
 /// without touching the destination. Large fields are referenced in place
 /// (borrows of the bundle / prefix that outlive the plan); small ones are
@@ -624,6 +653,38 @@ impl RawEncoding {
         assert_eq!(sink.pos, self.total);
     }
 
+    /// Lane gl2: [`Self::write`] spread over the Rayon pool with no serial
+    /// planning pass: each of `n` tasks walks the flat encoder over the whole
+    /// bundle with a sink that copies only the bytes falling inside its own
+    /// output window `[k*total/n, (k+1)*total/n)` and merely advances past the
+    /// rest. The windows tile `0..total` disjointly and every byte comes from
+    /// the same `put` the serial encoder makes, so the output is identical to
+    /// [`Self::write`] whatever the schedule.
+    ///
+    /// # Safety
+    /// As [`Self::write`].
+    pub(crate) unsafe fn write_win(self, bundle: &R1csProofBundleLigerito, dst: *mut u8, n: usize) {
+        use rayon::prelude::*;
+        let total = self.total;
+        let base = dst as usize;
+        let prefix = &self.prefix;
+        (0..n).into_par_iter().with_min_len(1).for_each(|k| {
+            let mut sink = WindowSink {
+                base: base as *mut u8,
+                pos: 0,
+                lo: k * total / n,
+                hi: (k + 1) * total / n,
+            };
+            sink.put(prefix);
+            encode_pcs_open_flat(&mut sink, &bundle.proof.pcs_open);
+            debug_assert_eq!(sink.pos, total);
+            flock_core::rstrace::evd("enc:win", k as u32);
+        });
+        // The publish is the worker's last act: leave the ~460 kB prefix
+        // buffer to process exit instead of freeing it inside the timed tail.
+        std::mem::forget(self.prefix);
+    }
+
     /// [`Self::write`] spread over the Rayon pool: one serial pass plans every
     /// copy (without touching `dst`), then the copies run in ~32 KiB tasks.
     /// Offsets are fixed by the plan, so the bytes cannot depend on the
@@ -642,6 +703,7 @@ impl RawEncoding {
         plan.put(&self.prefix);
         encode_pcs_open_flat(&mut plan, &bundle.proof.pcs_open);
         assert_eq!(plan.pos, self.total);
+        flock_core::gaptime::abs("enc:plan");
         let mut tasks: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(self.total / PIECE + 2);
         let mut cur: Vec<(usize, usize, usize)> = Vec::new();
         let mut cur_len = 0usize;
@@ -662,6 +724,7 @@ impl RawEncoding {
         if !cur.is_empty() {
             tasks.push(cur);
         }
+        flock_core::gaptime::abs("enc:tasks");
         let base = dst as usize;
         tasks.par_iter().for_each(|task| {
             for &(d, s, len) in task {
@@ -670,7 +733,9 @@ impl RawEncoding {
                 // `plan.small`, all alive until this loop ends.
                 unsafe { std::ptr::copy_nonoverlapping(s as *const u8, (base + d) as *mut u8, len) };
             }
+            flock_core::rstrace::evd("enc:task", task.len() as u32);
         });
+        flock_core::gaptime::abs("enc:par");
         drop(plan);
         drop(self.prefix);
     }

@@ -709,6 +709,7 @@ pub mod r1_owner_awake {
     fn hold_for(epoch: u64, limit: Duration, yielding: bool) {
         let t0 = Instant::now();
         while HOLD_EPOCH.load(Ordering::Relaxed) == epoch {
+            side_poll();
             if yielding {
                 std::thread::yield_now();
             }
@@ -778,6 +779,135 @@ pub mod r1_owner_awake {
         }
     }
 
+    // ---- Lane gl1: side jobs for round one's C-arm tail ----
+    //
+    // After its fold, the C arm's tail runs serially on one thread while the
+    // caller (yield-spinning on the C arm) and the AB pool's core-warm
+    // holders (PAUSE loop) are on CPU with nothing to do. `side_run` posts up
+    // to two independent closures into fixed slots that those waiting loops
+    // poll; whichever claims a slot first runs it. The poster runs its own
+    // part, then takes back any slot nobody claimed and waits for the rest,
+    // so the result is the same closures' values, only placed on other CPUs.
+    // `FLOCK_NO_GL1_SIDE=1` runs all three in order on the poster.
+    const SIDES: usize = 2;
+    static SIDE_BODY: [AtomicU64; SIDES] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static SIDE_STATE: [std::sync::atomic::AtomicU32; SIDES] =
+        [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+    const S_IDLE: u32 = 0;
+    const S_POSTED: u32 = 1;
+    const S_CLAIMED: u32 = 2;
+    const S_DONE: u32 = 3;
+
+    pub fn side_enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_SIDE").is_none());
+        *ON
+    }
+
+    #[inline]
+    fn side_poll() {
+        for i in 0..SIDES {
+            if SIDE_STATE[i].load(Ordering::Acquire) == S_POSTED
+                && SIDE_STATE[i]
+                    .compare_exchange(S_POSTED, S_CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                // SAFETY: the poster keeps the body alive until it sees S_DONE.
+                let body = unsafe { &**(SIDE_BODY[i].load(Ordering::Acquire) as usize as *const &(dyn Fn() + Sync)) };
+                body();
+                SIDE_STATE[i].store(S_DONE, Ordering::Release);
+            }
+        }
+    }
+
+    /// Run `main` here and `a`, `b` on whichever waiting round-one thread
+    /// claims them first (or here, if none does). Single poster at a time.
+    pub fn side_run<M, A, B, RM, RA, RB>(main: M, a: A, b: B) -> (RM, RA, RB)
+    where
+        M: FnOnce() -> RM,
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        let a_in = std::sync::Mutex::new(Some(a));
+        let b_in = std::sync::Mutex::new(Some(b));
+        let a_out: std::sync::Mutex<Option<RA>> = std::sync::Mutex::new(None);
+        let b_out: std::sync::Mutex<Option<RB>> = std::sync::Mutex::new(None);
+        let ja = || {
+            if let Some(f) = a_in.lock().unwrap().take() {
+                let v = f();
+                *a_out.lock().unwrap() = Some(v);
+            }
+        };
+        let jb = || {
+            if let Some(f) = b_in.lock().unwrap().take() {
+                let v = f();
+                *b_out.lock().unwrap() = Some(v);
+            }
+        };
+        let fa: &(dyn Fn() + Sync) = &ja;
+        let fb: &(dyn Fn() + Sync) = &jb;
+        let bodies = [&fa as *const &(dyn Fn() + Sync) as usize, &fb as *const &(dyn Fn() + Sync) as usize];
+        for i in 0..SIDES {
+            debug_assert_eq!(SIDE_STATE[i].load(Ordering::Relaxed), S_IDLE);
+            SIDE_BODY[i].store(bodies[i] as u64, Ordering::Release);
+            SIDE_STATE[i].store(S_POSTED, Ordering::Release);
+        }
+        let rm = main();
+        for i in 0..SIDES {
+            if SIDE_STATE[i]
+                .compare_exchange(S_POSTED, S_IDLE, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                if i == 0 { ja() } else { jb() }
+            } else {
+                while SIDE_STATE[i].load(Ordering::Acquire) != S_DONE {
+                    core::hint::spin_loop();
+                }
+                SIDE_STATE[i].store(S_IDLE, Ordering::Release);
+            }
+        }
+        (
+            rm,
+            a_out.into_inner().unwrap().expect("side job a ran"),
+            b_out.into_inner().unwrap().expect("side job b ran"),
+        )
+    }
+
+    // ---- Lane v1: round-one EXIT without two sleeping waits ----
+    //
+    // The caller (pinned to the CPU of AB worker 0) used to block inside
+    // `ab_pool.in_place_scope` until the AB arm finished, and the AB arm's own
+    // `rayon::broadcast` caller slept until the last band ended. Each wake-up
+    // measured 0.15-0.30 ms in about a third of the proves. With the switch on,
+    // the first AB thread that finds the band counter empty unparks the caller,
+    // which then yield-spins on `AB_DONE`; the broadcast caller spin-waits for
+    // the other AB threads (`ab_claim_spin`). Same closures, same inputs, same
+    // result order: proof bytes are unchanged. `FLOCK_NO_V1_R1_SPIN=1` restores
+    // the sleeping waits.
+    pub fn v1_spin_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_V1_R1_SPIN").is_none());
+        *ON
+    }
+    static AB_DRAIN: AtomicBool = AtomicBool::new(false);
+    static AB_DONE: AtomicBool = AtomicBool::new(false);
+    static OWNER: std::sync::Mutex<Option<std::thread::Thread>> = std::sync::Mutex::new(None);
+
+    fn unpark_owner() {
+        if let Some(t) = OWNER.lock().unwrap().as_ref() {
+            t.unpark();
+        }
+    }
+
+    /// An AB thread found the band counter exhausted (the arm's last bands are
+    /// in flight): wake the caller so it is on CPU when the arm ends.
+    pub fn ab_draining() {
+        if !AB_DRAIN.swap(true, Ordering::AcqRel) {
+            unpark_owner();
+        }
+    }
+
     struct Done<'a>(&'a AtomicBool);
     impl Drop for Done<'_> {
         fn drop(&mut self) {
@@ -800,6 +930,12 @@ pub mod r1_owner_awake {
         let c_done = AtomicBool::new(false);
         let mut ra = None;
         let mut rb = None;
+        let spin = v1_spin_enabled();
+        if spin {
+            AB_DRAIN.store(false, Ordering::Release);
+            AB_DONE.store(false, Ordering::Release);
+            *OWNER.lock().unwrap() = Some(std::thread::current());
+        }
         // The AB pool's thread i runs on the same CPU as global worker i.
         let owner_idx = rayon::current_thread_index();
         {
@@ -822,15 +958,36 @@ pub mod r1_owner_awake {
                                 }
                             });
                         }
+                        if spin {
+                            AB_DONE.store(true, Ordering::Release);
+                            unpark_owner();
+                        }
                     });
                     // Both arms are injected: release any pre-woken holders
                     // so they pick the arms up without a wake-up.
                     if PREWAKE_LIVE.swap(false, Ordering::AcqRel) {
                         HOLD_EPOCH.fetch_add(1, Ordering::Release);
                     }
+                    if spin {
+                        let t0 = Instant::now();
+                        while !AB_DONE.load(Ordering::Acquire) {
+                            if AB_DRAIN.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                                for _ in 0..32 {
+                                    core::hint::spin_loop();
+                                }
+                            } else {
+                                std::thread::park_timeout(Duration::from_millis(2));
+                            }
+                            if t0.elapsed() > Duration::from_millis(50) {
+                                break;
+                            }
+                        }
+                    }
                 });
                 let t0 = Instant::now();
                 while !c_done_ref.load(Ordering::Acquire) {
+                    side_poll();
                     std::thread::yield_now();
                     for _ in 0..32 {
                         core::hint::spin_loop();
@@ -842,10 +999,285 @@ pub mod r1_owner_awake {
                 HOLD_EPOCH.fetch_add(1, Ordering::Release);
             });
         }
+        if spin {
+            *OWNER.lock().unwrap() = None;
+        }
         (
             ra.expect("round-one AB arm finished"),
             rb.expect("round-one C arm finished"),
         )
+    }
+}
+
+/// Lane ru: flat claim-counter parallel map for short parallel passes.
+///
+/// `rayon`'s indexed `par_iter().map().reduce()` ends in a join tree: the
+/// worker that finishes the last leaf sets a latch whose owner, having run
+/// out of work long before, is usually parked in rayon's sleep and has to be
+/// woken (futex + idle exit), often more than once up the tree. Traced at the
+/// zerocheck tail's large levels that hand-off took 40-65 µs after the last
+/// chunk ended. Here the caller spawns one claimer per other worker, claims
+/// items itself, and then spins (no sleep) until every item is done; late
+/// claimers that start after the counter is exhausted exit without touching
+/// the borrowed closure. Each claimer folds its items into a private
+/// accumulator (a per-item slot array read back serially from other cores'
+/// caches cost 0.5 ms at 8192 items), so the result is the same sum of the
+/// same per-item values in another grouping.
+pub mod flat_par {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Shared {
+        body: usize, // thin pointer to a `&(dyn Fn() + Sync)`
+        active: AtomicUsize,
+        closed: AtomicBool,
+    }
+
+    fn enter(sh: &Shared) {
+        sh.active.fetch_add(1, Ordering::SeqCst);
+        if !sh.closed.load(Ordering::SeqCst) {
+            // SAFETY: `map_reduce` keeps the body alive until `closed` is set
+            // and `active` has drained; this claimer incremented `active` first.
+            let body = unsafe { &**(sh.body as *const &(dyn Fn() + Sync)) };
+            body();
+        }
+        sh.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// `FLOCK_NO_RU_FLAT_PAR=1` makes callers keep their rayon route.
+    pub fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RU_FLAT_PAR").is_none());
+        *ON
+    }
+
+    /// `op`-reduction of `f(0..n)`: claimers (the caller plus one spawned per
+    /// other worker of the current pool) take items from one counter and fold
+    /// them into a private accumulator; the caller folds the claimers'
+    /// accumulators. For an associative and commutative `op` (F128 sums) the
+    /// result equals any other grouping. Must be called from a pool worker.
+    pub fn map_reduce<T, F>(
+        n: usize,
+        f: F,
+        id: impl Fn() -> T + Sync,
+        op: impl Fn(T, T) -> T + Sync,
+    ) -> T
+    where
+        F: Fn(usize) -> T + Sync,
+    {
+        if n == 0 {
+            return id();
+        }
+        let helpers = rayon::current_num_threads().saturating_sub(1).min(n - 1);
+        let claimers = helpers + 1;
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let who = AtomicUsize::new(0);
+        let mut slots: Vec<core::mem::MaybeUninit<T>> = Vec::with_capacity(claimers);
+        // SAFETY: only slots flagged in `written` are read.
+        unsafe { slots.set_len(claimers) };
+        let written: Vec<AtomicBool> = (0..claimers).map(|_| AtomicBool::new(false)).collect();
+        let slot_addr = slots.as_mut_ptr() as usize;
+        let body = || {
+            let me = who.fetch_add(1, Ordering::Relaxed);
+            if me >= claimers {
+                return;
+            }
+            let mut acc = id();
+            // Guided claims: contiguous runs of remaining/(2·claimers) items
+            // (rayon's first split hands each worker a contiguous ~n/T range;
+            // single-item claims interleaved the passes' streams and cost
+            // +1.0/+1.3 ms in round two / r345).
+            let mut cur = next.load(Ordering::Relaxed);
+            loop {
+                if cur >= n {
+                    break;
+                }
+                let take = ((n - cur) / (2 * claimers)).max(1);
+                match next.compare_exchange_weak(cur, cur + take, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        for i in cur..cur + take {
+                            acc = op(acc, f(i));
+                        }
+                        done.fetch_add(take, Ordering::Release);
+                        cur = next.load(Ordering::Relaxed);
+                    }
+                    Err(now) => cur = now,
+                }
+            }
+            // SAFETY: slot `me` is owned by this claimer.
+            unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+            written[me].store(true, Ordering::Release);
+        };
+        let fat: &(dyn Fn() + Sync) = &body;
+        let sh = Arc::new(Shared {
+            body: &fat as *const &(dyn Fn() + Sync) as usize,
+            active: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        });
+        for _ in 0..helpers {
+            let s = sh.clone();
+            rayon::spawn(move || enter(&s));
+        }
+        enter(&sh);
+        while done.load(Ordering::Acquire) < n {
+            core::hint::spin_loop();
+        }
+        sh.closed.store(true, Ordering::SeqCst);
+        while sh.active.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        let mut acc = id();
+        for (slot, w) in slots.iter().zip(written.iter()) {
+            if w.load(Ordering::Acquire) {
+                // SAFETY: flagged slots were fully written before the flag.
+                acc = op(acc, unsafe { slot.assume_init_read() });
+            }
+        }
+        acc
+    }
+
+    // ---- Lane gl1: persistent spin team over the hot pool's spinners ----
+    //
+    // The small zerocheck tail levels (n18 .. n6) and other short parallel
+    // regions are fork/join-bound: rayon's split/steal and join-tree hand-off
+    // cost 5-30 µs per region against 1-20 µs of work. While a `HotPool` is
+    // live its spinners already run on every other worker; each spinner lap
+    // polls `TEAM_SEQ`, so the owner publishes a region with two stores and
+    // the claim loop below starts on every spinning worker within a lap. The
+    // owner waits for the region by spinning on the done count (no latch, no
+    // sleep). Results are folded per claimer exactly as in `map_reduce`, so
+    // for an associative and commutative `op` (F128 sums, XOR) the value is
+    // identical. `FLOCK_NO_GL1_TEAM=1` keeps the incumbent routes.
+    static TEAM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TEAM_BODY: AtomicUsize = AtomicUsize::new(0);
+    static TEAM_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static TEAM_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Kill switch, read once per process; callers resolve it once per phase.
+    pub fn team_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_TEAM").is_none());
+        *ON
+    }
+
+    std::thread_local! {
+        static TEAM_TOKEN: u8 = const { 0 };
+    }
+
+    /// This OS thread's identity for [`TEAM_OWNER`] (rayon indices are per
+    /// pool, so an index alone would also match a worker of another pool).
+    #[inline]
+    pub(crate) fn team_token() -> usize {
+        TEAM_TOKEN.with(|t| t as *const u8 as usize)
+    }
+
+    /// The calling thread owns a live hot pool (its spinners poll the team).
+    #[inline]
+    pub fn team_ready() -> bool {
+        let o = TEAM_OWNER.load(Ordering::Relaxed);
+        o != usize::MAX && o == team_token()
+    }
+
+    /// One spinner lap: join the live region if it is new to this spinner.
+    #[inline]
+    pub(crate) fn team_poll(last: &mut u64) {
+        let s = TEAM_SEQ.load(Ordering::Acquire);
+        if s & 1 == 0 || s == *last {
+            return;
+        }
+        *last = s;
+        TEAM_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        if TEAM_SEQ.load(Ordering::SeqCst) == s {
+            // SAFETY: the owner keeps the body alive until it has closed the
+            // region (`TEAM_SEQ` moved on) and seen `TEAM_ACTIVE` drain; this
+            // helper raised `TEAM_ACTIVE` before re-checking the sequence.
+            let body = unsafe { &**(TEAM_BODY.load(Ordering::Acquire) as *const &(dyn Fn() + Sync)) };
+            body();
+        }
+        TEAM_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// [`map_reduce`] dispatched to the hot pool's spinning team instead of
+    /// spawned claimers. Caller must satisfy [`team_ready`].
+    pub fn team_map_reduce<T, F>(
+        n: usize,
+        f: F,
+        id: impl Fn() -> T + Sync,
+        op: impl Fn(T, T) -> T + Sync,
+    ) -> T
+    where
+        F: Fn(usize) -> T + Sync,
+    {
+        if n == 0 {
+            return id();
+        }
+        if n == 1 {
+            return op(id(), f(0));
+        }
+        const CAP: usize = 64;
+        let claimers = rayon::current_num_threads().clamp(1, CAP);
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let who = AtomicUsize::new(0);
+        let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
+        let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
+        let slot_addr = slots.as_mut_ptr() as usize;
+        let body = || {
+            let me = who.fetch_add(1, Ordering::Relaxed);
+            if me >= CAP {
+                return;
+            }
+            let mut cur = next.load(Ordering::Relaxed);
+            if cur >= n {
+                return;
+            }
+            let mut acc = id();
+            let mut any = false;
+            loop {
+                if cur >= n {
+                    break;
+                }
+                let take = ((n - cur) / (2 * claimers)).max(1);
+                match next.compare_exchange_weak(cur, cur + take, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        for i in cur..cur + take {
+                            acc = op(acc, f(i));
+                        }
+                        any = true;
+                        done.fetch_add(take, Ordering::Release);
+                        cur = next.load(Ordering::Relaxed);
+                    }
+                    Err(now) => cur = now,
+                }
+            }
+            if any {
+                // SAFETY: slot `me` is owned by this claimer.
+                unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+                written[me].store(true, Ordering::Release);
+            }
+        };
+        let fat: &(dyn Fn() + Sync) = &body;
+        let seq = TEAM_SEQ.load(Ordering::Relaxed);
+        debug_assert!(seq & 1 == 0, "nested team region");
+        TEAM_BODY.store(&fat as *const &(dyn Fn() + Sync) as usize, Ordering::Release);
+        TEAM_SEQ.store(seq + 1, Ordering::SeqCst);
+        body();
+        while done.load(Ordering::Acquire) < n {
+            core::hint::spin_loop();
+        }
+        TEAM_SEQ.store(seq + 2, Ordering::SeqCst);
+        while TEAM_ACTIVE.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        let mut acc = id();
+        for (slot, w) in slots.iter().zip(written.iter()) {
+            if w.load(Ordering::Acquire) {
+                // SAFETY: flagged slots were fully written before the flag.
+                acc = op(acc, unsafe { slot.assume_init_read() });
+            }
+        }
+        acc
     }
 }
 
@@ -921,10 +1353,12 @@ pub mod hot_pool {
         let Some(_callback) = CallbackGuard::enter() else {
             return;
         };
+        let mut team_last = 0u64;
         for _ in 0..spins_per_job() {
             if !run.load(Ordering::Acquire) {
                 return;
             }
+            crate::flat_par::team_poll(&mut team_last);
             if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
                 for _ in 0..backoff {
                     core::hint::spin_loop();
@@ -934,7 +1368,7 @@ pub mod hot_pool {
         rayon::spawn(move || spinner(run, owner, backoff));
     }
 
-    pub struct HotPool(Arc<AtomicBool>);
+    pub struct HotPool(Arc<AtomicBool>, usize);
 
     impl HotPool {
         pub fn start() -> Option<Self> {
@@ -949,18 +1383,34 @@ pub mod hot_pool {
             let sibling = (owner + n / 2) % n.max(1);
             let run = Arc::new(AtomicBool::new(true));
             let flag = run.clone();
-            rayon::spawn_broadcast(move |ctx| {
-                let me = ctx.index();
-                if me != owner {
-                    spinner(flag.clone(), owner, if me == sibling { 64 } else { 8 });
-                }
-            });
-            Some(Self(run))
+            let bcast = move || {
+                rayon::spawn_broadcast(move |ctx| {
+                    let me = ctx.index();
+                    if me != owner {
+                        spinner(flag.clone(), owner, if me == sibling { 64 } else { 8 });
+                    }
+                })
+            };
+            // Lane gl1 (`FLOCK_NO_GL1_HOT_DEFER`): the broadcast wakes every
+            // sleeping worker (one futex wake each, 0.02-0.03 ms on the owner,
+            // which is on the serial path). Hand it to one woken worker
+            // instead: the owner pays a single spawn + wake.
+            static DEFER: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_HOT_DEFER").is_none());
+            if *DEFER {
+                rayon::spawn(bcast);
+            } else {
+                bcast();
+            }
+            // Lane gl1: the owner may dispatch team regions to the spinners.
+            let prev = crate::flat_par::TEAM_OWNER.swap(crate::flat_par::team_token(), Ordering::AcqRel);
+            Some(Self(run, prev))
         }
     }
 
     impl Drop for HotPool {
         fn drop(&mut self) {
+            crate::flat_par::TEAM_OWNER.store(self.1, Ordering::Release);
             self.0.store(false, Ordering::Release);
         }
     }
