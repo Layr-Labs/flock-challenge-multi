@@ -1141,7 +1141,28 @@ fn tail_split_n_hi(n_vars: usize) -> usize {
     if *OFF {
         return base;
     }
-    base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)))
+    let n_hi = base.max(TAIL_SPLIT_MAX_N_HI.min(n_vars.saturating_sub(TAIL_SPLIT_MIN_LO_LOG)));
+    // Lane gl1 (`FLOCK_NO_GL1_SPLIT`, floor `FLOCK_GL1_SPLIT_LO`, default 6):
+    // the small levels (n14 and below) kept 64-128 chunks of 4-32 inputs,
+    // where the per-chunk prologue and claim traffic cost 0.5-1 µs each
+    // against ~0.2 µs of work. Keep every chunk's `eq_lo` at ≥ 2^lo (fewer,
+    // larger chunks; down to one chunk). Same XOR/tensor identity as above.
+    let lo = gl1_split_lo();
+    if lo != 0 && n_vars <= 11 {
+        return n_hi.min(n_vars.saturating_sub(lo));
+    }
+    n_hi
+}
+
+/// 0 = off. Read once per process (per call site: once per tail level).
+fn gl1_split_lo() -> usize {
+    static LO: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_GL1_SPLIT").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_GL1_SPLIT_LO").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+    });
+    *LO
 }
 
 /// Per-chunk `eq_lo` length of the plain composed tail level whose input has
@@ -1178,6 +1199,76 @@ pub(crate) const fn lane_select(sel: [(u8, u8); 4]) -> [u64; 8] {
         i += 1;
     }
     idx
+}
+
+/// Lane ru: the flat claim route (see `crate::flat_par`) for the large
+/// passes, where rayon's join-tree hand-off after the last chunk was traced at
+/// 20-65 µs. Small tail levels keep rayon (its tree spreads tiny levels faster
+/// than one-by-one spawns). Needs a pool worker caller.
+pub(crate) fn flat_tail(n: usize) -> bool {
+    n >= (1usize << 21) && crate::flat_par::enabled() && rayon::current_thread_index().is_some()
+}
+
+/// Chunked [`crate::flat_par::map_reduce`] over paired output tables.
+pub(crate) fn flat_chunks<T>(
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    chunk: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
+    assert_eq!(a_out.len(), b_out.len());
+    assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
+    let n = a_out.len() / chunk;
+    let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
+    crate::flat_par::map_reduce(
+        n,
+        |i| {
+            // SAFETY: item `i` owns output chunk `i` of both tables; chunks are
+            // disjoint and both borrows outlive `map_reduce`.
+            let (ac, bc) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
+                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk), chunk),
+                )
+            };
+            leaf((i, (ac, bc)))
+        },
+        id,
+        op,
+    )
+}
+
+/// [`flat_chunks`] on the hot pool's spinning team (lane gl1).
+pub(crate) fn team_chunks<T>(
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    chunk: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
+    assert_eq!(a_out.len(), b_out.len());
+    assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
+    let n = a_out.len() / chunk;
+    let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
+    crate::flat_par::team_map_reduce(
+        n,
+        |i| {
+            // SAFETY: item `i` owns output chunk `i` of both tables; chunks are
+            // disjoint and both borrows outlive `team_map_reduce`.
+            let (ac, bc) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
+                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk), chunk),
+                )
+            };
+            leaf((i, (ac, bc)))
+        },
+        id,
+        op,
+    )
 }
 
 /// Whether cascade level buffers may be handed over lane-major (see
@@ -1372,7 +1463,38 @@ fn build_r2_eq_bake_checked(
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
     };
     let a_mats: [kernels::x86_64::R2FoldMats; 4] = std::array::from_fn(|g| scaled(s[g]));
-    let b_mats: Vec<kernels::x86_64::R2FoldMats> = etop.par_iter().map(|e| scaled(*e)).collect();
+    // Lane gl1 (`FLOCK_NO_GL1_BAKE_TEAM`): the 128 per-batch matrix sets on
+    // the hot pool's spinning team (fork/join-bound under rayon). Same values.
+    static GL1_BAKE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_BAKE_TEAM").is_none());
+    let b_mats: Vec<kernels::x86_64::R2FoldMats> =
+        if *GL1_BAKE && crate::flat_par::team_enabled() && crate::flat_par::team_ready() && etop.len() >= 16 {
+            let n = etop.len();
+            let mut v: Vec<core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>> = Vec::with_capacity(n);
+            // SAFETY: every slot is written exactly once below before the cast.
+            unsafe { v.set_len(n) };
+            let vp = v.as_mut_ptr() as usize;
+            const PER: usize = 4;
+            crate::flat_par::team_map_reduce(
+                n.div_ceil(PER),
+                |i| {
+                    for j in i * PER..((i + 1) * PER).min(n) {
+                        // SAFETY: item `i` owns slots [i*PER, (i+1)*PER).
+                        unsafe {
+                            (vp as *mut core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>)
+                                .add(j)
+                                .write(core::mem::MaybeUninit::new(scaled(etop[j])))
+                        };
+                    }
+                },
+                || (),
+                |_, _| (),
+            );
+            // SAFETY: all `n` slots initialized; MaybeUninit<T> has T's layout.
+            unsafe { core::mem::transmute::<_, Vec<kernels::x86_64::R2FoldMats>>(v) }
+        } else {
+            etop.par_iter().map(|e| scaled(*e)).collect()
+        };
     Some(kernels::x86_64::R2EqBake {
         a_mats,
         b_mats,
@@ -1827,6 +1949,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     want_r4: bool,
 ) -> ((F128, F128, Round3Lookahead), Option<Round4Lookahead>) {
     use rayon::prelude::*;
+    crate::rstrace::ev("r2:in", 0);
     assert_eq!(k_skip, 6, "lookahead round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
@@ -1921,6 +2044,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         let _ = canon;
         None
     };
+    crate::rstrace::ev("r2:bake", 0);
     // Per-pass (w, w·x⁶⁴) pair table for the message block: both are pure
     // functions of the odd eq_lo lanes, hoisted out of the sweep (the
     // companion CLMUL sat on the head of the chain feeding all eight
@@ -2029,13 +2153,22 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         None
     };
 
-    let (sum1_even, sum_inf_even, agg, r4_flat) = (0..hi_size)
-        .into_par_iter()
-        .map(|x_hi| {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let lo1_ys = kernels::x86_64::lo1_ys_enabled();
+    crate::rstrace::ev("r2:par0", hi_size as u32);
+    let leaf = |x_hi: usize| {
+            crate::rstrace::item_start();
             #[allow(unused_mut)]
             let mut r4_out = [F128::ZERO; 18];
-            let row_base = x_hi * chunk_size;
-            let pair_idx_base = x_hi * lo_size;
+            let x_in = x_hi;
+            let row_base = x_in * chunk_size;
+            let pair_idx_base = x_in * lo_size;
             let mut none_a: [F128; 0] = [];
             let mut none_b: [F128; 0] = [];
 
@@ -2063,6 +2196,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                             lo_size,
                             bk,
                             lw,
+                            lo1_ys,
                         );
                         r4_out = r4;
                         o
@@ -2162,6 +2296,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             );
 
             let eq_h = eq_hi[x_hi];
+            crate::rstrace::item_end();
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -2175,22 +2310,31 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 ],
                 if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
             )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]),
-            |(s1, sinf, sa, sr), (c1, cinf, ca, cr)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                let mut r4 = sr;
-                for (x, y) in r4.iter_mut().zip(cr.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a, r4)
-            },
-        );
+    };
+    type R2Sums = (F128, F128, [F128; 6], [F128; 18]);
+    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
+    let op = |(s1, sinf, sa, sr): R2Sums, (c1, cinf, ca, cr): R2Sums| -> R2Sums {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        let mut r4 = sr;
+        for (x, y) in r4.iter_mut().zip(cr.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a, r4)
+    };
+    // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.
+    let (sum1_even, sum_inf_even, agg, r4_flat) =
+        if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
+            crate::flat_par::map_reduce(hi_size, leaf, id, op)
+        } else {
+            (0..hi_size).into_par_iter().map(leaf).reduce(id, op)
+        };
+    crate::rstrace::ev("r2:par1", 0);
+    crate::rstrace::flush_items("r2:first", "r2:last");
 
+    crate::rstrace::ev("r2:red", 0);
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let mut la = lookahead_from_odd_weighted(&agg, r1_inv);
@@ -2226,6 +2370,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         let _ = r4_flat;
         None
     };
+    crate::rstrace::ev("r2:out", 0);
     ((mlv_challenges[0] * sum1, sum_inf, la), r4)
 }
 
@@ -3250,12 +3395,18 @@ pub(crate) fn fold_and_compute_round_pair_into_with_n_hi(
             .par_chunks_mut(chunk_out)
             .zip(b_out.par_chunks_mut(chunk_out))
             .enumerate()
-            .map(|(x_hi, (a_out, b_out))| chunk_body(x_hi, a_out, b_out))
+            .map(|(x_hi, (a_out, b_out))| {
+                crate::rstrace::evd("fr:b", x_hi as u32);
+                let r = chunk_body(x_hi, a_out, b_out);
+                crate::rstrace::evd("fr:e", 0);
+                r
+            })
             .reduce(
                 || (F128::ZERO, F128::ZERO),
                 |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
             )
     };
+    crate::rstrace::ev("fr:red", hi_size as u32);
 
     (r_next[0] * sum1, sum_inf)
 }
@@ -3315,6 +3466,7 @@ pub fn fold2_plain_and_round4_into(
         .zip(b_out.par_chunks_mut(chunk_out))
         .enumerate()
         .map(|(x_hi, (a_out, b_out))| {
+            crate::rstrace::evd("p4:b", x_hi as u32);
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -3338,12 +3490,14 @@ pub fn fold2_plain_and_round4_into(
             let (p1, pinf) = fold2_and_message_scalar(a_in, b_in, a_out, b_out, rho1, rho2, eq_lo);
 
             let eq_h = eq_hi[x_hi];
+            crate::rstrace::evd("p4:e", 0);
             (eq_h * p1, eq_h * pinf)
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
         );
+    crate::rstrace::ev("p4:red", 0);
 
     (r_next4[0] * sum1, sum_inf)
 }
@@ -3393,7 +3547,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
     out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
     let (m1, mi, la, _) = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-        a, b, a_out, b_out, rho_a, rho_b, r_next, in_lm, out_lm, false,
+        a, b, a_out, b_out, rho_a, rho_b, r_next, in_lm, out_lm, false, false,
     );
     (m1, mi, la)
 }
@@ -3446,6 +3600,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     in_lm: bool,
     out_lm: bool,
     casc: bool,
+    team: bool,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert!(!casc || fold2_plain_casc_route_ok(a.len()), "casc route unavailable");
@@ -3545,6 +3700,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     );
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            crate::rstrace::evd("zt:c0", x_hi as u32);
             let mut la7 = [F128::ZERO; 18];
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
@@ -3650,6 +3806,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
                 fold2_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo);
 
             let eq_h = eq_hi[x_hi];
+            crate::rstrace::evd("zt:c1", x_hi as u32);
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -3664,10 +3821,6 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
                 if casc { la7.map(|v| eq_h * v) } else { la7 },
             )
     };
-    let it = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate();
     type Sums = (F128, F128, [F128; 6], [F128; 18]);
     let id = || -> Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
     let op = |(s1, sinf, sa, sl): Sums, (c1, cinf, ca, cl): Sums| -> Sums {
@@ -3681,7 +3834,22 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         }
         (s1 + c1, sinf + cinf, a, l)
     };
-    let (sum1_even, sum_inf_even, agg, la7_acc) = it.map(leaf).reduce(id, op);
+    let (sum1_even, sum_inf_even, agg, la7_acc) =
+        if flat_tail(n) {
+            // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
+            // per-chunk results summed (XOR) on the caller.
+            flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+        } else if team && crate::flat_par::team_ready() {
+            // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
+            team_chunks(a_out, b_out, chunk_out, leaf, id, op)
+        } else {
+            a_out
+                .par_chunks_mut(chunk_out)
+                .zip(b_out.par_chunks_mut(chunk_out))
+                .enumerate()
+                .map(leaf)
+                .reduce(id, op)
+        };
 
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
@@ -3753,6 +3921,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     });
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            crate::rstrace::evd("zt:c0", x_hi as u32);
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             #[cfg(all(
@@ -3784,6 +3953,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
             let out =
                 fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm);
             let eq_h = eq_hi[x_hi];
+            crate::rstrace::evd("zt:c1", x_hi as u32);
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -3797,19 +3967,28 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
                 ],
             )
     };
-    let it = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate();
-    let id = || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
-    let op = |(s1, sinf, sa): (F128, F128, [F128; 6]), (c1, cinf, ca): (F128, F128, [F128; 6])| {
+    type Sums3 = (F128, F128, [F128; 6]);
+    let id = || -> Sums3 { (F128::ZERO, F128::ZERO, [F128::ZERO; 6]) };
+    let op = |(s1, sinf, sa): Sums3, (c1, cinf, ca): Sums3| -> Sums3 {
         let mut a = sa;
         for (x, y) in a.iter_mut().zip(ca.iter()) {
             *x += *y;
         }
         (s1 + c1, sinf + cinf, a)
     };
-    let (sum1_even, sum_inf_even, agg) = it.map(leaf).reduce(id, op);
+    let (sum1_even, sum_inf_even, agg) =
+        if flat_tail(n) {
+            // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
+            // per-chunk results summed (XOR) on the caller.
+            flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+        } else {
+            a_out
+                .par_chunks_mut(chunk_out)
+                .zip(b_out.par_chunks_mut(chunk_out))
+                .enumerate()
+                .map(leaf)
+                .reduce(id, op)
+        };
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
@@ -5662,7 +5841,7 @@ mod tests {
                 let mut b_out = vec![F128::ZERO; n_out];
                 let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
                     &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho, &r_next5,
-                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None,
                 );
                 (msg, a_out, b_out)
             };
@@ -5718,12 +5897,12 @@ mod tests {
             let mut a_rm = vec![F128::ZERO; n / 4];
             let mut b_rm = vec![F128::ZERO; n / 4];
             let inc = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-                &a, &b, &mut a_rm, &mut b_rm, ra, rb, &r_next, false, false, false,
+                &a, &b, &mut a_rm, &mut b_rm, ra, rb, &r_next, false, false, false, false,
             );
             let mut a_oct = vec![F128::ZERO; n / 4];
             let mut b_oct = vec![F128::ZERO; n / 4];
             let got = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-                &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true,
+                &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true, false,
             );
             assert!(inc.3.is_none());
             assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message log_n={log_n}");

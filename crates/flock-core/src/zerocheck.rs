@@ -587,6 +587,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = hoisted_flag!("FLOCK_ZC_TIMING");
+    crate::rstrace::ev("zc:r1in", 0);
     let t_round1 = std::time::Instant::now();
     let inv_table_owned;
     let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
@@ -598,6 +599,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Unbound identity-C inner-fold rows for the round-two canonical-window
     // elision (ranked one-row brand only; see `multilinear::CANON_ROWS`).
     let mut r2_canon_rows: Option<Vec<F128>> = None;
+    // Lane v1: round two's packed split eq depends on `r` only; with the
+    // switch on, the first idle AB thread of round one builds it (the same
+    // call as below, so the tensors are bit-identical). `FLOCK_NO_V1_PEQ_EARLY=1`.
+    static V1_PEQ_EARLY: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_V1_PEQ_EARLY").is_none());
+    let peq_slot: std::sync::OnceLock<crate::zerocheck::univariate_skip::SplitEqGhash> =
+        std::sync::OnceLock::new();
+    let mlv_pre: Vec<F128> = {
+        let mut v = vec![F128::ONE; n_mlv];
+        v[1..].copy_from_slice(&r[k_skip + 1..]);
+        v
+    };
+    // Lane gl1 (`FLOCK_NO_GL1_R345_PRE`): the same idle thread then builds
+    // the rounds 3+4+5 pass's challenge-independent tables from that eq.
+    static GL1_R345_PRE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R345_PRE").is_none());
+    let gl1_r345_pre = *GL1_R345_PRE;
+    let r345_pre_slot: std::sync::OnceLock<(Vec<F128>, Option<Vec<F128>>)> = std::sync::OnceLock::new();
+    let peq_idle = || {
+        let peq = peq_slot.get_or_init(|| packed_round2_split_eq(&mlv_pre));
+        if gl1_r345_pre && peq.n_lo >= 4 {
+            r345_pre_slot.get_or_init(|| multilinear::three_var::r345_pre_tables(&peq.lo));
+        }
+    };
+    let peq_idle_arg: Option<&(dyn Fn() + Sync)> = if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -638,18 +664,28 @@ fn prove_packed_padded_inner<C: Challenger>(
             // interleaved recovers the fused kernel's stream-level
             // parallelism over the same total bytes.
             let t_r1 = std::time::Instant::now();
-            let ab_closure = || {
+            #[allow(unused_mut)]
+            let mut ab_closure = || {
+                crate::rstrace::ev("r1:ab0", 0);
                 let t = std::time::Instant::now();
-                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                    ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding,
+                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
+                    ab_inner, a_packed, b_packed, m, k_skip, &r, inv_table, padding, peq_idle_arg,
                 );
                 crate::gaptime::mark("r1: AB closure end");
+                crate::rstrace::ev("r1:ab1", 0);
                 (ab, t.elapsed().as_secs_f64() * 1e3)
             };
+            // Lane gl1 (`FLOCK_NO_GL1_SIDE`): the C arm's one-row AB lift and
+            // the window-30 delta run on round one's waiting threads.
+            let gl1_side = crate::r1_owner_awake::side_enabled()
+                && crate::smt_split::zc_r1_pools().is_some()
+                && crate::r1_owner_awake::enabled();
+            let gl1_w30 = gl1_side && w30_elided && capture_canon;
             let c_closure = || {
+                crate::rstrace::ev("r1:c0", 0);
                 let t = std::time::Instant::now();
-                let (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z_with_canon(
+                let (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, w30d) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z_with_canon_side(
                         c_identity_z,
                         m,
                         padding.k_log,
@@ -660,8 +696,11 @@ fn prove_packed_padded_inner<C: Challenger>(
                         ranked_one_rows,
                         capture_canon,
                         roots,
+                        gl1_side,
+                        gl1_w30,
                     );
                 crate::gaptime::mark("r1: C closure end");
+                crate::rstrace::ev("r1:c1", 0);
                 (
                     c,
                     s_hat_v_c,
@@ -669,7 +708,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     fold4,
                     fold8,
                     one_ab,
-                    canon,
+                    (canon, w30d),
                     t.elapsed().as_secs_f64() * 1e3,
                 )
             };
@@ -680,8 +719,25 @@ fn prove_packed_padded_inner<C: Challenger>(
             // closures and inputs are identical, so proof bytes are unchanged.
             // Falls back to
             // the incumbent `rayon::join` whenever the pools are absent.
+            crate::rstrace::ev("r1:start", 0);
+            static AB1_R1_SEQPOOL: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_AB1_R1_SEQPOOL").is_some());
+            static V1_R1_SEQ: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_V1_R1_SEQ").is_some());
             let ((mut ab, t_ab_ms), (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, t_c_ms)) =
                 match crate::smt_split::zc_r1_pools() {
+                    // Timing probe: each arm alone on the full 16-thread pool.
+                    _ if *V1_R1_SEQ => {
+                        let a = ab_closure();
+                        let c = c_closure();
+                        (a, c)
+                    }
+                    // Lane ab1 timing probe: each arm alone on its own SMT pool.
+                    Some((ab_pool, c_pool)) if *AB1_R1_SEQPOOL => {
+                        let a = ab_pool.install(ab_closure);
+                        let c = c_pool.install(c_closure);
+                        (a, c)
+                    }
                     Some((ab_pool, c_pool)) if crate::r1_owner_awake::enabled() => {
                         crate::r1_owner_awake::run_both(ab_pool, c_pool, ab_closure, c_closure)
                     }
@@ -690,17 +746,21 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }
                     None => rayon::join(ab_closure, c_closure),
                 };
+            crate::rstrace::ev("r1:joined", 0);
+            let (canon, w30d) = canon;
             if w30_elided {
                 let rows = canon
                     .as_ref()
                     .expect("window-30 elision requires the row-240 identity-C capture");
-                let delta = crate::zerocheck::univariate_skip_optimized::round1_w30_delta_ab(
-                    &rows[16 * 64..17 * 64],
-                    &r,
-                    k_skip,
-                    padding.k_log,
-                    inv_table,
-                );
+                let delta = w30d.unwrap_or_else(|| {
+                    crate::zerocheck::univariate_skip_optimized::round1_w30_delta_ab(
+                        &rows[16 * 64..17 * 64],
+                        &r,
+                        k_skip,
+                        padding.k_log,
+                        inv_table,
+                    )
+                });
                 debug_assert_eq!(ab.len(), delta.len());
                 for (dst, src) in ab.iter_mut().zip(delta) {
                     *dst += src;
@@ -709,6 +769,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     eprintln!("[w30-elide] engaged: window 30 added from identity-C row 240");
                 }
             }
+            crate::rstrace::ev("r1:w30", 0);
             r2_canon_rows = canon;
             if let Some(one_ab) = one_ab {
                 debug_assert_eq!(ab.len(), one_ab.len());
@@ -788,11 +849,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     };
     // The A-sized transform is dead after the round-1 message and can return
     // to the scratch pool before the much larger round-2 fold allocations.
+    crate::rstrace::ev("r1:pre-drop", 0);
     drop(precomputed_ab);
+    crate::rstrace::ev("r1:dropped", 0);
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
     crate::gaptime::mark("zc: round1 done (URM + C_s restore)");
+    crate::rstrace::ev("r1:done", 0);
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms",
@@ -805,7 +869,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128_slice(&round1_c);
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
+    crate::rstrace::ev("r1:sampled", 0);
     let _hot_pool = crate::hot_pool::HotPool::start();
+    crate::rstrace::ev("r1:hot", 0);
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -818,6 +884,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let (final_c_eval, fold_table) =
         crate::zerocheck::multilinear::interpolate_lambda_and_fold_table(&round1_c, k_skip, z);
     crate::gaptime::mark("zc: fold_table built");
+    crate::rstrace::ev("r1:table", 0);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
     // Diagnostics kill switch: FLOCK_NO_TAIL_FUSION=1 routes every tail round
@@ -864,12 +931,17 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Round two and the packed rounds-3+4 pass share the same 13 high eq
     // coordinates at the ranked split. Keep round two's small tensors until
     // that pass; its low tensor loses exactly the first two coordinates.
+    let mut peq_early = peq_slot.into_inner();
+    // The round-one tables were built from the early eq; use them only then.
+    let eq_is_early = use_nomat && peq_early.is_some();
+    let mut r345_pre_slot = r345_pre_slot;
     let mut packed_eq = use_nomat
-        .then(|| packed_round2_split_eq(&mlv_arg))
+        .then(|| peq_early.take().unwrap_or_else(|| packed_round2_split_eq(&mlv_arg)))
         // The composed packed leaf requires at least one low variable after
         // the two-coordinate marginalization. Tiny test shapes keep their
         // independently built split.
         .filter(|eq| eq.n_lo >= 3);
+    crate::rstrace::ev("r2:peq", 0);
 
     // ZC-3VAR candidate: needs the round-six parity weight r[k_skip+4] ≠ 0
     // (β₁ at the ranked shape) and enough variables for the shifted cascade.
@@ -879,6 +951,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         && (cfg!(test) || cfg!(target_arch = "x86_64"))
         && !three_var_off();
     let mut la4: Option<multilinear::Round4Lookahead> = None;
+    crate::rstrace::ev("r2:call", 0);
     let (mut a_mlv, mut b_mlv, msg_1, msg_inf, lookahead) = if use_nomat {
         let ((m1, mi, la), r4) = uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             a_packed,
@@ -918,6 +991,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (a, b, m1, mi, None)
     };
     crate::gaptime::mark("zc: round2 fused fold done");
+    crate::rstrace::ev("r2:out", 0);
 
     if zc_timing {
         eprintln!(
@@ -991,6 +1065,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
     crate::gaptime::mark("zc: tail ping-pong buffers taken");
+    crate::rstrace::ev("tl:bufs", 0);
     let mut tail_round_ms: Vec<(usize, f64)> = Vec::new();
 
     // Cascade the lookahead deeper (rounds 5+6, then 7+8): every composed
@@ -1106,6 +1181,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `lm_in` carries the layout the previous level stored.
     let lm_handoff = zc_lane_major_handoff_on();
     let mut lm_in = false;
+    // Lane gl1: small plain levels on the hot pool's spinning team.
+    let gl1_team = crate::flat_par::team_enabled();
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Level offset: with ZC-3VAR, levels ≥ 1 sit one variable later.
@@ -1153,8 +1230,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         // At the ranked shape level 0 turns 2 GiB + 1 GiB of reads and 1 GiB
         // + 512 MiB of writes into one 2 GiB read + 512 MiB write; level 1
         // turns 512 + 256 MiB reads / 256 + 128 MiB writes into 512 / 128.
+        crate::rstrace::ev("lv:in", level as u32);
         let t_round = std::time::Instant::now();
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
+        crate::rstrace::ev("zt:lv0", n_cur.trailing_zeros());
         let log_n_cur = n_cur.trailing_zeros() as usize;
         let quarter = if (level == 0 && use_3var) || c3_level { n_cur / 8 } else { n_cur / 4 };
         let shift = if (level == 0 && use_3var) || c3_level { 3 } else { 2 };
@@ -1170,11 +1249,16 @@ fn prove_packed_padded_inner<C: Challenger>(
             // X₁..X₃ into N/8 tables and yields round five + round-six lookahead.
             let mut a8 = crate::scratch::take_f128(quarter);
             let mut b8 = crate::scratch::take_f128(quarter);
+            crate::rstrace::ev("r345:take", 0);
             let round2_eq = packed_eq.take();
-            let eq_lo = round2_eq
-                .as_ref()
-                .filter(|eq| eq.n_lo >= 4)
-                .map(|eq| multilinear::three_var::marginalize_eq_low3(&eq.lo));
+            let mut r345_pre = r345_pre_slot.take();
+            let eq_lo = round2_eq.as_ref().filter(|eq| eq.n_lo >= 4).map(|eq| {
+                match r345_pre.as_mut() {
+                    Some((lo, _)) if eq_is_early => std::mem::take(lo),
+                    _ => multilinear::three_var::marginalize_eq_low3(&eq.lo),
+                }
+            });
+            let pre_wtab = if eq_is_early { r345_pre.as_ref().and_then(|p| p.1.as_deref()) } else { None };
             let eq_override = match (&eq_lo, &round2_eq) {
                 (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
                 _ => None,
@@ -1193,6 +1277,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical} c3={c3}");
             }
             debug_assert!(!c3_r345 || b_canonical == r345_b_canonical);
+            crate::rstrace::ev("r345:call", 0);
             let (m1, mi, la_next, la7_next) =
                 multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_casc(
                     a_packed,
@@ -1209,6 +1294,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     lm_out && !c3_r345,
                     b_canonical,
                     c3_r345,
+                    pre_wtab,
                 );
             assert_eq!(la7_next.is_some(), c3_r345, "deeper cascade route did not run");
             la7 = la7_next;
@@ -1282,6 +1368,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     lm_in,
                     lm_out,
                     casc_level,
+                    gl1_team,
                 );
             la = Some(la_next);
             if casc_level {
@@ -1301,7 +1388,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
             (m1, mi, false)
         };
+        crate::rstrace::ev("lv:out", level as u32);
         lm_in = lm_out;
+        crate::rstrace::ev("zt:lv1", level as u32);
         if !(level == 0 && (use_nomat || use_3var)) {
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
@@ -1318,15 +1407,18 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m_even_1);
         challenger.observe_f128(m_even_inf);
         mlv_rhos.push(challenger.sample_f128());
+        crate::rstrace::ev("lv:smp", level as u32);
     }
     let loop_start = 2 * n_levels
         + if n_levels > 0 { off } else { 0 }
         + if n_levels > c3_at { c3 as usize } else { 0 };
 
     for i in loop_start..(n_mlv - 1) {
+        crate::rstrace::ev("tr:in", i as u32);
         let t_round = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        crate::rstrace::ev("zt:r0", log_n_before as u32);
 
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
@@ -1364,6 +1456,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+        crate::rstrace::ev("tr:out", i as u32);
     }
     // Last ML ρ is in. RowMajor `x_outer = mlv[k_log − k_skip ..]` is
     // complete here (not URM `r`). Kick today's one-shot leftover z-fold
@@ -1372,8 +1465,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ranked BlockMajor path did not prepare, or if `mlv` is short
     // (kicking during rounds 2–27 is REJECT). Kick after this function
     // returns is a no-op — the final bind has already run.
+    crate::rstrace::ev("zt:end", 0);
     crate::lincheck::kick_last_rho_z_fold(&mlv_rhos);
     crate::gaptime::mark("zc: tail rounds done");
+    crate::rstrace::ev("zc:tdone", 0);
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
     let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
@@ -1405,6 +1500,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     crate::scratch::give_f128(a_nxt);
     crate::scratch::give_f128(b_nxt);
     crate::gaptime::mark("zc: tail buffers recycled");
+    crate::rstrace::ev("zc:end", 0);
+    if crate::rstrace::on() && std::env::var_os("FLOCK_V1_ZCDUMP").is_some() {
+        crate::rstrace::dump("zerocheck");
+    }
 
     if zc_timing && !tail_round_ms.is_empty() {
         let per_round: String = tail_round_ms

@@ -13,6 +13,16 @@ pub fn level() -> u8 {
     *L
 }
 
+/// Lane v1 timing probe (proof INVALID when set): `FLOCK_V1_PROBE_MOD=K`
+/// maps every round-two / rounds-3+4+5 input chunk index to `x_hi % K`, so the
+/// sweep re-reads a cache-resident slice (same kernel, same op count).
+pub fn probe_mod() -> usize {
+    static K: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("FLOCK_V1_PROBE_MOD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    });
+    *K
+}
+
 pub fn on() -> bool {
     level() > 0
 }
@@ -26,7 +36,7 @@ pub fn evd(tag: &'static str, arg: u32) {
 }
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
-const CAP: usize = 1 << 16;
+const CAP: usize = 1 << 19;
 // Lock-free slots: (ns, tag ptr, tag len, arg|tid<<32|cpu<<48).
 static SLOTS: LazyLock<Vec<[AtomicU64; 4]>> = LazyLock::new(|| {
     (0..CAP).map(|_| [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]).collect()
@@ -69,6 +79,66 @@ pub fn ev(tag: &'static str, arg: u32) {
     s[3].store(arg as u64 | (tid & 0xffff) << 32 | c << 48, Ordering::Release);
 }
 
+/// Record `(ns, tag, arg)` at an explicit timestamp (lane ru diagnostics).
+fn ev_at(ns: u64, tag: &'static str, arg: u32) {
+    let tid = TID.with(|t| *t) as u64;
+    let c = (cpu() as u64) & 0xffff;
+    let i = NEXT.fetch_add(1, Ordering::Relaxed);
+    if i >= CAP {
+        return;
+    }
+    let s = &SLOTS[i];
+    s[0].store(ns, Ordering::Relaxed);
+    s[1].store(tag.as_ptr() as u64, Ordering::Relaxed);
+    s[2].store(tag.len() as u64, Ordering::Relaxed);
+    s[3].store(arg as u64 | (tid & 0xffff) << 32 | c << 48, Ordering::Release);
+}
+
+static LAST_END: AtomicU64 = AtomicU64::new(0);
+static LAST_FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Lane ru: note a parallel item's start (min kept) at FLOCK_RS_TRACE >= 1.
+#[inline]
+pub fn item_start() {
+    if !on() {
+        return;
+    }
+    LAST_FIRST.fetch_min(EPOCH.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Lane ru: note a parallel item's end (max kept) at FLOCK_RS_TRACE >= 1.
+#[inline]
+pub fn item_end() {
+    if !on() {
+        return;
+    }
+    LAST_END.fetch_max(EPOCH.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Emit `<tag>` events at the first item start and the last item end since the
+/// previous flush, then reset.
+pub fn flush_items(first_tag: &'static str, last_tag: &'static str) {
+    if !on() {
+        return;
+    }
+    let f = LAST_FIRST.swap(u64::MAX, Ordering::Relaxed);
+    let l = LAST_END.swap(0, Ordering::Relaxed);
+    if f != u64::MAX {
+        ev_at(f, first_tag, 0);
+    }
+    if l != 0 {
+        ev_at(l, last_tag, 0);
+    }
+}
+
+/// Drop every recorded event (start of a new prove).
+pub fn reset() {
+    if !on() {
+        return;
+    }
+    NEXT.store(0, Ordering::Release);
+}
+
 /// Print and clear every recorded event, relative to the first one.
 pub fn dump(header: &str) {
     if !on() {
@@ -90,8 +160,20 @@ pub fn dump(header: &str) {
         .collect();
     v.sort_by_key(|e| e.0);
     let t0 = v.first().map(|e| e.0).unwrap_or(0);
-    eprintln!("[rs] ==== {header} ({} events)", v.len());
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64 * v.len() + 64);
+    let _ = writeln!(out, "[rs] ==== {header} ({} events)", v.len());
     for (ns, tag, arg, tid, c) in v {
-        eprintln!("[rs] {:10.4} t{tid:<3} c{c:<3} {tag} {arg}", (ns - t0) as f64 / 1e6);
+        let _ = writeln!(out, "[rs] {:10.4} t{tid:<3} c{c:<3} {tag} {arg}", (ns - t0) as f64 / 1e6);
     }
+    // One write: the ranked harness / one.py kill the worker shortly after
+    // the proof appears, so a line-per-syscall dump gets cut off.
+    if let Some(path) = std::env::var_os("FLOCK_RS_TRACE_OUT") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(out.as_bytes());
+            return;
+        }
+    }
+    eprint!("{out}");
 }

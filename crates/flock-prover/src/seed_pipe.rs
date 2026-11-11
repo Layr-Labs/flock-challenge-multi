@@ -649,6 +649,7 @@ struct SpinGuard;
 impl Drop for SpinGuard {
     fn drop(&mut self) {
         preseed_spin_end();
+        gl2_release_hot();
         flock_core::set_pool_owner(false);
     }
 }
@@ -931,6 +932,45 @@ fn drop_sized_set(set: SizedSet) {
     }
 }
 
+/// Lane gl2 experiment: `FLOCK_GL2_PUB_LINK=1` publishes with `link` instead
+/// of `rename` (same atomic appearance of the complete file). Read once.
+fn gl2_pub_link() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GL2_PUB_LINK").is_some());
+    *ON
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_HOLDHOT=1` restores the incumbent tail: the open's
+/// hot-pool spinners stop when the open returns and the owner broadcasts
+/// fresh tail spinners. Default: in the timed prove the open's spinners stay
+/// up until the publish has encoded. Read once.
+pub(crate) fn gl2_hold_hot() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_HOLDHOT").is_none());
+    *ON && is_timed_speculative_prove()
+}
+
+static GL2_HOT: Mutex<Option<flock_core::hot_pool::HotPool>> = Mutex::new(None);
+
+/// Keep the open's hot pool alive until [`gl2_release_hot`].
+pub(crate) fn gl2_park_hot(hot: Option<flock_core::hot_pool::HotPool>) {
+    *GL2_HOT.lock().unwrap_or_else(|e| e.into_inner()) = hot;
+}
+
+/// Stop a parked hot pool (no-op when none is parked).
+pub(crate) fn gl2_release_hot() {
+    let hot = GL2_HOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(hot);
+}
+
+/// Lane gl2: `FLOCK_NO_GL2_ENC_WIN=1` restores the planned parallel encode
+/// (`write_par`); default: windowed parallel encode (`write_win`). Read once.
+fn gl2_enc_win() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_ENC_WIN").is_none());
+    *ON
+}
+
 /// Timed: publish through the sized set. `Ok(result)` when this path
 /// published (rename included); `Err(bytes)` when the incumbent tail must
 /// write `bytes` (the exact `to_bytes()` output); `None` when no set or no
@@ -948,7 +988,9 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
     // SAFETY: the mapping covers exactly `enc.len()` bytes of a file of that
     // length; the bundle is ordinary heap memory.
     unsafe {
-        if par {
+        if par && gl2_enc_win() {
+            enc.write_win(bundle, f.base as *mut u8, rayon::current_num_threads().clamp(1, 64));
+        } else if par {
             enc.write_par(bundle, f.base as *mut u8);
         } else {
             enc.write(bundle, f.base as *mut u8);
@@ -957,6 +999,11 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
     flock_core::gaptime::abs("encoded");
     if std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none() {
         preseed_spin_end();
+        gl2_release_hot();
+    }
+    flock_core::gaptime::abs("pub:spinend");
+    if gl2_pub_link() {
+        return Some(Ok(std::fs::hard_link(&f.path, path)));
     }
     Some(Ok(std::fs::rename(&f.path, path)))
 }
@@ -993,12 +1040,14 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let bytes = match publish_sized(path, &bundle) {
         Some(Ok(result)) => {
             flock_core::gaptime::abs("renamed");
+            flock_core::rstrace::dump("timed prove");
             flock_core::gaptime::abs_flush();
             return result;
         }
         Some(Err(bytes)) => bytes,
         None => bundle.to_bytes(),
     };
+    gl2_release_hot();
     flock_core::gaptime::abs("to_bytes done");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1015,6 +1064,7 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     flock_core::gaptime::abs("renamed");
     drop(bytes);
     flock_core::gaptime::abs("bytes dropped");
+    flock_core::rstrace::dump("timed prove");
     flock_core::gaptime::abs_flush();
     r
 }
@@ -1366,6 +1416,7 @@ fn speculative_main(
         let line_r = if hot { spin_read_line_fd(real_stdin) } else { read_line_fd(real_stdin) };
         // From here on the spinners behave exactly as before (bounded callbacks that re-spawn).
         PRESEED_HOLD.store(false, Ordering::Release);
+        flock_core::rstrace::reset();
         flock_core::gaptime::abs("seed read");
         let Some(line) = line_r else {
             close_fd(real_stdin);

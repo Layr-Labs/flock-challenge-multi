@@ -2465,6 +2465,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         n_f128,
         witgen_simd::scratch_tag(witgen_simd::ROLE_Z, n_f128),
     );
+    flock_core::rstrace::ev("wg:takes", 0);
     const {
         assert!(K_SKIP == flock_core::zerocheck::K_SKIP);
     }
@@ -2511,6 +2512,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
     };
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     let ranked_compact = false;
+    flock_core::rstrace::ev("wg:plan", 0);
     let mut ab_inner = if ranked_compact {
         flock_core::zerocheck::univariate_skip_optimized::Round1AbInner::take_ranked_compact_uninit(
             n_total * BYTES_PER_BLOCK,
@@ -2521,6 +2523,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         )
     };
     ab_inner.set_invalid_prefix_bytes(skip_bytes);
+    flock_core::rstrace::ev("wg:abinner", 0);
     let padding: Compression = ([0u32; 8], [0u32; 16], 0, 0, 0);
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -2948,6 +2951,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    let ab1_hole = flock_core::zerocheck::univariate_skip_optimized::ab1_hole_layout_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     // Exact ranked-closed specialisation: only the crown worker's committed
     // shape reaches it, and only when the current binary still selects the
@@ -3038,6 +3042,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let a_addr = a.as_mut_ptr() as usize;
             let b_addr = b.as_mut_ptr() as usize;
             let ab_addr = ab_inner_bytes.as_mut_ptr() as usize;
+            // Lane ab1: hole-free compact layout for round one's leaf kernels
+            // (switch read once here; `FLOCK_NO_AB1_HOLE=1` keeps `base * 1856`).
+            // The pipelined producer never writes window 30 (w30 elided) or 31,
+            // so every store of a lane lands inside its row's 28 live lines.
+            let ab1_hole = ab1_hole && ab_block_bytes == 29 * 64;
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
             let window_tile_cols=std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
             let merge_prefix=std::env::var_os("FLOCK_WITNESS_SEED_MERGE_PREFIX").is_some();
@@ -3097,7 +3106,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             compact_z: if target.is_some() { input_base.cast::<u32>() } else { core::ptr::null_mut() },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
-                            out: (ab_addr as *mut u8).add(base * ab_block_bytes),
+                            out: (ab_addr as *mut u8).add(if ab1_hole {
+                                flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(base)
+                            } else {
+                                base * ab_block_bytes
+                            }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
                             inv_table,
@@ -3237,6 +3250,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         } else {
             assert_eq!(elided_octas.load(std::sync::atomic::Ordering::Relaxed), 0);
             flock_core::scratch::give_f128(root_storage);
+        }
+        if pipelined && ab1_hole && ab_block_bytes == 29 * 64 {
+            ab_inner.set_ab1_hole_layout();
         }
         return;
     }
@@ -4840,6 +4856,9 @@ impl Blake3Setup {
         blocks: crate::seed_pipe::BlockSource<'_>,
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        if !crate::seed_pipe::is_timed_speculative_prove() {
+            flock_core::rstrace::reset();
+        }
         flock_core::gaptime::abs("inner begin");
         flock_core::gaptime::begin("blake3 prove_fast");
         match self.r1cs.layout {

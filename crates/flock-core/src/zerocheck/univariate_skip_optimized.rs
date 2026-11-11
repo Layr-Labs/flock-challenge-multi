@@ -579,6 +579,9 @@ pub struct Round1AbInner {
     /// constant, so round one adds the exact contribution from the identity-C
     /// inner fold instead ([`round1_w30_delta_ab`]).
     ranked_w30_elided: bool,
+    /// Lane ab1: the ranked compact producer wrote the hole-free layout (see
+    /// [`ab1_hole_layout_enabled`]); only the round-one leaf kernels read it.
+    ab1_hole_layout: bool,
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -594,6 +597,31 @@ pub struct Round1AbInner {
 
 const RANKED_AB_DENSE_BLOCK_BYTES: usize = 32 * ELL;
 const RANKED_AB_COMPACT_BLOCK_BYTES: usize = 29 * ELL;
+
+/// Lane ab1 hole-free ranked compact layout. Every aligned group of 64
+/// compact rows (64 x 1856 B = one round-one window stream of a band) stores
+/// row `p`'s 28 live lines (windows 2..29) at `p * 1792` and its window-30
+/// line, which the ranked producer never writes and round one never reads,
+/// in the group's tail at `64 * 1792 + p * 64`. It is a pure permutation of
+/// 64-byte lines inside each group; the round-one AB leaf kernels then read
+/// each stream without fetching the 64 dead lines in between.
+pub const AB1_BLOCK_BYTES: usize = 64 * RANKED_AB_COMPACT_BLOCK_BYTES;
+const AB1_ROW_LIVE: usize = 28 * ELL;
+
+/// Byte offset of compact row `c`'s first live line (window 2) in the
+/// hole-free layout. `FLOCK_NO_AB1_HOLE=1` keeps the incumbent `c * 1856`.
+#[inline(always)]
+pub fn ab1_row_offset(c: usize) -> usize {
+    (c >> 6) * AB1_BLOCK_BYTES + (c & 63) * AB1_ROW_LIVE
+}
+
+/// Kill switch for the hole-free layout, read once per process; callers read
+/// it once per phase.
+pub fn ab1_hole_layout_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_AB1_HOLE").is_none());
+    *ON
+}
 
 impl Round1AbInner {
     #[cfg(all(
@@ -654,6 +682,7 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: false,
             ranked_w30_elided: false,
+            ab1_hole_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -682,6 +711,7 @@ impl Round1AbInner {
             ranked_one_rows_elided: false,
             ranked_compact: true,
             ranked_w30_elided: false,
+            ab1_hole_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -730,6 +760,37 @@ impl Round1AbInner {
 
     /// Whether round one must add window 30 from the identity-C fold.
     #[inline]
+    /// Lane ab1: brand the storage as written in the hole-free layout.
+    pub fn set_ab1_hole_layout(&mut self) {
+        assert!(self.ranked_compact);
+        self.ab1_hole_layout = true;
+    }
+
+    /// Undo the hole-free layout in place (exact inverse permutation of
+    /// every 64-row block), for any consumer other than the leaf kernels.
+    pub(crate) fn restore_ab1_hole_layout(&mut self) {
+        use rayon::prelude::*;
+        if !self.ab1_hole_layout {
+            return;
+        }
+        self.ab1_hole_layout = false;
+        self.as_bytes_mut()
+            .par_chunks_mut(AB1_BLOCK_BYTES)
+            .for_each(|blk| {
+                if blk.len() != AB1_BLOCK_BYTES {
+                    return;
+                }
+                let tmp = blk.to_vec();
+                for p in 0..64 {
+                    let (dst, src) = (p * RANKED_AB_COMPACT_BLOCK_BYTES, p * AB1_ROW_LIVE);
+                    blk[dst..dst + AB1_ROW_LIVE].copy_from_slice(&tmp[src..src + AB1_ROW_LIVE]);
+                    let h = 64 * AB1_ROW_LIVE + p * ELL;
+                    blk[dst + AB1_ROW_LIVE..dst + RANKED_AB_COMPACT_BLOCK_BYTES]
+                        .copy_from_slice(&tmp[h..h + ELL]);
+                }
+            });
+    }
+
     pub fn ranked_w30_elided(&self) -> bool {
         self.ranked_w30_elided
     }
@@ -743,6 +804,7 @@ impl Round1AbInner {
         b_packed: &[u8],
         inv_table: &InvNttTableByteSingleGf8,
     ) {
+        self.restore_ab1_hole_layout();
         if !self.ranked_one_rows_elided {
             return;
         }
@@ -977,6 +1039,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_one_rows_elided: false,
         ranked_compact: false,
         ranked_w30_elided: false,
+        ab1_hole_layout: false,
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2616,6 +2679,7 @@ pub(crate) fn round1_with_precomputed_ab_impl(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
+    ab_inner.restore_ab1_hole_layout();
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     assert!(
         !ab_inner.ranked_compact(),
@@ -3334,6 +3398,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
+    ab_inner.restore_ab1_hole_layout();
     ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
     assert!(
         !ab_inner.ranked_compact(),
@@ -3595,6 +3660,19 @@ fn zc_r1ab_plane_cache_enabled() -> bool {
     *ON
 }
 
+/// Lane ab1 timing probe: read each band pair-major without the producer
+/// writing it so (proof INVALID; same bytes, one sequential stream/thread).
+fn ab1_probe_layout() -> usize {
+    static ON: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_AB1_PROBE_PMAJ").is_some() {
+            1
+        } else {
+            std::env::var("FLOCK_AB1_PROBE_NS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }
+    });
+    *ON
+}
+
 const RANKED_AB_PLANE_BYTES: usize = 128 * 16 * ELL;
 
 std::thread_local! {
@@ -3632,6 +3710,8 @@ pub(crate) struct WorkerStateAbOnly {
     leaf_cache: Option<ab_leaf_accum::Cache>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
+    /// Lane ab1: band layout the leaf kernels read (0 = incumbent rows).
+    ab1_layout: usize,
 }
 
 impl WorkerStateAbOnly {
@@ -3644,6 +3724,7 @@ impl WorkerStateAbOnly {
             leaf_cache: None,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
+            ab1_layout: 0,
         }
     }
 }
@@ -4131,7 +4212,7 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
             #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
             { ab_leaf_accum::enabled() && ab_leaf_accum::try_run(
                 &mut state.leaf_cache, ab_inner, mats, x_hi,
-                prefetch_mode, &mut state.plane_banks) }
+                prefetch_mode, &mut state.plane_banks, state.ab1_layout) }
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
             { false }
         };
@@ -4310,6 +4391,27 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Vec<F128> {
+    round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
+        ab_inner, a_packed, b_packed, m, k_skip, r, inv_table, padding, None,
+    )
+}
+
+/// [`round1_shift_reduce_ab_packed_padded_with_precomputed`] plus `idle`: on
+/// the claim route the first thread that finds the band counter empty runs it
+/// (challenge-independent setup for later rounds) while the arm's last bands
+/// finish. `idle` must not touch the AB result.
+#[allow(clippy::too_many_arguments)]
+pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    idle: Option<&(dyn Fn() + Sync)>,
+) -> Vec<F128> {
     use rayon::prelude::*;
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(m >= k_skip + N_INNER);
@@ -4362,7 +4464,6 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES
         );
     }
-    let ab_inner_bytes = ab_inner.as_bytes();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -4460,6 +4561,29 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         target_feature = "gfni"
     )))]
     let direct_ab = false;
+    // Lane ab1: the hole-free layout is read only by the round-one leaf
+    // kernels. Prove from the same gates the band dispatch uses that every
+    // band takes that path; otherwise undo the layout in place first.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    let ab1_leaf_ok = direct_ab
+        && ranked_compact
+        && ranked_one_rows_elided
+        && n_lo == 12
+        && hi_size == 128
+        && within_outer_mask == 1
+        && b_med_counts_live.as_slice() == [16, 14]
+        && zc_r1_ab_batch4_enabled()
+        && ab_leaf_accum::enabled()
+        && eq_fold_state.as_ref().is_some_and(|(eq_bot, mats, bank_bits)| {
+            eq_bot.len() == 128 && *bank_bits == 7 && ab_leaf_accum::would_run(mats)
+        });
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
+    let ab1_leaf_ok = false;
+    if ab_inner.ab1_hole_layout && !ab1_leaf_ok {
+        ab_inner.restore_ab1_hole_layout();
+    }
+    let ab1_layout = if ab_inner.ab1_hole_layout { 33 } else { ab1_probe_layout() };
+    let ab_inner_bytes = ab_inner.as_bytes();
     // One claim loop per pool thread instead of a `fold`/`reduce` tree. The
     // 128 bands are ~0.75 ms each at the ranked shape; under the adaptive
     // split a worker that finished its own half could steal a whole band
@@ -4469,7 +4593,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     // parks its accumulator in its own slot. The per-thread sums and their
     // final combine are XOR (field addition in characteristic two), so the
     // grouping of bands into threads cannot change the result bits.
+    crate::rstrace::ev("ab:setup", 0);
     let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
+        crate::rstrace::evd("ab:b", x_hi as u32);
+        state.ab1_layout = ab1_layout;
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -4523,13 +4650,19 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 state,
             );
         }
+        crate::rstrace::evd("ab:e", 0);
     };
     let res_ab = if zc_r1ab_claim_enabled() && rayon::current_thread_index().is_some() {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_threads = rayon::current_num_threads();
         let slots: Vec<std::sync::Mutex<Option<[F128; ELL]>>> =
             (0..n_threads).map(|_| std::sync::Mutex::new(None)).collect();
+        let spin = crate::r1_owner_awake::v1_spin_enabled();
+        let caller = rayon::current_thread_index();
+        let arrived = std::sync::atomic::AtomicUsize::new(0);
+        let idle_taken = std::sync::atomic::AtomicBool::new(false);
         rayon::broadcast(|ctx| {
+            crate::rstrace::evd("ab:t0", ctx.index() as u32);
             let mut state: Option<WorkerStateAbOnly> = None;
             loop {
                 let x_hi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4538,10 +4671,33 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed(
                 }
                 band(state.get_or_insert_with(WorkerStateAbOnly::new), x_hi);
             }
+            if spin {
+                crate::r1_owner_awake::ab_draining();
+            }
             if let Some(state) = state {
                 *slots[ctx.index()].lock().unwrap() = Some(state.local_res_ab);
             }
+            crate::rstrace::evd("ab:t1", ctx.index() as u32);
+            if let Some(f) = idle
+                && !idle_taken.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                f();
+                crate::rstrace::evd("ab:idle", ctx.index() as u32);
+            }
+            arrived.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if spin && Some(ctx.index()) == caller {
+                // Stay on CPU until every AB thread has parked its sum, so
+                // the broadcast returns without a sleeping wake-up.
+                let t0 = std::time::Instant::now();
+                while arrived.load(std::sync::atomic::Ordering::Acquire) < ctx.num_threads() {
+                    core::hint::spin_loop();
+                    if t0.elapsed() > std::time::Duration::from_millis(20) {
+                        break;
+                    }
+                }
+            }
         });
+        crate::rstrace::ev("ab:bcast", 0);
         let mut res = [F128::ZERO; ELL];
         for slot in slots {
             if let Some(part) = slot.into_inner().unwrap() {
@@ -4885,6 +5041,42 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
     Option<Vec<F128>>,
     Option<Vec<F128>>,
 ) {
+    let (a, b, c, d, e, f, g, _) = round1_c_fold4_from_block_major_z_with_canon_side(
+        z_packed, m, k_log, k_skip, useful_bits, r, inv_table, ranked_one_rows, capture_canon,
+        roots, false, false,
+    );
+    (a, b, c, d, e, f, g)
+}
+
+/// [`round1_c_fold4_from_block_major_z_with_canon`] plus lane gl1's side
+/// jobs (`side`): the one-row AB lift and, with `w30`, the window-30 delta
+/// ([`round1_w30_delta_ab`] of canon row 240, returned last) run on round
+/// one's waiting threads while this thread finishes C's own tail. Same
+/// closures, same values.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn round1_c_fold4_from_block_major_z_with_canon_side(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    ranked_one_rows: bool,
+    capture_canon: bool,
+    roots: Option<&crate::lincheck::RootFoldSource>,
+    side: bool,
+    w30: bool,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Option<Vec<F128>>,
+    Option<Vec<F128>>,
+    Option<Vec<F128>>,
+) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -4910,13 +5102,16 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         // never written and immediately read back by a second Rayon pass.
         let (fold8, one_fold8) = if par && inner_tail.len() == 7 {
             if let Some(roots) = roots {
+                crate::rstrace::ev("c:in", 0);
                 let full = roots.fold(z_packed, m, &r[k_log..]);
+                crate::rstrace::ev("c:fold", 0);
                 let (full, mut one) = crate::lincheck::finish_block_major_fold(
                     full,
                     Some(inner_tail[6]),
                     ranked_one_rows,
                     capture_canon,
                 );
+                crate::rstrace::ev("c:fin", 0);
                 if capture_canon {
                     canon = one.as_mut().map(|v| v.split_off(1usize << (k_log - 1)));
                 }
@@ -5011,88 +5206,107 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         )
     };
 
-    let (quad, s_hat_v_c) = if fold4.is_empty() {
-        let low_eq = build_eq(&inner_tail[..2]);
-        let hi_eq = build_eq(&inner_tail[2..4]);
-        let top_eq = build_eq(&inner_tail[4..6]);
-        let mut s_hat = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut s_hat,
-            &fold8[..n_packed],
-            low_eq[0] * hi_eq[0] * top_eq[0],
-        );
-        for bank in 1..64 {
-            let w = low_eq[bank & 3] * hi_eq[(bank >> 2) & 3] * top_eq[bank >> 4];
-            crate::field::f128_slice::add_scaled(
+    let prefix = r[k_skip];
+    let main = || {
+        let (quad, s_hat_v_c) = if fold4.is_empty() {
+            let low_eq = build_eq(&inner_tail[..2]);
+            let hi_eq = build_eq(&inner_tail[2..4]);
+            let top_eq = build_eq(&inner_tail[4..6]);
+            let mut s_hat = crate::alloc_uninit_vec::<F128>(n_packed);
+            crate::field::f128_slice::scale_slice(
                 &mut s_hat,
-                &fold8[bank * n_packed..(bank + 1) * n_packed],
-                w,
+                &fold8[..n_packed],
+                low_eq[0] * hi_eq[0] * top_eq[0],
             );
-        }
-        (Vec::new(), s_hat)
-    } else {
-        // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
-        // tensor (coordinates 0 and 1 stay bank selectors).
-        let retained_hi_eq = build_eq(&inner_tail[2..4]);
-        let quad_len = 4 * n_packed;
-        let quad = if r1_cfold_x4_enabled() {
-            let mut quad = crate::alloc_uninit_vec::<F128>(quad_len);
-            crate::field::f128_slice::scale_slice(&mut quad, &fold4[..quad_len], retained_hi_eq[0]);
-            for q in 1..4 {
+            for bank in 1..64 {
+                let w = low_eq[bank & 3] * hi_eq[(bank >> 2) & 3] * top_eq[bank >> 4];
                 crate::field::f128_slice::add_scaled(
-                    &mut quad,
-                    &fold4[q * quad_len..(q + 1) * quad_len],
-                    retained_hi_eq[q],
+                    &mut s_hat,
+                    &fold8[bank * n_packed..(bank + 1) * n_packed],
+                    w,
                 );
             }
-            quad
+            (Vec::new(), s_hat)
         } else {
-            let mut quad = vec![F128::ZERO; quad_len];
-            for q in 0..4 {
-                for e in 0..4 {
-                    let src = (e + 4 * q) * n_packed;
-                    let dst = e * n_packed;
-                    for packed in 0..n_packed {
-                        quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+            // Fold retained coordinates 2 and 3 to recover the incumbent four-bank
+            // tensor (coordinates 0 and 1 stay bank selectors).
+            let retained_hi_eq = build_eq(&inner_tail[2..4]);
+            let quad_len = 4 * n_packed;
+            let quad = if r1_cfold_x4_enabled() {
+                let mut quad = crate::alloc_uninit_vec::<F128>(quad_len);
+                crate::field::f128_slice::scale_slice(&mut quad, &fold4[..quad_len], retained_hi_eq[0]);
+                for q in 1..4 {
+                    crate::field::f128_slice::add_scaled(
+                        &mut quad,
+                        &fold4[q * quad_len..(q + 1) * quad_len],
+                        retained_hi_eq[q],
+                    );
+                }
+                quad
+            } else {
+                let mut quad = vec![F128::ZERO; quad_len];
+                for q in 0..4 {
+                    for e in 0..4 {
+                        let src = (e + 4 * q) * n_packed;
+                        let dst = e * n_packed;
+                        for packed in 0..n_packed {
+                            quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+                        }
                     }
                 }
-            }
-            quad
+                quad
+            };
+            let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+            (quad, s_hat_v_c)
         };
-        let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
-        (quad, s_hat_v_c)
-    };
 
-    // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
-    // bit at the original C point recovers C's 64 S-domain evaluations.
-    let prefix = r[k_skip];
-    let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_inv_for_identity_c();
-    if r1_cfold_x4_enabled() {
-        crate::field::f128_slice::scale_slice(
-            &mut res_c_s,
-            &s_hat_v_c[..ELL],
-            c_s_inv * (F128::ONE + prefix),
-        );
-        crate::field::f128_slice::add_scaled(
-            &mut res_c_s,
-            &s_hat_v_c[ELL..2 * ELL],
-            c_s_inv * prefix,
-        );
-    } else {
-        for lane in 0..ELL {
-            let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-            res_c_s[lane] = c_s_inv * naive;
-        }
-    }
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    let one_ab_lifted = one_fold8.map(|one_fold8| {
-        if ranked_one_rows {
-            round1_lifted_from_ranked_one_fold8(&one_fold8, inner_tail, prefix, inv_table)
+        crate::rstrace::ev("c:shat", 0);
+        // RingSwitch leaves global bit `k_skip` as its 128-way prefix; folding that
+        // bit at the original C point recovers C's 64 S-domain evaluations.
+        let mut res_c_s = [F128::ZERO; ELL];
+        let c_s_inv = c_s_inv_for_identity_c();
+        if r1_cfold_x4_enabled() {
+            crate::field::f128_slice::scale_slice(
+                &mut res_c_s,
+                &s_hat_v_c[..ELL],
+                c_s_inv * (F128::ONE + prefix),
+            );
+            crate::field::f128_slice::add_scaled(
+                &mut res_c_s,
+                &s_hat_v_c[ELL..2 * ELL],
+                c_s_inv * prefix,
+            );
         } else {
-            round1_lifted_from_fold8(&one_fold8, inner_tail, prefix, inv_table)
+            for lane in 0..ELL {
+                let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
+                res_c_s[lane] = c_s_inv * naive;
+            }
         }
-    });
+        crate::rstrace::ev("c:post", 0);
+        let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+        crate::rstrace::ev("c:lift", 0);
+        (res_c_lifted, s_hat_v_c, quad)
+    };
+    let one_job = || {
+        one_fold8.as_ref().map(|one_fold8| {
+            if ranked_one_rows {
+                round1_lifted_from_ranked_one_fold8(one_fold8, inner_tail, prefix, inv_table)
+            } else {
+                round1_lifted_from_fold8(one_fold8, inner_tail, prefix, inv_table)
+            }
+        })
+    };
+    let w30_job = || {
+        w30.then(|| {
+            let rows = canon.as_ref().expect("window-30 side job needs the canon rows");
+            round1_w30_delta_ab(&rows[16 * 64..17 * 64], r, k_skip, k_log, inv_table)
+        })
+    };
+    let ((res_c_lifted, s_hat_v_c, quad), one_ab_lifted, w30_delta) = if side {
+        crate::r1_owner_awake::side_run(main, one_job, w30_job)
+    } else {
+        (main(), one_job(), w30_job())
+    };
     (
         res_c_lifted,
         s_hat_v_c,
@@ -5101,6 +5315,7 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon(
         fold8,
         one_ab_lifted,
         canon,
+        w30_delta,
     )
 }
 

@@ -3648,6 +3648,16 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 ///
 /// `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build. Read once into a
 /// `LazyLock`, outside every loop.
+/// Lane rs: run the two ranked claims' tails as two parallel items (measured
+/// −0.035 ms on the ring-switch step, N=16 paired). Each claim's own inner
+/// parallelism is unchanged; output order is the indexed collect's.
+/// `FLOCK_NO_RS_CLAIMS_PAR=1` restores the sequential loop. Read once.
+fn rs_claims_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_CLAIMS_PAR").is_none());
+    *ON
+}
+
 pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
@@ -4163,7 +4173,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     const TAIL_PAR_MIN_CLAIMS: usize = 4;
     let n_claims = work.len();
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> =
-        if tail_par && n_claims >= TAIL_PAR_MIN_CLAIMS {
+        if tail_par && (n_claims >= TAIL_PAR_MIN_CLAIMS || (n_claims >= 2 && rs_claims_par_enabled())) {
             use rayon::prelude::*;
             work.into_par_iter()
                 .zip(gammas_rs.par_iter())
