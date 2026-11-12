@@ -453,6 +453,12 @@ unsafe fn affine_conv_pruned<const MODE: u8>(p: *const u64, m: *const u64) -> [_
 
 #[inline(always)]
 unsafe fn affine_prepared(p: *const u64, m: *const u64) -> [__m512i; 8] {
+    unsafe { global_cse::affine27_depth(p, m) }
+}
+
+#[cfg(test)]
+#[inline(always)]
+unsafe fn affine_prepared_reference(p: *const u64, m: *const u64) -> [__m512i; 8] {
     unsafe {
         let x = core::ptr::read_unaligned(p.cast::<[u64;8]>());
         let mut c = [_mm512_setzero_si512(); 8];
@@ -667,7 +673,7 @@ unsafe fn ring_prepared_pack(v:__m512i)->__m512i{
 }
 
 #[inline(always)]
-unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool, const PRUNE: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -683,6 +689,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
         let v = if PREPARE_A || mode(BLK, 0) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 0)) } {
+            sparse_pack::pack::<BLK, 0>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -690,6 +698,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
         let v = if PREPARE_A || mode(BLK, 1) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 1)) } {
+            sparse_pack::pack::<BLK, 1>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -697,6 +707,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
         let v = if PREPARE_A || mode(BLK, 2) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 2)) } {
+            sparse_pack::pack::<BLK, 2>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -704,6 +716,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
         let v = if PREPARE_A || mode(BLK, 3) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 3)) } {
+            sparse_pack::pack::<BLK, 3>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -711,6 +725,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
         let v = if PREPARE_A || mode(BLK, 4) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 4)) } {
+            sparse_pack::pack::<BLK, 4>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -718,6 +734,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
         let v = if PREPARE_A || mode(BLK, 5) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 5)) } {
+            sparse_pack::pack::<BLK, 5>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -725,6 +743,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
         let v = if PREPARE_A || mode(BLK, 6) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 6)) } {
+            sparse_pack::pack::<BLK, 6>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -732,6 +752,8 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
         let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
         let v = if PREPARE_A || mode(BLK, 7) == 0 {
             ring_prepared_pack(v)
+        } else if const { !PREPARE_A && BLK >= 2 && BLK <= 29 && PRUNE && prune_wins(mode(BLK, 7)) } {
+            sparse_pack::pack::<BLK, 7>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -766,7 +788,7 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, c
         let bv = if MODE == 0 {
             affine_prepared(bp, mb)
         } else if const { PRUNE && prune_wins(MODE) } {
-            affine_conv_pruned::<MODE>(bp, mb)
+            pruned_cse::affine_pruned_cse::<MODE, true, true>(bp, mb)
         } else {
             affine_conv(bp, mb, MODE)
         };
@@ -774,7 +796,7 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, c
         for i in 0..8 {
             let value = if MODE == 15 { av[i] } else {
                 let value = _mm512_gf2p8mul_epi8(av[i], bv[i]);
-                if MODE == 0 { value } else { _mm512_xor_si512(value, av[i]) }
+                if MODE == 0 || const { PRUNE && prune_wins(MODE) } { value } else { _mm512_xor_si512(value, av[i]) }
             };
             let previous = if i == 0 { acc0 } else { acc[i] };
             let value = if FIRST { value } else { _mm512_xor_si512(previous, value) };
@@ -799,7 +821,7 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
     m: *const u64,
 ) {
     unsafe {
-        let bp = pretranspose_ring::<BLK, false>(br, rw);
+        let bp = pretranspose_ring::<BLK, false, PRUNE>(br, rw);
         let mut acc = [_mm512_setzero_si512(); 8];
         rows.publish_dense_values(0, a[0], b[0]);
         if residual_row_live(BLK, 7) {
@@ -1133,7 +1155,7 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
 ) {
     let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
     unsafe {
-        let ap = pretranspose_ring::<0, true>(ar, rw);
+        let ap = pretranspose_ring::<0, true, PRUNE>(ar, rw);
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
@@ -1374,3 +1396,18 @@ mod tests {
         }
     }
 }
+
+#[path="blake3_witgen8_xor_cse.rs"]
+mod global_cse;
+#[cfg(test)]
+#[path="blake3_witgen8_xor_cse_tests.rs"]
+mod cse_tests;
+
+#[path="blake3_witgen8_xor_pruned_cse.rs"]
+mod pruned_cse;
+#[cfg(test)]
+#[path="blake3_witgen8_xor_pruned_cse_tests.rs"]
+mod pruned_cse_tests;
+
+#[path="blake3_witgen8_sparse_pack.rs"]
+mod sparse_pack;

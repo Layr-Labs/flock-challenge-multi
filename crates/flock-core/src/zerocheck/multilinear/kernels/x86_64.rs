@@ -5065,6 +5065,8 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") lo, out("zmm9") hi,
+            // Only the private return stack is written; rows and matrices are read-only.
+            options(pure,readonly),
         );
         [lo, hi]
     }
@@ -5109,6 +5111,8 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            // Only the private return stack is written; rows and matrices are read-only.
+            options(pure,readonly),
         );
         [a, b, c, d]
     }
@@ -6324,6 +6328,72 @@ unsafe fn r4_canonical_set(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn r4_canonical_outer_pair(
+    fa0: *const F128, fb0: *const F128, fa1: *const F128, fb1: *const F128, acc4: &mut [WideGhashX4; 10],
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let ld = |p: *const F128, g: usize, k: usize| {
+            _mm512_loadu_si512(p.add(16 * k + 4 * g).cast::<__m512i>())
+        };
+        // Pair the surviving first-quarter groups (2,3) with the last-
+        // quarter groups (0,1). Each product is unchanged; mul_acc2 merges
+        // their exact unreduced contributions before updating the accumulator.
+        macro_rules! corner {
+            ($k:literal) => {{
+                let (x0, x1, x2, x3) = (ld(fa0, 2, $k), ld(fa0, 3, $k), ld(fa1, 0, $k), ld(fa1, 1, $k));
+                let (y0, y1, y2, y3) = (ld(fb0, 2, $k), ld(fb0, 3, $k), ld(fb1, 0, $k), ld(fb1, 1, $k));
+                let a = _mm512_shuffle_i64x2::<0xDD>(x0, x1);
+                let b = _mm512_shuffle_i64x2::<0xDD>(y0, y1);
+                let c = _mm512_shuffle_i64x2::<0xDD>(x2, x3);
+                let d = _mm512_shuffle_i64x2::<0xDD>(y2, y3);
+                if $k == 0 { acc4[0].mul_acc2(a, b, c, d); }
+                (
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x0, x1), a),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(y0, y1), b),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(x2, x3), c),
+                    _mm512_xor_si512(_mm512_shuffle_i64x2::<0x88>(y2, y3), d),
+                )
+            }};
+        }
+        macro_rules! product {
+            ($i:literal, $q:expr) => {{ let (a,b,c,d)=$q; acc4[$i].mul_acc2(a,b,c,d); }};
+        }
+        macro_rules! plus {
+            ($x:expr, $y:expr) => {{
+                let (a,b,c,d)=$x; let (e,f,g,h)=$y;
+                (_mm512_xor_si512(a,e), _mm512_xor_si512(b,f),
+                 _mm512_xor_si512(c,g), _mm512_xor_si512(d,h))
+            }};
+        }
+        let q0=corner!(0); product!(1,q0);
+        let q1=corner!(1); product!(2,q1);
+        let q2=corner!(2); product!(4,q2);
+        let q3=corner!(3); product!(5,q3);
+        let e=plus!(q0,q1); product!(3,e);
+        let f=plus!(q2,q3); product!(6,f);
+        product!(7,plus!(q0,q2));
+        product!(8,plus!(q1,q3));
+        product!(9,plus!(e,f));
+    }
+}
+
 /// [`round2_lookahead_chunk_baked_elide_x86`] plus the deferred round-four
 /// biquadratic: returns the incumbent eight sums and the 18 round-four sums
 /// `[v1; 9] ++ [vinf; 9]` (on `S·Etop·f_{r3}` weights; the driver applies
@@ -6401,6 +6471,11 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     debug_assert_eq!(row_base & 255, 0);
 
     unsafe {
+        let outer_pair = PAIR && {
+            static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+                std::env::var_os("FLOCK_NO_R4_OUTER_PAIR").is_none());
+            *ON
+        };
         let mut acc = [WideGhashX4::zero(); 8];
         let mut acc4 = [WideGhashX4::zero(); 10];
         let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
@@ -6558,9 +6633,14 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
                     // initialized groups: the two full sets plus one set
                     // combining the two surviving partial halves.
                     // This replaces four sets of ten products with three.
-                    r4_canonical_set(fa_first,fb_first,2,fa_first,fb_first,3,&mut acc4);
-                    r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
-                    r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4);
+                    if outer_pair {
+                        r4_canonical_outer_pair(fa_first,fb_first,fa,fb,&mut acc4);
+                        r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
+                    } else {
+                        r4_canonical_set(fa_first,fb_first,2,fa_first,fb_first,3,&mut acc4);
+                        r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
+                        r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4);
+                    }
                 } else { r4_round4_batch(fa, fb, &mut acc4, 3); }
                 pf_quarter!(g0, 3);
                 #[cfg(test)]
@@ -7336,11 +7416,11 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false,true,true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true,true,true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
                 assert_eq!(got,want,"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false,true,true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,lo1_ys_enabled());
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
