@@ -453,6 +453,12 @@ unsafe fn affine_conv_pruned<const MODE: u8>(p: *const u64, m: *const u64) -> [_
 
 #[inline(always)]
 unsafe fn affine_prepared(p: *const u64, m: *const u64) -> [__m512i; 8] {
+    unsafe { global_cse::affine27_depth(p, m) }
+}
+
+#[cfg(test)]
+#[inline(always)]
+unsafe fn affine_prepared_reference(p: *const u64, m: *const u64) -> [__m512i; 8] {
     unsafe {
         let x = core::ptr::read_unaligned(p.cast::<[u64;8]>());
         let mut c = [_mm512_setzero_si512(); 8];
@@ -766,7 +772,7 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, c
         let bv = if MODE == 0 {
             affine_prepared(bp, mb)
         } else if const { PRUNE && prune_wins(MODE) } {
-            affine_conv_pruned::<MODE>(bp, mb)
+            pruned_cse::affine_pruned_cse::<MODE>(bp, mb)
         } else {
             affine_conv(bp, mb, MODE)
         };
@@ -1374,3 +1380,15 @@ mod tests {
         }
     }
 }
+
+#[path="blake3_witgen8_xor_cse.rs"]
+mod global_cse;
+#[cfg(test)]
+#[path="blake3_witgen8_xor_cse_tests.rs"]
+mod cse_tests;
+
+#[path="blake3_witgen8_xor_pruned_cse.rs"]
+mod pruned_cse;
+#[cfg(test)]
+#[path="blake3_witgen8_xor_pruned_cse_tests.rs"]
+mod pruned_cse_tests;
