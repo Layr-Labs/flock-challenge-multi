@@ -7336,11 +7336,11 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
                 assert_eq!(got,want,"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,lo1_ys_enabled());
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
