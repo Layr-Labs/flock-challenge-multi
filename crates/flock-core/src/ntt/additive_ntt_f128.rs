@@ -1404,6 +1404,8 @@ struct StFmpPair {
     group: std::sync::atomic::AtomicUsize,
     announced: std::sync::atomic::AtomicUsize,
     witness_done: std::sync::atomic::AtomicUsize,
+    assist_done: std::sync::atomic::AtomicUsize,
+    mp_gone: std::sync::atomic::AtomicBool,
     slot_r: [std::cell::UnsafeCell<usize>; ST_FMP_CAP],
 }
 
@@ -1438,6 +1440,8 @@ impl StFmpPair {
             group: AtomicUsize::new(usize::MAX),
             announced: AtomicUsize::new(0),
             witness_done: AtomicUsize::new(0),
+            assist_done: AtomicUsize::new(0),
+            mp_gone: AtomicBool::new(false),
             slot_r: [const { std::cell::UnsafeCell::new(0) }; ST_FMP_CAP],
         }
     }
@@ -1627,6 +1631,7 @@ fn st_fmp_run(
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
+    assist: Option<&(dyn Fn(*mut F128, usize, bool) + Sync)>,
     produce: Option<&(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)>,
     after: Option<&(dyn Fn(usize) + Sync)>,
 ) -> bool {
@@ -1649,7 +1654,7 @@ fn st_fmp_run(
         return false;
     };
     st_fmp_run_claimed(
-        n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf,
+        n_tasks, row_len, seed, fold, publish, assist, produce, after, pairs, nbuf,
         st_fmp_balanced_enabled(), claim,
     )
 }
@@ -1664,6 +1669,7 @@ fn st_fmp_run_claimed(
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
+    assist: Option<&(dyn Fn(*mut F128, usize, bool) + Sync)>,
     produce: Option<&(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)>,
     after: Option<&(dyn Fn(usize) + Sync)>,
     pairs: &[(usize, usize)],
@@ -1677,6 +1683,10 @@ fn st_fmp_run_claimed(
     assert!((2..=ST_FMP_CAP).contains(&nbuf));
     assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
     let balanced = balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
+    static ASSIST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LD_FOLD_ASSIST").is_none()
+    });
+    let assist = assist.filter(|_| balanced && *ASSIST);
     crate::rstrace::ev("st:setup", 0);
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
@@ -1805,7 +1815,19 @@ fn st_fmp_run_claimed(
                 // acquires the `folded` release below.
                 crate::rstrace::evd("f:seeded", i as u32);
                 unsafe {
-                    fold(bufp.add(s * stride), *st.slot_r[s].get());
+                    if let Some(part) = assist {
+                        // F owns the first 60 lanes; M+P folds the final four
+                        // while it would otherwise wait for this task.
+                        part(bufp.add(s * stride), *st.slot_r[s].get(), false);
+                    } else {
+                        fold(bufp.add(s * stride), *st.slot_r[s].get());
+                    }
+                }
+                if assist.is_some() {
+                    while st.assist_done.load(Ordering::Acquire) < i + 1 {
+                        if st.mp_gone.load(Ordering::Acquire) { return; }
+                        std::hint::spin_loop();
+                    }
                 }
                 crate::rstrace::evd("f:fold", i as u32);
                 if balanced {
@@ -1863,6 +1885,7 @@ fn st_fmp_run_claimed(
                 self.st
                     .total
                     .store(self.st.seeded.load(Ordering::Relaxed), Ordering::Release);
+                self.st.mp_gone.store(true, Ordering::Release);
                 while !self.st.f_gone.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
@@ -1898,6 +1921,13 @@ fn st_fmp_run_claimed(
                     let s = (seeded - 3) % nbuf;
                     publish(bufp.add(s * stride), *st.slot_r[s].get());
                     crate::rstrace::evd("mp:pub", (seeded - 3) as u32);
+                }
+                // Complete F's short suffix before our own long fold: doing
+                // it afterwards would delay F's independent publication.
+                if let Some(part) = assist {
+                    let even = (seeded - 2) % nbuf;
+                    part(bufp.add(even * stride), *st.slot_r[even].get(), true);
+                    st.assist_done.store(seeded - 1, Ordering::Release);
                 }
                 let s = (seeded - 1) % nbuf;
                 fold(bufp.add(s * stride), *st.slot_r[s].get());
@@ -2118,6 +2148,29 @@ unsafe fn st_fmp_fold4(
     stage_perm: bool,
     tw4: &[kernels::FourBlock],
 ) {
+    unsafe { st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, tw4, 0, row_len); }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn st_fmp_fold4_range(
+    bufp: *mut F128,
+    row_len: usize,
+    sub_stride: usize,
+    r: usize,
+    lanes4_tail: usize,
+    stage_perm: bool,
+    tw4: &[kernels::FourBlock],
+    lane_start: usize,
+    lane_count: usize,
+) {
     let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
@@ -2126,9 +2179,10 @@ unsafe fn st_fmp_fold4(
             let region = bufp.add(block * 64 * row_len);
             let tw = &tw4[block];
             for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail);
+                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail)
+                    .saturating_sub(lane_start).min(lane_count);
                 kernels::butterfly_fused_4layer_cached(
-                    region.add(j * g4_base * row_len),
+                    region.add(j * g4_base * row_len + lane_start),
                     g4_stride,
                     row_len,
                     lanes4,
@@ -4099,6 +4153,10 @@ impl AdditiveNttF128 {
             ))]
             if direct_publish && st_fmp_run(
                 sub_stride, row_len, &seed, &fold4, &publish2,
+                Some(&|bufp, r, helper| unsafe {
+                    let (start, count) = if helper { (60, 4) } else { (0, 60) };
+                    st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4, start, count);
+                }),
                 produce.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after,
             )
             {
@@ -6762,7 +6820,7 @@ mod tests {
                     }
                     published[r].fetch_add(1, Ordering::Relaxed);
                 };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None, None));
+                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None, None, None));
                 for r in 0..n_tasks {
                     assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
                     assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
@@ -9055,16 +9113,18 @@ mod generated_pair_dispatch_tests {
                 }}
                 assert_eq!(seeded[r].fetch_add(2,Release),0);
             };
-            let fold=|slot:*mut F128,r:usize| {
+            let fold_part=|slot:*mut F128,r:usize, roles:core::ops::Range<usize>| {
                 let _guard=enter();fail(4);if r>=8{fail(9);}
                 assert_eq!(seeded[r].load(Acquire),2,"fold ran before both seed roles joined");
-                for role in 0..2 {unsafe {
+                for role in roles {unsafe {
                     assert_eq!(*slot.add(role*4),F128::new(r as u64,round as u64));
                     assert_eq!(*slot.add(role*4+1),F128::new(!r as u64,0x12ab));
                     (*slot.add(role*4+1)).hi=0x98fe;
                 }}
                 if (r+round)%19==0{std::thread::yield_now();}
             };
+            let fold=|slot,r| fold_part(slot,r,0..2);
+            let assist=|slot,r,helper| fold_part(slot,r,if helper {1..2} else {0..1});
             let publish=|slot:*mut F128,r:usize| {
                 let _guard=enter();fail(5);if r>=8{fail(10);}
                 for role in 0..2 {unsafe {
@@ -9083,7 +9143,7 @@ mod generated_pair_dispatch_tests {
             let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
             let claim=StFmpClaim::take().expect("previous call leaked its claim");
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
-                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
+                2048,64,&seed,&fold,&publish,Some(&assist),producer,Some(&after),&pairs,nbuf,balanced,claim))));
             assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
             if injection==0 {
                 assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
