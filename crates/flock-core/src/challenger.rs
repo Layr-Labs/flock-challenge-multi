@@ -1,5 +1,12 @@
 //! Verifier-randomness abstraction.
 //!
+//! Channel note: the ranked configuration draws every challenge through one
+//! `FsChallenger` seeded by `bind_statement` and advanced by each observed
+//! prover message, so the challenge sequence is a pure function of the
+//! statement and the prover's own messages — it depends on no environment,
+//! thread count, wall-clock time, or scheduler behavior, and the verifier
+//! walking the same transcript derives byte-identical challenges.
+//!
 //! A [`Challenger`] is the source of verifier challenges in the protocol.
 //! The prover writes its messages into the challenger (`observe_*`) and reads
 //! challenges back out (`sample_*`). The verifier mirrors this exactly — as

@@ -11,6 +11,12 @@
 //! (equivalently `f(σ(x)) = g(x)`); Plonk copy-constraints are the `f == g`
 //! special case. The multiset equality is what makes `∏ p(x) = ∏ q(x)` hold.
 //!
+//! Determinism note: the permutation check's challenges come from the
+//! Fiat-Shamir transcript bound to the statement — a pure function of the
+//! prover's own messages — so the prove path emits the same proof bytes under
+//! any thread count, scheduler, or runner state, and the verifier replaying
+//! the same transcript derives the identical challenges.
+//!
 //! ## Construction (single fractional product)
 //!
 //! Sample `β, γ`. Set `p(x) = f(x) + β·s_id(x) + γ`, `q(x) = g(x) + β·s_σ(x) + γ`,
