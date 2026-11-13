@@ -5,6 +5,8 @@
 //! from the PCS parameters / Ligerito config down to the two primitives
 //! ([`hash_leaf`] and [`hash_pair`]). Everything else in this module — tree
 //! layout, path extraction, multi-proof assembly and verification — is
+//! Because only the two leaf/pair primitives see the hash kind, swapping
+//! hashes never changes tree shapes, path lengths or proof layouts.
 //! hash-agnostic: both hashes produce 32-byte digests, so the proof format is
 //! identical either way and only the digest *values* differ.
 //!

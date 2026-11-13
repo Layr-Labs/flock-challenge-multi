@@ -3,6 +3,8 @@
 //! Reduces three MLE evaluation claims (`â(x)=v`, `b̂(x')=v'`, `ĉ(x'')=v''`)
 //! plus the linear constraints (`a = Az`, `b = Bz`, `c = Cz`) to three MLE
 //! evaluation claims on `z`, all sharing a fresh random inner coord.
+//! The three reduced claims live on `z` itself, so the lincheck output
+//! closes the protocol without touching the witness commitment again.
 //!
 //! ## Matrix structure (the assumption we exploit)
 //!
