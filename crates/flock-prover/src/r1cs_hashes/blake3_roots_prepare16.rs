@@ -1,4 +1,6 @@
 //! Exact paired input generation without intermediate eight-lane structures.
+//! Prepared16 is consumed in register form, so nothing here allocates or
+//! spills through the wider intermediate shape.
 use super::*;
 
 #[inline(always)]

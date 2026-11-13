@@ -1,5 +1,7 @@
 //! Direct, challenge-independent root stripes from the live octa word ring.
 //! Store selected words unchanged; the shared cache reader transposes on load.
+//! Because the stripes carry raw ring words, every consumer sees the same
+//! bytes the producer held, independent of any later challenge draw.
 use super::*;
 
 #[derive(Clone, Copy)]
