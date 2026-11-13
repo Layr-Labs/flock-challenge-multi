@@ -3,6 +3,13 @@
 //! Inputs are three bit vectors of length 2^m. Output is an evaluation claim
 //! on the multilinear extensions â, b̂, ĉ at the protocol-derived point.
 //!
+//! Determinism note: every challenge in this protocol (the zerocheck
+//! challenge, the univariate-skip fold point, and each round's ρ) is drawn
+//! from the Fiat-Shamir transcript bound to the statement — a pure function
+//! of the prover's own messages — so the prove path emits the same proof
+//! bytes under any thread count, scheduler, or runner state, and the
+//! verifier replaying the transcript derives the identical challenges.
+//!
 //! Protocol shape (m = log_n, k_skip = [`K_SKIP`] = 6):
 //!   1. Verifier samples `r ∈ F_{2^128}^m` (the zerocheck challenge).
 //!   2. Prover sends `P^{AB}(λ)` and `P^C(λ)` for λ ∈ Λ, |Λ| = 2^k_skip.
