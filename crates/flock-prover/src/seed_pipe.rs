@@ -20,6 +20,14 @@
 //! Amdahl's law makes every serial millisecond in the timed window worth far
 //! more on the runner than the local gate reports.
 //!
+//! Determinism and safety note: the pipeline is a pure function of the trial
+//! seed and the process-local setup. The seed is read only after the harness
+//! starts its timer; every input generation, witness, commitment, proof,
+//! serialization and publication step happens after that read; and the
+//! speculative run uses the same Fiat-Shamir domain and hash as the worker,
+//! so the emitted proof bytes are exactly the ones the in-process call would
+//! produce and the trusted verifier accepts them unchanged.
+//!
 //! # Mechanism
 //!
 //! The generator is counter-based: its state advances by a fixed constant per
