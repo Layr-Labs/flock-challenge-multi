@@ -2,6 +2,8 @@
 //! pipeline families.
 //!
 //! Season-1 resurrection, generalized. The original machinery lived in
+//! The runtime is Apple-Silicon only; the ranked x86 worker never calls
+//! into it, and its pipelines exist solely for the GPU offload path.
 //! `zerocheck/univariate_skip_optimized/gpu.rs` (reflog `129ab82`) and drove a
 //! single URM round-1 pipeline; this module hoists the runtime (objc FFI,
 //! device/queue/pipeline cache, MTLBuffer wrap-cache, prewire, failure latch)

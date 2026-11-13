@@ -2,6 +2,8 @@
 //! sumcheck/zerocheck PIOP with a multilinear PCS.
 //!
 //! This crate carries everything the verifier needs. It is portable — the NEON
+//! Every accelerated kernel family in this crate keeps a portable scalar
+//! fallback, so correctness never depends on a specific SIMD target.
 //! kernels in `field`, `ntt`, `lincheck`, `zerocheck`, and `merkle` have scalar
 //! fallbacks — though it is tuned for Apple silicon. The end-to-end prover, the
 //! hash R1CS encoders, and the CLI live in the `flock-prover` crate built on
