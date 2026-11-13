@@ -432,6 +432,13 @@ impl RootTileCache {
                 .filter(|n| (1..=4).contains(n)).unwrap_or(3)
         });
         let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
+        static TAIL1: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+            if std::env::var_os("FLOCK_NO_SL1_FOLD_TAIL1").is_some() {
+                return None;
+            }
+            Some(std::env::var("FLOCK_SL1_TAIL1_MULT").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+        });
+        let tail1 = TAIL1.map_or(0, |m| m * word_batch * rayon::current_num_threads().max(1));
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
@@ -483,11 +490,24 @@ impl RootTileCache {
                         if !dynamic {
                             break;
                         }
-                        lo = next.fetch_add(word_batch, std::sync::atomic::Ordering::Relaxed);
+                        // Lane sl1 (`FLOCK_NO_SL1_FOLD_TAIL1`): single-tile
+                        // claims once fewer than `tail1` tiles are left, so the
+                        // workers' last claims end closer together (the plane
+                        // reduce waits for the last one). XOR-accumulated
+                        // planes: any tile-to-worker split gives the same sum.
+                        let take = if tail1 != 0
+                            && self.tiles.saturating_sub(next.load(std::sync::atomic::Ordering::Relaxed)) <= tail1
+                        {
+                            1
+                        } else {
+                            word_batch
+                        };
+                        lo = next.fetch_add(take, std::sync::atomic::Ordering::Relaxed);
                         if lo >= self.tiles {
                             break;
                         }
-                        hi = (lo + word_batch).min(self.tiles);
+                        super::sl1_rc_warm_step(self.tiles - lo);
+                        hi = (lo + take).min(self.tiles);
                     }
                     if BATCH_WORD_TILES {
                         let tile = lo;

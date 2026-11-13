@@ -350,7 +350,8 @@ fn finalize_cpu_commit(
     params: &PcsParams,
     encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
 ) -> (Commitment, ProverData) {
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    crate::rstrace::ev("fc:in", 0);
+    let timing = crate::sl2_env_set!("FLOCK_COMMIT_TIMING");
     let merkle_cut_depth = ranked_l0_merkle_cut_depth(params);
     // ---- Merkle rewrite 1: stream leaf hashes into the same 2n−1 tree as
     // each NTT deep-pass sub-group retires (regular stores, same worker).
@@ -398,6 +399,20 @@ fn finalize_cpu_commit(
             Vec::new()
         };
 
+    // Lane sl2 (`FLOCK_NO_SL2_SUPER`): after the subgroup folds, the worker
+    // that retires the last of SL2_SUPER adjacent subgroups also folds their
+    // roots up four more levels, so the serial post-join build starts from
+    // 32 nodes instead of 512. Same pair hashes, same tree slots.
+    const SL2_SUPER: usize = 16;
+    let sl2_super = sl2_super_enabled() && !sub_blocks_done.is_empty()
+        && sub_blocks_done.len().is_multiple_of(SL2_SUPER);
+    let super_done: Vec<std::sync::atomic::AtomicU32> = if sl2_super {
+        (0..sub_blocks_done.len() / SL2_SUPER).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()
+    } else {
+        Vec::new()
+    };
+    let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
+    crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
     encode(
         &mut codeword,
@@ -529,6 +544,40 @@ fn finalize_cpu_commit(
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
             }
+            if !super_done.is_empty() {
+                if len != RANKED_PARENT_SUBGROUP_LEAVES >> merkle_cut_depth
+                    || !parent_range.start.is_multiple_of(len)
+                {
+                    super_ok.store(false, Ordering::Release);
+                    return;
+                }
+                let sg = parent_range.start / len;
+                let sup = sg / SL2_SUPER;
+                if super_done[sup].fetch_add(1, Ordering::AcqRel) + 1 != SL2_SUPER as u32 {
+                    return;
+                }
+                // Every subgroup root of this supergroup is published (AcqRel
+                // chain); fold them four levels on this worker.
+                let mut node_lo = sup * SL2_SUPER; // index at level `depth`
+                let mut n = SL2_SUPER;
+                let mut j = depth;
+                while n > 1 {
+                    let nodes_j = stored_leaves >> j;
+                    let base_j = 2 * stored_leaves - 2 * nodes_j;
+                    let nodes_k = stored_leaves >> (j + 1);
+                    let base_k = 2 * stored_leaves - 2 * nodes_k;
+                    let (read, write) = unsafe {
+                        (
+                            core::slice::from_raw_parts((tree_addr as *const Hash).add(base_j + node_lo), n),
+                            core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(base_k + node_lo / 2), n / 2),
+                        )
+                    };
+                    merkle::hash_pairs_level_serial(read, write, kind);
+                    node_lo /= 2;
+                    n /= 2;
+                    j += 1;
+                }
+            }
         },
     );
     if timing {
@@ -542,6 +591,15 @@ fn finalize_cpu_commit(
     let folded = match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,
         d => d,
+    };
+    // All supergroups completed and every subgroup had the expected shape.
+    let folded = if folded != 0
+        && super_ok.load(Ordering::Acquire)
+        && super_done.iter().all(|c| c.load(Ordering::Acquire) == SL2_SUPER as u32)
+    {
+        folded + SL2_SUPER.trailing_zeros() as usize
+    } else {
+        folded
     };
     build_upper_levels(
         &mut merkle_tree,
@@ -576,7 +634,7 @@ fn finalize_cpu_commit(
 /// opening. `FLOCK_NO_MERKLE_CUT` restores the ordinary full tree.
 fn ranked_l0_merkle_cut_depth(params: &PcsParams) -> usize {
     if cfg!(target_arch = "x86_64")
-        && std::env::var_os("FLOCK_NO_MERKLE_CUT").is_none()
+        && !crate::sl2_env_set!("FLOCK_NO_MERKLE_CUT")
         && params.m == 32
         && params.log_inv_rate == 1
         && params.log_batch_size == 6
@@ -885,6 +943,12 @@ fn cpu_join_hash_leaves(
 pub(crate) fn subtree_parents_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_none());
+    *ON
+}
+
+fn sl2_super_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_SUPER").is_none());
     *ON
 }
 
