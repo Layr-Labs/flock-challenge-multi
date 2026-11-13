@@ -1,4 +1,6 @@
 //! Direct16-lane full witness qword stages, local to PCS consumers.
+//! Stage state lives entirely in this module, so the consumers only see
+//! finished qwords and never intermediate half-folds.
 use super::*;
 struct StageW16 {
     pending: V16,

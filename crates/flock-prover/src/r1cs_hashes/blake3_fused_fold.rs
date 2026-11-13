@@ -1,4 +1,6 @@
 //! Direct BLAKE3 witness generation and challenge-dependent PCS field fold.
+//! Fusing the two halves of the work keeps fold weights hot in L1 while
+//! witness qwords are still live in registers.
 use super::*;
 #[repr(C, align(64))]
 struct FoldWeights {
