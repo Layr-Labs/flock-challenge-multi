@@ -513,6 +513,13 @@ fn fast_pcs_open_encode_enabled() -> bool {
 /// Destination of the flat encoder.
 pub(crate) trait ByteSink {
     fn put(&mut self, bytes: &[u8]);
+
+    /// Advance over an encoding span when no bytes in it are needed.
+    /// Returning false leaves the position unchanged and requires normal encoding.
+    #[inline]
+    fn skip(&mut self, _len: usize) -> bool {
+        false
+    }
 }
 
 impl ByteSink for Vec<u8> {
@@ -529,6 +536,12 @@ impl ByteSink for CountSink {
     #[inline]
     fn put(&mut self, bytes: &[u8]) {
         self.0 += bytes.len();
+    }
+
+    #[inline]
+    fn skip(&mut self, len: usize) -> bool {
+        self.0 += len;
+        true
     }
 }
 
@@ -561,6 +574,17 @@ struct WindowSink {
 }
 
 impl ByteSink for WindowSink {
+    #[inline]
+    fn skip(&mut self, len: usize) -> bool {
+        let end = self.pos + len;
+        if end <= self.lo || self.pos >= self.hi {
+            self.pos = end;
+            true
+        } else {
+            false
+        }
+    }
+
     #[inline]
     fn put(&mut self, bytes: &[u8]) {
         let start = self.pos;
@@ -790,12 +814,7 @@ fn encode_pcs_open_flat<S: ByteSink>(out: &mut S, p: &BatchOpeningProofLigerito)
     put_f128_vec(out, yr);
     put_rows(out, opened_rows);
     put_hash_vec(out, merkle_proof);
-    put_u64(out, sumcheck_transcript.len() as u64);
-    for m in sumcheck_transcript {
-        let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
-    }
+    put_sumcheck_vec(out, sumcheck_transcript);
     put_u64_vec(out, grinding_nonces);
     put_f128_vec(out, ood_values);
     put_u64_vec(out, fold_grinding_nonces);
@@ -839,18 +858,71 @@ fn put_hash_vec<S: ByteSink>(out: &mut S, v: &[MerkleHash]) {
     out.put(v.as_flattened());
 }
 
+fn flat_tail_bulk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(target_endian = "little")
+        && *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_TAIL_BULK").map_or(true, |v| v != "1"))
+}
+
+// Portable tail-bulk mechanism from the Mac sibling's
+// a0163b69-ae21-479f-8e0a-0a892b12c6cd, adapted to the x86 ByteSink interface.
+#[inline]
+fn put_sumcheck_vec<S: ByteSink>(out: &mut S, v: &[SumcheckMessage]) {
+    put_u64(out, v.len() as u64);
+    // Serialized field sizes, not Rust struct layout: no repr(C) dependency.
+    if out.skip(v.len() * 32) {
+        return;
+    }
+    if flat_tail_bulk_enabled() {
+        const {
+            assert!(std::mem::size_of::<SumcheckMessage>() == 32);
+            assert!(std::mem::size_of::<F128>() == 16);
+            assert!(std::mem::offset_of!(F128, lo) == 0);
+            assert!(std::mem::offset_of!(F128, hi) == 8);
+            assert!(std::mem::offset_of!(SumcheckMessage, u_0) == 0);
+            assert!(std::mem::offset_of!(SumcheckMessage, u_2) == 16);
+        }
+        // SAFETY: repr(C) fixes both field orders, the assertions exclude
+        // padding, and the gate requires little-endian memory. The borrowed
+        // slice outlives every synchronous sink operation and encoding plan.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.put(bytes);
+    } else {
+        for m in v {
+            let SumcheckMessage { u_0, u_2 } = m;
+            put_f128(out, *u_0);
+            put_f128(out, *u_2);
+        }
+    }
+}
+
 #[inline]
 fn put_u64_vec<S: ByteSink>(out: &mut S, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
+    if out.skip(std::mem::size_of_val(v)) {
+        return;
+    }
+    if flat_tail_bulk_enabled() {
+        // SAFETY: u64 slices have no padding; the gate requires little endian.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.put(bytes);
+    } else {
+        for &x in v {
+            put_u64(out, x);
+        }
     }
 }
 
 fn put_rows<S: ByteSink>(out: &mut S, rows: &[Vec<F128>]) {
     put_u64(out, rows.len() as u64);
     for row in rows {
-        put_f128_vec(out, row);
+        if !out.skip(8 + std::mem::size_of_val(row.as_slice())) {
+            put_f128_vec(out, row);
+        }
     }
 }
 

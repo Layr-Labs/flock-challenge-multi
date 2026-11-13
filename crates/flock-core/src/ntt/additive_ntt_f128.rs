@@ -5108,52 +5108,15 @@ impl AdditiveNttF128 {
                         );
                     }
                 } else {
-                    // Carry the base address as an integer because raw
-                    // pointers are not Sync; every task owns four rows no
-                    // other task touches.
-                    let base_addr = data.as_mut_ptr() as usize;
-                    let log_quarter = log2_pow2(quarter);
-                    let stride = quarter * num_ntts;
-                    (0..num_blocks << log_quarter)
-                        .into_par_iter()
-                        .for_each(|idx| {
-                            let block = idx >> log_quarter;
-                            let r = idx & (quarter - 1);
-                            let t_outer = self.twiddle(layer, block);
-                            let t_inner_a = self.twiddle(layer + 1, 2 * block);
-                            let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
-                            let row = block * block_bytes + r * num_ntts;
-                            // SAFETY: rows `row + {0,1,2,3}·stride` lie inside
-                            // block `block` of `data` and are selected by a
-                            // unique (block, r) per task, so the four mutable
-                            // slices are disjoint across all tasks.
-                            let lanes = row_lanes(
-                                r,
-                                num_ntts,
-                                if quarter.is_multiple_of(2) {
-                                    odd_tail
-                                } else {
-                                    0
-                                },
-                            );
-                            unsafe {
-                                let base = base_addr as *mut F128;
-                                let a = std::slice::from_raw_parts_mut(base.add(row), lanes);
-                                let b =
-                                    std::slice::from_raw_parts_mut(base.add(row + stride), lanes);
-                                let c = std::slice::from_raw_parts_mut(
-                                    base.add(row + 2 * stride),
-                                    lanes,
-                                );
-                                let d = std::slice::from_raw_parts_mut(
-                                    base.add(row + 3 * stride),
-                                    lanes,
-                                );
-                                kernels::butterfly_fused_2layer(
-                                    a, b, c, d, t_outer, t_inner_a, t_inner_b,
-                                );
-                            }
-                        });
+                    butterfly_interleaved_fused_2layer_flat_rows(
+                        data, quarter, num_ntts, odd_tail, |block| {
+                            [
+                                self.twiddle(layer, block),
+                                self.twiddle(layer + 1, 2 * block),
+                                self.twiddle(layer + 1, 2 * block + 1),
+                            ]
+                        },
+                    );
                 }
                 layer += 2;
             } else {
@@ -5999,6 +5962,57 @@ fn butterfly_interleaved_block_par_rows(
         });
 }
 
+fn macport_ntt_rows_per_task(odd_tail: usize) -> usize {
+    static BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MACPORT_NTT_ROW_BATCH").is_none()
+    });
+    if odd_tail == 0 && *BATCH { 8 } else { 1 }
+}
+
+/// One parallel region over all (block, row-batch) tasks. Keep the x86
+/// flattened-pass schedule; port only Mac b3495082's eight-row granularity.
+fn butterfly_interleaved_fused_2layer_flat_rows(
+    data: &mut [F128],
+    quarter: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: impl Fn(usize) -> [F128; 3] + Sync,
+) {
+    use rayon::prelude::*;
+    assert!(quarter >= 256 && quarter.is_power_of_two());
+    assert!(num_ntts > 0 && odd_tail <= num_ntts);
+    let stride = quarter * num_ntts;
+    let block_bytes = 4 * stride;
+    assert!(data.len().is_multiple_of(block_bytes));
+    let num_blocks = data.len() / block_bytes;
+    let rows_per_task = macport_ntt_rows_per_task(odd_tail);
+    let tasks_per_block = quarter / rows_per_task;
+    let log_tasks = tasks_per_block.trailing_zeros() as usize;
+    let base_addr = data.as_mut_ptr() as usize;
+    (0..num_blocks * tasks_per_block).into_par_iter().for_each(|idx| {
+        let block = idx >> log_tasks;
+        let r = (idx & (tasks_per_block - 1)) * rows_per_task;
+        let [t_outer, t_inner_a, t_inner_b] = twiddles(block);
+        let row = block * block_bytes + r * num_ntts;
+        let lanes = if odd_tail == 0 {
+            rows_per_task * num_ntts
+        } else {
+            row_lanes(r, num_ntts, odd_tail)
+        };
+        // SAFETY: quarter is a power of two >=256, so each 1/8-row task
+        // fits within its quarter. Distinct (block, r) tasks own disjoint
+        // spans in all four quarters. Masks use one-row tasks exclusively.
+        unsafe {
+            let base = base_addr as *mut F128;
+            let a = std::slice::from_raw_parts_mut(base.add(row), lanes);
+            let b = std::slice::from_raw_parts_mut(base.add(row + stride), lanes);
+            let c = std::slice::from_raw_parts_mut(base.add(row + 2 * stride), lanes);
+            let d = std::slice::from_raw_parts_mut(base.add(row + 3 * stride), lanes);
+            kernels::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        }
+    });
+}
+
 /// Fused 2-layer butterfly: combines layer L (twiddle `t_outer`, shared by
 /// the whole outer block) with layer L+1 (twiddles `t_inner_a` for the top
 /// half, `t_inner_b` for the bottom half). Reads each row of the outer
@@ -6059,13 +6073,22 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             do_one(row_lanes(r, num_ntts, odd_tail), q1r, q2r, q3r, q4r);
         }
     } else {
-        q1.par_chunks_mut(num_ntts)
-            .zip(q2.par_chunks_mut(num_ntts))
-            .zip(q3.par_chunks_mut(num_ntts))
-            .zip(q4.par_chunks_mut(num_ntts))
+        // Mac b3495082 batches eight quarter-rows with identical twiddles.
+        // Only flatten unmasked rows: odd_tail requires per-row lane bounds.
+        let rows_per_task = macport_ntt_rows_per_task(odd_tail);
+        let chunk = rows_per_task * num_ntts;
+        q1.par_chunks_mut(chunk)
+            .zip(q2.par_chunks_mut(chunk))
+            .zip(q3.par_chunks_mut(chunk))
+            .zip(q4.par_chunks_mut(chunk))
             .enumerate()
             .for_each(|(r, (((row_a, row_b), row_c), row_d))| {
-                do_one(row_lanes(r, num_ntts, odd_tail), row_a, row_b, row_c, row_d);
+                let lanes = if odd_tail == 0 {
+                    row_a.len()
+                } else {
+                    row_lanes(r, num_ntts, odd_tail)
+                };
+                do_one(lanes, row_a, row_b, row_c, row_d);
             });
     }
 }
@@ -6430,6 +6453,103 @@ fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macport_row_batch_matches_scalar_layers() {
+        for quarter in [2usize, 254, 256, 258, 264, 512] {
+            for num_ntts in [1usize, 3, 8, 32, 64] {
+                let mut tails = vec![0, 1, num_ntts];
+                tails.sort_unstable();
+                tails.dedup();
+                for odd_tail in tails {
+                    for twiddle_shape in 0..4 {
+                        let t_outer = F128::new(7, if twiddle_shape & 1 == 0 { 0 } else { 19 });
+                        let t_a = F128::new(11, if twiddle_shape & 2 == 0 { 0 } else { 23 });
+                        let t_b = F128::new(13, if twiddle_shape & 2 == 0 { 0 } else { 29 });
+                        let stride = quarter * num_ntts;
+                        let mut seed = 0x53b0_0123_4567_89abu64;
+                        let input: Vec<F128> = (0..4 * stride).map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            F128::new(seed, seed.rotate_left(31) ^ u64::MAX)
+                        }).collect();
+                        let mut want = input.clone();
+                        // Independent two-layer reference; skipped lanes retain
+                        // nonzero sentinels, exposing accidental flattened masks.
+                        for r in 0..quarter {
+                            let lanes = if r % 2 == 1 { num_ntts - odd_tail } else { num_ntts };
+                            for lane in 0..lanes {
+                                let a = r * num_ntts + lane;
+                                let b = a + stride;
+                                let c = b + stride;
+                                let d = c + stride;
+                                for (u, v, t) in [(a, c, t_outer), (b, d, t_outer), (a, b, t_a), (c, d, t_b)] {
+                                    let old_v = want[v];
+                                    want[u] += old_v * t;
+                                    want[v] = old_v + want[u];
+                                }
+                            }
+                        }
+                        let mut got = input;
+                        butterfly_interleaved_fused_2layer_par_rows(
+                            &mut got, t_outer, t_a, t_b, quarter, num_ntts, odd_tail,
+                        );
+                        assert_eq!(got, want, "quarter={quarter} lanes={num_ntts} tail={odd_tail} twiddles={twiddle_shape}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macport_flat_row_batch_matches_scalar_layers() {
+        for quarter in [256usize, 512] {
+            for num_ntts in [3usize, 64] {
+                for odd_tail in [0, 1, num_ntts] {
+                    for shape in 0..4 {
+                        let twiddles = |block: usize| {
+                            let high = if shape & 1 == 0 { 0 } else { 37 + block as u64 };
+                            let inner_high = if shape & 2 == 0 { 0 } else { 41 + block as u64 };
+                            [F128::new(7 + block as u64, high),
+                             F128::new(11 + block as u64, inner_high),
+                             F128::new(13 + block as u64, inner_high)]
+                        };
+                        let stride = quarter * num_ntts;
+                        let mut seed = 0x53c0_0123_4567_89abu64;
+                        let mut got: Vec<F128> = (0..3 * 4 * stride).map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            F128::new(seed, !seed.rotate_left(17))
+                        }).collect();
+                        let mut want = got.clone();
+                        for block in 0..3 {
+                            let [outer, inner_a, inner_b] = twiddles(block);
+                            for r in 0..quarter {
+                                let lanes = if r % 2 == 1 { num_ntts - odd_tail } else { num_ntts };
+                                for lane in 0..lanes {
+                                    let a = block * 4 * stride + r * num_ntts + lane;
+                                    let b = a + stride;
+                                    let c = b + stride;
+                                    let d = c + stride;
+                                    for (u, v, t) in [(a, c, outer), (b, d, outer), (a, b, inner_a), (c, d, inner_b)] {
+                                        let old_v = want[v];
+                                        want[u] += old_v * t;
+                                        want[v] = old_v + want[u];
+                                    }
+                                }
+                            }
+                        }
+                        butterfly_interleaved_fused_2layer_flat_rows(
+                            &mut got, quarter, num_ntts, odd_tail, twiddles,
+                        );
+                        assert_eq!(got, want, "flat quarter={quarter} lanes={num_ntts} tail={odd_tail} shape={shape}");
+                    }
+                }
+            }
+        }
+    }
 
     /// The shaped row kernels are the generic kernels with the shape
     /// constants substituted for equal runtime values — bit-identical by

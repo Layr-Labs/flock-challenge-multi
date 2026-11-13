@@ -1940,10 +1940,32 @@ pub enum VerifyError {
 /// Build the eq-MLE table at `point ∈ F^d`. Returns a length-`2^d` vector
 /// where `output[i] = Π_j (1 + point[j] + bit_j(i)) = Π_j eq(point[j], bit_j(i))`.
 ///
-/// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
-/// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
+/// Small tables use doubling-in-half; large tables use a parallel tensor
+/// product of two small tables. Indexing is LSB-first — `bit_j(i)` is the
+/// `j`-th LSB of `i`. No inversions are needed in either construction.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     let d = point.len();
+    // Portable tensor split from Mac bd9c4133, concurrent halves from fba014ca.
+    // Keep the x86 scale-slice kernel rather than importing a PMULL leaf.
+    // This is an unmeasured x86 candidate; the switch restores the old ladder.
+    static TENSOR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_MACPORT_EQ_TENSOR").is_none()
+    });
+    if d >= 14 && *TENSOR {
+        use rayon::prelude::*;
+        let a = d / 2;
+        let (lo, hi) = rayon::join(
+            || build_eq_table(&point[..a]),
+            || build_eq_table(&point[a..]),
+        );
+        let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
+        out.par_chunks_mut(lo.len())
+            .zip(hi.par_iter())
+            .for_each(|(chunk, &scale)| {
+                crate::field::f128_slice::scale_slice(chunk, &lo, scale);
+            });
+        return out;
+    }
     let mut out = crate::alloc_uninit_vec::<F128>(1usize << d);
     out[0] = F128::ONE;
     for (j, &r_j) in point.iter().enumerate() {
@@ -6109,6 +6131,49 @@ mod tests {
                     expected *= factor;
                 }
                 assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
+            }
+        }
+    }
+
+    /// Tensor split, including its threshold and odd-dimensional split, agrees
+    /// with an independent scalar doubling ladder on every output entry.
+    #[test]
+    fn macport_eq_tensor_matches_ladder() {
+        for d in [0usize, 1, 7, 13, 14, 15, 16, 18] {
+            for shape in 0..4 {
+                let mut seed = 0x53a0_0123_4567_89abu64;
+                let point: Vec<F128> = (0..d)
+                    .map(|i| match shape {
+                        0 => F128::ZERO,
+                        1 => F128::ONE,
+                        2 => if i % 2 == 0 { F128::ZERO } else { F128::ONE },
+                        _ => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            F128::new(seed, seed.rotate_left(29) ^ u64::MAX)
+                        }
+                    })
+                    .collect();
+                let mut want = vec![F128::ONE];
+                for &r in &point {
+                    let n = want.len();
+                    want.resize(2 * n, F128::ZERO);
+                    for i in 0..n {
+                        let high = want[i] * r;
+                        want[i + n] = high;
+                        want[i] += high;
+                    }
+                }
+                let got = build_eq_table(&point);
+                assert_eq!(got, want, "d={d} shape={shape}");
+                // Direct product checks independently pin the LSB-first order.
+                for i in [0, got.len() / 3, got.len() - 1] {
+                    let direct = point.iter().enumerate().fold(F128::ONE, |v, (j, &r)| {
+                        v * if (i >> j) & 1 == 0 { F128::ONE + r } else { r }
+                    });
+                    assert_eq!(got[i], direct, "direct d={d} shape={shape} i={i}");
+                }
             }
         }
     }
