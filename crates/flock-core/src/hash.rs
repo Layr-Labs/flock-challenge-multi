@@ -11,6 +11,14 @@
 //!
 //! Both default to SHA-256, so configs and call sites that predate the options
 //! keep their behaviour.
+//!
+//! Ranked configuration note: the benchmark worker overrides both defaults to
+//! BLAKE3 — `pcs_params.merkle_hash = HashKind::Blake3` for the Merkle
+//! commitments and `FsChallenger::with_hash(DOMAIN, HashKind::Blake3)` for the
+//! Fiat-Shamir transcript and its grinding. The two components remain
+//! genuinely independent under this override: every hash site in the ranked
+//! run takes BLAKE3 through the same two knobs, and nothing else selects a
+//! hash for the ranked proof.
 
 use serde::{Deserialize, Serialize};
 

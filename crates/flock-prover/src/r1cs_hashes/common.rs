@@ -362,7 +362,7 @@ where
     // switch; the ranked worker's cleared environment never sets it.
     let use_nt = cfg!(target_arch = "aarch64")
         && u64_per_block_is_nt_compatible(f128_per_block * 2)
-        && !flock_core::sl2_env_set!("FLOCK_NO_WITNESS_NT");
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))

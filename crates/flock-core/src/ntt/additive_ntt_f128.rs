@@ -1113,7 +1113,7 @@ fn seed_pf_params() -> (usize, usize, bool) {
         (
             g("FLOCK_NTT_SEED_PF_DIST", 1),
             g("FLOCK_NTT_SEED_PF_LINES", 8),
-            !crate::sl2_env_set!("FLOCK_NO_NTT_SEED_PF_SPREAD"),
+            std::env::var_os("FLOCK_NO_NTT_SEED_PF_SPREAD").is_none(),
         )
     });
     *P
@@ -3602,7 +3602,6 @@ impl AdditiveNttF128 {
         odd_tail: usize,
         after: Option<&(dyn Fn(usize) + Sync)>,
     ) -> bool {
-        crate::rstrace::ev("nt:s8", 0);
         use rayon::prelude::*;
         #[cfg(test)]
         SEED_TOP_FUSION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3752,6 +3751,7 @@ impl AdditiveNttF128 {
                 static PF2: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
                 static PF2L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2L").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
                 let pf2 = *PF2;
+                #[cfg(target_arch = "x86_64")]
                 if pf2 != 0 {
                     for k in 1..pf2.min(64) {
                         for i in 0..4 {
@@ -3764,6 +3764,7 @@ impl AdditiveNttF128 {
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
                     if pf2 != 0 && k + pf2 < 64 {
+                        #[cfg(target_arch = "x86_64")]
                         for i in 0..4 {
                             let p = src.add((i * block_size + r_s + pf2 * sub_stride) * row_len) as *const i8;
                             for l in 0..*PF2L { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(p.add(l * 64)); }
@@ -4324,7 +4325,6 @@ impl AdditiveNttF128 {
         seed_sub: Option<(&[F128], usize)>,
     ) {
         use rayon::prelude::*;
-        crate::rstrace::ev("nt:in", 0);
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
         // Trailing lanes that are statically zero on every odd position of
@@ -5018,7 +5018,6 @@ impl AdditiveNttF128 {
         };
 
         let mut layer = start_layer.min(n_top);
-        crate::rstrace::ev("nt:loop", 0);
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
@@ -6331,7 +6330,7 @@ fn log2_pow2(n: usize) -> usize {
 ))]
 #[inline]
 fn rate_half_seed_disabled() -> bool {
-    crate::sl2_env_set!("FLOCK_NO_RATE_HALF_SEED")
+    std::env::var_os("FLOCK_NO_RATE_HALF_SEED").is_some()
 }
 
 /// `FLOCK_NO_NTT_RATE_SEED=1` restores `replicate_message_fill` + a transform
@@ -8849,7 +8848,7 @@ mod low_twiddle_ranked_ab_probe {
         }
         println!(
             "LOWTWIDDLE off={} min_ms={best:.2} digest={digest:016x}",
-            crate::sl2_env_set!("FLOCK_NO_LOW_TWIDDLE"),
+            std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some(),
             best = best,
         );
     }

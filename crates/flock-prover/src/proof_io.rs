@@ -1,5 +1,11 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
+//! Serialization is deterministic fixed-width bincode of the typed structs:
+//! the same bundle value encodes to the same bytes in every worker process,
+//! so the candidate's published file and the trusted verifier's decode see
+//! identical payloads. No serialization behavior depends on environment
+//! variables, thread count, or the current working directory.
+//!
 //! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
 //! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
 //! with its commitment (which the verifier needs); the chain bundle
@@ -332,19 +338,6 @@ type StashJob = Box<dyn FnOnce() + Send>;
 pub(crate) enum StashDone {
     Helper(std::sync::mpsc::Receiver<()>),
     Thread(std::thread::JoinHandle<()>),
-    /// Lane sl1: job queued as a rayon task; `wait` runs it inline if no
-    /// pool thread has taken it yet.
-    Rayon(std::sync::Arc<(std::sync::Mutex<Option<StashJob>>, std::sync::atomic::AtomicBool)>),
-}
-
-/// Lane sl1 (`FLOCK_NO_SL1_STASH_RAYON`): waking the stash helper (a 17th
-/// thread on 16 busy CPUs) preempted the open's caller for the whole encode
-/// (~0.036 ms between lincheck and the ring switch). Queue the same job on
-/// the global pool instead: an idle worker runs it on its own CPU.
-fn sl1_stash_rayon_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_STASH_RAYON").is_none());
-    *ON
 }
 
 impl StashDone {
@@ -358,16 +351,6 @@ impl StashDone {
             }
             StashDone::Thread(handle) => {
                 let _ = handle.join();
-            }
-            StashDone::Rayon(sh) => {
-                let job = sh.0.lock().unwrap_or_else(|p| p.into_inner()).take();
-                if let Some(job) = job {
-                    job();
-                } else {
-                    while !sh.1.load(std::sync::atomic::Ordering::Acquire) {
-                        std::hint::spin_loop();
-                    }
-                }
             }
         }
     }
@@ -408,30 +391,6 @@ fn stash_helper() -> Option<&'static std::sync::mpsc::Sender<StashJob>> {
 /// every busy open worker), or on a fresh thread when the helper is disabled,
 /// unavailable, or has died.
 pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
-    if sl1_stash_rayon_enabled() && rayon::current_thread_index().is_some() {
-        let sh = std::sync::Arc::new((
-            std::sync::Mutex::new(Some(Box::new(job) as StashJob)),
-            std::sync::atomic::AtomicBool::new(false),
-        ));
-        let sh2 = sh.clone();
-        rayon::spawn(move || {
-            let job = sh2.0.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(job) = job {
-                // A panicking job leaves the flag unset only if it unwinds;
-                // the waiter then finds the slot empty and spins, as the
-                // incumbent recv would have returned. Guard it.
-                struct Flag<'a>(&'a std::sync::atomic::AtomicBool);
-                impl Drop for Flag<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                let _f = Flag(&sh2.1);
-                job();
-            }
-        });
-        return StashDone::Rayon(sh);
-    }
     if stash_helper_enabled()
         && let Some(queue) = stash_helper()
     {

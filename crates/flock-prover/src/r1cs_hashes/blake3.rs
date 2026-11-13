@@ -1076,7 +1076,7 @@ static BLAKE3_ADJOINT_PLAN: std::sync::LazyLock<Blake3AdjointPlan> =
 
 fn linear_fold_enabled() -> bool {
     cfg!(all(target_arch = "x86_64", target_feature = "bmi2"))
-        && !flock_core::sl2_env_set!("FLOCK_NO_LINEAR_FOLD")
+        && std::env::var_os("FLOCK_NO_LINEAR_FOLD").is_none()
 }
 
 /// `FLOCK_NO_LC_ADJOINT=1` restores the materialized CSC gather (exact A/B
@@ -2326,7 +2326,7 @@ fn generate_witness_with_optional_commit_from(
     // the default. NT stays aarch64-only; do not combine with the AVX2 dump.
     let use_nt = cfg!(target_arch = "aarch64")
         && super::common::u64_per_block_is_nt_compatible(K / 64)
-        && !flock_core::sl2_env_set!("FLOCK_NO_WITNESS_NT");
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
     generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
         blocks, n_blocks_log, use_nt, live_witgen_simd_enabled(),
         witgen_simd::witgen_ab_nt_enabled(), commit_ctx,
@@ -2827,44 +2827,11 @@ enum RankedClosedDispatch {
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-struct SharedRankedClosedWindowPreps(&'static blake3_witgen8::RankedClosedWindowPreps, Option<Box<blake3_witgen8::RankedClosedWindowPreps>>);
+struct SharedRankedClosedWindowPreps(blake3_witgen8::RankedClosedWindowPreps);
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl SharedRankedClosedWindowPreps {
-    fn get(&self) -> &blake3_witgen8::RankedClosedWindowPreps {
-        match &self.1 { Some(b) => b, None => self.0 }
-    }
-
-    /// Lane sl2 (`FLOCK_NO_SL2_PREPS`): the preps are a pure function of the
-    /// (process-static, shared) inverse table and the plan, whose only
-    /// buffer-dependent input is the NT alignment class of `ab_inner`. The
-    /// warm-up proves leave the value cached for the timed prove.
-    fn new(
-        inv_table: &flock_core::ntt::InvNttTableByteSingleGf8,
-        plan: flock_core::zerocheck::univariate_skip_optimized::Round1AbWindowPlan,
-        align_class: (bool, usize),
-    ) -> Self {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_PREPS").is_none());
-        static CACHE: std::sync::Mutex<Vec<(usize, bool, usize, usize)>> = std::sync::Mutex::new(Vec::new());
-        let shared = core::ptr::eq(inv_table, flock_core::zerocheck::shared_urm_inv_table());
-        if !*ON || !shared {
-            let b = Box::new(blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, plan));
-            // SAFETY: the 'static slot is never read when the owned box is set.
-            let r: &'static blake3_witgen8::RankedClosedWindowPreps = unsafe { &*(&*b as *const _) };
-            return Self(r, Some(b));
-        }
-        let key = (inv_table as *const _ as usize, align_class.0, align_class.1);
-        let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(_, _, _, addr)) = c.iter().find(|e| (e.0, e.1, e.2) == key) {
-            // SAFETY: leaked below, never freed.
-            return Self(unsafe { &*(addr as *const blake3_witgen8::RankedClosedWindowPreps) }, None);
-        }
-        let r: &'static blake3_witgen8::RankedClosedWindowPreps =
-            Box::leak(Box::new(blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, plan)));
-        c.push((key.0, key.1, key.2, r as *const _ as usize));
-        Self(r, None)
-    }
+    fn get(&self) -> &blake3_witgen8::RankedClosedWindowPreps { &self.0 }
 }
 
 // SAFETY: the table-image pointers in each prep are immutable views into the
@@ -3036,10 +3003,11 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         && blake3_witgen8::widen_maddubs_enabled()
         && blake3_witgen8::ey_dead_w31_enabled()
         && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
-    let sl2_align = (abinner_nt, ab_inner_bytes.as_ptr() as usize % 64);
     let ranked_closed_preps = match ranked_closed_dispatch {
         RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
-            Some(SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align))
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
         }
         RankedClosedDispatch::Auto | RankedClosedDispatch::ForceGeneric => None,
         RankedClosedDispatch::ForceExact => {
@@ -3047,7 +3015,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 ranked_closed_exact_eligible,
                 "ranked closed exact dispatch requires the committed compact closed-form stream path"
             );
-            Some(SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align))
+            Some(SharedRankedClosedWindowPreps(
+                blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, win_plan),
+            ))
         }
     };
     flock_core::rstrace::evd("oc:preps", 0);
@@ -3078,7 +3048,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         assert!(root_offset <= 3);
         flock_core::rstrace::evd("oc:root", 0);
         let root_enabled = linear_fold_enabled()
-            && !flock_core::sl2_env_set!("FLOCK_NO_WITGEN_ROOT_CACHE");
+            && std::env::var_os("FLOCK_NO_WITGEN_ROOT_CACHE").is_none();
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
                 let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
@@ -3113,11 +3083,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // so every store of a lane lands inside its row's 28 live lines.
             let ab1_hole = ab1_hole && ab_block_bytes == 29 * 64;
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
-            static TILE_COLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            let tile_cols = || std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
-            let window_tile_cols = if flock_core::sl2_env_live() { tile_cols() } else { *TILE_COLS.get_or_init(tile_cols) };
-            let merge_prefix=flock_core::sl2_env_set!("FLOCK_WITNESS_SEED_MERGE_PREFIX");
-            let window_tile_enabled=!flock_core::sl2_env_set!("FLOCK_NO_WITNESS_SEED_TILE");
+            let window_tile_cols=std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
+            let merge_prefix=std::env::var_os("FLOCK_WITNESS_SEED_MERGE_PREFIX").is_some();
+            let window_tile_enabled=std::env::var_os("FLOCK_NO_WITNESS_SEED_TILE").is_none();
             let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
             flock_core::rstrace::evd("oc:gen", 0);
             let groups_n = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
@@ -3885,28 +3853,31 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        let t0 = vtrn1q_u32(w0, w1);
-        let t1 = vtrn2q_u32(w0, w1);
-        let t2 = vtrn1q_u32(w2, w3);
-        let t3 = vtrn2q_u32(w2, w3);
-        (
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-        )
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -4123,12 +4094,15 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        let sum = vaddq_u32(x, y);
-        let cin = veorq_u32(veorq_u32(sum, x), y);
-        let left = veorq_u32(x, cin);
-        let right = veorq_u32(y, cin);
-        let carry = vandq_u32(left, right);
-        (sum, left, right, carry)
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -4137,8 +4111,11 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        let v = veorq_u32(x, y);
-        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
@@ -4927,32 +4904,11 @@ impl Blake3Setup {
         // outlives this thread. Only shared reads happen through it — the same
         // `&self` the Rayon pool already fans out during any prove.
         let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::rstrace::ev("sp:run", 0);
-        let fresh = || {
-            crate::challenger::FsChallenger::with_hash(
-                crate::seed_pipe::BENCH_DOMAIN,
-                flock_core::hash::HashKind::Blake3,
-            )
-        };
-        // Lane sl2 (`FLOCK_NO_SL2_CHAL`): the initial transcript state is a
-        // constant (domain + hash), so an untimed prove leaves a freshly
-        // built spare for the next one instead of the timed prove paying the
-        // hasher allocation and the domain absorbs.
-        static SPARE: std::sync::Mutex<Option<crate::challenger::FsChallenger>> =
-            std::sync::Mutex::new(None);
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_CHAL").is_none());
-        let mut challenger = if *ON {
-            SPARE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(fresh)
-        } else {
-            fresh()
-        };
-        flock_core::rstrace::ev("sp:chal", 0);
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
-        if *ON && !crate::seed_pipe::is_timed_speculative_prove() {
-            *SPARE.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh());
-        }
-        out
+        let mut challenger = crate::challenger::FsChallenger::with_hash(
+            crate::seed_pipe::BENCH_DOMAIN,
+            flock_core::hash::HashKind::Blake3,
+        );
+        setup.prove_fast_inner(blocks, &mut challenger)
     }
 
     fn prove_fast_inner<Ch: Challenger>(
