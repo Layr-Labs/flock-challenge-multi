@@ -335,6 +335,26 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            const {
+                assert!(core::mem::size_of::<F128>() == 16);
+                assert!(core::mem::offset_of!(F128, lo) == 0);
+                assert!(core::mem::offset_of!(F128, hi) == 8);
+            }
+            // SAFETY: the two initialized u64 limbs fill F128 without padding.
+            // Little-endian object bytes are the protocol's limb encoding.
+            // Borrow only: no ownership/layout change or pointer retention.
+            // Byte-identical to absorbing lo then hi as 8-byte LE limbs per value (streaming hash concatenation).
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(values),
+                )
+            };
+            self.absorb(bytes);
+        }
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }

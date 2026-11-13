@@ -771,11 +771,12 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
 #[inline(always)]
 unsafe fn row_product<const MODE: u8, const FIRST: bool, const PRUNE: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
-    acc: &mut [__m512i; 8],
+    acc: &mut [core::mem::MaybeUninit<__m512i>; 8],
 ) {
     unsafe {
-        let acc0 = if FIRST { _mm512_setzero_si512() } else { acc[0] };
-        acc[0] = row_product_vector_abi::<MODE, FIRST, PRUNE>(ap, bp, ma, mb, acc, acc0);
+        let acc0 = if FIRST { _mm512_setzero_si512() } else { acc[0].assume_init() };
+        let value = row_product_vector_abi::<MODE, FIRST, PRUNE>(ap, bp, ma, mb, acc, acc0);
+        acc[0].write(value);
     }
 }
 
@@ -785,7 +786,7 @@ unsafe fn row_product<const MODE: u8, const FIRST: bool, const PRUNE: bool>(
 #[allow(improper_ctypes_definitions)]
 unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, const PRUNE: bool>(
     ap: *const u64, bp: *const u64, ma: *const u64, mb: *const u64,
-    acc: &mut [__m512i; 8], acc0: __m512i,
+    acc: &mut [core::mem::MaybeUninit<__m512i>; 8], acc0: __m512i,
 ) -> __m512i {
     unsafe {
         let av = affine_prepared(ap, ma);
@@ -801,9 +802,11 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, c
             let value = if MODE == 15 { av[i] } else {
                 _mm512_gf2p8mul_epi8(av[i], bv[i])
             };
-            let previous = if i == 0 { acc0 } else { acc[i] };
-            let value = if FIRST { value } else { _mm512_xor_si512(previous, value) };
-            if i == 0 { result = value; } else { acc[i] = value; }
+            let value = if FIRST { value } else {
+                let previous = if i == 0 { acc0 } else { acc[i].assume_init() };
+                _mm512_xor_si512(previous, value)
+            };
+            if i == 0 { result = value; } else { acc[i].write(value); }
         }
         result
     }
@@ -825,12 +828,12 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
 ) {
     unsafe {
         let bp = pretranspose_ring::<BLK, false>(br, rw);
-        // First-writer accumulators: every block's first live residual row runs
-        // the FIRST row_product variant, which writes all 8 lanes without reading
-        // them, so the array needs no zero fill (8 dead stack stores per window
-        // that the outlined call's &mut otherwise forces).
-        let mut acc_slot = core::mem::MaybeUninit::<[__m512i; 8]>::uninit();
-        let acc: &mut [__m512i; 8] = &mut *acc_slot.as_mut_ptr();
+        const { assert!(BLK >= 2 && BLK <= 29); }
+        // k=7 initializes all slots for BLK 2..28; BLK 29 first writes at k=3.
+        // Keep references to MaybeUninit until then, and read only after FIRST
+        // has written every slot. Publication does not borrow these slots.
+        let mut acc_slot = [core::mem::MaybeUninit::<__m512i>::uninit(); 8];
+        let acc = &mut acc_slot;
         let pend_live = DEFER && (*proj.ab_pend).live;
         rows.publish_dense_values(0, a[0], b[0]);
         if pend_live { ab_pend_one(proj.ab_pend, 0); }
@@ -1071,14 +1074,14 @@ _ => unreachable!(),
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
-            _mm512_permutexvar_epi8(ix, acc[0]),
-            _mm512_permutexvar_epi8(ix, acc[1]),
-            _mm512_permutexvar_epi8(ix, acc[2]),
-            _mm512_permutexvar_epi8(ix, acc[3]),
-            _mm512_permutexvar_epi8(ix, acc[4]),
-            _mm512_permutexvar_epi8(ix, acc[5]),
-            _mm512_permutexvar_epi8(ix, acc[6]),
-            _mm512_permutexvar_epi8(ix, acc[7]),
+            _mm512_permutexvar_epi8(ix, acc[0].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[1].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[2].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[3].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[4].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[5].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[6].assume_init()),
+            _mm512_permutexvar_epi8(ix, acc[7].assume_init()),
         ]);
         if DEFER && BLK < 29 {
             let p = proj.ab_pend;
@@ -1439,3 +1442,6 @@ mod global_cse;
 #[cfg(test)]
 #[path="blake3_witgen8_xor_cse_tests.rs"]
 mod cse_tests;
+#[cfg(test)]
+#[path="blake3_witgen8_xor_init_tests.rs"]
+mod init_tests;
