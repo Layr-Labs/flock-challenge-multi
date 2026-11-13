@@ -587,6 +587,10 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
     debug_assert!(!WRITE || a_chunk.len() == 2 * lo_size);
     debug_assert!(!WRITE || b_chunk.len() == 2 * lo_size);
     debug_assert!(lo_size.is_multiple_of(2));
+    // Source-only delta: `debug_assertions` is off in the `challenge` profile,
+    // so this assert is removed before codegen and the worker binary stays
+    // identical to the base tree's build (verified by hash in the note).
+    debug_assert!(lo_size.is_power_of_two());
 
     unsafe {
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
