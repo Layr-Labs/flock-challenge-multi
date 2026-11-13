@@ -42,6 +42,24 @@ use flock_core::zerocheck::univariate_skip_optimized::{
 #[path = "blake3_witgen8_root.rs"]
 pub(crate) mod root_emit;
 
+// Sixteen-lane ranked witness (near-miss lever P7, ported by glm-nearmiss):
+// two adjacent octas of one closed group evaluated as one AVX-512 word-major
+// stream, split back into the two existing Drain8 octas (vextracti64x4).
+// Kill switch: FLOCK_NO_WITGEN16=1 restores the two-octa path.
+#[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512dq",target_feature="avx512vbmi2",target_feature="avx512vl",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+#[path="blake3_witgen16.rs"]
+mod wide16;
+#[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512dq",target_feature="avx512vbmi2",target_feature="avx512vl",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+pub(crate) use wide16::build_hexa_witness_pair;
+
+#[cfg(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512dq",target_feature="avx512vbmi2",target_feature="avx512vl",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+pub(crate) fn ranked_witness16_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        ranked_b_constwin_enabled() && std::env::var_os("FLOCK_NO_WITGEN16").is_none()
+    });
+    *ENABLED
+}
+
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
@@ -1299,6 +1317,9 @@ pub(crate) struct StreamProj<'t> {
     /// seeds the commitment; z is regenerated later from the root tiles).
     pub(crate) elide_z: bool,
     pub(crate) out_bias: usize,
+    /// sb1: optional per-producer buffer that defers a window's eight ab_inner NT lines into the next
+    /// window's row publications (spreads the NT burst). Null keeps the burst.
+    pub(crate) ab_pend: *mut AbPend,
     pub(crate) inv_table: &'t InvNttTableByteSingleGf8,
     pub(crate) plan: Round1AbWindowPlan,
     /// Ranked residual representation; dense producers leave this off.
@@ -2008,6 +2029,47 @@ unsafe fn tr8_chunk(stage: *const V8, w: usize) -> [V8; 8] {
         )
     }
 }
+
+/// sb1: one window's eight transposed ab_inner lines, waiting to be streamed one per row
+/// publication of the next projected window (or by [`flush_ab_pend`] at the octa's end).
+#[repr(C, align(64))]
+pub(crate) struct AbPend {
+    pub(crate) v: [[u8; 64]; 8],
+    pub(crate) base: *mut u8,
+    pub(crate) stride: usize,
+    pub(crate) cq: bool,
+    pub(crate) live: bool,
+}
+impl AbPend {
+    pub(crate) const fn new() -> Self {
+        Self { v: [[0; 64]; 8], base: core::ptr::null_mut(), stride: 0, cq: false, live: false }
+    }
+}
+pub(crate) static SB1_DEFER_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SB1_DEFER").is_none());
+/// Stream one pending ab_inner line `j` (caller checked `live`).
+#[cfg(target_feature = "avx512f")]
+#[inline(always)]
+pub(crate) unsafe fn ab_pend_one(p: *mut AbPend, j: usize) {
+    unsafe {
+        let v = _mm512_load_si512((*p).v.as_ptr().add(j).cast());
+        _mm512_stream_si512((*p).base.add(compression_lane_offset(j, (*p).cq) * (*p).stride).cast(), v);
+    }
+}
+/// Stream every pending line (end of an octa); a no-op when nothing is pending.
+/// The producer owns this buffer exclusively and must flush before reusing the
+/// octa destination or returning. This is not a publication fence: the existing
+/// encoder producer fence must still run before cross-thread readers are released.
+#[cfg(target_feature = "avx512f")]
+pub(crate) unsafe fn flush_ab_pend(p: *mut AbPend) {
+    unsafe {
+        if !p.is_null() && (*p).live {
+            for j in 0..8 { ab_pend_one(p, j); }
+            (*p).live = false;
+        }
+    }
+}
+
 
 /// Publish one 32-byte transposed run non-temporally.
 ///
@@ -3347,8 +3409,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 ) {
     unsafe {
         // Only the all-elide provenance state selects the ranked static
-        // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        // windows. Its fixed ZMM publishers require line-aligned destinations;
+        // generic callers may supply F128 buffers aligned to only16 bytes.
+        let ranked_static = elide == [true; 3]
+            && ((z as usize | a as usize | b as usize | proj.out as usize) & 63) == 0
+            && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -4311,6 +4376,7 @@ mod tests {
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
                     out_bias: 0,
+                    ab_pend: core::ptr::null_mut(),
                     inv_table: &inv_table,
                     plan: win_plan,
                     one_rows_elided: false,
@@ -4362,6 +4428,7 @@ mod tests {
                         out: ab_ref.0.as_mut_ptr(),
                         out_stride,
                         out_bias,
+                        ab_pend: core::ptr::null_mut(),
                         inv_table: &inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
@@ -4381,6 +4448,7 @@ mod tests {
                         out: ab_new.0.as_mut_ptr(),
                         out_stride,
                         out_bias,
+                        ab_pend: core::ptr::null_mut(),
                         inv_table: &inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
@@ -4505,6 +4573,7 @@ mod cached_z_seed_pair_dispatch_tests {
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
                     out_bias: 0,
+                    ab_pend: core::ptr::null_mut(),
                     inv_table: &inv_table,
                     plan: win_plan,
                     one_rows_elided: false,
@@ -4604,6 +4673,7 @@ mod cached_z_seed_pair_dispatch_tests {
                         out: ab_ref.0.as_mut_ptr(),
                         out_stride,
                         out_bias,
+                        ab_pend: core::ptr::null_mut(),
                         inv_table: &inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
@@ -4623,6 +4693,7 @@ mod cached_z_seed_pair_dispatch_tests {
                         out: ab_new.0.as_mut_ptr(),
                         out_stride,
                         out_bias,
+                        ab_pend: core::ptr::null_mut(),
                         inv_table: &inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
@@ -4787,7 +4858,7 @@ mod cross_quarter_witness_tests {
                                         build_octa_witness_ab_stream_elide(
                                             OctaInputs::Blocks(core::array::from_fn(|lane| &blocks[lane])),
                                             zr.0.as_mut_ptr(), ar.0.as_mut_ptr(), br.0.as_mut_ptr(),
-                                            StreamProj { compact_z_tile_words: 0, seed_window: None, stage: reference_stage.0.as_mut_ptr(), out: abr.0.as_mut_ptr(), out_stride: if old { 32*64 } else { stride }, cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false, out_bias: if old { 0 } else { 2*64 }, inv_table, plan, one_rows_elided: !old, w30_elided: !old },
+                                            StreamProj { compact_z_tile_words: 0, seed_window: None, stage: reference_stage.0.as_mut_ptr(), out: abr.0.as_mut_ptr(), out_stride: if old { 32*64 } else { stride }, cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false, out_bias: if old { 0 } else { 2*64 }, ab_pend: core::ptr::null_mut(), inv_table, plan, one_rows_elided: !old, w30_elided: !old },
                                             [!old;3],
                                         );
                                         _mm_sfence();
@@ -4810,7 +4881,7 @@ mod cross_quarter_witness_tests {
                                         (addresses[0] as *mut u32).add(base*U32_PER_BLOCK),
                                         (addresses[1] as *mut u32).add(base*U32_PER_BLOCK),
                                         (addresses[2] as *mut u32).add(base*U32_PER_BLOCK),
-                                        StreamProj { compact_z_tile_words: 0, seed_window: None, stage: stage.0.as_mut_ptr(), out: (addresses[3] as *mut u8).add(base*stride), out_stride: stride, cross_quarter: true, compact_z: compact_z.0.as_mut_ptr(), elide_z: false, out_bias: 2*64, inv_table, plan, one_rows_elided: true, w30_elided: true },
+                                        StreamProj { compact_z_tile_words: 0, seed_window: None, stage: stage.0.as_mut_ptr(), out: (addresses[3] as *mut u8).add(base*stride), out_stride: stride, cross_quarter: true, compact_z: compact_z.0.as_mut_ptr(), elide_z: false, out_bias: 2*64, ab_pend: core::ptr::null_mut(), inv_table, plan, one_rows_elided: true, w30_elided: true },
                                         preps, [true;3], Some(root_emit::RootOctaWriter::new(&root_plan, roots.0.as_mut_ptr().add(stripe*64))), false,
                                     );
                                     _mm_sfence();
