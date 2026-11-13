@@ -141,6 +141,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let trace = *TRACE.get_or_init(|| std::env::var("PCS_TRACE").is_ok());
     let t_total = std::time::Instant::now();
+    crate::rstrace::ev("pcs:in", 0);
 
     assert_eq!(
         lig_config.initial_k, commitment.params.log_batch_size,
@@ -794,6 +795,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     challenger.observe_label(b"flock-pcs-open-batch-v0");
     crate::rstrace::ev("rs:open", 0);
+    // (Lane sl1 measured a grind prewarm here: rsw +0.012 ms, L0 first grind
+    // unchanged; not kept. The L1 prewarm in ligerito is kept.)
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
@@ -1101,7 +1104,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             // docs for the exact non-commuting step). FLOCK_COMBINE_MERGE=1
             // opts back into the merged kernel for re-measurement.
             #[cfg(target_arch = "aarch64")]
-            let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
+            let prime = if !crate::sl2_env_set!("FLOCK_NO_BCOMB_NT") {
                 if rs_deferred.len() <= 2
                     && b >= MERGE_MIN_BLOCK
                     && std::env::var_os("FLOCK_COMBINE_MERGE").is_some()
