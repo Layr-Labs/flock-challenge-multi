@@ -1,3 +1,5 @@
+//! The widening kernels below are pure functions of their table and packet
+//! inputs: every output lane depends only on the bytes handed to the call.
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
@@ -5065,6 +5067,8 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") lo, out("zmm9") hi,
+            // Only the private return stack is written; rows and matrices are read-only.
+            options(pure,readonly),
         );
         [lo, hi]
     }
@@ -5109,6 +5113,8 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
             out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            // Only the private return stack is written; rows and matrices are read-only.
+            options(pure,readonly),
         );
         [a, b, c, d]
     }
@@ -7336,14 +7342,15 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
                 assert_eq!(got,want,"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,lo1_ys_enabled());
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
         }}}
     }
 }
+
