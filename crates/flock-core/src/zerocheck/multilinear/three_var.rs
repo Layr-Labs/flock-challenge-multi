@@ -523,6 +523,13 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
     // weight; κ₆ restores the even lanes' own weight in the message sums.
     crate::rstrace::ev("r345:s3", 0);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     let wtab_casc = casc.then(|| build_w_pair_table_casc(eq_lo));
     let kappa6 = if casc { (F128::ONE + r_next5[2]) * r_next5[2].inv() } else { F128::ZERO };
     #[cfg(not(all(
