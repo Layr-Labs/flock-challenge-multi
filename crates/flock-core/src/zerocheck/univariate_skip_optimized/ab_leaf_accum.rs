@@ -5,6 +5,8 @@
 //! planes once per bank.
 //! The matrix-family guard and basis conversion come from the declared
 //! polynomial predecessor. Every window contributes its own weighted leaves.
+//! The per-window leaf contributions enter the accumulator linearly (fixed
+//! GHASH key powers), so the accumulated bank bytes do not depend on claim order.
 //! The complete matrix key is checked; incompatible linear maps use the caller's fallback.
 use super::F128;
 use core::arch::global_asm;

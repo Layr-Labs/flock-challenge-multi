@@ -29,6 +29,27 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    // Same doubling with the four-lane VPCLMULQDQ expansion step of
+    // `lincheck::build_eq_table` (every entry is still `v + v·r` / `v·r` of
+    // the same `v`, so the table is value-identical). This builder serves the
+    // per-level `SplitEqGhash` halves of the zerocheck tail (up to 2^12 + 2^11
+    // entries, rebuilt at each level start on the serial chain) and the
+    // round-one / round-two split factors. Mac-track analogue: fba014ca routes
+    // its scalar eq builder to the SIMD one. `FLOCK_NO_X1_EQ_X4=1` restores
+    // the scalar loop below.
+    // Mechanism from rival submission 9fc8de41-ba12-4559-8c56-2b88f91652ca (ported here).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_X1_EQ_X4").is_some());
+        if r.len() >= 3 && !*OFF {
+            return crate::lincheck::build_eq_table(r);
+        }
+    }
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.

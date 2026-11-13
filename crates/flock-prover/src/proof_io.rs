@@ -1,5 +1,9 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
+//! The writer is append-only and little-endian throughout: a proof's bytes are
+//! the concatenation of its sections in a fixed order, with no padding or
+//! reordering, so any reader sees exactly the bytes the writer produced.
+//!
 //! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
 //! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
 //! with its commitment (which the verifier needs); the chain bundle
