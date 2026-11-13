@@ -678,11 +678,11 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                 for l in l0..l0 + 2 {
                     _mm_prefetch(
                         a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
+                        core::arch::x86_64::_MM_HINT_NTA,
                     );
                     _mm_prefetch(
                         b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                        core::arch::x86_64::_MM_HINT_T0,
+                        core::arch::x86_64::_MM_HINT_NTA,
                     );
                 }
             }
@@ -974,13 +974,16 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                 if pf_on && !pf_spread {
                     let next = (g0 + 64 * pf_tiles) * 8;
                     for l in 0..8 {
+                        // The packed A/B stream is read exactly once and never
+                        // revisited; NTA keeps it from evicting the folded
+                        // output, which the next round reads back.
                         _mm_prefetch(
                             a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
+                            core::arch::x86_64::_MM_HINT_NTA,
                         );
                         _mm_prefetch(
                             b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
-                            core::arch::x86_64::_MM_HINT_T0,
+                            core::arch::x86_64::_MM_HINT_NTA,
                         );
                     }
                 }
