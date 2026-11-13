@@ -592,6 +592,20 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
         let odd_idx = _mm512_set_epi64(15, 14, 11, 10, 7, 6, 3, 2);
         let mut acc = [WideGhashX4::zero(); 8];
         let wsplit = zc_wsplit_enabled();
+        // Non-temporal output stores when the folded chunk cannot stay in
+        // cache: the next round reads it cold, so the regular store path pays
+        // one hidden write-allocate DRAM read per output line. 32 MiB per
+        // array mirrors the aarch64 `fold_and_compute` gate, which measured
+        // the same trade on the same shape; `FLOCK_NO_R2_NT` is the same-binary
+        // A/B kill switch. Outputs below the gate may still be L2/L3-resident
+        // for the next round, where NT inverts.
+        const R2_NT_MIN_F128: usize = (8usize << 20) / core::mem::size_of::<F128>();
+        let nt_out = WRITE
+            && !r2_nt_stores_disabled()
+            && a_chunk.len() >= R2_NT_MIN_F128
+            && b_chunk.len() >= R2_NT_MIN_F128
+            && (a_chunk.as_ptr() as usize).is_multiple_of(64)
+            && (b_chunk.as_ptr() as usize).is_multiple_of(64);
         let mut tail = [F256Unreduced::ZERO; 8];
         let mut x_lo = 0;
         const B_ONES_BLOCK_PAIRS: usize = 128;
@@ -741,9 +755,16 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                     if WRITE {
                         let ac = a_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
                         let bc = b_chunk.as_mut_ptr().add(2 * $x).cast::<__m512i>();
-                        for i in 0..4 {
-                            _mm512_storeu_si512(ac.add(i), za[i]);
-                            _mm512_storeu_si512(bc.add(i), zb[i]);
+                        if nt_out {
+                            for i in 0..4 {
+                                _mm512_stream_si512(ac.add(i), za[i]);
+                                _mm512_stream_si512(bc.add(i), zb[i]);
+                            }
+                        } else {
+                            for i in 0..4 {
+                                _mm512_storeu_si512(ac.add(i), za[i]);
+                                _mm512_storeu_si512(bc.add(i), zb[i]);
+                            }
                         }
                     }
                     let [a0, a1, a2, a3] = transpose4_lanes(za[0], za[1], za[2], za[3]);
@@ -1260,6 +1281,11 @@ unsafe fn round2_lookahead_chunk_general_x86_avx512<const WRITE: bool, const BAK
                 tail[i] ^= acc[i].fold();
                 out[i] = tail[i].reduce();
             }
+        }
+        // Order the non-temporal output stores before this chunk's result is
+        // handed to the caller (and before any later phase reads the chunk).
+        if nt_out {
+            _mm_sfence();
         }
         out
     }
@@ -2543,6 +2569,16 @@ pub(crate) fn zc_wsplit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_WSPLIT").is_none());
     *ON
+}
+
+/// Same-binary A/B kill switch for the round-two non-temporal output stores
+/// (see `round2_lookahead_chunk_general_x86_avx512`). The ranked worker's
+/// cleared environment never sets it.
+#[inline]
+fn r2_nt_stores_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_NT").is_some());
+    *OFF
 }
 
 pub(crate) fn zc_r2_eq_bake_enabled() -> bool {
