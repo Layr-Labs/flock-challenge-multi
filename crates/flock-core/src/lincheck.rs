@@ -339,6 +339,12 @@ impl CompactSched {
     }
 }
 
+fn lincheck_join_swap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_JOINSWAP").is_none());
+    *ON
+}
+
 fn rc_compact_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT1_RC_COMPACT").is_none());
@@ -5508,6 +5514,16 @@ fn prove_padded_inner<Ch: Challenger>(
         if kicked.is_some() {
             let comb_vec = fold_comb(beta);
             (comb_vec, fold_z(kicked))
+        } else if lincheck_join_swap_enabled() {
+            // Join-arm swap (`FLOCK_NO_SL1_JOINSWAP`; mechanism from rival
+            // 054e4d70-6385-409d-9ee6-8168d229a4b3, lane sl1): the caller runs
+            // the z fold (the critical arm, ending in the serial reduce and
+            // reconstruct) and the short comb fold is the stealable arm, so the
+            // sumcheck continues on the thread that finished the z fold without
+            // a join wake-up. Same closures and inputs; results returned in the
+            // same (comb, z) order.
+            let (z, comb) = rayon::join(|| fold_z(None), || fold_comb(beta));
+            (comb, z)
         } else {
             rayon::join(|| fold_comb(beta), || fold_z(None))
         }
