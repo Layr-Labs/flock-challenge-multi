@@ -398,6 +398,21 @@ fn finalize_cpu_commit(
             Vec::new()
         };
 
+    // Lane opus-pcs (mc7d): the worker that completes the last of
+    // OPUS_MERKLE_SUPER adjacent subgroups also folds their roots four more
+    // levels, so the post-join build starts from 32 nodes instead of 512.
+    let super_done: Vec<std::sync::atomic::AtomicU32> = if opus_merkle_super_enabled()
+        && !sub_blocks_done.is_empty()
+        && sub_blocks_done.len().is_multiple_of(OPUS_MERKLE_SUPER)
+    {
+        (0..sub_blocks_done.len() / OPUS_MERKLE_SUPER)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let super_ok = std::sync::atomic::AtomicBool::new(true);
+
     let t_ntt = std::time::Instant::now();
     encode(
         &mut codeword,
@@ -529,6 +544,26 @@ fn finalize_cpu_commit(
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
             }
+            if !super_done.is_empty() {
+                // SAFETY: see `opus_merkle_super_on_subgroup`; this worker has
+                // just written its subgroup's subtree, and supergroup node
+                // ranges are disjoint across supergroups.
+                let ok = unsafe {
+                    opus_merkle_super_on_subgroup(
+                        &super_done,
+                        tree_addr as *mut Hash,
+                        stored_leaves,
+                        parent_range.start,
+                        len,
+                        RANKED_PARENT_SUBGROUP_LEAVES >> merkle_cut_depth,
+                        depth,
+                        kind,
+                    )
+                };
+                if !ok {
+                    super_ok.store(false, Ordering::Release);
+                }
+            }
         },
     );
     if timing {
@@ -543,6 +578,7 @@ fn finalize_cpu_commit(
         usize::MAX | 0 => 0,
         d => d,
     };
+    let folded = opus_merkle_super_levels(folded, super_ok.load(Ordering::Acquire), &super_done);
     build_upper_levels(
         &mut merkle_tree,
         stored_leaves,
@@ -890,6 +926,100 @@ pub(crate) fn subtree_parents_enabled() -> bool {
 
 const RANKED_PARENT_BLOCK_LEAVES: usize = 128;
 const RANKED_PARENT_SUBGROUP_LEAVES: usize = 2048;
+
+/// Lane opus-pcs (mc7d): adjacent subgroups per Merkle supergroup.
+const OPUS_MERKLE_SUPER: usize = 16;
+
+/// Lane opus-pcs (mc7d): `FLOCK_NO_OPUS_MERKLE_SUPER=1` restores the
+/// post-join build from the subgroup roots. Read once.
+fn opus_merkle_super_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_MERKLE_SUPER").is_none());
+    *ON
+}
+
+/// Lane opus-pcs (mc7d): count one completed subgroup (stored nodes
+/// `start..start + len`, whose subtree is folded to level `depth`) into its
+/// supergroup. The caller that brings the count to OPUS_MERKLE_SUPER folds
+/// the supergroup's roots up log2(OPUS_MERKLE_SUPER) levels with the same
+/// `hash_pairs_level_serial` pair hashes into the same flat-tree slots that
+/// `build_upper_levels` would write. Returns false when the subgroup is not
+/// the expected aligned shape (the caller then keeps the incumbent build).
+///
+/// # Safety
+/// `tree` addresses a `2 * stored_leaves - 1` flat tree; this subgroup's
+/// level-`depth` root is written before the call. Every subgroup reports at
+/// most once. The AcqRel counter orders all other subgroups' root writes
+/// before the last finisher's reads, and its writes cover only its own
+/// supergroup's nodes.
+unsafe fn opus_merkle_super_on_subgroup(
+    counters: &[std::sync::atomic::AtomicU32],
+    tree: *mut Hash,
+    stored_leaves: usize,
+    start: usize,
+    len: usize,
+    expected_len: usize,
+    depth: usize,
+    kind: HashKind,
+) -> bool {
+    if len != expected_len
+        || !len.is_power_of_two()
+        || len.trailing_zeros() as usize != depth
+        || !start.is_multiple_of(len)
+    {
+        return false;
+    }
+    let sup = start / len / OPUS_MERKLE_SUPER;
+    if sup >= counters.len() || stored_leaves >> depth < OPUS_MERKLE_SUPER * counters.len() {
+        return false;
+    }
+    if counters[sup].fetch_add(1, Ordering::AcqRel) + 1 != OPUS_MERKLE_SUPER as u32 {
+        return true;
+    }
+    let mut node_lo = sup * OPUS_MERKLE_SUPER;
+    let mut n = OPUS_MERKLE_SUPER;
+    let mut j = depth;
+    while n > 1 {
+        let base_j = 2 * stored_leaves - 2 * (stored_leaves >> j);
+        let base_k = 2 * stored_leaves - 2 * (stored_leaves >> (j + 1));
+        // SAFETY: level j nodes node_lo..node_lo+n and level j+1 nodes
+        // node_lo/2..(node_lo+n)/2 belong to this supergroup only and lie in
+        // different levels, so they never alias.
+        let (read, write) = unsafe {
+            (
+                core::slice::from_raw_parts(tree.add(base_j + node_lo), n),
+                core::slice::from_raw_parts_mut(tree.add(base_k + node_lo / 2), n / 2),
+            )
+        };
+        merkle::hash_pairs_level_serial(read, write, kind);
+        node_lo /= 2;
+        n /= 2;
+        j += 1;
+    }
+    true
+}
+
+/// Lane opus-pcs (mc7d): levels already folded before the post-join build:
+/// `folded + log2(OPUS_MERKLE_SUPER)` only when every subgroup had the
+/// expected shape and every supergroup completed exactly once; otherwise
+/// `folded` (any supergroup nodes written are then rewritten identically).
+fn opus_merkle_super_levels(
+    folded: usize,
+    ok: bool,
+    counters: &[std::sync::atomic::AtomicU32],
+) -> usize {
+    if folded != 0
+        && ok
+        && !counters.is_empty()
+        && counters
+            .iter()
+            .all(|c| c.load(Ordering::Acquire) == OPUS_MERKLE_SUPER as u32)
+    {
+        folded + OPUS_MERKLE_SUPER.trailing_zeros() as usize
+    } else {
+        folded
+    }
+}
 
 /// The promoted L0 deep pass finalizes sixteen adjacent 128-leaf blocks for
 /// every 2048-leaf subgroup. Regroup only that exact production shape; every
@@ -1568,6 +1698,128 @@ mod tests {
             HashKind::Blake3,
         );
         assert_eq!(tree, oracle);
+    }
+
+    /// Lane opus-pcs (mc7d): subgroups completing in arbitrary order across
+    /// threads, each folding its own subtree and then reporting to its
+    /// supergroup, give the oracle tree after the post-join build from
+    /// `folded + 4` levels. Failure classes: a missing subgroup, a wrong
+    /// subgroup length, an unaligned start, a depth mismatch and a duplicate
+    /// report all fall back to `folded` (incumbent build); a corrupted leaf is
+    /// detected.
+    #[test]
+    fn opus_merkle_super_matches_oracle() {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const N: usize = 1024; // stored leaves
+        const SUB: usize = 16; // subgroup length (depth 4)
+        const DEPTH: usize = 4;
+        let n_sub = N / SUB;
+        let mk = |seed: u64| -> Vec<Hash> {
+            (0..N)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    for (k, b) in h.iter_mut().enumerate() {
+                        *b = ((i as u64 * 0x9E37_79B9 + k as u64 * 0x85EB_CA6B + seed) >> 7) as u8;
+                    }
+                    h
+                })
+                .collect()
+        };
+        let leaves = mk(1);
+        let mut oracle = vec![[0u8; 32]; 2 * N - 1];
+        oracle[..N].copy_from_slice(&leaves);
+        build_upper_levels(&mut oracle, N, N, HashKind::Blake3);
+
+        let fold_sub = |tree: usize, sg: usize| unsafe {
+            let tree = tree as *mut Hash;
+            let start = sg * SUB;
+            let mut read_off = start;
+            let mut read_len = SUB;
+            for j in 1..=DEPTH {
+                let write_off = 2 * N - 2 * (N >> j) + (start >> j);
+                let write_len = SUB >> j;
+                let read = core::slice::from_raw_parts(tree.add(read_off), read_len);
+                let write = core::slice::from_raw_parts_mut(tree.add(write_off), write_len);
+                merkle::hash_pairs_level_serial(read, write, HashKind::Blake3);
+                read_off = write_off;
+                read_len = write_len;
+            }
+        };
+        // order: a fixed scramble of the subgroups
+        let order: Vec<usize> = (0..n_sub).map(|i| (i * 37 + 11) % n_sub).collect();
+        let run = |leaves: &[Hash], skip: Option<usize>, dup: Option<usize>, len: usize, shift: usize, depth: usize| {
+            let mut tree = vec![[0u8; 32]; 2 * N - 1];
+            tree[..N].copy_from_slice(leaves);
+            let counters: Vec<AtomicU32> = (0..n_sub / OPUS_MERKLE_SUPER).map(|_| AtomicU32::new(0)).collect();
+            let ok = std::sync::atomic::AtomicBool::new(true);
+            let addr = tree.as_mut_ptr() as usize;
+            let mut jobs: Vec<(usize, bool)> =
+                order.iter().copied().filter(|&sg| Some(sg) != skip).map(|sg| (sg, false)).collect();
+            let report_dup = dup.map(|d| (d, true));
+            let body = |&(sg, again): &(usize, bool)| {
+                if !again {
+                    fold_sub(addr, sg);
+                }
+                let start = if sg == 5 { sg * SUB + shift } else { sg * SUB };
+                let r = unsafe {
+                    opus_merkle_super_on_subgroup(
+                        &counters,
+                        addr as *mut Hash,
+                        N,
+                        start,
+                        if sg == 5 { len } else { SUB },
+                        SUB,
+                        if sg == 5 { depth } else { DEPTH },
+                        HashKind::Blake3,
+                    )
+                };
+                if !r {
+                    ok.store(false, Ordering::Release);
+                }
+            };
+            jobs.par_iter().for_each(body);
+            // A second report of an already-counted subgroup (no second
+            // subtree write), after every other subgroup has finished.
+            if let Some(j) = report_dup {
+                jobs.clear();
+                body(&j);
+            }
+            let levels = opus_merkle_super_levels(DEPTH, ok.load(Ordering::Acquire), &counters);
+            (tree, levels)
+        };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        pool.install(|| {
+            for _ in 0..4 {
+                let (mut tree, levels) = run(&leaves, None, None, SUB, 0, DEPTH);
+                assert_eq!(levels, DEPTH + 4, "all supergroups complete");
+                build_upper_levels(&mut tree, N, N >> levels, HashKind::Blake3);
+                assert_eq!(tree, oracle, "super-folded tree vs oracle");
+            }
+            // Failure classes: each must fall back to the incumbent depth.
+            let (_, l) = run(&leaves, Some(9), None, SUB, 0, DEPTH);
+            assert_eq!(l, DEPTH, "missing subgroup");
+            let (_, l) = run(&leaves, None, Some(9), SUB, 0, DEPTH);
+            assert_eq!(l, DEPTH, "duplicate report");
+            let (_, l) = run(&leaves, None, None, SUB / 2, 0, DEPTH);
+            assert_eq!(l, DEPTH, "wrong subgroup length");
+            let (_, l) = run(&leaves, None, None, SUB, 3, DEPTH);
+            assert_eq!(l, DEPTH, "unaligned start");
+            let (_, l) = run(&leaves, None, None, SUB, 0, DEPTH - 1);
+            assert_eq!(l, DEPTH, "depth mismatch");
+            // Fallback after a failed supergroup still rebuilds the oracle.
+            let (mut tree, l) = run(&leaves, None, Some(9), SUB, 0, DEPTH);
+            build_upper_levels(&mut tree, N, N >> l, HashKind::Blake3);
+            assert_eq!(tree, oracle, "fallback rebuild vs oracle");
+            // Negative control.
+            let mut bad = leaves.clone();
+            bad[700][3] ^= 1;
+            let (mut tree, l) = run(&bad, None, None, SUB, 0, DEPTH);
+            build_upper_levels(&mut tree, N, N >> l, HashKind::Blake3);
+            assert_ne!(tree[2 * N - 2], oracle[2 * N - 2], "corrupted leaf undetected");
+        });
+        assert_eq!(opus_merkle_super_levels(0, true, &[]), 0);
+        assert_eq!(opus_merkle_super_levels(10, true, &[]), 10);
     }
 
     /// The fused recursive-commit route (encode → per-sub-group serial leaves

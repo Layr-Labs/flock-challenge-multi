@@ -2961,12 +2961,41 @@ fn direct_fold8_round0_wide(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     assert!(witness.len().is_multiple_of(2));
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
     {
+        if opus_rs_state_par_enabled()
+            && witness.len() >= 4096
+            && witness.len().is_multiple_of(32)
+        {
+            // Lane opus-pcs: four pair-aligned quarters in parallel. Each
+            // partial is a reduced sum of the same canonical products; the
+            // reduction is F2-linear and addition is XOR, so the combined
+            // value is identical.
+            return direct_fold8_round0_quarters(witness, basis);
+        }
+    }
+    #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    {
         // SAFETY: the cfg gate guarantees the target features; equal lengths
         // (asserted above) are the kernel's only slice contract.
         return unsafe { super::ligerito::msg_reduce_avx512(witness, basis) };
     }
     #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
     direct_fold8_round0(witness, basis)
+}
+
+/// Lane opus-pcs: [`direct_fold8_round0_wide`] over four pair-aligned
+/// quarters in parallel (`len` a multiple of 32).
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn direct_fold8_round0_quarters(witness: &[F128], basis: &[F128]) -> (F128, F128) {
+    use rayon::prelude::*;
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(32));
+    let q = witness.len() / 4;
+    witness
+        .par_chunks(q)
+        .zip(basis.par_chunks(q))
+        // SAFETY: cfg-gated target features; equal-length chunks.
+        .map(|(w, b)| unsafe { super::ligerito::msg_reduce_avx512(w, b) })
+        .reduce(|| (F128::ZERO, F128::ZERO), |x, y| (x.0 + y.0, x.1 + y.1))
 }
 
 /// Build one claim's [`DirectFold8Factors`] from its sixty-four-bank
@@ -3056,6 +3085,63 @@ fn build_direct_fold8_factors_reusing_a_state_from_generators(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+/// Lane opus-pcs (mc7a): [`build_direct_fold8_factors_reusing_a_state_from_generators`]
+/// reading the borrowed sixty-four-bank statistic in place. The incumbent
+/// copies the 128 KiB statistic so that the A state can be read from it
+/// before the W state overwrites the same buffer, which forces copy, then A,
+/// then W. Here W gets its own buffer: no copy, and W ‖ (A, tail eq split)
+/// run side by side. Every output is the same pure function of the same
+/// inputs (`opus_f8_borrowed_matches_incumbent`).
+fn build_direct_fold8_factors_borrowed_from_generators(
+    fold8: &[F128],
+    suffix: &[F128],
+    generators: &[F128],
+) -> DirectFold8Factors {
+    let low_eq: [F128; 64] = crate::lincheck::build_eq_table(&suffix[..6])
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
+    let n_packed = 1usize << LOG_PACKING;
+    let state_len = 64 * n_packed;
+    assert_eq!(fold8.len(), state_len);
+    let tail = &suffix[6..];
+    let mut w_state = crate::alloc_uninit_vec::<F128>(state_len);
+    let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
+    let ((), (eq_lo, eq_hi)) = rayon::join(
+        || unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) },
+        || {
+            rayon::join(
+                || direct_fold8_a_state_into(fold8, &mut a_state),
+                || build_eq_split(tail, deferred_split_n_lo(tail.len())),
+            )
+            .1
+        },
+    );
+    let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+    DirectFold8Factors {
+        eq_lo,
+        eq_hi,
+        a_state,
+        w_state,
+        round0,
+    }
+}
+
+/// Lane opus-pcs (mc7a): `FLOCK_NO_OPUS_F8_BORROW=1` restores the copied
+/// statistic and the sequential A-then-W build. Read once. (Also inactive
+/// when `FLOCK_NO_OPUS_RS_FS_PAR=1`, which copies on the chain.)
+fn opus_f8_borrow_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_F8_BORROW").is_none());
+    *ON
+}
+
 fn direct_fold8_states_seq(
     fold8: &[F128],
     low_eq: &[F128; 64],
@@ -3105,12 +3191,48 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
     generators: &[F128],
     w_state: &mut [F128],
 ) {
-    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
-    use core::arch::x86_64::*;
-
     let n_packed = 1usize << LOG_PACKING;
     assert_eq!(w_state.len(), 64 * n_packed);
     let map = build_gfni_direct_fold_map_from_generators(generators);
+    if opus_rs_state_par_enabled() {
+        // Lane opus-pcs: the 128 bit rows are independent once each task
+        // has advanced its own copy of the low rows to its first bit by the
+        // same exact doubling the serial loop applies, so the rows are
+        // value-identical. Four tasks of 32 contiguous rows (32 KiB each).
+        use rayon::prelude::*;
+        const ROWS: usize = 32;
+        w_state.par_chunks_mut(ROWS * 64).enumerate().for_each(|(c, out)| unsafe {
+            direct_fold8_w_state_gfni_rows(low_eq, &map, c * ROWS, out);
+        });
+        return;
+    }
+    unsafe { direct_fold8_w_state_gfni_rows(low_eq, &map, 0, w_state) };
+}
+
+/// Rows `first_bit .. first_bit + out.len() / 64` of the GFNI W state (the
+/// incumbent serial loop, entered at `first_bit` after `first_bit` exact
+/// doublings of the low rows).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
+unsafe fn direct_fold8_w_state_gfni_rows(
+    low_eq: &[F128; 64],
+    map: &GfniDirectFoldMap,
+    first_bit: usize,
+    w_state: &mut [F128],
+) {
+    use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
+    use core::arch::x86_64::*;
+
+    assert!(w_state.len().is_multiple_of(64));
+    let n_rows = w_state.len() / 64;
+    let end_bit = first_bit + n_rows;
     let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
@@ -3123,7 +3245,23 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
     }
     let poly = _mm512_set1_epi64(0x87);
     let zero = _mm512_setzero_si512();
-    for bit in 0..n_packed {
+    for _ in 0..first_bit {
+        unsafe {
+            let lo_ptr = core::hint::black_box(low_ptr.cast::<__m512i>());
+            let hi_ptr = core::hint::black_box(high_ptr.cast::<__m512i>());
+            for g in 0..8 {
+                let lo = _mm512_loadu_si512(lo_ptr.add(g));
+                let hi = _mm512_loadu_si512(hi_ptr.add(g));
+                let new_hi = _mm512_shldi_epi64::<1>(hi, lo);
+                let lo_shl = _mm512_add_epi64(lo, lo);
+                let mask = _mm512_cmpgt_epi64_mask(zero, hi);
+                let new_lo = _mm512_mask_xor_epi64(lo_shl, mask, lo_shl, poly);
+                _mm512_storeu_si512(lo_ptr.add(g), new_lo);
+                _mm512_storeu_si512(hi_ptr.add(g), new_hi);
+            }
+        }
+    }
+    for bit in first_bit..end_bit {
         // SAFETY: both input rows hold 64 initialized words, the destination
         // row covers 64 F128s, and the enclosing cfg supplies every feature.
         unsafe {
@@ -3132,10 +3270,10 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
                 &map.low,
                 high_ptr.cast::<u8>(),
                 &map.high,
-                w_state.as_mut_ptr().add(bit * 64),
+                w_state.as_mut_ptr().add((bit - first_bit) * 64),
                 core::ptr::null(),
             );
-            if bit + 1 < n_packed {
+            if bit + 1 < end_bit {
                 let lo_ptr = core::hint::black_box(low_ptr.cast::<__m512i>());
                 let hi_ptr = core::hint::black_box(high_ptr.cast::<__m512i>());
                 for g in 0..8 {
@@ -3211,7 +3349,75 @@ fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut 
     }
 }
 
+/// Lane opus-pcs: `FLOCK_NO_OPUS_RS_FS_PAR=1` restores the incumbent
+/// sequential sixty-four-bank collapses and the on-chain statistic copies.
+/// Read once.
+fn opus_rs_fs_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_RS_FS_PAR").is_none());
+    *ON
+}
+
+/// Lane opus-pcs: `FLOCK_NO_OPUS_RS_STATE_PAR=1` restores the incumbent
+/// per-bank A-state scatter (sixty-four tasks, four of which share every
+/// output cache line), the serial W-state row loop and the single-pass
+/// round-0 message. Read once.
+fn opus_rs_state_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPUS_RS_STATE_PAR").is_none());
+    *ON
+}
+
 fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
+    if opus_rs_state_par_enabled() {
+        direct_fold8_a_state_into_grouped(fold8, a_state);
+    } else {
+        direct_fold8_a_state_into_banks(fold8, a_state);
+    }
+}
+
+fn direct_fold8_a_state_into_grouped(fold8: &[F128], a_state: &mut [F128]) {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(fold8.len(), 64 * n_packed);
+    assert_eq!(a_state.len(), 64 * n_packed);
+    {
+        // Lane opus-pcs: one task per group of four banks, so each task owns
+        // whole 64-byte lines of the bit-major output (bit * 64 + e for
+        // e in 4g..4g+4) instead of four tasks storing into every line.
+        // Same transposes, same values, same positions.
+        const G: usize = 4;
+        let a_addr = a_state.as_mut_ptr() as usize;
+        (0..64 / G).into_par_iter().for_each(|g| {
+            let mut transposed = core::mem::MaybeUninit::<[[F128; 128]; G]>::uninit();
+            // SAFETY: `tensor_algebra_transpose_into` initializes all 128
+            // elements of each of the G rows.
+            let rows = unsafe {
+                let ptr = transposed.as_mut_ptr().cast::<[F128; 128]>();
+                for k in 0..G {
+                    let e = g * G + k;
+                    tensor_algebra_transpose_into(
+                        &fold8[e * n_packed..(e + 1) * n_packed],
+                        &mut *ptr.add(k),
+                    );
+                }
+                &*transposed.as_ptr()
+            };
+            let a = a_addr as *mut F128;
+            // SAFETY: group g owns lanes g*G..g*G+G of every output row.
+            unsafe {
+                for bit in 0..n_packed {
+                    let dst = a.add(bit * 64 + g * G);
+                    for (k, row) in rows.iter().enumerate() {
+                        *dst.add(k) = row[bit];
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn direct_fold8_a_state_into_banks(fold8: &[F128], a_state: &mut [F128]) {
     use rayon::prelude::*;
     let n_packed = 1usize << LOG_PACKING;
     assert_eq!(fold8.len(), 64 * n_packed);
@@ -3805,10 +4011,31 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
+    // Lane opus-pcs: the claims' sixty-four-bank collapses are independent
+    // (each reads only its own 128 KiB statistic and suffix), so they run
+    // side by side instead of one after the other on the Fiat-Shamir chain.
+    // Same function, same inputs, same outputs.
+    let mut pre_collapsed: Vec<Option<Vec<F128>>> = vec![None; dense_suffixes.len()];
+    if opus_rs_fs_par_enabled() && dense_suffixes.len() >= 2 {
+        use rayon::prelude::*;
+        pre_collapsed = (0..dense_suffixes.len())
+            .into_par_iter()
+            .map(|d| {
+                precomputed_s_hat_v
+                    .get(dense_to_orig[d])
+                    .copied()
+                    .flatten()
+                    .filter(|p| p.len() == 64 * n_packed && dense_suffixes[d].len() >= 6)
+                    .map(|p| collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]))
+            })
+            .collect();
+    }
     // Fill precomputed slots first.
     for d in 0..dense_suffixes.len() {
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
-            dense_s_hat_v[d] = if p.len() == 64 * n_packed {
+            dense_s_hat_v[d] = if let Some(collapsed) = pre_collapsed[d].take() {
+                collapsed
+            } else if p.len() == 64 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
@@ -3912,14 +4139,18 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //        already has γ_k baked in — pcs combine just adds.
     let t = std::time::Instant::now();
 
-    struct ClaimWork {
+    struct ClaimWork<'p> {
         s_hat_v: Vec<F128>,
         s_hat_v_quad: Option<Vec<F128>>,
         s_hat_v_fold4: Option<Vec<F128>>,
         s_hat_v_fold8: Option<Vec<F128>>,
+        // Lane opus-pcs: the borrowed 64-bank statistic, copied inside the
+        // (claim-parallel) tail instead of on the Fiat-Shamir chain.
+        s_hat_v_fold8_src: Option<&'p [F128]>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
+    let fs_par = opus_rs_fs_par_enabled();
     let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
@@ -3939,12 +4170,16 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .flatten()
             .filter(|precomputed| precomputed.len() == 16 * n_packed)
             .map(<[F128]>::to_vec);
-        let s_hat_v_fold8 = precomputed_s_hat_v
+        let s_hat_v_fold8_src = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 64 * n_packed);
+        let (s_hat_v_fold8, s_hat_v_fold8_src) = if fs_par {
+            (None, s_hat_v_fold8_src)
+        } else {
+            (s_hat_v_fold8_src.map(<[F128]>::to_vec), None)
+        };
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = crate::lincheck::build_eq_table(&r_dprime);
@@ -3958,6 +4193,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             s_hat_v_quad,
             s_hat_v_fold4,
             s_hat_v_fold8,
+            s_hat_v_fold8_src,
             sumcheck_claim,
             eq_r_dprime,
         });
@@ -4066,7 +4302,52 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 }
                 _ => None,
             };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
+            // Lane opus-pcs (mc7a): the ranked GFNI route reads the borrowed
+            // statistic in place (no copy; W ‖ A), see
+            // `build_direct_fold8_factors_borrowed_from_generators`.
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let opus_borrowed: Option<DirectFold8Factors> = match (kinds[i], w.s_hat_v_fold8_src) {
+                (Kind::Dense(d), Some(fold8))
+                    if skip_table
+                        && use_split
+                        && dense_suffixes[d].len() >= 6
+                        && w.s_hat_v_fold8.is_none()
+                        && opus_f8_borrow_enabled() =>
+                {
+                    w.s_hat_v_fold8_src = None;
+                    Some(build_direct_fold8_factors_borrowed_from_generators(
+                        fold8,
+                        dense_suffixes[d],
+                        &scaled_eq_r_dprime,
+                    ))
+                }
+                _ => None,
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let opus_borrowed: Option<DirectFold8Factors> = None;
+            let fold8_owned = if opus_borrowed.is_some() {
+                None
+            } else {
+                w.s_hat_v_fold8
+                    .take()
+                    .or_else(|| w.s_hat_v_fold8_src.map(<[F128]>::to_vec))
+            };
+            let direct_fold8 = if opus_borrowed.is_some() {
+                opus_borrowed
+            } else {
+                match (kinds[i], fold8_owned) {
                 (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
                     #[cfg(all(
                         target_arch = "x86_64",
@@ -4105,6 +4386,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     Some(factors)
                 }
                 _ => None,
+                }
             };
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
@@ -5062,6 +5344,145 @@ mod tests {
                 collapsed, got,
                 "four-bank sufficient statistic mismatch at m={m}, k_log={k_log}"
             );
+        }
+    }
+
+    /// Lane opus-pcs (mc7a): the borrowed builder equals the incumbent
+    /// copy-and-reuse builder on every field, on a 16-thread and a 1-thread
+    /// pool, for several tail lengths, and leaves the borrowed statistic
+    /// untouched (the incumbent overwrites its private copy; the borrowed
+    /// route must never write the caller's statistic, which pcs's combine
+    /// may still read). A corrupted statistic is detected.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn opus_f8_borrowed_matches_incumbent() {
+        let mut rng = Rng::new(0x0907_F8B0_0907_F8B0);
+        let n_packed = 1usize << LOG_PACKING;
+        let p16 = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        let p1 = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        for &tail_len in &[4usize, 5, 9, 13, 19] {
+            let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+            let snapshot = fold8.clone();
+            let suffix: Vec<F128> = (0..6 + tail_len).map(|_| rng.f128()).collect();
+            let generators: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
+            let want = build_direct_fold8_factors_reusing_a_state_from_generators(
+                fold8.clone(),
+                &suffix,
+                &generators,
+            );
+            for (pool, name) in [(&p16, "p16"), (&p1, "p1")] {
+                let got = pool.install(|| {
+                    build_direct_fold8_factors_borrowed_from_generators(&fold8, &suffix, &generators)
+                });
+                let what = format!("{name} tail={tail_len}");
+                assert_eq!(got.a_state, want.a_state, "{what}: a_state");
+                assert_eq!(got.w_state, want.w_state, "{what}: w_state");
+                assert_eq!(got.round0, want.round0, "{what}: round0");
+                assert_eq!(got.eq_lo, want.eq_lo, "{what}: eq_lo");
+                assert_eq!(got.eq_hi, want.eq_hi, "{what}: eq_hi");
+                assert_eq!(fold8, snapshot, "{what}: borrowed statistic was written");
+            }
+            let mut bad = fold8.clone();
+            bad[17 * n_packed + 3] += F128::ONE;
+            let got = build_direct_fold8_factors_borrowed_from_generators(&bad, &suffix, &generators);
+            assert_ne!(got.a_state, want.a_state, "corrupted statistic undetected");
+            assert_ne!(got.round0, want.round0, "corrupted statistic round0 undetected");
+            let mut bad_suffix = suffix.clone();
+            bad_suffix[6 + tail_len - 1] += F128::ONE;
+            let got = build_direct_fold8_factors_borrowed_from_generators(&fold8, &bad_suffix, &generators);
+            assert!(
+                got.eq_lo != want.eq_lo || got.eq_hi != want.eq_hi,
+                "perturbed tail coordinate undetected tail={tail_len}"
+            );
+        }
+    }
+
+    /// Lane opus-pcs: the grouped A-state scatter, the chunked W-state rows
+    /// and the quartered round-0 message are value-identical to the
+    /// incumbent forms, with a corrupted-input negative control.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn opus_rs_state_par_matches_incumbent() {
+        let mut rng = Rng::new(0x0905_5EED_0905_5EED);
+        let n_packed = 1usize << LOG_PACKING;
+        for _trial in 0..3 {
+            let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+            let generators: Vec<F128> = (0..n_packed).map(|_| rng.f128()).collect();
+            let low_eq: [F128; 64] = core::array::from_fn(|_| rng.f128());
+
+            let mut a_inc = vec![F128::ZERO; 64 * n_packed];
+            let mut a_new = vec![F128::ONE; 64 * n_packed];
+            direct_fold8_a_state_into_banks(&fold8, &mut a_inc);
+            direct_fold8_a_state_into_grouped(&fold8, &mut a_new);
+            assert_eq!(a_new, a_inc, "grouped A state");
+
+            let map = build_gfni_direct_fold_map_from_generators(&generators);
+            let mut w_inc = vec![F128::ZERO; 64 * n_packed];
+            unsafe { direct_fold8_w_state_gfni_rows(&low_eq, &map, 0, &mut w_inc) };
+            for rows in [1usize, 8, 32, 64] {
+                let mut w_new = vec![F128::ONE; 64 * n_packed];
+                for (c, out) in w_new.chunks_mut(rows * 64).enumerate() {
+                    unsafe { direct_fold8_w_state_gfni_rows(&low_eq, &map, c * rows, out) };
+                }
+                assert_eq!(w_new, w_inc, "chunked W state rows={rows}");
+            }
+            let mut w_disp = vec![F128::ONE; 64 * n_packed];
+            unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, &generators, &mut w_disp) };
+            assert_eq!(w_disp, w_inc, "W state dispatcher");
+
+            let single = unsafe { crate::pcs::ligerito::msg_reduce_avx512(&a_inc, &w_inc) };
+            assert_eq!(direct_fold8_round0_quarters(&a_inc, &w_inc), single, "round0 quarters");
+            assert_eq!(direct_fold8_round0_wide(&a_inc, &w_inc), single, "round0 dispatcher");
+
+            let mut bad = fold8.clone();
+            bad[3 * n_packed + 7] += F128::ONE;
+            let mut a_bad = vec![F128::ZERO; 64 * n_packed];
+            direct_fold8_a_state_into_grouped(&bad, &mut a_bad);
+            assert_ne!(a_bad, a_inc, "corrupted bank went undetected");
+
+            // Independent oracle (no shared helper): the scalar table route.
+            // `build_fold_byte_table(g)` has the generators as its one-hot
+            // entries, so states_seq's W equals the GFNI W from `g`.
+            let table = build_fold_byte_table(&generators);
+            let (a_seq, w_seq, r0_seq) = direct_fold8_states_seq(&fold8, &low_eq, &table);
+            assert_eq!(a_new, a_seq, "grouped A vs scalar oracle");
+            assert_eq!(w_inc, w_seq, "GFNI W rows vs scalar oracle");
+            assert_eq!(direct_fold8_round0_wide(&a_seq, &w_seq), r0_seq, "round0 vs scalar oracle");
+            // Non-divisor row chunks and the last single row.
+            for rows in [3usize, 5, 31, 33, 127] {
+                let mut w_new = vec![F128::ONE; 64 * n_packed];
+                for (c, out) in w_new.chunks_mut(rows * 64).enumerate() {
+                    unsafe { direct_fold8_w_state_gfni_rows(&low_eq, &map, c * rows, out) };
+                }
+                assert_eq!(w_new, w_seq, "W rows chunk={rows} vs scalar oracle");
+            }
+        }
+        // Round-0 dispatcher around the quarter threshold vs a scalar
+        // adjacent-pair reduction.
+        for &len in &[2usize, 8, 32, 4064, 4094, 4096, 4098, 4128, 8192] {
+            let w: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+            let mut want = (F128::ZERO, F128::ZERO);
+            for k in (0..len).step_by(2) {
+                want.0 += w[k] * b[k];
+                want.1 += (w[k] + w[k + 1]) * (b[k] + b[k + 1]);
+            }
+            assert_eq!(direct_fold8_round0_wide(&w, &b), want, "round0 dispatcher len={len}");
+            if len >= 32 && len.is_multiple_of(32) {
+                assert_eq!(direct_fold8_round0_quarters(&w, &b), want, "quarters len={len}");
+            }
         }
     }
 

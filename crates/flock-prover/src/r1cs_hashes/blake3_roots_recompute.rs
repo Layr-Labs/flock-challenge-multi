@@ -334,6 +334,7 @@ fn roots_only_matches_production_stripes() {
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
                                 out_bias: 2 * 64,
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table: &inv,
                                 plan,
                                 one_rows_elided: true,
