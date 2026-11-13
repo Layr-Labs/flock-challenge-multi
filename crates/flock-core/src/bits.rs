@@ -1,6 +1,8 @@
 //! Small bit-manipulation primitives shared across modules.
 
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.
+/// The transpose is its own inverse: applying it twice to the same `u64` returns
+/// the original bytes, so callers can undo a stripe without a second table.
 ///
 /// The input holds 8 bytes representing 8 rows of 8 bits each; the output holds
 /// the transposed matrix (bit `r·8 + c` of input → bit `c·8 + r` of output).

@@ -3,6 +3,8 @@
 //! - [`F8`]   — GF(2^8) with AES polynomial x^8 + x^4 + x^3 + x + 1
 //! - [`F128`] — GF(2^128) in GHASH form, polynomial x^128 + x^7 + x^2 + x + 1
 //! - [`F256Unreduced`] — 256-bit unreduced GHASH products, for deferred reduction
+//! Deferred reduction keeps GHASH products unreduced until a reduction step
+//! consumes them, so the multiplication side never re-reduces its inputs.
 
 pub mod gf2_128;
 pub mod gf2_8;

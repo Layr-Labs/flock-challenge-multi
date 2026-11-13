@@ -1,4 +1,6 @@
 #![allow(unused_variables, unused_mut, unused_parens, unused_unsafe, dead_code, non_snake_case, clippy::all)]
+//! Generated scalar stage IR kernels: every helper is a pure function of
+//! its inputs so the compiler is free to outline or inline each one.
 #[cfg_attr(not(debug_assertions), inline(always))]
 pub unsafe fn gf2_kern_isolate_lowest_one(v0: u64) -> u64 {
     unsafe {
