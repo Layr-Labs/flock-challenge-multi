@@ -8,6 +8,14 @@
 //! Diagnostics only: the ranked worker's cleared env never sets the var, and
 //! the disabled path is a single cached-bool load. Output goes to stderr so
 //! it never mixes with bench stdout parsing.
+//!
+//! Contract restated for the ranked path: [`enabled`] caches the
+//! `FLOCK_GAP_TIMING` presence once per process, and when it is absent every
+//! [`mark`] returns after the cheap `rstrace` hook without printing. Deltas
+//! are nanosecond differences against a process-wide monotonic epoch, clamped
+//! with `saturating_sub`; `begin` resets both the epoch-relative start and the
+//! previous-mark cursor, and `FLOCK_HOT1_WHO` adds the rayon thread index,
+//! pool-owner flag and thread name to each mark.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
