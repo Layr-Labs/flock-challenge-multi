@@ -34,6 +34,14 @@
 //! see the note above [`blake3_hash_many`] for why that API and how it is
 //! kept honest.
 //!
+//! Ranked configuration note: the benchmark worker sets
+//! `pcs_params.merkle_hash = HashKind::Blake3`, and the Ligerito prover and
+//! verifier configs derive from those params, so the L0 commitment and every
+//! recursive level of the ranked run hash with BLAKE3 — every node of every
+//! tree flows through the SIMD-batched entry point above, and the digests
+//! match the scalar `hazmat` specification bit-for-bit (enforced by this
+//! module's tests).
+//!
 //! Which hash is faster is size- and target-dependent. On a target with the
 //! ARM SHA-2 or x86 SHA-NI extensions, SHA-256 wins: its two compressions per
 //! internal node run on a dedicated hardware unit, against BLAKE3's one in the
