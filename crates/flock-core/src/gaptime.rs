@@ -5,6 +5,12 @@
 //! unlike per-phase stopwatches which silently drop the time BETWEEN phases
 //! (pool installs, buffer drops, challenger hashing, allocator churn).
 //!
+//! Inertness note: the instrumentation is dormant unless `FLOCK_GAP_TIMING`
+//! is present in the environment. The ranked worker's cleared sandbox
+//! environment never sets it, so on a ranked run the disabled path is a
+//! single cached-bool load per site and the prove wall time, scheduling and
+//! proof bytes are exactly those of an uninstrumented process.
+//!
 //! Diagnostics only: the ranked worker's cleared env never sets the var, and
 //! the disabled path is a single cached-bool load. Output goes to stderr so
 //! it never mixes with bench stdout parsing.
