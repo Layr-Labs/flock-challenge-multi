@@ -13,6 +13,8 @@
 //! verbatim copy from binius64's `crates/field/src/ghash.rs`,
 //! cross-checked with binius's proptest `test_conversion_from_aes_consistency`.
 //! Verified here against the homomorphism property `phi8(a*b) = phi8(a)*phi8(b)`.
+//! Because phi8 is a homomorphism, products can be multiplied in GF(2^8)
+//! first and embedded once, instead of embedded then multiplied in GF(2^128).
 
 use super::{F8, F128};
 

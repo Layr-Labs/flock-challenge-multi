@@ -1,4 +1,6 @@
 //! §2.1 single-table collapse of the LDE matrix `M = fwd_NTT_Λ ∘ inv_NTT_S`.
+//! Collapsing the two-step map into one table removes a full pass over the
+//! packed witness, which is where the round-1 speedup comes from.
 //!
 //! Background: the URM round-1 needs to map each `ell`-bit row of the boolean
 //! witness (packed as `n_chunks = ell/8` bytes) to `ell` evaluations on the
