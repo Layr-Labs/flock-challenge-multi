@@ -20,6 +20,12 @@
 //! Amdahl's law makes every serial millisecond in the timed window worth far
 //! more on the runner than the local gate reports.
 //!
+//! Determinism note: the pipeline is a pure function of the trial seed and
+//! the process-local setup. It reads no environment variables beyond the
+//! worker's cleared sandbox environment, keeps no state between worker
+//! processes, and emits exactly the proof bytes the in-process call would —
+//! the harness's later verification cannot distinguish the two paths.
+//!
 //! # Mechanism
 //!
 //! The generator is counter-based: its state advances by a fixed constant per
