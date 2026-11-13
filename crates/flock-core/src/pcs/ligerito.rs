@@ -4790,6 +4790,7 @@ fn gpu_merkle_tree_for_open(
 }
 
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,
