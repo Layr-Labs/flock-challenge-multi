@@ -1044,6 +1044,16 @@ pub mod flat_par {
         sh.active.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Lane cmb1 (after mpjunior92 a6571e3f): each claimer publishes its
+    /// completed item count once, after its last run, instead of one
+    /// `done` RMW per claimed run. `FLOCK_NO_CMB_DONE1=1` restores per-run.
+    #[inline]
+    fn done_once() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_CMB_DONE1").is_none());
+        *ON
+    }
+
     /// `FLOCK_NO_RU_FLAT_PAR=1` makes callers keep their rayon route.
     pub fn enabled() -> bool {
         static ON: std::sync::LazyLock<bool> =
@@ -1095,12 +1105,14 @@ pub mod flat_par {
         unsafe { slots.set_len(claimers) };
         let written: Vec<AtomicBool> = (0..claimers).map(|_| AtomicBool::new(false)).collect();
         let slot_addr = slots.as_mut_ptr() as usize;
+        let agg = done_once();
         let body = || {
             let me = who.fetch_add(1, Ordering::Relaxed);
             if me >= claimers {
                 return;
             }
             let mut acc = id();
+            let mut completed = 0usize;
             // Guided claims: contiguous runs of remaining/(2·claimers) items
             // (rayon's first split hands each worker a contiguous ~n/T range;
             // single-item claims interleaved the passes' streams and cost
@@ -1116,7 +1128,11 @@ pub mod flat_par {
                         for i in cur..cur + take {
                             acc = op(acc, f(i));
                         }
-                        done.fetch_add(take, Ordering::Release);
+                        if agg {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
@@ -1125,6 +1141,9 @@ pub mod flat_par {
             // SAFETY: slot `me` is owned by this claimer.
             unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
             written[me].store(true, Ordering::Release);
+            if completed != 0 {
+                done.fetch_add(completed, Ordering::Release);
+            }
         };
         let fat: &(dyn Fn() + Sync) = &body;
         let sh = Arc::new(Shared {
@@ -1241,6 +1260,7 @@ pub mod flat_par {
         let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
         let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
         let slot_addr = slots.as_mut_ptr() as usize;
+        let agg = done_once();
         let body = || {
             let me = who.fetch_add(1, Ordering::Relaxed);
             if me >= CAP {
@@ -1252,6 +1272,7 @@ pub mod flat_par {
             }
             let mut acc = id();
             let mut any = false;
+            let mut completed = 0usize;
             loop {
                 if cur >= n {
                     break;
@@ -1263,7 +1284,11 @@ pub mod flat_par {
                             acc = op(acc, f(i));
                         }
                         any = true;
-                        done.fetch_add(take, Ordering::Release);
+                        if agg {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
@@ -1273,6 +1298,9 @@ pub mod flat_par {
                 // SAFETY: slot `me` is owned by this claimer.
                 unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
                 written[me].store(true, Ordering::Release);
+            }
+            if completed != 0 {
+                done.fetch_add(completed, Ordering::Release);
             }
         };
         let fat: &(dyn Fn() + Sync) = &body;

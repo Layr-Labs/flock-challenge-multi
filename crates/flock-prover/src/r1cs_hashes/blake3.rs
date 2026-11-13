@@ -3117,6 +3117,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // buffer until all its octas return; drains initialize every
                 // word before reading it, so no zero fill is required.
                 let mut stage = core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
+                // sb1: per-producer deferred ab_inner window (flushed after every octa).
+                let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
+                let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
                 // storage follows physical octa order, so each writer still
@@ -3155,6 +3158,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
+                            ab_pend: if ab_pend_on { ab_pend.as_mut_ptr() } else { core::ptr::null_mut() },
                             inv_table,
                             plan: win_plan,
                             one_rows_elided: true,
@@ -3180,6 +3184,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         }
+                        #[cfg(target_feature = "avx512f")]
+                        if ab_pend_on { blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr()); }
                         if windows.is_none() && let Some(target) = target {
                             target.seed_octa(input_base, kpair);
                         }
@@ -3236,6 +3242,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: 2 * 64,
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided: true,
@@ -3369,6 +3376,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                     .add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: if compact { 2 * 64 } else { 0 },
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
