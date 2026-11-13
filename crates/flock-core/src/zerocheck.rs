@@ -6,6 +6,8 @@
 //! Protocol shape (m = log_n, k_skip = [`K_SKIP`] = 6):
 //!   1. Verifier samples `r ∈ F_{2^128}^m` (the zerocheck challenge).
 //!   2. Prover sends `P^{AB}(λ)` and `P^C(λ)` for λ ∈ Λ, |Λ| = 2^k_skip.
+//! The round messages are univariate restrictions the verifier checks
+//! against its own re-derivation, so no extra consistency proof is needed.
 //!   3. Verifier samples `z ∈ F_{2^128}` (univariate-skip fold point).
 //!   4. For each of the `m - k_skip` multilinear rounds, prover sends
 //!      `(P_r(1), P_r(∞))` and verifier samples `ρ_r`.

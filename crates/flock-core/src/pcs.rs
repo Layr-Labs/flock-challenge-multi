@@ -5,6 +5,8 @@
 //! - **Commit**: pack the 2^m Boolean witness into 2^(m−7) F_{2^128} elements
 //!   (one bit per polynomial-basis coordinate of F_{2^128}), batch RS-encode
 //!   via additive NTT, Merkle-commit the codeword.
+//! Because packing is bit-wise into basis coordinates, the codeword length
+//! is the witness size divided by the 128-bit packing width.
 //! - **Open**: at a QuirkyPoint (z_skip, x_outer) from the zerocheck/lincheck:
 //!   1. [`ring_switch::prove`] sends 128 partial-evaluations `s_hat_v` and
 //!      produces a sumcheck target `(rs_eq_ind, sumcheck_claim)`.
