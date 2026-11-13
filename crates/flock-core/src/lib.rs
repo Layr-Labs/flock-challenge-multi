@@ -1027,6 +1027,16 @@ pub mod flat_par {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// Aggregate each claimer's completed-item count and publish it once,
+    /// instead of one release `fetch_add` per claimed run. `FLOCK_FLAT_COMPLETION_MODE=0`
+    /// restores the per-run publication.
+    fn completion_once() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_FLAT_COMPLETION_MODE").as_deref() != Ok("0")
+        });
+        *ON
+    }
+
     struct Shared {
         body: usize, // thin pointer to a `&(dyn Fn() + Sync)`
         active: AtomicUsize,
@@ -1081,6 +1091,20 @@ pub mod flat_par {
     where
         F: Fn(usize) -> T + Sync,
     {
+        map_reduce_idle_inner(n, completion_once(), f, id, op, idle)
+    }
+
+    fn map_reduce_idle_inner<T, F>(
+        n: usize,
+        aggregate_completion: bool,
+        f: F,
+        id: impl Fn() -> T + Sync,
+        op: impl Fn(T, T) -> T + Sync,
+        idle: impl FnOnce(),
+    ) -> T
+    where
+        F: Fn(usize) -> T + Sync,
+    {
         if n == 0 {
             idle();
             return id();
@@ -1101,6 +1125,7 @@ pub mod flat_par {
                 return;
             }
             let mut acc = id();
+            let mut completed = 0usize;
             // Guided claims: contiguous runs of remaining/(2·claimers) items
             // (rayon's first split hands each worker a contiguous ~n/T range;
             // single-item claims interleaved the passes' streams and cost
@@ -1116,11 +1141,18 @@ pub mod flat_par {
                         for i in cur..cur + take {
                             acc = op(acc, f(i));
                         }
-                        done.fetch_add(take, Ordering::Release);
+                        if aggregate_completion {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
                 }
+            }
+            if aggregate_completion && completed != 0 {
+                done.fetch_add(completed, Ordering::Release);
             }
             // SAFETY: slot `me` is owned by this claimer.
             unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
@@ -1227,6 +1259,19 @@ pub mod flat_par {
     where
         F: Fn(usize) -> T + Sync,
     {
+        team_map_reduce_inner(n, completion_once(), f, id, op)
+    }
+
+    fn team_map_reduce_inner<T, F>(
+        n: usize,
+        aggregate_completion: bool,
+        f: F,
+        id: impl Fn() -> T + Sync,
+        op: impl Fn(T, T) -> T + Sync,
+    ) -> T
+    where
+        F: Fn(usize) -> T + Sync,
+    {
         if n == 0 {
             return id();
         }
@@ -1252,6 +1297,7 @@ pub mod flat_par {
             }
             let mut acc = id();
             let mut any = false;
+            let mut completed = 0usize;
             loop {
                 if cur >= n {
                     break;
@@ -1263,13 +1309,20 @@ pub mod flat_par {
                             acc = op(acc, f(i));
                         }
                         any = true;
-                        done.fetch_add(take, Ordering::Release);
+                        if aggregate_completion {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
                 }
             }
             if any {
+                if aggregate_completion && completed != 0 {
+                    done.fetch_add(completed, Ordering::Release);
+                }
                 // SAFETY: slot `me` is owned by this claimer.
                 unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
                 written[me].store(true, Ordering::Release);
@@ -1296,6 +1349,49 @@ pub mod flat_par {
             }
         }
         acc
+    }
+
+    #[cfg(test)]
+    mod completion_tests {
+        use super::*;
+
+        fn check(n: usize, aggregate: bool, team: bool) {
+            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            let f = |i: usize| {
+                hits[i].fetch_add(1, Ordering::Relaxed);
+                (i as u128).wrapping_mul(0x9e3779b97f4a7c15)
+            };
+            let id = || 0u128;
+            let op = |a: u128, b: u128| a.wrapping_add(b);
+            let got = if team {
+                team_map_reduce_inner(n, aggregate, f, id, op)
+            } else {
+                map_reduce_idle_inner(n, aggregate, f, id, op, || ())
+            };
+            let expected = (0..n)
+                .fold(0u128, |a, i| a.wrapping_add((i as u128).wrapping_mul(0x9e3779b97f4a7c15)));
+            assert_eq!(got, expected, "n={n} aggregate={aggregate} team={team}");
+            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+        }
+
+        #[test]
+        fn completion_publication_counts_every_item_once() {
+            for threads in [1, 2, 7, 16] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    for _ in 0..4 {
+                        for aggregate in [false, true] {
+                            for n in [0, 1, 2, 7, 31, 257, 8192, 10003] {
+                                check(n, aggregate, false);
+                            }
+                        }
+                    }
+                });
+            }
+        }
     }
 }
 
