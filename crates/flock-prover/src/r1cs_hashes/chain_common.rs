@@ -3,6 +3,8 @@
 //! The chain protocol (packed-pos fold → shift sumcheck → batched PCS open
 //! over `[ab, c] ring-switched + [chain] packed-direct`) is hash-agnostic; only
 //! the *geometry* of where the input/output regions live in a witness block
+//! Hash-specific code therefore only supplies region offsets, and every
+//! protocol step above the geometry is written once, here.
 //! varies. This module captures that geometry in [`ChainLayout`] and provides
 //! the fully generic [`prove_chain_ligerito_generic`] /
 //! [`verify_chain_ligerito_generic`]. A
