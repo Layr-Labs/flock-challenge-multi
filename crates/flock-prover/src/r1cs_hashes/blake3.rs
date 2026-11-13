@@ -3117,6 +3117,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // buffer until all its octas return; drains initialize every
                 // word before reading it, so no zero fill is required.
                 let mut stage = core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
+                // sb1: per-producer deferred ab_inner window (flushed after every octa).
+                let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
+                let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
                 // storage follows physical octa order, so each writer still
@@ -3124,12 +3127,56 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // Only the sibling-paired encoder passes a target, and it
                 // runs both role calls of a group concurrently and joins
                 // them; the materialize-first fallback keeps the parity split.
-                let octas = match (epoch_claims, octa_claims.as_ref(), target) {
+                let mut octas = match (epoch_claims, octa_claims.as_ref(), target) {
                     (Some((claims, epoch)), _, Some(_)) => OctaOrder::Epoch(&claims[group], epoch),
                     (None, Some(claims), Some(_)) => OctaOrder::Shared(&claims[group]),
                     _ => OctaOrder::Parity(role),
                 };
-                for kpair in octas {
+                while let Some(kpair) = octas.next() {
+                    // Claim both octas through the incumbent iterator: the
+                    // sibling cannot own either stripe. Keep all publication,
+                    // window seeding and join/fence contracts unchanged.
+                    #[cfg(all(target_feature="avx512dq", target_feature="avx512vbmi2", target_feature="avx512vl"))]
+                    if compact_tile && blake3_witgen8::ranked_witness16_enabled()
+                        && let Some(second) = octas.next()
+                    {
+                        let kpairs = [kpair, second];
+                        let bases = kpairs.map(|k| 2 * k * 1024 + group);
+                        let mut second_input = core::mem::MaybeUninit::<OctaInput>::uninit();
+                        let second_base = second_input.as_mut_ptr().cast::<F128>();
+                        let mut second_prefix = core::mem::MaybeUninit::<[F128; 32]>::uninit();
+                        unsafe {
+                            second_base.write_bytes(0, 8 * window_tile_cols);
+                            let inputs = [input_base, second_base];
+                            let prefixes = [prefix_base, second_prefix.as_mut_ptr().cast::<F128>()];
+                            let contexts: [_; 2] = std::array::from_fn(|i| blake3_witgen8::SeedWindowContext {
+                                window: windows.as_ref().unwrap(), input: inputs[i], prefix: prefixes[i],
+                                kpair: kpairs[i], merge_prefix,
+                            });
+                            let projs = std::array::from_fn(|i| blake3_witgen8::StreamProj {
+                                compact_z_tile_words: window_tile_cols * 4,
+                                seed_window: Some(&contexts[i]), cross_quarter: true,
+                                compact_z: inputs[i].cast::<u32>(), elide_z: true,
+                                stage: core::ptr::null_mut(),
+                                out: (ab_addr as *mut u8).add(if ab1_hole {
+                                    flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(bases[i])
+                                } else { bases[i] * ab_block_bytes }),
+                                out_stride: ab_block_bytes, out_bias: 2 * 64, inv_table,
+                                // P10 composition: deferred AB stays off on paired octas (one
+                                // AbPend cannot serve both interleaved halves).
+                                ab_pend: core::ptr::null_mut(),
+                                plan: win_plan, one_rows_elided: true, w30_elided: true,
+                            });
+                            let zs = bases.map(|base| z_base.add(base * F128_PER_BLOCK).cast::<u32>());
+                            let as_ = bases.map(|base| (a_addr as *mut F128).add(base * F128_PER_BLOCK).cast::<u32>());
+                            let bs = bases.map(|base| (b_addr as *mut F128).add(base * F128_PER_BLOCK).cast::<u32>());
+                            macro_rules! emit_pair { ($cols:literal) => {
+                                blake3_witgen8::build_hexa_witness_pair::<$cols>(init, bases, zs, as_, bs, projs, preps.get())
+                            }; }
+                            match window_tile_cols { 8 => emit_pair!(8), 16 => emit_pair!(16), 32 => emit_pair!(32), _ => emit_pair!(64) }
+                        }
+                        continue;
+                    }
                     let base = (2 * kpair) * 1024 + group;
                     let field_offset = base * F128_PER_BLOCK;
                     let physical_base = group * 256 + kpair * 8;
@@ -3155,6 +3202,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
+                            ab_pend: if ab_pend_on { ab_pend.as_mut_ptr() } else { core::ptr::null_mut() },
                             inv_table,
                             plan: win_plan,
                             one_rows_elided: true,
@@ -3180,6 +3228,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         }
+                        #[cfg(target_feature = "avx512f")]
+                        if ab_pend_on { blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr()); }
                         if windows.is_none() && let Some(target) = target {
                             target.seed_octa(input_base, kpair);
                         }
@@ -3236,6 +3286,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: 2 * 64,
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided: true,
@@ -3369,6 +3420,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                     .add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: if compact { 2 * 64 } else { 0 },
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
