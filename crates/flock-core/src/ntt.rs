@@ -4,6 +4,11 @@
 //! F_2 subspace of F_{2^8}). Maximum useful `k` is 7 (|W| = 128); going to k=8
 //! exhausts all 256 elements of F_{2^8}.
 //!
+//! Determinism note: the transform is a pure function of its input table and
+//! twiddle tables — no environment, thread-count, or allocation dependence —
+//! so a ranked candidate and the trusted verifier evaluate identical
+//! evaluation values for identical inputs, whatever machine either runs on.
+//!
 //! Scalar/portable implementation — correctness first. NEON "triple" variants
 //! that batch a/b/c with shared twiddles can be added later if the round-1 URM
 //! hot path needs them.
