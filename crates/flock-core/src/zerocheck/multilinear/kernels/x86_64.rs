@@ -2484,7 +2484,7 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
-const ZC_PKT_PF_TILES: usize = 3;
+const ZC_PKT_PF_TILES: usize = 6;
 
 pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
