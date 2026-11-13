@@ -2,6 +2,8 @@
 //! circuit R1CS instances. Outputs **two** z-claims at different quirky
 //! points that the PCS layer (when it lands) will verify against `z`'s
 //! commitment.
+//! The two quirky points are challenge-distinct, so each z-claim pins a
+//! different restriction of the same committed witness polynomial.
 //!
 //! Flow:
 //! ```text

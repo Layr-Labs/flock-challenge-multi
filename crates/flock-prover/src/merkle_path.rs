@@ -5,6 +5,8 @@
 //! bit `b_i` chooses which input is the previous hash's output `z_{i-1}`.
 //! The unselected input (the "sibling") is committed in the witness but
 //! protocol-unconstrained — soundness comes from preimage resistance: the
+//! The sibling stays inside the committed witness even though it is not
+//! constrained, which is what lets the root check bind the whole path.
 //! prover must still hash up to the public root.
 //!
 //! It implements the Merkle-path variation of the chain shift sumcheck over
