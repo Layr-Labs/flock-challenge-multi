@@ -3,6 +3,8 @@
 //! # The gap this closes
 //!
 //! The ranked harness times a trial from "seed written to worker stdin" to
+//! Pipelining is producer-consumer inside one process; it never writes
+//! scratch files or moves work across the worker boundary.
 //! "proof file published" (`benchmark-tools/harness/src/main.rs`, `run_trial`:
 //! `Instant::now()` immediately before the `writeln!(stdin, "{seed}")`, and
 //! the elapsed read once the renamed proof file is observed). The protected

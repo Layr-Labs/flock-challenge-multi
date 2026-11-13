@@ -4,6 +4,8 @@
 //! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
 //! with its commitment (which the verifier needs); the chain bundle
 //! additionally carries the public endpoint bits.
+//! Serialization is fixed-width bincode, so encode and decode costs are
+//! symmetric and the wire length is known before the first byte is written.
 //!
 //! On-disk format:
 //! ```text
