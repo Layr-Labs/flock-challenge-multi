@@ -22,6 +22,13 @@
 //!   The transcript hash is independent of the Merkle hash
 //!   ([`crate::pcs::commit::PcsParams::merkle_hash`]) — set both to the same
 //!   value if you want the whole system resting on a single primitive.
+//!
+//!   The ranked BLAKE3 configuration does exactly that: the benchmark worker
+//!   selects BLAKE3 for both sides — `FsChallenger::with_hash(DOMAIN, hash)`
+//!   for the transcript and `pcs_params.merkle_hash = hash` for the PCS —
+//!   so the whole ranked system rests on BLAKE3 alone, and the challenger
+//!   state after binding is identical between the candidate prover and the
+//!   trusted verifier, which re-derives it from the same statement inputs.
 
 use crate::field::F128;
 use crate::hash::HashKind;
