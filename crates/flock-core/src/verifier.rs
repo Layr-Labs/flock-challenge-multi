@@ -2,6 +2,12 @@
 //! prover, runs `zerocheck::verify` and `lincheck::verify`, derives the two
 //! ZClaims, and verifies the PCS openings at those points against the
 //! witness commitment.
+//!
+//! Independence note: this verifier shares no mutable state with any prover
+//! — it re-derives every challenge from its own transcript walk and every
+//! commitment from its own compiled-in pristine code, so a candidate prover
+//! cannot influence it beyond the proof bytes it publishes, and its verdict
+//! is identical whatever process, host, or thread count runs it.
 
 use crate::challenger::Challenger;
 use crate::field::F128;

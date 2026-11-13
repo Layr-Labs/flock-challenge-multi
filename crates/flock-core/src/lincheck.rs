@@ -4,6 +4,12 @@
 //! plus the linear constraints (`a = Az`, `b = Bz`, `c = Cz`) to three MLE
 //! evaluation claims on `z`, all sharing a fresh random inner coord.
 //!
+//! Determinism note: every challenge in this protocol is drawn from the
+//! Fiat-Shamir transcript bound to the statement — a pure function of the
+//! prover's own messages — so the prove path emits the same proof bytes
+//! under any thread count, scheduler, or runner state, and the verifier
+//! replaying the same transcript derives the identical challenges.
+//!
 //! ## Matrix structure (the assumption we exploit)
 //!
 //! `A = I_{2^n_log} ⊗ A_0` (block-diagonal with `A_0` repeated `2^n_log`

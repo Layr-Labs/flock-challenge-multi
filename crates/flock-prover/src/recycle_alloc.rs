@@ -4,6 +4,12 @@
 //! returned to the system allocator. The ranked worker performs an untimed warm proof
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
+//!
+//! Determinism note: allocation sizes and reuse order are a pure function of
+//! the prove sequence — independent of environment, wall-clock time, and
+//! scheduler behavior — so the candidate and the trusted verifier see the
+//! same allocation behavior on every run, and no allocation decision can
+//! change a proof byte.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;

@@ -4,6 +4,12 @@
 //! circuit-R1CS shape `(A·z) ⊙ (B·z) = z`), so the c-claim emitted by
 //! zerocheck is already a `z`-claim — no transformation needed downstream.
 //!
+//! Determinism note: the instance — the sparse block-diagonal `A` and `B`
+//! matrices, the implicit `C = I`, and the statement digest bound into the
+//! Fiat-Shamir transcript — is fixed at `Blake3Setup` construction and is
+//! identical between the candidate prover and the trusted verifier, so both
+//! sides constrain and read the same witness layout on every prove.
+//!
 //! We further specialize to **block-diagonal `A` and `B`**:
 //!   `A = I_{2^n_log} ⊗ A_0`, etc. The base matrices are `k × k` sparse
 //! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
