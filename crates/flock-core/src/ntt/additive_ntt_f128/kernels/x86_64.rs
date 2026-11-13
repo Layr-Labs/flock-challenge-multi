@@ -2040,7 +2040,7 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
 /// Requires AVX-512F, AVX-512BW and VPCLMULQDQ. The caller provides valid,
 /// disjoint row storage and initialized prepared pairs for the shaped geometry.
 #[cfg(target_feature = "avx512bw")]
-#[inline(always)]
+#[inline(never)]
 unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, const H: u8, const ORD: u8>(
     ptr: *mut F128,
     prepared: *const PreparedFour,
