@@ -22,6 +22,13 @@
 //!   The transcript hash is independent of the Merkle hash
 //!   ([`crate::pcs::commit::PcsParams::merkle_hash`]) — set both to the same
 //!   value if you want the whole system resting on a single primitive.
+//!
+//!   The ranked BLAKE3 configuration does exactly that: the benchmark worker
+//!   selects BLAKE3 for both sides — `FsChallenger::with_hash(DOMAIN, hash)`
+//!   for the transcript and `pcs_params.merkle_hash = hash` for the PCS —
+//!   so the whole ranked system rests on BLAKE3 alone, and the challenger
+//!   state after binding is identical between the candidate prover and the
+//!   trusted verifier, which re-derives it from the same statement inputs.
 
 use crate::field::F128;
 use crate::hash::HashKind;
@@ -1713,56 +1720,6 @@ fn grind_team(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> Option<u64>
     target_feature = "avx512bw"
 ))]
 const TEAM_SLOTS: usize = 64;
-
-/// Lane sl1 (`FLOCK_NO_SL1_GRIND_PREWARM`): put warm grind holders on CPU
-/// ahead of a team grind that would otherwise start cold (helpers spawned at
-/// publish come on CPU 7-9 µs late). The holders run a no-op team job, then
-/// hold for `hold_us` and join every grind published meanwhile, exactly as
-/// the incumbent's post-grind holders do; while holding they run pending
-/// rayon work. Nonces are unchanged (team grinds return the smallest nonce).
-pub fn sl1_grind_prewarm(hold_us: u64) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_GRIND_PREWARM").is_none());
-        let k = &*TEAM;
-        if !*ON || !k.on || !k.detach || k.hold_us == 0 || rayon::current_thread_index().is_none() {
-            return;
-        }
-        let warm = HUB.holding.0.load(Ordering::Acquire) as usize;
-        let threads = rayon::current_num_threads().max(1);
-        let want = threads.saturating_sub(1).saturating_sub(warm);
-        if want == 0 {
-            return;
-        }
-        let sh = std::sync::Arc::new(TeamShared {
-            next: TeamPad(AtomicU64::new(1)),
-            best_c: TeamPad(AtomicU64::new(0)),
-            best_n: TeamPad(AtomicU64::new(0)),
-            slots: std::array::from_fn(|_| TeamPad(AtomicU64::new(u64::MAX))),
-            pre: blake3_pow_avx512::prepare(&[0u8; 32], 1),
-            clog: 0,
-            fold: k.fold,
-            trace: None::<TeamTrace>,
-        });
-        let _ = (AtomicU32::new(0), AtomicUsize::new(0));
-        for _ in 0..want {
-            let h = sh.clone();
-            rayon::spawn(move || team_helper(h, hold_us));
-        }
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    let _ = hold_us;
-}
 
 /// Shared state of one detached team grind. Helpers hold an `Arc`, so a
 /// helper that starts after the grind returned still finds valid memory: it
