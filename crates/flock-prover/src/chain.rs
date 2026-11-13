@@ -7,6 +7,9 @@
 //!
 //! ## What it proves
 //!
+//! Endpoints stay public because the In/Out restrictions are read at
+//! fixed selector rows, so no extra commitment is needed for the boundary.
+//!
 //! `In`/`Out` are two-variable MLEs over instance index `i ∈ {0,1}^n` and
 //! state-bit index `b ∈ {0,1}^{11}`, restrictions of `ẑ`:
 //! `In(i,b) = ẑ(i, sel=state_0, b)`, `Out(i,b) = ẑ(i, sel=state_24, b)`.

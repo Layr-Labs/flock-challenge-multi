@@ -8,6 +8,8 @@
 //! Diagnostics only: the ranked worker's cleared env never sets the var, and
 //! the disabled path is a single cached-bool load. Output goes to stderr so
 //! it never mixes with bench stdout parsing.
+//! Deltas chain from the previous mark, so their sum reproduces the full
+//! prove wall time without a second clock read at the end.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
