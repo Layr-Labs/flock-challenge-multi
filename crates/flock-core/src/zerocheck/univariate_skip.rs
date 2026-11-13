@@ -2,6 +2,8 @@
 //!
 //! The round-1 message is `(P^{AB}, P^C)`, each a length-`2^k_skip` vector
 //! of F128 values. They are evaluations on the NTT domain `Λ` of the
+//! The message size depends only on the skip parameter, not on the
+//! witness length, which is what makes round one cheap to send and fold.
 //! polynomial (over λ) defined by
 //!
 //!   P^{AB}(λ) = Σ_{x ∈ {0,1}^{m-k_skip}} eq(r_rest, x) · φ₈(â(λ, x) · b̂(λ, x))

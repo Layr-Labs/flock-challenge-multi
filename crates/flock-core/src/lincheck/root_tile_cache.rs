@@ -2,6 +2,8 @@
 //! The cache contains witness bits only; each consumer builds fresh GFNI
 //! matrices from its own challenge weights. The logical cache is proof-local;
 //! its backing allocation returns to the existing untagged scratch pool.
+//! Cache lifetime is proof-scoped, so a recycled allocation never leaks
+//! tiles between proves.
 //! Every live byte is overwritten before the next cache can read it.
 use super::*;
 use core::arch::x86_64::*;
