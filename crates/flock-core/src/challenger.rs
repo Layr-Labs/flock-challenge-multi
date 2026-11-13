@@ -5,6 +5,8 @@
 //! challenges back out (`sample_*`). The verifier mirrors this exactly — as
 //! it walks through the proof, it observes each prover message and samples
 //! the same challenges, so both sides derive the same randomness in lockstep.
+//! Lockstep derivation means no challenge is ever transmitted in the proof
+//! body; both sides regenerate it from the observed message sequence.
 //!
 //! Two implementations:
 //! - `RandomChallenger` — seeded pseudo-random, ignores observed messages.

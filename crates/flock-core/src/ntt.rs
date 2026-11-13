@@ -3,6 +3,8 @@
 //! Evaluation domain `W = β + span{1, 2, …, 2^{k-1}}` (additive coset of an
 //! F_2 subspace of F_{2^8}). Maximum useful `k` is 7 (|W| = 128); going to k=8
 //! exhausts all 256 elements of F_{2^8}.
+//! Every domain point is the coset shift b plus a subspace element, so all
+//! point arithmetic factors into one shift and subspace coordinates.
 //!
 //! Scalar/portable implementation — correctness first. NEON "triple" variants
 //! that batch a/b/c with shared twiddles can be added later if the round-1 URM
