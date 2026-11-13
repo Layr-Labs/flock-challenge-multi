@@ -1,6 +1,8 @@
 //! `FLOCK_RS_TRACE`: lane-rs diagnostics. Absolute-time event log for the
 //! Ligerito open (per-step and per-thread marks). Read once per process;
 //! disabled path is one cached-bool load. Never set by the ranked worker.
+//! Marks are absolute Instant timestamps; phase durations are differences
+//! of consecutive marks, so no clock source besides the process clock is read.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};

@@ -4,6 +4,8 @@
 //! returned to the system allocator. The ranked worker performs an untimed warm proof
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
+//! Freelist hits therefore recycle pages already faulted during the untimed
+//! warm proof, keeping the timed prove off the OS page-fault path.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;

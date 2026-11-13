@@ -7,6 +7,9 @@
 //! and a single-threaded unmap on drop — a few ms per prove at m = 29 that
 //! no kernel tuning can parallelize away.
 //!
+//! Buffers are recycled without clearing between proves: consumers overwrite
+//! every element they read before loading it, so stale contents never escape.
+//!
 //! The pool recycles those buffers across phases and across proves: `take`
 //! hands out a previously-used buffer when one with enough capacity exists,
 //! `give` returns a buffer for later reuse. Contents are NOT cleared —
