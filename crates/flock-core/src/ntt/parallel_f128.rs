@@ -4,6 +4,8 @@
 //! SoA layout, SIMD across NTT instances via [`ghash_mul_vec2_neon`], shared
 //! twiddle table for all parallel NTTs. SIMD width is 2 (one F128 pair per
 //! `ghash_mul_vec2_neon`), so `num_ntts` must be a multiple of 2.
+//! The shared twiddle table is read-only across instances, so every lane
+//! pair can stride it independently without synchronization.
 
 use crate::field::F128;
 

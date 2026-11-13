@@ -2,6 +2,8 @@
 //! deferred **round-four** message as a biquadratic in `(ρ₁, ρ₂)`, so the
 //! packed composed pass folds `X₁, X₂, X₃` at once (`ρ₁, ρ₂, ρ₃`) and writes
 //! an eighth-size table instead of a quarter-size one. Every later cascade
+//! Folding three variables in one packed pass also removes one full
+//! cascade round from the tail, which is where the data halving comes from.
 //! level then works on half the data it used to.
 //!
 //! Value identity: with `A''(ρ₁, ρ₂)` the two-level fold of an eight-row group
