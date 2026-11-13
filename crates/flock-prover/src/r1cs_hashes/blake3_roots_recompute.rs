@@ -341,6 +341,7 @@ fn roots_only_matches_production_stripes() {
                                 cross_quarter: false,
                                 compact_z: core::ptr::null_mut(),
                                 elide_z: false,
+                                ab_pend: core::ptr::null_mut(), // test-only: field added by the crown's SB1 defer
                             },
                             &preps,
                             [true; 3],
