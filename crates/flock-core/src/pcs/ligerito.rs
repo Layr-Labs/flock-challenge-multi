@@ -31,15 +31,6 @@ pub enum LigeritoProfile {
     Secure,
 }
 
-/// Lane sl1: hold window for grind prewarm calls (`FLOCK_SL1_PREWARM_SCALE`
-/// percent, default 100).
-pub(crate) fn sl1_hold_us(base: u64) -> u64 {
-    static S: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_SL1_PREWARM_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
-    });
-    base * *S / 100
-}
-
 impl LigeritoProfile {
     pub fn log_inv_rate(self) -> usize {
         match self {
@@ -5582,7 +5573,7 @@ fn fold_and_msg_lsb_inner(
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
         && half >= (1usize << 21)
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_NT");
+        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -5591,7 +5582,7 @@ fn fold_and_msg_lsb_inner(
     let use_nt = lazy_ood.is_none()
         && deferred_basis.is_none()
         && half >= open_nt_min_half_x86()
-        && !crate::sl2_env_set!("FLOCK_NO_OPEN_NT");
+        && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -6880,7 +6871,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ"),
+        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
     )
 }
 
@@ -6929,8 +6920,8 @@ fn ranked_deep_lazy_ood_eq_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ")
-            || crate::sl2_env_set!("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP"),
+        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
+            || std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ_DEEP").is_some(),
     )
 }
 
@@ -7036,7 +7027,7 @@ fn ranked_deferred_induced_glue_enabled(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         )),
-        crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE),
+        std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some(),
     )
 }
 
@@ -7117,9 +7108,9 @@ fn ranked_sparse_dual_l0_depth(
             return Some(forced);
         }
     }
-    let sparse_disabled = crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL)
-        || crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL2);
-    let defer_disabled = crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE);
+    let sparse_disabled = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
+        || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
+    let defer_disabled = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
     let platform_supported = cfg!(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -7143,15 +7134,10 @@ fn ranked_sparse_dual_l0_depth(
     {
         return None;
     }
-    static EXPLICIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let explicit_depth = if crate::sl2_env_live() {
-        std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()
-    } else {
-        EXPLICIT.get_or_init(|| std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()).clone()
-    };
+    let explicit_depth = std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok();
     let depth = ranked_sparse_dual_l0_depth_setting(
         explicit_depth.as_deref(),
-        crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2),
+        std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL_DEPTH2).is_some(),
     );
     Some(depth)
 }
@@ -7187,16 +7173,16 @@ fn ranked_sparse_dual_deep_depth(
             return (depth >= 2).then_some(depth);
         }
     }
-    if crate::sl2_env_set!(ENV_NO_DEEP_INDUCE_DUAL) {
+    if std::env::var_os(ENV_NO_DEEP_INDUCE_DUAL).is_some() {
         return None;
     }
     let depth = ranked_sparse_dual_deep_depth_for_level(n_level)?;
     if depth > remaining_folds {
         return None;
     }
-    let sparse_disabled = crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL)
-        || crate::sl2_env_set!(ENV_NO_OPEN_INDUCE_DUAL2);
-    let defer_disabled = crate::sl2_env_set!(ENV_NO_LIG_DEFER_INDUCED_GLUE);
+    let sparse_disabled = std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL).is_some()
+        || std::env::var_os(ENV_NO_OPEN_INDUCE_DUAL2).is_some();
+    let defer_disabled = std::env::var_os(ENV_NO_LIG_DEFER_INDUCED_GLUE).is_some();
     let platform_supported = cfg!(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -8865,7 +8851,7 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = crate::sl2_env_set!("LIGERITO_TRACE");
+    let trace = std::env::var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -8932,7 +8918,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = crate::sl2_env_set!("LIGERITO_TRACE");
+    let trace = std::env::var("LIGERITO_TRACE").is_ok();
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -9239,7 +9225,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         "external L0 tree has unsupported layout"
     );
 
-    let trace = crate::sl2_env_set!("LIG_PROVE_TRACE") || open_timing();
+    let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -9675,8 +9661,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             gl2_jobs.0.push(job.clone());
             gl2_l1_job = Some(job);
             crate::rstrace::evd("L1:dual0", 0);
-            // Lane sl1: warm holders for L1's three fold grinds (~0.05 ms ahead).
-            crate::challenger::sl1_grind_prewarm(sl1_hold_us(120));
             let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_deref() {
                 let r = SparseDualL0::from_stream(st, log_inv_rate_0, queries_0.clone(), &gl2_perm0, &alpha_0);
                 gl2_side_done.extend(st.take_side());
@@ -9972,7 +9956,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
-            let proof = LigeritoProof {
+            return LigeritoProof {
                 initial_root,
                 initial_proof,
                 recursive_roots,
@@ -9987,15 +9971,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 ood_values,
                 fold_grinding_nonces,
             };
-            // Lane sl2 (`FLOCK_NO_SL2_LEAK`): the timed prove's process exits
-            // right after publishing; skip freeing (munmap + TLB shootdowns)
-            // the retired level witnesses and the last fold state here.
-            if crate::sl2_leak_tail() {
-                std::mem::forget(std::mem::take(&mut gl2_retired));
-                std::mem::forget(wtns_prev);
-                std::mem::forget(sc_prover);
-            }
-            return proof;
         }
 
         let n_next = sc_prover.f().len().trailing_zeros() as usize;

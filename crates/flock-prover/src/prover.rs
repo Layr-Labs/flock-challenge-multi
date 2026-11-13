@@ -38,7 +38,7 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(target_arch = "x86_64")
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && !flock_core::sl2_env_set!("FLOCK_NO_OPEN_DIRECT_AB")
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
 }
 
 #[inline]
@@ -119,7 +119,7 @@ fn ranked_identity_c_fold_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && c0_is_identity_cached(r1cs)
-        && !flock_core::sl2_env_set!("FLOCK_NO_ZC_IDENTITY_C")
+        && std::env::var_os("FLOCK_NO_ZC_IDENTITY_C").is_none()
 }
 
 /// Direct-fold8 capture/consumer predicate: the fold4 shape plus the shared
@@ -589,70 +589,6 @@ pub(crate) fn prove_fast_ligerito_from_generated_witness<Ch: Challenger>(
     )
 }
 
-fn sl2_stash_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_STASH").is_none());
-    *ON
-}
-
-/// Lane sl2: the publish-prefix pre-encode as a claim-once hot-pool side task.
-struct SideStash(std::sync::Arc<SideStashInner>);
-struct SideStashInner {
-    commitment: *const Commitment,
-    zc: *const zerocheck::ZerocheckProof,
-    lc: *const lincheck::LincheckProof,
-    // 0 = unclaimed, 1 = running, 2 = done.
-    state: std::sync::atomic::AtomicU8,
-}
-// SAFETY: the three pointees are `Sync` and outlive every use: `finish`
-// (called before any of them is moved or dropped) waits for a running job,
-// and the task is unregistered before that, so no later claim can start.
-unsafe impl Send for SideStashInner {}
-unsafe impl Sync for SideStashInner {}
-impl SideStashInner {
-    fn run_if_unclaimed(&self) {
-        use std::sync::atomic::Ordering;
-        if self.state.load(Ordering::Relaxed) != 0
-            || self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err()
-        {
-            return;
-        }
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            crate::proof_io::stash_pre_encoded_prefix(&*self.commitment, &*self.zc, &*self.lc);
-        }));
-        self.state.store(2, Ordering::Release);
-    }
-}
-impl SideStash {
-    fn new(
-        commitment: &Commitment,
-        zc: &zerocheck::ZerocheckProof,
-        lc: &lincheck::LincheckProof,
-    ) -> Self {
-        Self(std::sync::Arc::new(SideStashInner {
-            commitment,
-            zc,
-            lc,
-            state: std::sync::atomic::AtomicU8::new(0),
-        }))
-    }
-    fn task(&self) -> flock_core::hot_pool::side::Task {
-        let inner = self.0.clone();
-        std::sync::Arc::new(move |is_owner_sibling: bool| {
-            if !is_owner_sibling {
-                inner.run_if_unclaimed();
-            }
-        })
-    }
-    fn finish(&self) {
-        use std::sync::atomic::Ordering;
-        self.0.run_if_unclaimed();
-        while self.0.state.load(Ordering::Acquire) != 2 {
-            std::hint::spin_loop();
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -668,42 +604,9 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     flock_core::gaptime::mark("inner: enter");
-    // Lane sl2 (`FLOCK_NO_SL2_CFG`): the config is a pure function of these
-    // five parameters; the warm-up proves leave it cached (no clone of the
-    // parsed config's eleven vectors inside the timed prove).
-    type CfgKey = (usize, usize, usize, pcs::ligerito::LigeritoProfile, flock_core::hash::HashKind);
-    static CFG: std::sync::Mutex<Option<(CfgKey, &'static pcs::ligerito::ProverConfig)>> =
-        std::sync::Mutex::new(None);
-    static CFG_ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_CFG").is_none());
-    let owned_cfg;
-    let lig_config: &pcs::ligerito::ProverConfig = if *CFG_ON {
-        let key: CfgKey = (
-            pcs_params.m,
-            pcs_params.log_inv_rate,
-            pcs_params.log_batch_size,
-            pcs_params.profile,
-            pcs_params.merkle_hash,
-        );
-        let mut slot = CFG.lock().unwrap_or_else(|e| e.into_inner());
-        match *slot {
-            Some((k, c)) if k == key => c,
-            _ => {
-                let c: &'static pcs::ligerito::ProverConfig = Box::leak(Box::new(
-                    pcs_params
-                        .ligerito_prover_config()
-                        .expect("Ligerito default config; bump m for tiny instances"),
-                ));
-                *slot = Some((key, c));
-                c
-            }
-        }
-    } else {
-        owned_cfg = pcs_params
-            .ligerito_prover_config()
-            .expect("Ligerito default config; bump m for tiny instances");
-        &owned_cfg
-    };
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
 
     let ProveCore {
         zc_proof,
@@ -751,11 +654,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // bindings is moved or mutated.
     unsafe impl Send for ScopedPrefixPtrs {}
 
-    // Lane sl2 (`FLOCK_NO_SL2_STASH`): hand the pre-encode to one of the
-    // open's hot-pool spinners (side list, claim once) instead of waking the
-    // persistent helper thread, whose wake-up costs the owner ~0.03 ms here.
-    let sl2_stash = crate::proof_io::pre_encode_enabled() && sl2_stash_enabled();
-    let stash = if crate::proof_io::pre_encode_enabled() && !sl2_stash {
+    let stash = if crate::proof_io::pre_encode_enabled() {
         let ptrs = ScopedPrefixPtrs {
             commitment: &commitment,
             zc: &zc_proof,
@@ -772,23 +671,10 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     } else {
         None
     };
-    flock_core::rstrace::ev("pv:stash", 0);
     let claims_arr = [ab, c];
     let z_key = (z_packed.as_ptr() as usize, z_packed.len());
-    let side_stash = sl2_stash.then(|| SideStash::new(&commitment, &zc_proof, &lc_proof));
-    let (pcs_open, side_task) = flock_core::in_pool(|| {
-        flock_core::rstrace::ev("pv:pool", 0);
+    let pcs_open = flock_core::in_pool(|| {
         let _hot = flock_core::hot_pool::HotPool::start();
-        flock_core::rstrace::ev("pv:hot", 0);
-        let side_task = side_stash.as_ref().map(|st| {
-            if _hot.is_some() {
-                let t = st.task();
-                flock_core::hot_pool::side::register(t.clone());
-                Some(t)
-            } else {
-                None
-            }
-        });
         let opened = open_claims_with_precomputed_ligerito(
             z_packed,
             &prover_data,
@@ -803,20 +689,12 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         flock_core::gaptime::abs("open done");
         crate::seed_pipe::tail_spin_start();
         flock_core::rstrace::ev("pv:spin", 0);
-        (opened, side_task)
+        opened
     });
-    if let Some(st) = side_stash.as_ref() {
-        if let Some(Some(t)) = side_task {
-            flock_core::hot_pool::side::unregister(&t);
-        }
-        // Runs the job here if no spinner claimed it; waits if one is on it.
-        st.finish();
-    }
     flock_core::rstrace::ev("pv:inpool", 0);
     // The open consumed (or densified) any elided-z registration; drop a
     // stale one defensively so a recycled buffer can never match it.
     flock_core::pcs::elided_z::forget(z_key.0, z_key.1);
-    pcs::ring_switch::sl2_pre_settle();
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -1164,7 +1042,6 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
             "direct lincheck fold requires canonical block-major z"
         );
     }
-    flock_core::rstrace::ev("core:in", 0);
     let padding = r1cs.padding_spec();
     flock_core::gaptime::mark("core: padding built");
     gpu_prewire_round1_inputs(
@@ -1334,15 +1211,6 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
     flock_core::gaptime::mark("x_ab built"); flock_core::rstrace::ev("xab", 0);
-    // Lane sl2 (`FLOCK_NO_SL2_PRE`): the C claim's point and bank tensor are
-    // final here; its challenge-free ring-switch work runs during lincheck.
-    if let Some(fold8) = pre_c_slot(r1cs, &s_hat_v_c) {
-        let c_point = r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest);
-        let x_full = quirky_x_outer_full(&c_point);
-        if x_full.len() > 1 {
-            pcs::ring_switch::sl2_pre_spawn(fold8, x_full[1..].to_vec());
-        }
-    }
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
@@ -1356,7 +1224,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         flock_core::rstrace::ev("lc:inpool", 0);
         let _hot = flock_core::hot_pool::HotPool::start();
         flock_core::rstrace::ev("lc:hot", 0);
-        let lc_out = match lincheck_input {
+        match lincheck_input {
             FastLincheckInput::Stripe(z_packed_lincheck) => {
                 let result = lincheck::prove_padded_capture_z_vec_mode(
                     &z_packed_lincheck,
@@ -1388,8 +1256,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     challenger,
                 )
             }
-        };
-        lc_out
+        }
     });
     drop(roots);
     flock_core::gaptime::mark("lincheck: done"); flock_core::rstrace::ev("lc:done", 0);
