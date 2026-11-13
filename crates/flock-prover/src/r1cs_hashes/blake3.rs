@@ -4,6 +4,8 @@
 //! permutation), and the final output XORs in one big sparse system.
 //!
 //! ## Encoding choice — "Option D" (minimum-slot)
+//! One instance per compression call keeps counters and flags explicit,
+//! which is what lets the ranked batch use independent flags=11 inputs.
 //!
 //! BLAKE3 has no AND-based Ch/Maj; the only nonlinear constraints are the
 //! carry_aux bits of 32-bit ADDs. Per compression: 7 rounds × 8 G × 6 ADDs

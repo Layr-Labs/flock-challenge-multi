@@ -5,6 +5,8 @@
 //! wrapping R1CS + PCS params.
 //!
 //! Submodules share low-level bit-packing / matrix-row utilities via
+//! The `*Setup` wrappers exist so callers get a ready-to-prove package
+//! without touching the sparse matrices directly.
 //! [`common`].
 
 pub mod blake3;
