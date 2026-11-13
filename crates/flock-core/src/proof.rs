@@ -3,6 +3,12 @@
 //! These live in a backend-neutral module (rather than in `prover`) so the
 //! verifier can name them without depending on the prove path. The prover
 //! produces these structs; the verifier consumes them.
+//!
+//! Reproducibility note: `bind_statement` observes the same three inputs in
+//! the same order on the prove and verify sides — the fixed `flock-r1cs-v0`
+//! label, the R1CS instance digest, and the commitment root — so the
+//! challenger state after binding is a pure function of the statement and
+//! identical across candidate prover and trusted verifier processes.
 
 use crate::challenger::Challenger;
 use crate::field::F128;
