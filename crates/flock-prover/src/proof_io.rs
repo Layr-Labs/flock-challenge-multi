@@ -1,5 +1,13 @@
 //! Serialize / deserialize proofs to bytes (and files).
 //!
+//! Determinism note: serialization is fixed-width bincode of the typed
+//! structs — the same bundle value encodes to the same bytes in every worker
+//! process, on any host, under any thread count, and the encoding reads back
+//! through `from_bytes` identically. The candidate's published file and the
+//! trusted verifier's decode therefore see identical payloads, and no part
+//! of the format depends on environment variables or the current working
+//! directory.
+//!
 //! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
 //! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
 //! with its commitment (which the verifier needs); the chain bundle
