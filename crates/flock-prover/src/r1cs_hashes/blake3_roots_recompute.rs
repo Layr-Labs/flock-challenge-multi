@@ -1,5 +1,7 @@
 //! Experimental roots-only BLAKE3 recomputation, using the inherited exact
 //! round schedule and packed wire encoding. Each callback owns a full tile.
+//! Tile ownership is static per drain, so no callback ever waits on
+//! another callback bytes being published.
 use super::*;
 
 struct RootDrain8<'a> {
