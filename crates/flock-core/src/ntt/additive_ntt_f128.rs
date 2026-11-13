@@ -3751,6 +3751,7 @@ impl AdditiveNttF128 {
                 static PF2: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
                 static PF2L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DIAG_PF2L").ok().and_then(|v| v.parse().ok()).unwrap_or(16));
                 let pf2 = *PF2;
+                #[cfg(target_arch = "x86_64")]
                 if pf2 != 0 {
                     for k in 1..pf2.min(64) {
                         for i in 0..4 {
@@ -3763,6 +3764,7 @@ impl AdditiveNttF128 {
                     let r_s = r + k * sub_stride;
                     let kp = perm(k);
                     if pf2 != 0 && k + pf2 < 64 {
+                        #[cfg(target_arch = "x86_64")]
                         for i in 0..4 {
                             let p = src.add((i * block_size + r_s + pf2 * sub_stride) * row_len) as *const i8;
                             for l in 0..*PF2L { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(p.add(l * 64)); }

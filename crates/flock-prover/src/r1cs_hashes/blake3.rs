@@ -3117,6 +3117,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // buffer until all its octas return; drains initialize every
                 // word before reading it, so no zero fill is required.
                 let mut stage = core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
+                // sb1: per-producer deferred ab_inner window (flushed after every octa).
+                let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
+                let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
                 // storage follows physical octa order, so each writer still
@@ -3155,6 +3158,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                             }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
+                            ab_pend: if ab_pend_on { ab_pend.as_mut_ptr() } else { core::ptr::null_mut() },
                             inv_table,
                             plan: win_plan,
                             one_rows_elided: true,
@@ -3180,6 +3184,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         false,
                         );
                         }
+                        #[cfg(target_feature = "avx512f")]
+                        if ab_pend_on { blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr()); }
                         if windows.is_none() && let Some(target) = target {
                             target.seed_octa(input_base, kpair);
                         }
@@ -3236,6 +3242,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: 2 * 64,
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided: true,
@@ -3369,6 +3376,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                     .add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
                                 out_bias: if compact { 2 * 64 } else { 0 },
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table,
                                 plan: win_plan,
                                 one_rows_elided,
@@ -3845,28 +3853,31 @@ pub(crate) mod witgen_simd {
     /// data movement — exact.
     #[inline(always)]
     fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        let t0 = vtrn1q_u32(w0, w1);
-        let t1 = vtrn2q_u32(w0, w1);
-        let t2 = vtrn1q_u32(w2, w3);
-        let t3 = vtrn2q_u32(w2, w3);
-        (
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn1q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t0),
-                vreinterpretq_u64_u32(t2),
-            )),
-            vreinterpretq_u32_u64(vtrn2q_u64(
-                vreinterpretq_u64_u32(t1),
-                vreinterpretq_u64_u32(t3),
-            )),
-        )
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let t0 = vtrn1q_u32(w0, w1);
+            let t1 = vtrn2q_u32(w0, w1);
+            let t2 = vtrn1q_u32(w2, w3);
+            let t3 = vtrn2q_u32(w2, w3);
+            (
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t0),
+                    vreinterpretq_u64_u32(t2),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(t1),
+                    vreinterpretq_u64_u32(t3),
+                )),
+            )
+        }
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -4083,12 +4094,15 @@ pub(crate) mod witgen_simd {
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        let sum = vaddq_u32(x, y);
-        let cin = veorq_u32(veorq_u32(sum, x), y);
-        let left = veorq_u32(x, cin);
-        let right = veorq_u32(y, cin);
-        let carry = vandq_u32(left, right);
-        (sum, left, right, carry)
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            let cin = veorq_u32(veorq_u32(sum, x), y);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
+            let carry = vandq_u32(left, right);
+            (sum, left, right, carry)
+        }
     }
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
@@ -4097,8 +4111,11 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
-        let v = veorq_u32(x, y);
-        vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        // NEON is baseline on aarch64; edition 2024 still requires the block.
+        unsafe {
+            let v = veorq_u32(x, y);
+            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+        }
     }
 
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
