@@ -172,6 +172,29 @@ const OP_BYTES: u8 = 0x05;
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
+/// Byte view of an F128 slice (ported from the Mac track's challenger, where
+/// the bulk slice absorb has been on the record since before 10/26).
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes(values: &[F128]) -> &[u8] {
+    // SAFETY: F128 is exactly two adjacent u64 fields under repr(C, align(16)),
+    // so it has no padding and every byte is initialized. On little-endian
+    // targets this is the canonical lo.to_le_bytes() || hi.to_le_bytes() layout.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes_mut(values: &mut [F128]) -> &mut [u8] {
+    let byte_len = core::mem::size_of_val(values);
+    // SAFETY: F128 has the padding-free layout documented above, and all bit
+    // patterns are valid because both fields are u64. The caller initializes
+    // the F128 slice before exposing its bytes.
+    unsafe { core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), byte_len) }
+}
+
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
 /// tracked via [`FsChallenger::absorbed_bytes`].
@@ -238,9 +261,7 @@ impl FsChallenger {
             },
             n_absorbed: 0,
         };
-        c.absorb(&[OP_DOMAIN]);
-        c.absorb(&(domain.len() as u64).to_le_bytes());
-        c.absorb(domain);
+        c.absorb_tagged(OP_DOMAIN, domain);
         c
     }
 
@@ -266,6 +287,28 @@ impl FsChallenger {
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
+    /// `op ‖ len (u64 LE) ‖ bytes` as one `update` for short inputs (labels,
+    /// Merkle roots) and two for long ones. Same byte stream as three separate
+    /// absorbs, so the transcript state is unchanged.
+    #[inline]
+    fn absorb_tagged(&mut self, op: u8, bytes: &[u8]) {
+        const INLINE: usize = 64;
+        if bytes.len() <= INLINE {
+            let mut buf = [0u8; 9 + INLINE];
+            buf[0] = op;
+            buf[1..9].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            buf[9..9 + bytes.len()].copy_from_slice(bytes);
+            self.absorb(&buf[..9 + bytes.len()]);
+        } else {
+            let mut header = [0u8; 9];
+            header[0] = op;
+            header[1..].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            self.absorb(&header);
+            self.absorb(bytes);
+        }
+    }
+
+    #[cfg(not(target_endian = "little"))]
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
@@ -322,28 +365,39 @@ impl FsChallenger {
 
 impl Challenger for FsChallenger {
     fn observe_label(&mut self, label: &[u8]) {
-        self.absorb(&[OP_LABEL]);
-        self.absorb(&(label.len() as u64).to_le_bytes());
-        self.absorb(label);
+        self.absorb_tagged(OP_LABEL, label);
     }
 
+    // Coalesced absorbs (Mac track: bulk slice absorb on the record, header
+    // coalescing from cb61ec04 / bfea3bf2): the hash sees exactly the same
+    // concatenated byte stream, in fewer, larger `update` calls.
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        let mut buf = [0u8; 18];
+        buf[0] = OP_OBSERVE;
+        buf[1] = KIND_SCALAR;
+        buf[2..10].copy_from_slice(&value.lo.to_le_bytes());
+        buf[10..].copy_from_slice(&value.hi.to_le_bytes());
+        self.absorb(&buf);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        let mut header = [0u8; 10];
+        header[0] = OP_OBSERVE;
+        header[1] = KIND_SLICE;
+        header[2..].copy_from_slice(&(values.len() as u64).to_le_bytes());
+        self.absorb(&header);
+
+        #[cfg(target_endian = "little")]
+        self.absorb(f128s_as_bytes(values));
+
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {
-        self.absorb(&[OP_BYTES]);
-        self.absorb(&(bytes.len() as u64).to_le_bytes());
-        self.absorb(bytes);
+        self.absorb_tagged(OP_BYTES, bytes);
     }
 
     fn sample_f128(&mut self) -> F128 {
@@ -362,19 +416,35 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
-        self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+        let mut header = [0u8; 10];
+        header[0] = OP_SQUEEZE;
+        header[1] = KIND_SLICE;
+        header[2..].copy_from_slice(&(n as u64).to_le_bytes());
+        self.absorb(&header);
+
+        #[cfg(target_endian = "little")]
+        {
+            let mut values = vec![F128::ZERO; n];
+            let bytes = f128s_as_bytes_mut(&mut values);
+            self.squeeze_into(bytes);
+            self.absorb(bytes);
+            values
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = vec![0u8; n * 16];
+            self.squeeze_into(&mut buf);
+            self.absorb(&buf);
+            buf.as_chunks::<16>()
+                .0
+                .iter()
+                .map(|c| F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -1714,56 +1784,6 @@ fn grind_team(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> Option<u64>
 ))]
 const TEAM_SLOTS: usize = 64;
 
-/// Lane sl1 (`FLOCK_NO_SL1_GRIND_PREWARM`): put warm grind holders on CPU
-/// ahead of a team grind that would otherwise start cold (helpers spawned at
-/// publish come on CPU 7-9 µs late). The holders run a no-op team job, then
-/// hold for `hold_us` and join every grind published meanwhile, exactly as
-/// the incumbent's post-grind holders do; while holding they run pending
-/// rayon work. Nonces are unchanged (team grinds return the smallest nonce).
-pub fn sl1_grind_prewarm(hold_us: u64) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    ))]
-    {
-        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_GRIND_PREWARM").is_none());
-        let k = &*TEAM;
-        if !*ON || !k.on || !k.detach || k.hold_us == 0 || rayon::current_thread_index().is_none() {
-            return;
-        }
-        let warm = HUB.holding.0.load(Ordering::Acquire) as usize;
-        let threads = rayon::current_num_threads().max(1);
-        let want = threads.saturating_sub(1).saturating_sub(warm);
-        if want == 0 {
-            return;
-        }
-        let sh = std::sync::Arc::new(TeamShared {
-            next: TeamPad(AtomicU64::new(1)),
-            best_c: TeamPad(AtomicU64::new(0)),
-            best_n: TeamPad(AtomicU64::new(0)),
-            slots: std::array::from_fn(|_| TeamPad(AtomicU64::new(u64::MAX))),
-            pre: blake3_pow_avx512::prepare(&[0u8; 32], 1),
-            clog: 0,
-            fold: k.fold,
-            trace: None::<TeamTrace>,
-        });
-        let _ = (AtomicU32::new(0), AtomicUsize::new(0));
-        for _ in 0..want {
-            let h = sh.clone();
-            rayon::spawn(move || team_helper(h, hold_us));
-        }
-    }
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw"
-    )))]
-    let _ = hold_us;
-}
-
 /// Shared state of one detached team grind. Helpers hold an `Arc`, so a
 /// helper that starts after the grind returned still finds valid memory: it
 /// claims a chunk past the answer and exits.
@@ -2101,6 +2121,104 @@ mod tests {
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    /// X1: the coalesced absorbs feed the hash exactly the byte stream of the
+    /// previous piecewise absorbs (one `update` per tag / length / limb).
+    #[test]
+    fn x1_coalesced_absorbs_match_piecewise_stream() {
+        fn old_new(domain: &[u8], kind: HashKind) -> FsChallenger {
+            let mut c = FsChallenger {
+                state: match kind {
+                    HashKind::Sha256 => FsState::Sha256(Sha256::new()),
+                    HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
+                },
+                n_absorbed: 0,
+            };
+            c.absorb(&[OP_DOMAIN]);
+            c.absorb(&(domain.len() as u64).to_le_bytes());
+            c.absorb(domain);
+            c
+        }
+        fn old_tagged(c: &mut FsChallenger, op: u8, bytes: &[u8]) {
+            c.absorb(&[op]);
+            c.absorb(&(bytes.len() as u64).to_le_bytes());
+            c.absorb(bytes);
+        }
+        fn old_f128(c: &mut FsChallenger, v: F128) {
+            c.absorb(&v.lo.to_le_bytes());
+            c.absorb(&v.hi.to_le_bytes());
+        }
+        fn old_sample(c: &mut FsChallenger) -> F128 {
+            c.absorb(&[OP_SQUEEZE, KIND_SCALAR]);
+            let mut buf = [0u8; 16];
+            c.squeeze_into(&mut buf);
+            c.absorb(&buf);
+            F128::new(
+                u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                u64::from_le_bytes(buf[8..].try_into().unwrap()),
+            )
+        }
+        fn old_sample_vec(c: &mut FsChallenger, n: usize) -> Vec<F128> {
+            c.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+            c.absorb(&(n as u64).to_le_bytes());
+            let mut buf = vec![0u8; n * 16];
+            c.squeeze_into(&mut buf);
+            c.absorb(&buf);
+            buf.chunks_exact(16)
+                .map(|ch| {
+                    F128::new(
+                        u64::from_le_bytes(ch[..8].try_into().unwrap()),
+                        u64::from_le_bytes(ch[8..].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        }
+        let long_label = vec![0x5au8; 200];
+        let root = [0xc3u8; 32];
+        let edge64 = [7u8; 64];
+        let edge65 = [9u8; 65];
+        for kind in KINDS {
+            for domain in [&b""[..], &b"flock-r1cs-v0"[..], &long_label[..]] {
+                let mut new = FsChallenger::with_hash(domain, kind);
+                let mut old = old_new(domain, kind);
+                assert_eq!(new.state_digest(), old.state_digest());
+                let mut seq_vals: Vec<F128> = Vec::new();
+                for round in 0..6usize {
+                    let v = F128::new(0x0123_4567_89ab_cdef ^ round as u64, u64::MAX - round as u64);
+                    new.observe_label(b"zc-round");
+                    old_tagged(&mut old, OP_LABEL, b"zc-round");
+                    new.observe_label(b"");
+                    old_tagged(&mut old, OP_LABEL, b"");
+                    new.observe_label(&long_label[..round * 30]);
+                    old_tagged(&mut old, OP_LABEL, &long_label[..round * 30]);
+                    new.observe_bytes(&root);
+                    old_tagged(&mut old, OP_BYTES, &root);
+                    new.observe_bytes(&edge64);
+                    old_tagged(&mut old, OP_BYTES, &edge64);
+                    new.observe_bytes(&edge65);
+                    old_tagged(&mut old, OP_BYTES, &edge65);
+                    new.observe_f128(v);
+                    old.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+                    old_f128(&mut old, v);
+                    seq_vals.push(v);
+                    new.observe_f128_slice(&seq_vals);
+                    old.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                    old.absorb(&(seq_vals.len() as u64).to_le_bytes());
+                    for &x in &seq_vals {
+                        old_f128(&mut old, x);
+                    }
+                    new.observe_f128_slice(&[]);
+                    old.absorb(&[OP_OBSERVE, KIND_SLICE]);
+                    old.absorb(&0u64.to_le_bytes());
+                    assert_eq!(new.sample_f128(), old_sample(&mut old), "{kind:?} r{round}");
+                    for n in [0usize, 1, 3, 128] {
+                        assert_eq!(new.sample_f128_vec(n), old_sample_vec(&mut old, n), "{kind:?} n{n}");
+                    }
+                    assert_eq!(new.state_digest(), old.state_digest(), "{kind:?} r{round}");
+                }
+            }
+        }
+    }
 
     /// The ordered cursor grind returns exactly the sequential scan's nonce.
     #[test]

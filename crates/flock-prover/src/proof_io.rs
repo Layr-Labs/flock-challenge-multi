@@ -332,19 +332,6 @@ type StashJob = Box<dyn FnOnce() + Send>;
 pub(crate) enum StashDone {
     Helper(std::sync::mpsc::Receiver<()>),
     Thread(std::thread::JoinHandle<()>),
-    /// Lane sl1: job queued as a rayon task; `wait` runs it inline if no
-    /// pool thread has taken it yet.
-    Rayon(std::sync::Arc<(std::sync::Mutex<Option<StashJob>>, std::sync::atomic::AtomicBool)>),
-}
-
-/// Lane sl1 (`FLOCK_NO_SL1_STASH_RAYON`): waking the stash helper (a 17th
-/// thread on 16 busy CPUs) preempted the open's caller for the whole encode
-/// (~0.036 ms between lincheck and the ring switch). Queue the same job on
-/// the global pool instead: an idle worker runs it on its own CPU.
-fn sl1_stash_rayon_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_STASH_RAYON").is_none());
-    *ON
 }
 
 impl StashDone {
@@ -358,16 +345,6 @@ impl StashDone {
             }
             StashDone::Thread(handle) => {
                 let _ = handle.join();
-            }
-            StashDone::Rayon(sh) => {
-                let job = sh.0.lock().unwrap_or_else(|p| p.into_inner()).take();
-                if let Some(job) = job {
-                    job();
-                } else {
-                    while !sh.1.load(std::sync::atomic::Ordering::Acquire) {
-                        std::hint::spin_loop();
-                    }
-                }
             }
         }
     }
@@ -408,30 +385,6 @@ fn stash_helper() -> Option<&'static std::sync::mpsc::Sender<StashJob>> {
 /// every busy open worker), or on a fresh thread when the helper is disabled,
 /// unavailable, or has died.
 pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
-    if sl1_stash_rayon_enabled() && rayon::current_thread_index().is_some() {
-        let sh = std::sync::Arc::new((
-            std::sync::Mutex::new(Some(Box::new(job) as StashJob)),
-            std::sync::atomic::AtomicBool::new(false),
-        ));
-        let sh2 = sh.clone();
-        rayon::spawn(move || {
-            let job = sh2.0.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if let Some(job) = job {
-                // A panicking job leaves the flag unset only if it unwinds;
-                // the waiter then finds the slot empty and spins, as the
-                // incumbent recv would have returned. Guard it.
-                struct Flag<'a>(&'a std::sync::atomic::AtomicBool);
-                impl Drop for Flag<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                let _f = Flag(&sh2.1);
-                job();
-            }
-        });
-        return StashDone::Rayon(sh);
-    }
     if stash_helper_enabled()
         && let Some(queue) = stash_helper()
     {
@@ -450,6 +403,29 @@ pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
     StashDone::Thread(std::thread::spawn(job))
 }
 
+/// Lane s2 inline stash: capacity of the compact prefix buffer. The ranked
+/// prefix (header, commitment, zerocheck, lincheck) is ~4.3 kB; the margin
+/// only avoids regrowth. A larger prefix stays correct (the Vec grows).
+const COMPACT_PREFIX_CAP: usize = 16 << 10;
+
+/// Lane s2 inline stash: the publish prefix encoded on the CALLING thread
+/// into a small buffer, for proves whose publish goes through the mapped
+/// sized file (`seed_pipe::mapped_publish_armed`). That path copies only the
+/// prefix bytes into the mapped file (`RawEncoding::write_win`), so the
+/// incumbent stash's 460 kB reservation and its page prefault are dead work
+/// there, and running them on the stash helper thread wakes a 17th thread
+/// beside 16 busy workers right when the open starts. What is left is a
+/// ~4.3 kB bincode encode, a few µs inline. The stashed bytes and fingerprint
+/// are exactly those of [`stash_pre_encoded_prefix`]; only the capacity of
+/// the holding Vec differs, which no published byte depends on.
+pub(crate) fn stash_pre_encoded_prefix_compact(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+) {
+    stash_pre_encoded_prefix_cap(commitment, zerocheck, lincheck, false, HEADER_LEN + COMPACT_PREFIX_CAP);
+}
+
 /// [`stash_pre_encoded_prefix`] with the publish-tail fix taken as an
 /// argument instead of from the process-wide env gate, so a test can encode
 /// the same bundle both ways in one process and byte-compare.
@@ -459,12 +435,22 @@ fn stash_pre_encoded_prefix_with(
     lincheck: &flock_core::lincheck::LincheckProof,
     prefault: bool,
 ) {
+    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
+    // append extends this exact Vec, so it must never need to grow.
+    stash_pre_encoded_prefix_cap(commitment, zerocheck, lincheck, prefault, HEADER_LEN + 460_000);
+}
+
+fn stash_pre_encoded_prefix_cap(
+    commitment: &Commitment,
+    zerocheck: &flock_core::zerocheck::ZerocheckProof,
+    lincheck: &flock_core::lincheck::LincheckProof,
+    prefault: bool,
+    capacity: usize,
+) {
     if !pre_encode_enabled() {
         return;
     }
-    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
-    // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 460_000);
+    let mut bytes = Vec::with_capacity(capacity);
     if prefault {
         prefault_spare_capacity(&mut bytes);
     }
@@ -1271,41 +1257,49 @@ mod tests {
             bincode::serialize_into(&mut reference, &bundle).expect("reference serialize");
 
             let mut arms: Vec<Vec<u8>> = Vec::new();
-            for prefault in [true, false] {
+            // Third arm (`None`): lane s2's compact inline stash.
+            for prefault in [Some(true), Some(false), None] {
                 // Clear any stash a sibling test left behind, so the
                 // `is_some` check below is about OUR stash.
                 if let Ok(mut slot) = PRE_ENCODED.lock() {
                     *slot = None;
                 }
-                stash_pre_encoded_prefix_with(
-                    &bundle.commitment,
-                    &bundle.proof.zerocheck,
-                    &bundle.proof.lincheck,
-                    prefault,
-                );
+                match prefault {
+                    Some(prefault) => stash_pre_encoded_prefix_with(
+                        &bundle.commitment,
+                        &bundle.proof.zerocheck,
+                        &bundle.proof.lincheck,
+                        prefault,
+                    ),
+                    None => stash_pre_encoded_prefix_compact(
+                        &bundle.commitment,
+                        &bundle.proof.zerocheck,
+                        &bundle.proof.lincheck,
+                    ),
+                }
                 if pre_encode_enabled() {
                     assert!(
                         PRE_ENCODED.lock().expect("stash lock").is_some(),
-                        "{label}: stash not written (prefault={prefault})"
+                        "{label}: stash not written (prefault={prefault:?})"
                     );
                 }
                 let bytes = bundle.to_bytes();
                 if pre_encode_enabled() {
                     assert!(
                         PRE_ENCODED.lock().expect("stash lock").is_none(),
-                        "{label}: fast path did not consume the stash (prefault={prefault})"
+                        "{label}: fast path did not consume the stash (prefault={prefault:?})"
                     );
                 }
                 assert_eq!(
                     bytes.len(),
                     reference.len(),
-                    "{label}: length moved (prefault={prefault})"
+                    "{label}: length moved (prefault={prefault:?})"
                 );
                 // Compact report: a 437 kB `assert_eq!` dump is unreadable.
                 if let Some(i) = first_difference(&bytes, &reference) {
                     panic!(
                         "{label}: published bytes moved at index {i} \
-                         (prefault={prefault}): got {:#04x}, want {:#04x}",
+                         (prefault={prefault:?}): got {:#04x}, want {:#04x}",
                         bytes[i], reference[i]
                     );
                 }
@@ -1315,6 +1309,12 @@ mod tests {
                 panic!(
                     "{label}: fix ON vs OFF differ at index {i}: {:#04x} vs {:#04x}",
                     arms[0][i], arms[1][i]
+                );
+            }
+            if let Some(i) = first_difference(&arms[0], &arms[2]) {
+                panic!(
+                    "{label}: compact inline stash differs at index {i}: {:#04x} vs {:#04x}",
+                    arms[2][i], arms[0][i]
                 );
             }
             eprintln!(

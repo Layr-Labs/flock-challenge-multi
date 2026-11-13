@@ -1921,7 +1921,7 @@ pub unsafe fn round1_ab_inner_window_from_offsets_nt2_residual<const P: bool>(
 ///
 /// `FLOCK_NO_AB_INNER_SKIP=1` force-disables the skip (diagnostics).
 pub fn planned_round1_gpu_prefix_bytes(m: usize) -> usize {
-    if m < K_SKIP + N_INNER || crate::sl2_env_set!("FLOCK_NO_AB_INNER_SKIP") {
+    if m < K_SKIP + N_INNER || std::env::var_os("FLOCK_NO_AB_INNER_SKIP").is_some() {
         return 0;
     }
     let n_outer = m - K_SKIP - N_INNER;

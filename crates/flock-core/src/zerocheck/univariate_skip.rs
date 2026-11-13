@@ -29,6 +29,26 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    // Same doubling with the four-lane VPCLMULQDQ expansion step of
+    // `lincheck::build_eq_table` (every entry is still `v + v·r` / `v·r` of
+    // the same `v`, so the table is value-identical). This builder serves the
+    // per-level `SplitEqGhash` halves of the zerocheck tail (up to 2^12 + 2^11
+    // entries, rebuilt at each level start on the serial chain) and the
+    // round-one / round-two split factors. Mac-track analogue: fba014ca routes
+    // its scalar eq builder to the SIMD one. `FLOCK_NO_X1_EQ_X4=1` restores
+    // the scalar loop below.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_X1_EQ_X4").is_some());
+        if r.len() >= 3 && !*OFF {
+            return crate::lincheck::build_eq_table(r);
+        }
+    }
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
@@ -247,9 +267,6 @@ pub(crate) fn ntt_extend_f128_vec_ghash_units(
         target_feature = "vpclmulqdq"
     ))]
     {
-        if sl1_lift_m4rm_enabled() {
-            return unsafe { ntt_extend_f128_vec_ghash_units_m4rm(in_s, inv_table) };
-        }
         return unsafe { ntt_extend_f128_vec_ghash_units_avx512(in_s, inv_table) };
     }
     #[cfg(not(all(
@@ -347,79 +364,6 @@ unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
         }
     }
     out
-}
-
-/// Lane sl1 (`FLOCK_NO_SL1_LIFT_M4RM`): the unit-image extension with
-/// two 16-entry subset tables per input instead of 8x16 masked XORs: for
-/// input z, `lo[n] = Σ_{i∈n} v·φ₈(2^i)` (i < 4) and `hi[n]` (i ≥ 4), so
-/// `out[λ] += lo[N[z][λ] & 15] + hi[N[z][λ] >> 4]` adds exactly the same
-/// products as the masked form (XOR sums regroup freely): bit-identical.
-fn sl1_lift_m4rm_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_LIFT_M4RM").is_none());
-    *ON
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
-unsafe fn ntt_extend_f128_vec_ghash_units_m4rm(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
-    use core::arch::x86_64::*;
-    const ELL: usize = 64;
-    let basis: [F128; 8] = core::array::from_fn(|i| phi8(F8(1u8 << i)));
-    let base = inv_table.data_ptr();
-    let base8 = if inv_table.has_second_image() {
-        inv_table.half_swapped_data_ptr()
-    } else {
-        core::ptr::null()
-    };
-    let mut acc = [F128::ZERO; ELL];
-    let mut bytes = [0u8; ELL];
-    unsafe {
-        for (z, &v) in in_s.iter().enumerate() {
-            if v == F128::ZERO {
-                continue;
-            }
-            let b = z / 8;
-            let row_off = (1usize << (z % 8)) * ELL;
-            let raw = if b & 1 != 0 && !base8.is_null() {
-                _mm512_loadu_si512(base8.add(row_off).cast::<__m512i>())
-            } else {
-                let r = _mm512_loadu_si512(base.add(row_off).cast::<__m512i>());
-                if b & 1 != 0 {
-                    _mm512_shuffle_epi32::<0x4E>(r)
-                } else {
-                    r
-                }
-            };
-            let img = match b >> 1 {
-                0 => raw,
-                1 => _mm512_shuffle_i64x2::<0xB1>(raw, raw),
-                2 => _mm512_shuffle_i64x2::<0x4E>(raw, raw),
-                _ => _mm512_shuffle_i64x2::<0x1B>(raw, raw),
-            };
-            _mm512_storeu_si512(bytes.as_mut_ptr().cast::<__m512i>(), img);
-            let p: [F128; 8] = core::array::from_fn(|i| v * basis[i]);
-            let mut lo = [F128::ZERO; 16];
-            let mut hi = [F128::ZERO; 16];
-            for n in 1..16usize {
-                let t = n.trailing_zeros() as usize;
-                lo[n] = lo[n & (n - 1)] + p[t];
-                hi[n] = hi[n & (n - 1)] + p[4 + t];
-            }
-            for (dst, &n) in acc.iter_mut().zip(bytes.iter()) {
-                *dst += *lo.get_unchecked((n & 15) as usize) + *hi.get_unchecked((n >> 4) as usize);
-            }
-        }
-    }
-    acc.to_vec()
 }
 
 /// Bit-plane form of [`ntt_extend_f128_vec_ghash`] (every `ell`; the

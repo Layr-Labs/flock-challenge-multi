@@ -341,6 +341,7 @@ fn roots_only_matches_production_stripes() {
                                 cross_quarter: false,
                                 compact_z: core::ptr::null_mut(),
                                 elide_z: false,
+                                ab_pend: core::ptr::null_mut(),
                             },
                             &preps,
                             [true; 3],
@@ -526,6 +527,285 @@ unsafe fn prepare16(init:u64,base:usize)->Prepared16 {
     {unsafe {prepare16_legacy(init,base)}}
 }
 
+// ---------------------------------------------------------------------------
+// Lane s2 input cache
+// ---------------------------------------------------------------------------
+//
+// Every ranked prove regenerates the BLAKE3 witness three times after the
+// witness pass: the round-one C-arm root fold and the lincheck root fold
+// (`generate_tile16`, all 4096 tiles each) and the open's fused z fold
+// (`fused_fold::generate_folded`, all 16384 pairs). Each regenerated pair
+// first rebuilds its closed-form inputs with `prepare16`: 25 SplitMix64 draws
+// for 16 lanes, 100 `vpmullq` (3 uops each), 150 shifts, 150 xors, 52 adds and
+// 25 permutes, ~677 uops, which is ~23% of a root-tile pair (with
+// `recompute_pair`) and ~12% of a fused-fold pair. The inputs are a pure
+// function of `(init, pair)`, and the witness pass already computes every
+// octa's eight-lane half of them (`prepare_closed_inputs_ordered`).
+//
+// Layout: one 832-byte slot per witness octa (physical octa `s` =
+// `group * 32 + kpair`), 26 fields of 32 bytes: cv[0..8], message[0..16],
+// counter_lo, counter_hi (zero). A 16-compression pair `P = tile * 4 + pair`
+// is octas `2P` (lanes 0..8) and `2P + 1` (lanes 8..16), exactly the two
+// eight-lane halves `prepare16` joins; a reader joins the two 32-byte halves
+// of each field with one `vinserti64x4` from memory.
+//
+// Writers: (1) the ranked witness kernels store their octa's slot (13
+// full-line non-temporal stores) when `input_cache_begin_witness` armed the
+// writer for this `init`; each producer call counts its octas, and
+// `arm_input_cache` publishes the whole buffer only if all 32768 octas were
+// stored for this `init` (the witness tasks' SFENCEs and the joins order the
+// stores before it). (2) Otherwise the first regeneration pass stores each
+// tile's eight octa slots from its `prepare16` results and marks the tile
+// after an SFENCE. Readers use a slot only when its tile is marked for the
+// armed `init`; anything else takes the incumbent `prepare16` path. The same
+// values reach the same kernels, so tiles, folds and proof bytes are
+// unchanged. `FLOCK_NO_S2_INPUT_CACHE=1` disables both writers and readers.
+
+/// Witness octas per ranked prove (1024 groups x 32 kpairs).
+const IC_OCTAS: usize = 32768;
+/// 32-byte fields per octa slot (25 inputs + the zero counter_hi pad).
+const IC_FIELDS: usize = 26;
+const IC_OCTA_BYTES: usize = IC_FIELDS * 32;
+
+/// Kill switch for the lane-s2 input cache. Read once per process.
+pub(crate) fn s2_input_cache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_S2_INPUT_CACHE").is_none());
+    *ON
+}
+
+struct InputCacheBuf(*mut u8);
+// SAFETY: a plain pointer to a process-lifetime allocation; all access goes
+// through the arming / tile-mark protocol below.
+unsafe impl Send for InputCacheBuf {}
+unsafe impl Sync for InputCacheBuf {}
+
+static IC_BUF: std::sync::OnceLock<InputCacheBuf> = std::sync::OnceLock::new();
+static IC_INIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IC_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Bit `t` set: tile `t`'s eight octa slots hold the inputs of the armed `init`.
+static IC_DONE: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+/// Witness writer: armed for `IC_W_INIT` while `IC_W_ON`; octas stored so far.
+static IC_W_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IC_W_INIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IC_W_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn input_cache_buf() -> *mut u8 {
+    IC_BUF
+        .get_or_init(|| {
+            let layout = std::alloc::Layout::from_size_align(IC_OCTAS * IC_OCTA_BYTES, 64)
+                .expect("input cache layout");
+            // SAFETY: non-zero size; the buffer lives for the whole process.
+            let p = unsafe { std::alloc::alloc(layout) };
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            InputCacheBuf(p)
+        })
+        .0
+}
+
+/// Arm the witness-pass writer for the ranked prove starting at `init`.
+/// Called once per prove on one thread, before any witness producer starts.
+/// Readers are disarmed until [`arm_input_cache`].
+pub(crate) fn input_cache_begin_witness(init: u64) {
+    use std::sync::atomic::Ordering;
+    // `FLOCK_NO_S2_WITNESS_INPUTS=1` keeps the cache but leaves the witness
+    // pass out of it (the first regeneration pass then writes, as in lane s2
+    // v1): an A/B handle for the witness-side stores. Read once.
+    static WITNESS: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_S2_WITNESS_INPUTS").is_none());
+    if !s2_input_cache_enabled() || !*WITNESS {
+        return;
+    }
+    let _ = input_cache_buf();
+    IC_LIVE.store(false, Ordering::Relaxed);
+    IC_W_INIT.store(init, Ordering::Relaxed);
+    IC_W_COUNT.store(0, Ordering::Relaxed);
+    IC_W_ON.store(true, Ordering::Release);
+}
+
+thread_local! {
+    /// Octas this thread's witness kernels stored since the last take.
+    static IC_W_LOCAL: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Producers: take (and reset) this thread's stored-octa count.
+#[inline(always)]
+pub(crate) fn input_cache_take_thread_count() -> usize {
+    IC_W_LOCAL.with(|c| c.replace(0))
+}
+
+/// Physical octa slot of a ranked witness octa (`base = kpair * 2048 + group`).
+#[inline(always)]
+fn input_cache_octa_slot(base: usize) -> usize {
+    (base & 2047) * 32 + (base >> 11)
+}
+
+/// Witness kernels: this octa's slot when the writer is armed for `init`, or
+/// null. A non-null slot is counted as stored: the G loop of
+/// `build_octa_witness_ab_stream_prepared_elide` fills its 26 fields with
+/// non-temporal stores, two full lines after each round.
+///
+/// # Safety
+/// `base` is a ranked cross-quarter octa base; each octa is produced once per
+/// prove by one producer, which issues an SFENCE before its task joins.
+#[inline(always)]
+pub(super) unsafe fn input_cache_octa_dst(init: u64, base: usize) -> *mut u8 {
+    use std::sync::atomic::Ordering;
+    if !IC_W_ON.load(Ordering::Acquire) || IC_W_INIT.load(Ordering::Relaxed) != init {
+        return core::ptr::null_mut();
+    }
+    let s = input_cache_octa_slot(base);
+    let Some(buf) = IC_BUF.get() else {
+        return core::ptr::null_mut();
+    };
+    if s >= IC_OCTAS {
+        return core::ptr::null_mut();
+    }
+    IC_W_LOCAL.with(|c| c.set(c.get() + 1));
+    unsafe { buf.0.add(s * IC_OCTA_BYTES) }
+}
+
+/// Test helper: store one octa's inputs exactly as the G loop does.
+#[cfg(test)]
+unsafe fn input_cache_store_octa(init: u64, base: usize, p: &PreparedInputs) -> bool {
+    unsafe {
+        let slot = input_cache_octa_dst(init, base);
+        if slot.is_null() {
+            return false;
+        }
+        let q = slot.cast::<V8>();
+        for i in 0..8 {
+            _mm256_stream_si256(q.add(i), p.cv[i]);
+        }
+        for i in 0..16 {
+            _mm256_stream_si256(q.add(8 + i), p.message[i]);
+        }
+        _mm256_stream_si256(q.add(24), p.counter_lo);
+        _mm256_stream_si256(q.add(25), p.counter_hi);
+    }
+    true
+}
+
+/// Producers: add the number of octas this call stored (one atomic per call).
+#[inline(always)]
+pub(crate) fn input_cache_note_octas(n: usize) {
+    if n != 0 {
+        IC_W_COUNT.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Arm the readers for the ranked prove starting at `init`. Called once per
+/// prove on one thread, after every witness producer joined and before any
+/// root or z fold of that prove starts (the pool hand-offs order it before
+/// every generator call). If the witness pass stored all 32768 octas for this
+/// `init`, every tile is marked; otherwise the marks are cleared when the key
+/// changes and the first regeneration pass stores its tiles.
+pub(crate) fn arm_input_cache(init: u64) {
+    use std::sync::atomic::Ordering;
+    if !s2_input_cache_enabled() {
+        return;
+    }
+    let _ = input_cache_buf();
+    let witness_complete = IC_W_ON.swap(false, Ordering::AcqRel)
+        && IC_W_INIT.load(Ordering::Relaxed) == init
+        && IC_W_COUNT.load(Ordering::Acquire) == IC_OCTAS;
+    if witness_complete {
+        unsafe { _mm_sfence() };
+        for word in &IC_DONE {
+            word.store(u64::MAX, Ordering::Relaxed);
+        }
+    } else if !IC_LIVE.load(Ordering::Relaxed) || IC_INIT.load(Ordering::Relaxed) != init {
+        for word in &IC_DONE {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+    IC_INIT.store(init, Ordering::Relaxed);
+    IC_LIVE.store(true, Ordering::Release);
+}
+
+/// The slot buffer when the readers are armed for exactly `init`.
+#[inline(always)]
+fn input_cache_for(init: u64) -> Option<*mut u8> {
+    use std::sync::atomic::Ordering;
+    if IC_LIVE.load(Ordering::Acquire) && IC_INIT.load(Ordering::Relaxed) == init {
+        IC_BUF.get().map(|buf| buf.0)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn input_cache_tile_done(tile: usize) -> bool {
+    IC_DONE[tile / 64].load(std::sync::atomic::Ordering::Acquire) & (1u64 << (tile % 64)) != 0
+}
+
+/// Publish tile `tile`'s stored slots. The caller has stored them with
+/// non-temporal stores; the SFENCE orders those before the mark.
+#[inline(always)]
+unsafe fn input_cache_mark_tile(tile: usize) {
+    unsafe { _mm_sfence() };
+    IC_DONE[tile / 64].fetch_or(1u64 << (tile % 64), std::sync::atomic::Ordering::Release);
+}
+
+/// Regeneration writer: store pair `pair`'s two octa slots from its joined
+/// 16-lane inputs (26 full lines of non-temporal stores).
+#[inline(always)]
+unsafe fn input_cache_store_pair(buf: *mut u8, pair: usize, p: &Prepared16) {
+    unsafe {
+        let lo = buf.add(2 * pair * IC_OCTA_BYTES).cast::<V8>();
+        let hi = buf.add((2 * pair + 1) * IC_OCTA_BYTES).cast::<V8>();
+        let mut put = |f: usize, v: V16| {
+            _mm256_stream_si256(lo.add(f), _mm512_castsi512_si256(v));
+            _mm256_stream_si256(hi.add(f), _mm512_extracti64x4_epi64::<1>(v));
+        };
+        for i in 0..8 {
+            put(i, p.cv[i]);
+        }
+        for i in 0..16 {
+            put(8 + i, p.message[i]);
+        }
+        put(24, p.counter_lo);
+        put(25, p.counter_hi);
+    }
+}
+
+/// Reader: pair `pair`'s 16-lane inputs, joined from its two octa slots.
+#[inline(always)]
+unsafe fn input_cache_load_pair(buf: *const u8, pair: usize) -> Prepared16 {
+    unsafe {
+        let lo = buf.add(2 * pair * IC_OCTA_BYTES).cast::<V8>();
+        let hi = buf.add((2 * pair + 1) * IC_OCTA_BYTES).cast::<V8>();
+        let join = |f: usize| {
+            _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_load_si256(lo.add(f))),
+                _mm256_load_si256(hi.add(f)),
+            )
+        };
+        Prepared16 {
+            cv: core::array::from_fn(join),
+            message: core::array::from_fn(|i| join(8 + i)),
+            counter_lo: join(24),
+            counter_hi: join(25),
+            block_len: _mm512_set1_epi32(64),
+            flags: _mm512_set1_epi32(11),
+        }
+    }
+}
+
+/// Prefetch pair `pair`'s two octa slots (26 lines) toward L1.
+#[inline(always)]
+unsafe fn input_cache_prefetch_pair(buf: *const u8, pair: usize) {
+    unsafe {
+        let p = buf.add(2 * pair * IC_OCTA_BYTES).cast::<i8>();
+        for line in 0..2 * IC_OCTA_BYTES / 64 {
+            _mm_prefetch::<_MM_HINT_T0>(p.add(64 * line));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DirectAction {
     Skip,
@@ -606,14 +886,31 @@ fn direct_plan_valid() -> bool {
     });
     *VALID
 }
-struct RootW16 {
+/// Lane s2 split publish (`FLOCK_NO_S2_SPLIT_PUBLISH=1` restores the
+/// shuffled form). A group's 128-byte stripe is
+/// `[lo lanes 0..8 | hi lanes 0..8 | lo lanes 8..16 | hi lanes 8..16]`.
+/// The incumbent built each 64-byte half with a lane-crossing shuffle
+/// (`vinserti64x4 zmm,zmm,ymm` / `vshufi64x2`, port 5 only) before one
+/// 64-byte store: 2 shuffle uops per group, 352 per 16-compression pair,
+/// about 16% of the pair's ALU uops. Four 32-byte stores write the same
+/// bytes to the same addresses with no shuffle: the low halves are plain
+/// `vmovdqa ymm` stores and the high halves fold into
+/// `vextracti64x4 m256, zmm, 1`, whose uops are store-address and store-data
+/// only. The stripe is read only after the whole tile is generated, so no
+/// load ever forwards from these stores. Read once per process.
+pub(crate) fn s2_split_publish_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_S2_SPLIT_PUBLISH").is_none());
+    *ON
+}
+struct RootW16<const SPLIT: bool> {
     pending: V16,
     previous: V16,
     carry_lo: V16,
     carry_hi: V16,
     out: *mut u8,
 }
-impl RootW16 {
+impl<const SPLIT: bool> RootW16<SPLIT> {
     #[inline(always)]
     fn new(out: *mut u8, pending: V16) -> Self {
         let zero = dup16(0);
@@ -640,6 +937,32 @@ impl RootW16 {
     #[inline(always)]
     unsafe fn publish(&self, group: usize, lo: V16, hi: V16) {
         unsafe {
+            if SPLIT {
+                // Same 128 bytes as the shuffled arm below: bytes 0..32 are
+                // lo lanes 0..8, 32..64 hi lanes 0..8, 64..96 lo lanes 8..16,
+                // 96..128 hi lanes 8..16. `out` is 64-byte aligned and
+                // `group * 512` keeps it so; every store is 32-byte aligned.
+                // Written as asm: with the equivalent intrinsics
+                // (`_mm256_store_si256` of the cast / `_mm512_extracti64x4`)
+                // LLVM narrows the producing ZMM ops and sinks the stores,
+                // spilling ~24 KiB of stack in the pair kernel. The asm keeps
+                // full-width inputs and the stores at the incumbent position.
+                // All four halves use the memory form of `vextracti64x4`
+                // (store-address + store-data uops for either lane index);
+                // it also avoids a ymm template modifier on a ZMM operand.
+                let p = self.out.add(group * 512);
+                core::arch::asm!(
+                    "vextracti64x4 ymmword ptr [{p}], {lo:z}, 0",
+                    "vextracti64x4 ymmword ptr [{p} + 32], {hi:z}, 0",
+                    "vextracti64x4 ymmword ptr [{p} + 64], {lo:z}, 1",
+                    "vextracti64x4 ymmword ptr [{p} + 96], {hi:z}, 1",
+                    p = in(reg) p,
+                    lo = in(zmm_reg) lo,
+                    hi = in(zmm_reg) hi,
+                    options(nostack, preserves_flags),
+                );
+                return;
+            }
             _mm512_store_si512(
                 self.out.add(group * 512).cast(),
                 _mm512_shuffle_i64x2::<0x44>(lo, hi),
@@ -708,7 +1031,7 @@ impl RootW16 {
 }
 
 #[inline(never)]
-unsafe fn recompute_pair<const SAVE: bool>(
+unsafe fn recompute_pair<const SAVE: bool, const SPLIT: bool>(
     prepared: &Prepared16,
     out: *mut u8,
     deps: *mut V16,
@@ -744,7 +1067,7 @@ unsafe fn recompute_pair<const SAVE: bool>(
             flags,
         ];
 
-        let mut wa = RootW16::new(out, initial16(shr16::<31>(flags)));
+        let mut wa = RootW16::<SPLIT>::new(out, initial16(shr16::<31>(flags)));
         wa.write_word::<0>(cv_v[0]);
         wa.write_word::<1>(cv_v[1]);
         wa.write_word::<2>(cv_v[2]);
@@ -852,18 +1175,49 @@ unsafe fn recompute_pair<const SAVE: bool>(
 /// Same full, aligned tile contract as `generate_tile`.
 pub(crate) unsafe fn generate_tile16(init: u64, tile: usize, out: *mut u8) {
     assert!(tile < 4096);
+    // Read once per tile (a cached flag), never inside the pair kernel.
+    let split = s2_split_publish_enabled();
+    let n = core::ptr::null_mut();
     unsafe {
-        for pair in 0..4 {
-            let physical = tile * 64 + pair * 16;
-            let base = physical / 256 + ((physical % 256) / 8) * 2048;
-            let input = prepare16(init, base);
-            recompute_pair::<false>(
-                &input,
-                out.add(pair * 128),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            );
+        let pair_kernel = |input: &Prepared16, pair: usize| {
+            if split {
+                recompute_pair::<false, true>(input, out.add(pair * 128), n, n, n);
+            } else {
+                recompute_pair::<false, false>(input, out.add(pair * 128), n, n, n);
+            }
+        };
+        match input_cache_for(init) {
+            // Lane s2: inputs stored by the witness pass or an earlier pass.
+            Some(buf) if input_cache_tile_done(tile) => {
+                for pair in 0..4 {
+                    let p = tile * 4 + pair;
+                    if pair < 3 || (tile + 1 < 4096 && input_cache_tile_done(tile + 1)) {
+                        // Batched claims generate consecutive tiles.
+                        input_cache_prefetch_pair(buf, p + 1);
+                    }
+                    let input = input_cache_load_pair(buf, p);
+                    pair_kernel(&input, pair);
+                }
+            }
+            // Lane s2: the first regeneration pass stores what it computes.
+            Some(buf) => {
+                for pair in 0..4 {
+                    let physical = tile * 64 + pair * 16;
+                    let base = physical / 256 + ((physical % 256) / 8) * 2048;
+                    let input = prepare16(init, base);
+                    input_cache_store_pair(buf, tile * 4 + pair, &input);
+                    pair_kernel(&input, pair);
+                }
+                input_cache_mark_tile(tile);
+            }
+            None => {
+                for pair in 0..4 {
+                    let physical = tile * 64 + pair * 16;
+                    let base = physical / 256 + ((physical % 256) / 8) * 2048;
+                    let input = prepare16(init, base);
+                    pair_kernel(&input, pair);
+                }
+            }
         }
     }
 }
@@ -884,6 +1238,129 @@ fn paired_roots_match_eight_lane_generator() {
             }
             assert_eq!(a.0, b.0, "seed={seed:x} tile={tile}");
         }
+    }
+}
+
+/// Lane s2 input cache: the storing pass and the reading pass produce the
+/// incumbent tiles, every stored slot equals `prepare16`, and a generator call
+/// for another `init` ignores the armed cache.
+/// Serializes the tests that arm the process-global input cache.
+#[cfg(test)]
+static S2_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn s2_input_cache_matches_incumbent_tiles() {
+    let _guard = S2_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // An init no other test uses: before arming, generate_tile16 is the incumbent.
+    let init = 0x5a2b_17c0_ffee_0042u64;
+    let tiles = [0usize, 1, 2, 77, 1023, 2048, 4094, 4095];
+    let mut reference: Vec<Box<Tile>> = Vec::new();
+    for &tile in &tiles {
+        let mut t = Box::new(Tile([0xa5; 176 * 512]));
+        unsafe { generate_tile16(init, tile, t.0.as_mut_ptr()) };
+        reference.push(t);
+    }
+    arm_input_cache(init);
+    if !s2_input_cache_enabled() {
+        return;
+    }
+    for pass in 0..2 {
+        for (i, &tile) in tiles.iter().enumerate() {
+            let mut t = Box::new(Tile([0x5a; 176 * 512]));
+            unsafe { generate_tile16(init, tile, t.0.as_mut_ptr()) };
+            assert!(t.0 == reference[i].0, "pass={pass} tile={tile}");
+            assert!(input_cache_tile_done(tile), "tile {tile} not marked after pass {pass}");
+        }
+    }
+    let buf = input_cache_for(init).expect("armed cache");
+    let bytes = |v: &V16| -> [u8; 64] { unsafe { core::mem::transmute::<V16, [u8; 64]>(*v) } };
+    for &tile in &tiles {
+        for pair in 0..4 {
+            let physical = tile * 64 + pair * 16;
+            let base = physical / 256 + ((physical % 256) / 8) * 2048;
+            let want = unsafe { prepare16(init, base) };
+            let got = unsafe { input_cache_load_pair(buf, tile * 4 + pair) };
+            for i in 0..8 {
+                assert_eq!(bytes(&got.cv[i]), bytes(&want.cv[i]), "tile={tile} pair={pair} cv{i}");
+            }
+            for i in 0..16 {
+                assert_eq!(bytes(&got.message[i]), bytes(&want.message[i]), "tile={tile} pair={pair} m{i}");
+            }
+            for (g, w) in [(&got.counter_lo, &want.counter_lo), (&got.counter_hi, &want.counter_hi),
+                           (&got.block_len, &want.block_len), (&got.flags, &want.flags)] {
+                assert_eq!(bytes(g), bytes(w), "tile={tile} pair={pair} tail");
+            }
+        }
+    }
+    // Another init must not see this prove's slots.
+    assert!(input_cache_for(init ^ 1).is_none());
+    let mut a = Box::new(Tile([0; 176 * 512]));
+    let mut b = Box::new(Tile([0; 176 * 512]));
+    unsafe {
+        generate_tile(init ^ 1, 77, a.0.as_mut_ptr());
+        generate_tile16(init ^ 1, 77, b.0.as_mut_ptr());
+    }
+    assert!(a.0 == b.0, "foreign init");
+}
+
+/// Lane s2 witness-pass writer: storing every octa's eight-lane inputs (as the
+/// ranked witness kernels do) and arming publishes all tiles, whose joined
+/// pairs equal `prepare16`; an incomplete witness pass publishes nothing.
+#[test]
+fn s2_witness_written_input_cache_matches_prepare16() {
+    let _guard = S2_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let init = 0x7e57_ca5e_0123_4567u64;
+    if !s2_input_cache_enabled() {
+        return;
+    }
+    // Incomplete pass: one octa missing -> no tile may be marked.
+    input_cache_begin_witness(init ^ 0xff);
+    let _ = input_cache_take_thread_count();
+    for s in 0..IC_OCTAS - 1 {
+        let base = (s % 32) * 2048 + s / 32;
+        let p = unsafe { prepare_closed_inputs_ordered(init ^ 0xff, base, true) };
+        assert!(unsafe { input_cache_store_octa(init ^ 0xff, base, &p) });
+    }
+    input_cache_note_octas(input_cache_take_thread_count());
+    arm_input_cache(init ^ 0xff);
+    assert!(!input_cache_tile_done(4095), "incomplete witness pass published its last tile");
+    // Complete pass.
+    input_cache_begin_witness(init);
+    let _ = input_cache_take_thread_count();
+    for s in 0..IC_OCTAS {
+        let base = (s % 32) * 2048 + s / 32;
+        assert_eq!(input_cache_octa_slot(base), s);
+        let p = unsafe { prepare_closed_inputs_ordered(init, base, true) };
+        assert!(unsafe { input_cache_store_octa(init, base, &p) });
+    }
+    input_cache_note_octas(input_cache_take_thread_count());
+    unsafe { _mm_sfence() };
+    arm_input_cache(init);
+    let buf = input_cache_for(init).expect("armed cache");
+    let bytes = |v: &V16| -> [u8; 64] { unsafe { core::mem::transmute::<V16, [u8; 64]>(*v) } };
+    for tile in [0usize, 1, 999, 2048, 4095] {
+        assert!(input_cache_tile_done(tile));
+        for pair in 0..4 {
+            let physical = tile * 64 + pair * 16;
+            let base = physical / 256 + ((physical % 256) / 8) * 2048;
+            let want = unsafe { prepare16(init, base) };
+            let got = unsafe { input_cache_load_pair(buf, tile * 4 + pair) };
+            for i in 0..8 {
+                assert_eq!(bytes(&got.cv[i]), bytes(&want.cv[i]), "tile={tile} pair={pair} cv{i}");
+            }
+            for i in 0..16 {
+                assert_eq!(bytes(&got.message[i]), bytes(&want.message[i]), "tile={tile} pair={pair} m{i}");
+            }
+            assert_eq!(bytes(&got.counter_lo), bytes(&want.counter_lo), "tile={tile} pair={pair} counter");
+        }
+        // And the tile generator reading them equals the eight-lane reference.
+        let mut a = Box::new(Tile([0; 176 * 512]));
+        let mut b = Box::new(Tile([1; 176 * 512]));
+        unsafe {
+            generate_tile(init, tile, a.0.as_mut_ptr());
+            generate_tile16(init, tile, b.0.as_mut_ptr());
+        }
+        assert!(a.0 == b.0, "tile {tile} from witness-written inputs");
     }
 }
 
@@ -952,7 +1429,9 @@ pub(crate) unsafe fn generate_pair_with_deps(
         let physical = tile * 64 + pair * 16;
         let base = physical / 256 + ((physical % 256) / 8) * 2048;
         let input = prepare16(init, base);
-        recompute_pair::<true>(
+        // Off the ranked path (the fused z fold uses the stage generator);
+        // keeps the incumbent publish.
+        recompute_pair::<true, false>(
             &input,
             out.add(pair * 128),
             deps.cast(),
