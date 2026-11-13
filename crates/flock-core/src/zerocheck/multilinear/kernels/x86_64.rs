@@ -2504,7 +2504,7 @@ pub(crate) fn zc_tail_pf_enabled() -> bool {
     *ON
 }
 
-const ZC_TAIL_PF_TILES: usize = 2;
+const ZC_TAIL_PF_TILES: usize = 3;
 
 pub(crate) fn zc_tail_pf_spread_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
