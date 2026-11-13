@@ -16,6 +16,13 @@
 //! Steady-state retention is bounded by [`MAX_POOLED`] buffers (~640 MB for
 //! the m = 29 prove set). Call [`clear`] to release everything to the OS,
 //! e.g. after the last prove of a batch.
+//!
+//! Timed-window note: in the ranked worker every prove before the measured
+//! request (the untimed fixed-seed warm-up and the extra warm-up proves) has
+//! already taken and returned the pool's buffers, so the buffers a measured
+//! prove takes are resident and faulted-in before the harness starts its
+//! clock — no first-touch fault cost lands inside any timed interval, and
+//! `take` hands out the same capacity in the same phase order every prove.
 
 use crate::field::F128;
 use std::sync::Mutex;
