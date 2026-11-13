@@ -2,6 +2,8 @@
 //! the hash chain** (forked from [`super::sha2`]). Identical R1CS semantics;
 //! only the input chaining value `H_in` and the output chaining value `H_out`
 //! move to aligned 256-bit slots (slots 0 and 1), so the chain shift argument
+//! No constraint changes with the layout, so proofs from either variant
+//! verify against the same circuit semantics.
 //! folds them via a single tensor opening. `H_in` and `H_out` are exactly 256
 //! bits each, so the slots have NO interior padding. `K_LOG = 15` is unchanged.
 //!

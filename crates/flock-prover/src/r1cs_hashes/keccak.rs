@@ -1,6 +1,8 @@
 //! Keccak-f[1600] permutation primitives + compact per-Keccak R1CS encoder.
 //!
 //! ## Two layers
+//! The split keeps the bit-level permutation testable on its own and the
+//! encoder free of per-round branch code.
 //!
 //! 1. **Keccak-f primitives**: reference bit-level implementation and the
 //!    fast u64-lane version following FIPS 202. Shared with the rest of the
