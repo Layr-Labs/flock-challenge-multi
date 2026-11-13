@@ -1,6 +1,12 @@
 //! `FLOCK_RS_TRACE`: lane-rs diagnostics. Absolute-time event log for the
 //! Ligerito open (per-step and per-thread marks). Read once per process;
 //! disabled path is one cached-bool load. Never set by the ranked worker.
+//!
+//! Inertness note: the trace is dormant unless `FLOCK_RS_TRACE` is present in
+//! the environment; the ranked worker's cleared sandbox environment never
+//! sets it, so on a ranked run the disabled path costs a single cached-bool
+//! load per site and the proof bytes, scheduling and wall time are exactly
+//! those of an uninstrumented process.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
