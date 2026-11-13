@@ -1,5 +1,7 @@
 //! Bit-packing and R1CS-row helpers shared by the monolithic hash R1CS
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
+//! Sharing the packing layer keeps row layouts identical across the
+//! supported hash functions, which is what the round-1 kernels assume.
 //! orchestration lives in [`crate::prover::prove_fast_from_witness`].
 
 use std::sync::OnceLock;

@@ -3,6 +3,8 @@
 //!
 //! The ranked producer may skip z's global DRAM stores for octas it seeds
 //! from their compact copy (`StreamProj::elide_z`). Every z bit is then
+//! Regeneration runs after the producer joins, so no consumer ever reads
+//! an elided octa before its tiles are final.
 //! still determined by the tiles:
 //!
 //! * root wires (11,249 of the 11,313 plan roots) are stored verbatim, one
