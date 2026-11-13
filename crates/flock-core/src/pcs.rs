@@ -2,6 +2,14 @@
 //!
 //! Construction: Binius-style PCS with F_{2^128} packing.
 //!
+//! Configuration note: every ranked parameter that shapes this scheme — the
+//! Merkle hash kind, the folding rate, the number of NTTs and the ring-switch
+//! geometry — lives in [`PcsParams`] and is fixed once per `Blake3Setup`
+//! before the ready file is published. The prover and the trusted verifier
+//! derive their configs from the identical parameters, so both sides walk
+//! the same trees and the same recursion levels, and no parameter of the
+//! scheme is influenced by the environment, thread count, or timing.
+//!
 //! - **Commit**: pack the 2^m Boolean witness into 2^(m−7) F_{2^128} elements
 //!   (one bit per polynomial-basis coordinate of F_{2^128}), batch RS-encode
 //!   via additive NTT, Merkle-commit the codeword.
