@@ -3,6 +3,8 @@
 //! The standard R1CS is `(A·z) ⊙ (B·z) ⊕ (C·z) = 0`. We fix `C = I` (the
 //! circuit-R1CS shape `(A·z) ⊙ (B·z) = z`), so the c-claim emitted by
 //! zerocheck is already a `z`-claim — no transformation needed downstream.
+//! With `C = I`, the c-side claim is a witness claim itself, so the
+//! zerocheck output feeds the lincheck without a reduction step.
 //!
 //! We further specialize to **block-diagonal `A` and `B`**:
 //!   `A = I_{2^n_log} ⊗ A_0`, etc. The base matrices are `k × k` sparse

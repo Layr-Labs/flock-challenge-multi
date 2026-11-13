@@ -3,6 +3,8 @@
 //! adjacent license. All kernels preserve seven compression rounds, fixed
 //! strides and zero counters. Canonical kernels keep ordinary transposes;
 //! the first-edge interface passes CV word planes directly to parent hashes.
+//! Keeping the child count, stride and counter constant lets the assembly
+//! hard-code the message layout instead of reading a descriptor.
 use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
 unsafe extern "C" {
