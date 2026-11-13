@@ -339,6 +339,134 @@ impl CompactSched {
     }
 }
 
+/// Lane sl1 (`FLOCK_SL1_RC_WARM=1`, default OFF: the reconstruct got 0.02 ms
+/// faster but the lincheck fold/reduce slower, net positive): the reconstruct after a root fold ran
+/// cold (schedule and node table evicted by the fold: 0.085 ms vs ~0.04 warm).
+/// The thread that will reconstruct arms a hook before the fold; when its own
+/// fold worker runs out of tiles (other workers are still finishing) it pulls
+/// the compact schedule into its caches and pre-builds the node table
+/// (allocated, zero-filled exactly as `reconstruct_compact` would). Every
+/// table entry the reconstruct reads is written first either way, so the
+/// output is bit-identical.
+fn sl1_rc_warm_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_SL1_RC_WARM").is_some());
+    *ON
+}
+
+struct Sl1Warm {
+    plan: *const LinearFoldPlan,
+    k: usize,
+    /// Bytes of (ops, roots) touched so far, then table entries filled.
+    off: usize,
+    table: Option<Vec<F128>>,
+}
+
+thread_local! {
+    static SL1_RC_HOOK: std::cell::RefCell<Option<Sl1Warm>> = const { std::cell::RefCell::new(None) };
+    static SL1_RC_TABLE: std::cell::Cell<Option<Vec<F128>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tiles left in the fold when the reconstructing thread starts warming.
+fn sl1_warm_start_tiles() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_SL1_WARM_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+    });
+    *N
+}
+
+fn sl1_warm_budget() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_SL1_WARM_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(112) << 10
+    });
+    *N
+}
+
+fn sl1_rc_warm_arm(plan: &LinearFoldPlan, k: usize) {
+    if !sl1_rc_warm_enabled() || !level_sched_enabled() || !rc_compact_enabled() {
+        return;
+    }
+    if let Some(s) = plan.level_sched.get() {
+        if s.k == k && s.compact.is_some() {
+            SL1_RC_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Sl1Warm { plan: plan as *const LinearFoldPlan, k, off: 0, table: None })
+            });
+        }
+    }
+}
+
+/// One warm slice (`budget` bytes) on the thread that armed the hook, once
+/// fewer than `sl1_warm_start_tiles` tiles remain unclaimed. Returns
+/// immediately on every other thread. Prefetch-only work: the schedule is
+/// read-only and the table is (re)initialized exactly as the reconstruct does.
+pub(crate) fn sl1_rc_warm_step(remaining_tiles: usize) {
+    if remaining_tiles > sl1_warm_start_tiles() {
+        return;
+    }
+    SL1_RC_HOOK.with(|h| {
+        let mut g = h.borrow_mut();
+        if let Some(w) = g.as_mut() {
+            sl1_warm_advance(w, sl1_warm_budget());
+        }
+    });
+}
+
+fn sl1_warm_advance(w: &mut Sl1Warm, mut budget: usize) {
+    // SAFETY: armed by `RootFoldSource::fold` on this thread, which keeps the
+    // plan borrowed until it has called `sl1_rc_warm_run`.
+    let plan = unsafe { &*w.plan };
+    let Some(c) = plan.level_sched.get().and_then(|s| s.compact.as_ref()) else { return };
+    let ops = unsafe { core::slice::from_raw_parts(c.ops.as_ptr().cast::<u8>(), core::mem::size_of_val(&*c.ops)) };
+    let roots = unsafe { core::slice::from_raw_parts(c.roots.as_ptr().cast::<u8>(), core::mem::size_of_val(&*c.roots)) };
+    let pre = ops.len() + roots.len();
+    while budget > 0 && w.off < pre {
+        let (src, o) = if w.off < ops.len() { (ops, w.off) } else { (roots, w.off - ops.len()) };
+        let end = (o + budget).min(src.len());
+        let mut i = o & !63;
+        while i < end {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(src.as_ptr().add(i).cast());
+            }
+            i += 64;
+        }
+        budget = budget.saturating_sub(end - o);
+        w.off += end - o;
+    }
+    if budget == 0 || w.off < pre {
+        return;
+    }
+    let live_cols = plan.roots.len() + plan.outputs.len();
+    let t = w.table.get_or_insert_with(|| crate::alloc_uninit_vec::<F128>(c.table_len));
+    let done = w.off - pre;
+    if done < t.len() {
+        let end = (done + budget / 16).min(t.len());
+        // Every entry gets ZERO: a superset of the reconstruct's own init
+        // (it zeroes live_cols..=k; the rest is written before it is read).
+        let _ = live_cols;
+        t[done..end].fill(F128::ZERO);
+        w.off += end - done;
+    }
+}
+
+/// Finishes the hook armed on this thread, if any, and parks the table for
+/// the reconstruct. Called after the fold join on the reconstructing thread.
+pub(crate) fn sl1_rc_warm_run() {
+    let Some(mut w) = SL1_RC_HOOK.with(|h| h.borrow_mut().take()) else { return };
+    crate::rstrace::ev("sl1:warm0", 0);
+    sl1_warm_advance(&mut w, usize::MAX / 2);
+    if let Some(t) = w.table.take() {
+        SL1_RC_TABLE.with(|s| s.set(Some(t)));
+    }
+    crate::rstrace::ev("sl1:warm1", 0);
+}
+
+fn sl1_join_swap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_JOINSWAP").is_none());
+    *ON
+}
+
 fn rc_compact_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT1_RC_COMPACT").is_none());
@@ -527,7 +655,10 @@ impl LinearFoldPlan {
     #[inline(always)]
     fn reconstruct_compact(&self, c: &CompactSched, folded: &[F128], k: usize) -> Vec<F128> {
         let live_cols = self.roots.len() + self.outputs.len();
-        let mut t = if live_cols <= k {
+        let pre = SL1_RC_TABLE.with(|s| s.take()).filter(|v| v.len() == c.table_len);
+        let mut t = if let Some(v) = pre {
+            v
+        } else if live_cols <= k {
             let mut v = crate::alloc_uninit_vec::<F128>(c.table_len);
             v[live_cols..=k].fill(F128::ZERO);
             v
@@ -901,6 +1032,7 @@ impl RootFoldSource {
         let k = 1usize << k_log;
         assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
         crate::rstrace::ev("rf:fold0", 0);
+        sl1_rc_warm_arm(&self.plan, k);
         let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
             let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
             let eq_lo = build_eq_table(lo);
@@ -924,6 +1056,9 @@ impl RootFoldSource {
             let eq = build_eq_table(x_outer);
             self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]), |indices| indices.map(|i| eq[i]))
         };
+        // Hook not consumed (this thread ran no fold worker): run it now so
+        // the table slot is filled on the reconstructing thread either way.
+        sl1_rc_warm_run();
         crate::rstrace::ev("rf:recon0", self.plan.children.len() as u32);
         let r = self.plan.reconstruct(&folded, k);
         crate::rstrace::ev("rf:end", 0);
@@ -5508,6 +5643,13 @@ fn prove_padded_inner<Ch: Challenger>(
         if kicked.is_some() {
             let comb_vec = fold_comb(beta);
             (comb_vec, fold_z(kicked))
+        } else if sl1_join_swap_enabled() {
+            // Lane sl1 (`FLOCK_NO_SL1_JOINSWAP`): the caller runs the z fold
+            // (the critical arm, ending in the serial reduce + reconstruct)
+            // and the short comb fold is stolen, so the sumcheck starts on
+            // the thread that finished the fold, without a join wake-up.
+            let (z, comb) = rayon::join(|| fold_z(None), || fold_comb(beta));
+            (comb, z)
         } else {
             rayon::join(|| fold_comb(beta), || fold_z(None))
         }

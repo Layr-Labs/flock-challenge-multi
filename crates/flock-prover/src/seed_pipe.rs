@@ -414,6 +414,9 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// process exit after publication instead of inside the timed window.
 static TIMED_SPEC_PROVE: AtomicBool = AtomicBool::new(false);
 
+static SL2_LATECLOSE_OFF: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_LATECLOSE").is_some());
+
 pub(crate) fn is_timed_speculative_prove() -> bool {
     TIMED_SPEC_PROVE.load(Ordering::Relaxed)
 }
@@ -640,7 +643,7 @@ fn preseed_spin_start() {
 /// worker awake, so no sleeping worker has to be woken for the parallel
 /// encode. Released by the body's [`SpinGuard`] (or earlier, see publish).
 pub(crate) fn tail_spin_start() {
-    if flock_core::is_pool_owner() && std::env::var_os("FLOCK_EXP_NO_TAILSPIN").is_none() {
+    if flock_core::is_pool_owner() && !flock_core::sl2_env_set!("FLOCK_EXP_NO_TAILSPIN") {
         preseed_spin_start();
     }
 }
@@ -659,7 +662,7 @@ fn hot_wait_enabled() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
         && flock_core::ranked_pool_built()
         && rayon::current_num_threads() > 2
-        && std::env::var_os("FLOCK_NO_HOT_SEED_WAIT").is_none()
+        && !flock_core::sl2_env_set!("FLOCK_NO_HOT_SEED_WAIT")
 }
 
 /// Run `f` on a pool worker with the pre-seed spinners up when `hot`.
@@ -1010,7 +1013,7 @@ fn publish_sized(path: &Path, bundle: &R1csProofBundleLigerito) -> Option<Result
         }
     }
     flock_core::gaptime::abs("encoded");
-    if std::env::var_os("FLOCK_EXP_SPIN_TO_END").is_none() {
+    if !flock_core::sl2_env_set!("FLOCK_EXP_SPIN_TO_END") {
         preseed_spin_end();
     }
     flock_core::gaptime::abs("pub:spinend");
@@ -1405,6 +1408,9 @@ fn speculative_main(
     // and their first worker got on CPU 0.10-0.24 ms into the timed proof. Signalling from inside the hot wait,
     // after every spinner has started, moves only the moment readiness is announced; nothing inside the timed
     // proof changes, and keeping the pool spinning before the seed is what this wait already does.
+    // Read before the seed arrives (the first env read after the long hot
+    // wait costs ~2 us of cold misses).
+    std::sync::LazyLock::force(&SL2_LATECLOSE_OFF);
     let late_signal = hot && ready_when_hot_enabled();
     let signal_warm = move || {
         let (lock, cv) = &*warm;
@@ -1435,7 +1441,22 @@ fn speculative_main(
             mark_dead();
             return;
         };
-        close_fd(real_stdin);
+        // Lane sl2 (`FLOCK_NO_SL2_LATECLOSE`): nothing reads the real stdin
+        // again; close it when this body returns (after the publish) instead
+        // of paying the close at the head of the timed window.
+        struct CloseOnDrop(i32);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                close_fd(self.0);
+            }
+        }
+        let _stdin_guard = if !*SL2_LATECLOSE_OFF {
+            Some(CloseOnDrop(real_stdin))
+        } else {
+            close_fd(real_stdin);
+            None
+        };
+        flock_core::rstrace::ev("sp:closed", 0);
 
         let parsed = std::str::from_utf8(&line)
             .ok()
@@ -1454,8 +1475,10 @@ fn speculative_main(
             return;
         }
 
+        flock_core::rstrace::ev("sp:parsed", 0);
         let seed_at = std::time::Instant::now();
         TIMED_SPEC_PROVE.store(true, Ordering::Relaxed);
+        flock_core::SL2_TIMED_TAIL.store(true, Ordering::Relaxed);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Inline path: nothing is materialized except the two blocks the O(1)
             // adoption gate reads. Everything else is evaluated inside witgen from
@@ -1473,8 +1496,10 @@ fn speculative_main(
                     state.seed_at = Some(seed_at);
                     state.blocks_at = Some(std::time::Instant::now());
                     state.blocks = Some(published);
+                    flock_core::rstrace::ev("sp:locked", 0);
                     shared().signal.notify_all();
                 }
+                flock_core::rstrace::ev("sp:notified", 0);
                 return run(setup_addr, BlockSource::Closed { init, len: n });
             }
 
@@ -1498,6 +1523,7 @@ fn speculative_main(
         }));
 
         TIMED_SPEC_PROVE.store(false, Ordering::Relaxed);
+        flock_core::SL2_TIMED_TAIL.store(false, Ordering::Relaxed);
         match (direct_proof_path.as_deref(), outcome) {
             (Some(path), Ok(out)) => {
                 let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

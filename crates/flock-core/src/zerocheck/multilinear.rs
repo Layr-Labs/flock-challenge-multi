@@ -871,7 +871,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     // (bit-identical output). `FLOCK_NO_R2_QMSG` is a local-diagnostics kill
     // switch for one-process A/B runs; the ranked worker never sets it.
     #[cfg(target_arch = "aarch64")]
-    let r2_qmsg = std::env::var_os("FLOCK_NO_R2_QMSG").is_none();
+    let r2_qmsg = !crate::sl2_env_set!("FLOCK_NO_R2_QMSG");
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
@@ -1222,11 +1222,71 @@ pub(crate) fn flat_chunks<T>(
     assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
     let n = a_out.len() / chunk;
     let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
+    let rec = crate::flat_par::sl1_aff_enabled() && n <= crate::flat_par::SL1_OWN_CAP;
+    if rec {
+        *crate::flat_par::SL1_OWN_GEOM.lock().unwrap() = (ao, bo, chunk * 16, n);
+    }
     crate::flat_par::map_reduce(
         n,
         |i| {
+            if rec {
+                let t = rayon::current_thread_index().map_or(u8::MAX, |t| t.min(250) as u8);
+                crate::flat_par::SL1_OWN[i].store(t, core::sync::atomic::Ordering::Relaxed);
+            }
             // SAFETY: item `i` owns output chunk `i` of both tables; chunks are
             // disjoint and both borrows outlive `map_reduce`.
+            let (ac, bc) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
+                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk), chunk),
+                )
+            };
+            leaf((i, (ac, bc)))
+        },
+        id,
+        op,
+    )
+}
+
+/// Lane sl1: [`team_chunks`] that hands item `i` (input chunk `i` of `a`,
+/// `chunk_in` elements) first to the thread that wrote it in the last
+/// flat-claimed level, when `a` is that level's output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn team_chunks_aff<T>(
+    a_in: &[F128],
+    chunk_in: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    chunk: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
+    let n = a_out.len() / chunk;
+    let owner: Option<Vec<u8>> = if crate::flat_par::sl1_aff_enabled() {
+        let (ga, _gb, gbytes, gn) = *crate::flat_par::SL1_OWN_GEOM.lock().unwrap();
+        let base = a_in.as_ptr() as usize;
+        if gn > 0 && base == ga && a_in.len() * 16 == gbytes * gn {
+            Some((0..n).map(|i| {
+                let off = i * chunk_in * 16;
+                crate::flat_par::SL1_OWN[(off / gbytes).min(gn - 1)].load(core::sync::atomic::Ordering::Relaxed)
+            }).collect())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(owner) = owner else { return team_chunks(a_out, b_out, chunk, leaf, id, op) };
+    assert_eq!(a_out.len(), b_out.len());
+    assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
+    let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
+    crate::flat_par::team_map_reduce_aff(
+        n,
+        &owner,
+        |i| {
+            // SAFETY: item `i` owns output chunk `i` of both tables; chunks are
+            // disjoint and both borrows outlive `team_map_reduce_aff`.
             let (ac, bc) = unsafe {
                 (
                     core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
@@ -3862,7 +3922,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
             flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
         } else if team && crate::flat_par::team_ready() {
             // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
-            team_chunks(a_out, b_out, chunk_out, leaf, id, op)
+            team_chunks_aff(a, chunk_in, a_out, b_out, chunk_out, leaf, id, op)
         } else {
             a_out
                 .par_chunks_mut(chunk_out)

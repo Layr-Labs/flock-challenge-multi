@@ -1546,6 +1546,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = crate::lincheck::build_eq_table(low_point);
+    crate::rstrace::ev("col:eq", 0);
     if rs_tail_par_enabled() {
         // Same bank-major accumulation through the vectorized `scale_slice` /
         // `add_scaled` leaves — identical per-element operation in identical
@@ -1563,6 +1564,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
                 low_eq[bank],
             );
         }
+        crate::rstrace::ev("col:end", 0);
         return out;
     }
     let mut out = vec![F128::ZERO; n_packed];
@@ -3030,9 +3032,11 @@ fn build_direct_fold8_factors_reusing_a_state_from_generators(
     let state_len = 64 * n_packed;
     assert_eq!(fold8.len(), state_len);
     let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
+    crate::rstrace::ev("rs:al", 0);
     let mut w_state;
     if rs_reuse_fold8_a_state_enabled() {
         direct_fold8_a_state_into(&fold8, &mut a_state);
+        crate::rstrace::ev("rs:a", 0);
         w_state = fold8;
         unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
     } else {
@@ -3044,9 +3048,12 @@ fn build_direct_fold8_factors_reusing_a_state_from_generators(
             || direct_fold8_a_state_into(&fold8, &mut a_state),
         );
     }
+    crate::rstrace::ev("rs:aw", 0);
     let round0 = direct_fold8_round0_wide(&a_state, &w_state);
+    crate::rstrace::ev("rs:r0", 0);
     let tail = &suffix[6..];
     let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+    crate::rstrace::ev("rs:eq", 0);
     DirectFold8Factors {
         eq_lo,
         eq_hi,
@@ -3054,6 +3061,83 @@ fn build_direct_fold8_factors_reusing_a_state_from_generators(
         w_state,
         round0,
     }
+}
+
+/// Lane sl2 (`FLOCK_NO_SL2_F8LATE`): [`build_direct_fold8_factors_reusing_a_state_from_generators`]
+/// reading the borrowed bank tensor directly (no 128 KiB copy), with the A
+/// and W states built side by side and the tail split beside round 0. Each
+/// output is the same pure function of the same inputs.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+fn build_direct_fold8_factors_from_slice(
+    fold8: &[F128],
+    suffix: &[F128],
+    generators: &[F128],
+    pre: Option<PreParts>,
+) -> DirectFold8Factors {
+    let low_eq: [F128; 64] = crate::lincheck::build_eq_table(&suffix[..6])
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
+    let n_packed = 1usize << LOG_PACKING;
+    let state_len = 64 * n_packed;
+    assert_eq!(fold8.len(), state_len);
+    let mut w_state = crate::alloc_uninit_vec::<F128>(state_len);
+    crate::rstrace::ev("rs:al", 0);
+    let (pre_a, pre_eq) = match pre {
+        Some(p) => (Some(p.a), Some(p.eq)),
+        None => (None, None),
+    };
+    let a_state = if let Some(a) = pre_a.filter(|a| a.len() == state_len) {
+        crate::rstrace::ev("rs:W0", 0);
+        unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
+        crate::rstrace::ev("rs:W1", 0);
+        a
+    } else {
+        let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
+        rayon::join(
+            || { crate::rstrace::ev("rs:A0", 0); direct_fold8_a_state_lines(fold8, &mut a_state); crate::rstrace::ev("rs:A1", 0); },
+            || { crate::rstrace::ev("rs:W0", 0); unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) }; crate::rstrace::ev("rs:W1", 0); },
+        );
+        a_state
+    };
+    crate::rstrace::ev("rs:aw", 0);
+    let tail = &suffix[6..];
+    if let Some((eq_lo, eq_hi)) = pre_eq {
+        let round0 = direct_fold8_round0_chunked(&a_state, &w_state);
+        crate::rstrace::ev("rs:eq", 0);
+        return DirectFold8Factors { eq_lo, eq_hi, a_state, w_state, round0 };
+    }
+    let (round0, (eq_lo, eq_hi)) = rayon::join(
+        || direct_fold8_round0_chunked(&a_state, &w_state),
+        || build_eq_split(tail, deferred_split_n_lo(tail.len())),
+    );
+    crate::rstrace::ev("rs:eq", 0);
+    DirectFold8Factors {
+        eq_lo,
+        eq_hi,
+        a_state,
+        w_state,
+        round0,
+    }
+}
+
+/// XOR sums of canonical values: any even-aligned chunking of the pair sum
+/// gives the same (u0, u2) as [`direct_fold8_round0_wide`] on the whole.
+fn direct_fold8_round0_chunked(a_state: &[F128], w_state: &[F128]) -> (F128, F128) {
+    use rayon::prelude::*;
+    const CH: usize = 8;
+    let len = a_state.len() / CH;
+    (0..CH)
+        .into_par_iter()
+        .map(|k| direct_fold8_round0_wide(&a_state[k * len..(k + 1) * len], &w_state[k * len..(k + 1) * len]))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2))
 }
 
 fn direct_fold8_states_seq(
@@ -3105,12 +3189,54 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
     generators: &[F128],
     w_state: &mut [F128],
 ) {
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(w_state.len(), 64 * n_packed);
+    let map = build_gfni_direct_fold_map_from_generators(generators);
+    crate::rstrace::ev("rs:map", 0);
+    // Lane sl2 (`FLOCK_NO_SL2_WPAR`): the 128 bit rows are independent
+    // given their starting basis products, and the start of chunk k is the
+    // same `bit_lo` repeated mul-by-x steps the serial loop applies, so each
+    // chunk writes the same words as the serial loop.
+    if sl2_wpar_enabled() && rayon::current_num_threads() >= 8 {
+        use rayon::prelude::*;
+        const CH: usize = 8;
+        let w_addr = w_state.as_mut_ptr() as usize;
+        let map = &map;
+        (0..CH).into_par_iter().for_each(|k| unsafe {
+            direct_fold8_w_rows(low_eq, map, w_addr as *mut F128, k * n_packed / CH, (k + 1) * n_packed / CH);
+        });
+        return;
+    }
+    unsafe { direct_fold8_w_rows(low_eq, &map, w_state.as_mut_ptr(), 0, n_packed) }
+}
+
+fn sl2_wpar_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_WPAR").is_none());
+    *ON
+}
+
+/// Rows `bit_lo..bit_hi` of the W state (row `bit` = 64 F128 at `bit * 64`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq,gfni")]
+unsafe fn direct_fold8_w_rows(
+    low_eq: &[F128; 64],
+    map: &GfniDirectFoldMap,
+    w_state: *mut F128,
+    bit_lo: usize,
+    bit_hi: usize,
+) {
     use crate::zerocheck::multilinear::kernels::x86_64::gfni_fold64_two_maps;
     use core::arch::x86_64::*;
 
     let n_packed = 1usize << LOG_PACKING;
-    assert_eq!(w_state.len(), 64 * n_packed);
-    let map = build_gfni_direct_fold_map_from_generators(generators);
     let mut low_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let mut high_rows = core::mem::MaybeUninit::<[u64; 64]>::uninit();
     let low_ptr = low_rows.as_mut_ptr().cast::<u64>();
@@ -3123,19 +3249,21 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
     }
     let poly = _mm512_set1_epi64(0x87);
     let zero = _mm512_setzero_si512();
-    for bit in 0..n_packed {
+    for bit in 0..bit_hi {
         // SAFETY: both input rows hold 64 initialized words, the destination
         // row covers 64 F128s, and the enclosing cfg supplies every feature.
         unsafe {
-            gfni_fold64_two_maps::<false>(
-                low_ptr.cast::<u8>(),
-                &map.low,
-                high_ptr.cast::<u8>(),
-                &map.high,
-                w_state.as_mut_ptr().add(bit * 64),
-                core::ptr::null(),
-            );
-            if bit + 1 < n_packed {
+            if bit >= bit_lo {
+                gfni_fold64_two_maps::<false>(
+                    low_ptr.cast::<u8>(),
+                    &map.low,
+                    high_ptr.cast::<u8>(),
+                    &map.high,
+                    w_state.add(bit * 64),
+                    core::ptr::null(),
+                );
+            }
+            if bit + 1 < n_packed && bit + 1 < bit_hi {
                 let lo_ptr = core::hint::black_box(low_ptr.cast::<__m512i>());
                 let hi_ptr = core::hint::black_box(high_ptr.cast::<__m512i>());
                 for g in 0..8 {
@@ -3233,6 +3361,48 @@ fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
             }
         }
     });
+}
+
+/// Lane sl2: [`direct_fold8_a_state_into`] with each task owning four
+/// adjacent banks, i.e. whole 64-byte lines of every output row (the
+/// one-bank tasks share each line four ways across threads). Same values.
+fn direct_fold8_a_state_lines(fold8: &[F128], a_state: &mut [F128]) {
+    direct_fold8_a_state_lines_impl(fold8, a_state, true)
+}
+
+fn direct_fold8_a_state_lines_impl(fold8: &[F128], a_state: &mut [F128], par: bool) {
+    use rayon::prelude::*;
+    let n_packed = 1usize << LOG_PACKING;
+    assert_eq!(fold8.len(), 64 * n_packed);
+    assert_eq!(a_state.len(), 64 * n_packed);
+    let a_addr = a_state.as_mut_ptr() as usize;
+    let body = |g: usize| {
+        crate::rstrace::evd("a:g", g as u32);
+        let mut transposed = core::mem::MaybeUninit::<[[F128; 128]; 4]>::uninit();
+        // SAFETY: `tensor_algebra_transpose_into` initializes all 4 x 128 elements.
+        let t = unsafe {
+            let ptr = transposed.as_mut_ptr().cast::<[F128; 128]>();
+            for j in 0..4 {
+                let e = 4 * g + j;
+                tensor_algebra_transpose_into(&fold8[e * n_packed..(e + 1) * n_packed], &mut *ptr.add(j));
+            }
+            &*transposed.as_ptr()
+        };
+        let a = a_addr as *mut F128;
+        // SAFETY: banks 4g..4g+4 own lanes 4g..4g+4 of every output row.
+        unsafe {
+            for bit in 0..n_packed {
+                for j in 0..4 {
+                    *a.add(bit * 64 + 4 * g + j) = t[j][bit];
+                }
+            }
+        }
+    };
+    if par {
+        (0..16usize).into_par_iter().for_each(body);
+    } else {
+        (0..16usize).for_each(body);
+    }
 }
 
 /// Value-identical full-width form of [`direct_fold8_states_seq`]. Default
@@ -3472,7 +3642,7 @@ pub fn prove<Ch: Challenger>(
     // So packed_witness.len() = 2^(x_outer.len() - 1). Enforce that.
     assert_eq!(l, 1 << (x_outer.len() - 1));
 
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = crate::sl2_env_set!("PCS_TRACE");
 
     challenger.observe_label(b"flock-ring-switch-v0");
 
@@ -3652,9 +3822,102 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 /// −0.035 ms on the ring-switch step, N=16 paired). Each claim's own inner
 /// parallelism is unchanged; output order is the indexed collect's.
 /// `FLOCK_NO_RS_CLAIMS_PAR=1` restores the sequential loop. Read once.
+/// Lane sl2 (`FLOCK_NO_SL2_PRE`): one claim's challenge-free ring-switch
+/// work (the sixty-four-bank collapse and the A state), computed off the
+/// critical path as soon as its bank tensor and point are final (the C
+/// claim, at the end of zerocheck), and taken here by pointer + point match.
+mod sl2_pre {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    pub(super) struct Pre {
+        pub key: (usize, usize),
+        pub suffix: Vec<F128>,
+        pub s_hat_v: Vec<F128>,
+        pub a_state: Vec<F128>,
+        pub eq: (Vec<F128>, Vec<F128>),
+    }
+    // 0 = queued, 1 = running, 2 = done, 3 = idle/cancelled.
+    pub(super) static STATE: AtomicU8 = AtomicU8::new(3);
+    pub(super) static SLOT: std::sync::Mutex<Option<Pre>> = std::sync::Mutex::new(None);
+    pub(super) fn on() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_PRE").is_none());
+        *ON
+    }
+    /// Wait for a running job / cancel a queued one; then take the slot.
+    pub(super) fn settle() -> Option<Pre> {
+        loop {
+            match STATE.load(Ordering::Acquire) {
+                0 => {
+                    if STATE.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return None;
+                    }
+                }
+                1 => std::hint::spin_loop(),
+                2 => {
+                    STATE.store(3, Ordering::Release);
+                    return SLOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Queue the challenge-free part of a sixty-four-bank claim's ring-switch
+/// tail (see `sl2_pre`). The caller guarantees `fold8` stays alive and
+/// unmodified until [`sl2_pre_settle`] (or the ring switch) has run.
+pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
+    use std::sync::atomic::Ordering;
+    let n_packed = 1usize << LOG_PACKING;
+    if !sl2_pre::on() || fold8.len() != 64 * n_packed || suffix.len() < 6 {
+        return;
+    }
+    drop(sl2_pre::settle());
+    sl2_pre::STATE.store(0, Ordering::Release);
+    let (addr, len) = (fold8.as_ptr() as usize, fold8.len());
+    rayon::spawn(move || {
+        if sl2_pre::STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return;
+        }
+        crate::rstrace::ev("pre:run", 0);
+        // SAFETY: the caller's contract; the state machine makes the ring
+        // switch wait for (never race) this read.
+        let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
+        let s_hat_v = collapse_s_hat_v_fold8(fold8, &suffix[..6]);
+        let mut a_state = crate::alloc_uninit_vec::<F128>(len);
+        // Serial: a nested split here could park behind lincheck's long
+        // fold tasks on this worker.
+        direct_fold8_a_state_lines_impl(fold8, &mut a_state, false);
+        let tail = &suffix[6..];
+        let eq = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+        *sl2_pre::SLOT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(sl2_pre::Pre { key: (addr, len), suffix, s_hat_v, a_state, eq });
+        crate::rstrace::ev("pre:done", 0);
+        sl2_pre::STATE.store(2, Ordering::Release);
+    });
+}
+
+/// Drop any queued or finished precompute (waits for a running one).
+pub fn sl2_pre_settle() {
+    drop(sl2_pre::settle());
+}
+
+fn sl2_colpar_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_COLPAR").is_none());
+    *ON
+}
+
+fn sl2_f8late_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_F8LATE").is_none());
+    *ON
+}
+
 fn rs_claims_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_CLAIMS_PAR").is_none());
+        std::sync::LazyLock::new(|| !crate::sl2_env_set!("FLOCK_NO_RS_CLAIMS_PAR"));
     *ON
 }
 
@@ -3806,7 +4069,123 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
+    // Lane sl2 (`FLOCK_NO_SL2_COLPAR`): the two ranked sixty-four-bank
+    // collapses are independent per claim; run them side by side.
+    let sl2_colpar = sl2_colpar_enabled()
+        && dense_suffixes.len() == 2
+        && sparse_suffixes.is_empty()
+        && (0..2).all(|d| {
+            precomputed_s_hat_v
+                .get(dense_to_orig[d])
+                .copied()
+                .flatten()
+                .is_some_and(|p| p.len() == 64 * n_packed)
+        })
+        && dense_suffixes.iter().all(|s| s.len() >= 6);
+    // Lane sl2: a claim whose collapse and A state were precomputed.
+    let mut pre_a: Vec<Option<PreParts>> = (0..n).map(|_| None).collect();
+    let mut pre_done = [false; 2];
+    if sl2_colpar && let Some(pre) = sl2_pre::settle() {
+        for d in 0..2 {
+            let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
+            if pre.key == (p.as_ptr() as usize, p.len()) && pre.suffix[..] == dense_suffixes[d][..] {
+                dense_s_hat_v[d] = pre.s_hat_v;
+                pre_a[dense_to_orig[d]] = Some(PreParts { a: pre.a_state, eq: pre.eq });
+                pre_done[d] = true;
+                break;
+            }
+        }
+    }
+    // Lane sl2 (`FLOCK_NO_SL2_AEARLY`): the remaining claims' A states
+    // depend only on their bank tensors; build them on the pool while this
+    // thread runs the collapse / observe / sample chain.
+    let early_a: Vec<Option<std::sync::Arc<EarlyA>>> = (0..n)
+        .map(|i| {
+            let p = precomputed_s_hat_v.get(i).copied().flatten()?;
+            if !(sl2_colpar && sl2_aearly_enabled() && pre_a[i].is_none() && p.len() == 64 * n_packed) {
+                return None;
+            }
+            let slot = std::sync::Arc::new(EarlyA {
+                state: std::sync::atomic::AtomicU8::new(0),
+                val: std::sync::Mutex::new(None),
+            });
+            let job = slot.clone();
+            let (addr, len) = (p.as_ptr() as usize, p.len());
+            let tail: Vec<F128> = match kinds[i] {
+                Kind::Dense(d) if dense_suffixes[d].len() >= 6 => dense_suffixes[d][6..].to_vec(),
+                _ => return None,
+            };
+            rayon::spawn(move || {
+                use std::sync::atomic::Ordering;
+                if job.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    return;
+                }
+                // SAFETY: the owner waits for state 2 before its borrow of
+                // the tensor ends (claim tail or the final settle below).
+                let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
+                let mut a = crate::alloc_uninit_vec::<F128>(len);
+                let (_, eq) = rayon::join(
+                    || direct_fold8_a_state_lines(fold8, &mut a),
+                    || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
+                );
+                *job.val.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreParts { a, eq });
+                job.state.store(2, Ordering::Release);
+            });
+            Some(slot)
+        })
+        .collect();
+    if sl2_colpar && (pre_done[0] || pre_done[1]) {
+        let d = if pre_done[0] { 1 } else { 0 };
+        let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
+        dense_s_hat_v[d] = collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]);
+    } else if sl2_colpar {
+        let p0 = precomputed_s_hat_v[dense_to_orig[0]].unwrap();
+        let p1 = precomputed_s_hat_v[dense_to_orig[1]].unwrap();
+        // Two claims x four bank quarters, XOR-combined per claim (field
+        // addition): the same products summed in a different grouping.
+        use rayon::prelude::*;
+        crate::rstrace::ev("cp:0", 0);
+        let eqs = [
+            crate::lincheck::build_eq_table(&dense_suffixes[0][..6]),
+            crate::lincheck::build_eq_table(&dense_suffixes[1][..6]),
+        ];
+        crate::rstrace::ev("cp:eq", 0);
+        let ps = [p0, p1];
+        let parts: Vec<Vec<F128>> = (0..8usize)
+            .into_par_iter()
+            .map(|t| {
+                crate::rstrace::ev("cp:s", t as u32);
+                let (c, q) = (t / 4, t % 4);
+                let (p, low_eq) = (ps[c], &eqs[c]);
+                let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+                let b0 = 16 * q;
+                crate::field::f128_slice::scale_slice(&mut out, &p[b0 * n_packed..(b0 + 1) * n_packed], low_eq[b0]);
+                for bank in b0 + 1..b0 + 16 {
+                    crate::field::f128_slice::add_scaled(
+                        &mut out,
+                        &p[bank * n_packed..(bank + 1) * n_packed],
+                        low_eq[bank],
+                    );
+                }
+                crate::rstrace::ev("cp:e", t as u32);
+                out
+            })
+            .collect();
+        crate::rstrace::ev("cp:col", 0);
+        for c in 0..2 {
+            let mut acc = parts[4 * c].clone();
+            for q in 1..4 {
+                for (x, y) in acc.iter_mut().zip(&parts[4 * c + q]) {
+                    *x += *y;
+                }
+            }
+            dense_s_hat_v[c] = acc;
+        }
+    }
     for d in 0..dense_suffixes.len() {
+        if sl2_colpar {
+            break;
+        }
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
             dense_s_hat_v[d] = if p.len() == 64 * n_packed {
                 assert!(
@@ -3860,6 +4239,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             };
         }
     }
+    crate::rstrace::ev("rs:col", 0);
     // Run the kernel only on claims that genuinely need fold_1b_rows.
     if use_split {
         match dense_needs_fold.len() {
@@ -3921,6 +4301,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         eq_r_dprime: Vec<F128>,
     }
     let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
+    let f8late = sl2_f8late_enabled();
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
         let s_hat_v: Vec<F128> = match kinds[i] {
@@ -3939,19 +4320,29 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .flatten()
             .filter(|precomputed| precomputed.len() == 16 * n_packed)
             .map(<[F128]>::to_vec);
-        let s_hat_v_fold8 = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+        // Lane sl2 (`FLOCK_NO_SL2_F8LATE`): the 128 KiB copy is made inside
+        // the claim's own (parallel) tail instead of on this serial chain.
+        let s_hat_v_fold8 = if f8late {
+            None
+        } else {
+            precomputed_s_hat_v
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|precomputed| precomputed.len() == 64 * n_packed)
+                .map(<[F128]>::to_vec)
+        };
+        crate::rstrace::ev("rs:pre", i as u32);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
+        crate::rstrace::ev("rs:smp", i as u32);
         let eq_r_dprime = crate::lincheck::build_eq_table(&r_dprime);
+        crate::rstrace::ev("rs:eqt", i as u32);
 
         let mut s_hat_u = [F128::ZERO; 1usize << LOG_PACKING];
         tensor_algebra_transpose_into(&s_hat_v, &mut s_hat_u);
         let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
+        crate::rstrace::ev("rs:ip", i as u32);
 
         work.push(ClaimWork {
             s_hat_v,
@@ -3967,6 +4358,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // baked into eq_r_dprime[k] before building the Φ byte table, so the
     // fold output is γ_k · B_k directly. pcs combine just adds.
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
+    crate::rstrace::ev("rs:obs", 0);
 
     // The production all-direct experiment also retains C's materialization
     // factors. C has no four-bank witness statistic, so only AB carries the
@@ -3978,15 +4370,18 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             .first()
             .is_some_and(|claim| claim.s_hat_v_quad.is_some())
         && matches!(kinds.as_slice(), [Kind::Dense(_), Kind::Dense(_)])
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none();
+        && !crate::sl2_env_set!("FLOCK_NO_OPEN_DIRECT_AB")
+        && !crate::sl2_env_set!("FLOCK_NO_OPEN_DIRECT_C");
 
     // Per-claim tail body, shared verbatim by the sequential kill-switch
     // route and the full-width ranked route (see `rs_tail_par_enabled`). The
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
+    let pre_a_cells: Vec<std::sync::Mutex<Option<PreParts>>> =
+        pre_a.into_iter().map(std::sync::Mutex::new).collect();
     let claim_output =
         |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
+            crate::rstrace::ev("rs:c0", i as u32);
             let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
             crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
             let wants_direct = !elide_basis
@@ -4066,7 +4461,54 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 }
                 _ => None,
             };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
+            let fold8_borrowed: Option<&[F128]> = if f8late {
+                precomputed_s_hat_v
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .filter(|precomputed| precomputed.len() == 64 * n_packed)
+            } else {
+                None
+            };
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            ))]
+            let fast8 = match (kinds[i], fold8_borrowed) {
+                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 && skip_table => {
+                    Some(build_direct_fold8_factors_from_slice(
+                        fold8,
+                        dense_suffixes[d],
+                        &scaled_eq_r_dprime,
+                        pre_a_cells[i]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                            .or_else(|| early_a[i].as_ref().and_then(|e| e.take())),
+                    ))
+                }
+                _ => None,
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512vbmi",
+                target_feature = "vpclmulqdq",
+                target_feature = "gfni"
+            )))]
+            let fast8: Option<DirectFold8Factors> = None;
+            let fold8_owned = if fast8.is_some() {
+                None
+            } else {
+                match fold8_borrowed {
+                    Some(p) => Some(p.to_vec()),
+                    None => w.s_hat_v_fold8.take(),
+                }
+            };
+            let direct_fold8 = if fast8.is_some() { fast8 } else { match (kinds[i], fold8_owned) {
                 (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
                     #[cfg(all(
                         target_arch = "x86_64",
@@ -4105,7 +4547,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     Some(factors)
                 }
                 _ => None,
-            };
+            } };
+            crate::rstrace::ev("rs:f8", i as u32);
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
@@ -4196,7 +4639,51 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         );
     }
 
+    for e in early_a.iter().flatten() {
+        drop(e.take());
+    }
     (results, gammas_rs)
+}
+
+/// Lane sl2: an A state built beside the observe chain (claim-once).
+struct EarlyA {
+    // 0 = queued, 1 = running, 2 = done, 3 = cancelled/taken.
+    state: std::sync::atomic::AtomicU8,
+    val: std::sync::Mutex<Option<PreParts>>,
+}
+
+/// Lane sl2: a claim's challenge-free factor parts (A state, tail eq split).
+struct PreParts {
+    a: Vec<F128>,
+    eq: (Vec<F128>, Vec<F128>),
+}
+
+impl EarlyA {
+    /// Wait for a running job, cancel a queued one; take the result if any.
+    fn take(&self) -> Option<PreParts> {
+        use std::sync::atomic::Ordering;
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                0 => {
+                    if self.state.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return None;
+                    }
+                }
+                1 => std::hint::spin_loop(),
+                2 => {
+                    self.state.store(3, Ordering::Release);
+                    return self.val.lock().unwrap_or_else(|e| e.into_inner()).take();
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+fn sl2_aearly_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_AEARLY").is_none());
+    *ON
 }
 
 /// Verifier side of the ring-switching reduction.

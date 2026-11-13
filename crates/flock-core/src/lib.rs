@@ -1044,6 +1044,16 @@ pub mod flat_par {
         sh.active.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Lane cmb1 (after mpjunior92 a6571e3f): each claimer publishes its
+    /// completed item count once, after its last run, instead of one
+    /// `done` RMW per claimed run. `FLOCK_NO_CMB_DONE1=1` restores per-run.
+    #[inline]
+    fn done_once() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_CMB_DONE1").is_none());
+        *ON
+    }
+
     /// `FLOCK_NO_RU_FLAT_PAR=1` makes callers keep their rayon route.
     pub fn enabled() -> bool {
         static ON: std::sync::LazyLock<bool> =
@@ -1095,12 +1105,14 @@ pub mod flat_par {
         unsafe { slots.set_len(claimers) };
         let written: Vec<AtomicBool> = (0..claimers).map(|_| AtomicBool::new(false)).collect();
         let slot_addr = slots.as_mut_ptr() as usize;
+        let agg = done_once();
         let body = || {
             let me = who.fetch_add(1, Ordering::Relaxed);
             if me >= claimers {
                 return;
             }
             let mut acc = id();
+            let mut completed = 0usize;
             // Guided claims: contiguous runs of remaining/(2·claimers) items
             // (rayon's first split hands each worker a contiguous ~n/T range;
             // single-item claims interleaved the passes' streams and cost
@@ -1116,7 +1128,11 @@ pub mod flat_par {
                         for i in cur..cur + take {
                             acc = op(acc, f(i));
                         }
-                        done.fetch_add(take, Ordering::Release);
+                        if agg {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
@@ -1125,6 +1141,9 @@ pub mod flat_par {
             // SAFETY: slot `me` is owned by this claimer.
             unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
             written[me].store(true, Ordering::Release);
+            if completed != 0 {
+                done.fetch_add(completed, Ordering::Release);
+            }
         };
         let fat: &(dyn Fn() + Sync) = &body;
         let sh = Arc::new(Shared {
@@ -1216,6 +1235,100 @@ pub mod flat_par {
         TEAM_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Lane sl1 (`FLOCK_NO_SL1_AFF`): writer map of the last flat-claimed
+    /// tail level (rayon index of the claimer that wrote each output chunk),
+    /// so the next, cache-resident level can hand each chunk to the thread
+    /// whose L2 holds it. Performance hint only: any item may still be run by
+    /// any claimer, and the reduction is an XOR sum, so values are identical.
+    pub const SL1_OWN_CAP: usize = 1024;
+    pub static SL1_OWN: [core::sync::atomic::AtomicU8; SL1_OWN_CAP] =
+        [const { core::sync::atomic::AtomicU8::new(u8::MAX) }; SL1_OWN_CAP];
+    /// (a base address, b base address, chunk bytes, items) of the recorded level.
+    pub static SL1_OWN_GEOM: std::sync::Mutex<(usize, usize, usize, usize)> =
+        std::sync::Mutex::new((0, 0, 0, 0));
+
+    pub fn sl1_aff_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_AFF").is_none());
+        *ON
+    }
+
+    /// [`team_map_reduce`] where claimer `t` first runs the items with
+    /// `owner[i] == t` (rayon index), then sweeps every unclaimed item.
+    pub fn team_map_reduce_aff<T, F>(
+        n: usize,
+        owner: &[u8],
+        f: F,
+        id: impl Fn() -> T + Sync,
+        op: impl Fn(T, T) -> T + Sync,
+    ) -> T
+    where
+        F: Fn(usize) -> T + Sync,
+    {
+        assert_eq!(owner.len(), n);
+        if n <= 1 {
+            return team_map_reduce(n, f, id, op);
+        }
+        const CAP: usize = 64;
+        let claimers = rayon::current_num_threads().clamp(1, CAP);
+        let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        let done = AtomicUsize::new(0);
+        let who = AtomicUsize::new(0);
+        let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
+        let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
+        let slot_addr = slots.as_mut_ptr() as usize;
+        let body = || {
+            let me = who.fetch_add(1, Ordering::Relaxed);
+            if me >= CAP || done.load(Ordering::Relaxed) >= n {
+                return;
+            }
+            let tid = rayon::current_thread_index().map_or(u8::MAX - 1, |t| t.min(250) as u8);
+            let mut acc = id();
+            let mut completed = 0usize;
+            for i in 0..n {
+                if owner[i] == tid && !claimed[i].load(Ordering::Relaxed) && !claimed[i].swap(true, Ordering::AcqRel) {
+                    acc = op(acc, f(i));
+                    completed += 1;
+                }
+            }
+            let start = me * n / claimers;
+            for j in 0..n {
+                let i = (start + j) % n;
+                if !claimed[i].load(Ordering::Relaxed) && !claimed[i].swap(true, Ordering::AcqRel) {
+                    acc = op(acc, f(i));
+                    completed += 1;
+                }
+            }
+            if completed != 0 {
+                // SAFETY: slot `me` is owned by this claimer.
+                unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+                written[me].store(true, Ordering::Release);
+                done.fetch_add(completed, Ordering::Release);
+            }
+        };
+        let fat: &(dyn Fn() + Sync) = &body;
+        let seq = TEAM_SEQ.load(Ordering::Relaxed);
+        debug_assert!(seq & 1 == 0, "nested team region");
+        TEAM_BODY.store(&fat as *const &(dyn Fn() + Sync) as usize, Ordering::Release);
+        TEAM_SEQ.store(seq + 1, Ordering::SeqCst);
+        body();
+        while done.load(Ordering::Acquire) < n {
+            core::hint::spin_loop();
+        }
+        TEAM_SEQ.store(seq + 2, Ordering::SeqCst);
+        while TEAM_ACTIVE.load(Ordering::SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        let mut acc = id();
+        for (slot, w) in slots.iter().zip(written.iter()) {
+            if w.load(Ordering::Acquire) {
+                // SAFETY: flagged slots were fully written before the flag.
+                acc = op(acc, unsafe { slot.assume_init_read() });
+            }
+        }
+        acc
+    }
+
     /// [`map_reduce`] dispatched to the hot pool's spinning team instead of
     /// spawned claimers. Caller must satisfy [`team_ready`].
     pub fn team_map_reduce<T, F>(
@@ -1241,6 +1354,7 @@ pub mod flat_par {
         let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
         let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
         let slot_addr = slots.as_mut_ptr() as usize;
+        let agg = done_once();
         let body = || {
             let me = who.fetch_add(1, Ordering::Relaxed);
             if me >= CAP {
@@ -1252,6 +1366,7 @@ pub mod flat_par {
             }
             let mut acc = id();
             let mut any = false;
+            let mut completed = 0usize;
             loop {
                 if cur >= n {
                     break;
@@ -1263,7 +1378,11 @@ pub mod flat_par {
                             acc = op(acc, f(i));
                         }
                         any = true;
-                        done.fetch_add(take, Ordering::Release);
+                        if agg {
+                            completed += take;
+                        } else {
+                            done.fetch_add(take, Ordering::Release);
+                        }
                         cur = next.load(Ordering::Relaxed);
                     }
                     Err(now) => cur = now,
@@ -1273,6 +1392,9 @@ pub mod flat_par {
                 // SAFETY: slot `me` is owned by this claimer.
                 unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
                 written[me].store(true, Ordering::Release);
+            }
+            if completed != 0 {
+                done.fetch_add(completed, Ordering::Release);
             }
         };
         let fat: &(dyn Fn() + Sync) = &body;
@@ -1537,6 +1659,40 @@ pub mod hot_pool {
 /// Schedule only: the closure runs to completion before this returns, on the
 /// same pool, with the same work. `FLOCK_NO_IN_POOL=1` restores the direct
 /// call, and a caller that is already a worker takes the direct call anyway.
+/// Lane sl2 (`FLOCK_NO_SL2_ENV`): a per-site cached `var_os(name).is_some()`.
+/// The first read of the environment after a large phase costs ~2 us of
+/// cold misses on the serial path; the process environment never changes
+/// after start-up in the ranked worker.
+#[macro_export]
+macro_rules! sl2_env_set {
+    ($name:expr) => {{
+        static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if $crate::sl2_env_live() {
+            std::env::var_os($name).is_some()
+        } else {
+            *C.get_or_init(|| std::env::var_os($name).is_some())
+        }
+    }};
+}
+
+#[doc(hidden)]
+pub fn sl2_env_live() -> bool {
+    static LIVE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_ENV").is_some());
+    *LIVE
+}
+
+/// Lane sl2: set by the ranked worker for the timed speculative prove, whose
+/// process exits right after publishing (its tail may leak instead of free).
+pub static SL2_TIMED_TAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_SL2_LEAK=1` keeps every free in the timed prove's tail.
+pub fn sl2_leak_tail() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_LEAK").is_none());
+    *ON && SL2_TIMED_TAIL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
