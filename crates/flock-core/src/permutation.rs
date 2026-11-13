@@ -7,6 +7,8 @@
 //!   { (f(x), s_id(x)) : x ∈ B_μ }  =  { (g(x), s_σ(x)) : x ∈ B_μ }
 //!
 //! where `s_id` is an injective index tag and `s_σ(x) = s_id(σ(x))`. With this
+//! composition, the permuted-side witness reuses the identity tag machinery
+//! unchanged; only the tag values move.
 //! choice the relation is equivalent to `f(x) = g(σ⁻¹(x))` for all `x`
 //! (equivalently `f(σ(x)) = g(x)`); Plonk copy-constraints are the `f == g`
 //! special case. The multiset equality is what makes `∏ p(x) = ∏ q(x)` hold.

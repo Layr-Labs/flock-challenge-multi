@@ -8,6 +8,8 @@
 //!   (see [`crate::merkle`]);
 //! - the Fiat-Shamir transcript and its proof-of-work grinding, via
 //!   [`crate::challenger::FsChallenger::with_hash`].
+//! The two choices bind only through the proof serialization, never through
+//! shared state: swapping one component leaves the other code path untouched.
 //!
 //! Both default to SHA-256, so configs and call sites that predate the options
 //! keep their behaviour.
