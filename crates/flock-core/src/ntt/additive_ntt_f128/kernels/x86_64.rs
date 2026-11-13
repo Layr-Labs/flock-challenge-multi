@@ -5544,3 +5544,64 @@ unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &Prep
         }
     }
 }
+
+/// Pack the one live tail field from four odd r groups of the first deep
+/// sweep. The caller owns all sixteen rows for each r in r0..r1, supplies
+/// prepared twiddles for those rows, and guarantees fields 57..63 are zero
+/// on odd rows. r0 and r1 are multiples of eight in 0..=128; all 2048*64
+/// fields are initialized. No other worker may read the claimed groups
+/// before this call returns. The compact scratch is private to this call.
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+pub(crate) unsafe fn rows_raw7_s128_prepared(
+    ptr: *mut F128, p: &PreparedFour, r0: usize, r1: usize, hint: u8,
+) {
+    let ordered = super::super::ntt_alias_load_order_enabled();
+    unsafe {
+        match (hint, ordered) {
+            (0, false) => rows_raw7_s128_impl::<0, 0>(ptr, p, r0, r1),
+            (0, true) => rows_raw7_s128_impl::<0, 1>(ptr, p, r0, r1),
+            (1, false) => rows_raw7_s128_impl::<1, 0>(ptr, p, r0, r1),
+            (1, true) => rows_raw7_s128_impl::<1, 1>(ptr, p, r0, r1),
+            (_, false) => rows_raw7_s128_impl::<2, 0>(ptr, p, r0, r1),
+            (_, true) => rows_raw7_s128_impl::<2, 1>(ptr, p, r0, r1),
+        }
+    }
+}
+#[cfg(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+#[inline]
+unsafe fn rows_raw7_s128_impl<const H: u8, const ORD: u8>(
+    ptr: *mut F128, p: &PreparedFour, r0: usize, r1: usize,
+) {
+    #[repr(C, align(64))]
+    struct Tail([F128; 64]);
+    let mut storage = core::mem::MaybeUninit::<Tail>::uninit();
+    let tail = storage.as_mut_ptr().cast::<F128>();
+    let lead = (p.prefetch_lines * 4).min(64);
+    unsafe {
+        for rb in (r0..r1).step_by(8) {
+            for r in rb..rb + 8 {
+                let lanes = if r & 1 == 1 { 56 } else { 64 };
+                if r == 127 || H == 0 {
+                    butterfly_four_fixed_registers::<128, 64, 0, ORD>(ptr.add(r * 64), p, lanes * 16, ptr);
+                } else {
+                    butterfly_four_fixed_registers::<128, 64, H, ORD>(ptr.add(r * 64), p, lanes * 16, ptr.add(r * 64 + lead));
+                }
+                if r & 1 == 1 {
+                    // Exactly four odd r values initialize all 64 scratch
+                    // fields before the compact butterfly reads any of them.
+                    for i in 0..16 {
+                        tail.add(i * 4 + (r - rb) / 2).write(ptr.add((i * 128 + r) * 64 + 56).read());
+                    }
+                }
+            }
+            // Lane-local arithmetic: each compact lane has the same original
+            // twiddles, and none of its seven known-zero neighbors is read.
+            butterfly_four_fixed_registers::<1, 4, 0, 0>(tail, p, 64, tail);
+            for i in 0..16 {
+                for j in 0..4 {
+                    ptr.add((i * 128 + rb + 2 * j + 1) * 64 + 56).write(tail.add(i * 4 + j).read());
+                }
+            }
+        }
+    }
+}

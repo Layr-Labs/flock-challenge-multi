@@ -961,6 +961,13 @@ fn ranked_zero_odd_tail_snapshot(log_d: usize, num_ntts: usize) -> (usize, usize
     };
     (lanes, raw)
 }
+fn ntt_raw7_first_pack_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_RAW7_FIRST_PACK").is_none()
+    });
+    *ON
+}
+
 fn ntt_raw7_pack_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RAW7_PACK").is_none());
@@ -4889,7 +4896,7 @@ impl AdditiveNttF128 {
                             // SAFETY: rows b*per..(b+1)*per of sweep 1, claimed
                             // exactly once; the owner joins on the count below.
                             unsafe {
-                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, raw7_pack, hint);
                             }
                             dsteal_done[ws].fetch_add(1, std::sync::atomic::Ordering::Release);
                         }
@@ -4954,7 +4961,7 @@ impl AdditiveNttF128 {
                             while let Some((si, blk, c)) = dsteal_claim(w) {
                                 debug_assert!(si == i && !blk);
                                 unsafe {
-                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, raw7_pack, hint);
                                 }
                                 mine += 1;
                             }
@@ -4963,7 +4970,7 @@ impl AdditiveNttF128 {
                             }
                         } else {
                             unsafe {
-                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint);
+                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, raw7_pack, sub_size_positions, hint);
                             }
                         }
                         w.store((i as u64) << 16 | DSTEAL_BLK, Ordering::Release);
@@ -5661,6 +5668,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         num_ntts: usize,
         odd_tail: usize,
+        raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
     ) {
@@ -5680,13 +5688,14 @@ impl AdditiveNttF128 {
         for s in 0..8 {
             tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
         }
-        butterfly_interleaved_fused_4layer_rows(
+        butterfly_interleaved_fused_4layer_rows_raw7(
             sub_data,
             &tw,
             sixteenth,
             num_ntts,
             if sixteenth.is_multiple_of(2) { odd_tail } else { 0 },
             hint,
+            raw7_pack,
         );
     }
 
@@ -5740,6 +5749,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         num_ntts: usize,
         odd_tail: usize,
+        raw7_pack: bool,
         hint: u8,
     ) {
         let layer = n_top;
@@ -5760,6 +5770,16 @@ impl AdditiveNttF128 {
         let odd_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
         let prepared = unsafe { kernels::prepare_four(&t) }.expect("v2_sweep1_prepared checked");
         let base = sub_ptr;
+        #[cfg(target_feature = "avx512bw")]
+        if raw7_pack && sixteenth == 128 && num_ntts == 64 && odd_tail == 4
+            && r0.is_multiple_of(8) && r1.is_multiple_of(8) && r0 <= r1 && r1 <= 128
+            && ntt_shaped_enabled() && ntt_raw7_first_pack_enabled()
+        {
+            // This claimed range owns every field of its sixteen-row groups.
+            // Packing only within eight r values needs no cross-range join.
+            unsafe { kernels::rows_raw7_s128_prepared(base, &prepared, r0, r1, hint); }
+            return;
+        }
         for r in r0..r1 {
             let lanes = row_lanes(r, num_ntts, odd_tail);
             unsafe {
@@ -5883,7 +5903,7 @@ impl AdditiveNttF128 {
             for s in 0..8 {
                 tw[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
             }
-            butterfly_interleaved_fused_4layer_rows(
+            butterfly_interleaved_fused_4layer_rows_raw7(
                 sub_data,
                 &tw,
                 sixteenth,
@@ -5894,6 +5914,7 @@ impl AdditiveNttF128 {
                     0
                 },
                 hint,
+                raw7_pack,
             );
         }
         // Per-block pass: fused-four (n_top+4..n_top+8), fused-three
@@ -6172,6 +6193,19 @@ fn butterfly_interleaved_fused_4layer_rows_raw7(
         // The geometry bounds every access; the captured brand guarantees
         // that fields57..63 of all odd rows already contain zero.
         if unsafe { kernels::rows_raw7_s8(block.as_mut_ptr(), t, hint) } {
+            return;
+        }
+    }
+    #[cfg(all(
+        target_arch = "x86_64", target_feature = "avx512f",
+        target_feature = "avx512bw", target_feature = "vpclmulqdq"
+    ))]
+    if raw7 && sixteenth == 128 && num_ntts == 64 && odd_tail == 4
+        && block.len() == 2048 * 64 && ntt_shaped_enabled() && ntt_raw7_first_pack_enabled()
+    {
+        if let Some(prepared) = unsafe { kernels::prepare_four(t) } {
+            // The raw-seven brand leaves only field 56 live in each odd tail.
+            unsafe { kernels::rows_raw7_s128_prepared(block.as_mut_ptr(), &prepared, 0, 128, hint); }
             return;
         }
     }
@@ -9483,4 +9517,43 @@ fn raw7_ranked_encoder_and_callback_match_parent() {
         "raw-seven packing changed the complete ranked codeword"
     );
 }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+mod raw7_first_range_tests {
+    use super::*;
+    #[test]
+    fn packed_first_sweep_preserves_every_unclaimed_field() {
+        let mut seed = 0x1738264acb951edfu64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let mut input: Vec<F128> = (0..2048 * 64 + 8).map(|_| F128::new(next(), next())).collect();
+        for row in (1..2048).step_by(2) {
+            input[4 + row * 64 + 57..4 + (row + 1) * 64].fill(F128::ZERO);
+        }
+        for case in 0..3 {
+            let tw = core::array::from_fn(|_| match case {
+                0 => F128::ZERO, 1 => F128::ONE, _ => F128::new(next(), next()),
+            });
+            let p = unsafe { kernels::prepare_four(&tw) }.unwrap();
+            for (r0, r1) in [(0,8), (8,16), (24,56), (120,128), (0,128), (16,16)] {
+                for hint in 0..=2 {
+                    let mut got = input.clone(); let mut want = input.clone();
+                    unsafe {
+                        let base = want.as_mut_ptr().add(4);
+                        for r in r0..r1 {
+                            let lanes = if r & 1 == 1 {60} else {64};
+                            match hint {
+                                0 => kernels::row_prepared::<0>(base,128,64,lanes,r,&tw,0,&p),
+                                1 if r < 127 => kernels::row_prepared::<1>(base,128,64,lanes,r,&tw,r+1,&p),
+                                2 if r < 127 => kernels::row_prepared::<2>(base,128,64,lanes,r,&tw,r+1,&p),
+                                _ => kernels::row_prepared::<0>(base,128,64,lanes,r,&tw,0,&p),
+                            }
+                        }
+                        kernels::rows_raw7_s128_prepared(got.as_mut_ptr().add(4), &p, r0,r1,hint);
+                    }
+                    assert_eq!(got,want,"case={case} range={r0}..{r1} hint={hint}");
+                }
+            }
+        }
+    }
 }

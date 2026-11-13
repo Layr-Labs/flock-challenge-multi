@@ -1202,4 +1202,4 @@ pub(super) use x86_64::RAW7_PACK_HITS;
     target_feature = "avx512bw",
     target_feature = "vpclmulqdq"
 ))]
-pub(super) use x86_64::rows_raw7_s8;
+pub(super) use x86_64::{rows_raw7_s8, rows_raw7_s128_prepared};

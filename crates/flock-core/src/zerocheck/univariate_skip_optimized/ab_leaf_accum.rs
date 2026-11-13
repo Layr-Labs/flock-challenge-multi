@@ -1290,7 +1290,7 @@ mod tests {
                         &source, &mats, hi, true, mode, &mut old,
                     );
                 }
-                assert!(try_run(&mut cache, &source, &mats, hi, mode, &mut new));
+                assert!(try_run(&mut cache, &source, &mats, hi, mode, &mut new, 0));
                 assert_eq!(new, old, "hi={hi} mode={mode}");
                 comparisons += 131072;
             }
@@ -1315,24 +1315,25 @@ mod tests {
         unsafe {
             super::super::process_ranked_ab_w4_band(&source, &mats, 0, true, 1, &mut old);
         }
-        assert!(try_run(&mut cache, &source, &mats, 0, 1, &mut new));
+        assert!(try_run(&mut cache, &source, &mats, 0, 1, &mut new, 0));
         assert_eq!(new, old);
         comparisons += 131072;
         // A map outside the multiplication family must fall back without output writes.
         mats[8191] ^= 1;
         new.fill(0xad);
-        assert!(!try_run(&mut cache, &source, &mats, 0, 1, &mut new));
+        assert!(!try_run(&mut cache, &source, &mats, 0, 1, &mut new, 0));
         assert!(new.iter().all(|&v| v == 0xad));
-        assert!(!try_run(&mut cache, &source, &mats[..8191], 0, 1, &mut new));
+        assert!(!try_run(&mut cache, &source, &mats[..8191], 0, 1, &mut new, 0));
         assert!(!try_run(
             &mut cache,
             &source,
             &changed,
             usize::MAX,
             1,
-            &mut new
+            &mut new,
+            0,
         ));
-        assert!(!try_run(&mut cache, &source, &changed, 0, 3, &mut new));
+        assert!(!try_run(&mut cache, &source, &changed, 0, 3, &mut new, 0));
         assert_eq!(source, original);
         println!(
             "AB_LEAF_ACCUM_PRODUCTION_VALIDATED banks=896 comparisons={comparisons} basis_bits=128 rekey=true invalid_map_fallback=true"
