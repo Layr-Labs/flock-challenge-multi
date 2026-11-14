@@ -37,6 +37,66 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+/// DIAGNOSTIC SUBMISSION ONLY: factorial in-run probe on the ranked runner.
+///
+/// The harness names each trial's files `run-{r}.ready` / `run-{r}.proof`
+/// (r = 1..=120, the first 20 are warm-ups). Warm-up trials run the base
+/// settings. In measured trial r, factor `(mask, switches)` is ON iff
+/// `popcount(((r - 21) mod 16) & mask)` is odd: a two-level full factorial on
+/// the bits of `(r - 21) mod 16`. Every switch selects between schedules,
+/// prefetch distances, store kinds or kernels that compute the same values, so
+/// proof bytes do not depend on the settings. Design after
+/// patternrecognition9-del's published factorial probe.
+pub(crate) mod fact_probe {
+    pub(crate) const FACTORS: &[(u64, &[(&str, &str)])] = &[
+        (4, &[("FLOCK_ZC_TAIL_CHUNK_LOG", "10")]),
+        (5, &[("FLOCK_ZC_SERIAL_TAIL_LOG", "18")]),
+        (6, &[("FLOCK_GL1_LC_MIN", "4096")]),
+        (7, &[("FLOCK_SL1_PREWARM_SCALE", "150")]),
+        (8, &[("FLOCK_FOLD16_PF", "1024")]),
+        (9, &[("FLOCK_SL1_TAIL1_MULT", "3")]),
+        (10, &[("FLOCK_NTT_ST_STAGE_ALIGN_LOG", "12")]),
+        (11, &[("FLOCK_GL1_SPLIT_LO", "5")]),
+        (12, &[("FLOCK_LF1_DUAL_MINLEN", "16")]),
+        (13, &[("FLOCK_HOT_POOL_SPINS", "512")]),
+        (14, &[("FLOCK_ROOT_FOLD_BATCH", "2")]),
+        (15, &[("FLOCK_SL1_WARM_TILES", "512")]),
+    ];
+
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 21).then_some(r)
+    }
+
+    pub(crate) fn is_on(r: u64, mask: u64) -> bool {
+        (((r - 21) % 16) & mask).count_ones() & 1 == 1
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        for (mask, env) in FACTORS {
+            if is_on(r, *mask) {
+                for (key, value) in *env {
+                    // SAFETY: called once before any other thread exists.
+                    unsafe { std::env::set_var(key, value) };
+                }
+            }
+        }
+    }
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///
@@ -57,6 +117,7 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    fact_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
