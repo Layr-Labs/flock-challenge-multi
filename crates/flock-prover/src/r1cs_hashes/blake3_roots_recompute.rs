@@ -329,7 +329,7 @@ fn roots_only_matches_production_stripes() {
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
-                            StreamProj { compact_z_tile_words:0, seed_window:None,
+                            StreamProj { compact_z_tile_words:0, seed_window:None, ab_pend: core::ptr::null_mut(),
                                 stage: stage.0.as_mut_ptr(),
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
@@ -341,6 +341,7 @@ fn roots_only_matches_production_stripes() {
                                 cross_quarter: false,
                                 compact_z: core::ptr::null_mut(),
                                 elide_z: false,
+                                ab_pend: core::ptr::null_mut(), // test-only: field added by the crown's SB1 defer
                             },
                             &preps,
                             [true; 3],
@@ -962,6 +963,9 @@ pub(crate) unsafe fn generate_pair_with_deps(
     }
 }
 
+#[path = "xglm_root_compact.rs"]
+mod xglm_root_compact;
+
 pub(crate) fn selected_generator() -> Option<(
     unsafe fn(u64, usize, *mut u8),
     Option<flock_core::lincheck::RootPairGenerator>,
@@ -973,11 +977,23 @@ pub(crate) fn selected_generator() -> Option<(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ROOT_RECOMPUTE8").is_some());
     static REUSE: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROOT_PAIR_REUSE").is_none());
+    static COMPACT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_XGLM_ROOT_COMPACT_EMIT").is_some()
+    });
+    static INLINE_PREP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_XGLM_ROOT_INLINE_PREP").is_some()
+    });
     if *EIGHT {
         Some((generate_tile, None))
     } else {
         Some((
-            generate_tile16,
+            if *INLINE_PREP {
+                xglm_root_compact::generate_tile16_inline
+            } else if *COMPACT {
+                xglm_root_compact::generate_tile16
+            } else {
+                generate_tile16
+            },
             if *REUSE {
                 Some(generate_pair_with_deps)
             } else {

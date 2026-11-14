@@ -533,7 +533,7 @@ pub(crate) unsafe fn gfni_fold_rows(
 }
 
 
-/// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
+/// Fold one selected-word block across 1..=8 adjacent tiles, retaining all
 /// sixteen byte-plane accumulators until the last tile has been consumed.
 ///
 /// Exactly 22 ZMM registers are used: accumulators 0..15, transformed current
@@ -542,7 +542,7 @@ pub(crate) unsafe fn gfni_fold_rows(
 /// the optimized wrapper on the measured target before enabling production.
 ///
 /// # Safety
-/// - `count` is in 1..=4 and `tile_stride >= 512`.
+/// - `count` is in 1..=8 and `tile_stride >= 512`.
 /// - For each `t < count`, `source.add(t * tile_stride)` covers 512 readable
 ///   bytes containing eight raw selected-word stripes (low u32 lanes then high).
 ///   The entire addressed span belongs to one allocation; offset arithmetic
@@ -576,7 +576,8 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     permutation: *const u8,
     prefetch_next_block: bool,
 ) {
-    debug_assert!((1..=4).contains(&count));
+    // The generated batch8 reader supplies eight complete tiles/matrices.
+    debug_assert!((1..=8).contains(&count));
     debug_assert!(tile_stride >= 512);
     // SAFETY: the caller upholds the exact byte ranges above. Every modified
     // GPR and ZMM is explicitly an output; flags and memory are also clobbered
