@@ -2223,6 +2223,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let lo1_ys = kernels::x86_64::lo1_ys_enabled();
     crate::rstrace::ev("r2:par0", hi_size as u32);
     let leaf = |x_hi: usize| {
+            crate::rstrace::evd("r2:b", x_hi as u32);
             crate::rstrace::item_start();
             #[allow(unused_mut)]
             let mut r4_out = [F128::ZERO; 18];
@@ -2382,6 +2383,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         for (x, y) in r4.iter_mut().zip(cr.iter()) {
             *x += *y;
         }
+        crate::rstrace::evd("r2:e", 0);
         (s1 + c1, sinf + cinf, a, r4)
     };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.

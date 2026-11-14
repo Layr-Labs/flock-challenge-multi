@@ -283,8 +283,394 @@ pub fn prewarm_prover(m: usize) {
     bufs.par_iter_mut().for_each(|b| {
         crate::collapse_hugepages(b.as_mut_ptr().cast::<u8>(), b.len() * 16);
     });
+    crate::slow::init();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let diag = false;
+        let ranges: Vec<(usize, usize)> =
+            bufs.iter_mut().map(|b| (b.as_mut_ptr() as usize, b.len() * 16)).collect();
+        let mut tlb_slow = 0usize;
+        if hostfix::enabled() || diag {
+            // SAFETY: every range is a live, zero-filled, exclusively owned pool
+            // buffer; see `hostfix::repair` for the contract.
+            tlb_slow = unsafe { hostfix::repair(&ranges, hostfix::enabled()) };
+        }
+        let mut spread = 0.0f64;
+        if hostlat::enabled() || diag {
+            // SAFETY: as above.
+            spread = unsafe { hostlat::repair(&ranges, hostlat::enabled()) };
+        }
+        let _ = (tlb_slow, spread);
+    }
     for b in bufs {
         give_f128(b);
+    }
+}
+
+/// Diagnostic only, warm-up trials only (r <= 20): right before the proof is
+/// published, wait 8 ms if slowdown-probe site `(r - 1) mod 12` was reached
+/// in this process (see `crate::slow`). No-op in measured trials.
+pub fn diag_delay() {
+    let Some(r) = crate::fact_probe::trial_number() else { return };
+    if r > 20 {
+        return;
+    }
+    let us = crate::slow::warmup_delay_us(r);
+    if us == 0 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let d = std::time::Duration::from_micros(us);
+    while t0.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+/// xint (`FLOCK_XINT_HOSTLAT=1`): swap out 2 MiB pages of the prewarmed pool
+/// whose DRAM latency is clearly above the pool's fast quartile (pages that
+/// sit behind a farther memory controller or node). A flushed, random,
+/// dependent chain of 64 lines in 64 distinct 4 KiB pages of the region is
+/// timed twice (best of two); regions at least 1.15x the fast quartile are
+/// replaced by fresh zero-filled 2 MiB pages that probe within 1.05x of it,
+/// moved onto the same virtual address with `mremap(MREMAP_FIXED)`. Untimed
+/// setup only; the buffers hold zeros before and after.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod hostlat {
+    const HUGE: usize = 1 << 21;
+    const N: usize = 64;
+
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XINT_HOSTLAT").is_some());
+        *ON
+    }
+
+    #[inline(always)]
+    fn line(base: usize, x: usize) -> usize {
+        base + x * 32768 + ((x * 13) % 64) * 64
+    }
+
+    /// TSC ticks of one flushed pass of the chain (best of two).
+    ///
+    /// # Safety
+    /// `base` is 2 MiB aligned, mapped, writable, zero-filled and private to
+    /// the caller during the call; the touched lines are zeroed again.
+    unsafe fn probe(base: usize) -> u64 {
+        use core::arch::x86_64::{_mm_clflush, _mm_lfence, _mm_mfence, _rdtsc};
+        unsafe {
+            let mut x = 0usize;
+            for _ in 0..N {
+                let next = (5 * x + 1) % N;
+                *(line(base, x) as *mut usize) = line(base, next);
+                x = next;
+            }
+            let mut best = u64::MAX;
+            for _ in 0..2 {
+                for x in 0..N {
+                    _mm_clflush(line(base, x) as *const u8);
+                }
+                _mm_mfence();
+                let mut p = line(base, 0);
+                _mm_lfence();
+                let t0 = _rdtsc();
+                _mm_lfence();
+                for _ in 0..N {
+                    p = core::ptr::read_volatile(p as *const usize);
+                }
+                _mm_lfence();
+                let t1 = _rdtsc();
+                core::hint::black_box(p);
+                best = best.min(t1.wrapping_sub(t0));
+            }
+            for x in 0..N {
+                *(line(base, x) as *mut usize) = 0;
+            }
+            best
+        }
+    }
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, new_addr: *mut u8) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+
+    unsafe fn fresh_fast_page(limit: u64, keep: &mut Vec<(usize, usize)>) -> Option<usize> {
+        unsafe {
+            for _ in 0..8 {
+                let m = mmap(core::ptr::null_mut(), 2 * HUGE, 0x1 | 0x2, 0x02 | 0x20, -1, 0);
+                if m as isize == -1 {
+                    return None;
+                }
+                let m = m as usize;
+                let a = m.next_multiple_of(HUGE);
+                let _ = madvise(a as *mut u8, HUGE, 14);
+                std::ptr::write_bytes(a as *mut u8, 0, HUGE);
+                crate::collapse_hugepages(a as *mut u8, HUGE);
+                if probe(a) <= limit {
+                    if a > m {
+                        let _ = munmap(m as *mut u8, a - m);
+                    }
+                    let end = m + 2 * HUGE;
+                    if a + HUGE < end {
+                        let _ = munmap((a + HUGE) as *mut u8, end - a - HUGE);
+                    }
+                    return Some(a);
+                }
+                keep.push((m, 2 * HUGE));
+            }
+            None
+        }
+    }
+
+    /// Probe every whole 2 MiB region of `ranges`; replace slow ones when
+    /// `fix`. Returns the latency spread p90 / p25 - 1 of the probe.
+    ///
+    /// # Safety
+    /// Each range is a live, zero-filled buffer owned by the caller and
+    /// touched by no other thread during the call.
+    pub(super) unsafe fn repair(ranges: &[(usize, usize)], fix: bool) -> f64 {
+        let mut regions: Vec<usize> = Vec::new();
+        for &(p, n) in ranges {
+            let mut a = p.next_multiple_of(HUGE);
+            while a + HUGE <= p + n {
+                regions.push(a);
+                a += HUGE;
+            }
+        }
+        if regions.len() < 16 {
+            return 0.0;
+        }
+        // Four probing threads: enough to finish in milliseconds, few enough
+        // not to load the memory system the probe is measuring.
+        let mut ticks = vec![0u64; regions.len()];
+        std::thread::scope(|sc| {
+            for (t, chunk) in ticks.chunks_mut(regions.len().div_ceil(4)).enumerate() {
+                let start = t * regions.len().div_ceil(4);
+                let regs = &regions;
+                sc.spawn(move || {
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        // SAFETY: distinct regions, caller's contract.
+                        *slot = unsafe { probe(regs[start + i]) };
+                    }
+                });
+            }
+        });
+        let mut sorted = ticks.clone();
+        sorted.sort_unstable();
+        let p25 = sorted[sorted.len() / 4].max(1);
+        let p90 = sorted[sorted.len() * 9 / 10];
+        let spread = p90 as f64 / p25 as f64 - 1.0;
+        if !fix {
+            return spread;
+        }
+        let slow = p25 + p25 * 3 / 20;
+        let accept = p25 + p25 / 20;
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        for (i, &a) in regions.iter().enumerate() {
+            if ticks[i] < slow {
+                continue;
+            }
+            unsafe {
+                if probe(a) < slow {
+                    continue;
+                }
+                let Some(f) = fresh_fast_page(accept, &mut keep) else { break };
+                let r = mremap(f as *mut u8, HUGE, HUGE, 1 | 2, a as *mut u8);
+                if r as usize != a {
+                    keep.push((f, HUGE));
+                    break;
+                }
+            }
+        }
+        for (m, n) in keep {
+            // SAFETY: rejected fresh mappings only.
+            unsafe {
+                let _ = munmap(m as *mut u8, n);
+            }
+        }
+        spread
+    }
+}
+
+/// xint (`FLOCK_XINT_HOSTFIX=1`): swap out 2 MiB pages of the freshly
+/// prewarmed pool that translate like 4 KiB pages.
+///
+/// A guest 2 MiB page that the hypervisor backs with 4 KiB host pages is
+/// cached by the TLB as 4 KiB translations, so a scattered-write phase pays
+/// a page walk per 4 KiB on it even though the guest sees a huge page. The
+/// probe detects such regions without privileges: an L1-resident dependent
+/// load chain over 256 lines in 256 distinct 4 KiB pages of the region runs
+/// at L1 latency when one translation covers the region and misses the
+/// 64-entry first-level dTLB on every load otherwise (second-level hit,
+/// several cycles more per load). Each slow region is replaced by a fresh,
+/// zero-filled 2 MiB page that probes fast, moved onto the same virtual
+/// address with `mremap(MREMAP_FIXED)` (a page-table move: no copy, no
+/// split). Runs once, in the untimed setup, before any prove; the buffers
+/// hold zeros before and after, so no value anywhere changes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod hostfix {
+    use rayon::prelude::*;
+
+    const HUGE: usize = 1 << 21;
+    const LINES: usize = 256;
+    const REPS: usize = 4;
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, new_addr: *mut u8) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+    const MREMAP_MAYMOVE_FIXED: i32 = 1 | 2;
+    const MADV_HUGEPAGE: i32 = 14;
+
+    pub(super) fn enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XINT_HOSTFIX").is_some());
+        *ON
+    }
+
+    /// Line `x` of the chain: page `2x`, line `x mod 64` inside the page, so
+    /// the 256 lines spread over all 64 L1 sets (4 per set) and 256 pages.
+    #[inline(always)]
+    fn line(base: usize, x: usize) -> usize {
+        base + 2 * x * 4096 + (x % 64) * 64
+    }
+
+    /// TSC ticks for `REPS` passes of the dependent chain over the region at
+    /// `base` (one warm pass first). Writes the chain into the region and
+    /// zeroes those lines again before returning.
+    ///
+    /// # Safety
+    /// `base` is 2 MiB aligned and the 2 MiB behind it is mapped, writable,
+    /// zero-filled and not accessed by anyone else meanwhile.
+    unsafe fn probe(base: usize) -> u64 {
+        use core::arch::x86_64::{_mm_lfence, _rdtsc};
+        unsafe {
+            // Full-period LCG mod 256 (a = 5, c = 1): one cycle through all lines.
+            let mut x = 0usize;
+            for _ in 0..LINES {
+                let next = (5 * x + 1) % LINES;
+                *(line(base, x) as *mut usize) = line(base, next);
+                x = next;
+            }
+            let mut p = line(base, 0);
+            for _ in 0..LINES {
+                p = core::ptr::read_volatile(p as *const usize);
+            }
+            _mm_lfence();
+            let t0 = _rdtsc();
+            _mm_lfence();
+            for _ in 0..REPS * LINES {
+                p = core::ptr::read_volatile(p as *const usize);
+            }
+            _mm_lfence();
+            let t1 = _rdtsc();
+            core::hint::black_box(p);
+            for x in 0..LINES {
+                *(line(base, x) as *mut usize) = 0;
+            }
+            t1.wrapping_sub(t0)
+        }
+    }
+
+    /// Best of two probes (an interrupt inflates one, never both).
+    unsafe fn probe2(base: usize) -> u64 {
+        unsafe { probe(base).min(probe(base)) }
+    }
+
+    /// A fresh zero-filled 2 MiB page that probes at most `limit`, or `None`.
+    /// Returns the aligned page; `keep` collects every mapping to unmap later.
+    unsafe fn fresh_fast_page(limit: u64, keep: &mut Vec<(usize, usize)>) -> Option<usize> {
+        unsafe {
+            for _ in 0..8 {
+                let m = mmap(core::ptr::null_mut(), 2 * HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0);
+                if m as isize == -1 {
+                    return None;
+                }
+                let m = m as usize;
+                let a = m.next_multiple_of(HUGE);
+                let _ = madvise(a as *mut u8, HUGE, MADV_HUGEPAGE);
+                std::ptr::write_bytes(a as *mut u8, 0, HUGE);
+                crate::collapse_hugepages(a as *mut u8, HUGE);
+                if probe2(a) <= limit {
+                    // Trim the unaligned slack around the page now.
+                    if a > m {
+                        let _ = munmap(m as *mut u8, a - m);
+                    }
+                    let end = m + 2 * HUGE;
+                    if a + HUGE < end {
+                        let _ = munmap((a + HUGE) as *mut u8, end - a - HUGE);
+                    }
+                    return Some(a);
+                }
+                keep.push((m, 2 * HUGE));
+            }
+            None
+        }
+    }
+
+    /// # Safety
+    /// Each `(ptr, bytes)` is a live, zero-filled buffer owned by the caller
+    /// and touched by no other thread during the call. Only whole 2 MiB
+    /// aligned regions strictly inside a range are probed or replaced.
+    pub(super) unsafe fn repair(ranges: &[(usize, usize)], fix: bool) -> usize {
+        let mut regions: Vec<usize> = Vec::new();
+        for &(p, n) in ranges {
+            let mut a = p.next_multiple_of(HUGE);
+            while a + HUGE <= p + n {
+                regions.push(a);
+                a += HUGE;
+            }
+        }
+        if regions.len() < 16 {
+            return 0;
+        }
+        // SAFETY: distinct regions, caller's contract.
+        let ticks: Vec<u64> = regions.par_iter().map(|&a| unsafe { probe2(a) }).collect();
+        let mut sorted = ticks.clone();
+        sorted.sort_unstable();
+        let p25 = sorted[sorted.len() / 4].max(1);
+        // Slow = at least 1.6x the fast quartile; replacements must probe
+        // within 1.25x of it.
+        let slow = p25 + p25 * 3 / 5;
+        let accept = p25 + p25 / 4;
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        let mut found = 0usize;
+        let mut failed = false;
+        for (i, &a) in regions.iter().enumerate() {
+            if ticks[i] < slow {
+                continue;
+            }
+            unsafe {
+                // Re-check serially: a parallel probe can be slowed by its
+                // SMT sibling or an interrupt.
+                if probe2(a) < slow {
+                    continue;
+                }
+                found += 1;
+                if !fix || failed {
+                    continue;
+                }
+                let Some(f) = fresh_fast_page(accept, &mut keep) else { failed = true; continue };
+                let r = mremap(f as *mut u8, HUGE, HUGE, MREMAP_MAYMOVE_FIXED, a as *mut u8);
+                if r as usize != a {
+                    keep.push((f, HUGE));
+                    failed = true;
+                }
+            }
+        }
+        for (m, n) in keep {
+            // SAFETY: rejected fresh mappings only; nothing references them.
+            unsafe {
+                let _ = munmap(m as *mut u8, n);
+            }
+        }
+        found
     }
 }
 

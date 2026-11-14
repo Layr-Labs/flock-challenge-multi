@@ -47,6 +47,11 @@ use crate::field::F128;
 
 mod kernels;
 
+#[cfg(target_os = "linux")]
+mod xseed_hot_queue;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+mod xseed_half;
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -488,6 +493,13 @@ fn deep_share_enabled() -> bool {
     *ON
 }
 
+#[cfg(target_os = "linux")]
+fn xseed_hot_queue_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_HOT_QUEUE").is_some());
+    *ON
+}
+
 /// Run the deep pass inside the seed+top pass's sibling-paired broadcast,
 /// behind a spin barrier, instead of opening a second broadcast (whose
 /// workers have gone to sleep by then; waking them cost ~0.4 ms on the
@@ -566,6 +578,7 @@ mod affinity {
 #[cfg(target_os = "linux")]
 struct DeepSplitState {
     queues: Vec<DeepQueue>,
+    hot_queues: Option<Vec<xseed_hot_queue::HotQueue>>,
     next_sub: std::sync::atomic::AtomicUsize,
     prod_done: std::sync::atomic::AtomicUsize,
 }
@@ -575,6 +588,9 @@ impl DeepSplitState {
     fn new(n_pairs: usize) -> Self {
         Self {
             queues: (0..n_pairs).map(|_| DeepQueue::new()).collect(),
+            hot_queues: (deep_share_enabled() && xseed_hot_queue_enabled()).then(|| {
+                (0..n_pairs).map(|_| xseed_hot_queue::HotQueue::new(deep_split_depth())).collect()
+            }),
             next_sub: std::sync::atomic::AtomicUsize::new(0),
             prod_done: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1624,6 +1640,7 @@ impl<'a> SeedInput<'a> {
 fn st_fmp_run(
     n_tasks: usize,
     row_len: usize,
+    stage_rows: usize,
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
@@ -1640,7 +1657,7 @@ fn st_fmp_run(
     // tasks for the pipeline to fill.
     if n_pairs * 2 != rayon::current_num_threads()
         || n_tasks < 4 * nbuf * n_pairs
-        || (produce.is_some() && (n_tasks != 2048 || row_len != 64))
+        || (produce.is_some() && (n_tasks * stage_rows != 2048 * 512 || row_len != 64))
         || !crate::owns_whole_pool()
     {
         return false;
@@ -1649,7 +1666,7 @@ fn st_fmp_run(
         return false;
     };
     st_fmp_run_claimed(
-        n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf,
+        n_tasks, row_len, stage_rows, seed, fold, publish, produce, after, pairs, nbuf,
         st_fmp_balanced_enabled(), claim,
     )
 }
@@ -1661,6 +1678,7 @@ fn st_fmp_run(
 fn st_fmp_run_claimed(
     n_tasks: usize,
     row_len: usize,
+    stage_rows: usize,
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
@@ -1675,7 +1693,8 @@ fn st_fmp_run_claimed(
     let n_pairs = pairs.len();
     assert_eq!(n_pairs * 2, rayon::current_num_threads());
     assert!((2..=ST_FMP_CAP).contains(&nbuf));
-    assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
+    assert!(matches!(stage_rows, 512 | 1024));
+    assert!(produce.is_none() || (n_tasks * stage_rows == 2048 * 512 && row_len == 64));
     let balanced = balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
     crate::rstrace::ev("st:setup", 0);
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
@@ -1698,7 +1717,7 @@ fn st_fmp_run_claimed(
             .filter(|n| *n <= 4).unwrap_or(0)
     });
     let slot_pad = *SLOT_PAD_LINES * (64 / core::mem::size_of::<F128>());
-    let stride = 512 * row_len + slot_pad;
+    let stride = stage_rows * row_len + slot_pad;
     static HUGE_STAGE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_NTT_ST_HUGE_STAGE").is_none()
     });
@@ -1836,7 +1855,7 @@ fn st_fmp_run_claimed(
         // write. A small cache-line color leaves the complete three-slot
         // payload inside that frame while offsetting its L1 set mapping.
         let mut staging = staging_block(
-            if huge_stage { 4096 } else { 512 * nbuf + extra_rows }, row_len);
+            if huge_stage { stage_rows * 8 } else { stage_rows * nbuf + extra_rows }, row_len);
         let stage_offset = if huge_stage {
             staging.as_mut_ptr().align_offset(1usize << *STAGE_ALIGN_LOG)
                 + *STAGE_COLOR * (64 / core::mem::size_of::<F128>())
@@ -3600,6 +3619,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         log_d: usize,
         odd_tail: usize,
+        xseed_half: bool,
         after: Option<&(dyn Fn(usize) + Sync)>,
     ) -> bool {
         crate::rstrace::ev("nt:s8", 0);
@@ -4072,6 +4092,47 @@ impl AdditiveNttF128 {
                 produce(src_addr as *mut F128, group, role, Some(&target));
             }
         });
+        // Pair r and r+1024 before publication: the extra top layer is
+        // computed while both source tasks are still private staging.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        if xseed_half {
+            assert!(direct_publish && sub_stride == 2048 && row_len == 64);
+            let tw3 = self.xseed_half_top_twiddles();
+            let seed_pair = |buf: *mut F128, r: usize, compact: *const F128| {
+                assert!(compact.is_null());
+                seed(buf, r, compact);
+                unsafe { seed(buf.add(512 * 64), r + 1024, compact); }
+            };
+            let fold_pair = |buf: *mut F128, r: usize| {
+                fold4(buf, r);
+                unsafe { fold4(buf.add(512 * 64), r + 1024); }
+            };
+            let publish_pair = |buf: *mut F128, r: usize| {
+                unsafe {
+                    self.xseed_half_publish_top(buf, base_addr as *mut F128, r,
+                        row_lanes(r, 64, lanes2_tail), stage_perm, &tw3);
+                }
+            };
+            let produce_pair = produce.as_ref().map(|produce| {
+                move |group, role, a: *mut F128, b: *mut F128| {
+                    produce(group, role, a, b);
+                    unsafe { produce(group + 512, role, a.add(512 * 64), b.add(512 * 64)); }
+                }
+            });
+            if st_fmp_run(1024, 64, 1024, &seed_pair, &fold_pair, &publish_pair,
+                produce_pair.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after)
+            {
+                return after.is_some();
+            }
+            msg.generate_all();
+            (0..1024).into_par_iter().for_each_init(|| staging_block(1024, 64), |buf, r| {
+                let p = buf.as_mut_ptr();
+                seed_pair(p, r, core::ptr::null());
+                fold_pair(p, r);
+                publish_pair(p, r);
+            });
+            return false;
+        }
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // across every lane the selected downstream path can read. The exact
@@ -4099,7 +4160,7 @@ impl AdditiveNttF128 {
                 target_feature = "vpclmulqdq"
             ))]
             if direct_publish && st_fmp_run(
-                sub_stride, row_len, &seed, &fold4, &publish2,
+                sub_stride, row_len, 512, &seed, &fold4, &publish2,
                 produce.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after,
             )
             {
@@ -4367,6 +4428,19 @@ impl AdditiveNttF128 {
         // Not applied on the (dead-on-x86) ordered-streaming arm.
         let top_fusion_ok =
             Self::top_fusion_available() && stream.is_none() && !ntt_top_fusion_disabled();
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq")))]
+        let xseed_half = false;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+        let xseed_half = cfg!(target_feature = "avx512bw")
+            && std::env::var_os("FLOCK_XSEED_HALF_DEEP").is_some()
+            && force_n_top.is_none() && n_top == 9 && log_d == 20 && num_ntts == 64
+            && start_layer == 3 && top_fusion_ok && seed_msg.is_some() && seed_sub.is_none()
+            && on_sub_done.is_some() && !ntt_fused3_disabled() && deep_block_fuse_enabled()
+            && Self::scatter_nt_enabled() && (data.as_ptr() as usize).is_multiple_of(16)
+            && direct_fused2_publish_shape(log_d, num_ntts, odd_tail)
+            && !ntt_direct_fused2_publish_disabled()
+            && unsafe { self.v2_sweep1_prepared(0, 10) };
+        if xseed_half { n_top = 10; }
         // Seed fusion: `seed_msg` means layers 1–2 have NOT been applied yet
         // and the caller expects the first top task to apply them from the
         // message. That is only possible when layers 3..8 are all top layers;
@@ -4432,7 +4506,7 @@ impl AdditiveNttF128 {
         // so the output bytes are identical. `FLOCK_NO_NTT_DEEP_BLOCK_FUSE=1`
         // restores the sweep schedule (exact same-binary A/B).
         let fuse_blocks = deep_fused4_ok
-            && log_d == n_top + 11
+            && (log_d == n_top + 11 || xseed_half)
             && start_layer <= n_top
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
@@ -4443,6 +4517,18 @@ impl AdditiveNttF128 {
                         block_cb: Option<&(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)>,
                         hint: u8|
          -> bool {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+            if xseed_half {
+                let cb = block_cb.expect("half-deep requires canonical callbacks");
+                unsafe {
+                    self.v2_sweep1_rows_x86(sub_idx, sub_data.as_mut_ptr(), 0, 64,
+                        10, 20, 64, odd_tail, hint);
+                    for b in 0..8 {
+                        self.xseed_half_block(sub_idx, b, sub_data.as_mut_ptr(), cb, odd_tail, raw7_pack);
+                    }
+                }
+                return true;
+            }
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -4803,6 +4889,21 @@ impl AdditiveNttF128 {
             let hint = deep_pf_hint();
             let share = deep_share_enabled();
             let queues = &stt.queues;
+            let hot_queues = stt.hot_queues.as_ref();
+            let pop = |slot: usize, newest: bool| {
+                if let Some(hot) = hot_queues {
+                    hot[slot].try_pop(newest).map(|lo| DeepBlock { lo })
+                } else {
+                    queues[slot].try_pop()
+                }
+            };
+            let all_empty = || {
+                if let Some(hot) = hot_queues {
+                    hot.iter().all(|q| q.is_empty())
+                } else {
+                    queues.iter().all(|q| q.is_empty())
+                }
+            };
             let next_sub = &stt.next_sub;
             let prod_done = &stt.prod_done;
             let producer = idx < n_pairs;
@@ -4849,8 +4950,8 @@ impl AdditiveNttF128 {
             // Hash one claimed block.
             let run = |b: DeepBlock| {
                 // SAFETY: the producer finished every write to this block
-                // before publishing it, and the release on the ring head /
-                // acquire in the claiming pop order those writes before
+                // before publishing it, and the release on the ring head
+                // (or hot token) / acquire in the claiming pop order those writes before
                 // this read.
                 let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
@@ -4899,13 +5000,13 @@ impl AdditiveNttF128 {
                     }
                     let _ = got;
                 }
-                if let Some(b) = queues[own].try_pop() {
+                if let Some(b) = pop(own, true) {
                     run(b);
                     continue;
                 }
                 let mut got = false;
                 for k in 1..n_pairs {
-                    if let Some(b) = queues[(own + k) % n_pairs].try_pop() {
+                    if let Some(b) = pop((own + k) % n_pairs, false) {
                         run(b);
                         got = true;
                         break;
@@ -4914,7 +5015,7 @@ impl AdditiveNttF128 {
                 if got {
                     continue;
                 }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
+                if prod_done.load(Ordering::Acquire) == n_pairs && all_empty()
                 {
                     return;
                 }
@@ -4926,7 +5027,9 @@ impl AdditiveNttF128 {
                         cb(range, blk);
                         return;
                     };
-                    let queued = if share {
+                    let queued = if let Some(hot) = hot_queues {
+                        hot[slot].try_push(b.lo)
+                    } else if share {
                         q.try_push(b, depth)
                     } else {
                         q.push(b, depth)
@@ -5036,13 +5139,13 @@ impl AdditiveNttF128 {
                     };
                 #[cfg(not(target_os = "linux"))]
                 let after: Option<&(dyn Fn(usize) + Sync)> = None;
-                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, after) {
+                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, xseed_half, after) {
                     // The deep pass ran inside the same broadcast.
                     crate::gaptime::mark("ntt: deep pass done");
                     return;
                 }
                 crate::gaptime::mark("ntt: seed+top fused pass done");
-                layer += 6;
+                layer += 6 + usize::from(xseed_half);
             } else if top_fusion_ok && layer + 5 < n_top {
                 self.top_fused6_pass(data, num_ntts, layer, log_d, odd_tail);
                 layer += 6;
@@ -5805,6 +5908,11 @@ impl AdditiveNttF128 {
         sub_size_positions: usize,
         hint: u8,
     ) {
+        #[cfg(target_os = "linux")]
+        if n_top == 10 && log_d == 20 && num_ntts == 64 {
+            unsafe { self.xseed_half_block(sub_idx, b, sub_ptr, cb, odd_tail, raw7_pack); }
+            return;
+        }
         let layer4 = n_top + 4;
         let block_size4 = 1usize << (log_d - layer4);
         let block_bytes4 = block_size4 * num_ntts;
@@ -6765,7 +6873,7 @@ mod tests {
                     }
                     published[r].fetch_add(1, Ordering::Relaxed);
                 };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None, None));
+                assert!(st_fmp_run(n_tasks, ROW_LEN, 512, &seed, &fold, &publish, None, None));
                 for r in 0..n_tasks {
                     assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
                     assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
@@ -9086,7 +9194,7 @@ mod generated_pair_dispatch_tests {
             let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
             let claim=StFmpClaim::take().expect("previous call leaked its claim");
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
-                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
+                2048,64,512,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
             assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
             if injection==0 {
                 assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
@@ -9104,6 +9212,62 @@ mod generated_pair_dispatch_tests {
         }
         assert_eq!(balanced_runs,12);
         println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} balanced_runs={balanced_runs} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true");
+    }
+
+    #[test]
+    #[ignore = "requires four CPUs and exclusive global claim; run with --ignored --test-threads=1"]
+    fn xseed_half_dispatch_owns_both_staging_halves() {
+        let mask = affinity::get();
+        let cpus: Vec<_> = (0..mask.len()*64)
+            .filter(|&c| mask[c/64] & (1 << (c%64)) != 0).take(4).collect();
+        assert_eq!(cpus.len(),4);
+        let pairs = [(cpus[0],cpus[1]),(cpus[2],cpus[3])];
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut cases = 0;
+        for nbuf in 2..=4 { for balanced in [false,true] { for merged in [false,true] {
+            let published: Vec<_> = (0..1024).map(|_|AtomicUsize::new(0)).collect();
+            let generated: Vec<_> = (0..2048).map(|_|AtomicUsize::new(0)).collect();
+            let seed = |_:*mut F128,_:usize,_:*const F128| { panic!("generated input seeded twice"); };
+            let produce = |group:usize,role:usize,a:*mut F128,b:*mut F128| {
+                for half in 0..2 {
+                    let original_group = group + half * 512;
+                    assert_eq!(generated[2*original_group+role].fetch_add(1,Relaxed),0);
+                    for (q,p) in [a,b].into_iter().enumerate() { unsafe {
+                        // Ends of both halves expose an undersized allocation or
+                        // old 512-row slot stride, not merely a first-line race.
+                        for edge in [0,511*64] {
+                            *p.add(half*512*64+edge+role) = F128::new((group*2+q) as u64, (half*2+role) as u64);
+                        }
+                    }}
+                }
+            };
+            let fold = |p:*mut F128,r:usize| { unsafe {
+                for half in 0..2 {for role in 0..2 {for edge in [0,511*64] {
+                    let value = &mut *p.add(half*512*64+edge+role);
+                    assert_eq!(*value,F128::new(r as u64,(half*2+role) as u64));
+                    value.hi += 100;
+                }}}
+            }};
+            let publish = |p:*mut F128,r:usize| { unsafe {
+                for half in 0..2 {for role in 0..2 {for edge in [0,511*64] {
+                    let value = &mut *p.add(half*512*64+edge+role);
+                    assert_eq!(*value,F128::new(r as u64,(half*2+role+100) as u64));
+                    value.hi = u64::MAX;
+                }}}
+                assert_eq!(published[r].fetch_add(1,Release),0);
+            }};
+            let after = |_:usize| {
+                assert!(published.iter().all(|x|x.load(Acquire)==1));
+                assert!(generated.iter().all(|x|x.load(Acquire)==1));
+            };
+            let claim=StFmpClaim::take().expect("previous geometry leaked claim");
+            assert!(pool.install(||st_fmp_run_claimed(1024,64,1024,&seed,&fold,&publish,
+                Some(&produce),merged.then_some(&after),&pairs,nbuf,balanced,claim)));
+            assert!(published.iter().all(|x|x.load(Acquire)==1));
+            assert!(generated.iter().all(|x|x.load(Acquire)==1));
+            cases += 1;
+        }}}
+        println!("X6 paired staging: {cases} actual-dispatch cases PASS, both halves/roles/edges, merged and split");
     }
 }
 
