@@ -57,6 +57,8 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Diagnostic submission only: selects this trial's arm before anything reads a switch.
+    ab_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
@@ -65,6 +67,93 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // built: see `smt_split`.
     smt_split::init();
     built
+}
+
+/// DIAGNOSTIC SUBMISSION ONLY: run-parity A/B probe on the ranked runner
+/// (arm B: codeword scatter with ordinary stores).
+///
+/// The ranked harness starts one fresh worker per trial and names that trial's
+/// files `run-{r}.ready` / `run-{r}.proof`, so a worker knows its trial number
+/// `r` (1-based, warm-up trials included). Trials whose `(r - 1) mod 8` is 1,
+/// 3, 4 or 6 run arm B; the others run arm A, the unmodified record path. The
+/// pattern A B A B B A B A gives both arms the same number of trials in every
+/// residue class of `r` mod 2 and mod 4, so a slow drift of the host or an
+/// every-other-trial effect cancels in the comparison.
+///
+/// Arm B is the record with the switches in `B_ENV` set, exactly as if the
+/// harness had passed them (it clears the environment, so it cannot). They are
+/// set here, on the main thread, as the first statement of the worker's first
+/// library call: no thread, pool or lazily-read switch exists yet. Both arms
+/// produce the same proof bytes for the same seed: the switch changes the store
+/// instruction, not the stored values.
+///
+/// Method credit: newjordan's run-parity probes and 0xArion's delay-encoded
+/// runner profiles. Decoder: the published per-trial times, split by `r`.
+pub(crate) mod ab_probe {
+    /// Arm B: the record with ordinary (write-allocate) stores instead of
+    /// non-temporal ones where the seed-fused NTT top pass scatters its rows
+    /// into the 1 GiB codeword (`FLOCK_NO_NTT_SCATTER_NT=1`): the same bytes
+    /// land in the same places, but every written line is first fetched from
+    /// memory. The arm prices scattered memory traffic in the commit's first
+    /// phase on the runner.
+    const B_ENV: &[(&str, &str)] = &[("FLOCK_NO_NTT_SCATTER_NT", "1")];
+
+    /// The trial number, if this process is a ranked worker
+    /// (`flock-benchmark-worker LOG2 .../run-{r}.ready .../run-{r}.proof`).
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 1).then_some(r)
+    }
+
+    pub(crate) fn is_arm_b(r: u64) -> bool {
+        matches!((r - 1) % 8, 1 | 3 | 4 | 6)
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        if !is_arm_b(r) {
+            return;
+        }
+        for (key, value) in B_ENV {
+            // SAFETY: called once from `init_perf_thread_pool` before any other
+            // thread exists, so no concurrent environment access is possible.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn arms_are_balanced_over_small_periods() {
+            for period in [2u64, 4, 8] {
+                for class in 0..period {
+                    let (mut a, mut b) = (0, 0);
+                    for r in 1..=800u64 {
+                        if (r - 1) % period == class {
+                            if super::is_arm_b(r) { b += 1 } else { a += 1 }
+                        }
+                    }
+                    if period < 8 {
+                        assert_eq!(a, b, "period {period} class {class}");
+                    }
+                }
+            }
+            let b: usize = (21..=120u64).filter(|&r| super::is_arm_b(r)).count();
+            assert_eq!(b, 50);
+        }
+    }
 }
 
 /// Pin glibc's heap thresholds at process start: `M_MMAP_THRESHOLD` = 32 MiB
