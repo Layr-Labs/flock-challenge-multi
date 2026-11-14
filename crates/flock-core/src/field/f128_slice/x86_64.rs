@@ -339,6 +339,62 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Bank-major weighted collapse with deferred reduction, four adjacent output
+/// positions per vector: `dst[p] = Σ_{b<banks} w[b] · src[b·n + p]`,
+/// `n = dst.len()`, `banks = w.len()`.
+///
+/// Bank `b`'s four positions `p..p+4` are contiguous (`src[b·n + p..]`), so
+/// each load is already one output position per 128-bit lane; it is
+/// multiplied by the broadcast weight into ONE four-lane unreduced
+/// accumulator (`WideGhashX4::mul_acc2`, two banks per call), and each lane is
+/// reduced once after all banks (`reduce_lanes`) and stored once. The lanes
+/// are never XORed together: lane `l` stays output `p + l`. The product count
+/// is unchanged; the per-product reductions and the per-bank output
+/// load/store of the `scale_slice` + `add_scaled` chain are gone.
+/// Field-identical: GF(2^128) addition is XOR and the reduction is F₂-linear.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == w.len() * dst.len()`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn collapse_banks(src: &[F128], w: &[F128], dst: &mut [F128]) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    let n = dst.len();
+    let banks = w.len();
+    debug_assert_eq!(src.len(), banks * n);
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let wb = |b: usize| _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64));
+        let quads = n & !3;
+        let mut p = 0usize;
+        while p < quads {
+            let mut acc = WideGhashX4::zero();
+            let mut b = 0usize;
+            while b + 2 <= banks {
+                let x0 = _mm512_loadu_si512(src.as_ptr().add(b * n + p) as *const __m512i);
+                let x1 = _mm512_loadu_si512(src.as_ptr().add((b + 1) * n + p) as *const __m512i);
+                acc.mul_acc2(x0, wb(b), x1, wb(b + 1));
+                b += 2;
+            }
+            if b < banks {
+                let x0 = _mm512_loadu_si512(src.as_ptr().add(b * n + p) as *const __m512i);
+                acc.mul_acc(x0, wb(b));
+            }
+            _mm512_storeu_si512(dst.as_mut_ptr().add(p) as *mut __m512i, acc.reduce_lanes());
+            p += 4;
+        }
+        while p < n {
+            let mut v = F128::ZERO;
+            for b in 0..banks {
+                v += w[b] * src[b * n + p];
+            }
+            dst[p] = v;
+            p += 1;
+        }
+    }
+}
+
 /// Sixty-four-bank weighted + nested fold: fuses [`fold16_banked`] and
 /// [`fold4_nested`] in registers without materializing the 4x intermediate
 /// buffer (`mid4`).

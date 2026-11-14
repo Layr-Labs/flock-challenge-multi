@@ -1427,6 +1427,13 @@ pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 4);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
+    if rs_tail_par_enabled() {
+        // Bank-major collapse with one reduction per output (deferred over
+        // the sixteen banks): the same field sum as the scalar loop below.
+        let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
+        crate::field::f128_slice::collapse_banks(s_hat_v_fold4, &low_eq, &mut out);
+        return out;
+    }
     let mut out = vec![F128::ZERO; n_packed];
     for bank in 0..16 {
         for packed in 0..n_packed {
@@ -1442,23 +1449,11 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `scale_slice` /
-        // `add_scaled` leaves as [`collapse_s_hat_v_fold8`] — identical
-        // per-element operation in identical order, so the result is
-        // bit-identical to the scalar loop below.
+        // Bank-major collapse with one reduction per output (deferred over
+        // the four banks), as [`collapse_s_hat_v_fold8`]: the same field sum
+        // as the scalar loop below (XOR addition, F2-linear reduction).
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_quad[..n_packed],
-            low_eq[0],
-        );
-        for q in 1..4 {
-            crate::field::f128_slice::add_scaled(
-                &mut out,
-                &s_hat_v_quad[q * n_packed..(q + 1) * n_packed],
-                low_eq[q],
-            );
-        }
+        crate::field::f128_slice::collapse_banks(s_hat_v_quad, &low_eq, &mut out);
         return out;
     }
     let mut out = vec![F128::ZERO; n_packed];
@@ -1548,22 +1543,13 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     let low_eq = crate::lincheck::build_eq_table(low_point);
     crate::rstrace::ev("col:eq", 0);
     if rs_tail_par_enabled() {
-        // Same bank-major accumulation through the vectorized `scale_slice` /
-        // `add_scaled` leaves — identical per-element operation in identical
-        // order, so the result is bit-identical to the scalar loop below.
+        // Bank-major collapse: one unreduced accumulator per four outputs over
+        // all sixty-four banks and one reduction per output, instead of a
+        // reduction per product and an output load/store per bank. The same
+        // field sum as the scalar loop below (XOR addition, F2-linear
+        // reduction).
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_fold8[..n_packed],
-            low_eq[0],
-        );
-        for bank in 1..64 {
-            crate::field::f128_slice::add_scaled(
-                &mut out,
-                &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed],
-                low_eq[bank],
-            );
-        }
+        crate::field::f128_slice::collapse_banks(s_hat_v_fold8, &low_eq, &mut out);
         crate::rstrace::ev("col:end", 0);
         return out;
     }
