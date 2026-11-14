@@ -20,6 +20,7 @@
 //! ligerito module docs for the recursion.
 
 pub mod commit;
+mod xseed_virtual;
 pub mod elided_z;
 pub mod jagged;
 pub mod ligerito;
@@ -206,6 +207,12 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     }
 
     let t = std::time::Instant::now();
+    let ordinary_codeword = if combined.direct_fold8.is_none() && prover_data.virtual_deep {
+        #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+        {std::borrow::Cow::Owned(crate::ntt::AdditiveNttF128::standard(20).xseed_virtual_materialize(&prover_data.codeword))}
+        #[cfg(not(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq")))]
+        {panic!("virtual deep state without its encoder");}
+    } else {std::borrow::Cow::Borrowed(prover_data.codeword.as_slice())};
     let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
         ligerito::recursive_prover_with_basis_direct_fold8(
             lig_config,
@@ -213,8 +220,9 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
+            &ordinary_codeword,
             &*prover_data.merkle_tree,
+            prover_data.virtual_deep,
             combined.round0_prime,
             fold_arena,
             challenger,
@@ -226,7 +234,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
+            &ordinary_codeword,
             &prover_data.merkle_tree,
             combined.round0_prime,
             combined
@@ -248,7 +256,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
+            &ordinary_codeword,
             &prover_data.merkle_tree,
             combined.round0_prime,
             combined
@@ -263,7 +271,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             packed_witness,
             combined.b_combined,
             combined.target_combined,
-            &prover_data.codeword,
+            &ordinary_codeword,
             &prover_data.merkle_tree,
             combined.round0_prime,
             fold_arena,

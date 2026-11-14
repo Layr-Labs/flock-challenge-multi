@@ -47,6 +47,9 @@ use crate::field::F128;
 
 mod kernels;
 
+#[cfg(target_os = "linux")]
+mod xseed_hot_queue;
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -488,6 +491,13 @@ fn deep_share_enabled() -> bool {
     *ON
 }
 
+#[cfg(target_os = "linux")]
+fn xseed_hot_queue_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_HOT_QUEUE").is_some());
+    *ON
+}
+
 /// Run the deep pass inside the seed+top pass's sibling-paired broadcast,
 /// behind a spin barrier, instead of opening a second broadcast (whose
 /// workers have gone to sleep by then; waking them cost ~0.4 ms on the
@@ -566,6 +576,7 @@ mod affinity {
 #[cfg(target_os = "linux")]
 struct DeepSplitState {
     queues: Vec<DeepQueue>,
+    hot_queues: Option<Vec<xseed_hot_queue::HotQueue>>,
     next_sub: std::sync::atomic::AtomicUsize,
     prod_done: std::sync::atomic::AtomicUsize,
 }
@@ -575,6 +586,9 @@ impl DeepSplitState {
     fn new(n_pairs: usize) -> Self {
         Self {
             queues: (0..n_pairs).map(|_| DeepQueue::new()).collect(),
+            hot_queues: (deep_share_enabled() && xseed_hot_queue_enabled()).then(|| {
+                (0..n_pairs).map(|_| xseed_hot_queue::HotQueue::new(deep_split_depth())).collect()
+            }),
             next_sub: std::sync::atomic::AtomicUsize::new(0),
             prod_done: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -4803,6 +4817,21 @@ impl AdditiveNttF128 {
             let hint = deep_pf_hint();
             let share = deep_share_enabled();
             let queues = &stt.queues;
+            let hot_queues = stt.hot_queues.as_ref();
+            let pop = |slot: usize, newest: bool| {
+                if let Some(hot) = hot_queues {
+                    hot[slot].try_pop(newest).map(|lo| DeepBlock { lo })
+                } else {
+                    queues[slot].try_pop()
+                }
+            };
+            let all_empty = || {
+                if let Some(hot) = hot_queues {
+                    hot.iter().all(|q| q.is_empty())
+                } else {
+                    queues.iter().all(|q| q.is_empty())
+                }
+            };
             let next_sub = &stt.next_sub;
             let prod_done = &stt.prod_done;
             let producer = idx < n_pairs;
@@ -4849,8 +4878,8 @@ impl AdditiveNttF128 {
             // Hash one claimed block.
             let run = |b: DeepBlock| {
                 // SAFETY: the producer finished every write to this block
-                // before publishing it, and the release on the ring head /
-                // acquire in the claiming pop order those writes before
+                // before publishing it, and the release on the ring head
+                // (or hot token) / acquire in the claiming pop order those writes before
                 // this read.
                 let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
@@ -4899,13 +4928,13 @@ impl AdditiveNttF128 {
                     }
                     let _ = got;
                 }
-                if let Some(b) = queues[own].try_pop() {
+                if let Some(b) = pop(own, true) {
                     run(b);
                     continue;
                 }
                 let mut got = false;
                 for k in 1..n_pairs {
-                    if let Some(b) = queues[(own + k) % n_pairs].try_pop() {
+                    if let Some(b) = pop((own + k) % n_pairs, false) {
                         run(b);
                         got = true;
                         break;
@@ -4914,7 +4943,7 @@ impl AdditiveNttF128 {
                 if got {
                     continue;
                 }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
+                if prod_done.load(Ordering::Acquire) == n_pairs && all_empty()
                 {
                     return;
                 }
@@ -4926,7 +4955,9 @@ impl AdditiveNttF128 {
                         cb(range, blk);
                         return;
                     };
-                    let queued = if share {
+                    let queued = if let Some(hot) = hot_queues {
+                        hot[slot].try_push(b.lo)
+                    } else if share {
                         q.try_push(b, depth)
                     } else {
                         q.push(b, depth)
@@ -9228,6 +9259,11 @@ mod octa_seed_geometry_tests {
         println!("OCTA_SEED_GEOMETRY full_groups={cases} fields_per_group=63488_or_65536 wrong_quarter_controls={negative_controls} input_unchanged=true guards_unchanged=true reusable_local_input=true hold4_disabled={}",ntt_seed_hold4_disabled());
     }
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+mod xseed_virtual;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+mod xseed_virtual_queue;
 
 /// Proof-local immutable coefficient preparation for incremental witness seeding.
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
