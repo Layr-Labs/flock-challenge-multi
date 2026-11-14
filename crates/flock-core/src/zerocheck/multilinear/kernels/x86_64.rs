@@ -1,6 +1,10 @@
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu};
 use crate::field::{F128, F256Unreduced};
 
+#[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[path = "xseed_bbatch.rs"]
+pub(crate) mod xseed_bbatch;
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -5020,7 +5024,22 @@ core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
     include_str!("gfni_c4_pass4_register_result.S"),
+    include_str!("gfni_c4_register_result_ss.S"),
+    include_str!("gfni_c4_pass4_register_result_ss.S"),
 );
+
+/// xint factor `FLOCK_XINT_C4SS=1`: the two register-result c4 kernels with
+/// single-source byte permutations in the gather and finish (vpermb + unpack
+/// instead of vpermi2b / vpermt2b), adapted by yukonautominer (1cd15424) from
+/// patternrecognition9-del's c48e6f4b schedules onto the non-pipelined
+/// kernels. Same GFNI work, same scratch layout, same output bytes. Read once.
+#[cfg(target_os = "linux")]
+#[inline(always)]
+fn c4ss_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XINT_C4SS").is_some());
+    *ON
+}
 
 #[cfg(all(
     target_os = "linux",
@@ -5034,6 +5053,8 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
     fn flock_gfni_c4_pass4_register_result();
+    fn flock_gfni_c4_lm_register_result_ss();
+    fn flock_gfni_c4_pass4_register_result_ss();
 }
 
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
@@ -5056,6 +5077,20 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
     unsafe {
         let lo: __m512i;
         let hi: __m512i;
+        if c4ss_enabled() {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result_ss,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+            return [lo, hi];
+        }
         core::arch::asm!(
             "call {kernel}",
             kernel = sym flock_gfni_c4_pass4_register_result,
@@ -5102,6 +5137,20 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
         let b: __m512i;
         let c: __m512i;
         let d: __m512i;
+        if c4ss_enabled() {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result_ss,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+            return [a, b, c, d];
+        }
         core::arch::asm!(
             "call {kernel}",
             kernel = sym flock_gfni_c4_lm_register_result,
@@ -6818,9 +6867,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
 ) -> [F128; 8] {
     let mut unused = [F128::ZERO; 18];
     unsafe {
-        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false>(
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false>(
             a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
-            F128::ZERO,
+            F128::ZERO, None,
         )
     }
 }
@@ -7017,6 +7066,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
     const CASC: bool,
+    const BATCH: bool,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -7030,6 +7080,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     b_canon: &[F128; 4],
     la7: &mut [F128; 18],
     kappa6: F128,
+    b_batch: Option<&xseed_bbatch::Plan>,
 ) -> [F128; 8] {
     use super::super::lane_select;
     use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
@@ -7166,12 +7217,30 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // Round-seven accumulators (CASC only): [0] = A(0,0,1)·B(0,0,1) on
         // packed odd lanes, [1..10] = the t = ∞ corner products.
         let mut acc7 = [WideGhashX4::zero(); 10];
+        // The batch path is a compile-time specialization; scratch is unused
+        // on the incumbent path. Each batch consumes exactly 16 B blocks.
+        let mut batch = [[F128::ZERO; 32]; 16];
+        if BATCH { assert!(lo_size.is_multiple_of(256)); }
+        macro_rules! batch_tile {
+            ($x:expr, $line:expr) => {{
+                let p = batch[($x / 16) % 16].as_ptr().add($line);
+                transpose4_lanes(
+                    _mm512_loadu_si512(p.cast()),
+                    _mm512_loadu_si512(p.add(4).cast()),
+                    _mm512_loadu_si512(p.add(8).cast()),
+                    _mm512_loadu_si512(p.add(12).cast()),
+                )
+            }};
+        }
 
         let mut x_lo = 0;
         while x_lo + 16 <= lo_size {
             // First packed row of this block; B's live lines are 2..30.
             let row0 = 8 * (out_base + 2 * x_lo);
             debug_assert!(row0.is_multiple_of(256));
+            if BATCH && x_lo.is_multiple_of(256) {
+                xseed_bbatch::fold16(b_pkt.add(row0 * 8), b_batch.unwrap(), b_canon, &mut batch);
+            }
             let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
                 (0, 14, 2, 16)
             } else {
@@ -7183,16 +7252,21 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
             let a_tile = fold_a_half!(row0);
             prefetch_half!(next, 8..16, pf1_first, pf1_last);
-            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
-            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
-            let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
-            let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
-            let b_tile = [
-                _mm512_permutex2var_epi64(te, i_b0_a012, c0), // lines 0, 4, 8, 12
-                _mm512_permutex2var_epi64(to, i_b0_a012, c1), // lines 1, 5, 9, 13
-                _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
-                _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
-            ];
+            let (b_tile, te, to) = if BATCH {
+                (batch_tile!(x_lo, 0), _mm512_setzero_si512(), _mm512_setzero_si512())
+            } else {
+                let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
+                let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
+                let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
+                let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
+                let b_tile = [
+                    _mm512_permutex2var_epi64(te, i_b0_a012, c0), // lines 0, 4, 8, 12
+                    _mm512_permutex2var_epi64(to, i_b0_a012, c1), // lines 1, 5, 9, 13
+                    _mm512_shuffle_i64x2::<0x88>(e1, e2),         // lines 2, 6, 10, 14
+                    _mm512_shuffle_i64x2::<0x88>(o1, o2),         // lines 3, 7, 11, 15
+                ];
+                (b_tile, te, to)
+            };
             let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, wa, wa64) = emit_tile!(x_lo, a_tile, b_tile);
 
             // Lines 16..32.
@@ -7200,27 +7274,30 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             prefetch_half!(next, 0..8, pf2_first, pf2_last);
             let c_tile = fold_a_half!(row0 + 128);
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
-            let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
-            let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
-            let d_tile = [
-                // lines 16, 20, 24, 28
-                _mm512_permutex2var_epi64(
-                    _mm512_permutex2var_epi64(te, i_a3_b1_b3, e3),
-                    i_a012_b2,
-                    f4,
-                ),
-                // lines 17, 21, 25, 29
-                _mm512_permutex2var_epi64(
-                    _mm512_permutex2var_epi64(to, i_a3_b1_b3, o3),
-                    i_a012_b3,
-                    f4,
-                ),
-                // lines 18, 22, 26, 30
-                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(e3, i_a02_b0, f4), c30),
-                // lines 19, 23, 27, 31
-                _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(o3, i_a02_b1, f4), c31),
-            ];
+            let d_tile = if BATCH { batch_tile!(x_lo, 16) } else {
+                let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
+                let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+                let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
+                let d_tile = [
+                    // lines 16, 20, 24, 28
+                    _mm512_permutex2var_epi64(
+                        _mm512_permutex2var_epi64(te, i_a3_b1_b3, e3),
+                        i_a012_b2,
+                        f4,
+                    ),
+                    // lines 17, 21, 25, 29
+                    _mm512_permutex2var_epi64(
+                        _mm512_permutex2var_epi64(to, i_a3_b1_b3, o3),
+                        i_a012_b3,
+                        f4,
+                    ),
+                    // lines 18, 22, 26, 30
+                    _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(e3, i_a02_b0, f4), c30),
+                    // lines 19, 23, 27, 31
+                    _mm512_mask_blend_epi64(0xC0, _mm512_permutex2var_epi64(o3, i_a02_b1, f4), c31),
+                ];
+                d_tile
+            };
             let (c0w, c1w, c2w, c3w, d0, d1, d2, d3, wc, wc64) =
                 emit_tile!(x_lo + 8, c_tile, d_tile);
 

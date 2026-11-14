@@ -30,6 +30,7 @@ pub fn on() -> bool {
 /// Detail event (per task / per thread): recorded only at FLOCK_RS_TRACE=2.
 #[inline]
 pub fn evd(tag: &'static str, arg: u32) {
+    crate::slow::at(tag);
     if level() >= 2 {
         ev(tag, arg);
     }
@@ -62,6 +63,7 @@ fn cpu() -> i32 {
 /// Record `(now, tag, arg, thread, cpu)`.
 #[inline]
 pub fn ev(tag: &'static str, arg: u32) {
+    crate::slow::at(tag);
     if !on() {
         return;
     }

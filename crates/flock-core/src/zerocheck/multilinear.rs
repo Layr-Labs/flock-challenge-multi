@@ -1218,6 +1218,30 @@ pub(crate) fn flat_chunks<T>(
     id: impl Fn() -> T + Sync,
     op: impl Fn(T, T) -> T + Sync,
 ) -> T {
+    flat_chunks_capped(usize::MAX, a_out, b_out, chunk, leaf, id, op)
+}
+
+/// [`flat_chunks`] with the claimer cap of `crate::flat_par::with_cap`.
+pub(crate) fn flat_chunks_capped<T>(
+    cap: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    chunk: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
+    crate::flat_par::with_cap(cap, || flat_chunks_inner(a_out, b_out, chunk, leaf, id, op))
+}
+
+fn flat_chunks_inner<T>(
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    chunk: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
     assert_eq!(a_out.len(), b_out.len());
     assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
     let n = a_out.len() / chunk;
@@ -2223,6 +2247,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let lo1_ys = kernels::x86_64::lo1_ys_enabled();
     crate::rstrace::ev("r2:par0", hi_size as u32);
     let leaf = |x_hi: usize| {
+            crate::rstrace::evd("r2:b", x_hi as u32);
             crate::rstrace::item_start();
             #[allow(unused_mut)]
             let mut r4_out = [F128::ZERO; 18];
@@ -2382,6 +2407,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         for (x, y) in r4.iter_mut().zip(cr.iter()) {
             *x += *y;
         }
+        crate::rstrace::evd("r2:e", 0);
         (s1 + c1, sinf + cinf, a, r4)
     };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.
@@ -2392,8 +2418,13 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R2_DELTA_IDLE").is_none());
     let mut early_d: Option<(F128, F128, [F128; 6])> = None;
     let mut early_d4: Option<Round4Lookahead> = None;
+    // xint `FLOCK_XINT_R2_CAP=<n>`: round two's claim loop on workers < n only.
+    static R2_CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_XINT_R2_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX)
+    });
     let (sum1_even, sum_inf_even, agg, r4_flat) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
+          crate::flat_par::with_cap(*R2_CAP, || {
             if *GL1_DIDLE && canon_elided.is_some() {
                 let rows = canon_elided.unwrap();
                 crate::flat_par::map_reduce_idle(hi_size, leaf, id, op, || {
@@ -2405,6 +2436,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
             } else {
                 crate::flat_par::map_reduce(hi_size, leaf, id, op)
             }
+          })
         } else {
             (0..hi_size).into_par_iter().map(leaf).reduce(id, op)
         };

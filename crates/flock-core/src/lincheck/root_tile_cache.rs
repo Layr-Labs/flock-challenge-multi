@@ -55,6 +55,9 @@ pub struct WitnessTileView {
 #[repr(align(64))]
 struct GeneratedTiles([core::mem::MaybeUninit<u8>; 4 * 176 * 512]);
 
+#[repr(align(64))]
+struct GeneratedTiles8([core::mem::MaybeUninit<u8>; 8 * 176 * 512]);
+
 #[derive(Clone, Copy)]
 pub(super) struct Capture {
     ptr: *mut Block,
@@ -420,6 +423,12 @@ impl RootTileCache {
     fn fold_impl<const BATCH_WORD_TILES: bool>(
         &self, logical_eq8: &(impl Fn(usize) -> [F128; 8] + Sync),
     ) -> Vec<F128> {
+        static BATCH8: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_XGLM_ROOT_BATCH8").is_some()
+        });
+        // Only the ranked generated route: no full-cache materialization or
+        // duplicate generation, and no change to the materialized reader.
+        let batch8 = BATCH_WORD_TILES && self.generator.is_some() && *BATCH8;
         static PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
@@ -431,7 +440,7 @@ impl RootTileCache {
                 .ok().and_then(|s| s.parse().ok())
                 .filter(|n| (1..=4).contains(n)).unwrap_or(3)
         });
-        let word_batch = if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
+        let word_batch = if batch8 { 8 } else if BATCH_WORD_TILES { *WORD_BATCH } else { 4 };
         static TAIL1: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
             if std::env::var_os("FLOCK_NO_SL1_FOLD_TAIL1").is_some() {
                 return None;
@@ -468,14 +477,18 @@ impl RootTileCache {
                 crate::rstrace::evd("rf:w0", worker as u32);
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
-                let mut generated = self.generator.map(|_| unsafe {
+                let mut generated = self.generator.filter(|_| !batch8).map(|_| unsafe {
                     Box::<GeneratedTiles>::new_uninit().assume_init()
+                });
+                let mut generated8 = batch8.then(|| unsafe {
+                    Box::<GeneratedTiles8>::new_uninit().assume_init()
                 });
                 let mut mats = [0u64; 128];
                 // Const specialization lets the false worker discard the
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
                 let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut batch_mats8 = batch8.then(|| [[0u64; 128]; 8]);
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -514,7 +527,11 @@ impl RootTileCache {
                         let count = (hi - lo).min(word_batch);
                         lo += count;
                         let source = if let Some((seed, generate)) = self.generator {
-                            let base = generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>();
+                            let base = if let Some(wide) = generated8.as_mut() {
+                                wide.0.as_mut_ptr().cast::<u8>()
+                            } else {
+                                generated.as_mut().unwrap().0.as_mut_ptr().cast::<u8>()
+                            };
                             for slot in 0..count {
                                 unsafe { generate(seed, tile + slot, base.add(slot * self.blocks * 512)); }
                             }
@@ -523,7 +540,11 @@ impl RootTileCache {
                             unsafe { self.storage.0.as_ptr().add(self.offset).cast::<u8>()
                                 .add(tile * self.blocks * 512) }
                         };
-                        let matrices = batch_mats.as_mut().expect("selected-word batch matrices");
+                        let matrices: &mut [[u64; 128]] = if let Some(wide) = batch_mats8.as_mut() {
+                            &mut wide[..]
+                        } else {
+                            &mut batch_mats.as_mut().expect("selected-word batch matrices")[..]
+                        };
                         for (slot, matrix) in matrices[..count].iter_mut().enumerate() {
                             for t in 0..DIRECT_FOLD_TILE_STRIPES {
                                 let eq8 = logical_eq8(8 * ((tile + slot) * DIRECT_FOLD_TILE_STRIPES + t));

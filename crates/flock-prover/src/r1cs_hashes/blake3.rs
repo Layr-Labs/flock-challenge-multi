@@ -2258,6 +2258,10 @@ fn generate_witness_and_commit_from(
     (context.codeword, (witness, a, b, ab_inner))
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+#[path = "blake3_fallback_tests.rs"]
+mod fallback_tests;
+
 /// Generate packed z/A/B and the challenge-independent round-one AB
 /// projection in one per-block pass. The projection consumes each global A/B
 /// block immediately after the witness builder writes it, while those cache
@@ -2987,6 +2991,42 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     flock_core::rstrace::evd("oc:plan", 0);
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    if !ab_stream {
+        // The octa kernels below require streaming staging. Both rollback
+        // policies lack it; use the canonical full-write builder instead of
+        // constructing a StreamProj from None. This also serves direct callers
+        // of this helper, not just the public dispatch above.
+        assert!(!compact);
+        assert!(!matches!(ranked_closed_dispatch, RankedClosedDispatch::ForceExact));
+        z.par_chunks_mut(F128_PER_BLOCK)
+            .zip(a.par_chunks_mut(F128_PER_BLOCK))
+            .zip(b.par_chunks_mut(F128_PER_BLOCK))
+            .zip(ab_inner.as_bytes_mut().par_chunks_mut(BYTES_PER_BLOCK))
+            .enumerate()
+            .for_each(|(block_idx, (((z_out, a_out), b_out), ab_out))| {
+                blocks.with_block(block_idx, padding, |(cv, msg, counter, block_len, flags)| {
+                    // SAFETY: each disjoint F128 block owns exactly K bits;
+                    // F128 storage is aligned for u64 and fully overwritten.
+                    unsafe {
+                        build_block_witness_ab_packed_into(
+                            cv, msg, *counter, *block_len, *flags,
+                            std::slice::from_raw_parts_mut(z_out.as_mut_ptr().cast::<u64>(), K / 64),
+                            std::slice::from_raw_parts_mut(a_out.as_mut_ptr().cast::<u64>(), K / 64),
+                            std::slice::from_raw_parts_mut(b_out.as_mut_ptr().cast::<u64>(), K / 64),
+                        );
+                        if block_idx >= skip_blocks {
+                            flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                std::slice::from_raw_parts(a_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+                                std::slice::from_raw_parts(b_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK),
+                                ab_out, inv_table, false,
+                            );
+                        }
+                    }
+                });
+            });
+        // All stores above are temporal; no NT publication fence is needed.
+        return;
+    }
     let one_rows_elided = ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
