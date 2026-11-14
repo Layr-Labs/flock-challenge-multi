@@ -1,5 +1,10 @@
 use crate::field::F128;
 
+#[cfg(all(target_os="linux", target_feature="avx512bw"))]
+include!("xseed_inplace_four.rs");
+#[cfg(all(target_os="linux", target_feature="avx512bw"))]
+include!("xseed_inplace.rs");
+
 /// `FLOCK_NO_NTT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
 /// at DIET-controlled call sites, including the fused-two OUTER_LOW path.
 /// The independent fused-three high-one specialization has its own rollback
