@@ -7,6 +7,8 @@ use super::*;
 use core::arch::x86_64::*;
 use rayon::prelude::*;
 
+mod block_owned;
+
 #[repr(C, align(64))]
 pub(super) struct Block([u8; 512]);
 
@@ -420,10 +422,25 @@ impl RootTileCache {
     fn fold_impl<const BATCH_WORD_TILES: bool>(
         &self, logical_eq8: &(impl Fn(usize) -> [F128; 8] + Sync),
     ) -> Vec<F128> {
+        static BLOCK_OWNED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_XGLM_ROOT_BLOCK_OWNED").is_some()
+        });
+        if BATCH_WORD_TILES && self.generator.is_none() && *BLOCK_OWNED {
+            return self.fold_block_owned(logical_eq8);
+        }
         static PREFETCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        static LOOKUP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_XGLM_ROOT_LOOKUP").is_some()
+        });
+        static NARROW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_XGLM_ROOT_NARROW").is_some()
+        });
+        let narrow = BATCH_WORD_TILES && cfg!(target_feature = "avx512vl") && *NARROW;
+        // Alternative kernels, not additive switches: narrow takes precedence.
+        let lookup = BATCH_WORD_TILES && !narrow && *LOOKUP;
         // Resolve the tile group once, outside the parallel reader. Two-tile
         // groups reduced measured lincheck latency on the ranked CPU shape.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -476,6 +493,9 @@ impl RootTileCache {
                 // entire batch array. The true worker initializes it once,
                 // then fully overwrites only live slots before each call.
                 let mut batch_mats = BATCH_WORD_TILES.then(|| [[0u64; 128]; 4]);
+                let mut lookup_tables = lookup.then(|| {
+                    Box::new(core::array::from_fn::<_, 4, _>(|_| kernels::RootLookupTables::zero()))
+                });
                 let mut first = true;
                 let (mut lo, mut hi) = if dynamic {
                     (0, 0)
@@ -531,7 +551,35 @@ impl RootTileCache {
                                     &mut matrix[t * 16..(t + 1) * 16]);
                             }
                         }
+                        if let Some(tables) = lookup_tables.as_mut() {
+                            for slot in 0..count {
+                                unsafe { kernels::build_root_lookup(&matrices[slot], &mut tables[slot]); }
+                            }
+                        }
                         for block in 0..self.blocks {
+                            if narrow {
+                                // Same demand spans as the incumbent; AVX512VL checked above.
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_narrow(
+                                        source.add(block * 512), matrices.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                                continue;
+                            }
+                            if let Some(tables) = lookup_tables.as_ref() {
+                                // Same source/output spans as the incumbent below; every
+                                // live table was built from its matching matrix above.
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_lookup(
+                                        source.add(block * 512), matrices.as_ptr().cast::<u64>(),
+                                        tables.as_ptr(), dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                                continue;
+                            }
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
                             // and actual tile stride is blocks*512. Arrays of
@@ -685,9 +733,15 @@ mod tests {
                     let mut expected = [0u8; 1024];
                     let mut old = vec![0x5du8; 64 + 1024 + 64];
                     let mut new = old.clone();
+                    let mut lookup_out = old.clone();
+                    let mut tables = core::array::from_fn::<_, 4, _>(|_| kernels::RootLookupTables::zero());
+                    for tile in 0..count {
+                        unsafe { kernels::build_root_lookup(&mats[tile], &mut tables[tile]); }
+                    }
                     for i in 0..1024 {
                         old[64 + i] = (i as u8).wrapping_mul(73) ^ 0xc3;
                         new[64 + i] = old[64 + i];
+                        lookup_out[64 + i] = old[64 + i];
                         expected[i] = if seed_zero { 0 } else { old[64 + i] };
                         for tile in 0..count { expected[i] ^= oracle_tiles[tile][i]; }
                     }
@@ -708,7 +762,14 @@ mod tests {
                             source.as_ptr().add(group * 512), mats.as_ptr().cast(),
                             new.as_mut_ptr().add(64), STRIDE, count, seed_zero,
                             WORD_TO_COLUMNS.as_ptr(), prefetch);
+                        kernels::gfni_fold_word_tiles4_lookup(
+                            source.as_ptr().add(group * 512), mats.as_ptr().cast(), tables.as_ptr(),
+                            lookup_out.as_mut_ptr().add(64), STRIDE, count, seed_zero,
+                            WORD_TO_COLUMNS.as_ptr(), prefetch);
                     }
+                    assert_eq!(&lookup_out[64..1088], &expected,
+                        "lookup oracle, group={group}, count={count}, first={seed_zero}");
+                    assert!(lookup_out[..64].iter().chain(lookup_out[1088..].iter()).all(|&b| b == 0x5d));
                     assert_eq!(&old[64..1088], &expected,
                         "old oracle, group={group}, count={count}, first={seed_zero}");
                     assert_eq!(&new[64..1088], &expected,

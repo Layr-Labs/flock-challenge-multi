@@ -152,7 +152,10 @@ pub struct Commitment {
 /// avoids ~4 GB of duplication at large `m`, dropping peak commit memory by
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
+    /// Canonical final values ordinarily; with `virtual_deep`, immutable
+    /// nine-layer top state. Use the PCS opening API to obtain final rows.
     pub codeword: Vec<F128>,
+    pub(crate) virtual_deep: bool,
     pub merkle_tree: Vec<Hash>,
 }
 
@@ -263,7 +266,10 @@ pub unsafe fn commit_generated_into(
         // SAFETY: this function forwards its exclusive message borrow and
         // the documented producer contract; the encoder joins every role.
         unsafe {
+            #[cfg(target_feature = "avx512bw")]
+            if ntt.rs_encode_generated_virtual(z_packed, codeword, produce, on_range_done) {return true;}
             ntt.rs_encode_generated_on_range_done(z_packed, codeword, produce, on_range_done);
+            false
         }
     })
 }
@@ -331,6 +337,7 @@ fn finalize_commit(
                 },
                 ProverData {
                     codeword,
+                    virtual_deep: false,
                     merkle_tree,
                 },
             );
@@ -339,6 +346,7 @@ fn finalize_commit(
 
     finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
         ntt.rs_encode_interleaved_on_range_done(z_packed, codeword, params.num_ntts(), on_range_done);
+        false
     })
 }
 
@@ -348,7 +356,7 @@ fn finalize_commit(
 fn finalize_cpu_commit(
     mut codeword: Vec<F128>,
     params: &PcsParams,
-    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)) -> bool,
 ) -> (Commitment, ProverData) {
     crate::rstrace::ev("fc:in", 0);
     let timing = crate::sl2_env_set!("FLOCK_COMMIT_TIMING");
@@ -414,7 +422,7 @@ fn finalize_cpu_commit(
     let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
     crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
-    encode(
+    let virtual_deep = encode(
         &mut codeword,
         &|range, sub_data| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
@@ -624,6 +632,7 @@ fn finalize_cpu_commit(
         },
         ProverData {
             codeword,
+            virtual_deep,
             merkle_tree,
         },
     )

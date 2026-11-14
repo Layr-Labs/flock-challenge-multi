@@ -543,6 +543,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
 
     crate::rstrace::ev("r345:par0", 0);
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            crate::rstrace::evd("r3:b", x_hi as u32);
             crate::rstrace::item_start();
             let out_base = x_hi * chunk_out;
             let mut la7 = [F128::ZERO; 18];
@@ -640,6 +641,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
             };
             let eq_h = eq_hi[x_hi];
             crate::rstrace::item_end();
+            crate::rstrace::evd("r3:e", 0);
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -670,7 +672,13 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `super::flat_tail`.
     let (sum1_even, sum_inf_even, agg, la7_acc) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
-            super::flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+            {
+                // xint `FLOCK_XINT_L0_CAP=<n>`: this pass's claim loop on workers < n only.
+                static L0_CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                    std::env::var("FLOCK_XINT_L0_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX)
+                });
+                super::flat_chunks_capped(*L0_CAP, a_out, b_out, chunk_out, leaf, id, op)
+            }
         } else {
             a_out
                 .par_chunks_mut(chunk_out)
