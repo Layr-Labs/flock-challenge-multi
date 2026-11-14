@@ -1203,3 +1203,6 @@ pub(super) use x86_64::RAW7_PACK_HITS;
     target_feature = "vpclmulqdq"
 ))]
 pub(super) use x86_64::rows_raw7_s8;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+pub(super) use x86_64::{PreparedFour, xseed_inplace_first, xseed_inplace_second, xseed_inplace_second_packed, xseed_inplace_last};

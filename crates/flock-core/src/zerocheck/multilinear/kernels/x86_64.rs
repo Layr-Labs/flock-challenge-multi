@@ -5020,7 +5020,22 @@ core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
     include_str!("gfni_c4_pass4_register_result.S"),
+    include_str!("gfni_c4_register_result_ss.S"),
+    include_str!("gfni_c4_pass4_register_result_ss.S"),
 );
+
+/// xint factor `FLOCK_XINT_C4SS=1`: the two register-result c4 kernels with
+/// single-source byte permutations in the gather and finish (vpermb + unpack
+/// instead of vpermi2b / vpermt2b), adapted by yukonautominer (1cd15424) from
+/// patternrecognition9-del's c48e6f4b schedules onto the non-pipelined
+/// kernels. Same GFNI work, same scratch layout, same output bytes. Read once.
+#[cfg(target_os = "linux")]
+#[inline(always)]
+fn c4ss_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XINT_C4SS").is_some());
+    *ON
+}
 
 #[cfg(all(
     target_os = "linux",
@@ -5034,6 +5049,8 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
     fn flock_gfni_c4_pass4_register_result();
+    fn flock_gfni_c4_lm_register_result_ss();
+    fn flock_gfni_c4_pass4_register_result_ss();
 }
 
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
@@ -5056,6 +5073,20 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
     unsafe {
         let lo: __m512i;
         let hi: __m512i;
+        if c4ss_enabled() {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result_ss,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+            return [lo, hi];
+        }
         core::arch::asm!(
             "call {kernel}",
             kernel = sym flock_gfni_c4_pass4_register_result,
@@ -5102,6 +5133,20 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
         let b: __m512i;
         let c: __m512i;
         let d: __m512i;
+        if c4ss_enabled() {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result_ss,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+            return [a, b, c, d];
+        }
         core::arch::asm!(
             "call {kernel}",
             kernel = sym flock_gfni_c4_lm_register_result,

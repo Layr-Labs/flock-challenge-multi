@@ -286,6 +286,12 @@ const BLAKE3_IV: [u32; 8] = [
 #[path = "merkle_contiguous.rs"]
 mod contiguous;
 
+#[cfg(all(target_arch="x86_64",target_os="linux",target_feature="avx512f",target_feature="avx512vl"))]
+#[path="merkle_striped.rs"]
+mod striped;
+#[cfg(all(target_arch="x86_64",target_os="linux",target_feature="avx512f",target_feature="avx512vl"))]
+pub(crate) use striped::hash_leaf_stripe;
+
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;

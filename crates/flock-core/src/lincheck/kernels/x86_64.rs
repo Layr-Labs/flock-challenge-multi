@@ -533,6 +533,14 @@ pub(crate) unsafe fn gfni_fold_rows(
 }
 
 
+// Public rival 0194c7d2: request write ownership for the next private bank.
+// Default off here; the scorer decides whether the unseparated rival signal transfers.
+fn xglm_prefetchw_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XGLM_PREFETCHW").is_some());
+    *ON
+}
+
 /// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
 /// sixteen byte-plane accumulators until the last tile has been consumed.
 ///
@@ -589,9 +597,11 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "mov r10, r11",
             "mov rax, 0x8040201008040201",
             "vpbroadcastq zmm21, rax",
-            // Read-only, nonfaulting hints for the next private plane bank.
+            // Mode 2 requests ownership; mode 1 retains read-only hints.
             "test r10, r10",
             "jz 6f",
+            "cmp r10, 2",
+            "je 8f",
             "prefetcht0 [rdx + 1024]",
             "prefetcht0 [rdx + 1088]",
             "prefetcht0 [rdx + 1152]",
@@ -608,6 +618,24 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "prefetcht0 [rdx + 1856]",
             "prefetcht0 [rdx + 1920]",
             "prefetcht0 [rdx + 1984]",
+            "jmp 6f",
+            "8:",
+            "prefetchw [rdx + 1024]",
+            "prefetchw [rdx + 1088]",
+            "prefetchw [rdx + 1152]",
+            "prefetchw [rdx + 1216]",
+            "prefetchw [rdx + 1280]",
+            "prefetchw [rdx + 1344]",
+            "prefetchw [rdx + 1408]",
+            "prefetchw [rdx + 1472]",
+            "prefetchw [rdx + 1536]",
+            "prefetchw [rdx + 1600]",
+            "prefetchw [rdx + 1664]",
+            "prefetchw [rdx + 1728]",
+            "prefetchw [rdx + 1792]",
+            "prefetchw [rdx + 1856]",
+            "prefetchw [rdx + 1920]",
+            "prefetchw [rdx + 1984]",
             "6:",
             "test r9, r9",
             "jz 2f",
@@ -901,7 +929,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             inout("r8") count => _,
             in("r9") usize::from(seed_zero),
             inout("r10") permutation => _,
-            inout("r11") usize::from(prefetch_next_block) => _,
+            inout("r11") usize::from(prefetch_next_block) << usize::from(xglm_prefetchw_enabled()) => _,
             out("rax") _,
             out("zmm0") _,
             out("zmm1") _,

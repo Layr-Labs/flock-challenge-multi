@@ -259,10 +259,13 @@ pub unsafe fn commit_generated_into(
     assert_eq!(z_packed.len(), 1 << 25);
     assert_eq!(codeword.len(), 1 << 26);
     let ntt = AdditiveNttF128::standard(params.k_code());
-    finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
+    finalize_cpu_commit(codeword, params, |codeword, on_range_done, on_stripe_done| {
         // SAFETY: this function forwards its exclusive message borrow and
         // the documented producer contract; the encoder joins every role.
         unsafe {
+            #[cfg(target_feature = "avx512bw")]
+            if params.merkle_hash==HashKind::Blake3 && params.leaf_size_bytes()==1024
+                && ntt.rs_encode_generated_inplace(z_packed,codeword,produce,on_stripe_done) {return;}
             ntt.rs_encode_generated_on_range_done(z_packed, codeword, produce, on_range_done);
         }
     })
@@ -337,7 +340,7 @@ fn finalize_commit(
         }
     }
 
-    finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
+    finalize_cpu_commit(codeword, params, |codeword, on_range_done, _on_stripe_done| {
         ntt.rs_encode_interleaved_on_range_done(z_packed, codeword, params.num_ntts(), on_range_done);
     })
 }
@@ -348,7 +351,8 @@ fn finalize_commit(
 fn finalize_cpu_commit(
     mut codeword: Vec<F128>,
     params: &PcsParams,
-    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+        &(dyn Fn(core::ops::Range<usize>,usize,&[F128],&mut [u8])+Sync)),
 ) -> (Commitment, ProverData) {
     crate::rstrace::ev("fc:in", 0);
     let timing = crate::sl2_env_set!("FLOCK_COMMIT_TIMING");
@@ -414,44 +418,7 @@ fn finalize_cpu_commit(
     let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
     crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
-    encode(
-        &mut codeword,
-        &|range, sub_data| {
-            debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
-            // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
-            // the one-shot `merkle_tree` cast in the previous barrier path.
-            let bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    sub_data.as_ptr() as *const u8,
-                    sub_data.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            // At cut depth one, every two ordinary leaves are hashed directly
-            // to their parent and only that parent level is retained. Ranked
-            // deep-pass ranges are even-sized and pair-aligned, so workers
-            // still own disjoint output ranges.
-            let stored_range = if merkle_cut_depth == 1 {
-                assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
-                assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
-                (range.start >> 1)..(range.end >> 1)
-            } else {
-                range.clone()
-            };
-            // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
-            // range; only this worker writes it, and all corresponding NTT
-            // rows have retired on this thread.
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (tree_addr as *mut Hash).add(stored_range.start),
-                    stored_range.len(),
-                )
-            };
-            if merkle_cut_depth == 1 {
-                merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
-            } else {
-                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
-            }
-
+    let finish_range=|range:core::ops::Range<usize>| {
             if !subtree_parents {
                 return;
             }
@@ -578,6 +545,64 @@ fn finalize_cpu_commit(
                     j += 1;
                 }
             }
+    };
+    encode(
+        &mut codeword,
+        &|range, sub_data| {
+            debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
+            // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
+            // the one-shot `merkle_tree` cast in the previous barrier path.
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    sub_data.as_ptr() as *const u8,
+                    sub_data.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            // At cut depth one, every two ordinary leaves are hashed directly
+            // to their parent and only that parent level is retained. Ranked
+            // deep-pass ranges are even-sized and pair-aligned, so workers
+            // still own disjoint output ranges.
+            let stored_range = if merkle_cut_depth == 1 {
+                assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
+                assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
+                (range.start >> 1)..(range.end >> 1)
+            } else {
+                range.clone()
+            };
+            // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
+            // range; only this worker writes it, and all corresponding NTT
+            // rows have retired on this thread.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (tree_addr as *mut Hash).add(stored_range.start),
+                    stored_range.len(),
+                )
+            };
+            if merkle_cut_depth == 1 {
+                merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
+            } else {
+                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+            }
+
+            finish_range(range);
+        },
+        &|range,stripe,sub_data,cvs| {
+            #[cfg(all(target_arch="x86_64",target_os="linux",target_feature="avx512f",target_feature="avx512vl"))]
+            {
+                assert_eq!(kind,HashKind::Blake3);assert_eq!(leaf_size,1024);
+                assert_eq!(range.start%128,0);assert_eq!(range.len(),128);
+                let width=sub_data.len()/range.len();
+                assert_eq!(width,64);
+                assert_eq!(sub_data.len(),range.len()*width);
+                let start=range.start>>merkle_cut_depth;let len=range.len()>>merkle_cut_depth;
+                // Exclusive block claim covers both the persistent CVs and
+                // exactly this output range. Completion only fires on the last stripe.
+                let out=unsafe{core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(start),len)};
+                merkle::hash_leaf_stripe(sub_data,stripe,width,cvs,merkle_cut_depth==1,out);
+                if stripe==64/width.min(32)-1 {finish_range(range);}
+            }
+            #[cfg(not(all(target_arch="x86_64",target_os="linux",target_feature="avx512f",target_feature="avx512vl")))]
+            {let _=(range,stripe,sub_data,cvs);unreachable!("striped encoder is x86-only");}
         },
     );
     if timing {
