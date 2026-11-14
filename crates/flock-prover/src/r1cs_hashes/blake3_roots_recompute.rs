@@ -329,7 +329,7 @@ fn roots_only_matches_production_stripes() {
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
-                            StreamProj { compact_z_tile_words:0, seed_window:None,
+                            StreamProj { compact_z_tile_words:0, seed_window:None, ab_pend: core::ptr::null_mut(),
                                 stage: stage.0.as_mut_ptr(),
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
@@ -341,6 +341,7 @@ fn roots_only_matches_production_stripes() {
                                 cross_quarter: false,
                                 compact_z: core::ptr::null_mut(),
                                 elide_z: false,
+                                ab_pend: core::ptr::null_mut(), // test-only: field added by the crown's SB1 defer
                             },
                             &preps,
                             [true; 3],
