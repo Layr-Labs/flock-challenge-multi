@@ -3092,7 +3092,10 @@ fn build_direct_fold8_factors_from_slice(
         Some(p) => (Some(p.a), Some(p.eq)),
         None => (None, None),
     };
-    let a_state = if let Some(a) = pre_a.filter(|a| a.len() == state_len) {
+    let a_state = if let Some(a) = pre_a
+        .filter(|a| a.len() == state_len)
+        .or_else(|| lc_early_a_take(fold8))
+    {
         crate::rstrace::ev("rs:W0", 0);
         unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
         crate::rstrace::ev("rs:W1", 0);
@@ -4123,11 +4126,19 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 // SAFETY: the owner waits for state 2 before its borrow of
                 // the tensor ends (claim tail or the final settle below).
                 let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
-                let mut a = crate::alloc_uninit_vec::<F128>(len);
-                let (_, eq) = rayon::join(
-                    || direct_fold8_a_state_lines(fold8, &mut a),
-                    || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
-                );
+                // The A state lincheck already started for this tensor, if any;
+                // only the tail eq split is left then.
+                let (a, eq) = match lc_early_a_take(fold8) {
+                    Some(a) => (a, build_eq_split(&tail, deferred_split_n_lo(tail.len()))),
+                    None => {
+                        let mut a = crate::alloc_uninit_vec::<F128>(len);
+                        let (_, eq) = rayon::join(
+                            || direct_fold8_a_state_lines(fold8, &mut a),
+                            || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
+                        );
+                        (a, eq)
+                    }
+                };
                 *job.val.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreParts { a, eq });
                 job.state.store(2, Ordering::Release);
             });
@@ -4643,6 +4654,193 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         drop(e.take());
     }
     (results, gammas_rs)
+}
+
+/// AB's A state started at lincheck's first-bind Fold8 capture: the bank tensor
+/// is final there, and its A state (64 bank transposes) depends on nothing
+/// else, so it can run beside lincheck rounds 1..=7 instead of first starting
+/// at the open. Only a caller that requests it (lincheck's
+/// `RankedFold8TailEarlyA` capture, armed by the prover path that owns an
+/// [`LcEarlyAGuard`]) starts a job.
+///
+/// The job owns a copy of the tensor and keeps it with its result. A consumer
+/// takes the result only if that copy equals its own tensor element for
+/// element: the A state is a pure function of the tensor, so a result can
+/// never be applied to different data, whatever the allocator, timing or
+/// caller (a job left from an earlier proof included). One word packs a
+/// generation counter with the job state, so a job queued for an earlier
+/// generation never starts after a later spawn or settle.
+///
+/// Nothing ever waits for a job: a queued job is cancelled, a running job is
+/// left to finish (its result is dropped by a later settle or spawn), and the
+/// consumer then builds the A state itself as before. No Rayon worker can spin
+/// on a job suspended on its own stack, with any pool width.
+mod lc_early_a {
+    use super::F128;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) const QUEUED: u64 = 0;
+    pub(super) const RUNNING: u64 = 1;
+    pub(super) const DONE: u64 = 2;
+    pub(super) const IDLE: u64 = 3;
+    pub(super) struct Done {
+        pub src: Vec<F128>,
+        pub a: Vec<F128>,
+    }
+    /// `(generation << 8) | state`.
+    pub(super) static WORD: AtomicU64 = AtomicU64::new(IDLE);
+    pub(super) static SLOT: std::sync::Mutex<Option<Done>> = std::sync::Mutex::new(None);
+    pub(super) fn on() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_EARLY_A").is_none());
+        *ON
+    }
+    pub(super) fn word(generation: u64, state: u64) -> u64 {
+        (generation << 8) | state
+    }
+    /// Cancel a queued job or claim a finished entry, leaving the lane idle in
+    /// this generation. Never waits: a running job is left running (`None`).
+    pub(super) fn settle() -> Option<Done> {
+        loop {
+            let w = WORD.load(Ordering::Acquire);
+            let (generation, state) = (w >> 8, w & 0xff);
+            match state {
+                QUEUED | DONE => {
+                    if WORD
+                        .compare_exchange(
+                            w,
+                            word(generation, IDLE),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return if state == DONE {
+                            SLOT.lock().unwrap_or_else(|e| e.into_inner()).take()
+                        } else {
+                            None
+                        };
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Start AB's A state from lincheck's Fold8 capture (see [`lc_early_a`]). The
+/// job copies `fold8`, so it never reads the caller's buffer after this call;
+/// a wrong shape, the kill switch `FLOCK_NO_LC_EARLY_A=1`, a build without the
+/// ranked x86 consumer, or a still-running earlier job starts nothing.
+pub fn lc_early_a_spawn(fold8: &[F128]) {
+    use std::sync::atomic::Ordering;
+    let n_packed = 1usize << LOG_PACKING;
+    if !lc_early_a::on()
+        || fold8.len() != 64 * n_packed
+        || !cfg!(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))
+    {
+        return;
+    }
+    drop(lc_early_a::settle());
+    let w = lc_early_a::WORD.load(Ordering::Acquire);
+    if w & 0xff != lc_early_a::IDLE {
+        return;
+    }
+    let generation = (w >> 8).wrapping_add(1) & (u64::MAX >> 8);
+    if lc_early_a::WORD
+        .compare_exchange(
+            w,
+            lc_early_a::word(generation, lc_early_a::QUEUED),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let src = fold8.to_vec();
+    rayon::spawn(move || {
+        if lc_early_a::WORD
+            .compare_exchange(
+                lc_early_a::word(generation, lc_early_a::QUEUED),
+                lc_early_a::word(generation, lc_early_a::RUNNING),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        crate::rstrace::ev("lca:run", 0);
+        let mut a = crate::alloc_uninit_vec::<F128>(src.len());
+        direct_fold8_a_state_lines(&src, &mut a);
+        *lc_early_a::SLOT.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(lc_early_a::Done { src, a });
+        crate::rstrace::ev("lca:done", 0);
+        lc_early_a::WORD.store(
+            lc_early_a::word(generation, lc_early_a::DONE),
+            Ordering::Release,
+        );
+    });
+}
+
+/// Cancel a queued early A state and drop a finished one (never waits).
+pub fn lc_early_a_settle() {
+    drop(lc_early_a::settle());
+}
+
+/// Owner of the early A-state lane for one proof: created by the prover path
+/// that requests `RankedFold8TailEarlyA`, it settles the lane when the proof
+/// returns or unwinds.
+pub struct LcEarlyAGuard(());
+
+impl LcEarlyAGuard {
+    pub fn new() -> Self {
+        lc_early_a_settle();
+        LcEarlyAGuard(())
+    }
+}
+
+impl Default for LcEarlyAGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for LcEarlyAGuard {
+    fn drop(&mut self) {
+        lc_early_a_settle();
+    }
+}
+
+/// The finished early A state for exactly this bank tensor: taken only when
+/// the job's own copy equals `fold8` element for element. Never waits; any
+/// other case (no job, queued, running, other data) returns `None` and the
+/// caller builds the A state itself, as before. A finished entry for other
+/// data is put back untouched.
+fn lc_early_a_take(fold8: &[F128]) -> Option<Vec<F128>> {
+    use std::sync::atomic::Ordering;
+    if fold8.is_empty() || lc_early_a::WORD.load(Ordering::Acquire) & 0xff != lc_early_a::DONE {
+        return None;
+    }
+    {
+        let slot = lc_early_a::SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(done) if done.src[..] == fold8[..] && done.a.len() == fold8.len() => {}
+            _ => return None,
+        }
+    }
+    let done = lc_early_a::settle()?;
+    if done.src[..] == fold8[..] && done.a.len() == fold8.len() {
+        Some(done.a)
+    } else {
+        None
+    }
 }
 
 /// Lane sl2: an A state built beside the observe chain (claim-once).

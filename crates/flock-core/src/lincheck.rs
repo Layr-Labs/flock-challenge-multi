@@ -5318,6 +5318,12 @@ pub enum ZCaptureMode {
     /// Return the table after the first top bind. At the ranked shape this is
     /// already the Fold8 statistic consumed by the PCS opening.
     RankedFold8Tail,
+    /// [`ZCaptureMode::RankedFold8Tail`] that also starts the table's PCS A
+    /// state beside the remaining rounds
+    /// ([`crate::pcs::ring_switch::lc_early_a_spawn`]). Only a caller that owns
+    /// a [`crate::pcs::ring_switch::LcEarlyAGuard`] for the proof requests it;
+    /// a successful capture reports `RankedFold8Tail`.
+    RankedFold8TailEarlyA,
 }
 
 /// Capture lincheck's z table in the requested form, reporting the form that
@@ -5695,7 +5701,8 @@ fn prove_padded_inner<Ch: Challenger>(
     };
     // At the ranked shape, the first lincheck bind and the downstream Fold8
     // map use the same halves and challenge. Capture that output directly.
-    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+    let early_a_requested = capture == ZCaptureMode::RankedFold8TailEarlyA;
+    let fold8_ready = (capture == ZCaptureMode::RankedFold8Tail || early_a_requested)
         && inner_rest_len == 8
         && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
     let actual_capture = if fold8_ready {
@@ -5762,6 +5769,11 @@ fn prove_padded_inner<Ch: Challenger>(
             if fold8_ready && t == 0 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
                 captured_z_vec = Some(z_vec.clone());
+                // The Fold8 tensor is final: start its A state beside rounds
+                // 1..=7 when the guarded caller asked for it.
+                if early_a_requested && let Some(capture) = captured_z_vec.as_deref() {
+                    crate::pcs::ring_switch::lc_early_a_spawn(capture);
+                }
             }
             crate::rstrace::ev("lc:sc:rnd", t as u32);
         }

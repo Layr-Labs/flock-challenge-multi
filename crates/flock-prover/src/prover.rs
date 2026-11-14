@@ -705,6 +705,9 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         &owned_cfg
     };
 
+    // This proof owns the early AB A-state lane: lincheck may start the A
+    // state at its Fold8 capture; the guard settles the lane on return/unwind.
+    let lc_early_a = pcs::ring_switch::LcEarlyAGuard::new();
     let ProveCore {
         zc_proof,
         lc_proof,
@@ -726,6 +729,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_circuit,
         prefaulted_codeword,
         precommitted,
+        Some(&lc_early_a),
         challenger,
     );
     flock_core::gaptime::mark("core: returned");
@@ -817,6 +821,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // stale one defensively so a recycled buffer can never match it.
     flock_core::pcs::elided_z::forget(z_key.0, z_key.1);
     pcs::ring_switch::sl2_pre_settle();
+    // An early AB A state the open did not take ends with this proof.
+    pcs::ring_switch::lc_early_a_settle();
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -1027,6 +1033,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         lincheck_circuit,
         prefaulted_codeword,
         None,
+        None,
         challenger,
     )
 }
@@ -1155,6 +1162,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
     precommitted: Option<(Commitment, pcs::ProverData)>,
+    early_a: Option<&pcs::ring_switch::LcEarlyAGuard>,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -1352,6 +1360,14 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
+    // Only a caller owning the proof's early-A guard asks lincheck to start
+    // AB's A state at the Fold8 capture; every other caller keeps the capture.
+    let lc_mode = match ab_capture_mode(r1cs, &s_hat_v_c) {
+        lincheck::ZCaptureMode::RankedFold8Tail if early_a.is_some() => {
+            lincheck::ZCaptureMode::RankedFold8TailEarlyA
+        }
+        mode => mode,
+    };
     let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| {
         flock_core::rstrace::ev("lc:inpool", 0);
         let _hot = flock_core::hot_pool::HotPool::start();
@@ -1366,7 +1382,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     r1cs.useful_bits,
                     lincheck_circuit,
                     &x_ab,
-                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    lc_mode,
                     challenger,
                 );
                 // The stripe copy is dead after lincheck. Stripe-based callers
@@ -1384,7 +1400,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     r1cs.useful_bits,
                     lincheck_circuit,
                     &x_ab,
-                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    lc_mode,
                     challenger,
                 )
             }
