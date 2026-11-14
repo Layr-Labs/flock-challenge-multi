@@ -3388,8 +3388,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
 ) {
     unsafe {
         // Only the all-elide provenance state selects the ranked static
-        // windows. Partial/cold states still read both rings in every window.
-        let ranked_static = elide == [true; 3] && proj.plan.offsets_eligible(2);
+        // windows. Its fixed ZMM publishers require line-aligned destinations;
+        // generic callers may supply F128 buffers aligned to only16 bytes.
+        let ranked_static = elide == [true; 3]
+            && ((z as usize | a as usize | b as usize | proj.out as usize) & 63) == 0
+            && proj.plan.offsets_eligible(2);
         let prepared = match inputs {
             OctaInputs::Blocks(inputs) => {
                 let ptrs = [
@@ -4521,7 +4524,7 @@ mod cached_z_seed_pair_dispatch_tests {
                 &dummy_ab.0,
                 true,
             );
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, win_plan));
+        let preps = super::super::SharedRankedClosedWindowPreps(Box::leak(Box::new(prepare_ranked_closed_window_preps(&inv_table, win_plan))), None); // test-only: crown changed the tuple to (static ref, owned box)
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
         else {
@@ -4566,7 +4569,7 @@ mod cached_z_seed_pair_dispatch_tests {
         unsafe { _mm_sfence(); }
         assert!(compact, "this probe requires the actual ranked compact plan");
         fn shared_window_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
-            &value.0
+            value.get()
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
         let completed = AtomicUsize::new(0);
@@ -4778,7 +4781,7 @@ mod cross_quarter_witness_tests {
     struct Roots([u8; 176 * 512]);
 
     fn shared_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
-        &value.0
+        value.get()
     }
 
     #[test]
@@ -4790,7 +4793,7 @@ mod cross_quarter_witness_tests {
         let dummy = Box::new(Ab([0; 8 * 32 * 64]));
         let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&inv_table, &dummy.0, true);
         assert!(plan.offsets_eligible(2));
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, plan));
+        let preps = super::super::SharedRankedClosedWindowPreps(Box::leak(Box::new(prepare_ranked_closed_window_preps(&inv_table, plan))), None); // test-only: crown changed the tuple to (static ref, owned box)
         let stride = 29 * 64;
         let z = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let a = Arena::new((1 << 18) * U32_PER_BLOCK * 4);

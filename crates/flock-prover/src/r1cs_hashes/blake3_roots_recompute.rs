@@ -329,7 +329,7 @@ fn roots_only_matches_production_stripes() {
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
-                            StreamProj { compact_z_tile_words:0, seed_window:None,
+                            StreamProj { compact_z_tile_words:0, seed_window:None, ab_pend: core::ptr::null_mut(),
                                 stage: stage.0.as_mut_ptr(),
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
