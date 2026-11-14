@@ -1988,7 +1988,14 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 
     // Build the 16 byte-tables. `tables[byte_idx * 256 + value]` = the F128
     // sum of `eq_r_dprime[byte_idx*8 + bit]` over set bits in `value`.
-    let mut tables = vec![F128::ZERO; N_BYTES * TABLE_SIZE];
+    // Every entry is written by the loop below before any read, so the
+    // table starts uninitialised (no 64 KiB zero fill; spariev's
+    // fold-table zero-fill removal on the Apple track, `a408b770`).
+    let mut tables = if fold_table_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(N_BYTES * TABLE_SIZE)
+    } else {
+        vec![F128::ZERO; N_BYTES * TABLE_SIZE]
+    };
     for byte_idx in 0..N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..TABLE_SIZE {
@@ -2072,12 +2079,25 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+/// `FLOCK_NO_XP_FOLD_TABLE_UNINIT=1` restores the zero-filled allocation of
+/// the ring-switch byte-lookup fold tables. Read once.
+fn fold_table_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_FOLD_TABLE_UNINIT").is_none());
+    *ON
+}
+
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    // All 16 x 256 entries are written below before any read.
+    let mut tables = if fold_table_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(FOLD_N_BYTES * FOLD_TABLE_SIZE)
+    } else {
+        vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE]
+    };
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         for value in 0..FOLD_TABLE_SIZE {
@@ -2345,7 +2365,13 @@ fn build_direct_fold_table<const N: usize>(
     base: &[F128],
 ) -> Vec<F128> {
     debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
-    let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+    // Each byte table sets entry 0 and fills 1..256 by doubling below, so
+    // every entry is written before any read.
+    let mut out = if fold_table_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
+    } else {
+        vec![F128::ZERO; FOLD_TABLE_TOTAL]
+    };
     // N independent mul_by_x chains (one per low_eq bank), then XOR-sum.
     // Φ = fold_one_slot is only F2-linear on bits — do NOT pull fold_weight
     // through Φ.
@@ -2438,9 +2464,16 @@ pub(crate) fn build_direct_fold8_table(
 /// six retained bank coordinates online.
 pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
-    let mut out = vec![F128::ZERO; FOLD_TABLE_TOTAL];
+    // Entry 0 of each byte table is set explicitly and the doubling below
+    // writes entries 1..256, so the table starts uninitialised.
+    let mut out = if fold_table_uninit_enabled() {
+        crate::alloc_uninit_vec::<F128>(FOLD_TABLE_TOTAL)
+    } else {
+        vec![F128::ZERO; FOLD_TABLE_TOTAL]
+    };
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
+        table[0] = F128::ZERO;
         for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
             let half = 1usize << bit;
             for value in 0..half {

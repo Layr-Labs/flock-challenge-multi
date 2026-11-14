@@ -1209,6 +1209,50 @@ pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     sks_vks
 }
 
+/// Serial Montgomery batch inversion for the short deterministic denominator
+/// vectors used by Ligerito basis induction (one field inversion plus three
+/// products per element instead of one inversion per element). A zero input
+/// stays zero, matching the element-wise
+/// `if v.is_zero() { ZERO } else { v.inv() }` it replaces; every nonzero
+/// output is the identical canonical inverse at the same index. Ported from
+/// the Mac track (jacklightChen a0163b69, flock-challenge).
+/// `FLOCK_NO_LIG_BATCH_INV=1` restores the element-wise form.
+fn batch_inverse_or_zero(values: &[F128]) -> Vec<F128> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_BATCH_INV").is_none());
+    if values.len() < 2 || !*ON {
+        return values
+            .iter()
+            .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+            .collect();
+    }
+
+    let mut inverses = vec![F128::ZERO; values.len()];
+    let Some(first_nonzero) = values.iter().position(|v| !v.is_zero()) else {
+        return inverses;
+    };
+    let mut product = values[first_nonzero];
+    for index in first_nonzero + 1..values.len() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] = product;
+        product *= value;
+    }
+    let mut suffix_inverse = product.inv();
+    for index in (first_nonzero + 1..values.len()).rev() {
+        let value = values[index];
+        if value.is_zero() {
+            continue;
+        }
+        inverses[index] *= suffix_inverse;
+        suffix_inverse *= value;
+    }
+    inverses[first_nonzero] = suffix_inverse;
+    inverses
+}
+
 fn evaluate_scaled_basis_inplace(
     sks_at_x: &mut [F128],
     basis: &mut [F128],
@@ -1418,10 +1462,7 @@ pub(crate) fn induce_sumcheck_poly(
         table.into_iter().take(n_queries).collect()
     };
 
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    let inv_sks_vks: Vec<F128> = batch_inverse_or_zero(sks_vks);
 
     let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
@@ -11685,6 +11726,33 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn x1_batch_inverse_or_zero_matches_scalar_and_preserves_positions() {
+        use super::{batch_inverse_or_zero, eval_sk_at_vks};
+        use crate::field::F128;
+        let scalar = |values: &[F128]| -> Vec<F128> {
+            values
+                .iter()
+                .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+                .collect()
+        };
+        let x = |lo: u64, hi: u64| F128::new(lo, hi);
+        let cases: Vec<Vec<F128>> = vec![
+            vec![],
+            vec![F128::ZERO],
+            vec![x(7, 0)],
+            vec![F128::ZERO, F128::ZERO, F128::ZERO],
+            vec![F128::ZERO, x(3, 9), F128::ZERO, x(0x1234, 0xffff_0000_0000_0001), F128::ZERO],
+            vec![x(1, 0), x(2, 0), x(u64::MAX, u64::MAX), x(5, 1 << 63)],
+            (1..40u64).map(|i| x(i.wrapping_mul(0x9e37_79b9_7f4a_7c15), i << 40)).collect(),
+            eval_sk_at_vks(10),
+            eval_sk_at_vks(16),
+        ];
+        for values in &cases {
+            assert_eq!(batch_inverse_or_zero(values), scalar(values), "{values:?}");
+        }
+    }
+
     #[test]
     fn sparse_transpose_dead_top_keeps_prefix() {
         use crate::challenger::Challenger;

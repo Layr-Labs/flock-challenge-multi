@@ -119,6 +119,14 @@ fn dup_inv_elide_enabled() -> bool {
 /// independent inversions in the same binary.
 #[cold]
 #[inline(never)]
+/// `FLOCK_NO_XP_CASC_BATCH_INV=1` restores the three separate inversions of
+/// the deeper tail cascade step. Read once.
+fn casc_batch_inv_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_XP_CASC_BATCH_INV").is_none());
+    *ON
+}
+
 fn duplicate_lookahead_inv_factors(r: F128) -> (F128, F128) {
     ((F128::ONE + r) * r.inv(), r.inv())
 }
@@ -3691,7 +3699,11 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     }
     // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
     // κ restores the even lanes' own weight in the message sums.
-    let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
+    // With the batched inverse (below) κ_c is derived from the shared
+    // inversion once both weights have been checked.
+    let casc_batch_inv = casc && casc_batch_inv_enabled();
+    let kappa_c_single =
+        if casc && !casc_batch_inv { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
     let n = a.len();
     assert_eq!(b.len(), n);
     assert!(n.is_power_of_two() && n >= 16);
@@ -3717,7 +3729,23 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         !(in_lm || out_lm) || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
         "lane-major tiles need eight-group AVX-512 chunks"
     );
-    let (kappa, r_inv) = lookahead_inv_factors(r);
+    // `FLOCK_NO_XP_CASC_BATCH_INV`: the deeper cascade needs r1⁻¹, r2⁻¹ and
+    // (r1·r2)⁻¹. One inversion P = (r1·r2)⁻¹ gives all three exactly:
+    // r1⁻¹ = r2·P and r2⁻¹ = r1·P (inverses in GF(2^128) are unique, so
+    // these are the same field elements, bit for bit). Both weights are
+    // asserted non-zero above. Port of terrapinelf's batched tri-pass
+    // inversion from the Apple track (28dfebfb, `FLOCK_NO_ZC_TRI_BATCH_INV`).
+    let (kappa, r_inv, kappa_c, la7_scale) = if casc_batch_inv {
+        let p = (r_next[1] * r_next[2]).inv();
+        let r1_inv = r_next[2] * p;
+        let r2_inv = r_next[1] * p;
+        // (1 + r1)·r1⁻¹ = r1⁻¹ + 1: the value both arms of
+        // `lookahead_inv_factors` return.
+        (r1_inv + F128::ONE, r1_inv, (F128::ONE + r_next[2]) * r2_inv, Some(p))
+    } else {
+        let (kappa, r_inv) = lookahead_inv_factors(r);
+        (kappa, r_inv, kappa_c_single, None)
+    };
 
     let chunk_in = 8 * lo_size;
     let chunk_out = 2 * lo_size;
@@ -3937,7 +3965,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     let la7 = casc.then(|| {
         assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
-        Round4Lookahead::from_flat(&la7_acc).scaled((r_next[1] * r_next[2]).inv())
+        Round4Lookahead::from_flat(&la7_acc)
+            .scaled(la7_scale.unwrap_or_else(|| (r_next[1] * r_next[2]).inv()))
     });
     (r_next[0] * sum1, sum_inf, la, la7)
 }

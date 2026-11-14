@@ -3144,6 +3144,8 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
     ))]
     roots: Option<root_emit::RootOctaWriter<'_>>,
     cached_z: bool,
+    // Lane s2: this octa's input-cache slot (26 x 32 B), or null.
+    ic_slot: *mut u8,
 ) {
     unsafe {
         #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
@@ -3302,12 +3304,66 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
             }};
         }
         round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(0).cast(), cv_v[0]);
+                _mm256_stream_si256(ic_slot.add(32).cast(), cv_v[1]);
+                _mm256_stream_si256(ic_slot.add(64).cast(), cv_v[2]);
+                _mm256_stream_si256(ic_slot.add(96).cast(), cv_v[3]);
+        }
         round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(128).cast(), cv_v[4]);
+                _mm256_stream_si256(ic_slot.add(160).cast(), cv_v[5]);
+                _mm256_stream_si256(ic_slot.add(192).cast(), cv_v[6]);
+                _mm256_stream_si256(ic_slot.add(224).cast(), cv_v[7]);
+        }
         round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(256).cast(), m[0]);
+                _mm256_stream_si256(ic_slot.add(288).cast(), m[1]);
+                _mm256_stream_si256(ic_slot.add(320).cast(), m[2]);
+                _mm256_stream_si256(ic_slot.add(352).cast(), m[3]);
+        }
         round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(384).cast(), m[4]);
+                _mm256_stream_si256(ic_slot.add(416).cast(), m[5]);
+                _mm256_stream_si256(ic_slot.add(448).cast(), m[6]);
+                _mm256_stream_si256(ic_slot.add(480).cast(), m[7]);
+        }
         round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(512).cast(), m[8]);
+                _mm256_stream_si256(ic_slot.add(544).cast(), m[9]);
+                _mm256_stream_si256(ic_slot.add(576).cast(), m[10]);
+                _mm256_stream_si256(ic_slot.add(608).cast(), m[11]);
+        }
         round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(640).cast(), m[12]);
+                _mm256_stream_si256(ic_slot.add(672).cast(), m[13]);
+                _mm256_stream_si256(ic_slot.add(704).cast(), m[14]);
+                _mm256_stream_si256(ic_slot.add(736).cast(), m[15]);
+        }
         round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+        // Lane s2: spread this octa's input-cache slot over the rounds
+        // (two full lines per round, no burst next to the drains' streams).
+        if !ic_slot.is_null() {
+                _mm256_stream_si256(ic_slot.add(768).cast(), tlo);
+                _mm256_stream_si256(ic_slot.add(800).cast(), thi);
+        }
 
         const {
             assert!(OUT_HI_BASE % 32 == 17);
@@ -3490,6 +3546,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             ))]
             None,
         false,
+            core::ptr::null_mut(),
         );
     }
 }
@@ -3535,6 +3592,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(widen_maddubs_enabled());
         let ranked_static = proj.plan.offsets_eligible(2);
         let prepared = prepare_closed_inputs_ordered(init, base, proj.cross_quarter);
+        // Lane s2: this octa's input-cache slot (filled during the rounds).
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        let ic_slot = if proj.cross_quarter { root_recompute::input_cache_octa_dst(init, base) } else { core::ptr::null_mut() };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+        let ic_slot: *mut u8 = core::ptr::null_mut();
         build_octa_witness_ab_stream_prepared_elide::<true,0>(
             &prepared,
             z,
@@ -3553,6 +3615,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
             ))]
             roots,
         cached_z,
+            ic_slot,
         );
     }
 }
@@ -4521,7 +4584,7 @@ mod cached_z_seed_pair_dispatch_tests {
                 &dummy_ab.0,
                 true,
             );
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, win_plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::new(&inv_table, win_plan, (false, 0));
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
         else {
@@ -4790,7 +4853,7 @@ mod cross_quarter_witness_tests {
         let dummy = Box::new(Ab([0; 8 * 32 * 64]));
         let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&inv_table, &dummy.0, true);
         assert!(plan.offsets_eligible(2));
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::new(&inv_table, plan, (false, 0));
         let stride = 29 * 64;
         let z = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let a = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
@@ -4952,7 +5015,12 @@ impl SeedWindowContext<'_>{#[inline(always)] unsafe fn apply<const COLS:usize>(&
 pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_window<const COLS:usize>(init:u64,base:usize,z:*mut u32,a:*mut u32,b:*mut u32,proj:StreamProj<'_>,preps:&RankedClosedWindowPreps){unsafe{
  debug_assert!(matches!(COLS,8|16|32|64));debug_assert!(proj.seed_window.is_some());debug_assert_eq!(proj.compact_z_tile_words,COLS*4);debug_assert!(proj.elide_z);
  let prepared=prepare_closed_inputs_ordered(init,base,proj.cross_quarter);let ranked_static=proj.plan.offsets_eligible(2);
- build_octa_witness_ab_stream_prepared_elide::<true,COLS>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false);
+ // Lane s2: this octa's input-cache slot (filled during the rounds).
+ #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+ let ic_slot=if proj.cross_quarter{root_recompute::input_cache_octa_dst(init,base)}else{core::ptr::null_mut()};
+ #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+ let ic_slot:*mut u8=core::ptr::null_mut();
+ build_octa_witness_ab_stream_prepared_elide::<true,COLS>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false,ic_slot);
 }}
 
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]

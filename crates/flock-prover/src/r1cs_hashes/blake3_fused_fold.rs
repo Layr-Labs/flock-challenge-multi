@@ -427,6 +427,19 @@ unsafe fn baseline_fold(st: &Stage, w: &FoldWeights) -> [[__m512i; 2]; 2] {
 
 unsafe fn generate_folded(init: u64, tile: usize, pair: usize, w: &FoldWeights, out: *mut V16) {
     unsafe {
+        // Lane s2: the witness pass or a root fold already stored these inputs.
+        if let Some(buf) = input_cache_for(init)
+            && input_cache_tile_done(tile)
+        {
+            let p = tile * 4 + pair;
+            // The z fold walks pairs in order, eight tiles per task.
+            if pair < 3 || (tile + 1 < 4096 && input_cache_tile_done(tile + 1)) {
+                input_cache_prefetch_pair(buf, p + 1);
+            }
+            let input = input_cache_load_pair(buf, p);
+            recompute_folded16(&input, w, out);
+            return;
+        }
         let physical = tile * 64 + pair * 16;
         let base = physical / 256 + ((physical % 256) / 8) * 2048;
         let input = prepare16(init, base);
@@ -439,6 +452,50 @@ struct Stage([V16; 242]);
 #[cfg(test)]
 #[repr(C, align(64))]
 struct Out([V16; 8]);
+/// Lane s2 input cache: the z fold reading stored inputs equals the fold of
+/// freshly prepared inputs.
+#[test]
+fn s2_cached_fused_fold_matches_prepared() {
+    use flock_core::field::F128;
+    let w: [F128; 64] = core::array::from_fn(|i| {
+        let x = (i as u64 + 7).wrapping_mul(0x9e3779b97f4a7c15);
+        F128::new(x ^ 0xa5a5, x.rotate_left(17))
+    });
+    let weights = FoldWeights::new(&w);
+    let _guard = super::S2_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // An init no other test uses.
+    let init = 0x0dd5_eed5_2b00_c0deu64;
+    super::arm_input_cache(init);
+    if !super::s2_input_cache_enabled() {
+        return;
+    }
+    #[repr(align(64))]
+    struct T([u8; 176 * 512]);
+    let mut t = Box::new(T([0; 176 * 512]));
+    #[repr(align(64))]
+    struct O([V16; 8]);
+    for tile in [0usize, 5, 4095] {
+        unsafe { super::generate_tile16(init, tile, t.0.as_mut_ptr()) };
+        assert!(super::input_cache_tile_done(tile));
+        for pair in 0..4 {
+            let physical = tile * 64 + pair * 16;
+            let base = physical / 256 + ((physical % 256) / 8) * 2048;
+            let mut got = Box::new(O([dup16(0); 8]));
+            let mut want = Box::new(O([dup16(1); 8]));
+            unsafe {
+                super::stage_recompute::generate_pair_provider(
+                    init, tile, pair, got.0.as_mut_ptr().cast(), core::ptr::null_mut(),
+                    (&*weights as *const FoldWeights).cast(),
+                );
+                recompute_folded16(&prepare16(init, base), &weights, want.0.as_mut_ptr());
+                for k in 0..8 {
+                    assert_eq!(_mm512_cmpeq_epi64_mask(got.0[k], want.0[k]), 0xff, "tile={tile} pair={pair} k={k}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn fused_fold_matches_scalar() {
     use flock_core::field::F128;

@@ -3164,6 +3164,9 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     (None, Some(claims), Some(_)) => OctaOrder::Shared(&claims[group]),
                     _ => OctaOrder::Parity(role),
                 };
+                // Lane s2: count only this call's stored octas.
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+                let _ = blake3_witgen8::root_recompute::input_cache_take_thread_count();
                 for kpair in octas {
                     let base = (2 * kpair) * 1024 + group;
                     let field_offset = base * F128_PER_BLOCK;
@@ -3229,12 +3232,23 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 if elide_z && target.is_some() {
                     elided_octas.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Lane s2: one count per producer call for the octas whose
+                // inputs the witness kernels stored.
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+                blake3_witgen8::root_recompute::input_cache_note_octas(
+                    blake3_witgen8::root_recompute::input_cache_take_thread_count());
                 // The core scheduler joins both fully seeded halves and
                 // their global-output fences before folding either r task.
             };
             let _zero_lane_skip = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
                 context.params.num_ntts(), context.odd_tail,
             );
+            // Lane s2: arm the witness-pass input-cache writer for this prove
+            // (single-threaded, before any producer runs).
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+            if root_generator.is_some() {
+                blake3_witgen8::root_recompute::input_cache_begin_witness(init);
+            }
             let codeword = context.codeword.take().unwrap();
             flock_core::rstrace::evd("oc:commit", 0);
             // SAFETY: the callback implements the documented full ranked
@@ -3308,6 +3322,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let mut tiles = unsafe {
                 if let Some((generate, pair_generator)) = root_generator.filter(|_| pipelined) {
                     flock_core::scratch::give_f128(root_storage);
+                    // Lane s2: key the regenerators' input cache to this
+                    // prove before any root or z fold can run.
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+                    blake3_witgen8::root_recompute::arm_input_cache(init);
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_generator(init, generate, pair_generator)
                 } else if pipelined {
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_witness_storage(
