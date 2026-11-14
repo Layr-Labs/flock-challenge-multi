@@ -732,9 +732,9 @@ pub mod r1_owner_awake {
     // arms; `run_both` releases them (one `HOLD_EPOCH` bump) right after both
     // arms are injected. Same closures, pools and inputs: proof bytes are
     // unchanged. `FLOCK_NO_RL_PREWAKE=1` disables it; `FLOCK_RL_PREWAKE_AT=k`
-    // fires it when the k-th deep-pass worker has finished (default 4 of 16:
-    // measured best of 1/4/12/16; the holders yield, so the twelve workers still
-    // in the deep pass keep their CPUs).
+    // fires it when the k-th deep-pass worker has finished (default: off, see
+    // `prewake_at`; the earlier default 4 of 16 was measured while the release
+    // fired only at the AB arm's end).
 
     const PREWAKE_LIMIT: Duration = Duration::from_micros(1500);
     static PREWAKE_ARRIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -747,11 +747,17 @@ pub mod r1_owner_awake {
             if std::env::var_os("FLOCK_NO_RL_PREWAKE").is_some() || !enabled() {
                 return 0;
             }
+            // Off unless `FLOCK_RL_PREWAKE_AT` asks for it. Traced on the
+            // eight-core SMT box: the holders run 1.5 ms from the deep pass's
+            // first arrivals, and the thread that leaves the deep pass (and then
+            // enters the zerocheck pool) waits on its CPU until the yielding
+            // holder there times out -- round one started ~1.5 ms after the
+            // prewake instead of ~0.4 ms. Default 0 = no holders.
             std::env::var("FLOCK_RL_PREWAKE_AT")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&k| k >= 1)
-                .unwrap_or(4)
+                .unwrap_or(0)
         });
         *AT
     }
