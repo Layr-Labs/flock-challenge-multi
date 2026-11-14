@@ -1536,14 +1536,81 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         )
 }
 
+/// A canonical 128-vector a producer already folded from one sixty-four-bank
+/// statistic, keyed to that exact buffer (address, length, both end
+/// elements) and to the six coordinates it was folded at.
+struct CanonicalFold8 {
+    addr: usize,
+    len: usize,
+    first: F128,
+    last: F128,
+    coords: [F128; 6],
+    canonical: Vec<F128>,
+}
+
+static CANONICAL_FOLD8: std::sync::Mutex<Option<CanonicalFold8>> = std::sync::Mutex::new(None);
+
+/// Hand the open the canonical vector lincheck already derived from AB's
+/// Fold8 capture: its sumcheck rounds 1..=6 bind the six bank bits top first,
+/// which is `Σ_b eq(coords)[b] · fold8[b·128 + p]` with `coords` the
+/// LSB-first suffix coordinates (`inner_rest_tail[..6]`). The caller owns that
+/// producer invariant; a shape mismatch stashes nothing. Replaces any earlier
+/// unconsumed entry.
+pub fn stash_canonical_fold8(fold8: &[F128], coords: &[F128], canonical: Vec<F128>) {
+    let n_packed = 1usize << LOG_PACKING;
+    let mut slot = CANONICAL_FOLD8.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = None;
+    if fold8.len() != 64 * n_packed || canonical.len() != n_packed || coords.len() != 6 {
+        return;
+    }
+    *slot = Some(CanonicalFold8 {
+        addr: fold8.as_ptr() as usize,
+        len: fold8.len(),
+        first: fold8[0],
+        last: fold8[fold8.len() - 1],
+        coords: core::array::from_fn(|i| coords[i]),
+        canonical,
+    });
+}
+
+/// Drop any unconsumed entry.
+pub fn clear_canonical_fold8() {
+    *CANONICAL_FOLD8.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Take the stashed canonical vector iff it was made from exactly this buffer
+/// at exactly these six coordinates; otherwise leave it and return `None`.
+fn take_canonical_fold8(fold8: &[F128], low_point: &[F128]) -> Option<Vec<F128>> {
+    if fold8.is_empty() || low_point.len() != 6 {
+        return None;
+    }
+    let mut slot = CANONICAL_FOLD8.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = slot.as_ref().is_some_and(|st| {
+        st.addr == fold8.as_ptr() as usize
+            && st.len == fold8.len()
+            && st.first == fold8[0]
+            && st.last == fold8[fold8.len() - 1]
+            && st.coords[..] == low_point[..]
+    });
+    if hit {
+        slot.take().map(|st| st.canonical)
+    } else {
+        None
+    }
+}
+
 /// Collapse the sixty-four-bank direct-fold8 intake under the first six
 /// suffix coordinates, recovering the canonical transcript-visible
 /// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
 /// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
-/// addition is XOR.
+/// addition is XOR. A canonical vector stashed for exactly this buffer and
+/// these coordinates ([`stash_canonical_fold8`]) is returned instead.
 pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
+    if let Some(canonical) = take_canonical_fold8(s_hat_v_fold8, low_point) {
+        return canonical;
+    }
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = crate::lincheck::build_eq_table(low_point);
     crate::rstrace::ev("col:eq", 0);
@@ -4134,10 +4201,26 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             Some(slot)
         })
         .collect();
+    // A claim whose canonical vector its producer already folded (lincheck's
+    // AB) needs no collapse here either.
+    if sl2_colpar {
+        for d in 0..2 {
+            if !pre_done[d] {
+                let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
+                if let Some(canonical) = take_canonical_fold8(p, &dense_suffixes[d][..6]) {
+                    dense_s_hat_v[d] = canonical;
+                    pre_done[d] = true;
+                }
+            }
+        }
+    }
     if sl2_colpar && (pre_done[0] || pre_done[1]) {
-        let d = if pre_done[0] { 1 } else { 0 };
-        let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
-        dense_s_hat_v[d] = collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]);
+        for d in 0..2 {
+            if !pre_done[d] {
+                let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
+                dense_s_hat_v[d] = collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]);
+            }
+        }
     } else if sl2_colpar {
         let p0 = precomputed_s_hat_v[dense_to_orig[0]].unwrap();
         let p1 = precomputed_s_hat_v[dense_to_orig[1]].unwrap();
@@ -5611,6 +5694,37 @@ mod tests {
             want,
             "corrupted bank went undetected"
         );
+    }
+
+    /// The stashed canonical vector is taken only for the exact Fold8 buffer
+    /// and coordinates it was stashed for; any other buffer or coordinate
+    /// order collapses as before, and a taken entry is gone.
+    #[test]
+    fn canonical_fold8_stash_is_keyed_to_buffer_and_coordinates() {
+        let mut rng = Rng::new(0x5_7A5_AB_C0DE);
+        let n_packed = 1usize << LOG_PACKING;
+        let low: Vec<F128> = (0..6).map(|_| rng.f128()).collect();
+        let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+        let other: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+        clear_canonical_fold8();
+        let want = collapse_s_hat_v_fold8(&fold8, &low);
+        let marker = vec![F128::ONE; n_packed];
+        stash_canonical_fold8(&fold8, &low, marker.clone());
+        let other_want = {
+            clear_canonical_fold8();
+            let v = collapse_s_hat_v_fold8(&other, &low);
+            stash_canonical_fold8(&fold8, &low, marker.clone());
+            v
+        };
+        assert_eq!(collapse_s_hat_v_fold8(&other, &low), other_want);
+        let mut reversed = low.clone();
+        reversed.reverse();
+        assert_ne!(collapse_s_hat_v_fold8(&fold8, &reversed), marker);
+        assert_eq!(collapse_s_hat_v_fold8(&fold8, &low), marker);
+        assert_eq!(collapse_s_hat_v_fold8(&fold8, &low), want);
+        stash_canonical_fold8(&fold8[..63 * n_packed], &low, marker.clone());
+        assert_eq!(collapse_s_hat_v_fold8(&fold8, &low), want);
+        clear_canonical_fold8();
     }
 
     #[test]

@@ -180,11 +180,19 @@ fn ab_capture_mode(
 ) -> lincheck::ZCaptureMode {
     static REUSE: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R1_FOL8_CAPTURE_REUSE").is_none());
+    // `FLOCK_NO_AB_CANONICAL=1`: capture only the Fold8 table; the open then
+    // collapses AB's sixty-four banks itself.
+    static CANONICAL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_AB_CANONICAL").is_none());
     if *REUSE
         && ranked_direct_fold8_precompute_enabled(r1cs, captured)
         && r1cs.k_log.checked_sub(r1cs.k_skip) == Some(8)
     {
-        lincheck::ZCaptureMode::RankedFold8Tail
+        if *CANONICAL {
+            lincheck::ZCaptureMode::RankedFold8TailCanonical
+        } else {
+            lincheck::ZCaptureMode::RankedFold8Tail
+        }
     } else {
         lincheck::ZCaptureMode::PreSumcheck
     }
@@ -192,15 +200,32 @@ fn ab_capture_mode(
 
 /// Finish AB's precomputed statistic, keeping every non-Fold8 route on the
 /// incumbent helper. A successful first-bind capture is already the exact
-/// sixty-four-bank Fold8 tensor consumed by the PCS open.
+/// sixty-four-bank Fold8 tensor consumed by the PCS open. With the canonical
+/// capture, lincheck also returned the Fold8 table folded at its rounds 1..=6
+/// (`r_rounds[1..7]`, i.e. `inner_rest_tail[..6]` reversed into LSB-first
+/// order): split it off and hand it to the open, keyed to this Fold8 buffer
+/// and those six coordinates.
 #[inline]
 fn finish_ab_s_hat_v(
     r1cs: &BlockR1cs,
     captured: &zerocheck::CapturedSHatVC,
-    z_vec: Vec<F128>,
+    mut z_vec: Vec<F128>,
     actual: lincheck::ZCaptureMode,
     inner_rest_tail: &[F128],
 ) -> Option<Vec<F128>> {
+    pcs::ring_switch::clear_canonical_fold8();
+    if actual == lincheck::ZCaptureMode::RankedFold8TailCanonical {
+        let fold8_len = 64 * (1usize << pcs::LOG_PACKING);
+        debug_assert!(ranked_direct_fold8_precompute_enabled(r1cs, captured));
+        debug_assert_eq!(z_vec.len(), fold8_len + (1usize << pcs::LOG_PACKING));
+        if z_vec.len() == fold8_len + (1usize << pcs::LOG_PACKING) && inner_rest_tail.len() >= 6 {
+            let canonical = z_vec.split_off(fold8_len);
+            pcs::ring_switch::stash_canonical_fold8(&z_vec, &inner_rest_tail[..6], canonical);
+            return Some(z_vec);
+        }
+        z_vec.truncate(fold8_len);
+        return Some(z_vec);
+    }
     if actual == lincheck::ZCaptureMode::RankedFold8Tail {
         debug_assert!(ranked_direct_fold8_precompute_enabled(r1cs, captured));
         debug_assert_eq!(z_vec.len(), 64 * (1usize << pcs::LOG_PACKING));

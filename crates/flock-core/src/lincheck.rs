@@ -5318,6 +5318,13 @@ pub enum ZCaptureMode {
     /// Return the table after the first top bind. At the ranked shape this is
     /// already the Fold8 statistic consumed by the PCS opening.
     RankedFold8Tail,
+    /// [`ZCaptureMode::RankedFold8Tail`] followed, in the same vector, by the
+    /// 128-entry table after the next six top binds (rounds 1..=6, before the
+    /// final bind): the Fold8 statistic folded at those six challenges, i.e.
+    /// the canonical AB statistic. The returned vector is the 64 x 128 Fold8
+    /// table and then those 128 entries; the shape gate is that of
+    /// `RankedFold8Tail`, and a miss reports `PreSumcheck` as before.
+    RankedFold8TailCanonical,
 }
 
 /// Capture lincheck's z table in the requested form, reporting the form that
@@ -5695,11 +5702,12 @@ fn prove_padded_inner<Ch: Challenger>(
     };
     // At the ranked shape, the first lincheck bind and the downstream Fold8
     // map use the same halves and challenge. Capture that output directly.
-    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+    let canonical_requested = capture == ZCaptureMode::RankedFold8TailCanonical;
+    let fold8_ready = (capture == ZCaptureMode::RankedFold8Tail || canonical_requested)
         && inner_rest_len == 8
         && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
-    let actual_capture = if fold8_ready {
-        ZCaptureMode::RankedFold8Tail
+    let mut actual_capture = if fold8_ready {
+        capture
     } else if capture == ZCaptureMode::None {
         ZCaptureMode::None
     } else {
@@ -5761,7 +5769,27 @@ fn prove_padded_inner<Ch: Challenger>(
             }
             if fold8_ready && t == 0 {
                 debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
-                captured_z_vec = Some(z_vec.clone());
+                captured_z_vec = Some(if canonical_requested {
+                    // Room for the canonical tail appended after round 6.
+                    let mut v =
+                        Vec::with_capacity(z_vec.len() + (1usize << crate::pcs::LOG_PACKING));
+                    v.extend_from_slice(&z_vec);
+                    v
+                } else {
+                    z_vec.clone()
+                });
+            }
+            // Rounds 1..=6 bound the six Fold8 bank bits, top first; z_vec is
+            // now the 128-entry canonical AB statistic (round 7 binds once more
+            // to z_partial). Append it to the Fold8 capture.
+            if fold8_ready && canonical_requested && t == 6 {
+                let n_packed = 1usize << crate::pcs::LOG_PACKING;
+                match captured_z_vec.as_mut() {
+                    Some(v) if z_vec.len() == n_packed && v.len() == 64 * n_packed => {
+                        v.extend_from_slice(&z_vec);
+                    }
+                    _ => actual_capture = ZCaptureMode::RankedFold8Tail,
+                }
             }
             crate::rstrace::ev("lc:sc:rnd", t as u32);
         }
@@ -5992,6 +6020,29 @@ mod tests {
     /// incumbent Fold8 intake's only non-retained-coordinate fold. This is
     /// the equivalence that makes `RankedFold8Tail` safe to hand directly to
     /// the PCS opening.
+    /// The canonical AB capture: six more top binds of the Fold8 table at
+    /// `r_rounds[1..=6]` equal the PCS collapse of that table at the
+    /// LSB-first coordinates `r_inner_rest[1..7]` (`r_inner_rest =
+    /// reverse(r_rounds)`), and not at the unreversed order.
+    #[test]
+    fn ranked_fold8_six_binds_match_canonical_collapse() {
+        let mut rng = Rng::new(0xAB_CA70_F018); // deterministic, nonzero seed
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+        let r_rounds = rng.f128_vec(8);
+        let mut z_vec = fold8.clone();
+        for &r in &r_rounds[1..7] {
+            sumcheck_bind_top_in_place_par(&mut z_vec, r);
+        }
+        assert_eq!(z_vec.len(), n_packed);
+        let mut r_inner_rest = r_rounds.clone();
+        r_inner_rest.reverse();
+        let want = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &r_inner_rest[1..7]);
+        assert_eq!(z_vec, want, "six binds vs collapse");
+        let unreversed = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &r_rounds[1..7]);
+        assert_ne!(z_vec, unreversed, "coordinate order must matter");
+    }
+
     #[test]
     fn ranked_fold8_first_bind_matches_incumbent_intake() {
         let mut rng = Rng::new(0xF018_C4A7_0BE5); // deterministic, nonzero seed
