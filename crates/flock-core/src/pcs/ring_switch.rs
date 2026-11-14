@@ -1447,11 +1447,7 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
         // per-element operation in identical order, so the result is
         // bit-identical to the scalar loop below.
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_quad[..n_packed],
-            low_eq[0],
-        );
+        crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_quad[..n_packed], low_eq[0]);
         for q in 1..4 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
@@ -1552,11 +1548,7 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
         // `add_scaled` leaves — identical per-element operation in identical
         // order, so the result is bit-identical to the scalar loop below.
         let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
-        crate::field::f128_slice::scale_slice(
-            &mut out,
-            &s_hat_v_fold8[..n_packed],
-            low_eq[0],
-        );
+        crate::field::f128_slice::scale_slice(&mut out, &s_hat_v_fold8[..n_packed], low_eq[0]);
         for bank in 1..64 {
             crate::field::f128_slice::add_scaled(
                 &mut out,
@@ -2148,9 +2140,7 @@ pub(crate) struct GfniDirectFoldMap {
     target_feature = "gfni",
 ))]
 #[inline]
-pub(crate) fn build_gfni_direct_fold_map_from_generators(
-    generators: &[F128],
-) -> GfniDirectFoldMap {
+pub(crate) fn build_gfni_direct_fold_map_from_generators(generators: &[F128]) -> GfniDirectFoldMap {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
     use crate::zerocheck::multilinear::kernels::x86_64::build_row_fold_mats_from_cols;
     GfniDirectFoldMap {
@@ -2171,9 +2161,8 @@ pub(crate) fn build_gfni_direct_fold_map_from_generators(
 #[inline]
 pub(crate) fn build_gfni_direct_fold_map_from_table(table: &[F128]) -> GfniDirectFoldMap {
     debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
-    let generators: [F128; 128] = core::array::from_fn(|i| {
-        table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]
-    });
+    let generators: [F128; 128] =
+        core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
     build_gfni_direct_fold_map_from_generators(&generators)
 }
 
@@ -2247,11 +2236,8 @@ pub(crate) fn compose_block_mats_gfni_into(
                         _mm512_add_epi64(top, top),
                     );
                     let next_hi = _mm512_shldi_epi64::<8>(hi, lo);
-                    let next_lo = _mm512_ternarylogic_epi64::<0x96>(
-                        _mm512_slli_epi64::<8>(lo),
-                        red_721,
-                        top,
-                    );
+                    let next_lo =
+                        _mm512_ternarylogic_epi64::<0x96>(_mm512_slli_epi64::<8>(lo), red_721, top);
                     lo = next_lo;
                     hi = next_hi;
                 }
@@ -2280,6 +2266,7 @@ pub(crate) fn compose_block_mats_gfni_into(
     target_feature = "gfni",
 ))]
 #[inline(always)]
+#[cfg(test)]
 pub(crate) fn compose_block_mats_gfni(
     map: &GfniDirectFoldMap,
     e_hi: F128,
@@ -2965,7 +2952,7 @@ fn direct_fold8_round0_wide(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     {
         // SAFETY: the cfg gate guarantees the target features; equal lengths
         // (asserted above) are the kernel's only slice contract.
-        return unsafe { super::ligerito::msg_reduce_avx512(witness, basis) };
+        unsafe { super::ligerito::msg_reduce_avx512(witness, basis) }
     }
     #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
     direct_fold8_round0(witness, basis)
@@ -3100,8 +3087,18 @@ fn build_direct_fold8_factors_from_slice(
     } else {
         let mut a_state = crate::alloc_uninit_vec::<F128>(state_len);
         rayon::join(
-            || { crate::rstrace::ev("rs:A0", 0); direct_fold8_a_state_lines(fold8, &mut a_state); crate::rstrace::ev("rs:A1", 0); },
-            || { crate::rstrace::ev("rs:W0", 0); unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) }; crate::rstrace::ev("rs:W1", 0); },
+            || {
+                crate::rstrace::ev("rs:A0", 0);
+                direct_fold8_a_state_lines(fold8, &mut a_state);
+                crate::rstrace::ev("rs:A1", 0);
+            },
+            || {
+                crate::rstrace::ev("rs:W0", 0);
+                unsafe {
+                    direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state)
+                };
+                crate::rstrace::ev("rs:W1", 0);
+            },
         );
         a_state
     };
@@ -3110,7 +3107,13 @@ fn build_direct_fold8_factors_from_slice(
     if let Some((eq_lo, eq_hi)) = pre_eq {
         let round0 = direct_fold8_round0_chunked(&a_state, &w_state);
         crate::rstrace::ev("rs:eq", 0);
-        return DirectFold8Factors { eq_lo, eq_hi, a_state, w_state, round0 };
+        return DirectFold8Factors {
+            eq_lo,
+            eq_hi,
+            a_state,
+            w_state,
+            round0,
+        };
     }
     let (round0, (eq_lo, eq_hi)) = rayon::join(
         || direct_fold8_round0_chunked(&a_state, &w_state),
@@ -3128,16 +3131,30 @@ fn build_direct_fold8_factors_from_slice(
 
 /// XOR sums of canonical values: any even-aligned chunking of the pair sum
 /// gives the same (u0, u2) as [`direct_fold8_round0_wide`] on the whole.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn direct_fold8_round0_chunked(a_state: &[F128], w_state: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const CH: usize = 8;
     let len = a_state.len() / CH;
     (0..CH)
         .into_par_iter()
-        .map(|k| direct_fold8_round0_wide(&a_state[k * len..(k + 1) * len], &w_state[k * len..(k + 1) * len]))
+        .map(|k| {
+            direct_fold8_round0_wide(
+                &a_state[k * len..(k + 1) * len],
+                &w_state[k * len..(k + 1) * len],
+            )
+        })
         .collect::<Vec<_>>()
         .into_iter()
-        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2))
+        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {
+            (x0 + y0, x2 + y2)
+        })
 }
 
 fn direct_fold8_states_seq(
@@ -3169,9 +3186,8 @@ fn direct_fold8_states_seq(
 /// `FLOCK_NO_DF8_STATE_DIRECT=1` restores the collect-then-gather state build.
 #[inline]
 fn df8_state_direct_disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some()
-    });
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DF8_STATE_DIRECT").is_some());
     *OFF
 }
 
@@ -3203,13 +3219,26 @@ unsafe fn direct_fold8_w_state_gfni_from_generators(
         let w_addr = w_state.as_mut_ptr() as usize;
         let map = &map;
         (0..CH).into_par_iter().for_each(|k| unsafe {
-            direct_fold8_w_rows(low_eq, map, w_addr as *mut F128, k * n_packed / CH, (k + 1) * n_packed / CH);
+            direct_fold8_w_rows(
+                low_eq,
+                map,
+                w_addr as *mut F128,
+                k * n_packed / CH,
+                (k + 1) * n_packed / CH,
+            );
         });
         return;
     }
     unsafe { direct_fold8_w_rows(low_eq, &map, w_state.as_mut_ptr(), 0, n_packed) }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn sl2_wpar_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_WPAR").is_none());
@@ -3289,11 +3318,7 @@ unsafe fn direct_fold8_w_rows(
     target_feature = "gfni"
 ))]
 #[inline(always)]
-unsafe fn direct_fold8_w_state_gfni(
-    low_eq: &[F128; 64],
-    table: &[F128],
-    w_state: &mut [F128],
-) {
+unsafe fn direct_fold8_w_state_gfni(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
     debug_assert_eq!(table.len(), FOLD_TABLE_TOTAL);
     let generators: [F128; 128] =
         core::array::from_fn(|i| table[(i / 8) * FOLD_TABLE_SIZE + (1usize << (i % 8))]);
@@ -3311,8 +3336,9 @@ fn direct_fold8_w_state_into(low_eq: &[F128; 64], table: &[F128], w_state: &mut 
         target_feature = "gfni"
     ))]
     {
-        unsafe { direct_fold8_w_state_gfni(low_eq, table, w_state); }
-        return;
+        unsafe {
+            direct_fold8_w_state_gfni(low_eq, table, w_state);
+        }
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -3366,6 +3392,13 @@ fn direct_fold8_a_state_into(fold8: &[F128], a_state: &mut [F128]) {
 /// Lane sl2: [`direct_fold8_a_state_into`] with each task owning four
 /// adjacent banks, i.e. whole 64-byte lines of every output row (the
 /// one-bank tasks share each line four ways across threads). Same values.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn direct_fold8_a_state_lines(fold8: &[F128], a_state: &mut [F128]) {
     direct_fold8_a_state_lines_impl(fold8, a_state, true)
 }
@@ -3384,7 +3417,10 @@ fn direct_fold8_a_state_lines_impl(fold8: &[F128], a_state: &mut [F128], par: bo
             let ptr = transposed.as_mut_ptr().cast::<[F128; 128]>();
             for j in 0..4 {
                 let e = 4 * g + j;
-                tensor_algebra_transpose_into(&fold8[e * n_packed..(e + 1) * n_packed], &mut *ptr.add(j));
+                tensor_algebra_transpose_into(
+                    &fold8[e * n_packed..(e + 1) * n_packed],
+                    &mut *ptr.add(j),
+                );
             }
             &*transposed.as_ptr()
         };
@@ -3849,7 +3885,10 @@ mod sl2_pre {
         loop {
             match STATE.load(Ordering::Acquire) {
                 0 => {
-                    if STATE.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    if STATE
+                        .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         return None;
                     }
                 }
@@ -3877,7 +3916,10 @@ pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
     sl2_pre::STATE.store(0, Ordering::Release);
     let (addr, len) = (fold8.as_ptr() as usize, fold8.len());
     rayon::spawn(move || {
-        if sl2_pre::STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if sl2_pre::STATE
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         crate::rstrace::ev("pre:run", 0);
@@ -3891,8 +3933,13 @@ pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
         direct_fold8_a_state_lines_impl(fold8, &mut a_state, false);
         let tail = &suffix[6..];
         let eq = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-        *sl2_pre::SLOT.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(sl2_pre::Pre { key: (addr, len), suffix, s_hat_v, a_state, eq });
+        *sl2_pre::SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(sl2_pre::Pre {
+            key: (addr, len),
+            suffix,
+            s_hat_v,
+            a_state,
+            eq,
+        });
         crate::rstrace::ev("pre:done", 0);
         sl2_pre::STATE.store(2, Ordering::Release);
     });
@@ -4083,14 +4130,42 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         })
         && dense_suffixes.iter().all(|s| s.len() >= 6);
     // Lane sl2: a claim whose collapse and A state were precomputed.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
     let mut pre_a: Vec<Option<PreParts>> = (0..n).map(|_| None).collect();
     let mut pre_done = [false; 2];
     if sl2_colpar && let Some(pre) = sl2_pre::settle() {
         for d in 0..2 {
             let p = precomputed_s_hat_v[dense_to_orig[d]].unwrap();
-            if pre.key == (p.as_ptr() as usize, p.len()) && pre.suffix[..] == dense_suffixes[d][..] {
+            if pre.key == (p.as_ptr() as usize, p.len()) && pre.suffix[..] == dense_suffixes[d][..]
+            {
                 dense_s_hat_v[d] = pre.s_hat_v;
-                pre_a[dense_to_orig[d]] = Some(PreParts { a: pre.a_state, eq: pre.eq });
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                ))]
+                {
+                    pre_a[dense_to_orig[d]] = Some(PreParts {
+                        a: pre.a_state,
+                        eq: pre.eq,
+                    });
+                }
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512vbmi",
+                    target_feature = "vpclmulqdq",
+                    target_feature = "gfni"
+                )))]
+                drop((pre.a_state, pre.eq));
                 pre_done[d] = true;
                 break;
             }
@@ -4099,10 +4174,21 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // Lane sl2 (`FLOCK_NO_SL2_AEARLY`): the remaining claims' A states
     // depend only on their bank tensors; build them on the pool while this
     // thread runs the collapse / observe / sample chain.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
     let early_a: Vec<Option<std::sync::Arc<EarlyA>>> = (0..n)
         .map(|i| {
             let p = precomputed_s_hat_v.get(i).copied().flatten()?;
-            if !(sl2_colpar && sl2_aearly_enabled() && pre_a[i].is_none() && p.len() == 64 * n_packed) {
+            if !(sl2_colpar
+                && sl2_aearly_enabled()
+                && pre_a[i].is_none()
+                && p.len() == 64 * n_packed)
+            {
                 return None;
             }
             let slot = std::sync::Arc::new(EarlyA {
@@ -4117,7 +4203,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             };
             rayon::spawn(move || {
                 use std::sync::atomic::Ordering;
-                if job.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                if job
+                    .state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     return;
                 }
                 // SAFETY: the owner waits for state 2 before its borrow of
@@ -4159,7 +4249,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 let (p, low_eq) = (ps[c], &eqs[c]);
                 let mut out = crate::alloc_uninit_vec::<F128>(n_packed);
                 let b0 = 16 * q;
-                crate::field::f128_slice::scale_slice(&mut out, &p[b0 * n_packed..(b0 + 1) * n_packed], low_eq[b0]);
+                crate::field::f128_slice::scale_slice(
+                    &mut out,
+                    &p[b0 * n_packed..(b0 + 1) * n_packed],
+                    low_eq[b0],
+                );
                 for bank in b0 + 1..b0 + 16 {
                     crate::field::f128_slice::add_scaled(
                         &mut out,
@@ -4377,138 +4471,152 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // route and the full-width ranked route (see `rs_tail_par_enabled`). The
     // γs are already sampled, so this is challenger-free and pure per claim.
     let tail_par = rs_tail_par_enabled();
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
     let pre_a_cells: Vec<std::sync::Mutex<Option<PreParts>>> =
         pre_a.into_iter().map(std::sync::Mutex::new).collect();
-    let claim_output =
-        |i: usize, mut w: ClaimWork, g: F128| -> (RingSwitchProof, RingSwitchBatchOutput) {
-            crate::rstrace::ev("rs:c0", i as u32);
-            let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
-            crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
-            let wants_direct = !elide_basis
-                && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let skip_table =
-                elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let skip_table = false;
-            let table = if skip_table {
-                Vec::new()
-            } else {
-                build_fold_byte_table(&scaled_eq_r_dprime)
-            };
-            let direct_fold2 = match kinds[i] {
-                Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let products = w.s_hat_v_quad.as_deref().map(|quad| {
-                        let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
-                        for e in 0..4 {
-                            let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                            for d_low in 0..4 {
-                                for p in 0..n_packed {
-                                    scaled_bank[p] = low_eq[d_low] * bank[p];
-                                }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
-                                products[e * 4 + d_low] =
-                                    inner_product(&transposed, &scaled_eq_r_dprime);
+    let claim_output = |i: usize,
+                        mut w: ClaimWork,
+                        g: F128|
+     -> (RingSwitchProof, RingSwitchBatchOutput) {
+        crate::rstrace::ev("rs:c0", i as u32);
+        let mut scaled_eq_r_dprime = crate::alloc_uninit_vec::<F128>(w.eq_r_dprime.len());
+        crate::field::f128_slice::scale_slice(&mut scaled_eq_r_dprime, &w.eq_r_dprime, g);
+        let wants_direct =
+            !elide_basis && (w.s_hat_v_quad.is_some() || (retain_direct_c && i == 1));
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let skip_table =
+            elide_basis && tail_par && !df8_state_direct_disabled() && w.s_hat_v_fold4.is_none();
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        let skip_table = false;
+        let table = if skip_table {
+            Vec::new()
+        } else {
+            build_fold_byte_table(&scaled_eq_r_dprime)
+        };
+        let direct_fold2 = match kinds[i] {
+            Kind::Dense(d) if wants_direct && use_split && dense_suffixes[d].len() >= 2 => {
+                let suffix = dense_suffixes[d];
+                let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                    .try_into()
+                    .expect("two-coordinate eq has four entries");
+                let products = w.s_hat_v_quad.as_deref().map(|quad| {
+                    let mut products = [F128::ZERO; 16];
+                    let mut scaled_bank = vec![F128::ZERO; n_packed];
+                    for e in 0..4 {
+                        let bank = &quad[e * n_packed..(e + 1) * n_packed];
+                        for d_low in 0..4 {
+                            for p in 0..n_packed {
+                                scaled_bank[p] = low_eq[d_low] * bank[p];
                             }
+                            let transposed = tensor_algebra_transpose(&scaled_bank);
+                            products[e * 4 + d_low] =
+                                inner_product(&transposed, &scaled_eq_r_dprime);
                         }
-                        products
-                    });
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
-                (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 16] = build_eq(&suffix[..4])
-                        .try_into()
-                        .expect("four-coordinate eq has sixteen entries");
-                    let products = direct_fold4_products(fold4, &low_eq, &scaled_eq_r_dprime);
-                    let tail = &suffix[4..];
-                    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold4Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let fold8_borrowed: Option<&[F128]> = if f8late {
-                precomputed_s_hat_v
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            } else {
-                None
-            };
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            ))]
-            let fast8 = match (kinds[i], fold8_borrowed) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 && skip_table => {
-                    Some(build_direct_fold8_factors_from_slice(
-                        fold8,
-                        dense_suffixes[d],
-                        &scaled_eq_r_dprime,
-                        pre_a_cells[i]
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take()
-                            .or_else(|| early_a[i].as_ref().and_then(|e| e.take())),
-                    ))
-                }
-                _ => None,
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512vbmi",
-                target_feature = "vpclmulqdq",
-                target_feature = "gfni"
-            )))]
-            let fast8: Option<DirectFold8Factors> = None;
-            let fold8_owned = if fast8.is_some() {
-                None
-            } else {
-                match fold8_borrowed {
-                    Some(p) => Some(p.to_vec()),
-                    None => w.s_hat_v_fold8.take(),
-                }
-            };
-            let direct_fold8 = if fast8.is_some() { fast8 } else { match (kinds[i], fold8_owned) {
+                    }
+                    products
+                });
+                let tail = &suffix[2..];
+                let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                Some(DirectFold2Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq,
+                    table: table.clone(),
+                    products,
+                })
+            }
+            _ => None,
+        };
+        let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
+            (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
+                let suffix = dense_suffixes[d];
+                let low_eq: [F128; 16] = build_eq(&suffix[..4])
+                    .try_into()
+                    .expect("four-coordinate eq has sixteen entries");
+                let products = direct_fold4_products(fold4, &low_eq, &scaled_eq_r_dprime);
+                let tail = &suffix[4..];
+                let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                Some(DirectFold4Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq,
+                    table: table.clone(),
+                    products,
+                })
+            }
+            _ => None,
+        };
+        let fold8_borrowed: Option<&[F128]> = if f8late {
+            precomputed_s_hat_v
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|precomputed| precomputed.len() == 64 * n_packed)
+        } else {
+            None
+        };
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        ))]
+        let fast8 = match (kinds[i], fold8_borrowed) {
+            (Kind::Dense(d), Some(fold8))
+                if use_split && dense_suffixes[d].len() >= 6 && skip_table =>
+            {
+                Some(build_direct_fold8_factors_from_slice(
+                    fold8,
+                    dense_suffixes[d],
+                    &scaled_eq_r_dprime,
+                    pre_a_cells[i]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .or_else(|| early_a[i].as_ref().and_then(|e| e.take())),
+                ))
+            }
+            _ => None,
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "vpclmulqdq",
+            target_feature = "gfni"
+        )))]
+        let fast8: Option<DirectFold8Factors> = None;
+        let fold8_owned = if fast8.is_some() {
+            None
+        } else {
+            match fold8_borrowed {
+                Some(p) => Some(p.to_vec()),
+                None => w.s_hat_v_fold8.take(),
+            }
+        };
+        let direct_fold8 = if fast8.is_some() {
+            fast8
+        } else {
+            match (kinds[i], fold8_owned) {
                 (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
                     #[cfg(all(
                         target_arch = "x86_64",
@@ -4547,56 +4655,57 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     Some(factors)
                 }
                 _ => None,
-            } };
-            crate::rstrace::ev("rs:f8", i as u32);
-            let rs_eq_ind = match kinds[i] {
-                Kind::Dense(d) => {
-                    if use_split {
-                        // Defer the fold: carry the split factors + γ-baked byte
-                        // table so pcs's combine folds each slot directly into
-                        // `b_combined` (no 2^(m-7) materialize + readback). The
-                        // table build is the only work done here (16·256 adds).
-                        if elide_basis {
-                            // Dead basis: only `RsEqInd::len()` is observed.
-                            // Preserve the logical tensor shape without
-                            // allocating or zeroing factors no caller reads.
-                            let n_lo = split_n_lo(dense_suffixes[d].len());
-                            let n_hi = dense_suffixes[d].len() - n_lo;
-                            RsEqInd::DeferredDense {
-                                eq_lo: Vec::new(),
-                                eq_hi: Vec::new(),
-                                table,
-                                logical_len: (1usize << n_lo) * (1usize << n_hi),
-                            }
-                        } else {
-                            let (eq_lo, eq_hi) = &dense_splits[d];
-                            RsEqInd::DeferredDense {
-                                eq_lo: eq_lo.clone(),
-                                eq_hi: eq_hi.clone(),
-                                table,
-                                logical_len: eq_lo.len() * eq_hi.len(),
-                            }
+            }
+        };
+        crate::rstrace::ev("rs:f8", i as u32);
+        let rs_eq_ind = match kinds[i] {
+            Kind::Dense(d) => {
+                if use_split {
+                    // Defer the fold: carry the split factors + γ-baked byte
+                    // table so pcs's combine folds each slot directly into
+                    // `b_combined` (no 2^(m-7) materialize + readback). The
+                    // table build is the only work done here (16·256 adds).
+                    if elide_basis {
+                        // Dead basis: only `RsEqInd::len()` is observed.
+                        // Preserve the logical tensor shape without
+                        // allocating or zeroing factors no caller reads.
+                        let n_lo = split_n_lo(dense_suffixes[d].len());
+                        let n_hi = dense_suffixes[d].len() - n_lo;
+                        RsEqInd::DeferredDense {
+                            eq_lo: Vec::new(),
+                            eq_hi: Vec::new(),
+                            table,
+                            logical_len: (1usize << n_lo) * (1usize << n_hi),
                         }
                     } else {
-                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                        let (eq_lo, eq_hi) = &dense_splits[d];
+                        RsEqInd::DeferredDense {
+                            eq_lo: eq_lo.clone(),
+                            eq_hi: eq_hi.clone(),
+                            table,
+                            logical_len: eq_lo.len() * eq_hi.len(),
+                        }
                     }
+                } else {
+                    RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
                 }
-                Kind::Sparse(s) => RsEqInd::Sparse {
-                    len: l,
-                    entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
-                },
-            };
-            (
-                RingSwitchProof { s_hat_v: w.s_hat_v },
-                RingSwitchBatchOutput {
-                    rs_eq_ind,
-                    sumcheck_claim: w.sumcheck_claim,
-                    direct_fold2,
-                    direct_fold4,
-                    direct_fold8,
-                },
-            )
+            }
+            Kind::Sparse(s) => RsEqInd::Sparse {
+                len: l,
+                entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
+            },
         };
+        (
+            RingSwitchProof { s_hat_v: w.s_hat_v },
+            RingSwitchBatchOutput {
+                rs_eq_ind,
+                sumcheck_claim: w.sumcheck_claim,
+                direct_fold2,
+                direct_fold4,
+                direct_fold8,
+            },
+        )
+    };
     // Indexed parallel collect preserves claim order, so the output vector —
     // and with it every transcript-visible byte downstream — is identical to
     // the sequential route.
@@ -4615,21 +4724,22 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     // and that `direct_fold8_factor_tail_par_matches_seq` pins.
     const TAIL_PAR_MIN_CLAIMS: usize = 4;
     let n_claims = work.len();
-    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> =
-        if tail_par && (n_claims >= TAIL_PAR_MIN_CLAIMS || (n_claims >= 2 && rs_claims_par_enabled())) {
-            use rayon::prelude::*;
-            work.into_par_iter()
-                .zip(gammas_rs.par_iter())
-                .enumerate()
-                .map(|(i, (w, &g))| claim_output(i, w, g))
-                .collect()
-        } else {
-            work.into_iter()
-                .zip(gammas_rs.iter())
-                .enumerate()
-                .map(|(i, (w, &g))| claim_output(i, w, g))
-                .collect()
-        };
+    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = if tail_par
+        && (n_claims >= TAIL_PAR_MIN_CLAIMS || (n_claims >= 2 && rs_claims_par_enabled()))
+    {
+        use rayon::prelude::*;
+        work.into_par_iter()
+            .zip(gammas_rs.par_iter())
+            .enumerate()
+            .map(|(i, (w, &g))| claim_output(i, w, g))
+            .collect()
+    } else {
+        work.into_iter()
+            .zip(gammas_rs.iter())
+            .enumerate()
+            .map(|(i, (w, &g))| claim_output(i, w, g))
+            .collect()
+    };
 
     if trace {
         eprintln!(
@@ -4639,6 +4749,13 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         );
     }
 
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))]
     for e in early_a.iter().flatten() {
         drop(e.take());
     }
@@ -4646,6 +4763,13 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
 }
 
 /// Lane sl2: an A state built beside the observe chain (claim-once).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 struct EarlyA {
     // 0 = queued, 1 = running, 2 = done, 3 = cancelled/taken.
     state: std::sync::atomic::AtomicU8,
@@ -4653,11 +4777,25 @@ struct EarlyA {
 }
 
 /// Lane sl2: a claim's challenge-free factor parts (A state, tail eq split).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 struct PreParts {
     a: Vec<F128>,
     eq: (Vec<F128>, Vec<F128>),
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 impl EarlyA {
     /// Wait for a running job, cancel a queued one; take the result if any.
     fn take(&self) -> Option<PreParts> {
@@ -4665,7 +4803,11 @@ impl EarlyA {
         loop {
             match self.state.load(Ordering::Acquire) {
                 0 => {
-                    if self.state.compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    if self
+                        .state
+                        .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         return None;
                     }
                 }
@@ -4680,6 +4822,13 @@ impl EarlyA {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn sl2_aearly_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_AEARLY").is_none());

@@ -380,7 +380,11 @@ impl Challenger for FsChallenger {
     fn grind_pow(&mut self, bits: u32) -> u64 {
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
-        let trace_t0 = if *GRIND_TRACE { Some(std::time::Instant::now()) } else { None };
+        let trace_t0 = if *GRIND_TRACE {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Aggregate-aware parallelism: decide on the grind's *expected hash
         // work* (`2^bits`), not a raw bit threshold. Fold-challenge grinds are
         // individually modest — e.g. 2^15 at L0 under the per-round profiles —
@@ -1628,11 +1632,24 @@ fn pow_scan(
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 fn env_knob(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Grind team knobs, read once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 struct TeamKnobs {
     /// `FLOCK_NO_GRIND_TEAM=1` restores the incumbent serial / cursor grind.
     on: bool,
@@ -1657,6 +1674,11 @@ struct TeamKnobs {
     hold_us: u64,
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 static TEAM: std::sync::LazyLock<TeamKnobs> = std::sync::LazyLock::new(|| TeamKnobs {
     on: std::env::var_os("FLOCK_NO_GRIND_TEAM").is_none(),
     fold: std::env::var_os("FLOCK_NO_GRIND_FOLD").is_none(),
@@ -1798,6 +1820,11 @@ struct TeamTrace {
 }
 
 #[repr(align(128))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 struct TeamPad(std::sync::atomic::AtomicU64);
 
 #[cfg(all(
@@ -1828,14 +1855,19 @@ impl TeamShared {
                 sl.store(c, SeqCst);
             }
             let start = c << self.clog;
-            let hit = blake3_pow_avx512::scan_prepared(&self.pre, start, 1 << self.clog, self.fold, || {
-                self.best_c.0.load(Relaxed) < c
-            });
+            let hit = blake3_pow_avx512::scan_prepared(
+                &self.pre,
+                start,
+                1 << self.clog,
+                self.fold,
+                || self.best_c.0.load(Relaxed) < c,
+            );
             if let Some(n) = hit {
                 self.best_n.0.fetch_min(n, AcqRel);
                 self.best_c.0.fetch_min(c, SeqCst);
                 if let Some(t) = &self.trace {
-                    t.found_at.fetch_min(t.t0.elapsed().as_nanos() as u64, Relaxed);
+                    t.found_at
+                        .fetch_min(t.t0.elapsed().as_nanos() as u64, Relaxed);
                 }
                 break;
             }
@@ -1909,7 +1941,7 @@ fn team_helper(sh: std::sync::Arc<TeamShared>, hold_us: u64) {
             continue;
         }
         spins = spins.wrapping_add(1);
-        if spins % 64 == 0 {
+        if spins.is_multiple_of(64) {
             if std::time::Instant::now() > t_end {
                 break;
             }
@@ -1942,7 +1974,9 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
             start = start.saturating_add(span);
         }
     }
-    let clog = bits.saturating_sub(k.clog_off).clamp(k.clog_min, k.clog_max);
+    let clog = bits
+        .saturating_sub(k.clog_off)
+        .clamp(k.clog_min, k.clog_max);
     let threads = rayon::current_num_threads().max(1);
     let team = if bits < k.small_bits {
         k.small_team.clamp(1, threads)
@@ -2001,13 +2035,26 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
     if let Some(t) = &sh.trace {
         GRIND_CLAIMS.store(sh.next.0.load(Ordering::Relaxed), Ordering::Relaxed);
         let n = t.n.load(Ordering::Relaxed).min(TEAM_SLOTS);
-        let mut st: Vec<u32> = t.starts[..n].iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let mut st: Vec<u32> = t.starts[..n]
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
         st.sort_unstable();
         let fa = t.found_at.load(Ordering::Relaxed);
-        let q = |f: usize| st.get(f * st.len().saturating_sub(1) / 16).copied().unwrap_or(0) as f64 / 1e3;
+        let q = |f: usize| {
+            st.get(f * st.len().saturating_sub(1) / 16)
+                .copied()
+                .unwrap_or(0) as f64
+                / 1e3
+        };
         *GRIND_DETAIL.lock().unwrap() = format!(
             " nw={} st_min={:.1} st_med={:.1} st_max={:.1} found={:.1} clog={clog} warm={}",
-            st.len(), q(0), q(8), q(16), fa as f64 / 1e3, GRIND_WARM.load(Ordering::Relaxed)
+            st.len(),
+            q(0),
+            q(8),
+            q(16),
+            fa as f64 / 1e3,
+            GRIND_WARM.load(Ordering::Relaxed)
         );
     }
     let n = sh.best_n.0.load(Ordering::SeqCst);
@@ -2020,6 +2067,11 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
 static GRIND_TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GRIND_TRACE").is_some());
 static GRIND_CLAIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
 static GRIND_WARM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GRIND_DETAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -2052,14 +2104,14 @@ fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: 
     let trace_t0 = std::time::Instant::now();
     let starts = std::sync::Mutex::new(Vec::<u32>::new());
     let found_at = AtomicU64::new(u64::MAX);
-    (0..workers)
-        .into_par_iter()
-        .with_max_len(1)
-        .for_each(|_| {
-          if *GRIND_TRACE {
-              starts.lock().unwrap().push(trace_t0.elapsed().as_nanos() as u32);
-          }
-          loop {
+    (0..workers).into_par_iter().with_max_len(1).for_each(|_| {
+        if *GRIND_TRACE {
+            starts
+                .lock()
+                .unwrap()
+                .push(trace_t0.elapsed().as_nanos() as u32);
+        }
+        loop {
             let c = next.fetch_add(1, Ordering::Relaxed);
             if c > best_chunk.load(Ordering::Acquire) {
                 break;
@@ -2075,20 +2127,31 @@ fn grind_cursor_scan(state_digest: &[u8; 32], bits: u32, kind: HashKind, chunk: 
                 }
                 break;
             }
-          }
-        });
+        }
+    });
     if *GRIND_TRACE {
         GRIND_CLAIMS.store(next.load(Ordering::Relaxed), Ordering::Relaxed);
         let mut st = starts.into_inner().unwrap();
         st.sort_unstable();
         let fa = found_at.load(Ordering::Relaxed);
-        let q = |f: usize| st.get(f * st.len().saturating_sub(1) / 16).copied().unwrap_or(0) as f64 / 1e3;
+        let q = |f: usize| {
+            st.get(f * st.len().saturating_sub(1) / 16)
+                .copied()
+                .unwrap_or(0) as f64
+                / 1e3
+        };
         *GRIND_DETAIL.lock().unwrap() = format!(
             " nw={} st_min={:.1} st_med={:.1} st_max={:.1} found={:.1}",
-            st.len(), q(0), q(8), q(16), fa as f64 / 1e3
+            st.len(),
+            q(0),
+            q(8),
+            q(16),
+            fa as f64 / 1e3
         );
     }
-    let (found_chunk, nonce) = best.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    let (found_chunk, nonce) = best
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
     assert_ne!(found_chunk, u64::MAX, "cursor grind exited without a match");
     nonce
 }
@@ -2110,7 +2173,9 @@ mod tests {
             for seed in 0u8..12 {
                 let mut digest = [0u8; 32];
                 for (i, b) in digest.iter_mut().enumerate() {
-                    *b = seed.wrapping_mul(31).wrapping_add((i as u8).wrapping_mul(7));
+                    *b = seed
+                        .wrapping_mul(31)
+                        .wrapping_add((i as u8).wrapping_mul(7));
                 }
                 for bits in [1u32, 8, 13, 14, 16] {
                     let mut start = 0u64;
@@ -2401,12 +2466,24 @@ mod tests {
         for rep in 0..4u64 {
             for fold in [false, true] {
                 let t = std::time::Instant::now();
-                (0..nt as usize).into_par_iter().with_max_len(1).for_each(|i| {
-                    let r = blake3_pow_avx512::scan_prepared(&pre, (rep * nt + i as u64) * len, len, fold, || false);
-                    assert_eq!(r, None);
-                });
+                (0..nt as usize)
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .for_each(|i| {
+                        let r = blake3_pow_avx512::scan_prepared(
+                            &pre,
+                            (rep * nt + i as u64) * len,
+                            len,
+                            fold,
+                            || false,
+                        );
+                        assert_eq!(r, None);
+                    });
                 let dt = t.elapsed().as_secs_f64();
-                println!("{nt} threads fold={fold}: {:.1} Mh/s", (nt * len) as f64 / dt / 1e6);
+                println!(
+                    "{nt} threads fold={fold}: {:.1} Mh/s",
+                    (nt * len) as f64 / dt / 1e6
+                );
             }
         }
     }
@@ -2424,7 +2501,14 @@ mod tests {
             std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
         ];
         let lens = [1u64, 7, 16, 17, 31, 32, 33, 100, 300];
-        let starts = [0u64, 5, (1u64 << 32) - 4, (1u64 << 32) - 40, u64::from(u32::MAX), 1 << 40];
+        let starts = [
+            0u64,
+            5,
+            (1u64 << 32) - 4,
+            (1u64 << 32) - 40,
+            u64::from(u32::MAX),
+            1 << 40,
+        ];
         for state in &digests {
             for &len in &lens {
                 for &start in &starts {

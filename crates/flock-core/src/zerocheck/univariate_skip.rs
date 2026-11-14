@@ -250,7 +250,7 @@ pub(crate) fn ntt_extend_f128_vec_ghash_units(
         if sl1_lift_m4rm_enabled() {
             return unsafe { ntt_extend_f128_vec_ghash_units_m4rm(in_s, inv_table) };
         }
-        return unsafe { ntt_extend_f128_vec_ghash_units_avx512(in_s, inv_table) };
+        unsafe { ntt_extend_f128_vec_ghash_units_avx512(in_s, inv_table) }
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -332,12 +332,13 @@ unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
             for i in 0..8 {
                 let p = v * basis[i];
                 let pv = _mm512_broadcast_i32x4(_mm_set_epi64x(p.hi as i64, p.lo as i64));
-                let m64: u64 =
-                    _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
+                let m64: u64 = _mm512_test_epi8_mask(img, _mm512_set1_epi8((1u8 << i) as i8));
                 for g in 0..16 {
                     let nibble = ((m64 >> (4 * g)) & 0xF) as u8;
-                    let mask8 =
-                        ((nibble & 1) * 3) | (((nibble >> 1) & 1) * 12) | (((nibble >> 2) & 1) * 48) | (((nibble >> 3) & 1) * 192);
+                    let mask8 = ((nibble & 1) * 3)
+                        | (((nibble >> 1) & 1) * 12)
+                        | (((nibble >> 2) & 1) * 48)
+                        | (((nibble >> 3) & 1) * 192);
                     acc[g] = _mm512_mask_xor_epi64(acc[g], mask8, acc[g], pv);
                 }
             }
@@ -354,6 +355,12 @@ unsafe fn ntt_extend_f128_vec_ghash_units_avx512(
 /// input z, `lo[n] = Σ_{i∈n} v·φ₈(2^i)` (i < 4) and `hi[n]` (i ≥ 4), so
 /// `out[λ] += lo[N[z][λ] & 15] + hi[N[z][λ] >> 4]` adds exactly the same
 /// products as the masked form (XOR sums regroup freely): bit-identical.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
 fn sl1_lift_m4rm_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL1_LIFT_M4RM").is_none());

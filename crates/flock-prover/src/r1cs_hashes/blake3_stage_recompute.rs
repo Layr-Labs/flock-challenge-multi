@@ -34,7 +34,7 @@ impl StageW16 {
     #[inline(always)]
     unsafe fn write_word<const WORD: usize>(&mut self, v: V16) {
         unsafe {
-            if WORD % 2 == 0 {
+            if WORD.is_multiple_of(2) {
                 self.previous = v;
             } else {
                 self.publish(WORD / 2, self.previous, v);
@@ -304,7 +304,19 @@ pub(crate) fn enabled() -> bool {
 /// weights is an aligned8192-byte immutable weight frame, first is an aligned
 /// writable512-byte fold result, and second is unused. All spans are disjoint.
 /// See RootTileCache::set_stage_generator for the complete layout contract.
-pub(crate) unsafe fn generate_pair_provider(init:u64,tile:usize,pair:usize,first:*mut u8,second:*mut u8,weights:*const u8){unsafe{
-    if weights.is_null(){generate_stages(init,tile,pair,first,second);}
-    else{super::fused_fold::generate_pair_fold(init,tile,pair,weights,first);}
-}}
+pub(crate) unsafe fn generate_pair_provider(
+    init: u64,
+    tile: usize,
+    pair: usize,
+    first: *mut u8,
+    second: *mut u8,
+    weights: *const u8,
+) {
+    unsafe {
+        if weights.is_null() {
+            generate_stages(init, tile, pair, first, second);
+        } else {
+            super::fused_fold::generate_pair_fold(init, tile, pair, weights, first);
+        }
+    }
+}

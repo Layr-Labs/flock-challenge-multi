@@ -218,8 +218,8 @@ pub(super) fn shift_reduce_inner_ab(
         let _ = (a_col, b_col);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
-            if let Some((w, partials)) = bstatic {
-                if x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
+            if let Some((w, partials)) = bstatic
+                && x86_64_bstatic::shift_reduce_inner_ab_x86_avx512_bstatic(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -229,9 +229,9 @@ pub(super) fn shift_reduce_inner_ab(
                     partials,
                     out,
                     nt,
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
             }
             x86_64::shift_reduce_inner_ab_x86_avx512(
                 a_packed,

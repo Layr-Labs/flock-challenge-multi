@@ -51,6 +51,14 @@ const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
 const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 const U32_PER_BLOCK: usize = K / 32;
+#[cfg(all(
+    test,
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 const BYTES_PER_BLOCK: usize = K / 8;
 const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8;
 /// Words a drain step publishes at once — sixteen, which is exactly one
@@ -112,7 +120,11 @@ pub(crate) enum OctaInputs<'a> {
 /// all four quarters and the adjacent k pair for one pair of seed rows.
 #[inline(always)]
 fn compression_lane_offset(lane: usize, cross_quarter: bool) -> usize {
-    if cross_quarter { (lane / 2) * 65536 + (lane % 2) * 1024 } else { lane }
+    if cross_quarter {
+        (lane / 2) * 65536 + (lane % 2) * 1024
+    } else {
+        lane
+    }
 }
 
 struct PreparedInputs {
@@ -214,7 +226,11 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 
 #[cfg(not(target_feature = "avx512dq"))]
 #[inline(always)]
-unsafe fn prepare_closed_inputs_ordered(init: u64, base: usize, cross_quarter: bool) -> PreparedInputs {
+unsafe fn prepare_closed_inputs_ordered(
+    init: u64,
+    base: usize,
+    cross_quarter: bool,
+) -> PreparedInputs {
     unsafe {
         let stride =
             crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
@@ -222,15 +238,29 @@ unsafe fn prepare_closed_inputs_ordered(init: u64, base: usize, cross_quarter: b
         let mut states = [
             _mm256_setr_epi64x(
                 first as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64)) as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64)) as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64)) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64),
+                ) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64),
+                ) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64),
+                ) as i64,
             ),
             _mm256_setr_epi64x(
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64)) as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64)) as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64)) as i64,
-                first.wrapping_add(stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64)) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64),
+                ) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64),
+                ) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64),
+                ) as i64,
+                first.wrapping_add(
+                    stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64),
+                ) as i64,
             ),
         ];
         let cv = std::array::from_fn(|_| next_generator_draw(&mut states));
@@ -276,20 +306,38 @@ unsafe fn prepare_closed_inputs(init: u64, base: usize) -> PreparedInputs {
 
 #[cfg(target_feature = "avx512dq")]
 #[inline(always)]
-unsafe fn prepare_closed_inputs_ordered(init: u64, base: usize, cross_quarter: bool) -> PreparedInputs {
+unsafe fn prepare_closed_inputs_ordered(
+    init: u64,
+    base: usize,
+    cross_quarter: bool,
+) -> PreparedInputs {
     unsafe {
         let stride =
             crate::seed_pipe::GOLDEN.wrapping_mul(crate::seed_pipe::DRAWS_PER_BLOCK as u64);
         let first = init.wrapping_add((base as u64).wrapping_mul(stride));
         let mut state = _mm512_setr_epi64(
             first as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64)) as i64,
-            first.wrapping_add(stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64)) as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(1, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(2, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(3, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(4, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(5, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(6, cross_quarter) as u64))
+                as i64,
+            first
+                .wrapping_add(stride.wrapping_mul(compression_lane_offset(7, cross_quarter) as u64))
+                as i64,
         );
         let cv = std::array::from_fn(|_| next_generator_draw(&mut state));
         let message = std::array::from_fn(|_| next_generator_draw(&mut state));
@@ -467,6 +515,7 @@ fn shl_v8<const N: i32>(v: V8) -> V8 {
 
 /// NEON `vsli` #N, 8 lanes: bits `N..32` from `b << N`, bits `0..N` keep `a`.
 #[inline(always)]
+#[cfg(not(all(target_feature = "avx512vbmi2", target_feature = "avx512vl")))]
 fn vsli_v8<const N: i32>(a: V8, b: V8) -> V8 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
@@ -1748,14 +1797,16 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// `vpshldd(v, pending, u)` equal `(v << u) | pending_low` in one instruction.
 /// Bits below that high-aligned range are don't-care. Other targets keep the
 /// incumbent low-aligned `pending` representation.
-struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS:usize=0> {
+struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS: usize = 0> {
     pending: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
 }
 
-impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> W8<'t, FLUSH, RANKED_CLOSED, WINDOW_COLS> {
+impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS: usize>
+    W8<'t, FLUSH, RANKED_CLOSED, WINDOW_COLS>
+{
     #[inline(always)]
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
@@ -1788,7 +1839,11 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
                 // value is known.  The first rolling epoch therefore starts
                 // at word 16; later epochs cover their complete 128 words.
                 if WORD + 1 == RING_WORDS {
-                    (*self.drain).drain_range_gen::<RANKED_CLOSED, WINDOW_COLS>(16, 16, RING_WORDS - 16);
+                    (*self.drain).drain_range_gen::<RANKED_CLOSED, WINDOW_COLS>(
+                        16,
+                        16,
+                        RING_WORDS - 16,
+                    );
                 } else {
                     (*self.drain).drain_range_gen::<RANKED_CLOSED, WINDOW_COLS>(
                         WORD + 1 - RING_WORDS,
@@ -2023,10 +2078,18 @@ pub(crate) struct AbPend {
     pub(crate) live: bool,
 }
 impl AbPend {
+    #[cfg(target_feature = "avx512f")]
     pub(crate) const fn new() -> Self {
-        Self { v: [[0; 64]; 8], base: core::ptr::null_mut(), stride: 0, cq: false, live: false }
+        Self {
+            v: [[0; 64]; 8],
+            base: core::ptr::null_mut(),
+            stride: 0,
+            cq: false,
+            live: false,
+        }
     }
 }
+#[cfg(target_feature = "avx512f")]
 pub(crate) static SB1_DEFER_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SB1_DEFER").is_none());
 /// Stream one pending ab_inner line `j` (caller checked `live`).
@@ -2035,7 +2098,12 @@ pub(crate) static SB1_DEFER_ON: std::sync::LazyLock<bool> =
 pub(crate) unsafe fn ab_pend_one(p: *mut AbPend, j: usize) {
     unsafe {
         let v = _mm512_load_si512((*p).v.as_ptr().add(j).cast());
-        _mm512_stream_si512((*p).base.add(compression_lane_offset(j, (*p).cq) * (*p).stride).cast(), v);
+        _mm512_stream_si512(
+            (*p).base
+                .add(compression_lane_offset(j, (*p).cq) * (*p).stride)
+                .cast(),
+            v,
+        );
     }
 }
 /// Stream every pending line (end of an octa); a no-op when nothing is pending.
@@ -2043,12 +2111,13 @@ pub(crate) unsafe fn ab_pend_one(p: *mut AbPend, j: usize) {
 pub(crate) unsafe fn flush_ab_pend(p: *mut AbPend) {
     unsafe {
         if !p.is_null() && (*p).live {
-            for j in 0..8 { ab_pend_one(p, j); }
+            for j in 0..8 {
+                ab_pend_one(p, j);
+            }
             (*p).live = false;
         }
     }
 }
-
 
 /// Publish one 32-byte transposed run non-temporally.
 ///
@@ -2078,7 +2147,7 @@ unsafe fn stream_v8(p: *mut u32, v: V8, wide_nt: bool) {
 unsafe fn stream_pair_v8(p: *mut u32, va: V8, vb: V8, wide_nt: bool) {
     unsafe {
         #[cfg(target_feature = "avx512f")]
-        if wide_nt && p as usize % 64 == 0 {
+        if wide_nt && (p as usize).is_multiple_of(64) {
             let z = _mm512_castsi256_si512(va);
             let z = _mm512_inserti64x4::<1>(z, vb);
             _mm512_stream_si512(p.cast::<__m512i>(), z);
@@ -2215,7 +2284,7 @@ impl StepRows {
 /// never changes global liveness, arithmetic, addresses, or synchronization.
 /// The optional local compact tile has a compile-time row pitch.
 #[derive(Clone, Copy)]
-struct RankedRows<const COMPACT_COLS:usize=0> {
+struct RankedRows<const COMPACT_COLS: usize = 0> {
     z: *mut u32,
     a: *mut u32,
     b: *mut u32,
@@ -2225,11 +2294,21 @@ struct RankedRows<const COMPACT_COLS:usize=0> {
     elide_z: bool,
 }
 
-impl<const COMPACT_COLS:usize> RankedRows<COMPACT_COLS> {
+impl<const COMPACT_COLS: usize> RankedRows<COMPACT_COLS> {
     #[inline(always)]
-    fn with_compact_z(mut self, base: *mut u32, word: usize, tile:usize) -> Self {
-        debug_assert_eq!(tile,COMPACT_COLS*4);
-        self.compact_z = if base.is_null() { base } else { unsafe { base.add(if COMPACT_COLS!=0 {word&(COMPACT_COLS*4-1)}else{word}) } };
+    fn with_compact_z(mut self, base: *mut u32, word: usize, tile: usize) -> Self {
+        debug_assert_eq!(tile, COMPACT_COLS * 4);
+        self.compact_z = if base.is_null() {
+            base
+        } else {
+            unsafe {
+                base.add(if COMPACT_COLS != 0 {
+                    word & (COMPACT_COLS * 4 - 1)
+                } else {
+                    word
+                })
+            }
+        };
         self
     }
 
@@ -2253,7 +2332,15 @@ impl<const COMPACT_COLS:usize> RankedRows<COMPACT_COLS> {
             debug_assert!((a as usize).is_multiple_of(64));
             debug_assert!((b as usize).is_multiple_of(64));
         }
-        Self { z, a, b, cached_z: false, cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false }
+        Self {
+            z,
+            a,
+            b,
+            cached_z: false,
+            cross_quarter: false,
+            compact_z: core::ptr::null_mut(),
+            elide_z: false,
+        }
     }
 
     /// Only the actual immediate-seed producer requests this policy. All
@@ -2269,8 +2356,11 @@ impl<const COMPACT_COLS:usize> RankedRows<COMPACT_COLS> {
     #[inline(always)]
     unsafe fn publish_z(&self, j: usize, p: *mut u32, value: __m512i) {
         unsafe {
-            if COMPACT_COLS!=0 {
-                _mm512_storeu_si512(self.compact_z.add(j*COMPACT_COLS*4).cast::<__m512i>(),value);
+            if COMPACT_COLS != 0 {
+                _mm512_storeu_si512(
+                    self.compact_z.add(j * COMPACT_COLS * 4).cast::<__m512i>(),
+                    value,
+                );
                 return;
             }
             if !self.compact_z.is_null() {
@@ -2281,7 +2371,10 @@ impl<const COMPACT_COLS:usize> RankedRows<COMPACT_COLS> {
                 }
                 // Vec<F128> need not be64-byte aligned; use the unaligned
                 // cached intrinsic. Each role still owns whole dense rows.
-                _mm512_storeu_si512(self.compact_z.add(j * U32_PER_BLOCK).cast::<__m512i>(), value);
+                _mm512_storeu_si512(
+                    self.compact_z.add(j * U32_PER_BLOCK).cast::<__m512i>(),
+                    value,
+                );
             } else if self.cached_z {
                 _mm512_store_si512(p.cast::<__m512i>(), value);
             } else {
@@ -2311,7 +2404,15 @@ impl<const COMPACT_COLS:usize> RankedRows<COMPACT_COLS> {
                 let a_hi = load_v8(ap.add(8));
                 let b_lo = load_v8(bp);
                 let b_hi = load_v8(bp.add(8));
-                emit_pair(self.z.add(o), and_v8(a_lo, b_lo), and_v8(a_hi, b_hi), true, true, !self.cached_z, true);
+                emit_pair(
+                    self.z.add(o),
+                    and_v8(a_lo, b_lo),
+                    and_v8(a_hi, b_hi),
+                    true,
+                    true,
+                    !self.cached_z,
+                    true,
+                );
                 stream_pair_v8(self.a.add(o), a_lo, a_hi, true);
                 stream_pair_v8(self.b.add(o), b_lo, b_hi, true);
             }
@@ -2412,16 +2513,19 @@ pub(crate) fn ranked_static01_direct_enabled() -> bool {
 
 impl Drain8<'_> {
     #[inline(always)]
-    unsafe fn drain_range_gen<const RANKED_CLOSED: bool, const WINDOW_COLS:usize>(
+    unsafe fn drain_range_gen<const RANKED_CLOSED: bool, const WINDOW_COLS: usize>(
         &mut self,
         base_word: usize,
         ring_word: usize,
         words: usize,
     ) {
         unsafe {
-            if WINDOW_COLS!=0 {
+            if WINDOW_COLS != 0 {
                 self.drain_window_rows::<WINDOW_COLS>(base_word);
-                self.proj.seed_window.unwrap_unchecked().apply::<WINDOW_COLS>(base_word/4,words/4);
+                self.proj
+                    .seed_window
+                    .unwrap_unchecked()
+                    .apply::<WINDOW_COLS>(base_word / 4, words / 4);
                 return;
             }
             #[cfg(all(
@@ -2436,7 +2540,7 @@ impl Drain8<'_> {
             }
             #[cfg(all(target_feature = "avx512f", target_feature = "avx512bw"))]
             if RANKED_CLOSED {
-                if base_word >= 32 && base_word <= 448 {
+                if (32..=448).contains(&base_word) {
                     debug_assert_eq!(ring_word, 0);
                     debug_assert_eq!(words, 32);
                     self.drain_pair_ranked_closed_exact_fast(base_word);
@@ -2482,7 +2586,7 @@ impl Drain8<'_> {
         unsafe {
             debug_assert!(self.ranked_static);
             debug_assert!(proj.one_rows_elided);
-            if base_word >= 32 && base_word <= 448 && ring_word == 0 && words == 32 {
+            if (32..=448).contains(&base_word) && ring_word == 0 && words == 32 {
                 return self.drain_pair_ranked_closed_exact_fast(base_word);
             }
             if (base_word == 16 && ring_word == 16 && words == 16)
@@ -2586,7 +2690,7 @@ impl Drain8<'_> {
     #[inline(never)]
     unsafe fn drain_pair_ranked_closed_exact_fast(&self, base_word: usize) {
         unsafe {
-            debug_assert!(base_word >= 32 && base_word <= 448);
+            debug_assert!((32..=448).contains(&base_word));
             debug_assert!(base_word.is_multiple_of(32));
             let proj = &self.proj;
             let preps = self.ranked_preps.unwrap_unchecked();
@@ -3126,7 +3230,10 @@ unsafe fn dump_elide_win(
 /// self-consistent regardless).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,const WINDOW_COLS:usize>(
+unsafe fn build_octa_witness_ab_stream_prepared_elide<
+    const RANKED_CLOSED: bool,
+    const WINDOW_COLS: usize,
+>(
     prepared: &PreparedInputs,
     z: *mut u32,
     a: *mut u32,
@@ -3245,11 +3352,16 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
 
         let pending_bit = packer_initial_bit(shr_v8::<31>(flags));
         let drain_ptr = &mut drain as *mut Drain8;
-        let mut wa = W8::<false, RANKED_CLOSED, WINDOW_COLS>::at(ast, pending_bit, drain_ptr, false);
+        let mut wa =
+            W8::<false, RANKED_CLOSED, WINDOW_COLS>::at(ast, pending_bit, drain_ptr, false);
         // B is pushed after A at every site; it alone triggers a band drain
         // once both rings contain the completed word. Z is derived there.
-        let mut wb =
-            W8::<true, RANKED_CLOSED, WINDOW_COLS>::at(bs, packer_initial_bit(one), drain_ptr, ranked_static);
+        let mut wb = W8::<true, RANKED_CLOSED, WINDOW_COLS>::at(
+            bs,
+            packer_initial_bit(one),
+            drain_ptr,
+            ranked_static,
+        );
 
         macro_rules! g {
             ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -3344,7 +3456,11 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
                 store_v8(bs.add(i) as *mut u32, zero);
             }
         }
-        drain.drain_range_gen::<RANKED_CLOSED, WINDOW_COLS>(U32_PER_BLOCK - RING_WORDS, 0, RING_WORDS);
+        drain.drain_range_gen::<RANKED_CLOSED, WINDOW_COLS>(
+            U32_PER_BLOCK - RING_WORDS,
+            0,
+            RING_WORDS,
+        );
 
         // Band 0 is the one intentional deferral: words 0..7 are the input
         // CV, while words 8..15 depend on the final compression state. Build
@@ -3386,6 +3502,11 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
     proj: StreamProj<'_>,
     elide: [bool; 3],
 ) {
+    #[cfg(not(target_feature = "avx512f"))]
+    debug_assert!(
+        proj.ab_pend.is_null(),
+        "deferred AB publication requires AVX-512F"
+    );
     unsafe {
         // Only the all-elide provenance state selects the ranked static
         // windows. Partial/cold states still read both rings in every window.
@@ -3472,7 +3593,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
             }
             OctaInputs::Closed { init, base } => prepare_closed_inputs(init, base),
         };
-        build_octa_witness_ab_stream_prepared_elide::<false,0>(
+        build_octa_witness_ab_stream_prepared_elide::<false, 0>(
             &prepared,
             z,
             a,
@@ -3489,7 +3610,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_elide(
                 target_feature = "vpclmulqdq"
             ))]
             None,
-        false,
+            false,
         );
     }
 }
@@ -3535,7 +3656,7 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
         debug_assert!(widen_maddubs_enabled());
         let ranked_static = proj.plan.offsets_eligible(2);
         let prepared = prepare_closed_inputs_ordered(init, base, proj.cross_quarter);
-        build_octa_witness_ab_stream_prepared_elide::<true,0>(
+        build_octa_witness_ab_stream_prepared_elide::<true, 0>(
             &prepared,
             z,
             a,
@@ -3552,8 +3673,262 @@ pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_closed(
                 target_feature = "vpclmulqdq"
             ))]
             roots,
-        cached_z,
+            cached_z,
         );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "avx512dq",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[path = "blake3_roots_recompute.rs"]
+pub(crate) mod root_recompute;
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) struct SeedWindowContext<'a> {
+    pub(crate) window: &'a flock_core::ntt::additive_ntt_f128::WitnessWindowSeed<'a>,
+    pub(crate) input: *mut flock_core::field::F128,
+    pub(crate) prefix: *mut flock_core::field::F128,
+    pub(crate) kpair: usize,
+    pub(crate) merge_prefix: bool,
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+)))]
+pub(crate) struct SeedWindowContext<'a> {
+    _lifetime: core::marker::PhantomData<&'a ()>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+impl SeedWindowContext<'_> {
+    #[inline(always)]
+    unsafe fn apply<const COLS: usize>(&self, first: usize, count: usize) {
+        unsafe {
+            if COLS == 0 {
+                return;
+            }
+            if self.merge_prefix && first == 4 {
+                for row in 0..8 {
+                    core::ptr::copy_nonoverlapping(
+                        self.input.add(row * COLS + 4),
+                        self.prefix.add(row * 4),
+                        4,
+                    );
+                }
+                return;
+            }
+            if first == 0 {
+                if self.merge_prefix {
+                    for row in 0..8 {
+                        core::ptr::copy_nonoverlapping(
+                            self.prefix.add(row * 4),
+                            self.input.add(row * COLS + 4),
+                            4,
+                        );
+                    }
+                }
+                self.window.seed_range_tile(
+                    self.input,
+                    self.kpair,
+                    0,
+                    if self.merge_prefix { 8 } else { count },
+                    COLS,
+                );
+            } else if (first + count) & (COLS - 1) == 0 {
+                let start = (first + count - COLS).max(if self.merge_prefix { 8 } else { 4 });
+                self.window.seed_range_tile(
+                    self.input,
+                    self.kpair,
+                    start,
+                    first + count - start,
+                    COLS,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+)))]
+impl SeedWindowContext<'_> {
+    #[inline(always)]
+    unsafe fn apply<const COLS: usize>(&self, _first: usize, _count: usize) {
+        unreachable!("window seeding requires native x86")
+    }
+}
+
+/// Native ranked producer with a statically selected compact-window width.
+///
+/// # Safety
+/// Inherits the ordinary ranked producer's exclusive buffer contract. The
+/// supplied context lives through the call, targets the same octa and owns
+/// its disjoint NTT kpair. Global z is elided; roots are regenerated elsewhere.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_window<const COLS: usize>(
+    init: u64,
+    base: usize,
+    z: *mut u32,
+    a: *mut u32,
+    b: *mut u32,
+    proj: StreamProj<'_>,
+    preps: &RankedClosedWindowPreps,
+) {
+    unsafe {
+        debug_assert!(matches!(COLS, 8 | 16 | 32 | 64));
+        debug_assert!(proj.seed_window.is_some());
+        debug_assert_eq!(proj.compact_z_tile_words, COLS * 4);
+        debug_assert!(proj.elide_z);
+        let prepared = prepare_closed_inputs_ordered(init, base, proj.cross_quarter);
+        let ranked_static = proj.plan.offsets_eligible(2);
+        build_octa_witness_ab_stream_prepared_elide::<true, COLS>(
+            &prepared,
+            z,
+            a,
+            b,
+            proj,
+            [true; 3],
+            ranked_static,
+            Some(preps),
+            None,
+            false,
+        );
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) fn window_seed_projection_eligible(preps: &RankedClosedWindowPreps) -> bool {
+    ranked_static01_direct_enabled()
+        && ranked_b_constwin_enabled()
+        && (2..=29).all(|blk| unsafe { preps.get_unchecked(blk).0.bcomplement_static_eligible() })
+}
+
+impl Drain8<'_> {
+    #[inline(never)]
+    unsafe fn drain_window_rows<const COLS: usize>(&self, base_word: usize) {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        unsafe {
+            debug_assert!(self.proj.elide_z);
+            debug_assert_eq!(self.proj.compact_z_tile_words, COLS * 4);
+            let rows_for = |word| {
+                RankedRows::<COLS>::new(self.z.add(word), self.a.add(word), self.b.add(word))
+                    .with_cached_z(false)
+                    .with_cross_quarter(self.proj.cross_quarter)
+                    .with_compact_z(self.proj.compact_z, word, COLS * 4)
+                    .with_elide_z(true)
+            };
+            if (32..=448).contains(&base_word) {
+                let preps = self.ranked_preps.unwrap_unchecked();
+                for step in 0..2 {
+                    let rw = step * STEP_WORDS;
+                    let word = base_word + rw;
+                    let blk = word / STEP_WORDS;
+                    debug_assert!(preps.get_unchecked(blk).0.bcomplement_static_eligible());
+                    xor_projection::project(
+                        &self.proj,
+                        blk,
+                        rows_for(word),
+                        self.ast,
+                        self.bs,
+                        rw,
+                        &preps.tables,
+                    );
+                }
+            } else if base_word == 480 {
+                let x0 = load_v8(self.ast.cast::<u32>());
+                let x1 = load_v8(self.ast.add(1).cast::<u32>());
+                let l = _mm256_unpacklo_epi32(x0, x1);
+                let h = _mm256_unpackhi_epi32(x0, x1);
+                let mut q = [0u64; 8];
+                store_v8(
+                    q.as_mut_ptr().cast::<u32>(),
+                    _mm256_permute2x128_si256::<0x20>(l, h),
+                );
+                store_v8(
+                    q.as_mut_ptr().cast::<u32>().add(8),
+                    _mm256_permute2x128_si256::<0x31>(l, h),
+                );
+                let rows = rows_for(480);
+                for j in 0..8 {
+                    rows.publish_sparse_30(j, q.as_ptr().add(j));
+                }
+            } else {
+                debug_assert!(base_word == 0 || base_word == 16);
+                let a_rows = tr8x16_zmm(self.ast, base_word);
+                let rows = rows_for(base_word);
+                for j in 0..8 {
+                    rows.publish_static_values(j, a_rows[j]);
+                }
+            }
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        )))]
+        {
+            let _ = base_word;
+            unreachable!("window drain requires native ranked projection");
+        }
     }
 }
 
@@ -4346,8 +4721,12 @@ mod tests {
                 z_seed.0.as_mut_ptr(),
                 a_seed.0.as_mut_ptr(),
                 b_seed.0.as_mut_ptr(),
-                StreamProj { compact_z_tile_words: 0, seed_window: None,
-                    cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
+                StreamProj {
+                    compact_z_tile_words: 0,
+                    seed_window: None,
+                    cross_quarter: false,
+                    compact_z: core::ptr::null_mut(),
+                    elide_z: false,
                     stage: stage_ref.0.as_mut_ptr(),
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
@@ -4389,7 +4768,21 @@ mod tests {
             ))]
             let roots = root_emit::RootEmitPlan::new(&fold.roots).unwrap();
             #[repr(align(64))]
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
             struct RootTile([u8; 176 * 512]);
+            #[cfg(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
             let mut root_tile = Box::new(RootTile([0xa5; 176 * 512]));
 
             unsafe {
@@ -4398,8 +4791,12 @@ mod tests {
                     z_ref.0.as_mut_ptr(),
                     a_ref.0.as_mut_ptr(),
                     b_ref.0.as_mut_ptr(),
-                    StreamProj { compact_z_tile_words: 0, seed_window: None,
-                        cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
+                    StreamProj {
+                        compact_z_tile_words: 0,
+                        seed_window: None,
+                        cross_quarter: false,
+                        compact_z: core::ptr::null_mut(),
+                        elide_z: false,
                         stage: stage_ref.0.as_mut_ptr(),
                         out: ab_ref.0.as_mut_ptr(),
                         out_stride,
@@ -4418,8 +4815,12 @@ mod tests {
                     z_new.0.as_mut_ptr(),
                     a_new.0.as_mut_ptr(),
                     b_new.0.as_mut_ptr(),
-                    StreamProj { compact_z_tile_words: 0, seed_window: None,
-                        cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
+                    StreamProj {
+                        compact_z_tile_words: 0,
+                        seed_window: None,
+                        cross_quarter: false,
+                        compact_z: core::ptr::null_mut(),
+                        elide_z: false,
                         stage: stage_new.0.as_mut_ptr(),
                         out: ab_new.0.as_mut_ptr(),
                         out_stride,
@@ -4439,8 +4840,11 @@ mod tests {
                         target_feature = "gfni",
                         target_feature = "vpclmulqdq"
                     ))]
-                    Some(root_emit::RootOctaWriter::new(&roots, root_tile.0.as_mut_ptr())),
-                false,
+                    Some(root_emit::RootOctaWriter::new(
+                        &roots,
+                        root_tile.0.as_mut_ptr(),
+                    )),
+                    false,
                 );
                 _mm_sfence();
             }
@@ -4455,17 +4859,28 @@ mod tests {
                 for column in 0..64 {
                     let lane = column % 32 / 4;
                     let expected = (0..8).fold(0u8, |bits, bit| {
-                        let value = fold.roots.get({
-                                    let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
-                                    index + if index >= 833 { 64 } else { 0 }
-                                })
-                            .map_or(0, |&wire| (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1);
+                        let value = fold
+                            .roots
+                            .get({
+                                let index = group * 64 + column / 32 * 32 + column % 4 * 8 + bit;
+                                index + if index >= 833 { 64 } else { 0 }
+                            })
+                            .map_or(0, |&wire| {
+                                (z_new.0[lane * U32_PER_BLOCK + wire / 32] >> (wire % 32)) & 1
+                            });
                         bits | (value as u8) << bit
                     });
-                    assert_eq!(root_tile.0[group * 512 + column], expected,
-                        "live drain base={base}, group={group}, column={column}");
+                    assert_eq!(
+                        root_tile.0[group * 512 + column],
+                        expected,
+                        "live drain base={base}, group={group}, column={column}"
+                    );
                 }
-                assert!(root_tile.0[group * 512 + 64..(group + 1) * 512].iter().all(|&v| v == 0xa5));
+                assert!(
+                    root_tile.0[group * 512 + 64..(group + 1) * 512]
+                        .iter()
+                        .all(|&v| v == 0xa5)
+                );
             }
             assert_eq!(z_ref, z_new, "z mismatch at base={base}");
             assert_eq!(a_ref, a_new, "a mismatch at base={base}");
@@ -4490,7 +4905,14 @@ mod tests {
 // rivaldraw-28 marker 76708 on 2758bc1
 // rivaldraw-37 marker 33507 on ca47b5d
 
-#[cfg(all(test, target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    test,
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 mod cached_z_seed_pair_dispatch_tests {
     use super::*;
     #[test]
@@ -4521,7 +4943,9 @@ mod cached_z_seed_pair_dispatch_tests {
                 &dummy_ab.0,
                 true,
             );
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, win_plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::Owned(Box::new(
+            prepare_ranked_closed_window_preps(&inv_table, win_plan),
+        ));
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
         else {
@@ -4543,8 +4967,12 @@ mod cached_z_seed_pair_dispatch_tests {
                 z_seed.0.as_mut_ptr(),
                 a_seed.0.as_mut_ptr(),
                 b_seed.0.as_mut_ptr(),
-                StreamProj { compact_z_tile_words: 0, seed_window: None,
-                    cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
+                StreamProj {
+                    compact_z_tile_words: 0,
+                    seed_window: None,
+                    cross_quarter: false,
+                    compact_z: core::ptr::null_mut(),
+                    elide_z: false,
                     stage: stage_ref.0.as_mut_ptr(),
                     out: ab_seed.0.as_mut_ptr(),
                     out_stride: 32 * 64,
@@ -4559,14 +4987,20 @@ mod cached_z_seed_pair_dispatch_tests {
             );
         }
 
-
         // Constants come from a completed, fenced generation of a DIFFERENT
         // seed. This is a real elision-provenance fixture, not a zero-filled
         // guess at B's constant-one regions.
-        unsafe { _mm_sfence(); }
-        assert!(compact, "this probe requires the actual ranked compact plan");
-        fn shared_window_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
-            &value.0
+        unsafe {
+            _mm_sfence();
+        }
+        assert!(
+            compact,
+            "this probe requires the actual ranked compact plan"
+        );
+        fn shared_window_preps(
+            value: &super::super::SharedRankedClosedWindowPreps,
+        ) -> &RankedClosedWindowPreps {
+            value.get()
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
         let completed = AtomicUsize::new(0);
@@ -4578,7 +5012,9 @@ mod cached_z_seed_pair_dispatch_tests {
         for (case_seed, groups) in selected {
             let crate::seed_pipe::BlockSource::Closed { init, .. } =
                 crate::seed_pipe::BlockSource::closed(18, case_seed)
-            else { unreachable!() };
+            else {
+                unreachable!()
+            };
             for seed_group in groups {
                 // Each real worker owns its actual output allocations. The
                 // sparse arena preserves every octa's original input base,
@@ -4650,7 +5086,7 @@ mod cached_z_seed_pair_dispatch_tests {
                         out_stride,
                         out_bias,
                         ab_pend: core::ptr::null_mut(),
-                        inv_table: &inv_table,
+                        inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
                         w30_elided: compact,
@@ -4670,12 +5106,12 @@ mod cached_z_seed_pair_dispatch_tests {
                         out_stride,
                         out_bias,
                         ab_pend: core::ptr::null_mut(),
-                        inv_table: &inv_table,
+                        inv_table,
                         plan: win_plan,
                         one_rows_elided: compact,
                         w30_elided: compact,
                     },
-                    &preps,
+                    preps,
                     [true; 3],
                     #[cfg(all(
                         target_feature = "avx512f",
@@ -4740,31 +5176,46 @@ mod cached_z_seed_pair_dispatch_tests {
         }
         assert_eq!(completed.load(Ordering::Relaxed), 2048);
         assert_eq!(stripe_mask.load(Ordering::Relaxed), 255);
-        println!("CACHED_Z_PAIR_WITNESS cases=2048 cached_z=true compressions=16384 seeds=2 groups=8 worker_roles=2 root_stripes=8 full_zab_bytes_compared=100663296 compact_ab_live_bytes_compared=29360128 root_bytes_checked=23068672 adjacent_stripes_unchanged=true field_witness_arithmetic=true ntt_arithmetic=false");
+        println!(
+            "CACHED_Z_PAIR_WITNESS cases=2048 cached_z=true compressions=16384 seeds=2 groups=8 worker_roles=2 root_stripes=8 full_zab_bytes_compared=100663296 compact_ab_live_bytes_compared=29360128 root_bytes_checked=23068672 adjacent_stripes_unchanged=true field_witness_arithmetic=true ntt_arithmetic=false"
+        );
     }
 }
 
-#[cfg(all(test, target_os = "linux", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 mod cross_quarter_witness_tests {
     use super::*;
 
     // Reserve the true ranked address ranges without eagerly touching every
     // page. Every selected live row is initialized from a completed oracle.
-    struct Arena { address: *mut u8, bytes: usize }
+    struct Arena {
+        address: *mut u8,
+        bytes: usize,
+    }
     unsafe extern "C" {
-        fn mmap(address: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut core::ffi::c_void;
-        fn munmap(address: *mut core::ffi::c_void, len: usize) -> i32;
+        fn mmap(address: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(address: *mut u8, len: usize) -> i32;
     }
     impl Arena {
         fn new(bytes: usize) -> Self {
             let address = unsafe { mmap(core::ptr::null_mut(), bytes, 3, 0x22, -1, 0) };
             assert_ne!(address as isize, -1);
             assert!((address as usize).is_multiple_of(64));
-            Self { address: address.cast(), bytes }
+            Self { address, bytes }
         }
     }
     impl Drop for Arena {
-        fn drop(&mut self) { assert_eq!(unsafe { munmap(self.address.cast(), self.bytes) }, 0); }
+        fn drop(&mut self) {
+            assert_eq!(unsafe { munmap(self.address, self.bytes) }, 0);
+        }
     }
 
     #[repr(C, align(64))]
@@ -4777,30 +5228,49 @@ mod cross_quarter_witness_tests {
     #[repr(C, align(64))]
     struct Roots([u8; 176 * 512]);
 
-    fn shared_preps(value: &super::super::SharedRankedClosedWindowPreps) -> &RankedClosedWindowPreps {
-        &value.0
+    fn shared_preps(
+        value: &super::super::SharedRankedClosedWindowPreps,
+    ) -> &RankedClosedWindowPreps {
+        value.get()
     }
 
     #[test]
     fn compact_copy_actual_witness_matches_scalar_inputs_and_root_bytes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let short = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
-        let long = flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8(1 << super::super::K_SKIP));
+        let short =
+            flock_core::ntt::AdditiveNttGf8::new(super::super::K_SKIP, flock_core::field::F8::ZERO);
+        let long = flock_core::ntt::AdditiveNttGf8::new(
+            super::super::K_SKIP,
+            flock_core::field::F8(1 << super::super::K_SKIP),
+        );
         let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&short, &long);
         let dummy = Box::new(Ab([0; 8 * 32 * 64]));
-        let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&inv_table, &dummy.0, true);
+        let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(
+            &inv_table, &dummy.0, true,
+        );
         assert!(plan.offsets_eligible(2));
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::Owned(Box::new(
+            prepare_ranked_closed_window_preps(&inv_table, plan),
+        ));
         let stride = 29 * 64;
         let z = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let a = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let b = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let ab = Arena::new((1 << 18) * stride);
-        let addresses = [z.address as usize, a.address as usize, b.address as usize, ab.address as usize];
+        let addresses = [
+            z.address as usize,
+            a.address as usize,
+            b.address as usize,
+            ab.address as usize,
+        ];
         let completed = AtomicUsize::new(0);
         let stripe_mask = AtomicUsize::new(0);
         for seed in [0x1234_5678_90ab_cdefu64, 0xfedc_ba09_8765_4321] {
-            let crate::seed_pipe::BlockSource::Closed { init, .. } = crate::seed_pipe::BlockSource::closed(18, seed) else { unreachable!() };
+            let crate::seed_pipe::BlockSource::Closed { init, .. } =
+                crate::seed_pipe::BlockSource::closed(18, seed)
+            else {
+                unreachable!()
+            };
             for group in [0usize, 1, 2, 3, 127, 255, 511, 1023] {
                 std::thread::scope(|scope| {
                     for role in 0..2 {
@@ -4894,98 +5364,10 @@ mod cross_quarter_witness_tests {
                 });
             }
         }
-        assert_eq!(completed.load(Ordering::Relaxed),512);
-        assert_eq!(stripe_mask.load(Ordering::Relaxed),255);
-        println!("COMPACT_COPY_WITNESS cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_streamed=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true");
+        assert_eq!(completed.load(Ordering::Relaxed), 512);
+        assert_eq!(stripe_mask.load(Ordering::Relaxed), 255);
+        println!(
+            "COMPACT_COPY_WITNESS cases=512 compressions=4096 seeds=2 groups=8 roles=2 global_z_streamed=true compact_z_cached=true compact_z_bytes_compared=8388608 root_stripes=8 full_zab_bytes=25165824 compact_ab_live_bytes=7340032 root_bytes=5767168 scalar_inputs=true global_output_addresses=true adjacent_root_stripes_unchanged=true"
+        );
     }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "avx512vbmi", target_feature = "avx512vbmi2", target_feature = "avx512dq", target_feature = "gfni", target_feature = "vpclmulqdq"))]
-#[path = "blake3_roots_recompute.rs"]
-pub(crate) mod root_recompute;
-
-#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
-
-pub(crate) struct SeedWindowContext<'a>{
- pub(crate) window:&'a flock_core::ntt::additive_ntt_f128::WitnessWindowSeed<'a>,
- pub(crate) input:*mut flock_core::field::F128,
- pub(crate) prefix:*mut flock_core::field::F128,
- pub(crate) kpair:usize,
- pub(crate) merge_prefix:bool,
-}
-
-#[cfg(not(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq")))]
-
-pub(crate) struct SeedWindowContext<'a>{_lifetime:core::marker::PhantomData<&'a()>}
-
-#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
-
-impl SeedWindowContext<'_>{
- #[inline(always)]
- unsafe fn apply<const COLS:usize>(&self,first:usize,count:usize){unsafe{
-  if COLS==0{return;}
-  if self.merge_prefix&&first==4 {for row in 0..8{core::ptr::copy_nonoverlapping(self.input.add(row*COLS+4),self.prefix.add(row*4),4);}return;}
-  if first==0{
-   if self.merge_prefix{for row in 0..8{core::ptr::copy_nonoverlapping(self.prefix.add(row*4),self.input.add(row*COLS+4),4);}}
-   self.window.seed_range_tile(self.input,self.kpair,0,if self.merge_prefix{8}else{count},COLS);
-  }else if (first+count)&(COLS-1)==0{
-   let start=(first+count-COLS).max(if self.merge_prefix{8}else{4});
-   self.window.seed_range_tile(self.input,self.kpair,start,first+count-start,COLS);
-  }
- }}
-}
-
-#[cfg(not(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq")))]
-
-impl SeedWindowContext<'_>{#[inline(always)] unsafe fn apply<const COLS:usize>(&self,_first:usize,_count:usize){unreachable!("window seeding requires native x86")}}
-
-#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
-
-/// Native ranked producer with a statically selected compact-window width.
-///
-/// # Safety
-/// Inherits the ordinary ranked producer's exclusive buffer contract. The
-/// supplied context lives through the call, targets the same octa, and owns
-/// its disjoint NTT kpair. Global z is elided; roots are regenerated elsewhere.
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn build_octa_witness_ab_stream_ranked_window<const COLS:usize>(init:u64,base:usize,z:*mut u32,a:*mut u32,b:*mut u32,proj:StreamProj<'_>,preps:&RankedClosedWindowPreps){unsafe{
- debug_assert!(matches!(COLS,8|16|32|64));debug_assert!(proj.seed_window.is_some());debug_assert_eq!(proj.compact_z_tile_words,COLS*4);debug_assert!(proj.elide_z);
- let prepared=prepare_closed_inputs_ordered(init,base,proj.cross_quarter);let ranked_static=proj.plan.offsets_eligible(2);
- build_octa_witness_ab_stream_prepared_elide::<true,COLS>(&prepared,z,a,b,proj,[true;3],ranked_static,Some(preps),None,false);
-}}
-
-#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
-
-pub(crate) fn window_seed_projection_eligible(preps:&RankedClosedWindowPreps)->bool{
- ranked_static01_direct_enabled()&&ranked_b_constwin_enabled()&&
- (2..=29).all(|blk|unsafe{preps.get_unchecked(blk).0.bcomplement_static_eligible()})
-}
-
-impl Drain8<'_>{
- #[inline(never)]
- unsafe fn drain_window_rows<const COLS:usize>(&self,base_word:usize){unsafe{
-#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
-{
-  debug_assert!(self.proj.elide_z);debug_assert_eq!(self.proj.compact_z_tile_words,COLS*4);
-  let rows_for=|word|RankedRows::<COLS>::new(self.z.add(word),self.a.add(word),self.b.add(word)).with_cached_z(false).with_cross_quarter(self.proj.cross_quarter).with_compact_z(self.proj.compact_z,word,COLS*4).with_elide_z(true);
-  if (32..=448).contains(&base_word){
-   let preps=self.ranked_preps.unwrap_unchecked();
-   for step in 0..2{let rw=step*STEP_WORDS;let word=base_word+rw;let blk=word/STEP_WORDS;
-    debug_assert!(preps.get_unchecked(blk).0.bcomplement_static_eligible());
-    xor_projection::project(&self.proj,blk,rows_for(word),self.ast,self.bs,rw,&preps.tables);
-   }
-  }else if base_word==480{
-   let x0=load_v8(self.ast.cast::<u32>());let x1=load_v8(self.ast.add(1).cast::<u32>());let l=_mm256_unpacklo_epi32(x0,x1);let h=_mm256_unpackhi_epi32(x0,x1);
-   let mut q=[0u64;8];store_v8(q.as_mut_ptr().cast::<u32>(),_mm256_permute2x128_si256::<0x20>(l,h));store_v8(q.as_mut_ptr().cast::<u32>().add(8),_mm256_permute2x128_si256::<0x31>(l,h));
-   let rows=rows_for(480);for j in 0..8{rows.publish_sparse_30(j,q.as_ptr().add(j));}
-  }else{
-   debug_assert!(base_word==0||base_word==16);
-   let a_rows=tr8x16_zmm(self.ast,base_word);let rows=rows_for(base_word);
-   for j in 0..8{rows.publish_static_values(j,a_rows[j]);}
-  }
- }
-#[cfg(not(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq")))]
-{let _=base_word;unreachable!("window drain requires native ranked projection");}
- }}
 }

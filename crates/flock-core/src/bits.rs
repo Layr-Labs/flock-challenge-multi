@@ -119,6 +119,7 @@ unsafe fn transpose_8_u64s_to_64_bytes_gfni(lanes: &[u64; 8], out: &mut [u8]) {
     not(target_feature = "vpclmulqdq"),
     target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")
 )]
+#[cfg(test)]
 pub(crate) unsafe fn transpose_8_u64s_to_8_mats_swapped_gfni(lanes: &[u64; 8], out_mats: &mut [u64]) {
     use core::arch::x86_64::*;
     debug_assert_eq!(out_mats.len(), 8);
@@ -233,6 +234,30 @@ mod tests {
             transpose_8_u64s_to_64_bytes(&lanes, &mut fast);
             transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut oracle);
             assert_eq!(fast, oracle, "lanes={lanes:?}");
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gfni_single_limb_matrices_match_scalar_transpose() {
+        for bit in 0..64 {
+            let lanes = std::array::from_fn(|lane| (1u64 << bit).rotate_left(lane as u32));
+            let mut bytes = [0u8; 64];
+            transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut bytes);
+            let expected: [u64; 8] = std::array::from_fn(|column| {
+                u64::from_le_bytes(bytes[column * 8..column * 8 + 8].try_into().unwrap())
+                    .swap_bytes()
+            });
+            let mut actual = [0u64; 8];
+            // SAFETY: cfg guarantees the ISA and both arrays have their exact required sizes.
+            unsafe { transpose_8_u64s_to_8_mats_swapped_gfni(&lanes, &mut actual) };
+            assert_eq!(actual, expected);
         }
     }
 

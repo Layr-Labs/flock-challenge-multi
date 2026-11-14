@@ -23,6 +23,10 @@ unsafe fn lane1(v: __m128i) -> u64 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply by a right operand whose high limb is zero.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
     unsafe {
         let p0 = pmull(a.lo, b_lo);
@@ -33,6 +37,10 @@ pub unsafe fn ghash_mul_low_rhs(a: F128, b_lo: u64) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply and reduce a four-product schoolbook expansion.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
     unsafe {
         let p_ll = pmull(a.lo, b.lo);
@@ -55,6 +63,10 @@ pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply with register-local polynomial reduction.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     unsafe {
         let t0 = pmull(a.lo, b.lo);
@@ -82,6 +94,10 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply a three-product Karatsuba expansion in vector registers.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     unsafe {
         let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
@@ -91,7 +107,9 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
         let xs = _mm_xor_si128(x, _mm_shuffle_epi32::<0x4e>(x));
         let ys = _mm_xor_si128(y, _mm_shuffle_epi32::<0x4e>(y));
         let middle = _mm_xor_si128(
-            _mm_xor_si128(_mm_clmulepi64_si128::<0x00>(xs, ys), low), high);
+            _mm_xor_si128(_mm_clmulepi64_si128::<0x00>(xs, ys), low),
+            high,
+        );
         reduce_register_product(low, middle, high)
     }
 }
@@ -102,17 +120,31 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
 unsafe fn reduce_register_product(low: __m128i, middle: __m128i, high: __m128i) -> F128 {
     unsafe {
         let polynomial = _mm_set_epi64x(0, 0x87);
-        let middle = _mm_xor_si128(middle, _mm_xor_si128(
-            _mm_slli_si128::<8>(high),
-            _mm_clmulepi64_si128::<0x01>(high, polynomial)));
-        let result = _mm_xor_si128(low, _mm_xor_si128(
-            _mm_slli_si128::<8>(middle),
-            _mm_clmulepi64_si128::<0x01>(middle, polynomial)));
-        F128 { lo: lane0(result), hi: lane1(result) }
+        let middle = _mm_xor_si128(
+            middle,
+            _mm_xor_si128(
+                _mm_slli_si128::<8>(high),
+                _mm_clmulepi64_si128::<0x01>(high, polynomial),
+            ),
+        );
+        let result = _mm_xor_si128(
+            low,
+            _mm_xor_si128(
+                _mm_slli_si128::<8>(middle),
+                _mm_clmulepi64_si128::<0x01>(middle, polynomial),
+            ),
+        );
+        F128 {
+            lo: lane0(result),
+            hi: lane1(result),
+        }
     }
 }
 
 /// Squaring has no cross term in characteristic two.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 pub unsafe fn ghash_square_register(a: F128) -> F128 {
@@ -121,12 +153,17 @@ pub unsafe fn ghash_square_register(a: F128) -> F128 {
         reduce_register_product(
             _mm_clmulepi64_si128::<0x00>(x, x),
             _mm_setzero_si128(),
-            _mm_clmulepi64_si128::<0x11>(x, x))
+            _mm_clmulepi64_si128::<0x11>(x, x),
+        )
     }
 }
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply using a three-product Karatsuba expansion.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     unsafe {
         let p0 = pmull(a.lo, b.lo);
@@ -149,6 +186,10 @@ pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Multiply using Karatsuba products followed by polynomial reduction.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     unsafe {
         let d0 = pmull(a.lo, b.lo);
@@ -188,6 +229,10 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
+/// Return the full unreduced polynomial product.
+///
+/// # Safety
+/// The executing CPU must support PCLMULQDQ and SSE4.1.
 pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     unsafe {
         let p_ll = pmull(a.lo, b.lo);
@@ -207,7 +252,6 @@ pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
         }
     }
 }
-
 
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
@@ -231,6 +275,10 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Reduce four accumulated polynomial products lane by lane.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m512i {
     unsafe {
         let t1 = gf2_128_reduce_x4(mid, hi);
@@ -241,6 +289,10 @@ pub unsafe fn ghash_reduce_acc_x4(lo: __m512i, mid: __m512i, hi: __m512i) -> __m
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Multiply four independent field elements.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
     unsafe {
         let t1a = _mm512_clmulepi64_epi128::<0x01>(x, y);
@@ -256,6 +308,10 @@ pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Multiply four elements with zero high limbs in the left operand.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
     unsafe {
         let t1 = _mm512_clmulepi64_epi128::<0x10>(x, y);
@@ -264,10 +320,13 @@ pub unsafe fn ghash_mul_x4_low_lhs(x: __m512i, y: __m512i) -> __m512i {
     }
 }
 
-
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Multiply each field lane by the reduced x^64 monomial.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_shift64_x4(t: __m512i) -> __m512i {
     unsafe { gf2_128_reduce_x4(_mm512_setzero_si512(), t) }
 }
@@ -275,6 +334,10 @@ pub unsafe fn ghash_shift64_x4(t: __m512i) -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Multiply using `t` and its precomputed x^64 companion.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m512i {
     unsafe {
         let lo = _mm512_xor_si512(
@@ -292,6 +355,10 @@ pub unsafe fn ghash_mul_x4_split(v: __m512i, t: __m512i, t_x64: __m512i) -> __m5
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Broadcast a field element and its reduced x^64 companion.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_broadcast_split(t: F128) -> (__m512i, __m512i) {
     unsafe {
         let tv = _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
@@ -302,6 +369,10 @@ pub unsafe fn ghash_broadcast_split(t: F128) -> (__m512i, __m512i) {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+/// Multiply four vectors using the same split right operand.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and VPCLMULQDQ.
 pub unsafe fn ghash_mul_x4_split_unroll4(
     v0: __m512i,
     v1: __m512i,
@@ -320,10 +391,14 @@ pub unsafe fn ghash_mul_x4_split_unroll4(
     }
 }
 
-
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f")]
+/// Load four field elements without requiring 64-byte alignment.
+///
+/// # Safety
+/// The CPU must support AVX-512F. `p` must identify 64 initialized readable
+/// bytes in a live allocation, without concurrent writes during the load.
 pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
     unsafe { _mm512_loadu_si512(p as *const __m512i) }
 }
@@ -331,36 +406,42 @@ pub unsafe fn f128x4_loadu(p: *const F128) -> __m512i {
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f,sse4.1")]
+/// Extract four field lanes in their original order.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F and SSE4.1.
 pub unsafe fn f128x4_extract(v: __m512i) -> [F128; 4] {
-    unsafe {
-        let l0 = _mm512_extracti32x4_epi32::<0>(v);
-        let l1 = _mm512_extracti32x4_epi32::<1>(v);
-        let l2 = _mm512_extracti32x4_epi32::<2>(v);
-        let l3 = _mm512_extracti32x4_epi32::<3>(v);
-        [
-            F128 {
-                lo: _mm_extract_epi64::<0>(l0) as u64,
-                hi: _mm_extract_epi64::<1>(l0) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l1) as u64,
-                hi: _mm_extract_epi64::<1>(l1) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l2) as u64,
-                hi: _mm_extract_epi64::<1>(l2) as u64,
-            },
-            F128 {
-                lo: _mm_extract_epi64::<0>(l3) as u64,
-                hi: _mm_extract_epi64::<1>(l3) as u64,
-            },
-        ]
-    }
+    let l0 = _mm512_extracti32x4_epi32::<0>(v);
+    let l1 = _mm512_extracti32x4_epi32::<1>(v);
+    let l2 = _mm512_extracti32x4_epi32::<2>(v);
+    let l3 = _mm512_extracti32x4_epi32::<3>(v);
+    [
+        F128 {
+            lo: _mm_extract_epi64::<0>(l0) as u64,
+            hi: _mm_extract_epi64::<1>(l0) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l1) as u64,
+            hi: _mm_extract_epi64::<1>(l1) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l2) as u64,
+            hi: _mm_extract_epi64::<1>(l2) as u64,
+        },
+        F128 {
+            lo: _mm_extract_epi64::<0>(l3) as u64,
+            hi: _mm_extract_epi64::<1>(l3) as u64,
+        },
+    ]
 }
 
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[inline]
 #[target_feature(enable = "avx512f")]
+/// Pack four field elements in lane order.
+///
+/// # Safety
+/// The executing CPU must support AVX-512F.
 pub unsafe fn f128x4_set(a: F128, b: F128, c: F128, d: F128) -> __m512i {
     _mm512_set_epi64(
         d.hi as i64,
@@ -397,6 +478,10 @@ pub struct WideGhashX4 {
 impl WideGhashX4 {
     #[inline]
     #[target_feature(enable = "avx512f")]
+    /// Construct four zero unreduced products.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F.
     pub unsafe fn zero() -> Self {
         let z = _mm512_setzero_si512();
         Self {
@@ -408,6 +493,10 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f")]
+    /// Add unreduced products lane by lane.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F.
     pub unsafe fn xor(self, other: Self) -> Self {
         Self {
             lo: _mm512_xor_si512(self.lo, other.lo),
@@ -418,8 +507,10 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
-    #[inline]
-    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    /// Compute four unreduced products.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and VPCLMULQDQ.
     pub unsafe fn from_mul(x: __m512i, y: __m512i) -> Self {
         Self {
             lo: _mm512_clmulepi64_epi128::<0x00>(x, y),
@@ -431,6 +522,11 @@ impl WideGhashX4 {
         }
     }
 
+    /// Accumulate four unreduced products.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and VPCLMULQDQ.
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
     pub unsafe fn mul_acc(&mut self, x: __m512i, y: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_clmulepi64_epi128::<0x00>(x, y));
         self.hi = _mm512_xor_si512(self.hi, _mm512_clmulepi64_epi128::<0x11>(x, y));
@@ -443,6 +539,10 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
+    /// Accumulate two sets of four unreduced products.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and VPCLMULQDQ.
     pub unsafe fn mul_acc2(&mut self, x0: __m512i, y0: __m512i, x1: __m512i, y1: __m512i) {
         let c00_0 = _mm512_clmulepi64_epi128::<0x00>(x0, y0);
         let c00_1 = _mm512_clmulepi64_epi128::<0x00>(x1, y1);
@@ -460,6 +560,10 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f,avx512bw")]
+    /// Accumulate multiplication by one without carry-less products.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and AVX-512BW.
     pub unsafe fn mul_acc_one(&mut self, x: __m512i) {
         self.lo = _mm512_xor_si512(self.lo, _mm512_maskz_mov_epi64(0x55, x));
         self.mid = _mm512_xor_si512(self.mid, _mm512_bsrli_epi128::<8>(x));
@@ -467,12 +571,11 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
-    pub unsafe fn fold4_and_reduce(
-        a0: Self,
-        a1: Self,
-        a2: Self,
-        a3: Self,
-    ) -> __m512i {
+    /// Fold and reduce four accumulators into four field lanes.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and VPCLMULQDQ.
+    pub unsafe fn fold4_and_reduce(a0: Self, a1: Self, a2: Self, a3: Self) -> __m512i {
         unsafe {
             let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
             let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
@@ -501,12 +604,20 @@ impl WideGhashX4 {
 
     #[inline]
     #[target_feature(enable = "avx512f,vpclmulqdq")]
+    /// Reduce each accumulated field lane.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and VPCLMULQDQ.
     pub unsafe fn reduce_lanes(self) -> __m512i {
         unsafe { ghash_reduce_acc_x4(self.lo, self.mid, self.hi) }
     }
 
     #[inline]
     #[target_feature(enable = "avx512f,sse4.1")]
+    /// XOR the four lanes into one unreduced product.
+    ///
+    /// # Safety
+    /// The executing CPU must support AVX-512F and SSE4.1.
     pub unsafe fn fold(self) -> F256Unreduced {
         unsafe {
             let lo = xor4_lanes(self.lo);

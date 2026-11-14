@@ -1234,7 +1234,7 @@ mod microbench {
                         x * OUTER,
                         b_med,
                         w,
-                        &partials,
+                        partials,
                         &mut out,
                         0,
                     );
@@ -1259,7 +1259,7 @@ mod microbench {
                 let x = i % n_windows;
                 unsafe {
                     let byte_base_b = x * OUTER + b_med * N_CHUNKS * 8;
-                    let ok = kernel::<32>(&a, &b, &inv_table, byte_base_b, &partials, &mut out, 0);
+                    let ok = kernel::<32>(&a, &b, &inv_table, byte_base_b, partials, &mut out, 0);
                     assert!(ok);
                 }
                 sink ^= out[0] as u64 ^ (out[63] as u64) << 8;
@@ -1272,7 +1272,7 @@ mod microbench {
                 unsafe {
                     let byte_base_b = x * OUTER + b_med * N_CHUNKS * 8;
                     macro_rules! run {
-                        ($($i:literal),*) => { match plan { $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, &partials, &mut out, 0),)* _ => unreachable!() } };
+                        ($($i:literal),*) => { match plan { $($i => kernel::<$i>(&a, &b, &inv_table, byte_base_b, partials, &mut out, 0),)* _ => unreachable!() } };
                     }
                     let ok = run!(
                         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,

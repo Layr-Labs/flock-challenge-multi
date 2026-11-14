@@ -144,6 +144,7 @@ fn lookahead_inv_factors(r: F128) -> (F128, F128) {
     not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
     allow(dead_code)
 )]
+#[cfg(test)]
 fn prefold_row_skip_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -224,6 +225,7 @@ pub(crate) fn round2_row_zero(padding: &PaddingSpec, k_skip: usize) -> Option<(u
     not(all(target_feature = "avx512vbmi", target_feature = "gfni")),
     allow(dead_code)
 )]
+#[cfg(test)]
 pub(crate) fn prefold_dead_line_mask(
     tile_base_row: usize,
     pair_in_block_mask: usize,
@@ -262,6 +264,7 @@ pub(crate) fn prefold_dead_line_mask(
     allow(dead_code)
 )]
 #[inline]
+#[cfg(test)]
 pub(crate) fn prefold_dead_line_mask_gated(
     tile_base_row: usize,
     pair_in_block_mask: usize,
@@ -1160,7 +1163,10 @@ fn gl1_split_lo() -> usize {
         if std::env::var_os("FLOCK_NO_GL1_SPLIT").is_some() {
             return 0;
         }
-        std::env::var("FLOCK_GL1_SPLIT_LO").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+        std::env::var("FLOCK_GL1_SPLIT_LO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6)
     });
     *LO
 }
@@ -1267,17 +1273,24 @@ pub(crate) fn team_chunks_aff<T>(
         let (ga, _gb, gbytes, gn) = *crate::flat_par::SL1_OWN_GEOM.lock().unwrap();
         let base = a_in.as_ptr() as usize;
         if gn > 0 && base == ga && a_in.len() * 16 == gbytes * gn {
-            Some((0..n).map(|i| {
-                let off = i * chunk_in * 16;
-                crate::flat_par::SL1_OWN[(off / gbytes).min(gn - 1)].load(core::sync::atomic::Ordering::Relaxed)
-            }).collect())
+            Some(
+                (0..n)
+                    .map(|i| {
+                        let off = i * chunk_in * 16;
+                        crate::flat_par::SL1_OWN[(off / gbytes).min(gn - 1)]
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                    })
+                    .collect(),
+            )
         } else {
             None
         }
     } else {
         None
     };
-    let Some(owner) = owner else { return team_chunks(a_out, b_out, chunk, leaf, id, op) };
+    let Some(owner) = owner else {
+        return team_chunks(a_out, b_out, chunk, leaf, id, op);
+    };
     assert_eq!(a_out.len(), b_out.len());
     assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
     let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
@@ -1410,6 +1423,11 @@ fn build_w_pair_table_casc(eq_lo: &[F128]) -> Vec<F128> {
     t
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 fn build_w_pair_table(eq_lo: &[F128]) -> Vec<F128> {
     debug_assert!(eq_lo.len().is_multiple_of(8));
     let x64 = F128::new(0, 1);
@@ -1516,8 +1534,7 @@ fn build_r2_eq_bake_checked(
     // Scaling a fold table's 64 basis columns scales every XOR-composed image
     // by the same factor, so the matrices of `c · fold` are the matrices of
     // the `c`-scaled basis and the prefold emits `c · fold(row)` for free.
-    let cols: [F128; 64] =
-        std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|i| table.data[(i / 8) * 256 + (1usize << (i % 8))]);
     let scaled = |c: F128| {
         let sc: [F128; 64] = std::array::from_fn(|i| c * cols[i]);
         kernels::x86_64::R2FoldMats(kernels::x86_64::build_row_fold_mats_from_cols(&sc))
@@ -1527,34 +1544,47 @@ fn build_r2_eq_bake_checked(
     // the hot pool's spinning team (fork/join-bound under rayon). Same values.
     static GL1_BAKE: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_BAKE_TEAM").is_none());
-    let b_mats: Vec<kernels::x86_64::R2FoldMats> =
-        if *GL1_BAKE && crate::flat_par::team_enabled() && crate::flat_par::team_ready() && etop.len() >= 16 {
-            let n = etop.len();
-            let mut v: Vec<core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>> = Vec::with_capacity(n);
-            // SAFETY: every slot is written exactly once below before the cast.
-            unsafe { v.set_len(n) };
-            let vp = v.as_mut_ptr() as usize;
-            const PER: usize = 4;
-            crate::flat_par::team_map_reduce(
-                n.div_ceil(PER),
-                |i| {
-                    for j in i * PER..((i + 1) * PER).min(n) {
-                        // SAFETY: item `i` owns slots [i*PER, (i+1)*PER).
-                        unsafe {
-                            (vp as *mut core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>)
-                                .add(j)
-                                .write(core::mem::MaybeUninit::new(scaled(etop[j])))
-                        };
-                    }
-                },
-                || (),
-                |_, _| (),
-            );
-            // SAFETY: all `n` slots initialized; MaybeUninit<T> has T's layout.
-            unsafe { core::mem::transmute::<_, Vec<kernels::x86_64::R2FoldMats>>(v) }
-        } else {
-            etop.par_iter().map(|e| scaled(*e)).collect()
-        };
+    let b_mats: Vec<kernels::x86_64::R2FoldMats> = if *GL1_BAKE
+        && crate::flat_par::team_enabled()
+        && crate::flat_par::team_ready()
+        && etop.len() >= 16
+    {
+        let n = etop.len();
+        let mut v: Vec<core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>> = Vec::with_capacity(n);
+        // SAFETY: every slot is written exactly once below before the cast.
+        unsafe { v.set_len(n) };
+        let vp = v.as_mut_ptr() as usize;
+        const PER: usize = 4;
+        crate::flat_par::team_map_reduce(
+            n.div_ceil(PER),
+            |i| {
+                for j in i * PER..((i + 1) * PER).min(n) {
+                    // SAFETY: item `i` owns slots [i*PER, (i+1)*PER).
+                    unsafe {
+                        (vp as *mut core::mem::MaybeUninit<kernels::x86_64::R2FoldMats>)
+                            .add(j)
+                            .write(core::mem::MaybeUninit::new(scaled(etop[j])))
+                    };
+                }
+            },
+            || (),
+            |_, _| (),
+        );
+        // SAFETY: all n slots were initialized and all workers have joined.
+        // MaybeUninit<T> has T's size/alignment, so the original allocation
+        // layout and capacity remain valid. Transfer its single ownership
+        // without assuming a field order for two Vec instantiations.
+        let mut v = core::mem::ManuallyDrop::new(v);
+        unsafe {
+            Vec::from_raw_parts(
+                v.as_mut_ptr().cast::<kernels::x86_64::R2FoldMats>(),
+                v.len(),
+                v.capacity(),
+            )
+        }
+    } else {
+        etop.par_iter().map(|e| scaled(*e)).collect()
+    };
     Some(kernels::x86_64::R2EqBake {
         a_mats,
         b_mats,
@@ -1890,8 +1920,7 @@ pub(crate) fn round2_canonical_window_deltas(
     assert_eq!(table.n_chunks, 8);
     assert_eq!(rows.len(), CANON_ROWS * 64);
     assert!(mlv_challenges.len() >= 8);
-    let cols: [F128; 64] =
-        std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
+    let cols: [F128; 64] = std::array::from_fn(|s| table.data[(s / 8) * 256 + (1usize << (s % 8))]);
     let fold = |slot: usize| -> F128 {
         crate::pcs::ring_switch::inner_product(&cols, &rows[slot * 64..(slot + 1) * 64])
     };
@@ -2223,153 +2252,157 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let lo1_ys = kernels::x86_64::lo1_ys_enabled();
     crate::rstrace::ev("r2:par0", hi_size as u32);
     let leaf = |x_hi: usize| {
-            crate::rstrace::item_start();
-            #[allow(unused_mut)]
-            let mut r4_out = [F128::ZERO; 18];
-            let x_in = x_hi;
-            let row_base = x_in * chunk_size;
-            let pair_idx_base = x_in * lo_size;
-            let mut none_a: [F128; 0] = [];
-            let mut none_b: [F128; 0] = [];
+        crate::rstrace::item_start();
+        #[allow(unused_mut)]
+        let mut r4_out = [F128::ZERO; 18];
+        let x_in = x_hi;
+        let row_base = x_in * chunk_size;
+        let pair_idx_base = x_in * lo_size;
+        let mut none_a: [F128; 0] = [];
+        let mut none_b: [F128; 0] = [];
 
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the packed inputs expose 8 readable bytes per post-URM
-            // row of this chunk, the table has the protocol-fixed 8 × 256
-            // shape, WRITE=false touches no chunk, and the cfg gate supplies
-            // every intrinsic feature.
-            let out = unsafe {
-                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-                if fast_r2
-                    && (pair_idx_base & 127) == 0
-                    && (row_base & 255) == 0
-                    && let Some(bk) = bake_arg
-                {
-                    if let Some(lw) = r4_lv.as_ref() {
-                        let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
-                            a_packed.as_ptr(),
-                            b_packed.as_ptr(),
-                            row_base,
-                            lo_size,
-                            bk,
-                            lw,
-                            lo1_ys,
-                        );
-                        r4_out = r4;
-                        o
-                    } else {
-                        kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
-                            a_packed.as_ptr(),
-                            b_packed.as_ptr(),
-                            row_base,
-                            lo_size,
-                            bk,
-                        )
-                    }
-                } else if let Some(bk) = bake_arg {
-                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
-                        table.data.as_ptr(),
-                        r2_mats_arg,
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: the packed inputs expose 8 readable bytes per post-URM
+        // row of this chunk, the table has the protocol-fixed 8 × 256
+        // shape, WRITE=false touches no chunk, and the cfg gate supplies
+        // every intrinsic feature.
+        let out = unsafe {
+            #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+            if fast_r2
+                && (pair_idx_base & 127) == 0
+                && (row_base & 255) == 0
+                && let Some(bk) = bake_arg
+            {
+                if let Some(lw) = r4_lv.as_ref() {
+                    let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
                         a_packed.as_ptr(),
                         b_packed.as_ptr(),
                         row_base,
-                        &mut none_a,
-                        &mut none_b,
-                        eq_lo,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        wtab_arg,
-                        Some(bk),
-                    )
+                        lo_size,
+                        bk,
+                        lw,
+                        lo1_ys,
+                    );
+                    r4_out = r4;
+                    o
                 } else {
-                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
-                        table.data.as_ptr(),
-                        r2_mats_arg,
+                    kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
                         a_packed.as_ptr(),
                         b_packed.as_ptr(),
                         row_base,
-                        &mut none_a,
-                        &mut none_b,
-                        eq_lo,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        wtab_arg,
-                        None,
+                        lo_size,
+                        bk,
                     )
                 }
-                #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-                if let Some(bk) = bake_arg {
-                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
-                        table.data.as_ptr(),
-                        r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
-                        &mut none_a,
-                        &mut none_b,
-                        eq_lo,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        wtab_arg,
-                        Some(bk),
-                    )
-                } else {
-                    kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
-                        table.data.as_ptr(),
-                        r2_mats_arg,
-                        a_packed.as_ptr(),
-                        b_packed.as_ptr(),
-                        row_base,
-                        &mut none_a,
-                        &mut none_b,
-                        eq_lo,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        wtab_arg,
-                        None,
-                    )
-                }
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out = round2_lookahead_chunk_scalar::<false>(
-                a_packed,
-                b_packed,
-                table,
-                &mut none_a,
-                &mut none_b,
-                eq_lo,
-                row_base,
-                pair_idx_base,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
+            } else if let Some(bk) = bake_arg {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut none_a,
+                    &mut none_b,
+                    eq_lo,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    wtab_arg,
+                    Some(bk),
+                )
+            } else {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut none_a,
+                    &mut none_b,
+                    eq_lo,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    wtab_arg,
+                    None,
+                )
+            }
+            #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
+            if let Some(bk) = bake_arg {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, true>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut none_a,
+                    &mut none_b,
+                    eq_lo,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    wtab_arg,
+                    Some(bk),
+                )
+            } else {
+                kernels::x86_64::round2_lookahead_chunk_x86_avx512::<false, false>(
+                    table.data.as_ptr(),
+                    r2_mats_arg,
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    row_base,
+                    &mut none_a,
+                    &mut none_b,
+                    eq_lo,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    wtab_arg,
+                    None,
+                )
+            }
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let out = round2_lookahead_chunk_scalar::<false>(
+            a_packed,
+            b_packed,
+            table,
+            &mut none_a,
+            &mut none_b,
+            eq_lo,
+            row_base,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        );
 
-            let eq_h = eq_hi[x_hi];
-            crate::rstrace::item_end();
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-                if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
-            )
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::item_end();
+        (
+            eq_h * out[0],
+            eq_h * out[1],
+            [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ],
+            if r4_fast {
+                r4_out.map(|x| eq_h * x)
+            } else {
+                r4_out
+            },
+        )
     };
     type R2Sums = (F128, F128, [F128; 6], [F128; 18]);
     let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
@@ -2394,12 +2427,15 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
     let mut early_d4: Option<Round4Lookahead> = None;
     let (sum1_even, sum_inf_even, agg, r4_flat) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
-            if *GL1_DIDLE && canon_elided.is_some() {
-                let rows = canon_elided.unwrap();
+            if *GL1_DIDLE && let Some(rows) = canon_elided {
                 crate::flat_par::map_reduce_idle(hi_size, leaf, id, op, || {
                     early_d = Some(round2_canonical_window_deltas(table, mlv_challenges, rows));
                     if r4_fast {
-                        early_d4 = Some(three_var::round4_canonical_window_deltas(table, mlv_challenges, rows));
+                        early_d4 = Some(three_var::round4_canonical_window_deltas(
+                            table,
+                            mlv_challenges,
+                            rows,
+                        ));
                     }
                 })
             } else {
@@ -2645,8 +2681,8 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
     ))]
     let nt_out = kernels::x86_64::zc_fold_nt_enabled()
         && quarter >= (1 << 23)
-        && (a_out.as_ptr() as usize) % 16 == 0
-        && (b_out.as_ptr() as usize) % 16 == 0;
+        && (a_out.as_ptr() as usize).is_multiple_of(16)
+        && (b_out.as_ptr() as usize).is_multiple_of(16);
     // Lane-major composed prefold (see `zc_c4_lm_enabled`), once per pass.
     #[cfg(all(
         target_arch = "x86_64",
@@ -2669,52 +2705,84 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
         wtab_arg.is_some(),
     );
 
-    let (sum1_even, sum_inf_even, agg) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            // Output x of this chunk ← packed rows 4x..4x+4 (pairs 2x, 2x+1).
-            let out_base = x_hi * chunk_out;
+    let (sum1_even, sum_inf_even, agg) =
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| {
+                // Output x of this chunk ← packed rows 4x..4x+4 (pairs 2x, 2x+1).
+                let out_base = x_hi * chunk_out;
 
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: the packed inputs expose 8 readable bytes for every row
-            // 4·out_base .. 4·(out_base + chunk_out); the table has the
-            // protocol-fixed shape; the cfg gate supplies every feature.
-            let out = unsafe {
-                #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
-                if fast_r34
-                    && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg)
-                {
-                    let ap = a_packed.as_ptr();
-                    let bp = b_packed.as_ptr();
-                    match (nt_out, out_lm) {
-                        (true, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ))]
+                // SAFETY: the packed inputs expose 8 readable bytes for every row
+                // 4·out_base .. 4·(out_base + chunk_out); the table has the
+                // protocol-fixed shape; the cfg gate supplies every feature.
+                let out = unsafe {
+                    #[cfg(all(target_feature = "avx512vbmi", target_feature = "gfni"))]
+                    if fast_r34 && let (Some(c), Some(wt)) = (cfold_arg, wtab_arg) {
+                        let ap = a_packed.as_ptr();
+                        let bp = b_packed.as_ptr();
+                        match (nt_out, out_lm) {
+                            (true, true) => {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<
+                                    true,
+                                    true,
+                                >(
+                                    ap, bp, out_base, a_out, b_out, lo_size, c, wt
+                                )
+                            }
+                            (true, false) => {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<
+                                    true,
+                                    false,
+                                >(
+                                    ap, bp, out_base, a_out, b_out, lo_size, c, wt
+                                )
+                            }
+                            (false, true) => {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<
+                                    false,
+                                    true,
+                                >(
+                                    ap, bp, out_base, a_out, b_out, lo_size, c, wt
+                                )
+                            }
+                            (false, false) => {
+                                kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<
+                                    false,
+                                    false,
+                                >(
+                                    ap, bp, out_base, a_out, b_out, lo_size, c, wt
+                                )
+                            }
                         }
-                        (true, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<true, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (false, true) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, true>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
-                        (false, false) => {
-                            kernels::x86_64::fold2_from_packed_lookahead_c4_lm_wtab_x86::<false, false>(
-                                ap, bp, out_base, a_out, b_out, lo_size, c, wt,
-                            )
-                        }
+                    } else {
+                        kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
+                            table.data.as_ptr(),
+                            r2_mats_arg,
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            out_base,
+                            a_out,
+                            b_out,
+                            rho1,
+                            rho2,
+                            eq_lo,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            nt_out,
+                            cfold_arg,
+                            wtab_arg,
+                            c4_lm,
+                            out_lm,
+                        )
                     }
-                } else {
+                    #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
                     kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
                         table.data.as_ptr(),
                         r2_mats_arg,
@@ -2734,13 +2802,16 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                         c4_lm,
                         out_lm,
                     )
-                }
-                #[cfg(not(all(target_feature = "avx512vbmi", target_feature = "gfni")))]
-                kernels::x86_64::fold2_from_packed_lookahead_x86_avx512(
-                    table.data.as_ptr(),
-                    r2_mats_arg,
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
+                };
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )))]
+                let out = fold2_from_packed_lookahead_scalar(
+                    a_packed,
+                    b_packed,
+                    table,
                     out_base,
                     a_out,
                     b_out,
@@ -2749,56 +2820,32 @@ pub(crate) fn fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     eq_lo,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
-                    nt_out,
-                    cfold_arg,
-                    wtab_arg,
-                    c4_lm,
-                    out_lm,
-                )
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out = fold2_from_packed_lookahead_scalar(
-                a_packed,
-                b_packed,
-                table,
-                out_base,
-                a_out,
-                b_out,
-                rho1,
-                rho2,
-                eq_lo,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
+                );
 
-            let eq_h = eq_hi[x_hi];
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(s1, sinf, sa), (c1, cinf, ca)| {
-                let mut a = sa;
-                for (x, y) in a.iter_mut().zip(ca.iter()) {
-                    *x += *y;
-                }
-                (s1 + c1, sinf + cinf, a)
-            },
-        );
+                let eq_h = eq_hi[x_hi];
+                (
+                    eq_h * out[0],
+                    eq_h * out[1],
+                    [
+                        eq_h * out[2],
+                        eq_h * out[3],
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ],
+                )
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+                |(s1, sinf, sa), (c1, cinf, ca)| {
+                    let mut a = sa;
+                    for (x, y) in a.iter_mut().zip(ca.iter()) {
+                        *x += *y;
+                    }
+                    (s1 + c1, sinf + cinf, a)
+                },
+            );
 
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
@@ -3684,14 +3731,32 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     team: bool,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
-    assert!(!casc || fold2_plain_casc_route_ok(a.len()), "casc route unavailable");
+    assert!(
+        !casc || fold2_plain_casc_route_ok(a.len()),
+        "casc route unavailable"
+    );
     let out_lm = out_lm && !casc;
     if casc {
-        assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
+        assert_ne!(
+            r_next[2],
+            F128::ZERO,
+            "deeper cascade needs a non-zero second weight"
+        );
     }
     // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
     // κ restores the even lanes' own weight in the message sums.
-    let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let kappa_c = if casc {
+        (F128::ONE + r_next[2]) * r_next[2].inv()
+    } else {
+        F128::ZERO
+    };
     let n = a.len();
     assert_eq!(b.len(), n);
     assert!(n.is_power_of_two() && n >= 16);
@@ -3760,8 +3825,8 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     ))]
     let nt_out = kernels::x86_64::zc_tail_nt_enabled()
         && quarter >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
-        && (a_out.as_ptr() as usize) % 16 == 0
-        && (b_out.as_ptr() as usize) % 16 == 0;
+        && (a_out.as_ptr() as usize).is_multiple_of(16)
+        && (b_out.as_ptr() as usize).is_multiple_of(16);
     // Split-companion deferred fold (see `zc_defer_split_enabled`), once per pass.
     #[cfg(all(
         target_arch = "x86_64",
@@ -3774,133 +3839,180 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    let fast_plain = kernels::x86_64::fold2_plain_defer_wtab_route_ok(
-        split,
-        lo_size,
-        wtab_arg.is_some(),
-    );
+    let fast_plain =
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(split, lo_size, wtab_arg.is_some());
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
-            crate::rstrace::evd("zt:c0", x_hi as u32);
-            let mut la7 = [F128::ZERO; 18];
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        crate::rstrace::evd("zt:c0", x_hi as u32);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
+        let mut la7 = [F128::ZERO; 18];
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        )))]
+        let la7 = [F128::ZERO; 18];
+        let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            // SAFETY: chunk geometry supplies four inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let out = unsafe {
-                if casc && let Some(wt) = wtab_arg {
-                    let ap = a_in.as_ptr();
-                    let bp = b_in.as_ptr();
-                    let aop = a_out.as_mut_ptr();
-                    let bop = b_out.as_mut_ptr();
-                    let l7 = &mut la7;
-                    let _ = wt;
-                    let wt = wtab_casc.as_deref().unwrap();
-                    match (nt_out, in_lm) {
-                        (true, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<true, true, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
-                        (true, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<true, false, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
-                        (false, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<false, true, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
-                        (false, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<false, false, false, true>(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c),
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: chunk geometry supplies four inputs per output and two
+        // outputs per eq_lo value; features are guaranteed by the cfg.
+        let out = unsafe {
+            if casc && let Some(wt) = wtab_arg {
+                let ap = a_in.as_ptr();
+                let bp = b_in.as_ptr();
+                let aop = a_out.as_mut_ptr();
+                let bop = b_out.as_mut_ptr();
+                let l7 = &mut la7;
+                let _ = wt;
+                let wt = wtab_casc.as_deref().unwrap();
+                match (nt_out, in_lm) {
+                    (true, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<
+                            true,
+                            true,
+                            false,
+                            true,
+                        >(
+                            ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c
+                        )
                     }
-                } else if fast_plain && let Some(wt) = wtab_arg {
-                    let ap = a_in.as_ptr();
-                    let bp = b_in.as_ptr();
-                    let aop = a_out.as_mut_ptr();
-                    let bop = b_out.as_mut_ptr();
-                    match (nt_out, in_lm, out_lm) {
-                        (false, true, true) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                false,
-                                true,
-                                true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (false, false, true) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                false,
-                                false,
-                                true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (false, true, false) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                false,
-                                true,
-                                false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (false, false, false) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                false,
-                                false,
-                                false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (true, true, true) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                true,
-                                true,
-                                true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (true, false, true) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                true,
-                                false,
-                                true,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (true, true, false) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                true,
-                                true,
-                                false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
-                        (true, false, false) => {
-                            kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
-                                true,
-                                false,
-                                false,
-                            >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
-                        }
+                    (true, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<
+                            true,
+                            false,
+                            false,
+                            true,
+                        >(
+                            ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c
+                        )
                     }
-                } else {
-                    kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
-                        a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm,
-                        out_lm, split,
-                    )
+                    (false, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<
+                            false,
+                            true,
+                            false,
+                            true,
+                        >(
+                            ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c
+                        )
+                    }
+                    (false, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_casc_x86::<
+                            false,
+                            false,
+                            false,
+                            true,
+                        >(
+                            ap, bp, aop, bop, rho_a, rho_b, lo_size, wt, l7, kappa_c
+                        )
+                    }
                 }
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out =
-                fold2_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo);
+            } else if fast_plain && let Some(wt) = wtab_arg {
+                let ap = a_in.as_ptr();
+                let bp = b_in.as_ptr();
+                let aop = a_out.as_mut_ptr();
+                let bop = b_out.as_mut_ptr();
+                match (nt_out, in_lm, out_lm) {
+                    (false, true, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            false,
+                            true,
+                            true,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (false, false, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            false,
+                            false,
+                            true,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (false, true, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            false,
+                            true,
+                            false,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (false, false, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            false,
+                            false,
+                            false,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (true, true, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            true,
+                            true,
+                            true,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (true, false, true) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            true,
+                            false,
+                            true,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (true, true, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            true,
+                            true,
+                            false,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                    (true, false, false) => {
+                        kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<
+                            true,
+                            false,
+                            false,
+                        >(ap, bp, aop, bop, rho_a, rho_b, lo_size, wt)
+                    }
+                }
+            } else {
+                kernels::x86_64::fold2_and_message_lookahead_x86_avx512(
+                    a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo, wtab_arg, nt_out, in_lm, out_lm,
+                    split,
+                )
+            }
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let out = fold2_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo);
 
-            let eq_h = eq_hi[x_hi];
-            crate::rstrace::evd("zt:c1", x_hi as u32);
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-                if casc { la7.map(|v| eq_h * v) } else { la7 },
-            )
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::evd("zt:c1", x_hi as u32);
+        (
+            eq_h * out[0],
+            eq_h * out[1],
+            [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ],
+            if casc { la7.map(|v| eq_h * v) } else { la7 },
+        )
     };
     type Sums = (F128, F128, [F128; 6], [F128; 18]);
     let id = || -> Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
@@ -3915,28 +4027,31 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         }
         (s1 + c1, sinf + cinf, a, l)
     };
-    let (sum1_even, sum_inf_even, agg, la7_acc) =
-        if flat_tail(n) {
-            // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
-            // per-chunk results summed (XOR) on the caller.
-            flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
-        } else if team && crate::flat_par::team_ready() {
-            // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
-            team_chunks_aff(a, chunk_in, a_out, b_out, chunk_out, leaf, id, op)
-        } else {
-            a_out
-                .par_chunks_mut(chunk_out)
-                .zip(b_out.par_chunks_mut(chunk_out))
-                .enumerate()
-                .map(leaf)
-                .reduce(id, op)
-        };
+    let (sum1_even, sum_inf_even, agg, la7_acc) = if flat_tail(n) {
+        // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
+        // per-chunk results summed (XOR) on the caller.
+        flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+    } else if team && crate::flat_par::team_ready() {
+        // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
+        team_chunks_aff(a, chunk_in, a_out, b_out, chunk_out, leaf, id, op)
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(leaf)
+            .reduce(id, op)
+    };
 
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     let la7 = casc.then(|| {
-        assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
+        assert_ne!(
+            r_next[2],
+            F128::ZERO,
+            "deeper cascade needs a non-zero second weight"
+        );
         Round4Lookahead::from_flat(&la7_acc).scaled((r_next[1] * r_next[2]).inv())
     });
     (r_next[0] * sum1, sum_inf, la, la7)
@@ -3970,7 +4085,11 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 3);
     let r = r_next[1];
-    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+    assert_ne!(
+        r,
+        F128::ZERO,
+        "cascade lookahead requires a non-zero parity weight"
+    );
 
     let n_vars = r_next.len() - 1;
     let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
@@ -3996,57 +4115,69 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     let fast = (lo_size >= 16 && lo_size.is_multiple_of(16)).then(|| {
         let nt = kernels::x86_64::zc_tail_nt_enabled()
             && eighth >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
-            && (a_out.as_ptr() as usize) % 16 == 0
-            && (b_out.as_ptr() as usize) % 16 == 0;
+            && (a_out.as_ptr() as usize).is_multiple_of(16)
+            && (b_out.as_ptr() as usize).is_multiple_of(16);
         (build_w_pair_table(eq_lo), nt)
     });
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
-            crate::rstrace::evd("zt:c0", x_hi as u32);
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            #[cfg(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            ))]
-            let out = if let Some((wt, nt)) = fast.as_ref() {
-                let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
-                let (aop, bop) = (a_out.as_mut_ptr(), b_out.as_mut_ptr());
-                // SAFETY: the chunk holds eight inputs per output and two
-                // outputs per eq_lo entry; lo_size is a multiple of 16.
-                unsafe {
-                    match (*nt, out_lm) {
-                        (true, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, true>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (true, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, false>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (false, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, true>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (false, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, false>(ap, bp, aop, bop, rho, lo_size, wt),
-                    }
+        crate::rstrace::evd("zt:c0", x_hi as u32);
+        let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let out = if let Some((wt, nt)) = fast.as_ref() {
+            let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
+            let (aop, bop) = (a_out.as_mut_ptr(), b_out.as_mut_ptr());
+            // SAFETY: the chunk holds eight inputs per output and two
+            // outputs per eq_lo entry; lo_size is a multiple of 16.
+            unsafe {
+                match (*nt, out_lm) {
+                    (true, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<
+                        true,
+                        true,
+                    >(ap, bp, aop, bop, rho, lo_size, wt),
+                    (true, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<
+                        true,
+                        false,
+                    >(ap, bp, aop, bop, rho, lo_size, wt),
+                    (false, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<
+                        false,
+                        true,
+                    >(ap, bp, aop, bop, rho, lo_size, wt),
+                    (false, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<
+                        false,
+                        false,
+                    >(ap, bp, aop, bop, rho, lo_size, wt),
                 }
-            } else {
-                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm)
-            };
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
-            )))]
-            let out =
-                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm);
-            let eq_h = eq_hi[x_hi];
-            crate::rstrace::evd("zt:c1", x_hi as u32);
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-            )
+            }
+        } else {
+            fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm)
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let out =
+            fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm);
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::evd("zt:c1", x_hi as u32);
+        (
+            eq_h * out[0],
+            eq_h * out[1],
+            [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ],
+        )
     };
     type Sums3 = (F128, F128, [F128; 6]);
     let id = || -> Sums3 { (F128::ZERO, F128::ZERO, [F128::ZERO; 6]) };
@@ -4057,19 +4188,18 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
         }
         (s1 + c1, sinf + cinf, a)
     };
-    let (sum1_even, sum_inf_even, agg) =
-        if flat_tail(n) {
-            // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
-            // per-chunk results summed (XOR) on the caller.
-            flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
-        } else {
-            a_out
-                .par_chunks_mut(chunk_out)
-                .zip(b_out.par_chunks_mut(chunk_out))
-                .enumerate()
-                .map(leaf)
-                .reduce(id, op)
-        };
+    let (sum1_even, sum_inf_even, agg) = if flat_tail(n) {
+        // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
+        // per-chunk results summed (XOR) on the caller.
+        flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(leaf)
+            .reduce(id, op)
+    };
     let sum1 = kappa * sum1_even + agg[0];
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
@@ -4107,7 +4237,11 @@ pub(crate) fn fold3_oct_and_message_lookahead_scalar(
     let b_rm: Vec<F128> = (0..n_out).map(|o| fold8(b_in, o)).collect();
     for o in 0..n_out {
         // Lane-major tiles: tile element 4k + g holds group g's element k.
-        let dst = if out_lm { (o & !15) + 4 * (o % 4) + (o % 16) / 4 } else { o };
+        let dst = if out_lm {
+            (o & !15) + 4 * (o % 4) + (o % 16) / 4
+        } else {
+            o
+        };
         a_out[dst] = a_rm[o];
         b_out[dst] = b_rm[o];
     }
@@ -5627,9 +5761,7 @@ mod tests {
             (64, true),
             (128, true),
         ];
-        for (&(lo_size, canon), unroll16) in
-            shapes.iter().flat_map(|s| [(s, true), (s, false)])
-        {
+        for (&(lo_size, canon), unroll16) in shapes.iter().flat_map(|s| [(s, true), (s, false)]) {
             let _arm = kernels::x86_64::R2Unroll16Override::set(unroll16);
             let mut rng = Rng::new(0x5B00 + lo_size as u64 + u64::from(canon));
             let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
@@ -5651,8 +5783,7 @@ mod tests {
                         .copy_from_slice(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
                 }
             }
-            let bake =
-                build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
+            let bake = build_r2_eq_bake(&table, &eq_lo, &r_lo).expect("tensor eq_lo must factor");
             let mut a_s: [F128; 0] = [];
             let mut b_s: [F128; 0] = [];
             let out_s = round2_lookahead_chunk_scalar::<false>(
@@ -5780,13 +5911,27 @@ mod tests {
             let (d_g1, d_ginf, d_c) = round2_canonical_window_deltas(&table, &mlv, &rows);
             {
                 let mut want = rest4.expect("test route computes round four");
-                want.add(&three_var::round4_canonical_window_deltas(&table, &mlv, &rows));
-                assert_eq!(full4.expect("round four"), want, "r4 deltas blocks_log={blocks_log}");
+                want.add(&three_var::round4_canonical_window_deltas(
+                    &table, &mlv, &rows,
+                ));
+                assert_eq!(
+                    full4.expect("round four"),
+                    want,
+                    "r4 deltas blocks_log={blocks_log}"
+                );
             }
-            assert_eq!(full.0, rest.0 + mlv[0] * d_g1, "G(1) blocks_log={blocks_log}");
+            assert_eq!(
+                full.0,
+                rest.0 + mlv[0] * d_g1,
+                "G(1) blocks_log={blocks_log}"
+            );
             assert_eq!(full.1, rest.1 + d_ginf, "G(inf) blocks_log={blocks_log}");
             for i in 0..6 {
-                assert_eq!(full.2.c[i], rest.2.c[i] + d_c[i], "c[{i}] blocks_log={blocks_log}");
+                assert_eq!(
+                    full.2.c[i],
+                    rest.2.c[i] + d_c[i],
+                    "c[{i}] blocks_log={blocks_log}"
+                );
             }
         }
     }
@@ -5921,15 +6066,32 @@ mod tests {
                 let mut a_out = vec![F128::ZERO; n_out];
                 let mut b_out = vec![F128::ZERO; n_out];
                 let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
-                    &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho, &r_next5,
-                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None,
+                    &a,
+                    &b,
+                    m,
+                    K_SKIP,
+                    &table,
+                    &padding,
+                    &mut a_out,
+                    &mut b_out,
+                    rho,
+                    &r_next5,
+                    Some((&eq.lo[..], &eq.hi[..])),
+                    false,
+                    true,
+                    casc,
+                    None,
                 );
                 (msg, a_out, b_out)
             };
             let (inc, a_rm, b_rm) = run(false);
             let (got, a_oct, b_oct) = run(true);
             assert!(inc.3.is_none());
-            assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message {case}");
+            assert_eq!(
+                (inc.0, inc.1, inc.2),
+                (got.0, got.1, got.2),
+                "message {case}"
+            );
             for e in 0..n_out {
                 let pos = 32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8;
                 assert_eq!(a_oct[pos], a_rm[e], "a oct {case} e={e}");
@@ -5986,7 +6148,11 @@ mod tests {
                 &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true, false,
             );
             assert!(inc.3.is_none());
-            assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message log_n={log_n}");
+            assert_eq!(
+                (inc.0, inc.1, inc.2),
+                (got.0, got.1, got.2),
+                "message log_n={log_n}"
+            );
             for e in 0..n / 4 {
                 let pos = 32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8;
                 assert_eq!(a_oct[pos], a_rm[e], "a oct log_n={log_n} e={e}");
@@ -6036,7 +6202,9 @@ mod tests {
                 o
             };
             let fold1 = |v: &[F128]| -> Vec<F128> {
-                (0..v.len() / 2).map(|i| v[2 * i] + rho[0] * (v[2 * i] + v[2 * i + 1])).collect()
+                (0..v.len() / 2)
+                    .map(|i| v[2 * i] + rho[0] * (v[2 * i] + v[2 * i + 1]))
+                    .collect()
             };
             let (a1, b1) = (fold1(&a), fold1(&b));
             let mut a_ref = vec![F128::ZERO; n / 8];
@@ -6079,7 +6247,11 @@ mod tests {
         for (i, &(src, lane)) in sel.iter().enumerate() {
             let from = if src == 0 { a } else { b };
             let lane = lane as usize;
-            assert_eq!(got[2 * i..2 * i + 2], from[2 * lane..2 * lane + 2], "lane {i}");
+            assert_eq!(
+                got[2 * i..2 * i + 2],
+                from[2 * lane..2 * lane + 2],
+                "lane {i}"
+            );
         }
     }
 
@@ -6120,8 +6292,16 @@ mod tests {
             let mut a_ref = vec![F128::ZERO; n_out];
             let mut b_ref = vec![F128::ZERO; n_out];
             three_var::fold3_from_packed_lookahead_scalar(
-                &a, &b, &table, 0, &mut a_ref, &mut b_ref, rho,
-                &vec![F128::ONE; n_out / 2], mask, useful,
+                &a,
+                &b,
+                &table,
+                0,
+                &mut a_ref,
+                &mut b_ref,
+                rho,
+                &vec![F128::ONE; n_out / 2],
+                mask,
+                useful,
             );
 
             for out_lm in [false, true] {
@@ -6129,8 +6309,19 @@ mod tests {
                     let mut a_out = vec![F128::ZERO; n_out];
                     let mut b_out = vec![F128::ZERO; n_out];
                     let msg = three_var::fold3_from_packed_and_round_pair_lookahead_into_with_eq(
-                        &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho,
-                        &r_next5, Some((&eq.lo[..], &eq.hi[..])), out_lm, b_canonical,
+                        &a,
+                        &b,
+                        m,
+                        K_SKIP,
+                        &table,
+                        &padding,
+                        &mut a_out,
+                        &mut b_out,
+                        rho,
+                        &r_next5,
+                        Some((&eq.lo[..], &eq.hi[..])),
+                        out_lm,
+                        b_canonical,
                     );
                     (msg, a_out, b_out)
                 };
@@ -6379,7 +6570,10 @@ mod tests {
             let mut rng = Rng::new(0x1A00 + log_n as u64);
             let n = 1usize << log_n;
             assert!(plain_cascade_lo_size(n).is_multiple_of(8), "log_n={log_n}");
-            assert!(plain_cascade_lo_size(n / 4).is_multiple_of(8), "log_n={log_n}");
+            assert!(
+                plain_cascade_lo_size(n / 4).is_multiple_of(8),
+                "log_n={log_n}"
+            );
             let a = rng.f128_vec(n);
             let b = rng.f128_vec(n);
             let (rho_a, rho_b, rho_c, rho_d) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
@@ -6395,8 +6589,9 @@ mod tests {
 
             let mut a1 = vec![F128::ZERO; n / 4];
             let mut b1 = vec![F128::ZERO; n / 4];
-            let (m1, mi1, la1) =
-                fold2_plain_and_round_pair_lookahead_into(&a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1);
+            let (m1, mi1, la1) = fold2_plain_and_round_pair_lookahead_into(
+                &a, &b, &mut a1, &mut b1, rho_a, rho_b, &r1,
+            );
             let mut a1l = vec![F128::ZERO; n / 4];
             let mut b1l = vec![F128::ZERO; n / 4];
             let (m1l, mi1l, la1l) = fold2_plain_and_round_pair_lookahead_into_lm(
@@ -6427,7 +6622,11 @@ mod tests {
                 } else {
                     (a2.clone(), b2.clone())
                 };
-                assert_eq!((m2, mi2), (m2l, mi2l), "reader msg log_n={log_n} out_lm={out_lm}");
+                assert_eq!(
+                    (m2, mi2),
+                    (m2l, mi2l),
+                    "reader msg log_n={log_n} out_lm={out_lm}"
+                );
                 assert_eq!(a_want, a2l, "reader a log_n={log_n} out_lm={out_lm}");
                 assert_eq!(b_want, b2l, "reader b log_n={log_n} out_lm={out_lm}");
                 assert_eq!(
@@ -6894,7 +7093,6 @@ mod tests {
         assert_eq!(plain_b_shared, plain_b_incumbent, "plain b output");
         assert_eq!(plain_shared, plain_incumbent, "plain message/lookahead");
     }
-
 
     /// Pins the active NT/lane-major route and 64-byte output alignment.
     #[cfg(all(
@@ -8027,7 +8225,7 @@ mod tests {
         for t in 0..16 {
             let mut want_t = F128::ZERO;
             for (a, c) in coeffs.iter().enumerate() {
-                want_t = want_t + *c * want[4 * t + a];
+                want_t += *c * want[4 * t + a];
             }
             assert_eq!(c4[t], want_t, "composed rounds-3+4 fold, group {t}");
             assert_eq!(c4b[t], want_t, "composed broadcast fold, group {t}");

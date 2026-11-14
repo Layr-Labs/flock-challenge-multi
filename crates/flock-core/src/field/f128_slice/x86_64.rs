@@ -101,6 +101,7 @@ pub(super) unsafe fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
 /// slices contain every pair selected by `base` and `dst.len()`.
 #[inline]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
+#[cfg(test)]
 pub(super) unsafe fn fold_pairs_with_scaled_addend(
     src: &[F128],
     addend: &[F128],

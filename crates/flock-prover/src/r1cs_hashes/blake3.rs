@@ -1438,7 +1438,7 @@ impl flock_core::lincheck::LincheckCircuit for Blake3AdjointPlan {
             target_feature = "vpclmulqdq"
         ))]
         unsafe {
-            return self.fold_alpha_batched_x86(alpha, eq_inner);
+            self.fold_alpha_batched_x86(alpha, eq_inner)
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -2214,7 +2214,9 @@ pub(crate) struct WitnessWithCommitment {
 }
 
 impl WitnessWithCommitment {
-    pub(crate) fn into_parts(self) -> (Vec<F128>, Option<(Commitment, flock_core::pcs::ProverData)>) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Vec<F128>, Option<(Commitment, flock_core::pcs::ProverData)>) {
         (self.z, self.committed)
     }
 }
@@ -2227,11 +2229,23 @@ struct WitnessCommitContext<'a> {
 }
 
 impl WitnessCommitContext<'_> {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     fn ranked_resident(&self) -> bool {
         self.params.log_msg_len() == 25
             && self.params.num_ntts() == 64
             && self.params.k_code() == 20
-            && self.codeword.as_ref().is_some_and(|buf| buf.len() == 1 << 26)
+            && self
+                .codeword
+                .as_ref()
+                .is_some_and(|buf| buf.len() == 1 << 26)
     }
 }
 
@@ -2243,18 +2257,30 @@ fn generate_witness_and_commit_from(
     resident_codeword: Option<Vec<F128>>,
 ) -> (
     Option<Vec<F128>>,
-    (WitnessWithCommitment, Vec<F128>, Vec<F128>, flock_core::zerocheck::univariate_skip_optimized::Round1AbInner),
+    (
+        WitnessWithCommitment,
+        Vec<F128>,
+        Vec<F128>,
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    ),
 ) {
     let mut context = WitnessCommitContext {
-        params, odd_tail, codeword: resident_codeword, committed: None,
+        params,
+        odd_tail,
+        codeword: resident_codeword,
+        committed: None,
     };
-    let (z, a, b, ab_inner) = generate_witness_with_optional_commit_from(
-        blocks, n_blocks_log, Some(&mut context),
-    );
+    debug_assert_eq!(context.params.m, K_LOG + n_blocks_log);
+    debug_assert!(context.odd_tail < context.params.num_ntts());
+    let (z, a, b, ab_inner) =
+        generate_witness_with_optional_commit_from(blocks, n_blocks_log, Some(&mut context));
     // Both the producer and every codeword/Merkle reader have joined before
     // the generator returns. A panic cannot construct or return this bundle.
     assert!(context.committed.is_none() || context.codeword.is_none());
-    let witness = WitnessWithCommitment { z, committed: context.committed };
+    let witness = WitnessWithCommitment {
+        z,
+        committed: context.committed,
+    };
     (context.codeword, (witness, a, b, ab_inner))
 }
 
@@ -2328,8 +2354,12 @@ fn generate_witness_with_optional_commit_from(
         && super::common::u64_per_block_is_nt_compatible(K / 64)
         && !flock_core::sl2_env_set!("FLOCK_NO_WITNESS_NT");
     generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
-        blocks, n_blocks_log, use_nt, live_witgen_simd_enabled(),
-        witgen_simd::witgen_ab_nt_enabled(), commit_ctx,
+        blocks,
+        n_blocks_log,
+        use_nt,
+        live_witgen_simd_enabled(),
+        witgen_simd::witgen_ab_nt_enabled(),
+        commit_ctx,
     )
 }
 
@@ -2351,6 +2381,7 @@ fn live_witgen_simd_enabled() -> bool {
 /// Backend for [`generate_witness_with_ab_packed_and_round1_inner`] with an
 /// explicit staged-NT toggle so tests can assert byte equality of the paths.
 /// SIMD dispatch follows [`live_witgen_simd_enabled`].
+#[cfg(test)]
 fn generate_witness_with_ab_packed_and_round1_inner_impl(
     blocks: crate::seed_pipe::BlockSource<'_>,
     n_blocks_log: usize,
@@ -2372,6 +2403,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl(
 /// Same as [`generate_witness_with_ab_packed_and_round1_inner_impl`] with an
 /// explicit SIMD toggle so tests can A/B the octa kernel vs the scalar
 /// 1-block loop without fighting the process-wide env LazyLock.
+#[cfg(test)]
 fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
     blocks: crate::seed_pipe::BlockSource<'_>,
     n_blocks_log: usize,
@@ -2396,6 +2428,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_ex(
 /// the fused a/b-NT drain (`ab_nt`) also spelled out, so tests can A/B the
 /// fused octa path against its `FLOCK_NO_WITGEN_AB_NT=1` restore in one
 /// process. Only the octa arm reads `ab_nt`.
+#[cfg(test)]
 fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     blocks: crate::seed_pipe::BlockSource<'_>,
     n_blocks_log: usize,
@@ -2409,7 +2442,12 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_tuned(
     flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
     generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
-        blocks, n_blocks_log, use_nt, use_simd, ab_nt, None,
+        blocks,
+        n_blocks_log,
+        use_nt,
+        use_simd,
+        ab_nt,
+        None,
     )
 }
 
@@ -2556,7 +2594,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
             &mut a,
             &mut b,
             &mut ab_inner,
-            &inv_table,
+            inv_table,
             &padding,
             [z_tok && elide_on, a_tok && ab_elide, b_tok && ab_elide],
             ab_nt,
@@ -2639,7 +2677,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
                             a_bytes,
                             b_bytes,
                             ab_stage_bytes,
-                            &inv_table,
+                            inv_table,
                             // Staging vec, re-read L1-hot by nt_copy_u64s
                             // below: temporal.
                             false,
@@ -2697,7 +2735,7 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
                         std::slice::from_raw_parts(b_out.as_ptr().cast::<u8>(), BYTES_PER_BLOCK)
                     };
                     flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
-                        a_bytes, b_bytes, ab_out, &inv_table, false,
+                        a_bytes, b_bytes, ab_out, inv_table, false,
                     );
                 }
               });
@@ -2722,12 +2760,34 @@ fn generate_witness_with_ab_packed_and_round1_inner_impl_with_commit(
 }
 
 /// Octas (`kpair` values) in one ranked witness group.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )
+))]
 const OCTAS_PER_GROUP: usize = 32;
 
 /// Next unclaimed octa of one ranked group. Neighbouring groups are produced
 /// by different cores at the same time, so each counter has its own line.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )
+))]
 #[derive(Default)]
 #[repr(align(64))]
 struct OctaClaim(std::sync::atomic::AtomicUsize);
@@ -2741,17 +2801,47 @@ struct OctaClaim(std::sync::atomic::AtomicUsize);
 /// both calls stay busy until the group is complete. An octa is self-contained
 /// (own rows of both staging slots, per-call scratch), so the bytes produced
 /// do not depend on which call runs it.
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )
+))]
 enum OctaOrder<'a> {
     Parity(usize),
     Shared(&'a OctaClaim),
     /// Lane gl2: a process-lifetime claim counter tagged with this prove's
     /// epoch in its high half; a counter still carrying an older epoch
     /// counts as 0, so nothing has to be reset between proves.
+    #[cfg(all(
+        target_os = "linux",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     Epoch(&'a OctaClaim, usize),
 }
 
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )
+))]
 impl Iterator for OctaOrder<'_> {
     type Item = usize;
 
@@ -2766,14 +2856,30 @@ impl Iterator for OctaOrder<'_> {
             // Atomicity alone gives each value to one caller. The octa's
             // writes reach the fold through the encoder's existing join.
             Self::Shared(claim) => claim.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            #[cfg(all(
+                target_os = "linux",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi",
+                target_feature = "gfni",
+                target_feature = "vpclmulqdq"
+            ))]
             Self::Epoch(claim, epoch) => loop {
                 use std::sync::atomic::Ordering::Relaxed;
                 let v = claim.0.load(Relaxed);
-                let n = if v >> 32 == *epoch { v & 0xffff_ffff } else { 0 };
+                let n = if v >> 32 == *epoch {
+                    v & 0xffff_ffff
+                } else {
+                    0
+                };
                 if n >= OCTAS_PER_GROUP {
                     break n;
                 }
-                if claim.0.compare_exchange_weak(v, (*epoch << 32) | (n + 1), Relaxed, Relaxed).is_ok() {
+                if claim
+                    .0
+                    .compare_exchange_weak(v, (*epoch << 32) | (n + 1), Relaxed, Relaxed)
+                    .is_ok()
+                {
                     break n;
                 }
             },
@@ -2785,7 +2891,15 @@ impl Iterator for OctaOrder<'_> {
 /// Lane gl2: `FLOCK_NO_GL2_OCTA_EPOCH=1` builds the per-prove claim vector
 /// (1024 padded counters, 5-14 us on the serial prove entry) as before;
 /// default: one process-lifetime vector with epoch-tagged counters. Read once.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 fn gl2_octa_epoch_claims(groups: usize) -> Option<(&'static [OctaClaim], usize)> {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL2_OCTA_EPOCH").is_none());
@@ -2801,7 +2915,15 @@ fn gl2_octa_epoch_claims(groups: usize) -> Option<(&'static [OctaClaim], usize)>
 
 /// `FLOCK_NO_WITNESS_OCTA_CLAIM=1` restores the fixed parity split in the
 /// same binary. Read once per process.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 fn witness_octa_claim_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITNESS_OCTA_CLAIM").is_none());
@@ -2822,17 +2944,25 @@ struct AbWinLine([u64; 8]);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RankedClosedDispatch {
     Auto,
+    #[cfg(test)]
     ForceGeneric,
+    #[cfg(test)]
     ForceExact,
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-struct SharedRankedClosedWindowPreps(&'static blake3_witgen8::RankedClosedWindowPreps, Option<Box<blake3_witgen8::RankedClosedWindowPreps>>);
+enum SharedRankedClosedWindowPreps {
+    Shared(&'static blake3_witgen8::RankedClosedWindowPreps),
+    Owned(Box<blake3_witgen8::RankedClosedWindowPreps>),
+}
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl SharedRankedClosedWindowPreps {
     fn get(&self) -> &blake3_witgen8::RankedClosedWindowPreps {
-        match &self.1 { Some(b) => b, None => self.0 }
+        match self {
+            Self::Owned(preps) => preps,
+            Self::Shared(preps) => preps,
+        }
     }
 
     /// Lane sl2 (`FLOCK_NO_SL2_PREPS`): the preps are a pure function of the
@@ -2846,24 +2976,28 @@ impl SharedRankedClosedWindowPreps {
     ) -> Self {
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_PREPS").is_none());
-        static CACHE: std::sync::Mutex<Vec<(usize, bool, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        static CACHE: std::sync::Mutex<Vec<(usize, bool, usize, usize)>> =
+            std::sync::Mutex::new(Vec::new());
         let shared = core::ptr::eq(inv_table, flock_core::zerocheck::shared_urm_inv_table());
         if !*ON || !shared {
-            let b = Box::new(blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, plan));
-            // SAFETY: the 'static slot is never read when the owned box is set.
-            let r: &'static blake3_witgen8::RankedClosedWindowPreps = unsafe { &*(&*b as *const _) };
-            return Self(r, Some(b));
+            let b = Box::new(blake3_witgen8::prepare_ranked_closed_window_preps(
+                inv_table, plan,
+            ));
+            return Self::Owned(b);
         }
         let key = (inv_table as *const _ as usize, align_class.0, align_class.1);
         let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(_, _, _, addr)) = c.iter().find(|e| (e.0, e.1, e.2) == key) {
             // SAFETY: leaked below, never freed.
-            return Self(unsafe { &*(addr as *const blake3_witgen8::RankedClosedWindowPreps) }, None);
+            return Self::Shared(unsafe {
+                &*(addr as *const blake3_witgen8::RankedClosedWindowPreps)
+            });
         }
-        let r: &'static blake3_witgen8::RankedClosedWindowPreps =
-            Box::leak(Box::new(blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, plan)));
+        let r: &'static blake3_witgen8::RankedClosedWindowPreps = Box::leak(Box::new(
+            blake3_witgen8::prepare_ranked_closed_window_preps(inv_table, plan),
+        ));
         c.push((key.0, key.1, key.2, r as *const _ as usize));
-        Self(r, None)
+        Self::Shared(r)
     }
 }
 
@@ -2895,6 +3029,7 @@ unsafe impl Sync for SharedRankedClosedWindowPreps {}
 /// sees the same bytes either way.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn generate_round1_inner_octa(
     blocks: crate::seed_pipe::BlockSource<'_>,
     skip_blocks: usize,
@@ -2924,6 +3059,7 @@ fn generate_round1_inner_octa(
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     blocks: crate::seed_pipe::BlockSource<'_>,
     skip_blocks: usize,
@@ -2938,8 +3074,18 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch(
     ranked_closed_dispatch: RankedClosedDispatch,
 ) {
     generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
-        blocks, skip_blocks, z, a, b, ab_inner, inv_table, padding,
-        elide, ab_nt, ranked_closed_dispatch, None,
+        blocks,
+        skip_blocks,
+        z,
+        a,
+        b,
+        ab_inner,
+        inv_table,
+        padding,
+        elide,
+        ab_nt,
+        ranked_closed_dispatch,
+        None,
     )
 }
 
@@ -2959,6 +3105,16 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     ranked_closed_dispatch: RankedClosedDispatch,
     commit_ctx: Option<&mut WitnessCommitContext<'_>>,
 ) {
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    )))]
+    let _ = commit_ctx;
     use rayon::prelude::*;
     const F128_PER_BLOCK: usize = K / 128;
     const BYTES_PER_BLOCK: usize = K / 8;
@@ -2987,6 +3143,39 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     flock_core::rstrace::evd("oc:plan", 0);
     // Streaming form of the fused projection: no whole-block window buffer.
     let ab_stream = ab_nt && witgen_simd::witgen_ab_winstream_enabled();
+    if !ab_stream {
+        // The rolling octa kernel requires a StreamProj. Its older full-window
+        // and temporal callers have no stage, so regenerate complete blocks
+        // before projecting instead of constructing a projection from None.
+        assert!(!compact);
+        z.par_chunks_mut(F128_PER_BLOCK)
+            .zip(a.par_chunks_mut(F128_PER_BLOCK))
+            .zip(b.par_chunks_mut(F128_PER_BLOCK))
+            .zip(ab_inner.as_bytes_mut().par_chunks_mut(BYTES_PER_BLOCK))
+            .enumerate()
+            .for_each(|(block_idx, (((z_out, a_out), b_out), ab_out))| {
+                blocks.with_block(block_idx, padding, |(cv, msg, counter, len, flags)| {
+                    // SAFETY: each task owns one complete block in each output.
+                    // The packed writer initializes every word before projection.
+                    unsafe {
+                        build_block_witness_ab_packed_into(
+                            cv, msg, *counter, *len, *flags,
+                            std::slice::from_raw_parts_mut(z_out.as_mut_ptr().cast(), K / 64),
+                            std::slice::from_raw_parts_mut(a_out.as_mut_ptr().cast(), K / 64),
+                            std::slice::from_raw_parts_mut(b_out.as_mut_ptr().cast(), K / 64),
+                        );
+                        if block_idx >= skip_blocks {
+                            flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_windows(
+                                std::slice::from_raw_parts(a_out.as_ptr().cast(), BYTES_PER_BLOCK),
+                                std::slice::from_raw_parts(b_out.as_ptr().cast(), BYTES_PER_BLOCK),
+                                ab_out, inv_table, false,
+                            );
+                        }
+                    }
+                });
+            });
+        return;
+    }
     let one_rows_elided = ab_stream
         && skip_blocks == 0
         && z.len() / F128_PER_BLOCK == 1 << 18
@@ -3017,6 +3206,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
     // reads the L1 window buffers instead of the 512 MiB buffers themselves.
     // Contract: one sfence per rayon task, below, before the task's release.
     let z_nt = witgen_simd::witgen_z_nt_enabled();
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
     let ab1_hole = flock_core::zerocheck::univariate_skip_optimized::ab1_hole_layout_enabled();
     let ab_inner_bytes = ab_inner.as_bytes_mut();
     // Exact ranked-closed specialisation: only the crown worker's committed
@@ -3038,16 +3234,21 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         && flock_core::zerocheck::univariate_skip_optimized::ranked_ab_compact_enabled();
     let sl2_align = (abinner_nt, ab_inner_bytes.as_ptr() as usize % 64);
     let ranked_closed_preps = match ranked_closed_dispatch {
-        RankedClosedDispatch::Auto if ranked_closed_exact_eligible => {
-            Some(SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align))
-        }
-        RankedClosedDispatch::Auto | RankedClosedDispatch::ForceGeneric => None,
+        RankedClosedDispatch::Auto if ranked_closed_exact_eligible => Some(
+            SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align),
+        ),
+        RankedClosedDispatch::Auto => None,
+        #[cfg(test)]
+        RankedClosedDispatch::ForceGeneric => None,
+        #[cfg(test)]
         RankedClosedDispatch::ForceExact => {
             assert!(
                 ranked_closed_exact_eligible,
                 "ranked closed exact dispatch requires the committed compact closed-form stream path"
             );
-            Some(SharedRankedClosedWindowPreps::new(inv_table, win_plan, sl2_align))
+            Some(SharedRankedClosedWindowPreps::new(
+                inv_table, win_plan, sl2_align,
+            ))
         }
     };
     flock_core::rstrace::evd("oc:preps", 0);
@@ -3077,26 +3278,45 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         let root_offset = root_storage.as_ptr().align_offset(64);
         assert!(root_offset <= 3);
         flock_core::rstrace::evd("oc:root", 0);
-        let root_enabled = linear_fold_enabled()
-            && !flock_core::sl2_env_set!("FLOCK_NO_WITGEN_ROOT_CACHE");
+        let root_enabled =
+            linear_fold_enabled() && !flock_core::sl2_env_set!("FLOCK_NO_WITGEN_ROOT_CACHE");
         static ROOT_PLAN: std::sync::LazyLock<Option<blake3_witgen8::root_emit::RootEmitPlan>> =
             std::sync::LazyLock::new(|| {
-                let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                let plan = BLAKE3_ADJOINT_PLAN
+                    .linear_fold
+                    .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
                 blake3_witgen8::root_emit::RootEmitPlan::new(&plan.roots)
             });
         let root_plan = &*ROOT_PLAN;
-        #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
+        #[cfg(all(
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512dq"
+        ))]
         let root_generator = blake3_witgen8::root_recompute::selected_generator()
             .filter(|_| root_enabled && root_plan.is_some());
-        #[cfg(not(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq")))]
-        let root_generator: Option<(unsafe fn(u64, usize, *mut u8), Option<flock_core::lincheck::RootPairGenerator>)> = None;
+        #[cfg(not(all(
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi2",
+            target_feature = "avx512dq"
+        )))]
+        let root_generator: Option<(
+            unsafe fn(u64, usize, *mut u8),
+            Option<flock_core::lincheck::RootPairGenerator>,
+        )> = None;
         // z elision: octas seeded from their compact copy skip z's global
         // stores; the prover regenerates z exactly from the root tiles.
-        let elide_z = root_enabled
-            && root_plan.is_some()
-            && blake3_zregen::z_elide_enabled();
+        let elide_z = root_enabled && root_plan.is_some() && blake3_zregen::z_elide_enabled();
         let elided_octas = std::sync::atomic::AtomicUsize::new(0);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        ))]
         let pipelined = if let Some(context) = commit_ctx
             && context.ranked_resident()
         {
@@ -3114,25 +3334,42 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let ab1_hole = ab1_hole && ab_block_bytes == 29 * 64;
             let root_addr = unsafe { root_storage.as_mut_ptr().add(root_offset) } as usize;
             static TILE_COLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            let tile_cols = || std::env::var("FLOCK_WITNESS_SEED_TILE_COLS").ok().and_then(|v|v.parse::<usize>().ok()).filter(|n|matches!(n,8|16|32|64)).unwrap_or(16);
-            let window_tile_cols = if flock_core::sl2_env_live() { tile_cols() } else { *TILE_COLS.get_or_init(tile_cols) };
-            let merge_prefix=flock_core::sl2_env_set!("FLOCK_WITNESS_SEED_MERGE_PREFIX");
-            let window_tile_enabled=!flock_core::sl2_env_set!("FLOCK_NO_WITNESS_SEED_TILE");
-            let window_seed_enabled=window_tile_enabled&&root_generator.is_some()&&blake3_witgen8::window_seed_projection_eligible(preps.get());
+            let tile_cols = || {
+                std::env::var("FLOCK_WITNESS_SEED_TILE_COLS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| matches!(n, 8 | 16 | 32 | 64))
+                    .unwrap_or(16)
+            };
+            let window_tile_cols = if flock_core::sl2_env_live() {
+                tile_cols()
+            } else {
+                *TILE_COLS.get_or_init(tile_cols)
+            };
+            let merge_prefix = flock_core::sl2_env_set!("FLOCK_WITNESS_SEED_MERGE_PREFIX");
+            let window_tile_enabled = !flock_core::sl2_env_set!("FLOCK_NO_WITNESS_SEED_TILE");
+            let window_seed_enabled = window_tile_enabled
+                && root_generator.is_some()
+                && blake3_witgen8::window_seed_projection_eligible(preps.get());
             flock_core::rstrace::evd("oc:gen", 0);
             let groups_n = z.len() / F128_PER_BLOCK / (SIMD * OCTAS_PER_GROUP);
             let epoch_claims = witness_octa_claim_enabled()
                 .then(|| gl2_octa_epoch_claims(groups_n))
                 .flatten();
-            let octa_claims: Option<Vec<OctaClaim>> =
-                (witness_octa_claim_enabled() && epoch_claims.is_none()).then(|| {
-                    (0..groups_n).map(|_| OctaClaim::default()).collect()
-                });
+            let octa_claims: Option<Vec<OctaClaim>> = (witness_octa_claim_enabled()
+                && epoch_claims.is_none())
+            .then(|| (0..groups_n).map(|_| OctaClaim::default()).collect());
             flock_core::rstrace::evd("oc:claims", 0);
-            let produce = |z_base: *mut F128, group: usize, role: usize,
-                           target: Option<&flock_core::ntt::additive_ntt_f128::WitnessSeedTarget>| {
-                let windows=target.filter(|_|window_seed_enabled&&elide_z).map(|t|t.prepare_windows());
-                let compact_tile=window_tile_enabled&&windows.is_some();
+            let produce = |z_base: *mut F128,
+                           group: usize,
+                           role: usize,
+                           target: Option<
+                &flock_core::ntt::additive_ntt_f128::WitnessSeedTarget,
+            >| {
+                let windows = target
+                    .filter(|_| window_seed_enabled && elide_z)
+                    .map(|t| t.prepare_windows());
+                let compact_tile = window_tile_enabled && windows.is_some();
                 // The window route uses only the first 8*window_tile_cols
                 // fields as a rolling tile. Every read follows publication of
                 // its complete range; the final padding is synthesized by the
@@ -3140,17 +3377,33 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // octa and seeds it once before these bytes can be reused.
                 #[repr(align(64))]
                 struct OctaInput([F128; 8 * F128_PER_BLOCK]);
-                let mut input=core::mem::MaybeUninit::<OctaInput>::uninit();
-                let input_base=input.as_mut_ptr().cast::<F128>();
-                let mut saved_prefix=core::mem::MaybeUninit::<[F128;32]>::uninit();let prefix_base=saved_prefix.as_mut_ptr().cast::<F128>();
-                unsafe{input_base.write_bytes(0,if compact_tile{8*window_tile_cols}else{8*F128_PER_BLOCK});}
+                let mut input = core::mem::MaybeUninit::<OctaInput>::uninit();
+                let input_base =
+                    unsafe { core::ptr::addr_of_mut!((*input.as_mut_ptr()).0).cast::<F128>() };
+                let mut saved_prefix = core::mem::MaybeUninit::<[F128; 32]>::uninit();
+                let prefix_base = saved_prefix.as_mut_ptr().cast::<F128>();
+                unsafe {
+                    input_base.write_bytes(
+                        0,
+                        if compact_tile {
+                            8 * window_tile_cols
+                        } else {
+                            8 * F128_PER_BLOCK
+                        },
+                    );
+                }
                 // The const-window rollback uses StreamProj's scratch even
                 // in the exact path. Each callback owns this aligned 1 KiB
                 // buffer until all its octas return; drains initialize every
                 // word before reading it, so no zero fill is required.
                 let mut stage = core::mem::MaybeUninit::<[AbWinLine; STAGE_LINES]>::uninit();
                 // sb1: per-producer deferred ab_inner window (flushed after every octa).
-                let ab_pend_on = cfg!(all(target_feature="avx512f",target_feature="avx512bw",target_feature="avx512vbmi",target_feature="gfni")) && *blake3_witgen8::SB1_DEFER_ON;
+                let ab_pend_on = cfg!(all(
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vbmi",
+                    target_feature = "gfni"
+                )) && *blake3_witgen8::SB1_DEFER_ON;
                 let mut ab_pend = core::mem::MaybeUninit::new(blake3_witgen8::AbPend::new());
                 // Group g owns r=2g and r=2g+1 across every q/k input.
                 // Each octa spans four quarters and adjacent k values. Root
@@ -3177,48 +3430,102 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                     // offsets. Constants may be retained only because the
                     // enclosing exact branch verified all three scratch tags.
                     unsafe {
-                        let seed_context=windows.as_ref().map(|window|blake3_witgen8::SeedWindowContext{window,input:input_base,prefix:prefix_base,kpair,merge_prefix});
-                        let proj = blake3_witgen8::StreamProj { compact_z_tile_words: if compact_tile{window_tile_cols*4}else{0}, seed_window: seed_context.as_ref(),
+                        let seed_context =
+                            windows
+                                .as_ref()
+                                .map(|window| blake3_witgen8::SeedWindowContext {
+                                    window,
+                                    input: input_base,
+                                    prefix: prefix_base,
+                                    kpair,
+                                    merge_prefix,
+                                });
+                        let proj = blake3_witgen8::StreamProj {
+                            compact_z_tile_words: if compact_tile {
+                                window_tile_cols * 4
+                            } else {
+                                0
+                            },
+                            seed_window: seed_context.as_ref(),
                             cross_quarter: true,
-                            compact_z: if target.is_some() { input_base.cast::<u32>() } else { core::ptr::null_mut() },
+                            compact_z: if target.is_some() {
+                                input_base.cast::<u32>()
+                            } else {
+                                core::ptr::null_mut()
+                            },
                             elide_z: elide_z && target.is_some(),
                             stage: stage.as_mut_ptr().cast::<u32>(),
                             out: (ab_addr as *mut u8).add(if ab1_hole {
-                                flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(base)
+                                flock_core::zerocheck::univariate_skip_optimized::ab1_row_offset(
+                                    base,
+                                )
                             } else {
                                 base * ab_block_bytes
                             }),
                             out_stride: ab_block_bytes,
                             out_bias: 2 * 64,
-                            ab_pend: if ab_pend_on { ab_pend.as_mut_ptr() } else { core::ptr::null_mut() },
+                            ab_pend: if ab_pend_on {
+                                ab_pend.as_mut_ptr()
+                            } else {
+                                core::ptr::null_mut()
+                            },
                             inv_table,
                             plan: win_plan,
                             one_rows_elided: true,
                             w30_elided: true,
                         };
                         if compact_tile {
-                            macro_rules! emit_window {($cols:literal)=>{blake3_witgen8::build_octa_witness_ab_stream_ranked_window::<$cols>(init,base,z_base.add(field_offset).cast::<u32>(),(a_addr as *mut F128).add(field_offset).cast::<u32>(),(b_addr as *mut F128).add(field_offset).cast::<u32>(),proj,preps.get())};}
-                            match window_tile_cols {8=>emit_window!(8),16=>emit_window!(16),32=>emit_window!(32),_=>emit_window!(64)}
-                        }else{
-                        blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
-                            init,
-                            base,
-                            z_base.add(field_offset).cast::<u32>(),
-                            (a_addr as *mut F128).add(field_offset).cast::<u32>(),
-                            (b_addr as *mut F128).add(field_offset).cast::<u32>(),
-                            proj,
-                            preps.get(),
-                            [true; 3],
-                            if root_enabled && root_generator.is_none() {
-                                root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
-                                    plan, (root_addr as *mut u8).add(root_byte_offset)))
-                            } else { None },
-                        false,
-                        );
+                            macro_rules! emit_window {
+                                ($cols:literal) => {
+                                    blake3_witgen8::build_octa_witness_ab_stream_ranked_window::<
+                                        $cols,
+                                    >(
+                                        init,
+                                        base,
+                                        z_base.add(field_offset).cast::<u32>(),
+                                        (a_addr as *mut F128).add(field_offset).cast::<u32>(),
+                                        (b_addr as *mut F128).add(field_offset).cast::<u32>(),
+                                        proj,
+                                        preps.get(),
+                                    )
+                                };
+                            }
+                            match window_tile_cols {
+                                8 => emit_window!(8),
+                                16 => emit_window!(16),
+                                32 => emit_window!(32),
+                                _ => emit_window!(64),
+                            }
+                        } else {
+                            blake3_witgen8::build_octa_witness_ab_stream_ranked_closed(
+                                init,
+                                base,
+                                z_base.add(field_offset).cast::<u32>(),
+                                (a_addr as *mut F128).add(field_offset).cast::<u32>(),
+                                (b_addr as *mut F128).add(field_offset).cast::<u32>(),
+                                proj,
+                                preps.get(),
+                                [true; 3],
+                                if root_enabled && root_generator.is_none() {
+                                    root_plan.as_ref().map(|plan| {
+                                        blake3_witgen8::root_emit::RootOctaWriter::new(
+                                            plan,
+                                            (root_addr as *mut u8).add(root_byte_offset),
+                                        )
+                                    })
+                                } else {
+                                    None
+                                },
+                                false,
+                            );
                         }
                         #[cfg(target_feature = "avx512f")]
-                        if ab_pend_on { blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr()); }
-                        if windows.is_none() && let Some(target) = target {
+                        if ab_pend_on {
+                            blake3_witgen8::flush_ab_pend(ab_pend.as_mut_ptr());
+                        }
+                        if windows.is_none()
+                            && let Some(target) = target
+                        {
                             target.seed_octa(input_base, kpair);
                         }
                     }
@@ -3233,7 +3540,8 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // their global-output fences before folding either r task.
             };
             let _zero_lane_skip = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
-                context.params.num_ntts(), context.odd_tail,
+                context.params.num_ntts(),
+                context.odd_tail,
             );
             let codeword = context.codeword.take().unwrap();
             flock_core::rstrace::evd("oc:commit", 0);
@@ -3242,14 +3550,27 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             // output allocations stay exclusively held here until every
             // producer, NTT role and Merkle callback has joined.
             let committed = unsafe {
-                flock_core::pcs::commit::commit_generated_into(z, context.params, codeword, &produce)
+                flock_core::pcs::commit::commit_generated_into(
+                    z,
+                    context.params,
+                    codeword,
+                    &produce,
+                )
             };
             context.committed = Some(committed);
             true
         } else {
             false
         };
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni",
+            target_feature = "vpclmulqdq"
+        )))]
         let pipelined = false;
 
         if !pipelined {
@@ -3257,7 +3578,10 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 .zip(a.par_chunks_mut(group_f128))
                 .zip(b.par_chunks_mut(group_f128))
                 .zip(ab_inner_bytes.par_chunks_mut(group_bytes))
-                .zip(root_storage[root_offset..root_offset + root_fields].par_chunks_mut(ROOT_FIELDS_PER_TILE))
+                .zip(
+                    root_storage[root_offset..root_offset + root_fields]
+                        .par_chunks_mut(ROOT_FIELDS_PER_TILE),
+                )
                 .enumerate()
                 .for_each(|(g, ((((z_out, a_out), b_out), ab_out), root_out))| {
                     let n_here = z_out.len() / F128_PER_BLOCK;
@@ -3268,8 +3592,12 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                         for half in 0..(n_here / SIMD) {
                             let base = GROUP * g + half * SIMD;
                             let off = half * SIMD * F128_PER_BLOCK;
-                            let proj = blake3_witgen8::StreamProj { compact_z_tile_words: 0, seed_window: None,
-                                cross_quarter: false, compact_z: core::ptr::null_mut(), elide_z: false,
+                            let proj = blake3_witgen8::StreamProj {
+                                compact_z_tile_words: 0,
+                                seed_window: None,
+                                cross_quarter: false,
+                                compact_z: core::ptr::null_mut(),
+                                elide_z: false,
                                 stage: stage.as_mut_ptr().cast::<u32>(),
                                 out: ab_out.as_mut_ptr().add(half * SIMD * ab_block_bytes),
                                 out_stride: ab_block_bytes,
@@ -3287,13 +3615,19 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
                                 proj,
-                                &preps.0,
+                                preps.get(),
                                 [true; 3],
                                 if root_enabled {
-                                    root_plan.as_ref().map(|plan| blake3_witgen8::root_emit::RootOctaWriter::new(
-                                        plan, root_out.as_mut_ptr().cast::<u8>().add(half * 64)))
-                                } else { None },
-                            false,
+                                    root_plan.as_ref().map(|plan| {
+                                        blake3_witgen8::root_emit::RootOctaWriter::new(
+                                            plan,
+                                            root_out.as_mut_ptr().cast::<u8>().add(half * 64),
+                                        )
+                                    })
+                                } else {
+                                    None
+                                },
+                                false,
                             );
                         }
                     }
@@ -3308,13 +3642,21 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
             let mut tiles = unsafe {
                 if let Some((generate, pair_generator)) = root_generator.filter(|_| pipelined) {
                     flock_core::scratch::give_f128(root_storage);
-                    flock_core::lincheck::WitnessRootTiles::from_cross_quarter_generator(init, generate, pair_generator)
+                    flock_core::lincheck::WitnessRootTiles::from_cross_quarter_generator(
+                        init,
+                        generate,
+                        pair_generator,
+                    )
                 } else if pipelined {
                     flock_core::lincheck::WitnessRootTiles::from_cross_quarter_witness_storage(
-                        root_storage, z.len() / F128_PER_BLOCK)
+                        root_storage,
+                        z.len() / F128_PER_BLOCK,
+                    )
                 } else {
                     flock_core::lincheck::WitnessRootTiles::from_witness_storage(
-                        root_storage, z.len() / F128_PER_BLOCK)
+                        root_storage,
+                        z.len() / F128_PER_BLOCK,
+                    )
                 }
             };
             if elided_octas.load(std::sync::atomic::Ordering::Relaxed) != 0 {
@@ -3322,11 +3664,23 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                 // only complete source of z for this proof.
                 tiles.mark_z_elided();
             }
-            #[cfg(all(target_feature = "avx512vl", target_feature = "avx512vbmi2", target_feature = "avx512dq"))]
-            if root_generator.is_some() && pipelined && (blake3_witgen8::root_recompute::stage_recompute::enabled() || blake3_zregen::fused_fold_enabled()) {
+            #[cfg(all(
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi2",
+                target_feature = "avx512dq"
+            ))]
+            if root_generator.is_some()
+                && pipelined
+                && (blake3_witgen8::root_recompute::stage_recompute::enabled()
+                    || blake3_zregen::fused_fold_enabled())
+            {
                 // SAFETY: the exact closed pipeline and validated root plan
                 // brand this seed, cross-quarter tile layout and fixed shape.
-                unsafe { tiles.set_stage_generator(blake3_witgen8::root_recompute::stage_recompute::generate_pair_provider); }
+                unsafe {
+                    tiles.set_stage_generator(
+                        blake3_witgen8::root_recompute::stage_recompute::generate_pair_provider,
+                    );
+                }
             }
             ab_inner.set_witness_root_tiles(tiles);
         } else {
@@ -3423,7 +3777,7 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
                                 a_out.as_mut_ptr().add(off).cast::<u32>(),
                                 b_out.as_mut_ptr().add(off).cast::<u32>(),
                                 proj,
-                                &preps.0,
+                                preps.get(),
                                 elide,
                                 #[cfg(all(
                                     target_feature = "avx512f",
@@ -3811,26 +4165,26 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
-    /// `FLOCK_NO_WITGEN_AB_NT=1` restores the pre-fusion octa task structure
-    /// in full: temporal a/b dumps, then a separate round-1 projection loop
-    /// that re-reads a/b. With the switch off (the default) the dump writes
-    /// a/b non-temporally while filling a per-task window buffer from the
-    /// same transpose registers, and the projection runs per octa off those
-    /// windows — deleting a/b's write-allocate RFO traffic. Orthogonal to the
-    /// z, ab_inner and elide switches.
+    /// `FLOCK_NO_WITGEN_AB_NT=1` selects the independent packed-block writer:
+    /// temporal a/b stores followed by projection over initialized a/b bytes.
+    /// With the switch off (the default), the rolling octa producer publishes
+    /// a/b non-temporally and projects its L1-resident window staging directly.
+    /// The fallback overwrites complete blocks rather than relying on scratch
+    /// elision or a streaming stage that does not exist in this mode.
+    /// Both paths produce the same witness and projected AB bytes.
     pub(crate) fn witgen_ab_nt_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_NT").is_none());
         *ON
     }
 
-    /// `FLOCK_NO_WITGEN_AB_WINSTREAM=1` restores the whole-block a/b window
-    /// buffers: the fused dump fills two full per-task window copies of the
-    /// octa and the round-1 projection runs over them once the octa is
-    /// complete. With the switch off (the default) each drain step's eight
-    /// 64-byte round-1 medium windows are transformed as they are produced,
-    /// out of a small staging pair, and no whole-block window buffer exists.
-    /// Same ab_inner bytes either way; only meaningful under
+    /// `FLOCK_NO_WITGEN_AB_WINSTREAM=1` selects the materialize-and-project
+    /// fallback instead of entering the rolling producer without a stage.
+    /// That fallback writes complete packed blocks with temporal stores before
+    /// projecting their initialized A/B bytes. With the switch off (default),
+    /// each drain step's eight 64-byte round-1 windows are transformed as they
+    /// are produced from a small staging pair, without whole-block windows.
+    /// Same ab_inner bytes either way; the default streaming route requires
     /// `witgen_ab_nt_enabled`.
     pub(crate) fn witgen_ab_winstream_enabled() -> bool {
         static ON: LazyLock<bool> =
@@ -4720,7 +5074,11 @@ impl Blake3Setup {
         } else {
             r1cs.csc_lincheck_circuit();
         }
-        flock_core::scratch::prewarm_prover(r1cs.m);
+        if n_blocks == 1 << 18 && r1cs.m == 32 {
+            flock_core::scratch::prewarm_prover_for_warmup(r1cs.m);
+        } else {
+            flock_core::scratch::prewarm_prover(r1cs.m);
+        }
         // GPU warmup + calibration for BOTH Metal pipelines, in the untimed
         // setup window (the ranked worker constructs the Setup, then runs an
         // untimed warm-up prove, then the measured proves):
@@ -4943,7 +5301,11 @@ impl Blake3Setup {
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_CHAL").is_none());
         let mut challenger = if *ON {
-            SPARE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(fresh)
+            SPARE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(fresh)
         } else {
             fresh()
         };
@@ -4972,14 +5334,23 @@ impl Blake3Setup {
                         flock_core::gaptime::abs("witness pool entered");
                         flock_core::gaptime::mark("witness: pool entered");
                         let padding = self.r1cs.padding_spec();
-                        let odd_tail = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
-                            self.pcs_params.num_ntts(), padding.k_log, padding.useful_bits_per_block,
-                        );
+                        let odd_tail =
+                            flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                                self.pcs_params.num_ntts(),
+                                padding.k_log,
+                                padding.useful_bits_per_block,
+                            );
                         let r = flock_core::pcs::commit::prefault_codeword_during_with_resident(
                             &self.pcs_params,
-                            |resident| generate_witness_and_commit_from(
-                                blocks, self.n_blocks_log(), &self.pcs_params, odd_tail, resident,
-                            ),
+                            |resident| {
+                                generate_witness_and_commit_from(
+                                    blocks,
+                                    self.n_blocks_log(),
+                                    &self.pcs_params,
+                                    odd_tail,
+                                    resident,
+                                )
+                            },
                         );
                         // Witness jobs are all retired: release the pre-seed
                         // spinners (no-op unless the hot seed wait started them).
@@ -6999,7 +7370,11 @@ mod octa_order_tests {
                         "callers={callers} round={round} kpair={kpair}"
                     );
                 }
-                assert_eq!(OctaOrder::Shared(&claim).count(), 0, "late call ran an octa");
+                assert_eq!(
+                    OctaOrder::Shared(&claim).count(),
+                    0,
+                    "late call ran an octa"
+                );
             }
         }
     }
@@ -7140,23 +7515,42 @@ mod chain_e2e_tests {
     #[test]
     #[ignore = "ranked full-cache oracle uses >2 GiB; run serially on benchmark host"]
     fn ranked_witness_root_cache_matches_capture_and_reweights() {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
         pool.install(|| {
             for pass in 0..3 {
                 let blocks = crate::seed_pipe::BlockSource::closed(18, 0x953a_81c7 + pass);
-                let (z, a, b, mut ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
+                let (z, a, b, mut ab) =
+                    generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
                 let tiles = ab.take_witness_root_tiles();
                 if pass != 0 {
                     let tiles = tiles.expect("warm ranked witness must publish root tiles");
-                    let plan = BLAKE3_ADJOINT_PLAN.linear_fold.get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
+                    let plan = BLAKE3_ADJOINT_PLAN
+                        .linear_fold
+                        .get_or_init(|| BLAKE3_ADJOINT_PLAN.linear_fold_plan());
                     tiles.assert_matches_witness(&z, K_LOG, plan);
                     let source = flock_core::lincheck::RootFoldSource::new(&z, K_LOG, plan);
                     assert!(source.install_witness_root_tiles(&z, tiles));
                     for challenge in [17u64, 283] {
-                        let point: Vec<F128> = (0..18).map(|i| F128::new(challenge + i, (challenge * 51 + i).rotate_left(23))).collect();
+                        let point: Vec<F128> = (0..18)
+                            .map(|i| F128::new(challenge + i, (challenge * 51 + i).rotate_left(23)))
+                            .collect();
                         let eq = flock_core::lincheck::build_eq_table(&point);
-                        let reference = flock_core::lincheck::partial_fold_packed_z_block_major_padded(&z, K_LOG + 18, K_LOG, USEFUL_BITS, &eq);
-                        assert_eq!(source.fold(&z, K_LOG + 18, &point), reference, "pass={pass}, challenge={challenge}");
+                        let reference =
+                            flock_core::lincheck::partial_fold_packed_z_block_major_padded(
+                                &z,
+                                K_LOG + 18,
+                                K_LOG,
+                                USEFUL_BITS,
+                                &eq,
+                            );
+                        assert_eq!(
+                            source.fold(&z, K_LOG + 18, &point),
+                            reference,
+                            "pass={pass}, challenge={challenge}"
+                        );
                     }
                 }
                 flock_core::scratch::give_f128(z);
@@ -7165,5 +7559,4 @@ mod chain_e2e_tests {
             }
         });
     }
-
 }

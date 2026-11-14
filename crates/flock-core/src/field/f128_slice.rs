@@ -210,6 +210,14 @@ pub(crate) fn scale_slice(dst: &mut [F128], src: &[F128], scale: F128) {
 /// one register pipeline and writes `dst` once; other builds use the identical
 /// scalar expression.
 #[inline]
+#[cfg(any(
+    test,
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))
+))]
 pub(crate) fn fold_pairs_with_scaled_addend(
     src: &[F128],
     addend: &[F128],
@@ -362,7 +370,7 @@ mod tests {
     #[test]
     fn fold64_banked_nested_matches_two_stage_fold() {
         use super::*;
-        let mut state = 0x64f0_1d00_CAFE_BABEu64;
+        let mut state = 0x64F0_1D00_CAFE_BABEu64;
         let mut next = || {
             state ^= state << 13;
             state ^= state >> 7;

@@ -1,5 +1,3 @@
-
-
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -21,7 +19,6 @@ pub(crate) fn open_fill_enabled() -> bool {
     *ON
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LigeritoProfile {
@@ -35,7 +32,10 @@ pub enum LigeritoProfile {
 /// percent, default 100).
 pub(crate) fn sl1_hold_us(base: u64) -> u64 {
     static S: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_SL1_PREWARM_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
+        std::env::var("FLOCK_SL1_PREWARM_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
     });
     base * *S / 100
 }
@@ -364,7 +364,6 @@ pub fn default_verifier_config(
         merkle_hash: p.merkle_hash,
     })
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1017,7 +1016,6 @@ impl LigeritoSecurityConfig {
     }
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecursiveProof {
     pub opened_rows: Vec<Vec<F128>>,
@@ -1158,7 +1156,6 @@ impl LigeritoProof {
     }
 }
 
-
 pub(crate) fn partial_eval_lsb(evals: &[F128], rs: &[F128]) -> Vec<F128> {
     let mut cur = evals.to_vec();
     for &r in rs {
@@ -1180,7 +1177,6 @@ pub(crate) fn eval_mle_lsb(evals: &[F128], point: &[F128]) -> F128 {
     debug_assert_eq!(folded.len(), 1);
     folded[0]
 }
-
 
 #[inline]
 fn next_s(s: F128, s_at_root: F128) -> F128 {
@@ -1260,7 +1256,6 @@ fn open_basis_x4_enabled() -> bool {
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_BASIS_X4").is_none());
     *ON
 }
-
 
 pub(crate) fn induce_sumcheck_enforced_sum(
     opened_rows: &[Vec<F128>],
@@ -1704,10 +1699,7 @@ fn transpose_top_only(top: &mut [F128], bot: &[F128]) {
                 let b0 = _mm512_loadu_si512(src.add(i).cast::<__m512i>());
                 let b1 = _mm512_loadu_si512(src.add(i + 4).cast::<__m512i>());
                 _mm512_storeu_si512(dst.add(i).cast::<__m512i>(), _mm512_xor_si512(a0, b0));
-                _mm512_storeu_si512(
-                    dst.add(i + 4).cast::<__m512i>(),
-                    _mm512_xor_si512(a1, b1),
-                );
+                _mm512_storeu_si512(dst.add(i + 4).cast::<__m512i>(), _mm512_xor_si512(a1, b1));
                 i += 8;
             }
             let lanes = n & !3;
@@ -1973,12 +1965,7 @@ struct SparseDualL0 {
 const SPARSE_DUAL_MAX_DEPTH: usize = 4;
 
 #[inline(always)]
-fn sparse_dual_one_plus_scale(
-    ntt: &AdditiveNttF128,
-    log_d: usize,
-    s: usize,
-    query: usize,
-) -> F128 {
+fn sparse_dual_one_plus_scale(ntt: &AdditiveNttF128, log_d: usize, s: usize, query: usize) -> F128 {
     let mut val = ntt.twiddle(log_d - 1 - s, query >> (s + 1));
     if (query >> s) & 1 == 0 {
         val += F128::ONE;
@@ -1994,9 +1981,8 @@ fn lig_sparse_dual_snapshot_enabled() -> bool {
 }
 
 fn lig_sparse_dual_lane_x4_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_SPARSE_DUAL_LANE_X4").is_none());
     *ON
 }
 
@@ -2067,11 +2053,7 @@ unsafe fn sparse_dual_lane_fold_avx512(row: &[F128], weights: &[F128]) -> F128 {
 
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_lane_fold_block_avx512(
-    block: &[F128],
-    weights: &[F128],
-    out: &mut [F128],
-) {
+unsafe fn sparse_dual_lane_fold_block_avx512(block: &[F128], weights: &[F128], out: &mut [F128]) {
     use crate::field::gf2_128::x86_64::WideGhashX4;
     use core::arch::x86_64::*;
     let num_interleaved = weights.len();
@@ -2184,12 +2166,7 @@ unsafe fn sparse_dual_lane_fold_block_avx512(
 }
 
 #[inline]
-fn sparse_dual_lane_fold_block(
-    block: &[F128],
-    weights: &[F128],
-    out: &mut [F128],
-    x4: bool,
-) {
+fn sparse_dual_lane_fold_block(block: &[F128], weights: &[F128], out: &mut [F128], x4: bool) {
     let num_interleaved = weights.len();
     debug_assert_eq!(block.len(), out.len() * num_interleaved);
     #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
@@ -2241,10 +2218,7 @@ unsafe fn sparse_dual_round_dots_half2_pre_avx512(
 
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-unsafe fn sparse_dual_round_dots_half2_avx512(
-    local: &[F128],
-    weights: &[F128],
-) -> (F128, F128) {
+unsafe fn sparse_dual_round_dots_half2_avx512(local: &[F128], weights: &[F128]) -> (F128, F128) {
     use crate::field::gf2_128::x86_64::ghash_shift64_x4;
     use core::arch::x86_64::*;
     unsafe {
@@ -2484,7 +2458,18 @@ fn inverse_ntt_final_layers_local_staged(
     for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
         let block_size = 1usize << (log_d - layer);
         let half = block_size >> 1;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
         let mut handled = false;
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let handled = false;
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2714,7 +2699,8 @@ impl Gl2DualStream {
             for _ in 0..helpers {
                 let h = st.clone();
                 rayon::spawn(move || {
-                    if h.owner_sibling.is_some() && rayon::current_thread_index() == h.owner_sibling {
+                    if h.owner_sibling.is_some() && rayon::current_thread_index() == h.owner_sibling
+                    {
                         return;
                     }
                     h.work(true);
@@ -2733,8 +2719,11 @@ impl Gl2DualStream {
         // SAFETY: unpublished lines are touched only by the owner; helpers
         // read a line only after its release below.
         unsafe {
-            (*self.qlines.get()).as_mut_ptr().add(d / 8).cast::<usize>().add(d % 8).write(q);
-            if (d + 1) % 8 == 0 || d + 1 == self.count {
+            core::ptr::addr_of_mut!((*(*self.qlines.get()).as_mut_ptr().add(d / 8)).0)
+                .cast::<usize>()
+                .add(d % 8)
+                .write(q);
+            if (d + 1).is_multiple_of(8) || d + 1 == self.count {
                 self.produced.0.store(d + 1, Ordering::Release);
             }
         }
@@ -2754,11 +2743,21 @@ impl Gl2DualStream {
                 }
                 continue;
             }
-            if self.next.0.compare_exchange_weak(d, d + 1, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            if self
+                .next
+                .0
+                .compare_exchange_weak(d, d + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
                 continue;
             }
             // SAFETY: slot d < produced (acquire above): its line is final.
-            let q = unsafe { (*self.qlines.get()).as_ptr().add(d / 8).cast::<usize>().add(d % 8).read() };
+            let q = unsafe {
+                core::ptr::addr_of!((*(*self.qlines.get()).as_ptr().add(d / 8)).0)
+                    .cast::<usize>()
+                    .add(d % 8)
+                    .read()
+            };
             self.one(d, q);
             self.done.0.fetch_add(1, Ordering::AcqRel);
             if helper {
@@ -2775,7 +2774,12 @@ impl Gl2DualStream {
         let qoff = query - base;
         let block = &cw[base * ni..(base + cache_len) * ni];
         let mut cached = [F128::ZERO; 32];
-        sparse_dual_lane_fold_block(block, &self.lane_weights, &mut cached[..cache_len], self.lane_x4);
+        sparse_dual_lane_fold_block(
+            block,
+            &self.lane_weights,
+            &mut cached[..cache_len],
+            self.lane_x4,
+        );
         let c = cached[qoff];
         let mut qscales = [F128::ZERO; 4];
         for (s, slot) in qscales.iter_mut().enumerate().take((self.depth + 1).min(4)) {
@@ -2835,7 +2839,18 @@ fn inverse_ntt_final_layers_local_staged_raw(
     for (stage, layer) in ((log_d - log_s)..log_d).rev().enumerate() {
         let block_size = 1usize << (log_d - layer);
         let half = block_size >> 1;
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
         let mut handled = false;
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let handled = false;
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -2949,7 +2964,8 @@ impl SparseDualL0 {
         alpha: &[F128],
     ) -> (Self, F128) {
         use rayon::prelude::*;
-        let (depth, log_d, stride, n_queries) = (stream.depth, stream.log_d, stream.stride, stream.count);
+        let (depth, log_d, stride, n_queries) =
+            (stream.depth, stream.log_d, stream.stride, stream.count);
         assert!(log_inv_rate + depth <= log_d);
         assert_eq!(queries.len(), n_queries);
         let alpha_pows: Vec<F128> = if queries.is_empty() {
@@ -2988,7 +3004,10 @@ impl SparseDualL0 {
                 }
                 (e, u0, u2)
             })
-            .reduce(|| (zero, zero, zero), |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2));
+            .reduce(
+                || (zero, zero, zero),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1, a.2 ^ b.2),
+            );
         let enforced_sum = enf_acc.reduce();
         let round0_msg = SumcheckMessage {
             u_0: u0_acc.reduce(),
@@ -3067,7 +3086,8 @@ impl SparseDualL0 {
         } else {
             Vec::new()
         };
-        let use_par = crate::serial_par_enabled() && n_queries * cache_len * num_interleaved >= 16384;
+        let use_par =
+            crate::serial_par_enabled() && n_queries * cache_len * num_interleaved >= 16384;
         let (enforced_sum, round0_msg) = if snapshots {
             let (enf_acc, u0_acc, u2_acc) = if use_par {
                 queries
@@ -3079,8 +3099,8 @@ impl SparseDualL0 {
                     .map(|(((&query, &alpha), w2_slot), out_rows)| {
                         let base = query & !(cache_len - 1);
                         let qoff = query - base;
-                        let block =
-                            &l0_codeword[base * num_interleaved..(base + cache_len) * num_interleaved];
+                        let block = &l0_codeword
+                            [base * num_interleaved..(base + cache_len) * num_interleaved];
                         let mut cached = [F128::ZERO; 32];
                         sparse_dual_lane_fold_block(
                             block,
@@ -3240,9 +3260,7 @@ impl SparseDualL0 {
                 2 => &self.rows[base_row][0..4],
                 3 => &self.rows[base_row][4..12],
                 4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
+                5 => unsafe { core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32) },
                 _ => unreachable!(),
             }
         } else {
@@ -3457,9 +3475,7 @@ impl SparseDualL0 {
                 2 => &self.rows[base_row][0..4],
                 3 => &self.rows[base_row][4..12],
                 4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
+                5 => unsafe { core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32) },
                 _ => unreachable!(),
             };
             let w0 = self.w0_pows[index];
@@ -3556,7 +3572,6 @@ impl SparseDualL0 {
                     }
                 }
             }
-            return;
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -3672,8 +3687,7 @@ impl SparseDualL0 {
                 }
             } else {
                 for (s, &r_s) in fold_challenges.iter().enumerate() {
-                    let one_plus_scale =
-                        sparse_dual_one_plus_scale(full_ntt, self.log_d, s, query);
+                    let one_plus_scale = sparse_dual_one_plus_scale(full_ntt, self.log_d, s, query);
                     local_value *= F128::ONE + r_s * one_plus_scale;
                 }
             }
@@ -4016,11 +4030,7 @@ fn transpose_forward_ntt_window_dense_slice(
                     let t0 = ntt.twiddle(layer, block_base + jb);
                     let t1 = ntt.twiddle(layer, block_base + jb + 1);
                     unsafe {
-                        transpose_butterfly_blocks_bsh2_pair(
-                            buf.as_mut_ptr().add(jb * 4),
-                            t0,
-                            t1,
-                        )
+                        transpose_butterfly_blocks_bsh2_pair(buf.as_mut_ptr().add(jb * 4), t0, t1)
                     };
                     jb += 2;
                 }
@@ -4138,7 +4148,6 @@ fn expand_singleton_into(
             unsafe { eq_expand_block_x4(&mut rest[..len], current, scale) };
             len <<= 1;
         }
-        return;
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -4397,7 +4406,14 @@ fn transpose_forward_ntt_sparse_inner_dead(
                     let first = order[rs] as usize;
                     if sparse_trie {
                         sparse_window::expand(
-                            ntt, log_d, k, w, positions, values, &order[rs..re], dst,
+                            ntt,
+                            log_d,
+                            k,
+                            w,
+                            positions,
+                            values,
+                            &order[rs..re],
+                            dst,
                         );
                     } else if singleton_on && nnz <= multi_max {
                         expand_singleton_into(
@@ -4463,7 +4479,14 @@ fn transpose_forward_ntt_sparse_inner_dead(
                     if sparse_trie {
                         let mut buf = take_singleton_buf(k);
                         sparse_window::expand(
-                            ntt, log_d, k, w, positions, values, &order[rs..re], &mut buf,
+                            ntt,
+                            log_d,
+                            k,
+                            w,
+                            positions,
+                            values,
+                            &order[rs..re],
+                            &mut buf,
                         );
                         return (w, buf);
                     } else if singleton_on && nnz <= multi_max {
@@ -4547,7 +4570,6 @@ fn transpose_forward_ntt_sparse_inner_dead(
     }
     (data, singleton_stats)
 }
-
 
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
@@ -4798,7 +4820,6 @@ fn gpu_merkle_tree_for_open(
     Some(tree)
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
@@ -4853,14 +4874,12 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
         let (u_0, u_2) = f
             .par_chunks(CHUNK)
             .zip(b.par_chunks(CHUNK))
-            .map(|(fc, bc)| {
-                unsafe { msg_reduce_avx512(fc, bc) }
-            })
+            .map(|(fc, bc)| unsafe { msg_reduce_avx512(fc, bc) })
             .reduce(
                 || (F128::ZERO, F128::ZERO),
                 |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
             );
-        return SumcheckMessage { u_0, u_2 };
+        SumcheckMessage { u_0, u_2 }
     }
 
     #[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
@@ -4916,9 +4935,7 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
         let (u_0, u_2, y) = f
             .par_chunks(CHUNK)
             .zip(b.par_chunks(CHUNK))
-            .map(|(fc, bc)| {
-                unsafe { msg_reduce_eval_avx512(fc, bc) }
-            })
+            .map(|(fc, bc)| unsafe { msg_reduce_eval_avx512(fc, bc) })
             .reduce(
                 || (F128::ZERO, F128::ZERO, F128::ZERO),
                 |(a0, a2, ay), (c0, c2, cy)| (a0 + c0, a2 + c2, ay + cy),
@@ -5241,7 +5258,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
     deferred: Option<(&[F128], F128)>,
     ood: Option<(&[F128], F128)>,
 ) -> (F128, F128) {
-    use crate::field::gf2_128::x86_64::{ghash_mul_x4_split, WideGhashX4};
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split};
     use core::arch::x86_64::*;
 
     let len = fc.len();
@@ -5297,10 +5314,7 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
         };
         let store4 = |value: __m512i, ptr: *mut F128| {
             if stream && dst_aligned {
-                _mm_stream_si128(
-                    ptr.cast::<__m128i>(),
-                    _mm512_extracti32x4_epi32::<0>(value),
-                );
+                _mm_stream_si128(ptr.cast::<__m128i>(), _mm512_extracti32x4_epi32::<0>(value));
                 _mm_stream_si128(
                     ptr.add(1).cast::<__m128i>(),
                     _mm512_extracti32x4_epi32::<1>(value),
@@ -5351,7 +5365,10 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
                     fold4_sum(b_ptr, dptr, 2 * (base + t)),
                     fold4_sum(b_ptr, dptr, 2 * (base + t + 4)),
                 ),
-                None => (fold4(b_ptr, 2 * (base + t)), fold4(b_ptr, 2 * (base + t + 4))),
+                None => (
+                    fold4(b_ptr, 2 * (base + t)),
+                    fold4(b_ptr, 2 * (base + t + 4)),
+                ),
             };
             if CORR {
                 if let (None, Some((dptr, ax, ax64))) = (defer_one, deferred_vec) {
@@ -5398,7 +5415,8 @@ unsafe fn fold_and_msg_chunk_x86<const CORR: bool>(
             let f0 = *f_ptr.add(source) + r * (*f_ptr.add(source) + *f_ptr.add(source + 1));
             let f1 = *f_ptr.add(source + 2) + r * (*f_ptr.add(source + 2) + *f_ptr.add(source + 3));
             let mut b0 = *b_ptr.add(source) + r * (*b_ptr.add(source) + *b_ptr.add(source + 1));
-            let mut b1 = *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
+            let mut b1 =
+                *b_ptr.add(source + 2) + r * (*b_ptr.add(source + 2) + *b_ptr.add(source + 3));
             if CORR {
                 if let Some((basis, alpha)) = deferred {
                     let dptr = basis.as_ptr();
@@ -5487,7 +5505,9 @@ fn fold_and_msg_lsb_inner(
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ))]
-        if half >= 2 && lazy_ood.is_none_or(|(eq_lo, eq_hi, _)| eq_hi.len() == 1 && eq_lo.len() >= half) {
+        if half >= 2
+            && lazy_ood.is_none_or(|(eq_lo, eq_hi, _)| eq_hi.len() == 1 && eq_lo.len() >= half)
+        {
             let mut nf = crate::alloc_uninit_f128_vec(half);
             let mut nb = crate::alloc_uninit_f128_vec(half);
             let (u_0, u_2) = unsafe {
@@ -5654,7 +5674,7 @@ fn fold_and_msg_lsb_inner(
                         )
                     };
                 }
-                return unsafe {
+                unsafe {
                     let ood = lazy_ood.map(|(eq_lo, eq_hi, gamma)| (eq_lo, gamma * eq_hi[ci]));
                     fold_and_msg_chunk_x86::<true>(
                         f,
@@ -5669,7 +5689,7 @@ fn fold_and_msg_lsb_inner(
                         deferred_basis,
                         ood,
                     )
-                };
+                }
             }
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
@@ -5685,7 +5705,6 @@ fn fold_and_msg_lsb_inner(
                 if use_nt {
                     return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
                 }
-
             }
             #[cfg(not(all(
                 target_arch = "x86_64",
@@ -7125,7 +7144,7 @@ fn ranked_sparse_dual_l0_depth(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ));
-    if ranked_sparse_dual_l0_depth_selected(
+    ranked_sparse_dual_l0_depth_selected(
         config,
         log_n,
         n_level,
@@ -7138,16 +7157,14 @@ fn ranked_sparse_dual_l0_depth(
         sparse_disabled,
         defer_disabled,
         SPARSE_DUAL_MAX_DEPTH,
-    )
-    .is_none()
-    {
-        return None;
-    }
+    )?;
     static EXPLICIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let explicit_depth = if crate::sl2_env_live() {
         std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()
     } else {
-        EXPLICIT.get_or_init(|| std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok()).clone()
+        EXPLICIT
+            .get_or_init(|| std::env::var(ENV_OPEN_INDUCE_DUAL_DEPTH).ok())
+            .clone()
     };
     let depth = ranked_sparse_dual_l0_depth_setting(
         explicit_depth.as_deref(),
@@ -7306,6 +7323,13 @@ fn direct_fold8_b_overlap_enabled() -> bool {
 
 /// Lane rs: `FLOCK_NO_RS_F8_REBAL=1` (or `FLOCK_NO_RS_SEED6=1`) restores
 /// the fold64 ‖ basis, then commit ‖ message schedule. Read once.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn rs_f8_rebal_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_RS_F8_REBAL").is_none()
@@ -7314,6 +7338,13 @@ fn rs_f8_rebal_enabled() -> bool {
     *ON
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
 fn direct_fold8_l1_precommit_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_L1_PRECOMMIT").is_none());
@@ -7424,7 +7455,10 @@ fn materialize_direct_fold8_f_for_precommit(
         regen.fold64(folded_f, &w);
         drop(regen);
         if open_timing() || std::env::var_os("FLOCK_ZR_TRACE").is_some() {
-            eprintln!("[zr] regen fold64 {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[zr] regen fold64 {:.3} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
         }
         return;
     }
@@ -7688,98 +7722,48 @@ fn materialize_direct_fold8(
         target_feature = "vpclmulqdq",
         target_feature = "gfni"
     ))]
-    if b_gfni_on && direct_fold8_l1_precommit_enabled() {
-        if let Some(precommit) = l1_precommit {
-            assert_eq!(
-                out_len,
-                (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
-            );
-            // Lane rs: with the seed6 L1 commit (CLMUL + NT publish, then
-            // hash) the GFNI basis fold (+ its fused message) overlaps the
-            // commit better than it overlaps fold64 (both p0/p5-heavy), so
-            // the sequential-fold schedule below wins; see rs RESULT.md.
-            if direct_fold8_b_overlap_enabled() && !rs_f8_rebal_enabled() {
-                let t_f8 = std::time::Instant::now();
-                crate::rstrace::ev("f8:start", 0);
-                let mut folded_f = crate::scratch::take_f128(out_len);
-                let folded_b = crate::scratch::take_f128(out_len);
-                let ((), (folded_b, _)) = rayon::join(
-                    || {
-                        materialize_direct_fold8_f_for_precommit(
-                            &packed_witness,
-                            &mut folded_f,
-                            block_len,
-                            &fold16_weight,
-                            r4,
-                            r5,
-                        );
-                        crate::rstrace::ev("f8:fold64:end", 0);
-                    },
-                    || {
-                        let r = materialize_direct_fold8_b_gfni_impl(
-                            None, folded_b, claims, challenges, block_len,
-                        );
-                        crate::rstrace::ev("f8:basis:end", 0);
-                        r
-                    },
-                );
-                crate::rstrace::ev("f8:join1", 0);
-                let t_f8a = t_f8.elapsed();
-                crate::scratch::give_f128(packed_witness);
-                crate::scratch::give_f128(ordinary_basis);
-                let (precommitted, msg) = rayon::join(
-                    || {
-                        let ntt = AdditiveNttF128::standard(
-                            precommit.log_msg_cols + precommit.log_inv_rate,
-                        );
-                        ligero_commit(
-                            &folded_f,
-                            precommit.log_msg_cols,
-                            precommit.log_num_interleaved,
-                            precommit.log_inv_rate,
-                            &ntt,
-                            precommit.kind,
-                        )
-                    },
-                    || {
-                        let m = direct_fold8_msg_par(&folded_f, &folded_b, block_len);
-                        crate::rstrace::ev("f8:msg:end", 0);
-                        m
-                    },
-                );
-                crate::rstrace::ev("f8:join2", 0);
-                if open_timing() {
-                    eprintln!(
-                        "[f8] overlap: f-fold+basis {:.3} ms, commit+msg {:.3} ms",
-                        t_f8a.as_secs_f64() * 1e3,
-                        (t_f8.elapsed() - t_f8a).as_secs_f64() * 1e3
-                    );
-                }
-                return (folded_f, folded_b, msg, Some(precommitted));
-            }
+    if b_gfni_on
+        && direct_fold8_l1_precommit_enabled()
+        && let Some(precommit) = l1_precommit
+    {
+        assert_eq!(
+            out_len,
+            (1usize << precommit.log_msg_cols) * (1usize << precommit.log_num_interleaved)
+        );
+        // Lane rs: with the seed6 L1 commit (CLMUL + NT publish, then
+        // hash) the GFNI basis fold (+ its fused message) overlaps the
+        // commit better than it overlaps fold64 (both p0/p5-heavy), so
+        // the sequential-fold schedule below wins; see rs RESULT.md.
+        if direct_fold8_b_overlap_enabled() && !rs_f8_rebal_enabled() {
             let t_f8 = std::time::Instant::now();
-            crate::rstrace::ev("f8s:start", 0);
+            crate::rstrace::ev("f8:start", 0);
             let mut folded_f = crate::scratch::take_f128(out_len);
-            let t_f8a = t_f8.elapsed();
-            materialize_direct_fold8_f_for_precommit(
-                &packed_witness,
-                &mut folded_f,
-                block_len,
-                &fold16_weight,
-                r4,
-                r5,
-            );
-            if open_timing() {
-                eprintln!("[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
-                    t_f8a.as_secs_f64()*1e3, (t_f8.elapsed()-t_f8a).as_secs_f64()*1e3, packed_witness.len()*16>>20);
-            }
-            crate::rstrace::ev("f8s:fold64", 0);
-            let t_f8 = std::time::Instant::now();
             let folded_b = crate::scratch::take_f128(out_len);
+            let ((), (folded_b, _)) = rayon::join(
+                || {
+                    materialize_direct_fold8_f_for_precommit(
+                        &packed_witness,
+                        &mut folded_f,
+                        block_len,
+                        &fold16_weight,
+                        r4,
+                        r5,
+                    );
+                    crate::rstrace::ev("f8:fold64:end", 0);
+                },
+                || {
+                    let r = materialize_direct_fold8_b_gfni_impl(
+                        None, folded_b, claims, challenges, block_len,
+                    );
+                    crate::rstrace::ev("f8:basis:end", 0);
+                    r
+                },
+            );
+            crate::rstrace::ev("f8:join1", 0);
+            let t_f8a = t_f8.elapsed();
             crate::scratch::give_f128(packed_witness);
             crate::scratch::give_f128(ordinary_basis);
-
-            let (precommitted, (folded_b, msg)) = rayon::join(
+            let (precommitted, msg) = rayon::join(
                 || {
                     let ntt =
                         AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
@@ -7793,19 +7777,76 @@ fn materialize_direct_fold8(
                     )
                 },
                 || {
-                    let r = materialize_direct_fold8_b_gfni_for_precommit(
-                        &folded_f, folded_b, claims, challenges, block_len,
-                    );
-                    crate::rstrace::ev("f8s:basis", 0);
-                    r
+                    let m = direct_fold8_msg_par(&folded_f, &folded_b, block_len);
+                    crate::rstrace::ev("f8:msg:end", 0);
+                    m
                 },
             );
-            crate::rstrace::ev("f8s:join", 0);
+            crate::rstrace::ev("f8:join2", 0);
             if open_timing() {
-                eprintln!("[f8] give+join {:.3} ms", t_f8.elapsed().as_secs_f64()*1e3);
+                eprintln!(
+                    "[f8] overlap: f-fold+basis {:.3} ms, commit+msg {:.3} ms",
+                    t_f8a.as_secs_f64() * 1e3,
+                    (t_f8.elapsed() - t_f8a).as_secs_f64() * 1e3
+                );
             }
             return (folded_f, folded_b, msg, Some(precommitted));
         }
+        let t_f8 = std::time::Instant::now();
+        crate::rstrace::ev("f8s:start", 0);
+        let mut folded_f = crate::scratch::take_f128(out_len);
+        let t_f8a = t_f8.elapsed();
+        materialize_direct_fold8_f_for_precommit(
+            &packed_witness,
+            &mut folded_f,
+            block_len,
+            &fold16_weight,
+            r4,
+            r5,
+        );
+        if open_timing() {
+            eprintln!(
+                "[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
+                t_f8a.as_secs_f64() * 1e3,
+                (t_f8.elapsed() - t_f8a).as_secs_f64() * 1e3,
+                (packed_witness.len() * 16) >> 20
+            );
+        }
+        crate::rstrace::ev("f8s:fold64", 0);
+        let t_f8 = std::time::Instant::now();
+        let folded_b = crate::scratch::take_f128(out_len);
+        crate::scratch::give_f128(packed_witness);
+        crate::scratch::give_f128(ordinary_basis);
+
+        let (precommitted, (folded_b, msg)) = rayon::join(
+            || {
+                let ntt =
+                    AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
+                ligero_commit(
+                    &folded_f,
+                    precommit.log_msg_cols,
+                    precommit.log_num_interleaved,
+                    precommit.log_inv_rate,
+                    &ntt,
+                    precommit.kind,
+                )
+            },
+            || {
+                let r = materialize_direct_fold8_b_gfni_for_precommit(
+                    &folded_f, folded_b, claims, challenges, block_len,
+                );
+                crate::rstrace::ev("f8s:basis", 0);
+                r
+            },
+        );
+        crate::rstrace::ev("f8s:join", 0);
+        if open_timing() {
+            eprintln!(
+                "[f8] give+join {:.3} ms",
+                t_f8.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return (folded_f, folded_b, msg, Some(precommitted));
     }
 
     #[cfg(not(all(
@@ -8394,9 +8435,7 @@ impl SumcheckProver {
                 } else {
                     acc.par_chunks_mut(CHUNK)
                         .zip(b_new.par_chunks(CHUNK))
-                        .for_each(|(a, v)| {
-                            unsafe { glue_block_x4(a, v, alpha) }
-                        });
+                        .for_each(|(a, v)| unsafe { glue_block_x4(a, v, alpha) });
                 }
             }
         } else if self.combined_basis.len() < PAR_THRESHOLD {
@@ -8440,7 +8479,6 @@ impl SumcheckProver {
     }
 }
 
-
 fn serial_par_enabled() -> bool {
     crate::serial_par_enabled()
 }
@@ -8469,7 +8507,11 @@ fn lf1_open_par() -> bool {
 /// before). Read once.
 fn lf1_dual_minlen() -> usize {
     static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_LF1_DUAL_MINLEN").ok().and_then(|s| s.parse().ok()).filter(|&v| v >= 1).unwrap_or(8)
+        std::env::var("FLOCK_LF1_DUAL_MINLEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(8)
     });
     *V
 }
@@ -8519,8 +8561,14 @@ fn gl2_side_enabled() -> bool {
 /// owner's publication counter (default 16).
 fn gl2_stream_knobs() -> (usize, usize) {
     static K: std::sync::LazyLock<(usize, usize)> = std::sync::LazyLock::new(|| {
-        let h = std::env::var("FLOCK_GL2_STREAM_HELPERS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-        let p = std::env::var("FLOCK_GL2_STREAM_POLL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let h = std::env::var("FLOCK_GL2_STREAM_HELPERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        let p = std::env::var("FLOCK_GL2_STREAM_POLL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
         (h, p)
     });
     *K
@@ -8578,7 +8626,11 @@ impl Gl2Deferred {
 
     fn run(&self) {
         use std::sync::atomic::Ordering;
-        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
         // SAFETY: claim won above; see the `Sync` impl.
@@ -8784,17 +8836,11 @@ fn merkle_multi_proof_for_l0(
     let bytes = unsafe {
         core::slice::from_raw_parts(
             codeword.as_ptr().cast::<u8>(),
-            codeword.len() * core::mem::size_of::<F128>(),
+            std::mem::size_of_val(codeword),
         )
     };
 
-    if ranked_l0_auth_batch_enabled(
-        tree.len(),
-        block_len,
-        num_interleaved,
-        queries.len(),
-        kind,
-    ) {
+    if ranked_l0_auth_batch_enabled(tree.len(), block_len, num_interleaved, queries.len(), kind) {
         let leaf_siblings = indices.partition_point(|&i| i < block_len);
         debug_assert!(indices[leaf_siblings..].iter().all(|&i| i >= block_len));
         let mut proof: Vec<Hash> = crate::alloc_uninit_vec(indices.len());
@@ -8805,9 +8851,7 @@ fn merkle_multi_proof_for_l0(
         rayon::join(
             || merkle::hash_indexed_blake3_1k(bytes, leaf_indices, leaf_out),
             || {
-                if serial_par_enabled()
-                    && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS
-                {
+                if serial_par_enabled() && stored_indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
                     stored_out
                         .par_iter_mut()
                         .zip(stored_indices.par_iter())
@@ -9330,10 +9374,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let l1_precommit_candidate = false;
     // Only the direct-fold8 L1-precommit route can fold an elided witness
     // from its regenerator; every other route reads it directly.
-    if !l1_precommit_candidate {
-        if let Some(w) = packed_witness.as_mut() {
-            super::elided_z::ensure_dense(w, "ligerito non-fold8");
-        }
+    if !l1_precommit_candidate && let Some(w) = packed_witness.as_mut() {
+        super::elided_z::ensure_dense(w, "ligerito non-fold8");
     }
     let mut early_wtns_1: Option<LigeroWitness> = None;
     let mut fold4_challenges: Vec<F128> = Vec::with_capacity(6);
@@ -9633,7 +9675,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     };
     let (queries_0, gl2_perm0) = match &gl2_s0 {
         Some(st) => sample_distinct_queries_streamed(challenger, l0_block_len, num_queries_0, st),
-        None => (sample_distinct_queries(challenger, l0_block_len, num_queries_0), Vec::new()),
+        None => (
+            sample_distinct_queries(challenger, l0_block_len, num_queries_0),
+            Vec::new(),
+        ),
     };
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     crate::rstrace::evd("L1:qs", queries_0.len() as u32);
@@ -9667,7 +9712,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 // SAFETY: the L0 tree / codeword are borrowed for the whole
                 // open; `gl2_jobs` waits for this job before it returns.
                 let (tree, cw) = unsafe { (tree_p.get(), cw_p.get()) };
-                let rows = gather_opened_rows(&qs, |q| &cw[q * ni..(q + 1) * ni], serial_par_enabled());
+                let rows =
+                    gather_opened_rows(&qs, |q| &cw[q * ni..(q + 1) * ni], serial_par_enabled());
                 let mp = merkle_multi_proof_for_l0(tree, cw, bl, ni, &qs, kind);
                 crate::rstrace::evd("L1:deferred", 0);
                 (rows, mp)
@@ -9678,7 +9724,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Lane sl1: warm holders for L1's three fold grinds (~0.05 ms ahead).
             crate::challenger::sl1_grind_prewarm(sl1_hold_us(120));
             let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_deref() {
-                let r = SparseDualL0::from_stream(st, log_inv_rate_0, queries_0.clone(), &gl2_perm0, &alpha_0);
+                let r = SparseDualL0::from_stream(
+                    st,
+                    log_inv_rate_0,
+                    queries_0.clone(),
+                    &gl2_perm0,
+                    &alpha_0,
+                );
                 gl2_side_done.extend(st.take_side());
                 r
             } else {
@@ -9901,12 +9953,24 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let (opened_rows_last, merkle_proof_last): (Vec<Vec<F128>>, Vec<Hash>) = if *FIN_JOIN {
                 rayon::join(
                     || gather_opened_rows(&queries_last, |q| wtns_prev.row(q), false),
-                    || multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, false),
+                    || {
+                        multi_proof_gather(
+                            &wtns_prev.tree,
+                            wtns_prev.block_len,
+                            &queries_last,
+                            false,
+                        )
+                    },
                 )
             } else {
                 let rows = gather_opened_rows(&queries_last, |q| wtns_prev.row(q), lf1_open_par());
                 crate::rstrace::evd("fin:rows", 0);
-                let mp = multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_last, lf1_open_par());
+                let mp = multi_proof_gather(
+                    &wtns_prev.tree,
+                    wtns_prev.block_len,
+                    &queries_last,
+                    lf1_open_par(),
+                );
                 (rows, mp)
             };
             crate::rstrace::ev("fin:open", 0);
@@ -10078,7 +10142,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             remaining_folds,
         );
         let gl2_si = match deep_dual_depth {
-            Some(depth) if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() => {
+            Some(depth)
+                if gl2_defer && gl2_stream_enabled() && lig_sparse_dual_snapshot_enabled() =>
+            {
                 Some(Gl2DualStream::start(
                     depth,
                     n_next + config.log_inv_rates[i + 1],
@@ -10091,17 +10157,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             _ => None,
         };
         let (queries_i, gl2_permi) = match &gl2_si {
-            Some(st) => sample_distinct_queries_streamed(challenger, wtns_prev.block_len, num_queries_i, st),
-            None => (sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i), Vec::new()),
+            Some(st) => {
+                sample_distinct_queries_streamed(challenger, wtns_prev.block_len, num_queries_i, st)
+            }
+            None => (
+                sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i),
+                Vec::new(),
+            ),
         };
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         crate::rstrace::evd("lv:qs", i as u32);
         let open_i = || {
-            let opened_rows =
-                gather_opened_rows(&queries_i, |q| wtns_prev.row(q), lf1_open_par());
+            let opened_rows = gather_opened_rows(&queries_i, |q| wtns_prev.row(q), lf1_open_par());
             crate::rstrace::evd("lv:rows", i as u32);
-            let merkle_proof =
-                multi_proof_gather(&wtns_prev.tree, wtns_prev.block_len, &queries_i, lf1_open_par());
+            let merkle_proof = multi_proof_gather(
+                &wtns_prev.tree,
+                wtns_prev.block_len,
+                &queries_i,
+                lf1_open_par(),
+            );
             crate::rstrace::evd("lv:mp", i as u32);
             (opened_rows, merkle_proof)
         };
@@ -11726,7 +11800,8 @@ mod tests {
             let basis = rng.sample_f128_vec(n);
             let r = rng.sample_f128();
             for alpha in [F128::ONE, rng.sample_f128()] {
-                let (nf, nb, msg) = fold_and_msg_lsb_inner(&f, &b, r, None, None, Some((&basis, alpha)));
+                let (nf, nb, msg) =
+                    fold_and_msg_lsb_inner(&f, &b, r, None, None, Some((&basis, alpha)));
                 let half = n / 2;
                 let mut u_0 = F128::ZERO;
                 let mut u_2 = F128::ZERO;
@@ -12186,8 +12261,7 @@ mod tests {
             let (r_x4, r_x64) = unsafe {
                 use crate::field::gf2_128::x86_64::ghash_shift64_x4;
                 use core::arch::x86_64::*;
-                let r_x4 =
-                    _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+                let r_x4 = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
                 (r_x4, ghash_shift64_x4(r_x4))
             };
 
@@ -12196,7 +12270,16 @@ mod tests {
                 let mut bc_x86 = vec![F128::ZERO; n_pairs];
                 let (u0_x86, u2_x86) = unsafe {
                     super::fold_and_msg_chunk_x86::<false>(
-                        &f, &b, base, &mut fc_x86, &mut bc_x86, r, r_x4, r_x64, stream, None,
+                        &f,
+                        &b,
+                        base,
+                        &mut fc_x86,
+                        &mut bc_x86,
+                        r,
+                        r_x4,
+                        r_x64,
+                        stream,
+                        None,
                         None,
                     )
                 };
@@ -13276,13 +13359,8 @@ mod tests {
 
         let log_n = 12usize;
         let initial_k = 2usize;
-        let (p_cfg, v_cfg) = ood_test_configs(
-            log_n,
-            initial_k,
-            &[3, 2],
-            vec![0, 1, 1],
-            vec![0, 0, 0],
-        );
+        let (p_cfg, v_cfg) =
+            ood_test_configs(log_n, initial_k, &[3, 2], vec![0, 1, 1], vec![0, 0, 0]);
         let mut rng = crate::challenger::RandomChallenger::new(0x5A2E_D0A1_0004);
         let poly = rng.sample_f128_vec(1usize << log_n);
         let z = rng.sample_f128_vec(log_n);
@@ -13335,8 +13413,7 @@ mod tests {
             bincode::serialize(&sparse).expect("serialize sparse proof"),
             bincode::serialize(&dense).expect("serialize dense proof")
         );
-        let mut verifier_ch =
-            crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
+        let mut verifier_ch = crate::challenger::FsChallenger::new(b"sparse-dual-k4-proof-byte");
         assert!(recursive_verifier_with_basis(
             &v_cfg,
             &sparse,
@@ -13427,8 +13504,7 @@ mod tests {
             bincode::serialize(&sparse).expect("serialize sparse proof"),
             bincode::serialize(&dense).expect("serialize dense proof")
         );
-        let mut verifier_ch =
-            crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
+        let mut verifier_ch = crate::challenger::FsChallenger::new(b"sparse-dual-deep-proof-byte");
         assert!(recursive_verifier_with_basis(
             &v_cfg,
             &sparse,
@@ -13441,8 +13517,8 @@ mod tests {
 
     #[test]
     fn sparse_dual_exact_ranked_selector_positive_kill_and_negative() {
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("exact ranked m32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         let select = |cfg: &ProverConfig, sparse_disabled: bool, defer_disabled: bool| {
             ranked_sparse_dual_l0_depth_selected(
@@ -13461,8 +13537,16 @@ mod tests {
             )
         };
         assert_eq!(select(&config, false, false), Some(4));
-        assert_eq!(select(&config, true, false), None, "sparse kill must restore dense");
-        assert_eq!(select(&config, false, true), None, "defer kill must restore dense");
+        assert_eq!(
+            select(&config, true, false),
+            None,
+            "sparse kill must restore dense"
+        );
+        assert_eq!(
+            select(&config, false, true),
+            None,
+            "defer kill must restore dense"
+        );
 
         let mut wrong_queries = config.clone();
         wrong_queries.queries[0] = 217;
@@ -13492,8 +13576,8 @@ mod tests {
 
     #[test]
     fn sparse_dual_deep_selector_covers_every_ranked_level() {
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("exact ranked m32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         let ladder: [(usize, usize, usize); 5] = [
             (19, 218, 1),
@@ -13548,7 +13632,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("no depth for ranked level n={n_level}"));
             assert!((2..=SPARSE_DUAL_MAX_DEPTH).contains(&depth));
             let remaining = 3 * (4 - level);
-            assert!(depth <= remaining, "n={n_level}: depth {depth} > {remaining}");
+            assert!(
+                depth <= remaining,
+                "n={n_level}: depth {depth} > {remaining}"
+            );
             materializations.push(3 * (level + 1) + depth - 1);
         }
         let mut sorted = materializations.clone();
@@ -13569,8 +13656,8 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
-            .expect("exact ranked m32 Fast config");
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("exact ranked m32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         assert_eq!(
             ranked_sparse_dual_l0_depth_selected(
@@ -13625,9 +13712,7 @@ mod tests {
         ntt.rs_encode_interleaved(&poly, &mut l0_codeword, LANES);
         let encode_ms = encode_start.elapsed().as_secs_f64() * 1e3;
         let mut queries: Vec<usize> = vec![1, 2];
-        queries.extend(
-            (0..Q - 2).map(|index| (index * 4093 + 17) & ((1usize << LOG_D) - 1)),
-        );
+        queries.extend((0..Q - 2).map(|index| (index * 4093 + 17) & ((1usize << LOG_D) - 1)));
         assert_eq!(queries.len(), Q);
         let mut reduced_k4: Vec<usize> = queries.iter().map(|&query| query >> 4).collect();
         reduced_k4.sort_unstable();
@@ -13656,8 +13741,7 @@ mod tests {
         for _ in 0..INTRO_REPEATS {
             black_box(round_msg_lsb(black_box(&f), black_box(&dense_basis)));
         }
-        let dense_intro_ms =
-            dense_intro_start.elapsed().as_secs_f64() * 1e3 / INTRO_REPEATS as f64;
+        let dense_intro_ms = dense_intro_start.elapsed().as_secs_f64() * 1e3 / INTRO_REPEATS as f64;
         let all_fold_challenges = rng.sample_f128_vec(5);
 
         let mut depth4_dual = None;
@@ -13692,8 +13776,7 @@ mod tests {
                     black_box(dual.round_msg(black_box(&all_fold_challenges[..prior])));
                 }
             }
-            let messages_ms = messages_start.elapsed().as_secs_f64() * 1e3
-                / MESSAGE_REPEATS as f64;
+            let messages_ms = messages_start.elapsed().as_secs_f64() * 1e3 / MESSAGE_REPEATS as f64;
             let material_start = Instant::now();
             let materialized = dual.materialize_after_folds(&all_fold_challenges[..depth]);
             let materialize_ms = material_start.elapsed().as_secs_f64() * 1e3;
@@ -13761,7 +13844,10 @@ mod tests {
         let z_l2 = rng.sample_f128_vec(LOG_MSG - 3);
         let (dense_ood_msg, dense_ood_sum) = dense.introduce_new_ood_factorized(&z_l2).unwrap();
         let (sparse_ood_msg, sparse_ood_sum) = sparse.introduce_new_ood_factorized(&z_l2).unwrap();
-        assert_eq!((sparse_ood_msg, sparse_ood_sum), (dense_ood_msg, dense_ood_sum));
+        assert_eq!(
+            (sparse_ood_msg, sparse_ood_sum),
+            (dense_ood_msg, dense_ood_sum)
+        );
         let ood_beta_l2 = rng.sample_f128();
         dense.glue_factorized_ood(ood_beta_l2);
         sparse.glue_factorized_ood(ood_beta_l2);
@@ -13772,7 +13858,10 @@ mod tests {
             .zip(&b1)
             .map(|(&x, &y)| x * y)
             .fold(F128::ZERO, |x, y| x + y);
-        assert_eq!(dense.introduce_new(b1.clone(), h1), sparse.introduce_new(b1, h1));
+        assert_eq!(
+            dense.introduce_new(b1.clone(), h1),
+            sparse.introduce_new(b1, h1)
+        );
         let beta1 = rng.sample_f128();
         dense.glue_deferred_into_factorized_ood_fold(beta1);
         sparse.glue_deferred_into_factorized_ood_fold(beta1);
@@ -13785,7 +13874,10 @@ mod tests {
             dual.materialize_after_folds(&all_fold_challenges[..4]),
             F128::ONE,
         );
-        assert_eq!(sparse.fold(all_fold_challenges[4]), dense.fold(all_fold_challenges[4]));
+        assert_eq!(
+            sparse.fold(all_fold_challenges[4]),
+            dense.fold(all_fold_challenges[4])
+        );
         assert_eq!(&*sparse.f, &*dense.f);
         assert_eq!(&*sparse.combined_basis, &*dense.combined_basis);
         assert_eq!(sparse.t_r, dense.t_r);
@@ -15392,15 +15484,12 @@ mod tests {
             state
         };
         for _ in 0..3 {
-            let generators: Vec<F128> = (0..128)
-                .map(|_| F128::new(next(), next()))
-                .collect();
+            let generators: Vec<F128> = (0..128).map(|_| F128::new(next(), next())).collect();
             let table = super::super::ring_switch::build_fold_byte_table(&generators);
             let e_hi = F128::new(next(), next());
             let map =
                 super::super::ring_switch::build_gfni_direct_fold_map_from_generators(&generators);
-            let (got_lo, got_hi) =
-                super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
+            let (got_lo, got_hi) = super::super::ring_switch::compose_block_mats_gfni(&map, e_hi);
             let cols = super::super::ring_switch::compose_block_cols(&table, e_hi);
             assert_eq!(
                 got_lo,
@@ -15414,7 +15503,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn direct_fold4_gfni_gate_is_ranked_shape_only() {
@@ -16589,6 +16677,3 @@ mod tests {
         }
     }
 }
-
-
-

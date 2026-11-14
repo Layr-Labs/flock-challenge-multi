@@ -18,12 +18,11 @@
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
 pub mod bits;
-#[path = "stage_ir.rs"]
-pub mod gf2_kernels;
 pub mod challenger;
 pub mod field;
 pub mod gaptime;
-pub mod rstrace;
+#[path = "stage_ir.rs"]
+pub mod gf2_kernels;
 pub mod gpu;
 pub mod hash;
 pub mod lincheck;
@@ -33,6 +32,7 @@ pub mod pcs;
 pub mod permutation;
 pub mod proof;
 pub mod r1cs;
+pub mod rstrace;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
@@ -361,8 +361,12 @@ pub(crate) mod smt_split {
     fn arm_cpus_for_workers(groups: &[Vec<usize>], ab_workers: usize) -> (Vec<usize>, Vec<usize>) {
         assert!(ab_workers > 0 && ab_workers < 2 * groups.len());
         let (mut ab, mut c) = arm_cpus(groups, false);
-        while ab.len() < ab_workers { ab.push(c.pop().unwrap()); }
-        while ab.len() > ab_workers { c.push(ab.pop().unwrap()); }
+        while ab.len() < ab_workers {
+            ab.push(c.pop().unwrap());
+        }
+        while ab.len() > ab_workers {
+            c.push(ab.pop().unwrap());
+        }
         (ab, c)
     }
 
@@ -398,7 +402,9 @@ pub(crate) mod smt_split {
                     assert_eq!(all, (0..2 * cores).collect::<Vec<_>>());
                     assert_eq!(&ab[..cores], &(0..cores).collect::<Vec<_>>());
                     assert_eq!(c, (cores..2 * cores - moved).collect::<Vec<_>>());
-                    if moved != 0 { assert_eq!(ab.last(), Some(&(2 * cores - 1))); }
+                    if moved != 0 {
+                        assert_eq!(ab.last(), Some(&(2 * cores - 1)));
+                    }
                 }
             }
         }
@@ -578,13 +584,18 @@ pub(crate) mod smt_split {
                 && std::env::var_os("FLOCK_NO_ZC_R1_AB_REBALANCE").is_none();
             let (s0, s1) = super::arm_cpus(&groups, rebalance);
             let (s0, s1) = if cores == 8 {
-                match std::env::var("FLOCK_ZC_R1_AB_WORKERS").ok()
-                    .and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..16).contains(n)) {
+                match std::env::var("FLOCK_ZC_R1_AB_WORKERS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|n| (1..16).contains(n))
+                {
                     Some(workers) => super::arm_cpus_for_workers(&groups, workers),
                     None if rebalance => (s0, s1),
                     None => super::arm_cpus_for_workers(&groups, 7),
                 }
-            } else { (s0, s1) };
+            } else {
+                (s0, s1)
+            };
             let p0 = half(0, s0, debug);
             let p1 = half(1, s1, debug);
             if std::env::var_os("FLOCK_ZC_R1_SMT_SPLIT_IDLE").is_some() {
@@ -675,8 +686,8 @@ fn advise_hugepages(_ptr: *mut u8, _bytes: usize) {}
 /// nothing runs on a CPU the C arm uses) until the caller releases them at the end of round one,
 /// bounded at 1.5 ms. The thread that shares the caller's CPU is left out.
 pub mod r1_owner_awake {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     /// After this long the caller stops spinning and rayon's sleeping wait takes over.
@@ -791,15 +802,18 @@ pub mod r1_owner_awake {
     // `FLOCK_NO_GL1_SIDE=1` runs all three in order on the poster.
     const SIDES: usize = 2;
     static SIDE_BODY: [AtomicU64; SIDES] = [AtomicU64::new(0), AtomicU64::new(0)];
-    static SIDE_STATE: [std::sync::atomic::AtomicU32; SIDES] =
-        [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+    static SIDE_STATE: [std::sync::atomic::AtomicU32; SIDES] = [
+        std::sync::atomic::AtomicU32::new(0),
+        std::sync::atomic::AtomicU32::new(0),
+    ];
     const S_IDLE: u32 = 0;
     const S_POSTED: u32 = 1;
     const S_CLAIMED: u32 = 2;
     const S_DONE: u32 = 3;
 
     pub fn side_enabled() -> bool {
-        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_SIDE").is_none());
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_SIDE").is_none());
         *ON
     }
 
@@ -812,7 +826,9 @@ pub mod r1_owner_awake {
                     .is_ok()
             {
                 // SAFETY: the poster keeps the body alive until it sees S_DONE.
-                let body = unsafe { &**(SIDE_BODY[i].load(Ordering::Acquire) as usize as *const &(dyn Fn() + Sync)) };
+                let body = unsafe {
+                    &**(SIDE_BODY[i].load(Ordering::Acquire) as usize as *const &(dyn Fn() + Sync))
+                };
                 body();
                 SIDE_STATE[i].store(S_DONE, Ordering::Release);
             }
@@ -847,7 +863,10 @@ pub mod r1_owner_awake {
         };
         let fa: &(dyn Fn() + Sync) = &ja;
         let fb: &(dyn Fn() + Sync) = &jb;
-        let bodies = [&fa as *const &(dyn Fn() + Sync) as usize, &fb as *const &(dyn Fn() + Sync) as usize];
+        let bodies = [
+            &fa as *const &(dyn Fn() + Sync) as usize,
+            &fb as *const &(dyn Fn() + Sync) as usize,
+        ];
         for i in 0..SIDES {
             debug_assert_eq!(SIDE_STATE[i].load(Ordering::Relaxed), S_IDLE);
             SIDE_BODY[i].store(bodies[i] as u64, Ordering::Release);
@@ -1024,8 +1043,8 @@ pub mod r1_owner_awake {
 /// caches cost 0.5 ms at 8192 items), so the result is the same sum of the
 /// same per-item values in another grouping.
 pub mod flat_par {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct Shared {
         body: usize, // thin pointer to a `&(dyn Fn() + Sync)`
@@ -1123,7 +1142,12 @@ pub mod flat_par {
                     break;
                 }
                 let take = ((n - cur) / (2 * claimers)).max(1);
-                match next.compare_exchange_weak(cur, cur + take, Ordering::Relaxed, Ordering::Relaxed) {
+                match next.compare_exchange_weak(
+                    cur,
+                    cur + take,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         for i in cur..cur + take {
                             acc = op(acc, f(i));
@@ -1139,7 +1163,11 @@ pub mod flat_par {
                 }
             }
             // SAFETY: slot `me` is owned by this claimer.
-            unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+            unsafe {
+                (slot_addr as *mut core::mem::MaybeUninit<T>)
+                    .add(me)
+                    .write(core::mem::MaybeUninit::new(acc))
+            };
             written[me].store(true, Ordering::Release);
             if completed != 0 {
                 done.fetch_add(completed, Ordering::Release);
@@ -1229,7 +1257,8 @@ pub mod flat_par {
             // SAFETY: the owner keeps the body alive until it has closed the
             // region (`TEAM_SEQ` moved on) and seen `TEAM_ACTIVE` drain; this
             // helper raised `TEAM_ACTIVE` before re-checking the sequence.
-            let body = unsafe { &**(TEAM_BODY.load(Ordering::Acquire) as *const &(dyn Fn() + Sync)) };
+            let body =
+                unsafe { &**(TEAM_BODY.load(Ordering::Acquire) as *const &(dyn Fn() + Sync)) };
             body();
         }
         TEAM_ACTIVE.fetch_sub(1, Ordering::SeqCst);
@@ -1274,7 +1303,8 @@ pub mod flat_par {
         let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
         let done = AtomicUsize::new(0);
         let who = AtomicUsize::new(0);
-        let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
+        let mut slots: [core::mem::MaybeUninit<T>; CAP] =
+            [const { core::mem::MaybeUninit::uninit() }; CAP];
         let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
         let slot_addr = slots.as_mut_ptr() as usize;
         let body = || {
@@ -1286,7 +1316,10 @@ pub mod flat_par {
             let mut acc = id();
             let mut completed = 0usize;
             for i in 0..n {
-                if owner[i] == tid && !claimed[i].load(Ordering::Relaxed) && !claimed[i].swap(true, Ordering::AcqRel) {
+                if owner[i] == tid
+                    && !claimed[i].load(Ordering::Relaxed)
+                    && !claimed[i].swap(true, Ordering::AcqRel)
+                {
                     acc = op(acc, f(i));
                     completed += 1;
                 }
@@ -1301,7 +1334,11 @@ pub mod flat_par {
             }
             if completed != 0 {
                 // SAFETY: slot `me` is owned by this claimer.
-                unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+                unsafe {
+                    (slot_addr as *mut core::mem::MaybeUninit<T>)
+                        .add(me)
+                        .write(core::mem::MaybeUninit::new(acc))
+                };
                 written[me].store(true, Ordering::Release);
                 done.fetch_add(completed, Ordering::Release);
             }
@@ -1309,7 +1346,10 @@ pub mod flat_par {
         let fat: &(dyn Fn() + Sync) = &body;
         let seq = TEAM_SEQ.load(Ordering::Relaxed);
         debug_assert!(seq & 1 == 0, "nested team region");
-        TEAM_BODY.store(&fat as *const &(dyn Fn() + Sync) as usize, Ordering::Release);
+        TEAM_BODY.store(
+            &fat as *const &(dyn Fn() + Sync) as usize,
+            Ordering::Release,
+        );
         TEAM_SEQ.store(seq + 1, Ordering::SeqCst);
         body();
         while done.load(Ordering::Acquire) < n {
@@ -1351,7 +1391,8 @@ pub mod flat_par {
         let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
         let who = AtomicUsize::new(0);
-        let mut slots: [core::mem::MaybeUninit<T>; CAP] = [const { core::mem::MaybeUninit::uninit() }; CAP];
+        let mut slots: [core::mem::MaybeUninit<T>; CAP] =
+            [const { core::mem::MaybeUninit::uninit() }; CAP];
         let written: [AtomicBool; CAP] = [const { AtomicBool::new(false) }; CAP];
         let slot_addr = slots.as_mut_ptr() as usize;
         let agg = done_once();
@@ -1372,7 +1413,12 @@ pub mod flat_par {
                     break;
                 }
                 let take = ((n - cur) / (2 * claimers)).max(1);
-                match next.compare_exchange_weak(cur, cur + take, Ordering::Relaxed, Ordering::Relaxed) {
+                match next.compare_exchange_weak(
+                    cur,
+                    cur + take,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         for i in cur..cur + take {
                             acc = op(acc, f(i));
@@ -1390,7 +1436,11 @@ pub mod flat_par {
             }
             if any {
                 // SAFETY: slot `me` is owned by this claimer.
-                unsafe { (slot_addr as *mut core::mem::MaybeUninit<T>).add(me).write(core::mem::MaybeUninit::new(acc)) };
+                unsafe {
+                    (slot_addr as *mut core::mem::MaybeUninit<T>)
+                        .add(me)
+                        .write(core::mem::MaybeUninit::new(acc))
+                };
                 written[me].store(true, Ordering::Release);
             }
             if completed != 0 {
@@ -1400,7 +1450,10 @@ pub mod flat_par {
         let fat: &(dyn Fn() + Sync) = &body;
         let seq = TEAM_SEQ.load(Ordering::Relaxed);
         debug_assert!(seq & 1 == 0, "nested team region");
-        TEAM_BODY.store(&fat as *const &(dyn Fn() + Sync) as usize, Ordering::Release);
+        TEAM_BODY.store(
+            &fat as *const &(dyn Fn() + Sync) as usize,
+            Ordering::Release,
+        );
         TEAM_SEQ.store(seq + 1, Ordering::SeqCst);
         body();
         while done.load(Ordering::Acquire) < n {
@@ -1529,7 +1582,9 @@ pub mod hot_pool {
         }
 
         pub fn unregister(t: &Task) {
-            LIST.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| !Arc::ptr_eq(x, t));
+            LIST.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|x| !Arc::ptr_eq(x, t));
             GEN.fetch_add(1, Ordering::AcqRel);
         }
 
@@ -1608,7 +1663,8 @@ pub mod hot_pool {
                 bcast();
             }
             // Lane gl1: the owner may dispatch team regions to the spinners.
-            let prev = crate::flat_par::TEAM_OWNER.swap(crate::flat_par::team_token(), Ordering::AcqRel);
+            let prev =
+                crate::flat_par::TEAM_OWNER.swap(crate::flat_par::team_token(), Ordering::AcqRel);
             Some(Self(run, prev))
         }
     }
@@ -1684,7 +1740,8 @@ pub fn sl2_env_live() -> bool {
 
 /// Lane sl2: set by the ranked worker for the timed speculative prove, whose
 /// process exits right after publishing (its tail may leak instead of free).
-pub static SL2_TIMED_TAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static SL2_TIMED_TAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// `FLOCK_NO_SL2_LEAK=1` keeps every free in the timed prove's tail.
 pub fn sl2_leak_tail() -> bool {

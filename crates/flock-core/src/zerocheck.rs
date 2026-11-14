@@ -15,7 +15,6 @@
 //! is tested on honest witnesses; verify also rejects byte-mutated proofs and
 //! shape-corrupted ones.
 
-
 /// One-time resolution of a diagnostic flag. The process environment does not
 /// change after entry, so the first answer is the answer every later call would
 /// get; caching it keeps a lock and a string scan out of the per-round path.
@@ -38,11 +37,10 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    eval_round3_lookahead, fold_and_compute_round_pair_into, fold_in_place_pair,
-    fold2_from_packed_and_round_pair_lookahead_into_with_eq,
-    fold2_plain_and_round_pair_lookahead_into_lm, fold2_plain_and_round4_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, marginalize_eq_low2,
-    eval_round4_lookahead, packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
+    eval_round3_lookahead, eval_round4_lookahead, fold_and_compute_round_pair_into,
+    fold_in_place_pair, fold2_from_packed_and_round_pair_lookahead_into_with_eq,
+    fold2_plain_and_round4_into, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    marginalize_eq_low2, packed_round2_split_eq, plain_cascade_lo_size, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
     uni_skip_fold_and_round_pair_optimized_packed_padded_lookahead,
     uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq, zc_lane_major_handoff_on,
@@ -101,12 +99,11 @@ pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
 /// Cascade level of the deeper tail cascade (`FLOCK_ZC_C3_AT`, 1 or 2;
 /// default 2). `FLOCK_NO_ZC_C3=1` turns the deeper cascade off.
 fn zc_c3_at() -> usize {
-    static AT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        match std::env::var("FLOCK_ZC_C3_AT").ok().as_deref() {
+    static AT: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| match std::env::var("FLOCK_ZC_C3_AT").ok().as_deref() {
             Some("1") => 1,
             _ => 2,
-        }
-    });
+        });
     *AT
 }
 
@@ -616,14 +613,16 @@ fn prove_packed_padded_inner<C: Challenger>(
     static GL1_R345_PRE: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R345_PRE").is_none());
     let gl1_r345_pre = *GL1_R345_PRE;
-    let r345_pre_slot: std::sync::OnceLock<(Vec<F128>, Option<Vec<F128>>)> = std::sync::OnceLock::new();
+    let r345_pre_slot: std::sync::OnceLock<(Vec<F128>, Option<Vec<F128>>)> =
+        std::sync::OnceLock::new();
     let peq_idle = || {
         let peq = peq_slot.get_or_init(|| packed_round2_split_eq(&mlv_pre));
         if gl1_r345_pre && peq.n_lo >= 4 {
             r345_pre_slot.get_or_init(|| multilinear::three_var::r345_pre_tables(&peq.lo));
         }
     };
-    let peq_idle_arg: Option<&(dyn Fn() + Sync)> = if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
+    let peq_idle_arg: Option<&(dyn Fn() + Sync)> =
+        if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -936,7 +935,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     let eq_is_early = use_nomat && peq_early.is_some();
     let mut r345_pre_slot = r345_pre_slot;
     let mut packed_eq = use_nomat
-        .then(|| peq_early.take().unwrap_or_else(|| packed_round2_split_eq(&mlv_arg)))
+        .then(|| {
+            peq_early
+                .take()
+                .unwrap_or_else(|| packed_round2_split_eq(&mlv_arg))
+        })
         // The composed packed leaf requires at least one low variable after
         // the two-coordinate marginalization. Tiny test shapes keep their
         // independently built split.
@@ -1033,12 +1036,21 @@ fn prove_packed_padded_inner<C: Challenger>(
     ZC_3VAR_LAST.store(use_3var, std::sync::atomic::Ordering::Relaxed);
     if use_3var && hoisted_flag!("FLOCK_ZC_3VAR_CHECK") {
         let want = multilinear::three_var::round4_lookahead_ref(
-            a_packed, b_packed, &fold_table, &mlv_arg, padding, k_skip,
+            a_packed,
+            b_packed,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            k_skip,
         );
         let got = la4.unwrap();
         for k in 0..9 {
             if got.v1[k] != want.v1[k] || got.vinf[k] != want.vinf[k] {
-                eprintln!("[zc3-check] MISMATCH k={k} v1 {} vinf {}", got.v1[k] == want.v1[k], got.vinf[k] == want.vinf[k]);
+                eprintln!(
+                    "[zc3-check] MISMATCH k={k} v1 {} vinf {}",
+                    got.v1[k] == want.v1[k],
+                    got.vinf[k] == want.vinf[k]
+                );
             }
         }
         eprintln!("[zc3-check] done (equal={})", got == want);
@@ -1085,10 +1097,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // continues from there. `n_mlv ≥ 7` (level 2) / `≥ 8` (level 3) keep
     // every composed input ≥ 16 and every eq split at lo_size ≥ 2.
     // Kill switches: FLOCK_NO_ZC_CASCADE2 / FLOCK_NO_ZC_CASCADE3.
-    let use_cascade2 = use_lookahead
-        && n_mlv >= 7 + off
-        && r[k_skip + 3 + off] != F128::ZERO
-        && !cascade2_off();
+    let use_cascade2 =
+        use_lookahead && n_mlv >= 7 + off && r[k_skip + 3 + off] != F128::ZERO && !cascade2_off();
     // Deeper tail cascade (`FLOCK_NO_ZC_C3`): the level before cascade level
     // `c3_at` also defers the round two ahead of its message as a biquadratic
     // (`casc`), so level `c3_at` folds three variables and every later level
@@ -1123,14 +1133,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     let off2 = off + c3 as usize;
     // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain; with
     // ZC-3VAR every level sits one variable later (`off`).
-    let use_cascade4 = use_cascade3
-        && n_mlv >= 10 + off2
-        && r[k_skip + 7 + off2] != F128::ZERO
-        && !cascade4_off();
-    let use_cascade5 = use_cascade4
-        && n_mlv >= 12 + off2
-        && r[k_skip + 9 + off2] != F128::ZERO
-        && !cascade5_off();
+    let use_cascade4 =
+        use_cascade3 && n_mlv >= 10 + off2 && r[k_skip + 7 + off2] != F128::ZERO && !cascade4_off();
+    let use_cascade5 =
+        use_cascade4 && n_mlv >= 12 + off2 && r[k_skip + 9 + off2] != F128::ZERO && !cascade5_off();
     let use_cascade6 = use_cascade5
         && n_mlv >= 14 + off2
         && r[k_skip + 11 + off2] != F128::ZERO
@@ -1213,7 +1219,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         }
         if c3_level {
             // Round seven from the r345 pass's biquadratic at (ρ₄, ρ₅). No pass.
-            let la = la7.take().expect("deeper cascade without its round-seven lookahead");
+            let la = la7
+                .take()
+                .expect("deeper cascade without its round-seven lookahead");
             let (g1, ginf) = eval_round4_lookahead(
                 &la,
                 mlv_rhos[2 * level + lo_off],
@@ -1235,129 +1243,171 @@ fn prove_packed_padded_inner<C: Challenger>(
         let n_cur = if level == 0 { n_in } else { a_mlv.len() };
         crate::rstrace::ev("zt:lv0", n_cur.trailing_zeros());
         let log_n_cur = n_cur.trailing_zeros() as usize;
-        let quarter = if (level == 0 && use_3var) || c3_level { n_cur / 8 } else { n_cur / 4 };
-        let shift = if (level == 0 && use_3var) || c3_level { 3 } else { 2 };
+        let quarter = if (level == 0 && use_3var) || c3_level {
+            n_cur / 8
+        } else {
+            n_cur / 4
+        };
+        let shift = if (level == 0 && use_3var) || c3_level {
+            3
+        } else {
+            2
+        };
         let mut r_next = vec![F128::ONE; log_n_cur - shift];
         r_next[1..].copy_from_slice(&r[k_skip + 2 * level + 1 + shift + lo_off..]);
         // This level may store lane-major tiles only for another lookahead
         // level (the last level's pair fold reads row-major) whose chunks are
         // all eight-group chunks; its own chunk split is checked per branch.
         let lm_reader_ok =
-            lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter) % 8 == 0;
-        let (m_even_1, m_even_inf, lm_out) = if level == 0 && use_3var {
-            // Rounds 3+4+5 straight from the packed witness: one pass folds
-            // X₁..X₃ into N/8 tables and yields round five + round-six lookahead.
-            let mut a8 = crate::scratch::take_f128(quarter);
-            let mut b8 = crate::scratch::take_f128(quarter);
-            crate::rstrace::ev("r345:take", 0);
-            let round2_eq = packed_eq.take();
-            let mut r345_pre = r345_pre_slot.take();
-            let eq_lo = round2_eq.as_ref().filter(|eq| eq.n_lo >= 4).map(|eq| {
-                match r345_pre.as_mut() {
-                    Some((lo, _)) if eq_is_early => std::mem::take(lo),
-                    _ => multilinear::three_var::marginalize_eq_low3(&eq.lo),
+            lm_handoff && level + 2 < n_levels && plain_cascade_lo_size(quarter).is_multiple_of(8);
+        let (m_even_1, m_even_inf, lm_out) =
+            if level == 0 && use_3var {
+                // Rounds 3+4+5 straight from the packed witness: one pass folds
+                // X₁..X₃ into N/8 tables and yields round five + round-six lookahead.
+                let mut a8 = crate::scratch::take_f128(quarter);
+                let mut b8 = crate::scratch::take_f128(quarter);
+                crate::rstrace::ev("r345:take", 0);
+                let round2_eq = packed_eq.take();
+                let mut r345_pre = r345_pre_slot.take();
+                let eq_lo = round2_eq.as_ref().filter(|eq| eq.n_lo >= 4).map(|eq| {
+                    match r345_pre.as_mut() {
+                        Some((lo, _)) if eq_is_early => std::mem::take(lo),
+                        _ => multilinear::three_var::marginalize_eq_low3(&eq.lo),
+                    }
+                });
+                let pre_wtab = if eq_is_early {
+                    r345_pre.as_ref().and_then(|p| p.1.as_deref())
+                } else {
+                    None
+                };
+                let eq_override = match (&eq_lo, &round2_eq) {
+                    (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
+                    _ => None,
+                };
+                let lm_out = lm_reader_ok
+                    && cfg!(target_arch = "x86_64")
+                    && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
+                // The ranked brand round two's canonical-window elision ran on:
+                // the same static B rows let this pass skip them too.
+                let b_canonical = r2_canon_rows.is_some()
+                    && padding.k_log == 14
+                    && padding.useful_bits_per_block == 15_409
+                    && m >= k_skip + 8
+                    && multilinear::round2_canonical_elide_enabled();
+                if zc_timing {
+                    eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical} c3={c3}");
                 }
-            });
-            let pre_wtab = if eq_is_early { r345_pre.as_ref().and_then(|p| p.1.as_deref()) } else { None };
-            let eq_override = match (&eq_lo, &round2_eq) {
-                (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
-                _ => None,
-            };
-            let lm_out = lm_reader_ok
-                && cfg!(target_arch = "x86_64")
-                && eq_lo.as_ref().is_some_and(|lo| lo.len() % 16 == 0);
-            // The ranked brand round two's canonical-window elision ran on:
-            // the same static B rows let this pass skip them too.
-            let b_canonical = r2_canon_rows.is_some()
-                && padding.k_log == 14
-                && padding.useful_bits_per_block == 15_409
-                && m >= k_skip + 8
-                && multilinear::round2_canonical_elide_enabled();
-            if zc_timing {
-                eprintln!("[zc-timing] rounds 3+4+5 pass: b_canonical={b_canonical} c3={c3}");
-            }
-            debug_assert!(!c3_r345 || b_canonical == r345_b_canonical);
-            crate::rstrace::ev("r345:call", 0);
-            let (m1, mi, la_next, la7_next) =
-                multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                debug_assert!(!c3_r345 || b_canonical == r345_b_canonical);
+                crate::rstrace::ev("r345:call", 0);
+                let (m1, mi, la_next, la7_next) =
+                    multilinear::three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                        a_packed,
+                        b_packed,
+                        m,
+                        k_skip,
+                        &fold_table,
+                        padding,
+                        &mut a8,
+                        &mut b8,
+                        [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]],
+                        &r_next,
+                        eq_override,
+                        lm_out && !c3_r345,
+                        b_canonical,
+                        c3_r345,
+                        pre_wtab,
+                    );
+                assert_eq!(
+                    la7_next.is_some(),
+                    c3_r345,
+                    "deeper cascade route did not run"
+                );
+                la7 = la7_next;
+                a_mlv = a8;
+                b_mlv = b8;
+                if level + 1 < n_levels {
+                    la = Some(la_next);
+                }
+                // With c3_r345 the tables are octet-layout; level 1 reads them as such.
+                (m1, mi, lm_out && !c3_r345)
+            } else if level == 0 && use_nomat {
+                // Rounds 3+4 straight from the packed witness (see above); the
+                // outputs land in freshly taken N/4 buffers, and the old (empty)
+                // pair is dropped. Also yields the round-five lookahead.
+                let mut a4 = crate::scratch::take_f128(quarter);
+                let mut b4 = crate::scratch::take_f128(quarter);
+                let round2_eq = packed_eq.take();
+                let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
+                let eq_override = match (&eq_lo, &round2_eq) {
+                    (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
+                    _ => None,
+                };
+                let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
+                let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
                     a_packed,
                     b_packed,
                     m,
                     k_skip,
                     &fold_table,
                     padding,
-                    &mut a8,
-                    &mut b8,
-                    [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]],
+                    &mut a4,
+                    &mut b4,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
                     &r_next,
                     eq_override,
-                    lm_out && !c3_r345,
-                    b_canonical,
-                    c3_r345,
-                    pre_wtab,
+                    lm_out,
                 );
-            assert_eq!(la7_next.is_some(), c3_r345, "deeper cascade route did not run");
-            la7 = la7_next;
-            a_mlv = a8;
-            b_mlv = b8;
-            if level + 1 < n_levels {
+                a_mlv = a4;
+                b_mlv = b4;
+                if level + 1 < n_levels {
+                    la = Some(la_next);
+                }
+                (m1, mi, lm_out)
+            } else if c3_level {
+                let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2).is_multiple_of(8);
+                let (m1, mi, la_next) = multilinear::fold3_oct_plain_and_round_pair_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    [
+                        mlv_rhos[2 * level + lo_off],
+                        mlv_rhos[2 * level + 1 + lo_off],
+                        mlv_rhos[2 * level + 2 + lo_off],
+                    ],
+                    &r_next,
+                    lm_out,
+                );
+                if level + 1 < n_levels {
+                    la = Some(la_next);
+                }
+                (m1, mi, lm_out)
+            } else if level + 1 < n_levels {
+                let lm_out =
+                    lm_reader_ok && plain_cascade_lo_size(n_cur).is_multiple_of(8) && !casc_level;
+                let (m1, mi, la_next, la7_next) =
+                    multilinear::fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                        &a_mlv,
+                        &b_mlv,
+                        &mut a_nxt[..quarter],
+                        &mut b_nxt[..quarter],
+                        mlv_rhos[2 * level + lo_off],
+                        mlv_rhos[2 * level + 1 + lo_off],
+                        &r_next,
+                        lm_in,
+                        lm_out,
+                        casc_level,
+                        gl1_team,
+                    );
                 la = Some(la_next);
-            }
-            // With c3_r345 the tables are octet-layout; level 1 reads them as such.
-            (m1, mi, lm_out && !c3_r345)
-        } else if level == 0 && use_nomat {
-            // Rounds 3+4 straight from the packed witness (see above); the
-            // outputs land in freshly taken N/4 buffers, and the old (empty)
-            // pair is dropped. Also yields the round-five lookahead.
-            let mut a4 = crate::scratch::take_f128(quarter);
-            let mut b4 = crate::scratch::take_f128(quarter);
-            let round2_eq = packed_eq.take();
-            let eq_lo = round2_eq.as_ref().map(|eq| marginalize_eq_low2(&eq.lo));
-            let eq_override = match (&eq_lo, &round2_eq) {
-                (Some(lo), Some(eq)) => Some((&lo[..], &eq.hi[..])),
-                _ => None,
-            };
-            let lm_out = lm_reader_ok && eq_lo.as_ref().is_some_and(|lo| lo.len() % 8 == 0);
-            let (m1, mi, la_next) = fold2_from_packed_and_round_pair_lookahead_into_with_eq(
-                a_packed,
-                b_packed,
-                m,
-                k_skip,
-                &fold_table,
-                padding,
-                &mut a4,
-                &mut b4,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next,
-                eq_override,
-                lm_out,
-            );
-            a_mlv = a4;
-            b_mlv = b4;
-            if level + 1 < n_levels {
-                la = Some(la_next);
-            }
-            (m1, mi, lm_out)
-        } else if c3_level {
-            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
-            let (m1, mi, la_next) = multilinear::fold3_oct_plain_and_round_pair_lookahead_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..quarter],
-                &mut b_nxt[..quarter],
-                [mlv_rhos[2 * level + lo_off], mlv_rhos[2 * level + 1 + lo_off], mlv_rhos[2 * level + 2 + lo_off]],
-                &r_next,
-                lm_out,
-            );
-            if level + 1 < n_levels {
-                la = Some(la_next);
-            }
-            (m1, mi, lm_out)
-        } else if level + 1 < n_levels {
-            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
-            let (m1, mi, la_next, la7_next) =
-                multilinear::fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                if casc_level {
+                    la7 = la7_next;
+                }
+                (m1, mi, lm_out)
+            } else {
+                debug_assert!(!lm_in, "the last composed level reads row-major pairs");
+                let (m1, mi) = fold2_plain_and_round4_into(
                     &a_mlv,
                     &b_mlv,
                     &mut a_nxt[..quarter],
@@ -1365,29 +1415,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                     mlv_rhos[2 * level + lo_off],
                     mlv_rhos[2 * level + 1 + lo_off],
                     &r_next,
-                    lm_in,
-                    lm_out,
-                    casc_level,
-                    gl1_team,
                 );
-            la = Some(la_next);
-            if casc_level {
-                la7 = la7_next;
-            }
-            (m1, mi, lm_out)
-        } else {
-            debug_assert!(!lm_in, "the last composed level reads row-major pairs");
-            let (m1, mi) = fold2_plain_and_round4_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..quarter],
-                &mut b_nxt[..quarter],
-                mlv_rhos[2 * level + lo_off],
-                mlv_rhos[2 * level + 1 + lo_off],
-                &r_next,
-            );
-            (m1, mi, false)
-        };
+                (m1, mi, false)
+            };
         crate::rstrace::ev("lv:out", level as u32);
         lm_in = lm_out;
         crate::rstrace::ev("zt:lv1", level as u32);
@@ -1964,7 +1994,11 @@ mod tests {
                 ZC_3VAR_FORCED_OFF.store(off, Ordering::Relaxed);
                 let mut ch = FsChallenger::new(b"flock-test-v0");
                 out.push(prove_packed_padded(&a_p, &b_p, &c_p, m, &padding, &mut ch));
-                assert_eq!(ZC_3VAR_LAST.load(Ordering::Relaxed), !off, "3var engagement m={m}");
+                assert_eq!(
+                    ZC_3VAR_LAST.load(Ordering::Relaxed),
+                    !off,
+                    "3var engagement m={m}"
+                );
             }
             ZC_3VAR_FORCED_OFF.store(false, Ordering::Relaxed);
             assert_eq!(out[0].0, out[1].0, "proof diverges m={m} padded={padded}");

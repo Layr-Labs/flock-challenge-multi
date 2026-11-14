@@ -54,8 +54,14 @@ pub fn mark(label: &'static str) {
     let t_ms = now.saturating_sub(begin) as f64 / 1e6;
     if who_enabled() {
         let owner = crate::is_pool_owner();
-        let name = std::thread::current().name().map(str::to_owned).unwrap_or_default();
-        eprintln!("[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}  [who idx={:?} owner={owner} thr={name}]", rayon::current_thread_index());
+        let name = std::thread::current()
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        eprintln!(
+            "[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}  [who idx={:?} owner={owner} thr={name}]",
+            rayon::current_thread_index()
+        );
         return;
     }
     eprintln!("[gap] +{d_ms:9.3} ms  @{t_ms:9.3} ms  {label}");
@@ -70,8 +76,13 @@ pub fn who_enabled() -> bool {
 
 // TEMP-ABS-TRACE
 #[repr(C)]
-struct Ts { s: i64, ns: i64 }
-unsafe extern "C" { fn clock_gettime(clk: i32, ts: *mut Ts) -> i32; }
+struct Ts {
+    s: i64,
+    ns: i64,
+}
+unsafe extern "C" {
+    fn clock_gettime(clk: i32, ts: *mut Ts) -> i32;
+}
 pub fn abs_enabled() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_ABS_TRACE").is_some());
     *ON
@@ -79,16 +90,25 @@ pub fn abs_enabled() -> bool {
 static ABS_BUF: std::sync::Mutex<Vec<(u64, &'static str)>> = std::sync::Mutex::new(Vec::new());
 pub fn abs(label: &'static str) {
     crate::rstrace::ev(label, 1);
-    if !abs_enabled() { return; }
+    if !abs_enabled() {
+        return;
+    }
     let mut t = Ts { s: 0, ns: 0 };
     unsafe { clock_gettime(1, &mut t) };
     let ns = t.s as u64 * 1_000_000_000 + t.ns as u64;
     ABS_BUF.lock().unwrap().push((ns, label));
 }
 pub fn abs_flush() {
-    if !abs_enabled() { return; }
+    if !abs_enabled() {
+        return;
+    }
     let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+    let f: Vec<&str> = st
+        .rsplit(')')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
     let minflt = f.get(7).copied().unwrap_or("?");
     for (ns, l) in ABS_BUF.lock().unwrap().drain(..) {
         eprintln!("[abs] {ns} {l} minflt={minflt}");

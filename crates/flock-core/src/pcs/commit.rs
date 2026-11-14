@@ -245,12 +245,20 @@ pub fn commit_into(
 /// input nor target pointers may escape the callback.
 /// No shared view of z may coexist with these writes. Unwinding joins all
 /// callbacks and publishes no completed commitment.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 pub unsafe fn commit_generated_into(
     z_packed: &mut [F128],
     params: &PcsParams,
     codeword: Vec<F128>,
-    produce: &(dyn Fn(*mut F128, usize, usize, Option<&crate::ntt::additive_ntt_f128::WitnessSeedTarget>) + Sync),
+    produce: &(
+         dyn Fn(*mut F128, usize, usize, Option<&crate::ntt::additive_ntt_f128::WitnessSeedTarget>)
+             + Sync
+     ),
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(params.log_msg_len(), 25);
@@ -338,13 +346,22 @@ fn finalize_commit(
     }
 
     finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
-        ntt.rs_encode_interleaved_on_range_done(z_packed, codeword, params.num_ntts(), on_range_done);
+        ntt.rs_encode_interleaved_on_range_done(
+            z_packed,
+            codeword,
+            params.num_ntts(),
+            on_range_done,
+        );
     })
 }
 
 /// Shared CPU commit tail: the encoder invokes the original Merkle callback
 /// only for final codeword ranges, then joins before upper levels are built.
-#[allow(clippy::collapsible_if, clippy::manual_is_multiple_of, clippy::manual_slice_size_calculation)]
+#[allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::manual_slice_size_calculation
+)]
 fn finalize_cpu_commit(
     mut codeword: Vec<F128>,
     params: &PcsParams,
@@ -404,182 +421,188 @@ fn finalize_cpu_commit(
     // roots up four more levels, so the serial post-join build starts from
     // 32 nodes instead of 512. Same pair hashes, same tree slots.
     const SL2_SUPER: usize = 16;
-    let sl2_super = sl2_super_enabled() && !sub_blocks_done.is_empty()
+    let sl2_super = sl2_super_enabled()
+        && !sub_blocks_done.is_empty()
         && sub_blocks_done.len().is_multiple_of(SL2_SUPER);
     let super_done: Vec<std::sync::atomic::AtomicU32> = if sl2_super {
-        (0..sub_blocks_done.len() / SL2_SUPER).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()
+        (0..sub_blocks_done.len() / SL2_SUPER)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect()
     } else {
         Vec::new()
     };
     let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
     crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
-    encode(
-        &mut codeword,
-        &|range, sub_data| {
-            debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
-            // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
-            // the one-shot `merkle_tree` cast in the previous barrier path.
-            let bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    sub_data.as_ptr() as *const u8,
-                    sub_data.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            // At cut depth one, every two ordinary leaves are hashed directly
-            // to their parent and only that parent level is retained. Ranked
-            // deep-pass ranges are even-sized and pair-aligned, so workers
-            // still own disjoint output ranges.
-            let stored_range = if merkle_cut_depth == 1 {
-                assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
-                assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
-                (range.start >> 1)..(range.end >> 1)
-            } else {
-                range.clone()
-            };
-            // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
-            // range; only this worker writes it, and all corresponding NTT
-            // rows have retired on this thread.
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (tree_addr as *mut Hash).add(stored_range.start),
-                    stored_range.len(),
-                )
-            };
-            if merkle_cut_depth == 1 {
-                merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
-            } else {
-                merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
-            }
+    encode(&mut codeword, &|range, sub_data| {
+        debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
+        // Zero-copy: F128 is repr(C, align(16)) lo||hi LE — same bytes as
+        // the one-shot `merkle_tree` cast in the previous barrier path.
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                sub_data.as_ptr() as *const u8,
+                sub_data.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        // At cut depth one, every two ordinary leaves are hashed directly
+        // to their parent and only that parent level is retained. Ranked
+        // deep-pass ranges are even-sized and pair-aligned, so workers
+        // still own disjoint output ranges.
+        let stored_range = if merkle_cut_depth == 1 {
+            assert_eq!(range.start & 1, 0, "Merkle-cut range is not pair-aligned");
+            assert_eq!(range.len() & 1, 0, "Merkle-cut range has odd length");
+            (range.start >> 1)..(range.end >> 1)
+        } else {
+            range.clone()
+        };
+        // SAFETY: each deep-pass sub-group maps to a disjoint stored-node
+        // range; only this worker writes it, and all corresponding NTT
+        // rows have retired on this thread.
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(
+                (tree_addr as *mut Hash).add(stored_range.start),
+                stored_range.len(),
+            )
+        };
+        if merkle_cut_depth == 1 {
+            merkle::hash_leaf_pairs_serial(bytes, leaf_size, out, kind);
+        } else {
+            merkle::hash_leaves_serial(bytes, leaf_size, out, kind);
+        }
 
-            if !subtree_parents {
-                return;
+        if !subtree_parents {
+            return;
+        }
+        // The deep block-fused schedule retires sixteen 128-leaf blocks
+        // per 2048-leaf subgroup. Keep hashing each block's leaves at
+        // retirement for producer/consumer overlap, but fold parents
+        // only when the subgroup's final FIFO block arrives. At that
+        // point all 2048 leaf CVs are ready, so one depth-11 fold fills
+        // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
+        let Some(parent_range) = (if regroup_subtree_parents
+            && range.len() == RANKED_PARENT_BLOCK_LEAVES
+            && range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
+            && !sub_blocks_done.is_empty()
+        {
+            // Order-free regroup: blocks of one 2048-leaf subgroup may be
+            // hashed by different workers in any order. The worker that
+            // retires the subgroup's last block folds it; the AcqRel RMW
+            // chain orders every other block's leaf writes before it.
+            let sg = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
+            let per = (RANKED_PARENT_SUBGROUP_LEAVES / RANKED_PARENT_BLOCK_LEAVES) as u32;
+            if sub_blocks_done[sg].fetch_add(1, Ordering::AcqRel) + 1 == per {
+                let lo = sg * RANKED_PARENT_SUBGROUP_LEAVES;
+                Some(lo..lo + RANKED_PARENT_SUBGROUP_LEAVES)
+            } else {
+                None
             }
-            // The deep block-fused schedule retires sixteen 128-leaf blocks
-            // per 2048-leaf subgroup. Keep hashing each block's leaves at
-            // retirement for producer/consumer overlap, but fold parents
-            // only when the subgroup's final FIFO block arrives. At that
-            // point all 2048 leaf CVs are ready, so one depth-11 fold fills
-            // the BLAKE3 SIMD lanes that sixteen depth-7 folds leave sparse.
-            let Some(parent_range) = (if regroup_subtree_parents
-                && range.len() == RANKED_PARENT_BLOCK_LEAVES
-                && range.start.is_multiple_of(RANKED_PARENT_BLOCK_LEAVES)
-                && !sub_blocks_done.is_empty()
+        } else {
+            local_parent_fold_range(&range, regroup_subtree_parents)
+        }) else {
+            return;
+        };
+        let parent_range = if merkle_cut_depth == 1 {
+            (parent_range.start >> 1)..(parent_range.end >> 1)
+        } else {
+            parent_range
+        };
+        let len = parent_range.len();
+        let depth = if len.is_power_of_two()
+            && len >= 2
+            && parent_range.start % len == 0
+            && stored_leaves % len == 0
+        {
+            len.trailing_zeros() as usize
+        } else {
+            0
+        };
+        // Publish this sub-group's depth; every sub-group must agree.
+        let seen = match local_levels.compare_exchange(
+            usize::MAX,
+            depth,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => depth,
+            Err(prev) => prev,
+        };
+        if seen != depth {
+            local_levels.store(0, Ordering::Release);
+        }
+        if depth == 0 || seen == 0 {
+            return;
+        }
+        // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
+        // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
+        // nodes [start >> j, (start + len) >> j) of it.
+        let mut lvl_read_off = parent_range.start; // level 0 = leaves
+        let mut lvl_read_len = len;
+        for j in 1..=depth {
+            let nodes_j = stored_leaves >> j;
+            let base_j = 2 * stored_leaves - 2 * nodes_j;
+            let write_off = base_j + (parent_range.start >> j);
+            let write_len = len >> j;
+            // SAFETY: the read range is this worker's own just-written
+            // nodes of level j−1 (leaves for j = 1); the write range is
+            // this worker's own disjoint slice of level j. Both are inside
+            // the 2·n_leaves−1 tree and never alias each other.
+            let (read, write) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        (tree_addr as *const Hash).add(lvl_read_off),
+                        lvl_read_len,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        (tree_addr as *mut Hash).add(write_off),
+                        write_len,
+                    ),
+                )
+            };
+            merkle::hash_pairs_level_serial(read, write, kind);
+            lvl_read_off = write_off;
+            lvl_read_len = write_len;
+        }
+        if !super_done.is_empty() {
+            if len != RANKED_PARENT_SUBGROUP_LEAVES >> merkle_cut_depth
+                || !parent_range.start.is_multiple_of(len)
             {
-                // Order-free regroup: blocks of one 2048-leaf subgroup may be
-                // hashed by different workers in any order. The worker that
-                // retires the subgroup's last block folds it; the AcqRel RMW
-                // chain orders every other block's leaf writes before it.
-                let sg = range.start / RANKED_PARENT_SUBGROUP_LEAVES;
-                let per = (RANKED_PARENT_SUBGROUP_LEAVES / RANKED_PARENT_BLOCK_LEAVES) as u32;
-                if sub_blocks_done[sg].fetch_add(1, Ordering::AcqRel) + 1 == per {
-                    let lo = sg * RANKED_PARENT_SUBGROUP_LEAVES;
-                    Some(lo..lo + RANKED_PARENT_SUBGROUP_LEAVES)
-                } else {
-                    None
-                }
-            } else {
-                local_parent_fold_range(&range, regroup_subtree_parents)
-            }) else {
-                return;
-            };
-            let parent_range = if merkle_cut_depth == 1 {
-                (parent_range.start >> 1)..(parent_range.end >> 1)
-            } else {
-                parent_range
-            };
-            let len = parent_range.len();
-            let depth = if len.is_power_of_two()
-                && len >= 2
-                && parent_range.start % len == 0
-                && stored_leaves % len == 0
-            {
-                len.trailing_zeros() as usize
-            } else {
-                0
-            };
-            // Publish this sub-group's depth; every sub-group must agree.
-            let seen = match local_levels.compare_exchange(
-                usize::MAX,
-                depth,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => depth,
-                Err(prev) => prev,
-            };
-            if seen != depth {
-                local_levels.store(0, Ordering::Release);
-            }
-            if depth == 0 || seen == 0 {
+                super_ok.store(false, Ordering::Release);
                 return;
             }
-            // Level j (j ≥ 1) has n_leaves >> j nodes and starts at flat
-            // offset 2·n_leaves − 2·(n_leaves >> j); this sub-group owns
-            // nodes [start >> j, (start + len) >> j) of it.
-            let mut lvl_read_off = parent_range.start; // level 0 = leaves
-            let mut lvl_read_len = len;
-            for j in 1..=depth {
+            let sg = parent_range.start / len;
+            let sup = sg / SL2_SUPER;
+            if super_done[sup].fetch_add(1, Ordering::AcqRel) + 1 != SL2_SUPER as u32 {
+                return;
+            }
+            // Every subgroup root of this supergroup is published (AcqRel
+            // chain); fold them four levels on this worker.
+            let mut node_lo = sup * SL2_SUPER; // index at level `depth`
+            let mut n = SL2_SUPER;
+            let mut j = depth;
+            while n > 1 {
                 let nodes_j = stored_leaves >> j;
                 let base_j = 2 * stored_leaves - 2 * nodes_j;
-                let write_off = base_j + (parent_range.start >> j);
-                let write_len = len >> j;
-                // SAFETY: the read range is this worker's own just-written
-                // nodes of level j−1 (leaves for j = 1); the write range is
-                // this worker's own disjoint slice of level j. Both are inside
-                // the 2·n_leaves−1 tree and never alias each other.
+                let nodes_k = stored_leaves >> (j + 1);
+                let base_k = 2 * stored_leaves - 2 * nodes_k;
                 let (read, write) = unsafe {
                     (
                         core::slice::from_raw_parts(
-                            (tree_addr as *const Hash).add(lvl_read_off),
-                            lvl_read_len,
+                            (tree_addr as *const Hash).add(base_j + node_lo),
+                            n,
                         ),
                         core::slice::from_raw_parts_mut(
-                            (tree_addr as *mut Hash).add(write_off),
-                            write_len,
+                            (tree_addr as *mut Hash).add(base_k + node_lo / 2),
+                            n / 2,
                         ),
                     )
                 };
                 merkle::hash_pairs_level_serial(read, write, kind);
-                lvl_read_off = write_off;
-                lvl_read_len = write_len;
+                node_lo /= 2;
+                n /= 2;
+                j += 1;
             }
-            if !super_done.is_empty() {
-                if len != RANKED_PARENT_SUBGROUP_LEAVES >> merkle_cut_depth
-                    || !parent_range.start.is_multiple_of(len)
-                {
-                    super_ok.store(false, Ordering::Release);
-                    return;
-                }
-                let sg = parent_range.start / len;
-                let sup = sg / SL2_SUPER;
-                if super_done[sup].fetch_add(1, Ordering::AcqRel) + 1 != SL2_SUPER as u32 {
-                    return;
-                }
-                // Every subgroup root of this supergroup is published (AcqRel
-                // chain); fold them four levels on this worker.
-                let mut node_lo = sup * SL2_SUPER; // index at level `depth`
-                let mut n = SL2_SUPER;
-                let mut j = depth;
-                while n > 1 {
-                    let nodes_j = stored_leaves >> j;
-                    let base_j = 2 * stored_leaves - 2 * nodes_j;
-                    let nodes_k = stored_leaves >> (j + 1);
-                    let base_k = 2 * stored_leaves - 2 * nodes_k;
-                    let (read, write) = unsafe {
-                        (
-                            core::slice::from_raw_parts((tree_addr as *const Hash).add(base_j + node_lo), n),
-                            core::slice::from_raw_parts_mut((tree_addr as *mut Hash).add(base_k + node_lo / 2), n / 2),
-                        )
-                    };
-                    merkle::hash_pairs_level_serial(read, write, kind);
-                    node_lo /= 2;
-                    n /= 2;
-                    j += 1;
-                }
-            }
-        },
-    );
+        }
+    });
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",
@@ -595,7 +618,9 @@ fn finalize_cpu_commit(
     // All supergroups completed and every subgroup had the expected shape.
     let folded = if folded != 0
         && super_ok.load(Ordering::Acquire)
-        && super_done.iter().all(|c| c.load(Ordering::Acquire) == SL2_SUPER as u32)
+        && super_done
+            .iter()
+            .all(|c| c.load(Ordering::Acquire) == SL2_SUPER as u32)
     {
         folded + SL2_SUPER.trailing_zeros() as usize
     } else {
@@ -1519,7 +1544,10 @@ pub fn prefault_codeword_during_with_resident<R>(
             buf
         });
         let (unused, r) = generate(None);
-        assert!(unused.is_none(), "cold generation must not supply a codeword");
+        assert!(
+            unused.is_none(),
+            "cold generation must not supply a codeword"
+        );
         (Some(h.join().unwrap()), r)
     })
 }

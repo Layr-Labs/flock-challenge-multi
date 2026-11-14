@@ -259,6 +259,20 @@ pub fn give_f128_tagged(v: Vec<F128>, tag: u64) {
 /// AB projection, zerocheck ping-pong, and open-stage transients. This parks
 /// 6.5 GiB at ranked m = 32 instead of 10.5 GiB; release with [`clear`].
 pub fn prewarm_prover(m: usize) {
+    prewarm_prover_buffers(m, 11);
+}
+
+/// Prewarm one codeword and four witness owners for a full BLAKE3 warm proof.
+///
+/// The warm proof populates the remaining pool at the fold and opening sizes
+/// actually requested. Its first invocation may still allocate and first-touch
+/// those smaller buffers. Other witness sizes keep the ordinary fleet.
+#[doc(hidden)]
+pub fn prewarm_prover_for_warmup(m: usize) {
+    prewarm_prover_buffers(m, if m == 32 { 4 } else { 11 });
+}
+
+fn prewarm_prover_buffers(m: usize, witness_buffers: usize) {
     use rayon::prelude::*;
     if m < 7 {
         return;
@@ -267,7 +281,7 @@ pub fn prewarm_prover(m: usize) {
     let large = 1usize << (m - 6);
     let mut bufs: Vec<Vec<F128>> = Vec::new();
     bufs.push(take_f128(large));
-    for _ in 0..11 {
+    for _ in 0..witness_buffers {
         bufs.push(take_f128(small));
     }
     // First-touch every page of every buffer, all cores. Already-resident

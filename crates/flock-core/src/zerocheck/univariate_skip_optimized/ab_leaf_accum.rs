@@ -43,9 +43,8 @@ pub(super) fn enabled() -> bool {
 // The layout is fixed once per process. Keep one coefficient allocation
 // pair, in the selected grouping, while retaining an exact diagnostic rollback.
 fn grouped_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_AB_MERGED").is_none()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_AB_MERGED").is_none());
     *ON
 }
 
@@ -113,7 +112,10 @@ impl Cache {
             }
         }
         if grouped_enabled() {
-            cache.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
+            cache.merged = Some((
+                pack_groups(m0, &[27, 24, 27]),
+                pack_groups(m2, &[24, 27, 27]),
+            ));
         } else {
             cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
         }
@@ -138,7 +140,11 @@ pub(super) fn try_run(
     }
     // Probe only: the padded split-half layout spans more than one band.
     let x_hi = if layout == 65 { x_hi % 120 } else { x_hi };
-    let end_pad = if layout == 65 { 32 * 15 * 4096 * 2 + 4096 - BAND_BYTES } else { 0 };
+    let end_pad = if layout == 65 {
+        32 * 15 * 4096 * 2 + 4096 - BAND_BYTES
+    } else {
+        0
+    };
     let Some(start) = x_hi.checked_mul(BAND_BYTES) else {
         return false;
     };
@@ -278,9 +284,24 @@ unsafe extern "C" fn flock_ab_poly_band(
         let (bank0, bank2, pair_bytes, half): (Bank, Bank, usize, usize) = match layout {
             0 => (bank0, bank2, 1856, 896),
             1 => match mode {
-                0 => (flock_ab_pmaj_bank0_m0, flock_ab_pmaj_bank2_m0, 32 * 1856, 896),
-                1 => (flock_ab_pmaj_bank0_m1, flock_ab_pmaj_bank2_m1, 32 * 1856, 896),
-                _ => (flock_ab_pmaj_bank0_m2, flock_ab_pmaj_bank2_m2, 32 * 1856, 896),
+                0 => (
+                    flock_ab_pmaj_bank0_m0,
+                    flock_ab_pmaj_bank2_m0,
+                    32 * 1856,
+                    896,
+                ),
+                1 => (
+                    flock_ab_pmaj_bank0_m1,
+                    flock_ab_pmaj_bank2_m1,
+                    32 * 1856,
+                    896,
+                ),
+                _ => (
+                    flock_ab_pmaj_bank0_m2,
+                    flock_ab_pmaj_bank2_m2,
+                    32 * 1856,
+                    896,
+                ),
             },
             32 => match mode {
                 0 => (flock_ab_ns32_bank0_m0, flock_ab_ns32_bank2_m0, 1792, 896),
@@ -288,20 +309,65 @@ unsafe extern "C" fn flock_ab_poly_band(
                 _ => (flock_ab_ns32_bank0_m2, flock_ab_ns32_bank2_m2, 1792, 896),
             },
             16 => match mode {
-                0 => (flock_ab_ns16_bank0_m0, flock_ab_ns16_bank2_m0, 2 * 1792, 2 * 896),
-                1 => (flock_ab_ns16_bank0_m1, flock_ab_ns16_bank2_m1, 2 * 1792, 2 * 896),
-                _ => (flock_ab_ns16_bank0_m2, flock_ab_ns16_bank2_m2, 2 * 1792, 2 * 896),
+                0 => (
+                    flock_ab_ns16_bank0_m0,
+                    flock_ab_ns16_bank2_m0,
+                    2 * 1792,
+                    2 * 896,
+                ),
+                1 => (
+                    flock_ab_ns16_bank0_m1,
+                    flock_ab_ns16_bank2_m1,
+                    2 * 1792,
+                    2 * 896,
+                ),
+                _ => (
+                    flock_ab_ns16_bank0_m2,
+                    flock_ab_ns16_bank2_m2,
+                    2 * 1792,
+                    2 * 896,
+                ),
             },
             // split halves: 64 streams of 896 B per pair
             64 => match mode {
-                0 => (flock_ab_nsh_bank0_m0, flock_ab_nsh_bank2_m0, 896, 32 * 64 * 896),
-                1 => (flock_ab_nsh_bank0_m1, flock_ab_nsh_bank2_m1, 896, 32 * 64 * 896),
-                _ => (flock_ab_nsh_bank0_m2, flock_ab_nsh_bank2_m2, 896, 32 * 64 * 896),
+                0 => (
+                    flock_ab_nsh_bank0_m0,
+                    flock_ab_nsh_bank2_m0,
+                    896,
+                    32 * 64 * 896,
+                ),
+                1 => (
+                    flock_ab_nsh_bank0_m1,
+                    flock_ab_nsh_bank2_m1,
+                    896,
+                    32 * 64 * 896,
+                ),
+                _ => (
+                    flock_ab_nsh_bank0_m2,
+                    flock_ab_nsh_bank2_m2,
+                    896,
+                    32 * 64 * 896,
+                ),
             },
             65 => match mode {
-                0 => (flock_ab_nshp_bank0_m0, flock_ab_nshp_bank2_m0, 896, 32 * 15 * 4096 + 2048),
-                1 => (flock_ab_nshp_bank0_m1, flock_ab_nshp_bank2_m1, 896, 32 * 15 * 4096 + 2048),
-                _ => (flock_ab_nshp_bank0_m2, flock_ab_nshp_bank2_m2, 896, 32 * 15 * 4096 + 2048),
+                0 => (
+                    flock_ab_nshp_bank0_m0,
+                    flock_ab_nshp_bank2_m0,
+                    896,
+                    32 * 15 * 4096 + 2048,
+                ),
+                1 => (
+                    flock_ab_nshp_bank0_m1,
+                    flock_ab_nshp_bank2_m1,
+                    896,
+                    32 * 15 * 4096 + 2048,
+                ),
+                _ => (
+                    flock_ab_nshp_bank0_m2,
+                    flock_ab_nshp_bank2_m2,
+                    896,
+                    32 * 15 * 4096 + 2048,
+                ),
             },
             // 32 streams, hole-free 1792 B pairs, stream stride 29 pages
             33 => match mode {
@@ -1323,7 +1389,15 @@ mod tests {
         new.fill(0xad);
         assert!(!try_run(&mut cache, &source, &mats, 0, 1, &mut new, 0));
         assert!(new.iter().all(|&v| v == 0xad));
-        assert!(!try_run(&mut cache, &source, &mats[..8191], 0, 1, &mut new, 0));
+        assert!(!try_run(
+            &mut cache,
+            &source,
+            &mats[..8191],
+            0,
+            1,
+            &mut new,
+            0
+        ));
         assert!(!try_run(
             &mut cache,
             &source,

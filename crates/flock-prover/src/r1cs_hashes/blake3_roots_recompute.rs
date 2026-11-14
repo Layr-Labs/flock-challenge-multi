@@ -329,11 +329,14 @@ fn roots_only_matches_production_stripes() {
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
-                            StreamProj { compact_z_tile_words:0, seed_window:None,
+                            StreamProj {
+                                compact_z_tile_words: 0,
+                                seed_window: None,
                                 stage: stage.0.as_mut_ptr(),
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
                                 out_bias: 2 * 64,
+                                ab_pend: core::ptr::null_mut(),
                                 inv_table: &inv,
                                 plan,
                                 one_rows_elided: true,
@@ -496,7 +499,7 @@ fn initial16(x: V16) -> V16 {
 fn xor_rotr16<const N: i32, const M: i32>(x: V16, y: V16) -> V16 {
     unsafe { _mm512_ror_epi32::<N>(xor16(x, y)) }
 }
-#[cfg(any(test,not(target_feature="avx512dq")))]
+#[cfg(any(test, not(target_feature = "avx512dq")))]
 #[inline(always)]
 unsafe fn prepare16_legacy(init: u64, base: usize) -> Prepared16 {
     unsafe {
@@ -514,16 +517,20 @@ unsafe fn prepare16_legacy(init: u64, base: usize) -> Prepared16 {
     }
 }
 
-#[cfg(target_feature="avx512dq")]
-#[path="blake3_roots_prepare16.rs"]
+#[cfg(target_feature = "avx512dq")]
+#[path = "blake3_roots_prepare16.rs"]
 mod prepare16_fused;
 
 #[inline(always)]
-unsafe fn prepare16(init:u64,base:usize)->Prepared16 {
-    #[cfg(target_feature="avx512dq")]
-    {unsafe {prepare16_fused::prepare(init,base)}}
-    #[cfg(not(target_feature="avx512dq"))]
-    {unsafe {prepare16_legacy(init,base)}}
+unsafe fn prepare16(init: u64, base: usize) -> Prepared16 {
+    #[cfg(target_feature = "avx512dq")]
+    {
+        unsafe { prepare16_fused::prepare(init, base) }
+    }
+    #[cfg(not(target_feature = "avx512dq"))]
+    {
+        unsafe { prepare16_legacy(init, base) }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -561,14 +568,14 @@ const fn direct_roots() -> [usize; DIRECT_BITS] {
     assert!(i == DIRECT_BITS);
     out
 }
-const DIRECT_ROOTS: [usize; DIRECT_BITS] = direct_roots();
+static DIRECT_ROOTS: [usize; DIRECT_BITS] = direct_roots();
 const fn direct_actions() -> [DirectAction; 256] {
     let mut actions = [DirectAction::Skip; 256];
     let mut group = 0;
     while group < 176 {
         let start = group * 64;
         let first = DIRECT_ROOTS[start];
-        assert!(first % 64 == 0);
+        assert!(first.is_multiple_of(64));
         let source = first / 64;
         let count = if DIRECT_BITS - start < 64 {
             DIRECT_BITS - start
@@ -657,7 +664,7 @@ impl RootW16 {
             if matches!(action, DirectAction::Skip) {
                 return;
             }
-            if WORD % 2 == 0 {
+            if WORD.is_multiple_of(2) {
                 self.previous = v;
                 return;
             }
@@ -1021,5 +1028,5 @@ fn add_root16(x: V16, y: V16) -> (V16, V16) {
 #[path = "blake3_stage_recompute.rs"]
 pub(crate) mod stage_recompute;
 
-#[path="blake3_fused_fold.rs"]
+#[path = "blake3_fused_fold.rs"]
 pub(crate) mod fused_fold;

@@ -251,7 +251,12 @@ struct CompactSched {
 }
 
 impl CompactSched {
-    fn build(roots: &[usize], k: usize, children: &[[u32; 2]], outputs: &[(u32, u32)]) -> Option<Self> {
+    fn build(
+        roots: &[usize],
+        k: usize,
+        children: &[[u32; 2]],
+        outputs: &[(u32, u32)],
+    ) -> Option<Self> {
         let base = k + 1;
         let n = children.len();
         if base > u16::MAX as usize {
@@ -292,10 +297,17 @@ impl CompactSched {
             let (ma, mb) = (map(a, &loc)?, map(b, &loc)?);
             // Free the operand slots whose last reader is this op (the
             // destination may take one of them: read-then-write in one op).
-            let operands: &[(usize, u32)] =
-                if a == b { &[(a as usize, ma)][..] } else { &[(a as usize, ma), (b as usize, mb)][..] };
+            let operands: &[(usize, u32)] = if a == b {
+                &[(a as usize, ma)][..]
+            } else {
+                &[(a as usize, ma), (b as usize, mb)][..]
+            };
             for &(x, m) in operands {
-                if x >= base && last_use[x - base] == Some(i) && home_col[x - base].is_none() && m as usize >= base {
+                if x >= base
+                    && last_use[x - base] == Some(i)
+                    && home_col[x - base].is_none()
+                    && m as usize >= base
+                {
                     free.push(m);
                 }
             }
@@ -321,15 +333,18 @@ impl CompactSched {
         }
         let mut copies = Vec::with_capacity(pending.len());
         for (col, node) in pending {
-            let src = if (node as usize) < base { node } else { loc[node as usize - base] };
+            let src = if (node as usize) < base {
+                node
+            } else {
+                loc[node as usize - base]
+            };
             if src == u32::MAX || src as usize >= base {
                 // Only output-homed nodes (columns) outlive the ops.
                 return None;
             }
             copies.push((col, src as u16));
         }
-        let roots: Option<Vec<u16>> =
-            roots.iter().map(|&c| (c < k).then_some(c as u16)).collect();
+        let roots: Option<Vec<u16>> = roots.iter().map(|&c| (c < k).then_some(c as u16)).collect();
         Some(Self {
             roots: roots?.into_boxed_slice(),
             ops: ops.into_boxed_slice(),
@@ -356,7 +371,6 @@ fn sl1_rc_warm_enabled() -> bool {
 
 struct Sl1Warm {
     plan: *const LinearFoldPlan,
-    k: usize,
     /// Bytes of (ops, roots) touched so far, then table entries filled.
     off: usize,
     table: Option<Vec<F128>>,
@@ -368,16 +382,39 @@ thread_local! {
 }
 
 /// Tiles left in the fold when the reconstructing thread starts warming.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 fn sl1_warm_start_tiles() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_SL1_WARM_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+        std::env::var("FLOCK_SL1_WARM_TILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
     });
     *N
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 fn sl1_warm_budget() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_SL1_WARM_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(112) << 10
+        std::env::var("FLOCK_SL1_WARM_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(112)
+            << 10
     });
     *N
 }
@@ -386,12 +423,17 @@ fn sl1_rc_warm_arm(plan: &LinearFoldPlan, k: usize) {
     if !sl1_rc_warm_enabled() || !level_sched_enabled() || !rc_compact_enabled() {
         return;
     }
-    if let Some(s) = plan.level_sched.get() {
-        if s.k == k && s.compact.is_some() {
-            SL1_RC_HOOK.with(|h| {
-                *h.borrow_mut() = Some(Sl1Warm { plan: plan as *const LinearFoldPlan, k, off: 0, table: None })
-            });
-        }
+    if let Some(s) = plan.level_sched.get()
+        && s.k == k
+        && s.compact.is_some()
+    {
+        SL1_RC_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Sl1Warm {
+                plan: plan as *const LinearFoldPlan,
+                off: 0,
+                table: None,
+            })
+        });
     }
 }
 
@@ -399,6 +441,14 @@ fn sl1_rc_warm_arm(plan: &LinearFoldPlan, k: usize) {
 /// fewer than `sl1_warm_start_tiles` tiles remain unclaimed. Returns
 /// immediately on every other thread. Prefetch-only work: the schedule is
 /// read-only and the table is (re)initialized exactly as the reconstruct does.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 pub(crate) fn sl1_rc_warm_step(remaining_tiles: usize) {
     if remaining_tiles > sl1_warm_start_tiles() {
         return;
@@ -415,18 +465,33 @@ fn sl1_warm_advance(w: &mut Sl1Warm, mut budget: usize) {
     // SAFETY: armed by `RootFoldSource::fold` on this thread, which keeps the
     // plan borrowed until it has called `sl1_rc_warm_run`.
     let plan = unsafe { &*w.plan };
-    let Some(c) = plan.level_sched.get().and_then(|s| s.compact.as_ref()) else { return };
-    let ops = unsafe { core::slice::from_raw_parts(c.ops.as_ptr().cast::<u8>(), core::mem::size_of_val(&*c.ops)) };
-    let roots = unsafe { core::slice::from_raw_parts(c.roots.as_ptr().cast::<u8>(), core::mem::size_of_val(&*c.roots)) };
+    let Some(c) = plan.level_sched.get().and_then(|s| s.compact.as_ref()) else {
+        return;
+    };
+    let ops = unsafe {
+        core::slice::from_raw_parts(c.ops.as_ptr().cast::<u8>(), core::mem::size_of_val(&*c.ops))
+    };
+    let roots = unsafe {
+        core::slice::from_raw_parts(
+            c.roots.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(&*c.roots),
+        )
+    };
     let pre = ops.len() + roots.len();
     while budget > 0 && w.off < pre {
-        let (src, o) = if w.off < ops.len() { (ops, w.off) } else { (roots, w.off - ops.len()) };
+        let (src, o) = if w.off < ops.len() {
+            (ops, w.off)
+        } else {
+            (roots, w.off - ops.len())
+        };
         let end = (o + budget).min(src.len());
         let mut i = o & !63;
         while i < end {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(src.as_ptr().add(i).cast());
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T1 }>(
+                    src.as_ptr().add(i).cast(),
+                );
             }
             i += 64;
         }
@@ -437,7 +502,9 @@ fn sl1_warm_advance(w: &mut Sl1Warm, mut budget: usize) {
         return;
     }
     let live_cols = plan.roots.len() + plan.outputs.len();
-    let t = w.table.get_or_insert_with(|| crate::alloc_uninit_vec::<F128>(c.table_len));
+    let t = w
+        .table
+        .get_or_insert_with(|| crate::alloc_uninit_vec::<F128>(c.table_len));
     let done = w.off - pre;
     if done < t.len() {
         let end = (done + budget / 16).min(t.len());
@@ -452,7 +519,9 @@ fn sl1_warm_advance(w: &mut Sl1Warm, mut budget: usize) {
 /// Finishes the hook armed on this thread, if any, and parks the table for
 /// the reconstruct. Called after the fold join on the reconstructing thread.
 pub(crate) fn sl1_rc_warm_run() {
-    let Some(mut w) = SL1_RC_HOOK.with(|h| h.borrow_mut().take()) else { return };
+    let Some(mut w) = SL1_RC_HOOK.with(|h| h.borrow_mut().take()) else {
+        return;
+    };
     crate::rstrace::ev("sl1:warm0", 0);
     sl1_warm_advance(&mut w, usize::MAX / 2);
     if let Some(t) = w.table.take() {
@@ -500,7 +569,10 @@ impl LevelSched {
             for &l in &level {
                 h[l as usize] += 1;
             }
-            eprintln!("[v1] level sched: nodes {n}, depth {maxl}, per level {:?}", h);
+            eprintln!(
+                "[v1] level sched: nodes {n}, depth {maxl}, per level {:?}",
+                h
+            );
         }
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by_key(|&i| (level[i as usize], i));
@@ -510,7 +582,12 @@ impl LevelSched {
             for &l in &level {
                 w[l as usize] += 1;
             }
-            eprintln!("[hot1] levelsched k={k} nodes={n} outputs={} roots={} levels={maxl} widths={:?}", plan.outputs.len(), plan.roots.len(), &w[1..]);
+            eprintln!(
+                "[hot1] levelsched k={k} nodes={n} outputs={} roots={} levels={maxl} widths={:?}",
+                plan.outputs.len(),
+                plan.roots.len(),
+                &w[1..]
+            );
         }
         let mut pos = vec![0u32; n];
         for (new, &old) in order.iter().enumerate() {
@@ -540,7 +617,13 @@ impl LevelSched {
         let compact = CompactSched::build(&plan.roots, k, &children, &outputs);
         if crate::gaptime::who_enabled() {
             match &compact {
-                Some(c) => eprintln!("[hot1] compact ops={} copies={} table={} (slots {})", c.ops.len(), c.copies.len(), c.table_len, c.table_len - k - 1),
+                Some(c) => eprintln!(
+                    "[hot1] compact ops={} copies={} table={} (slots {})",
+                    c.ops.len(),
+                    c.copies.len(),
+                    c.table_len,
+                    c.table_len - k - 1
+                ),
                 None => eprintln!("[hot1] compact: not applicable"),
             }
         }
@@ -575,7 +658,7 @@ impl LinearFoldPlan {
             target_feature = "vpclmulqdq"
         ))]
         unsafe {
-            return self.reconstruct_x86(folded, k);
+            self.reconstruct_x86(folded, k)
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -655,7 +738,9 @@ impl LinearFoldPlan {
     #[inline(always)]
     fn reconstruct_compact(&self, c: &CompactSched, folded: &[F128], k: usize) -> Vec<F128> {
         let live_cols = self.roots.len() + self.outputs.len();
-        let pre = SL1_RC_TABLE.with(|s| s.take()).filter(|v| v.len() == c.table_len);
+        let pre = SL1_RC_TABLE
+            .with(|s| s.take())
+            .filter(|v| v.len() == c.table_len);
         let mut t = if let Some(v) = pre {
             v
         } else if live_cols <= k {
@@ -731,7 +816,6 @@ impl LinearFoldPlan {
         nodes.truncate(k);
         nodes
     }
-
 }
 
 /// Root fold preparation, shared by C and AB at their distinct Fiat-Shamir
@@ -764,7 +848,7 @@ pub use root_tile_cache::RootTileCache as WitnessRootTiles;
     target_feature = "gfni",
     target_feature = "vpclmulqdq"
 ))]
-pub use root_tile_cache::{WitnessTileView, RootPairGenerator};
+pub use root_tile_cache::{RootPairGenerator, WitnessTileView};
 
 pub struct RootFoldSource {
     plan: &'static LinearFoldPlan,
@@ -823,11 +907,13 @@ impl RootFoldSource {
         z: &[F128],
         tiles: WitnessRootTiles,
     ) -> Result<(), WitnessRootTiles> {
-        if self.k_log != 14 || !z.len().is_multiple_of(128) { return Err(tiles); }
-        if let RootFoldStorage::Splice(splice) = &self.source {
-            if tiles.matches_geometry(z.len() / 128, splice.root_bits) {
-                return self.cached_tiles.set(tiles);
-            }
+        if self.k_log != 14 || !z.len().is_multiple_of(128) {
+            return Err(tiles);
+        }
+        if let RootFoldStorage::Splice(splice) = &self.source
+            && tiles.matches_geometry(z.len() / 128, splice.root_bits)
+        {
+            return self.cached_tiles.set(tiles);
         }
         Err(tiles)
     }
@@ -860,9 +946,9 @@ impl RootFoldSource {
             let k = 1usize << k_log;
             let stride = k / 128;
             k_log == 14
-                && z_len % stride == 0
+                && z_len.is_multiple_of(stride)
                 && z_len / stride >= 64
-                && (z_len / stride) % 64 == 0
+                && (z_len / stride).is_multiple_of(64)
                 && block_major_gfni_enabled()
                 && RootSplicePlan::cached(plan, k).is_some()
         }
@@ -897,25 +983,24 @@ impl RootFoldSource {
         ))]
         if k_log == 14
             && z.len() / stride >= 64
-            && z.len() / stride % 64 == 0
+            && (z.len() / stride).is_multiple_of(64)
             && block_major_gfni_enabled()
+            && let Some(splice) = splice
         {
-            if let Some(splice) = splice {
-                return Self {
-                    plan,
-                    source: RootFoldStorage::Splice(splice),
-                    k_log,
-                    #[cfg(all(
-                        target_arch = "x86_64",
-                        target_feature = "avx512f",
-                        target_feature = "avx512bw",
-                        target_feature = "avx512vbmi",
-                        target_feature = "gfni",
-                        target_feature = "vpclmulqdq"
-                    ))]
-                    cached_tiles: std::sync::OnceLock::new(),
-                };
-            }
+            return Self {
+                plan,
+                source: RootFoldStorage::Splice(splice),
+                k_log,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vbmi",
+                    target_feature = "gfni",
+                    target_feature = "vpclmulqdq"
+                ))]
+                cached_tiles: std::sync::OnceLock::new(),
+            };
         }
         #[cfg(not(all(
             target_arch = "x86_64",
@@ -990,6 +1075,14 @@ impl RootFoldSource {
         eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
         eq8_indices: impl Fn([usize; 8]) -> [F128; 8] + Sync,
     ) -> Vec<F128> {
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        )))]
+        let _ = (z_canonical, k, &eq8_indices);
         #[allow(unused_variables)]
         match &self.source {
             RootFoldStorage::Packed(packed) => {
@@ -1032,7 +1125,7 @@ impl RootFoldSource {
         let k = 1usize << k_log;
         assert_eq!(z_canonical.len(), (1usize << (m - k_log)) * (k / 128));
         crate::rstrace::ev("rf:fold0", 0);
-        sl1_rc_warm_arm(&self.plan, k);
+        sl1_rc_warm_arm(self.plan, k);
         let folded = if x_outer.len() == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
             let (lo, hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
             let eq_lo = build_eq_table(lo);
@@ -1041,20 +1134,32 @@ impl RootFoldSource {
             let mask = eq_lo.len() - 1;
             #[allow(unused_variables)]
             let eq8_x4 = lc_eq8_x4_enabled();
-            self.run_fold(z_canonical, m, k, |i| {
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                ))]
-                if eq8_x4 {
-                    return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, i, log_b, mask) };
-                }
-                eq8_from_factors_scalar_cold(&eq_lo, &eq_hi, i, log_b, mask)
-            }, |indices| eq8_from_factors_indices(&eq_lo, &eq_hi, indices, log_b, mask))
+            self.run_fold(
+                z_canonical,
+                m,
+                k,
+                |i| {
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if eq8_x4 {
+                        return unsafe { eq8_from_factors_x4(&eq_lo, &eq_hi, i, log_b, mask) };
+                    }
+                    eq8_from_factors_scalar_cold(&eq_lo, &eq_hi, i, log_b, mask)
+                },
+                |indices| eq8_from_factors_indices(&eq_lo, &eq_hi, indices, log_b, mask),
+            )
         } else {
             let eq = build_eq_table(x_outer);
-            self.run_fold(z_canonical, m, k, |i| std::array::from_fn(|j| eq[i + j]), |indices| indices.map(|i| eq[i]))
+            self.run_fold(
+                z_canonical,
+                m,
+                k,
+                |i| std::array::from_fn(|j| eq[i + j]),
+                |indices| indices.map(|i| eq[i]),
+            )
         };
         // Hook not consumed (this thread ran no fold worker): run it now so
         // the table slot is filled on the reconstructing thread either way.
@@ -1118,7 +1223,8 @@ impl RootSplicePlan {
         }
         static CACHE: std::sync::OnceLock<(usize, usize, Option<RootSplicePlan>)> =
             std::sync::OnceLock::new();
-        let (addr, ck, splice) = CACHE.get_or_init(|| (plan as *const LinearFoldPlan as usize, k, build()));
+        let (addr, ck, splice) =
+            CACHE.get_or_init(|| (plan as *const LinearFoldPlan as usize, k, build()));
         if *addr == plan as *const LinearFoldPlan as usize && *ck == k {
             splice.clone()
         } else {
@@ -1642,21 +1748,6 @@ impl CscCircuit {
         self
     }
 
-    /// Evaluate `one_col` for every column — sequential below the rayon
-    /// threshold, one `par_iter_mut` dispatch above it. Shared by the u16 and
-    /// u32 gather bodies so both keep exactly the same dispatch structure.
-    #[inline]
-    fn map_cols(&self, one_col: impl Fn(usize) -> F128 + Sync + Send) -> Vec<F128> {
-        use rayon::prelude::*;
-        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
-            return (0..self.n_cols).map(one_col).collect();
-        }
-        let mut out = vec![F128::ZERO; self.n_cols];
-        out.par_iter_mut()
-            .enumerate()
-            .for_each(|(c, slot)| *slot = one_col(c));
-        out
-    }
     #[cfg_attr(
         all(
             target_arch = "x86_64",
@@ -1784,9 +1875,13 @@ impl CscCircuit {
                 _mm_storeu_si128(&mut sb as *mut F128 as *mut __m128i, acc_b);
                 *slot = alpha * sa + sb;
             }
-            return;
         }
 
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
         for (i, slot) in out_chunk.iter_mut().enumerate() {
             let c = c_base + i;
             let a_start = unsafe { *self.a_col_ptr.get_unchecked(c) as usize };
@@ -1911,7 +2006,6 @@ impl LincheckCircuit for CscCircuit {
                     ))]
                     unsafe {
                         self.fold_cols_narrow_chunk(c_base, chunk, alpha, eq_inner);
-                        return;
                     }
                     #[cfg(not(all(
                         target_arch = "x86_64",
@@ -1962,7 +2056,6 @@ impl LincheckCircuit for CscCircuit {
                 ))]
                 unsafe {
                     self.fold_cols_wide_chunk(c_base, chunk, alpha, eq_inner);
-                    return;
                 }
                 #[cfg(not(all(
                     target_arch = "x86_64",
@@ -2533,9 +2626,17 @@ fn eq8_from_factors_scalar_cold(
 /// neighbors of each index. Factors belong to the current fold challenge.
 #[inline]
 fn eq8_from_factors_indices(
-    eq_lo: &[F128], eq_hi: &[F128], indices: [usize; 8], log_b: usize, lo_mask: usize,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    indices: [usize; 8],
+    log_b: usize,
+    lo_mask: usize,
 ) -> [F128; 8] {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
     if lc_eq8_x4_enabled() {
         // SAFETY: compile-time target features admit the same multiplication
         // leaf as the consecutive-index path. Factor accesses are checked.
@@ -2544,10 +2645,18 @@ fn eq8_from_factors_indices(
     indices.map(|i| eq_lo[i & lo_mask] * eq_hi[i >> log_b])
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 #[inline(always)]
 unsafe fn eq8_from_factors_indices_x4(
-    eq_lo: &[F128], eq_hi: &[F128], indices: [usize; 8], log_b: usize, lo_mask: usize,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    indices: [usize; 8],
+    log_b: usize,
+    lo_mask: usize,
 ) -> [F128; 8] {
     use crate::field::gf2_128::x86_64::ghash_mul_x4;
     use core::arch::x86_64::*;
@@ -2555,17 +2664,30 @@ unsafe fn eq8_from_factors_indices_x4(
     unsafe {
         let out_ptr = out.as_mut_ptr().cast::<F128>();
         for group in 0..2 {
-            let lo = core::array::from_fn::<_, 4, _>(|lane| eq_lo[indices[group*4+lane] & lo_mask]);
-            let hi = core::array::from_fn::<_, 4, _>(|lane| eq_hi[indices[group*4+lane] >> log_b]);
-            let product = ghash_mul_x4(_mm512_loadu_si512(lo.as_ptr().cast::<__m512i>()),
-                _mm512_loadu_si512(hi.as_ptr().cast::<__m512i>()));
-            _mm512_storeu_si512(out_ptr.add(group*4).cast::<__m512i>(), product);
+            let lo =
+                core::array::from_fn::<_, 4, _>(|lane| eq_lo[indices[group * 4 + lane] & lo_mask]);
+            let hi =
+                core::array::from_fn::<_, 4, _>(|lane| eq_hi[indices[group * 4 + lane] >> log_b]);
+            let product = ghash_mul_x4(
+                _mm512_loadu_si512(lo.as_ptr().cast::<__m512i>()),
+                _mm512_loadu_si512(hi.as_ptr().cast::<__m512i>()),
+            );
+            _mm512_storeu_si512(out_ptr.add(group * 4).cast::<__m512i>(), product);
         }
         out.assume_init()
     }
 }
 
 /// Eight consecutive factorized outer weights starting at `outer_base`.
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 #[inline]
 fn eq8_from_factors(
     eq_lo: &[F128],
@@ -3435,7 +3557,6 @@ fn fold_block_major_gfni(
                         worker_active,
                     );
                 }
-                return;
             }
             #[cfg(not(all(
                 target_feature = "avx512bw",
@@ -3525,7 +3646,6 @@ fn fold_block_major_gfni(
                 o,
                 one_o,
             );
-            return;
         }
         #[cfg(not(all(
             target_feature = "avx512bw",
@@ -4079,7 +4199,10 @@ fn partial_fold_packed_z_block_major_padded_with_tables_result(
         target_feature = "avx512f",
         target_feature = "gfni"
     ))]
-    if block_major_gfni_enabled() && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0 && k_log >= 6 {
+    if block_major_gfni_enabled()
+        && n_stripes.is_multiple_of(DIRECT_FOLD_TILE_STRIPES)
+        && k_log >= 6
+    {
         let _ = (trace_fold, timing);
         return fold_block_major_gfni(
             z_packed,
@@ -4804,7 +4927,10 @@ fn gl1_lc_team_min() -> usize {
         if std::env::var_os("FLOCK_NO_GL1_LC_TEAM").is_some() {
             return 0;
         }
-        std::env::var("FLOCK_GL1_LC_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+        std::env::var("FLOCK_GL1_LC_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048)
     });
     if *MIN != 0 && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
         *MIN
@@ -4826,7 +4952,11 @@ fn gl1_round_eval_team(c: &[F128], z: &[F128]) -> (F128, F128) {
         |i| {
             let s = i * ch;
             crate::field::f128_slice::msg_split_half(
-                &chi[s..s + ch], &clo[s..s + ch], &zhi[s..s + ch], &zlo[s..s + ch], ch,
+                &chi[s..s + ch],
+                &clo[s..s + ch],
+                &zhi[s..s + ch],
+                &zlo[s..s + ch],
+                ch,
             )
         },
         || (F128::ZERO, F128::ZERO),
@@ -4835,7 +4965,11 @@ fn gl1_round_eval_team(c: &[F128], z: &[F128]) -> (F128, F128) {
 }
 
 /// [`sumcheck_bind_both_and_eval_next`] on the spinning team (x4 leaves).
-fn gl1_bind_both_and_eval_next_team(comb: &mut Vec<F128>, z: &mut Vec<F128>, r: F128) -> (F128, F128) {
+fn gl1_bind_both_and_eval_next_team(
+    comb: &mut Vec<F128>,
+    z: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
     let len = comb.len();
     debug_assert_eq!(z.len(), len);
     let half = len / 2;
@@ -4853,11 +4987,20 @@ fn gl1_bind_both_and_eval_next_team(comb: &mut Vec<F128>, z: &mut Vec<F128>, r: 
                 let c = cp as *mut F128;
                 let zz = zp as *mut F128;
                 let m = |p: *mut F128, o: usize| core::slice::from_raw_parts_mut(p.add(o), ch);
-                let r_ = |p: *mut F128, o: usize| core::slice::from_raw_parts(p.add(o) as *const F128, ch);
+                let r_ = |p: *mut F128, o: usize| {
+                    core::slice::from_raw_parts(p.add(o) as *const F128, ch)
+                };
                 crate::field::f128_slice::bind_both_and_msg_split(
-                    m(c, s), m(c, half2 + s), r_(c, half + s), r_(c, half + half2 + s),
-                    m(zz, s), m(zz, half2 + s), r_(zz, half + s), r_(zz, half + half2 + s),
-                    r, ch,
+                    m(c, s),
+                    m(c, half2 + s),
+                    r_(c, half + s),
+                    r_(c, half + half2 + s),
+                    m(zz, s),
+                    m(zz, half2 + s),
+                    r_(zz, half + s),
+                    r_(zz, half + half2 + s),
+                    r,
+                    ch,
                 )
             }
         },
@@ -5729,9 +5872,16 @@ fn prove_padded_inner<Ch: Challenger>(
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
         crate::rstrace::ev("lc:sc:start", 0);
-        let gl1_min = if sumcheck_x4_enabled() { gl1_lc_team_min() } else { 0 };
+        let gl1_min = if sumcheck_x4_enabled() {
+            gl1_lc_team_min()
+        } else {
+            0
+        };
         let gl1_ok = |len: usize| {
-            gl1_min != 0 && len / 4 >= gl1_min && (len / 4).is_multiple_of(GL1_LC_CHUNKS) && len.is_power_of_two()
+            gl1_min != 0
+                && len / 4 >= gl1_min
+                && (len / 4).is_multiple_of(GL1_LC_CHUNKS)
+                && len.is_power_of_two()
         };
         let (mut e1, mut einf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
             gl1_round_eval_team(&comb_vec, &z_vec)
@@ -7431,7 +7581,6 @@ mod canon_capture_tests {
 ))]
 #[test]
 fn root_preselect_matrix_domain_matches_scalar() {
-    use core::arch::x86_64::*;
     let mut seed = 93u64;
     let mut next = || {
         seed ^= seed << 13;

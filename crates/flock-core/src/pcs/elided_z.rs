@@ -50,7 +50,10 @@ pub fn install(z: &[F128], regen: Box<dyn ZRegen>) {
 /// True iff `z` is a registered elided buffer.
 pub fn is_elided(z: &[F128]) -> bool {
     let (addr, len) = (z.as_ptr() as usize, z.len());
-    SLOT.lock().unwrap().iter().any(|e| e.addr == addr && e.len == len)
+    SLOT.lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.addr == addr && e.len == len)
 }
 
 /// Remove and return the regenerator registered for exactly `z`.

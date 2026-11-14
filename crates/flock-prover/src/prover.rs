@@ -583,9 +583,17 @@ pub(crate) fn prove_fast_ligerito_from_generated_witness<Ch: Challenger>(
     let (z_packed, precommitted) = witness.into_parts();
     assert!(precommitted.is_none() || prefaulted_codeword.is_none());
     prove_fast_ligerito_from_witness_inner(
-        r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
-        Some(ab_inner), FastLincheckInput::BlockMajor, lincheck_circuit,
-        prefaulted_codeword, precommitted, challenger,
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        Some(ab_inner),
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        precommitted,
+        challenger,
     )
 }
 
@@ -613,7 +621,10 @@ impl SideStashInner {
     fn run_if_unclaimed(&self) {
         use std::sync::atomic::Ordering;
         if self.state.load(Ordering::Relaxed) != 0
-            || self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_err()
+            || self
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
         {
             return;
         }
@@ -671,7 +682,13 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // Lane sl2 (`FLOCK_NO_SL2_CFG`): the config is a pure function of these
     // five parameters; the warm-up proves leave it cached (no clone of the
     // parsed config's eleven vectors inside the timed prove).
-    type CfgKey = (usize, usize, usize, pcs::ligerito::LigeritoProfile, flock_core::hash::HashKind);
+    type CfgKey = (
+        usize,
+        usize,
+        usize,
+        pcs::ligerito::LigeritoProfile,
+        flock_core::hash::HashKind,
+    );
     static CFG: std::sync::Mutex<Option<(CfgKey, &'static pcs::ligerito::ProverConfig)>> =
         std::sync::Mutex::new(None);
     static CFG_ON: std::sync::LazyLock<bool> =
@@ -733,7 +750,8 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c = pre_c_slot(r1cs, &s_hat_v_c);
-    flock_core::gaptime::mark("open: begin"); flock_core::rstrace::ev("open:begin", 0);
+    flock_core::gaptime::mark("open: begin");
+    flock_core::rstrace::ev("open:begin", 0);
     // Publish-prefix pre-encode: commitment / zerocheck / lincheck are
     // transcript-final here, so their serialization (plus the 460 kB output
     // allocation) runs on a detached helper thread concurrently with the
@@ -796,7 +814,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
             &claims_arr,
             &[pre_ab, pre_c],
             &padding,
-            &lig_config,
+            lig_config,
             challenger,
         );
         flock_core::rstrace::ev("pv:opened", 0);
@@ -1038,7 +1056,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
 /// later reader folds the tiles or calls `ensure_dense`), or regenerates z in
 /// place right here when any route would read it before installation.
 fn build_root_source(
-    z_packed: &mut Vec<F128>,
+    z_packed: &mut [F128],
     k_log: usize,
     plan: Option<&'static lincheck::LinearFoldPlan>,
     ab_inner: &mut zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -1288,7 +1306,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     let (zc_proof, zc_claim, s_hat_v_c) = in_zerocheck_phase_pool(r1cs.m, || {
         flock_core::rstrace::ev("tz:zcpool", 0);
         flock_core::in_pool(|| {
-            flock_core::gaptime::mark("zerocheck: pool entered"); flock_core::rstrace::ev("zc:enter", 0);
+            flock_core::gaptime::mark("zerocheck: pool entered");
+            flock_core::rstrace::ev("zc:enter", 0);
             // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
             let a_packed: &[u8] = unsafe {
                 std::slice::from_raw_parts(
@@ -1333,7 +1352,8 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     flock_core::gaptime::mark("a/b recycled to scratch pool");
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
-    flock_core::gaptime::mark("x_ab built"); flock_core::rstrace::ev("xab", 0);
+    flock_core::gaptime::mark("x_ab built");
+    flock_core::rstrace::ev("xab", 0);
     // Lane sl2 (`FLOCK_NO_SL2_PRE`): the C claim's point and bank tensor are
     // final here; its challenge-free ring-switch work runs during lincheck.
     if let Some(fold8) = pre_c_slot(r1cs, &s_hat_v_c) {
@@ -1356,7 +1376,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         flock_core::rstrace::ev("lc:inpool", 0);
         let _hot = flock_core::hot_pool::HotPool::start();
         flock_core::rstrace::ev("lc:hot", 0);
-        let lc_out = match lincheck_input {
+        match lincheck_input {
             FastLincheckInput::Stripe(z_packed_lincheck) => {
                 let result = lincheck::prove_padded_capture_z_vec_mode(
                     &z_packed_lincheck,
@@ -1388,11 +1408,11 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     challenger,
                 )
             }
-        };
-        lc_out
+        }
     });
     drop(roots);
-    flock_core::gaptime::mark("lincheck: done"); flock_core::rstrace::ev("lc:done", 0);
+    flock_core::gaptime::mark("lincheck: done");
+    flock_core::rstrace::ev("lc:done", 0);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1536,7 +1556,7 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
 
     // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
-    let ((commitment, prover_data), mut ab_inner) = in_commit_phase_pool(r1cs.m, || {
+    let ((commitment, prover_data), ab_inner) = in_commit_phase_pool(r1cs.m, || {
         commit_with_round1_ab_precompute(
             &z_packed,
             &a_packed_f128,
@@ -1546,6 +1566,15 @@ fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
             prefaulted_codeword,
         )
     });
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni",
+        target_feature = "vpclmulqdq"
+    ))]
+    let mut ab_inner = ab_inner;
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
 

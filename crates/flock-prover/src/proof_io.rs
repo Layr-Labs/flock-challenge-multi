@@ -207,7 +207,10 @@ impl R1csProofBundleLigerito {
         let prefix = take_matching_pre_encoded(self)?;
         let mut count = CountSink(prefix.len());
         encode_pcs_open_flat(&mut count, &self.proof.pcs_open);
-        Some(RawEncoding { prefix, total: count.0 })
+        Some(RawEncoding {
+            prefix,
+            total: count.0,
+        })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -334,7 +337,12 @@ pub(crate) enum StashDone {
     Thread(std::thread::JoinHandle<()>),
     /// Lane sl1: job queued as a rayon task; `wait` runs it inline if no
     /// pool thread has taken it yet.
-    Rayon(std::sync::Arc<(std::sync::Mutex<Option<StashJob>>, std::sync::atomic::AtomicBool)>),
+    Rayon(
+        std::sync::Arc<(
+            std::sync::Mutex<Option<StashJob>>,
+            std::sync::atomic::AtomicBool,
+        )>,
+    ),
 }
 
 /// Lane sl1 (`FLOCK_NO_SL1_STASH_RAYON`): waking the stash helper (a 17th
@@ -443,7 +451,7 @@ pub(crate) fn spawn_stash(job: impl FnOnce() + Send + 'static) -> StashDone {
         return match queue.send(wrapped) {
             Ok(()) => StashDone::Helper(done_rx),
             Err(std::sync::mpsc::SendError(wrapped)) => {
-                StashDone::Thread(std::thread::spawn(move || wrapped()))
+                StashDone::Thread(std::thread::spawn(wrapped))
             }
         };
     }
@@ -593,7 +601,9 @@ impl ByteSink for RawSink {
         // SAFETY: `ptr..ptr+cap` is writable (see `RawEncoding::write`), the
         // bound is checked above, and the source is a live borrow that cannot
         // alias the destination.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.pos), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.pos), bytes.len())
+        };
         self.pos += bytes.len();
     }
 }
@@ -694,7 +704,11 @@ impl RawEncoding {
     /// # Safety
     /// `dst..dst + self.len()` writable and not aliasing `bundle`.
     pub(crate) unsafe fn write(self, bundle: &R1csProofBundleLigerito, dst: *mut u8) {
-        let mut sink = RawSink { ptr: dst, pos: 0, cap: self.total };
+        let mut sink = RawSink {
+            ptr: dst,
+            pos: 0,
+            cap: self.total,
+        };
         sink.put(&self.prefix);
         encode_pcs_open_flat(&mut sink, &bundle.proof.pcs_open);
         assert_eq!(sink.pos, self.total);
@@ -778,7 +792,9 @@ impl RawEncoding {
                 // SAFETY: the plan's ranges tile `0..total` disjointly; each
                 // source is a live borrow of `bundle`, `self.prefix` or
                 // `plan.small`, all alive until this loop ends.
-                unsafe { std::ptr::copy_nonoverlapping(s as *const u8, (base + d) as *mut u8, len) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(s as *const u8, (base + d) as *mut u8, len)
+                };
             }
             flock_core::rstrace::evd("enc:task", task.len() as u32);
         });
@@ -1228,9 +1244,7 @@ mod tests {
                 zerocheck: flock_core::zerocheck::ZerocheckProof {
                     round1_ab: f128_vec(&mut rng, 128),
                     round1_c: f128_vec(&mut rng, 128),
-                    multilinear_rounds: (0..25)
-                        .map(|_| (f128(&mut rng), f128(&mut rng)))
-                        .collect(),
+                    multilinear_rounds: (0..25).map(|_| (f128(&mut rng), f128(&mut rng))).collect(),
                     final_a_eval: f128(&mut rng),
                     final_b_eval: f128(&mut rng),
                     final_c_eval: f128(&mut rng),

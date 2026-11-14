@@ -58,14 +58,20 @@ impl F128 {
     #[inline]
     pub fn square(self) -> Self {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-        { unsafe { x86_64::ghash_square_register(self) } }
+        {
+            unsafe { x86_64::ghash_square_register(self) }
+        }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
-        { self * self }
+        {
+            self * self
+        }
     }
 
     #[inline]
     fn square_n(mut self, count: usize) -> Self {
-        for _ in 0..count { self = self.square(); }
+        for _ in 0..count {
+            self = self.square();
+        }
         self
     }
 
@@ -86,7 +92,6 @@ impl F128 {
         let a127 = a126.square() * self;
         a127.square()
     }
-
 }
 
 impl Add for F128 {
@@ -325,8 +330,13 @@ mod tests {
 
     #[test]
     fn register_arithmetic_matches_bitwise_oracle() {
-        let basis = |i: usize| if i < 64 { F128::new(1u64 << i, 0) }
-            else { F128::new(0, 1u64 << (i - 64)) };
+        let basis = |i: usize| {
+            if i < 64 {
+                F128::new(1u64 << i, 0)
+            } else {
+                F128::new(0, 1u64 << (i - 64))
+            }
+        };
         for i in 0..128 {
             let x = basis(i);
             assert_eq!(x.square(), software::ghash_mul(x, x));
@@ -337,7 +347,8 @@ mod tests {
         }
         let mut rng = Rng::new(0xa6412732);
         for _ in 0..1024 {
-            let x = rng.next_f128(); let y = rng.next_f128();
+            let x = rng.next_f128();
+            let y = rng.next_f128();
             assert_eq!(x * y, software::ghash_mul(x, y));
             assert_eq!(x.square(), software::ghash_mul(x, x));
         }
@@ -354,14 +365,22 @@ mod tests {
             }
             r
         };
-        for x in [F128::ZERO, F128::ONE, F128::new(u64::MAX,u64::MAX), F128::new(0,1<<63)] {
+        for x in [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0, 1 << 63),
+        ] {
             assert_eq!(x.inv(), old(x));
         }
         let mut rng = Rng::new(0x127128);
         for _ in 0..1024 {
-            let x = rng.next_f128(); let inverse = x.inv();
+            let x = rng.next_f128();
+            let inverse = x.inv();
             assert_eq!(inverse, old(x));
-            if !x.is_zero() { assert_eq!(x * inverse, F128::ONE); }
+            if !x.is_zero() {
+                assert_eq!(x * inverse, F128::ONE);
+            }
         }
     }
 

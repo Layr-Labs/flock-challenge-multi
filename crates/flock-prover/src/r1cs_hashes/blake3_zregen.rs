@@ -19,24 +19,79 @@
 //! consumes that stage directly with carry-less multiplies, so z is never
 //! transposed to block order and never written to DRAM.
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Test-only override: force z elision off without touching the process env.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 pub(crate) static FORCE_OFF: AtomicBool = AtomicBool::new(false);
 /// Diagnostics: regenerator folds / full materializations performed.
-pub(crate) static REGEN_FOLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) static REGEN_FOLDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 pub(crate) static REGEN_MATERIALIZES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Direct field folding for exact generated witness pairs; rollback keeps
 /// the promoted full-stage generation and field-fold path.
-pub(crate) fn fused_fold_enabled()->bool {
-    static ON:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_FUSED_Z_FOLD").is_none());
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "avx512vbmi2",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) fn fused_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FUSED_Z_FOLD").is_none());
     *ON
 }
 
 /// Production gate for skipping z's DRAM stores (`FLOCK_NO_Z_ELIDE=1`
 /// restores the dense witness). Requires the exact regeneration plan.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
 pub(crate) fn z_elide_enabled() -> bool {
     #[cfg(all(
         target_arch = "x86_64",
@@ -63,7 +118,6 @@ pub(crate) fn z_elide_enabled() -> bool {
         target_feature = "vpclmulqdq"
     )))]
     {
-        let _ = &FORCE_OFF;
         false
     }
 }
@@ -90,9 +144,9 @@ pub(crate) use imp::TileRegen;
 ))]
 pub(crate) mod imp {
     use super::super::{
-        BLEN_BASE, FLAGS_BASE, G_LANES, G_MSG_IDX, G_STRIDE, GS_BASE, K, MSG_PERMUTATION,
-        N_G, N_G_PER_ROUND, N_ROUNDS, OUT_HI_BASE, OUT_LO_BASE, T_HI_BASE, USEFUL_BITS,
-        WORD_BITS, ADDS_PER_G, CARRY_BITS_PER_ADD,
+        ADDS_PER_G, BLEN_BASE, CARRY_BITS_PER_ADD, FLAGS_BASE, G_LANES, G_MSG_IDX, G_STRIDE,
+        GS_BASE, K, MSG_PERMUTATION, N_G, N_G_PER_ROUND, N_ROUNDS, OUT_HI_BASE, OUT_LO_BASE,
+        T_HI_BASE, USEFUL_BITS, WORD_BITS,
     };
     use core::arch::x86_64::*;
     use flock_core::field::F128;
@@ -115,8 +169,8 @@ pub(crate) mod imp {
     const TAIL_Q: usize = 235;
     const TAIL_BITS: u32 = 49;
     /// Constant bits of z qword 17 (wires 1088..1152): block_len and flags.
-    const Q17_CONST: u64 = ((BLOCK_LEN as u64) << (BLEN_BASE - 1088))
-        | ((FLAGS as u64) << (FLAGS_BASE - 1088));
+    const Q17_CONST: u64 =
+        ((BLOCK_LEN as u64) << (BLEN_BASE - 1088)) | ((FLAGS as u64) << (FLAGS_BASE - 1088));
     const LIN_OFFSET: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 
     const fn sched() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
@@ -211,7 +265,8 @@ pub(crate) mod imp {
         if groups.len() != GROUPS + 1 {
             return None;
         }
-        let contiguous = |g: &[usize], first: usize| g.iter().enumerate().all(|(i, &c)| c == first + i);
+        let contiguous =
+            |g: &[usize], first: usize| g.iter().enumerate().all(|(i, &c)| c == first + i);
         if groups[13].len() != 64 || !contiguous(groups[13], 1088) {
             return None;
         }
@@ -253,7 +308,10 @@ pub(crate) mod imp {
             }
             if contiguous(grp, first) {
                 covered[q] += 1;
-                full.push(FullOp { q: q as u16, cg: cg as u16 });
+                full.push(FullOp {
+                    q: q as u16,
+                    cg: cg as u16,
+                });
                 continue;
             }
             let split = grp.iter().position(|&c| c >= first + 64)?;
@@ -276,14 +334,23 @@ pub(crate) mod imp {
             }
             covered[q] += 1;
             covered[q + 1] += 1;
-            pairs.push(PairOp { q: q as u16, cg: cg as u16, g: g as u16 });
+            pairs.push(PairOp {
+                q: q as u16,
+                cg: cg as u16,
+                g: g as u16,
+            });
             rot.push(Lanes([split as u64; 8]));
             mask.push(Lanes([(1u64 << split) - 1; 8]));
         }
         if covered.iter().any(|&c| c != 1) || g_seen.iter().any(|&s| !s) {
             return None;
         }
-        Some(Plan { full, pairs, rot, mask })
+        Some(Plan {
+            full,
+            pairs,
+            rot,
+            mask,
+        })
     }
 
     pub(crate) fn plan() -> Option<&'static Plan> {
@@ -332,7 +399,12 @@ pub(crate) mod imp {
     /// tile (176 groups x 512 bytes) and `o0 + 1 < 8`.
     #[inline(never)]
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,gfni,vpclmulqdq")]
-    pub(super) unsafe fn blake3_pair(tile: *const u8, o0: usize, scratch: &mut Scratch, pf: &mut PfCur) {
+    pub(super) unsafe fn blake3_pair(
+        tile: *const u8,
+        o0: usize,
+        scratch: &mut Scratch,
+        pf: &mut PfCur,
+    ) {
         unsafe {
             macro_rules! stripe {
                 ($cg:expr, $o:expr) => {
@@ -340,7 +412,8 @@ pub(crate) mod imp {
                 };
             }
             let idx_lo = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
-            let idx_hi = _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
+            let idx_hi =
+                _mm512_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
             // Word w (16 lanes: octa o0 then o0+1) from its cache group.
             macro_rules! word16 {
                 ($cg:expr, $hi:expr) => {
@@ -360,7 +433,8 @@ pub(crate) mod imp {
                 let cg = if q == 17 { SPLICED_GROUP } else { q - 4 };
                 word16!(cg, w & 1 == 1)
             });
-            let m: [__m512i; 16] = core::array::from_fn(|i| _mm512_shrdi_epi32::<1>(zw[i], zw[i + 1]));
+            let m: [__m512i; 16] =
+                core::array::from_fn(|i| _mm512_shrdi_epi32::<1>(zw[i], zw[i + 1]));
             let t_lo = _mm512_shrdi_epi32::<1>(zw[16], zw[17]);
             let t_hi = _mm512_shrdi_epi32::<1>(zw[17], zw[18]);
             let iv = super::super::BLAKE3_IV;
@@ -384,7 +458,8 @@ pub(crate) mod imp {
             ];
             // Lane j of octa A/B as qword (b_new | d_new << 32).
             let il_a = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
-            let il_b = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+            let il_b =
+                _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
             let deps = &mut scratch.deps;
             macro_rules! g {
                 ($r:literal, $gi:literal, $a:literal, $b:literal, $c:literal, $d:literal) => {{
@@ -490,7 +565,8 @@ pub(crate) mod imp {
             }
             let one = _mm512_set1_epi64(1);
             let c13 = q64!(SPLICED_GROUP);
-            *stp.add(17) = _mm512_ternarylogic_epi64::<0xEA>(c13, one, _mm512_set1_epi64(Q17_CONST as i64));
+            *stp.add(17) =
+                _mm512_ternarylogic_epi64::<0xEA>(c13, one, _mm512_set1_epi64(Q17_CONST as i64));
             *stp.add(18) = _mm512_andnot_si512(one, c13);
             let oh = &scratch.out_hi[x];
             let d55 = *dep.add(N_G - 1);
@@ -532,7 +608,14 @@ pub(crate) mod imp {
     impl PfCur {
         fn new(next: Option<usize>) -> Self {
             let (cur, end) = next.map_or((0, 0), |n| (n, n + 2 * (TILE_BYTES / 8)));
-            Self { cur, lim: cur, end, num: 0, den: 1, acc: 0 }
+            Self {
+                cur,
+                lim: cur,
+                end,
+                num: 0,
+                den: 1,
+                acc: 0,
+            }
         }
 
         /// Next phase: `lines` prefetches, spread over `ticks` ticks.
@@ -589,7 +672,8 @@ pub(crate) mod imp {
             unsafe {
                 let mut out: Box<Self> = Box::new(core::mem::zeroed());
                 for (i, wi) in w.iter().enumerate() {
-                    out.lohi[i] = _mm512_broadcast_i32x4(_mm_set_epi64x(wi.hi as i64, wi.lo as i64));
+                    out.lohi[i] =
+                        _mm512_broadcast_i32x4(_mm_set_epi64x(wi.hi as i64, wi.lo as i64));
                     out.sum[i] = _mm512_broadcast_i32x4(_mm_set_epi64x(0, (wi.lo ^ wi.hi) as i64));
                 }
                 out
@@ -699,6 +783,12 @@ pub(crate) mod imp {
     // SAFETY: each worker writes a disjoint set of destination slots.
     unsafe impl<T> Send for SendPtr<T> {}
     unsafe impl<T> Sync for SendPtr<T> {}
+    impl<T> SendPtr<T> {
+        #[inline]
+        fn get(self) -> *mut T {
+            self.0
+        }
+    }
 
     /// Visit every octa of every tile with its z staged in qword-lane order,
     /// eight tiles per task (the cross-quarter outputs of compressions 2i and
@@ -711,7 +801,7 @@ pub(crate) mod imp {
         if view.cross_quarter {
             assert_eq!(view.tiles * 64, 1 << 18);
         }
-        let unit = if view.tiles % 8 == 0 { 8 } else { 1 };
+        let unit = if view.tiles.is_multiple_of(8) { 8 } else { 1 };
         let base = view.base;
         let tiles = view.tiles;
         #[cfg(test)]
@@ -730,13 +820,17 @@ pub(crate) mod imp {
                 let (scratch, generated_tile) = guard.get_or_insert_with(|| {
                     // Separate allocations keep the read-only tile disjoint
                     // from the &mut Scratch passed to the expansion kernels.
-                    (Scratch::new(), unsafe { Box::<GeneratedTile>::new_uninit().assume_init() })
+                    (Scratch::new(), unsafe {
+                        Box::<GeneratedTile>::new_uninit().assume_init()
+                    })
                 });
                 for t in u * unit..(u + 1) * unit {
                     let tile = if let Some((seed, generate)) = view.generator {
                         let dst = generated_tile.0.as_mut_ptr().cast::<u8>();
                         if view.pair_generator.is_none() {
-                            unsafe { generate(seed, t, dst); }
+                            unsafe {
+                                generate(seed, t, dst);
+                            }
                         }
                         dst.cast_const()
                     } else {
@@ -745,25 +839,38 @@ pub(crate) mod imp {
                     let next = (view.generator.is_none() && t + 1 < tiles)
                         .then(|| base + (t + 1) * TILE_BYTES);
                     for pair in 0..4 {
-                        if mode == 0 && let Some(generate) = view.stage_generator {
-                            let seed=view.generator.expect("stage generator seed").0;
+                        if mode == 0
+                            && let Some(generate) = view.stage_generator
+                        {
+                            let seed = view.generator.expect("stage generator seed").0;
                             unsafe {
-                                generate(seed,t,pair,scratch.stage.0.as_mut_ptr().cast(),scratch.second_stage.0.as_mut_ptr().cast(),core::ptr::null());
+                                generate(
+                                    seed,
+                                    t,
+                                    pair,
+                                    scratch.stage.0.as_mut_ptr().cast(),
+                                    scratch.second_stage.0.as_mut_ptr().cast(),
+                                    core::ptr::null(),
+                                );
                             }
-                            let mut pf=PfCur::new(None);
-                            f(&scratch.stage,t,2*pair,&mut pf);
-                            f(&scratch.second_stage,t,2*pair+1,&mut pf);
+                            let mut pf = PfCur::new(None);
+                            f(&scratch.stage, t, 2 * pair, &mut pf);
+                            f(&scratch.second_stage, t, 2 * pair + 1, &mut pf);
                             continue;
                         }
 
                         if let Some(generate_pair) = view.pair_generator {
                             let seed = view.generator.expect("paired generator has a seed").0;
                             unsafe {
-                                generate_pair(seed, t, pair,
+                                generate_pair(
+                                    seed,
+                                    t,
+                                    pair,
                                     tile.cast_mut(),
                                     scratch.deps.as_mut_ptr().cast(),
                                     scratch.out_lo.as_mut_ptr().cast(),
-                                    scratch.out_hi.as_mut_ptr().cast());
+                                    scratch.out_hi.as_mut_ptr().cast(),
+                                );
                             }
                         }
                         // While octa pair `pair` of this tile is processed,
@@ -802,7 +909,8 @@ pub(crate) mod imp {
 
     #[cfg(test)]
     pub(crate) fn check_generated_pair(
-        seed: u64, tile: usize,
+        seed: u64,
+        tile: usize,
         generate: unsafe fn(u64, usize, *mut u8),
         generate_pair: flock_core::lincheck::RootPairGenerator,
     ) {
@@ -815,20 +923,45 @@ pub(crate) mod imp {
             let dst = rebuilt.0.as_mut_ptr().cast::<u8>();
             generate(seed, tile, src);
             for pair in 0..4 {
-                generate_pair(seed, tile, pair, dst, fused.deps.as_mut_ptr().cast(),
-                    fused.out_lo.as_mut_ptr().cast(), fused.out_hi.as_mut_ptr().cast());
+                generate_pair(
+                    seed,
+                    tile,
+                    pair,
+                    dst,
+                    fused.deps.as_mut_ptr().cast(),
+                    fused.out_lo.as_mut_ptr().cast(),
+                    fused.out_hi.as_mut_ptr().cast(),
+                );
                 blake3_pair(src, 2 * pair, &mut reference, &mut PfCur::new(None));
                 for (a, b, size) in [
-                    (reference.deps.as_ptr().cast::<u8>(), fused.deps.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.deps)),
-                    (reference.out_lo.as_ptr().cast::<u8>(), fused.out_lo.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.out_lo)),
-                    (reference.out_hi.as_ptr().cast::<u8>(), fused.out_hi.as_ptr().cast::<u8>(), core::mem::size_of_val(&fused.out_hi)),
+                    (
+                        reference.deps.as_ptr().cast::<u8>(),
+                        fused.deps.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&fused.deps),
+                    ),
+                    (
+                        reference.out_lo.as_ptr().cast::<u8>(),
+                        fused.out_lo.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&fused.out_lo),
+                    ),
+                    (
+                        reference.out_hi.as_ptr().cast::<u8>(),
+                        fused.out_hi.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&fused.out_hi),
+                    ),
                 ] {
-                    assert_eq!(core::slice::from_raw_parts(a, size), core::slice::from_raw_parts(b, size),
-                        "generated dependencies seed={seed:x} tile={tile} pair={pair}");
+                    assert_eq!(
+                        core::slice::from_raw_parts(a, size),
+                        core::slice::from_raw_parts(b, size),
+                        "generated dependencies seed={seed:x} tile={tile} pair={pair}"
+                    );
                 }
                 for group in 0..GROUPS {
                     let at = group * GROUP_BYTES + pair * 128;
-                    assert_eq!(core::slice::from_raw_parts(src.add(at), 128), core::slice::from_raw_parts(dst.add(at), 128));
+                    assert_eq!(
+                        core::slice::from_raw_parts(src.add(at), 128),
+                        core::slice::from_raw_parts(dst.add(at), 128)
+                    );
                 }
             }
         }
@@ -852,7 +985,6 @@ pub(crate) mod imp {
         struct FoldOut([__m512i; 8]);
         thread_local! {static OUTPUT:core::cell::RefCell<Option<Box<FoldOut>>>=const {core::cell::RefCell::new(None)};}
         (0..view.tiles / 8).into_par_iter().for_each(|u| {
-            let dst = dst;
             flock_core::rstrace::evd("z:task", u as u32);
             OUTPUT.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -886,7 +1018,7 @@ pub(crate) mod imp {
                                                 ),
                                                 _mm512_extracti32x4_epi32::<$l>(hi),
                                             );
-                                            _mm256_storeu_si256(dst.0.add(2 * c).cast(), value);
+                                            _mm256_storeu_si256(dst.get().add(2 * c).cast(), value);
                                         }};
                                     }
                                     store!(0);
@@ -905,15 +1037,16 @@ pub(crate) mod imp {
     pub(crate) fn fold64(view: &WitnessTileView, out: &mut [F128], w: &[F128; 64]) {
         assert_eq!(out.len(), view.tiles * 64 * 2);
         let weights = Weights::new(w);
-        if super::fused_fold_enabled() && let Some(generate)=view.stage_generator {
-            fold64_generated(view,out,&weights,generate);
+        if super::fused_fold_enabled()
+            && let Some(generate) = view.stage_generator
+        {
+            fold64_generated(view, out, &weights, generate);
             return;
         }
 
         let dst = SendPtr(out.as_mut_ptr());
         let cq = view.cross_quarter;
         for_each_octa(view, |stage, t, o, pf| {
-            let dst = dst;
             // SAFETY: AVX-512/VPCLMULQDQ are cfg preconditions; every
             // (compression, half) slot is written by exactly one octa; the
             // prefetch hints stay within the tile span.
@@ -926,7 +1059,7 @@ pub(crate) mod imp {
                         _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *v);
                         for (l, value) in lanes.into_iter().enumerate() {
                             let c = compression(cq, base + 2 * l + parity);
-                            *dst.0.add(2 * c + h) = value;
+                            *dst.get().add(2 * c + h) = value;
                         }
                     }
                 }
@@ -940,14 +1073,13 @@ pub(crate) mod imp {
         let dst = SendPtr(z.as_mut_ptr().cast::<u64>());
         let cq = view.cross_quarter;
         for_each_octa(view, |stage, t, o, _| {
-            let dst = dst;
             // SAFETY: Stage is NQ ZMMs = NQ x 8 qwords; each compression's
             // 256 qwords are written by exactly one octa lane.
             unsafe {
                 let words = &*(stage.0.as_ptr().cast::<[[u64; 8]; NQ]>());
                 for j in 0..8 {
                     let c = compression(cq, 64 * t + 8 * o + j);
-                    let row = dst.0.add(c * (K / 64));
+                    let row = dst.get().add(c * (K / 64));
                     for (q, w) in words.iter().enumerate() {
                         *row.add(q) = w[j];
                     }
@@ -978,18 +1110,21 @@ pub(crate) mod imp {
         if let Some((seed, generate)) = view.generator {
             #[repr(align(64))]
             struct Tile([core::mem::MaybeUninit<u8>; TILE_BYTES]);
-            return (0..view.tiles).into_par_iter().map_init(
-                || unsafe { Box::<Tile>::new_uninit().assume_init() },
-                |tile, index| unsafe {
-                    let p = tile.0.as_mut_ptr().cast::<u8>();
-                    generate(seed, index, p);
-                    let mut x = _mm512_setzero_si512();
-                    for line in 0..TILE_BYTES / 64 {
-                        x = _mm512_xor_si512(x, _mm512_load_si512(p.add(line * 64).cast()));
-                    }
-                    _mm512_reduce_or_epi64(x) as u64
-                },
-            ).reduce(|| 0, |a, b| a ^ b);
+            return (0..view.tiles)
+                .into_par_iter()
+                .map_init(
+                    || unsafe { Box::<Tile>::new_uninit().assume_init() },
+                    |tile, index| unsafe {
+                        let p = tile.0.as_mut_ptr().cast::<u8>();
+                        generate(seed, index, p);
+                        let mut x = _mm512_setzero_si512();
+                        for line in 0..TILE_BYTES / 64 {
+                            x = _mm512_xor_si512(x, _mm512_load_si512(p.add(line * 64).cast()));
+                        }
+                        _mm512_reduce_or_epi64(x) as u64
+                    },
+                )
+                .reduce(|| 0, |a, b| a ^ b);
         }
         let n = view.tiles * TILE_BYTES / 64;
         let base = view.base;
@@ -1000,7 +1135,10 @@ pub(crate) mod imp {
                 unsafe {
                     let mut x = _mm512_setzero_si512();
                     for i in c * 4096..(c + 1) * 4096 {
-                        x = _mm512_xor_si512(x, _mm512_load_si512((base + i * 64) as *const __m512i));
+                        x = _mm512_xor_si512(
+                            x,
+                            _mm512_load_si512((base + i * 64) as *const __m512i),
+                        );
                     }
                     _mm512_reduce_or_epi64(x) as u64
                 }
@@ -1022,13 +1160,22 @@ pub(crate) mod imp {
         /// Regenerator over tiles installed in `source` (shared with
         /// zerocheck/lincheck; kept alive until the open consumes it).
         pub(crate) fn installed(source: Arc<RootFoldSource>) -> Self {
-            assert!(source.witness_root_tiles().and_then(|t| t.witness_view()).is_some());
-            Self { tiles: Tiles::Installed(source) }
+            assert!(
+                source
+                    .witness_root_tiles()
+                    .and_then(|t| t.witness_view())
+                    .is_some()
+            );
+            Self {
+                tiles: Tiles::Installed(source),
+            }
         }
 
         pub(crate) fn owned(tiles: WitnessRootTiles) -> Self {
             assert!(tiles.witness_view().is_some());
-            Self { tiles: Tiles::Owned(tiles) }
+            Self {
+                tiles: Tiles::Owned(tiles),
+            }
         }
 
         pub(crate) fn view(&self) -> WitnessTileView {
@@ -1073,9 +1220,13 @@ mod tests {
     fn weights(seed: u64) -> [F128; 64] {
         let mut s = seed;
         std::array::from_fn(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let lo = s;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             F128::new(lo, s)
         })
     }
@@ -1096,12 +1247,19 @@ mod tests {
         let mut zr = vec![F128::new(0xdead, 0xbeef); z.len()];
         regen.materialize(&mut zr);
         let bad = z.iter().zip(&zr).position(|(a, b)| a != b);
-        assert!(bad.is_none(), "{tag}: regenerated z differs at element {bad:?} (block {:?})", bad.map(|i| i / 128));
+        assert!(
+            bad.is_none(),
+            "{tag}: regenerated z differs at element {bad:?} (block {:?})",
+            bad.map(|i| i / 128)
+        );
         for seed in [3u64, 0x5eed_0f_f01d] {
             let w = weights(seed);
             let mut got = vec![F128::ZERO; z.len() / 64];
             regen.fold64(&mut got, &w);
-            assert!(got == reference_fold64(z, &w), "{tag}: fold64 mismatch (seed {seed})");
+            assert!(
+                got == reference_fold64(z, &w),
+                "{tag}: fold64 mismatch (seed {seed})"
+            );
         }
     }
 
@@ -1111,16 +1269,27 @@ mod tests {
     #[ignore = "ranked-scale (~3 GiB); run serially on the benchmark host"]
     fn zregen_matches_ranked_witness_block_order() {
         use super::super::generate_witness_with_ab_packed_and_round1_inner_from;
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap();
         pool.install(|| {
             let mut checked = 0;
-            for (pass, seed) in [0x953a_81c7u64, 0x953a_81c7, 0x1234_5678_9abc, 7].into_iter().enumerate() {
+            for (pass, seed) in [0x953a_81c7u64, 0x953a_81c7, 0x1234_5678_9abc, 7]
+                .into_iter()
+                .enumerate()
+            {
                 let blocks = crate::seed_pipe::BlockSource::closed(18, seed);
-                let (z, a, b, mut ab) = generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
+                let (z, a, b, mut ab) =
+                    generate_witness_with_ab_packed_and_round1_inner_from(blocks, 18);
                 if let Some(tiles) = ab.take_witness_root_tiles() {
                     assert!(!tiles.z_elided());
                     let regen = TileRegen::owned(tiles);
-                    check(&z, &regen, &format!("block-order pass={pass} seed={seed:#x}"));
+                    check(
+                        &z,
+                        &regen,
+                        &format!("block-order pass={pass} seed={seed:#x}"),
+                    );
                     checked += 1;
                 }
                 flock_core::scratch::give_f128(z);
@@ -1157,13 +1326,14 @@ mod tests {
                 let run = |elide: bool| {
                     FORCE_OFF.store(!elide, Ordering::Relaxed);
                     let codeword = vec![F128::ZERO; 1 << 26];
-                    let (cw, (witness, a, b, mut ab)) = super::super::generate_witness_and_commit_from(
-                        crate::seed_pipe::BlockSource::closed(18, seed),
-                        18,
-                        &params,
-                        odd_tail,
-                        Some(codeword),
-                    );
+                    let (cw, (witness, a, b, mut ab)) =
+                        super::super::generate_witness_and_commit_from(
+                            crate::seed_pipe::BlockSource::closed(18, seed),
+                            18,
+                            &params,
+                            odd_tail,
+                            Some(codeword),
+                        );
                     FORCE_OFF.store(false, Ordering::Relaxed);
                     drop(cw);
                     let (z, committed) = witness.into_parts();
@@ -1180,21 +1350,32 @@ mod tests {
                 };
                 assert!(!tiles.z_elided());
                 let cq = tiles.witness_view().unwrap().cross_quarter;
-                check(&z, &TileRegen::owned(tiles), &format!("dense seed={seed:#x} cq={cq}"));
+                check(
+                    &z,
+                    &TileRegen::owned(tiles),
+                    &format!("dense seed={seed:#x} cq={cq}"),
+                );
                 dense_checked += usize::from(cq);
                 let (mut z2, tiles2, root_elided) = run(true);
-                if let Some(tiles2) = tiles2 {
-                    if tiles2.z_elided() {
-                        assert_eq!(format!("{root_dense:?}"), format!("{root_elided:?}"), "commitment changed under elision");
-                        let regen = TileRegen::owned(tiles2);
-                        let mut got = vec![F128::ZERO; z.len() / 64];
-                        let w = weights(seed);
-                        regen.fold64(&mut got, &w);
-                        assert!(got == reference_fold64(&z, &w), "elided fold64 mismatch seed={seed:#x}");
-                        regen.materialize(&mut z2);
-                        assert!(z2 == z, "elided materialize mismatch seed={seed:#x}");
-                        elided_checked += 1;
-                    }
+                if let Some(tiles2) = tiles2
+                    && tiles2.z_elided()
+                {
+                    assert_eq!(
+                        format!("{root_dense:?}"),
+                        format!("{root_elided:?}"),
+                        "commitment changed under elision"
+                    );
+                    let regen = TileRegen::owned(tiles2);
+                    let mut got = vec![F128::ZERO; z.len() / 64];
+                    let w = weights(seed);
+                    regen.fold64(&mut got, &w);
+                    assert!(
+                        got == reference_fold64(&z, &w),
+                        "elided fold64 mismatch seed={seed:#x}"
+                    );
+                    regen.materialize(&mut z2);
+                    assert!(z2 == z, "elided materialize mismatch seed={seed:#x}");
+                    elided_checked += 1;
                 }
                 flock_core::scratch::give_f128(z);
                 flock_core::scratch::give_f128(z2);
@@ -1221,8 +1402,8 @@ mod tests {
                     b"zr-proof-identity",
                     flock_core::hash::HashKind::Blake3,
                 );
-                let (proof, commitment, _claim) =
-                    setup.prove_fast_inner(crate::seed_pipe::BlockSource::closed(18, seed), &mut ch);
+                let (proof, commitment, _claim) = setup
+                    .prove_fast_inner(crate::seed_pipe::BlockSource::closed(18, seed), &mut ch);
                 FORCE_OFF.store(false, Relaxed);
                 crate::proof_io::R1csProofBundleLigerito { commitment, proof }.to_bytes()
             };
@@ -1237,8 +1418,14 @@ mod tests {
                 let elided = prove(true, seed);
                 let used_fold = REGEN_FOLDS.load(Relaxed) - folds;
                 let used_mat = REGEN_MATERIALIZES.load(Relaxed) - mats;
-                assert!(dense == elided, "proof bytes differ under z elision (seed {seed:#x}, folds {used_fold}, materializes {used_mat})");
-                println!("ZREGEN_PROOF seed={seed:#x} bytes={} regen_folds={used_fold} fallback_materializes={used_mat}", dense.len());
+                assert!(
+                    dense == elided,
+                    "proof bytes differ under z elision (seed {seed:#x}, folds {used_fold}, materializes {used_mat})"
+                );
+                println!(
+                    "ZREGEN_PROOF seed={seed:#x} bytes={} regen_folds={used_fold} fallback_materializes={used_mat}",
+                    dense.len()
+                );
                 engaged += used_fold;
             }
             assert!(engaged >= 1, "z elision never reached the regenerator fold");
@@ -1276,11 +1463,11 @@ mod tests {
             drop(committed);
             flock_core::scratch::give_f128(a);
             flock_core::scratch::give_f128(b);
-            if let Some(t) = ab.take_witness_root_tiles() {
-                if t.witness_view().unwrap().cross_quarter {
-                    found = Some((z, t));
-                    break;
-                }
+            if let Some(t) = ab.take_witness_root_tiles()
+                && t.witness_view().unwrap().cross_quarter
+            {
+                found = Some((z, t));
+                break;
             }
             // Return z to the tagged pool so the warm exact producer engages.
             flock_core::scratch::give_f128(z);
@@ -1307,7 +1494,9 @@ mod tests {
             (v[0], v[4])
         };
         let mut sink = 0u64;
-        let td = time(&mut || flock_core::pcs::ligerito::bench_direct_fold8_f_dense(&z, &mut dense, &w16, r4, r5));
+        let td = time(&mut || {
+            flock_core::pcs::ligerito::bench_direct_fold8_f_dense(&z, &mut dense, &w16, r4, r5)
+        });
         let tr = time(&mut || regen.fold64(&mut regd, &w));
         let te = time(&mut || sink ^= super::imp::expand_only(&view));
         let tt = time(&mut || sink ^= super::imp::read_only(&view));
@@ -1321,9 +1510,15 @@ mod tests {
             super::imp::TEST_MODE.store(mode, Ordering::Relaxed);
             let tf = time(&mut || regen.fold64(&mut regd, &w));
             let tx = time(&mut || sink ^= super::imp::expand_only(&view));
-            parts.push(format!("{name}: fold {:.3}/{:.3} expand {:.3}/{:.3}", tf.0, tf.1, tx.0, tx.1));
+            parts.push(format!(
+                "{name}: fold {:.3}/{:.3} expand {:.3}/{:.3}",
+                tf.0, tf.1, tx.0, tx.1
+            ));
         }
         super::imp::TEST_MODE.store(0, Ordering::Relaxed);
-        println!("ZREGEN_PARTS {} (min/med ms, sink {sink:x})", parts.join(" | "));
+        println!(
+            "ZREGEN_PARTS {} (min/med ms, sink {sink:x})",
+            parts.join(" | ")
+        );
     }
 }

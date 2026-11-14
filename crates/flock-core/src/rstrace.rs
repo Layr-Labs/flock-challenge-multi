@@ -8,7 +8,10 @@ use std::time::Instant;
 
 pub fn level() -> u8 {
     static L: LazyLock<u8> = LazyLock::new(|| {
-        std::env::var("FLOCK_RS_TRACE").ok().map(|s| s.parse().unwrap_or(1)).unwrap_or(0)
+        std::env::var("FLOCK_RS_TRACE")
+            .ok()
+            .map(|s| s.parse().unwrap_or(1))
+            .unwrap_or(0)
     });
     *L
 }
@@ -18,7 +21,10 @@ pub fn level() -> u8 {
 /// sweep re-reads a cache-resident slice (same kernel, same op count).
 pub fn probe_mod() -> usize {
     static K: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("FLOCK_V1_PROBE_MOD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+        std::env::var("FLOCK_V1_PROBE_MOD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
     });
     *K
 }
@@ -39,7 +45,16 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 const CAP: usize = 1 << 19;
 // Lock-free slots: (ns, tag ptr, tag len, arg|tid<<32|cpu<<48).
 static SLOTS: LazyLock<Vec<[AtomicU64; 4]>> = LazyLock::new(|| {
-    (0..CAP).map(|_| [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]).collect()
+    (0..CAP)
+        .map(|_| {
+            [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]
+        })
+        .collect()
 });
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TID: AtomicU32 = AtomicU32::new(0);
@@ -76,7 +91,10 @@ pub fn ev(tag: &'static str, arg: u32) {
     s[0].store(ns, Ordering::Relaxed);
     s[1].store(tag.as_ptr() as u64, Ordering::Relaxed);
     s[2].store(tag.len() as u64, Ordering::Relaxed);
-    s[3].store(arg as u64 | (tid & 0xffff) << 32 | c << 48, Ordering::Release);
+    s[3].store(
+        arg as u64 | (tid & 0xffff) << 32 | c << 48,
+        Ordering::Release,
+    );
 }
 
 /// Record `(ns, tag, arg)` at an explicit timestamp (lane ru diagnostics).
@@ -91,7 +109,10 @@ fn ev_at(ns: u64, tag: &'static str, arg: u32) {
     s[0].store(ns, Ordering::Relaxed);
     s[1].store(tag.as_ptr() as u64, Ordering::Relaxed);
     s[2].store(tag.len() as u64, Ordering::Relaxed);
-    s[3].store(arg as u64 | (tid & 0xffff) << 32 | c << 48, Ordering::Release);
+    s[3].store(
+        arg as u64 | (tid & 0xffff) << 32 | c << 48,
+        Ordering::Release,
+    );
 }
 
 static LAST_END: AtomicU64 = AtomicU64::new(0);
@@ -155,7 +176,13 @@ pub fn dump(header: &str) {
                     s[2].load(Ordering::Relaxed) as usize,
                 ))
             };
-            (s[0].load(Ordering::Relaxed), tag, w as u32, ((w >> 32) & 0xffff) as u32, ((w >> 48) & 0xffff) as i32)
+            (
+                s[0].load(Ordering::Relaxed),
+                tag,
+                w as u32,
+                ((w >> 32) & 0xffff) as u32,
+                ((w >> 48) & 0xffff) as i32,
+            )
         })
         .collect();
     v.sort_by_key(|e| e.0);
@@ -164,13 +191,21 @@ pub fn dump(header: &str) {
     let mut out = String::with_capacity(64 * v.len() + 64);
     let _ = writeln!(out, "[rs] ==== {header} ({} events)", v.len());
     for (ns, tag, arg, tid, c) in v {
-        let _ = writeln!(out, "[rs] {:10.4} t{tid:<3} c{c:<3} {tag} {arg}", (ns - t0) as f64 / 1e6);
+        let _ = writeln!(
+            out,
+            "[rs] {:10.4} t{tid:<3} c{c:<3} {tag} {arg}",
+            (ns - t0) as f64 / 1e6
+        );
     }
     // One write: the ranked harness / one.py kill the worker shortly after
     // the proof appears, so a line-per-syscall dump gets cut off.
     if let Some(path) = std::env::var_os("FLOCK_RS_TRACE_OUT") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = f.write_all(out.as_bytes());
             return;
         }

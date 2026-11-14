@@ -373,7 +373,8 @@ pub(crate) unsafe fn gather_transpose_stripe4_x86<const FUSE: bool, const RAW: b
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
-    target_feature = "gfni"
+    target_feature = "gfni",
+    not(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))
 ))]
 fn lc_mats_aos_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -387,7 +388,8 @@ fn lc_mats_aos_enabled() -> bool {
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
-    target_feature = "gfni"
+    target_feature = "gfni",
+    not(all(target_feature = "avx512bw", target_feature = "avx512vbmi"))
 ))]
 #[target_feature(enable = "avx512f")]
 unsafe fn aos8_lohi(eq8: &[F128]) -> ([u64; 8], [u64; 8]) {
@@ -442,7 +444,6 @@ pub(crate) fn fold_mats_from_basis(eq8: &[F128], mats: &mut [u64]) {
         unsafe {
             crate::bits::transpose_8_f128_to_16_mats_swapped_gfni(eq8, mats);
         }
-        return;
     }
     #[cfg(not(all(target_feature = "avx512bw", target_feature = "avx512vbmi")))]
     {
@@ -531,7 +532,6 @@ pub(crate) unsafe fn gfni_fold_rows(
         }
     }
 }
-
 
 /// Fold one selected-word block across 1..=4 adjacent tiles, retaining all
 /// sixteen byte-plane accumulators until the last tile has been consumed.

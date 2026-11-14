@@ -365,6 +365,7 @@ fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128
 /// Round-0 message `(u_0, u_2)` over paired slots, without a following
 /// lookahead. DirectFold8 uses this for its sixth and final retained round.
 #[inline]
+#[cfg(not(all(target_feature = "avx512f", target_feature = "vpclmulqdq")))]
 pub(crate) fn round0_scalar(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(2));

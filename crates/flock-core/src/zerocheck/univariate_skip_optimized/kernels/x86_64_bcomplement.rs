@@ -636,14 +636,18 @@ unsafe fn apply_b_complement<const FIRST: usize, const END: usize, const P: bool
             _mm512_shuffle_i64x2::<0x4E>(u3, u3),
             END > 6
         );
-        let complement = join!(
+        join!(
             even,
             FIRST < 2 || (FIRST < 6 && END > 4),
             _mm512_shuffle_i64x2::<0xB1>(odd, odd),
             (FIRST < 4 && END > 2) || END > 6
-        );
-        complement
+        )
     }
+}
+
+/// Structural mode shared by the eight-row projection.
+pub(crate) const fn window_mode(blk: usize, k: usize) -> u8 {
+    (WINDOW_PLANS[blk - 2].modes >> (8 * (7 - k))) as u8
 }
 
 #[cfg(test)]
@@ -1027,9 +1031,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Structural mode shared by the eight-row projection.
-pub(crate) const fn window_mode(blk: usize, k: usize) -> u8 {
-    (WINDOW_PLANS[blk - 2].modes >> (8 * (7 - k))) as u8
 }
