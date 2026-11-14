@@ -24,6 +24,7 @@ pub mod challenger;
 pub mod field;
 pub mod gaptime;
 pub mod rstrace;
+pub mod slow;
 pub mod gpu;
 pub mod hash;
 pub mod lincheck;
@@ -57,6 +58,8 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Diagnostic submission only: selects this trial's factor levels before anything reads a switch.
+    fact_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
@@ -65,6 +68,118 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // built: see `smt_split`.
     smt_split::init();
     built
+}
+
+/// DIAGNOSTIC SUBMISSION ONLY: factorial in-run probe on the ranked runner.
+///
+/// The ranked harness starts one fresh worker per trial and names that trial's
+/// files `run-{r}.ready` / `run-{r}.proof`, so a worker knows its trial number
+/// `r` (1-based, warm-up trials included). Each entry of `FACTORS` is a set of
+/// existing switches of this tree plus a 4-bit mask: the factor is ON in trial
+/// `r` iff `popcount(((r - 1) mod 16) & mask)` is odd. Every mask contains bit
+/// 2 or bit 3, so each factor is ON in exactly half of every 16 consecutive
+/// trials, balanced over `r mod 2` and `r mod 4`, and any two factors are
+/// orthogonal (a two-level full factorial on the bits of `(r - 1) mod 16`).
+/// One run therefore holds one paired A/B per factor, each over all trials.
+///
+/// The switches are set here, on the main thread, as the first statement of the
+/// worker's first library call: no thread, pool or lazily-read switch exists
+/// yet, exactly as if the harness had passed them (it clears the environment,
+/// so it cannot). Every switch only selects between schedules, prefetch
+/// distances or store kinds that compute the same values: proof bytes are the
+/// same in every trial for the same seed.
+///
+/// Method credit: newjordan's run-parity probes; patternrecognition9-del's
+/// interleaved A/B probes. Decoder: the published per-trial times.
+pub(crate) mod fact_probe {
+    /// (mask, switches set when the factor is ON)
+    pub(crate) const FACTORS: &[(u64, &[(&str, &str)])] = &[
+        // Groups {4..7} {8..11}: interactions inside a group alias onto the
+        // r mod 2/4 nuisance columns, never onto a factor.
+        // A: commit memory: X7 compact staging, DRAM-latency page repair (two strengths).
+        (4, &[("FLOCK_XSEED_COMPACT_STAGE", "1")]),
+        (5, &[("FLOCK_XINT_HOSTLAT", "1")]),
+        (6, &[("FLOCK_XINT_HOSTLAT2", "1")]),
+        // B: thread placement of the port-bound zerocheck passes: one claimer
+        // per physical core (workers 0-7 = sibling 0 of cores 0-7) + caller.
+        (8, &[("FLOCK_XINT_R2_CAP", "8")]),
+        (9, &[("FLOCK_XINT_L0_CAP", "8")]),
+    ];
+
+    /// The trial number, if this process is a ranked worker
+    /// (`flock-benchmark-worker LOG2 .../run-{r}.ready .../run-{r}.proof`).
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 1).then_some(r)
+    }
+
+    pub(crate) fn is_on(r: u64, mask: u64) -> bool {
+        (((r - 1) % 16) & mask).count_ones() & 1 == 1
+    }
+
+    /// The trial number (cached), if this process is a ranked worker.
+    pub(crate) fn trial_number() -> Option<u64> {
+        static T: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *T.get_or_init(trial)
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        for (mask, env) in FACTORS {
+            if !is_on(r, *mask) {
+                continue;
+            }
+            for (key, value) in *env {
+                // SAFETY: called once from `init_perf_thread_pool` before any other
+                // thread exists, so no concurrent environment access is possible.
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{is_on, FACTORS};
+        #[test]
+        fn factors_are_balanced_and_orthogonal() {
+            let mut seen = std::collections::HashSet::new();
+            for (mask, env) in FACTORS {
+                assert!(*mask < 16 && mask & 0b1100 != 0, "mask {mask}");
+                assert!(seen.insert(*mask), "duplicate mask {mask}");
+                assert!(!env.is_empty());
+                // balanced over r mod 2 and r mod 4 inside every 16-trial period
+                for period in [2u64, 4] {
+                    for class in 0..period {
+                        let on = (1..=16u64).filter(|&r| (r - 1) % period == class && is_on(r, *mask)).count();
+                        assert_eq!(on as u64, 8 / period, "mask {mask} period {period} class {class}");
+                    }
+                }
+            }
+            for (a, _) in FACTORS {
+                for (b, _) in FACTORS {
+                    if a < b {
+                        let agree = (1..=16u64).filter(|&r| is_on(r, *a) == is_on(r, *b)).count();
+                        assert_eq!(agree, 8, "masks {a} {b} not orthogonal");
+                    }
+                }
+            }
+            let keys: Vec<&str> = FACTORS.iter().flat_map(|(_, e)| e.iter().map(|(k, _)| *k)).collect();
+            let unique: std::collections::HashSet<&&str> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "a switch appears in two factors");
+        }
+    }
 }
 
 /// Pin glibc's heap thresholds at process start: `M_MMAP_THRESHOLD` = 32 MiB
@@ -1054,6 +1169,24 @@ pub mod flat_par {
         *ON
     }
 
+    /// xint thread-placement probe: while set below the pool size, only
+    /// workers with index < CAP (worker i < 8 = sibling 0 of core i on the
+    /// pin16 pool) plus the caller claim items in [`map_reduce_idle`].
+    static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Run `f` with the claimer cap set to `cap` (restored afterwards).
+    pub fn with_cap<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+        let old = CAP.swap(cap, Ordering::SeqCst);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CAP.store(self.0, Ordering::SeqCst);
+            }
+        }
+        let _r = Restore(old);
+        f()
+    }
+
     /// `FLOCK_NO_RU_FLAT_PAR=1` makes callers keep their rayon route.
     pub fn enabled() -> bool {
         static ON: std::sync::LazyLock<bool> =
@@ -1086,7 +1219,7 @@ pub mod flat_par {
         f: F,
         id: impl Fn() -> T + Sync,
         op: impl Fn(T, T) -> T + Sync,
-        idle: impl FnOnce(),
+        idle: impl FnOnce() + Send,
     ) -> T
     where
         F: Fn(usize) -> T + Sync,
@@ -1151,12 +1284,33 @@ pub mod flat_par {
             active: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         });
-        for _ in 0..helpers {
-            let s = sh.clone();
-            rayon::spawn(move || enter(&s));
+        let cap = CAP.load(Ordering::SeqCst);
+        if cap < rayon::current_num_threads() {
+            // Capped placement: one broadcast; workers >= cap (other than the
+            // caller) return at once, the caller runs `idle` after its claims.
+            let me = rayon::current_thread_index();
+            let idle_once = std::sync::Mutex::new(Some(idle));
+            rayon::broadcast(|ctx| {
+                if Some(ctx.index()) == me {
+                    enter(&sh);
+                    if let Some(f) = idle_once.lock().unwrap().take() {
+                        f();
+                    }
+                } else if ctx.index() < cap {
+                    enter(&sh);
+                }
+            });
+            if let Some(f) = idle_once.into_inner().unwrap() {
+                f();
+            }
+        } else {
+            for _ in 0..helpers {
+                let s = sh.clone();
+                rayon::spawn(move || enter(&s));
+            }
+            enter(&sh);
+            idle();
         }
-        enter(&sh);
-        idle();
         while done.load(Ordering::Acquire) < n {
             core::hint::spin_loop();
         }

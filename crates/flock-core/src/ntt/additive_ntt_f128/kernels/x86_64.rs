@@ -4240,6 +4240,13 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
 ) {
     unsafe {
         if super::super::ntt_shaped_enabled() {
+            if num_ntts == 16 {
+                match sixteenth {
+                    1 => return butterfly_fused_4layer_row_impl::<true,true,H,1,16>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    4 => return butterfly_fused_4layer_row_impl::<true,true,H,4,16>(ptr,sixteenth,num_ntts,lanes,r,t,pf_r,p),
+                    _ => {}
+                }
+            }
             if num_ntts == 64 {
                 match sixteenth {
                     128 => {
@@ -5544,3 +5551,9 @@ unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &Prep
         }
     }
 }
+
+#[cfg(target_feature = "avx512bw")]
+#[path = "xseed_compact.rs"]
+mod xseed_compact;
+#[cfg(target_feature = "avx512bw")]
+pub(crate) use xseed_compact::{xseed_compact_seed, xseed_compact_publish};

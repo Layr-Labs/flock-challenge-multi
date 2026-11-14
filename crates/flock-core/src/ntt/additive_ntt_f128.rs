@@ -47,6 +47,9 @@ use crate::field::F128;
 
 mod kernels;
 
+#[cfg(target_os = "linux")]
+mod xseed_hot_queue;
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -488,6 +491,13 @@ fn deep_share_enabled() -> bool {
     *ON
 }
 
+#[cfg(target_os = "linux")]
+fn xseed_hot_queue_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_HOT_QUEUE").is_some());
+    *ON
+}
+
 /// Run the deep pass inside the seed+top pass's sibling-paired broadcast,
 /// behind a spin barrier, instead of opening a second broadcast (whose
 /// workers have gone to sleep by then; waking them cost ~0.4 ms on the
@@ -566,6 +576,7 @@ mod affinity {
 #[cfg(target_os = "linux")]
 struct DeepSplitState {
     queues: Vec<DeepQueue>,
+    hot_queues: Option<Vec<xseed_hot_queue::HotQueue>>,
     next_sub: std::sync::atomic::AtomicUsize,
     prod_done: std::sync::atomic::AtomicUsize,
 }
@@ -575,6 +586,9 @@ impl DeepSplitState {
     fn new(n_pairs: usize) -> Self {
         Self {
             queues: (0..n_pairs).map(|_| DeepQueue::new()).collect(),
+            hot_queues: (deep_share_enabled() && xseed_hot_queue_enabled()).then(|| {
+                (0..n_pairs).map(|_| xseed_hot_queue::HotQueue::new(deep_split_depth())).collect()
+            }),
             next_sub: std::sync::atomic::AtomicUsize::new(0),
             prod_done: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1487,12 +1501,28 @@ pub struct WitnessSeedTarget {
     output: [*mut F128; 2],
     odd_tail: usize,
     stage_perm: bool,
+    compact: bool,
     right: F128,
     dense: [F128; 3],
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 impl WitnessSeedTarget {
+    /// Copy a ready witness window without rate expansion. Rows are q-major;
+    /// producer roles own distinct kpair values until the dispatcher joins.
+    unsafe fn capture_compact(&self, input: *const F128, stride: usize,
+        kpair: usize, parity: usize, col: usize, count: usize) {
+        assert!(kpair < 32 && parity < 2 && col + count <= 64);
+        unsafe {
+            for kbit in 0..2 {
+                let kp = seed_top_stage_row(2 * kpair + kbit, self.stage_perm);
+                for q in 0..4 {
+                    core::ptr::copy_nonoverlapping(input.add((2 * q + kbit) * stride),
+                        self.output[parity].add((q * 64 + kp) * 64 + col), count);
+                }
+            }
+        }
+    }
     /// Seed both r parities for the octa with lanes `2*q + kbit`. This uses
     /// exactly the same complete-row kernel and coefficient preparation as
     /// the group gather, with the source now confined to sixteen local rows.
@@ -1506,6 +1536,13 @@ impl WitnessSeedTarget {
     pub unsafe fn seed_octa(&self, input: *const F128, kpair: usize) {
         assert!(kpair < 32);
         unsafe {
+            if self.compact {
+                for parity in 0..2 {
+                    self.capture_compact(input.add(parity * 64), 128, kpair, parity, 0,
+                        if parity == 1 { 64 - self.odd_tail } else { 64 });
+                }
+                return;
+            }
             for parity in 0..2 {
                 for kbit in 0..2 {
                     let kp = seed_top_stage_row(2 * kpair + kbit, self.stage_perm);
@@ -1624,6 +1661,7 @@ impl<'a> SeedInput<'a> {
 fn st_fmp_run(
     n_tasks: usize,
     row_len: usize,
+    stage_rows: usize,
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
@@ -1649,7 +1687,7 @@ fn st_fmp_run(
         return false;
     };
     st_fmp_run_claimed(
-        n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf,
+        n_tasks, row_len, stage_rows, seed, fold, publish, produce, after, pairs, nbuf,
         st_fmp_balanced_enabled(), claim,
     )
 }
@@ -1661,6 +1699,7 @@ fn st_fmp_run(
 fn st_fmp_run_claimed(
     n_tasks: usize,
     row_len: usize,
+    stage_rows: usize,
     seed: &(dyn Fn(*mut F128, usize, *const F128) + Sync),
     fold: &(dyn Fn(*mut F128, usize) + Sync),
     publish: &(dyn Fn(*mut F128, usize) + Sync),
@@ -1698,7 +1737,8 @@ fn st_fmp_run_claimed(
             .filter(|n| *n <= 4).unwrap_or(0)
     });
     let slot_pad = *SLOT_PAD_LINES * (64 / core::mem::size_of::<F128>());
-    let stride = 512 * row_len + slot_pad;
+    assert!(matches!(stage_rows, 256 | 512));
+    let stride = stage_rows * row_len + slot_pad;
     static HUGE_STAGE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_NTT_ST_HUGE_STAGE").is_none()
     });
@@ -1836,7 +1876,7 @@ fn st_fmp_run_claimed(
         // write. A small cache-line color leaves the complete three-slot
         // payload inside that frame while offsetting its L1 set mapping.
         let mut staging = staging_block(
-            if huge_stage { 4096 } else { 512 * nbuf + extra_rows }, row_len);
+            if huge_stage { 4096 } else { stage_rows * nbuf + extra_rows }, row_len);
         let stage_offset = if huge_stage {
             staging.as_mut_ptr().align_offset(1usize << *STAGE_ALIGN_LOG)
                 + *STAGE_COLOR * (64 / core::mem::size_of::<F128>())
@@ -4067,11 +4107,38 @@ impl AdditiveNttF128 {
                 let target = WitnessSeedTarget {
                     output: [output0, output1],
                     odd_tail: if seed_odd_tail { odd_tail } else { 0 },
-                    stage_perm, right: seed_right, dense: seed_dense,
+                    stage_perm, compact: false, right: seed_right, dense: seed_dense,
                 };
                 produce(src_addr as *mut F128, group, role, Some(&target));
             }
         });
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+        if crate::sl2_env_set!("FLOCK_XSEED_COMPACT_STAGE") && direct_publish
+            && log_d == 20 && row_len == 64 && sub_stride == 2048
+            && st_fmp_balanced_enabled() && st_fmp_bufs() == ST_FMP_BALANCED_BUFS
+        {
+            if let Some(source_produce) = msg.producer() {
+                let compact_produce = |group, role, output0, output1| {
+                    let target = WitnessSeedTarget {
+                        output: [output0, output1],
+                        odd_tail: if seed_odd_tail { odd_tail } else { 0 },
+                        stage_perm, compact: true, right: seed_right, dense: seed_dense,
+                    };
+                    source_produce(src_addr as *mut F128, group, role, Some(&target));
+                };
+                let seed_plan = xseed_compact::seed_plan(seed_right, seed_dense);
+                let publish_plan = xseed_compact::publish_plan(&tw2);
+                let compact_publish = |buf: *mut F128, r| unsafe {
+                    xseed_compact::publish(buf, base_addr as *mut F128, r,
+                        row_lanes(r, 64, lanes2_tail), stage_perm, &seed_plan,
+                        &tw4, &publish_plan);
+                };
+                let no_seed = |_: *mut F128, _: usize, _: *const F128| panic!("compact stage requires direct producer");
+                let no_fold = |_: *mut F128, _: usize| {};
+                if st_fmp_run(2048, 64, 256, &no_seed, &no_fold, &compact_publish,
+                    Some(&compact_produce), after) { return after.is_some(); }
+            }
+        }
         const PARALLEL_TASK_THRESHOLD: usize = 32;
         // Staging is write-before-read: the seed kernels write all 512 rows
         // across every lane the selected downstream path can read. The exact
@@ -4099,7 +4166,7 @@ impl AdditiveNttF128 {
                 target_feature = "vpclmulqdq"
             ))]
             if direct_publish && st_fmp_run(
-                sub_stride, row_len, &seed, &fold4, &publish2,
+                sub_stride, row_len, 512, &seed, &fold4, &publish2,
                 produce.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after,
             )
             {
@@ -4803,6 +4870,21 @@ impl AdditiveNttF128 {
             let hint = deep_pf_hint();
             let share = deep_share_enabled();
             let queues = &stt.queues;
+            let hot_queues = stt.hot_queues.as_ref();
+            let pop = |slot: usize, newest: bool| {
+                if let Some(hot) = hot_queues {
+                    hot[slot].try_pop(newest).map(|lo| DeepBlock { lo })
+                } else {
+                    queues[slot].try_pop()
+                }
+            };
+            let all_empty = || {
+                if let Some(hot) = hot_queues {
+                    hot.iter().all(|q| q.is_empty())
+                } else {
+                    queues.iter().all(|q| q.is_empty())
+                }
+            };
             let next_sub = &stt.next_sub;
             let prod_done = &stt.prod_done;
             let producer = idx < n_pairs;
@@ -4849,8 +4931,8 @@ impl AdditiveNttF128 {
             // Hash one claimed block.
             let run = |b: DeepBlock| {
                 // SAFETY: the producer finished every write to this block
-                // before publishing it, and the release on the ring head /
-                // acquire in the claiming pop order those writes before
+                // before publishing it, and the release on the ring head
+                // (or hot token) / acquire in the claiming pop order those writes before
                 // this read.
                 let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
@@ -4899,13 +4981,13 @@ impl AdditiveNttF128 {
                     }
                     let _ = got;
                 }
-                if let Some(b) = queues[own].try_pop() {
+                if let Some(b) = pop(own, true) {
                     run(b);
                     continue;
                 }
                 let mut got = false;
                 for k in 1..n_pairs {
-                    if let Some(b) = queues[(own + k) % n_pairs].try_pop() {
+                    if let Some(b) = pop((own + k) % n_pairs, false) {
                         run(b);
                         got = true;
                         break;
@@ -4914,7 +4996,7 @@ impl AdditiveNttF128 {
                 if got {
                     continue;
                 }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
+                if prod_done.load(Ordering::Acquire) == n_pairs && all_empty()
                 {
                     return;
                 }
@@ -4926,7 +5008,9 @@ impl AdditiveNttF128 {
                         cb(range, blk);
                         return;
                     };
-                    let queued = if share {
+                    let queued = if let Some(hot) = hot_queues {
+                        hot[slot].try_push(b.lo)
+                    } else if share {
                         q.try_push(b, depth)
                     } else {
                         q.push(b, depth)
@@ -6765,7 +6849,7 @@ mod tests {
                     }
                     published[r].fetch_add(1, Ordering::Relaxed);
                 };
-                assert!(st_fmp_run(n_tasks, ROW_LEN, &seed, &fold, &publish, None, None));
+                assert!(st_fmp_run(n_tasks, ROW_LEN, 512, &seed, &fold, &publish, None, None));
                 for r in 0..n_tasks {
                     assert_eq!(seeded[r].load(Ordering::Relaxed), 1, "task {r} seeded");
                     assert_eq!(folded[r].load(Ordering::Relaxed), 1, "task {r} folded");
@@ -9086,7 +9170,7 @@ mod generated_pair_dispatch_tests {
             let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
             let claim=StFmpClaim::take().expect("previous call leaked its claim");
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
-                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
+                2048,64,512,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
             assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
             if injection==0 {
                 assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
@@ -9207,7 +9291,7 @@ mod octa_seed_geometry_tests {
             let mut expected=vec![poison;2*512*64+8];let mut actual=expected.clone();
             unsafe {
                 for parity in 0..2{seed_compact_witness_group(expected.as_mut_ptr().add(4+parity*512*64),input.as_ptr(),parity,64,tail,perm,right,&dense);}
-                let target=WitnessSeedTarget{output:[actual.as_mut_ptr().add(4),actual.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,right,dense};
+                let target=WitnessSeedTarget{output:[actual.as_mut_ptr().add(4),actual.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,compact:false,right,dense};
                 // Actual producer order: roles process alternating kpair, each
                 // fully consumes its reusable local input before overwriting.
                 let mut local=[F128::ZERO;8*128];
@@ -9221,13 +9305,17 @@ mod octa_seed_geometry_tests {
             assert!(actual[..4].iter().chain(actual[actual.len()-4..].iter()).all(|v|*v==poison));
             let mut wrong=vec![poison;2*512*64+8];let mut local=input[..1024].to_vec();
             for lane in 0..128{local.swap(lane,4*128+lane);}
-            unsafe {let target=WitnessSeedTarget{output:[wrong.as_mut_ptr().add(4),wrong.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,right,dense};target.seed_octa(local.as_ptr(),0);}
+            unsafe {let target=WitnessSeedTarget{output:[wrong.as_mut_ptr().add(4),wrong.as_mut_ptr().add(4+512*64)],odd_tail:tail,stage_perm:perm,compact:false,right,dense};target.seed_octa(local.as_ptr(),0);}
             // Compare one independently selected output lane affected by q0.
             assert_ne!(wrong[4],expected[4]);negative_controls+=1;cases+=1;
         }}}}
         println!("OCTA_SEED_GEOMETRY full_groups={cases} fields_per_group=63488_or_65536 wrong_quarter_controls={negative_controls} input_unchanged=true guards_unchanged=true reusable_local_input=true hold4_disabled={}",ntt_seed_hold4_disabled());
     }
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "vpclmulqdq"))]
+#[path = "additive_ntt_f128/xseed_compact.rs"]
+mod xseed_compact;
 
 /// Proof-local immutable coefficient preparation for incremental witness seeding.
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
@@ -9254,6 +9342,7 @@ impl WitnessWindowSeed<'_>{
   assert!(kpair<32&&first<128&&first.is_multiple_of(4)&&count>0&&count<=64&&count.is_multiple_of(4)&&first+count<=128&&first/64==(first+count-1)/64);
   let parity=first/64;let col=first%64;let limit=if parity==1{64-self.target.odd_tail}else{64};let active=count.min(limit.saturating_sub(col));
   assert!(active.is_multiple_of(4));if active==0{return;}
+  if self.target.compact {self.target.capture_compact(input.add(first),128,kpair,parity,col,active);return;}
   for kbit in 0..2 {let kp=seed_top_stage_row(2*kpair+kbit,self.target.stage_perm);let dst=self.target.output[parity].add(kp*64+col);
    kernels::seed_window_prepared(input.add(col),4,2*kbit+parity,dst,dst.add(256*64),64,active,&self.prepared);
   }
@@ -9278,6 +9367,7 @@ impl WitnessWindowSeed<'_>{
   if first+count==128&&self.target.odd_tail==0 {for row in 0..8{input.add(row*source_cols+source_cols-4).write_bytes(0,4);}}
   let parity=first/64;let col=first%64;let limit=if parity==1{64-self.target.odd_tail}else{64};let active=count.min(limit.saturating_sub(col));
   assert!(active.is_multiple_of(4));if active==0{return;}
+  if self.target.compact {self.target.capture_compact(input.add(first%source_cols),source_cols,kpair,parity,col,active);return;}
   for kbit in 0..2{let kp=seed_top_stage_row(2*kpair+kbit,self.target.stage_perm);let dst=self.target.output[parity].add(kp*64+col);
    kernels::seed_window_prepared(input.add(first%source_cols),2,kbit,dst,dst.add(256*64),source_cols,active,&self.prepared);
   }
@@ -9294,7 +9384,7 @@ mod witness_window_tests{
   for low in[false,true]{for odd_tail in[0,4]{for stage_perm in[false,true]{for kpair in[0,1,15,31]{
    let mut old:[Vec<F128>;2]=core::array::from_fn(|_|vec![poison;512*64]);let mut new=old.clone();
    let right=F128{lo:next(),hi:next()};let dense=[F128{lo:next(),hi:if low{0}else{next()}},F128{lo:next(),hi:next()},F128{lo:next(),hi:next()}];
-   let target=|out:&mut[Vec<F128>;2]|WitnessSeedTarget{output:[out[0].as_mut_ptr(),out[1].as_mut_ptr()],odd_tail,stage_perm,right,dense};
+   let target=|out:&mut[Vec<F128>;2]|WitnessSeedTarget{output:[out[0].as_mut_ptr(),out[1].as_mut_ptr()],odd_tail,stage_perm,compact:false,right,dense};
    target(&mut old).seed_octa(input.as_ptr(),kpair);
    let new_target=target(&mut new);let windows=new_target.prepare_windows();
    for(first,count)in core::iter::once((4,4)).chain((8..120).step_by(8).map(|first|(first,8))).chain([(120,8),(0,4)]){windows.seed_range_full(input.as_ptr(),kpair,first,count);}

@@ -5,6 +5,20 @@
 //! the first-edge interface passes CV word planes directly to parent hashes.
 use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
+core::arch::global_asm!(include_str!("merkle_xseed_transpose.S"));
+
+// Per-process A/B switch, read outside the compression loop. No layout or
+// commitment changes: the variant only replaces the leaf input transpose.
+fn xseed_transpose_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_TRANSPOSE").is_some());
+    *ON
+}
+
+unsafe extern "C" {
+    fn flock_xseed_blake3_contiguous_1024(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_xseed_blake3_planes_leaf_1024(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+}
 unsafe extern "C" {
     fn flock_blake3_contiguous_64(
         data: *const u8,
@@ -86,6 +100,7 @@ pub(super) fn hash_many<const N: usize>(
         128 => flock_blake3_contiguous_128,
         256 => flock_blake3_contiguous_256,
         512 => flock_blake3_contiguous_512,
+        1024 if xseed_transpose_enabled() => flock_xseed_blake3_contiguous_1024,
         1024 => flock_blake3_contiguous_1024,
         _ => unreachable!("unsupported contiguous BLAKE3 size"),
     };
@@ -132,6 +147,7 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
         128 => flock_blake3_planes_leaf_128,
         256 => flock_blake3_planes_leaf_256,
         512 => flock_blake3_planes_leaf_512,
+        1024 if xseed_transpose_enabled() => flock_xseed_blake3_planes_leaf_1024,
         1024 => flock_blake3_planes_leaf_1024,
         _ => unreachable!("unsupported plane leaf size"),
     };
@@ -156,6 +172,54 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
 #[cfg(test)]
 mod plane_tests {
     use super::*;
+
+    #[test]
+    fn xseed_full_line_transpose_matches_incumbent_and_hazmat() {
+        use blake3::hazmat::HasherExt;
+        for count in [16usize, 32, 64, 128] {
+            for offset in [0usize, 1, 31, 63] {
+                for fixture in 0..3 {
+                    let mut seed = 0x9e3779b97f4a7c15u64;
+                    let mut storage = vec![0u8; offset + count * 1024];
+                    for x in &mut storage {
+                        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                        *x = match fixture { 0 => 0, 1 => 255, _ => seed as u8 };
+                    }
+                    let data = &storage[offset..];
+                    for (baseline, candidate, planes) in [
+                        (flock_blake3_contiguous_1024 as Kernel,
+                         flock_xseed_blake3_contiguous_1024 as Kernel, false),
+                        (flock_blake3_planes_leaf_1024 as Kernel,
+                         flock_xseed_blake3_planes_leaf_1024 as Kernel, true),
+                    ] {
+                        let mut expected = vec![0xa5u8; count * 32 + 128];
+                        let mut actual = expected.clone();
+                        for (kernel, output) in [(baseline, &mut expected), (candidate, &mut actual)] {
+                            // SAFETY: complete 16-message groups, initialized input and
+                            // enough output including guards; the module gates AVX-512.
+                            unsafe {
+                                kernel(data.as_ptr(), count, 16, BLAKE3_IV.as_ptr(), 0, false,
+                                    0, super::super::BLAKE3_CHUNK_START,
+                                    super::super::BLAKE3_CHUNK_END, output.as_mut_ptr().add(64));
+                            }
+                        }
+                        assert_eq!(actual, expected, "count={count} offset={offset} planes={planes}");
+                        assert!(actual[..64].iter().all(|&x| x == 0xa5));
+                        assert!(actual[count * 32 + 64..].iter().all(|&x| x == 0xa5));
+                        for i in 0..count {
+                            let cv = blake3::Hasher::new().update(&data[i*1024..(i+1)*1024]).finalize_non_root();
+                            for word in 0..8 {
+                                let p = 64 + if planes { (i / 16)*512 + word*64 + (i % 16)*4 }
+                                             else { i*32 + word*4 };
+                                assert_eq!(actual[p..p+4], cv[word*4..word*4+4]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn direct_leaf_planes_match_hazmat_words() {
         use blake3::hazmat::HasherExt;
