@@ -557,6 +557,17 @@ pub(crate) unsafe fn gfni_fold_rows(
 ///   planes + 1024. Hint addresses may exceed the demand spans above; no
 ///   out-of-range demand load is introduced. Production disables hints at
 ///   the final block so they stay inside the caller's source/plane arenas.
+/// `FLOCK_NO_X7_PREFETCHW=1` restores read-only `prefetcht0` hints for the
+/// next plane bank in [`gfni_fold_word_tiles4`] (exact same-binary A/B). The
+/// bank is written next, so `prefetchw` asks for ownership up front; prefetches
+/// have no architectural effect, so the folded planes are identical either way.
+#[cfg(target_arch = "x86_64")]
+fn x7_prefetchw_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_X7_PREFETCHW").is_none());
+    *ON
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -589,9 +600,12 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "mov r10, r11",
             "mov rax, 0x8040201008040201",
             "vpbroadcastq zmm21, rax",
-            // Read-only, nonfaulting hints for the next private plane bank.
+            // Nonfaulting hints for the next private plane bank: mode 2 requests
+            // write ownership (prefetchw, 804bfffc), mode 1 is the read-only hint.
             "test r10, r10",
             "jz 6f",
+            "cmp r10, 2",
+            "je 8f",
             "prefetcht0 [rdx + 1024]",
             "prefetcht0 [rdx + 1088]",
             "prefetcht0 [rdx + 1152]",
@@ -608,6 +622,24 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             "prefetcht0 [rdx + 1856]",
             "prefetcht0 [rdx + 1920]",
             "prefetcht0 [rdx + 1984]",
+            "jmp 6f",
+            "8:",
+            "prefetchw [rdx + 1024]",
+            "prefetchw [rdx + 1088]",
+            "prefetchw [rdx + 1152]",
+            "prefetchw [rdx + 1216]",
+            "prefetchw [rdx + 1280]",
+            "prefetchw [rdx + 1344]",
+            "prefetchw [rdx + 1408]",
+            "prefetchw [rdx + 1472]",
+            "prefetchw [rdx + 1536]",
+            "prefetchw [rdx + 1600]",
+            "prefetchw [rdx + 1664]",
+            "prefetchw [rdx + 1728]",
+            "prefetchw [rdx + 1792]",
+            "prefetchw [rdx + 1856]",
+            "prefetchw [rdx + 1920]",
+            "prefetchw [rdx + 1984]",
             "6:",
             "test r9, r9",
             "jz 2f",
@@ -901,7 +933,7 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
             inout("r8") count => _,
             in("r9") usize::from(seed_zero),
             inout("r10") permutation => _,
-            inout("r11") usize::from(prefetch_next_block) => _,
+            inout("r11") usize::from(prefetch_next_block) << usize::from(x7_prefetchw_enabled()) => _,
             out("rax") _,
             out("zmm0") _,
             out("zmm1") _,
