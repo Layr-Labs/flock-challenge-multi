@@ -4661,6 +4661,29 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
         let caller = rayon::current_thread_index();
         let arrived = std::sync::atomic::AtomicUsize::new(0);
         let idle_taken = std::sync::atomic::AtomicBool::new(false);
+        // xint `FLOCK_XINT_R1_XARM=1`: the C pool's threads, once the C arm
+        // has ended, claim from the same counter (see `r1_owner_awake::xarm_*`).
+        let helper_sums: std::sync::Mutex<Vec<[F128; ELL]>> = std::sync::Mutex::new(Vec::new());
+        let help = || {
+            let mut state: Option<WorkerStateAbOnly> = None;
+            loop {
+                let x_hi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if x_hi >= hi_size {
+                    break;
+                }
+                band(state.get_or_insert_with(WorkerStateAbOnly::new), x_hi);
+            }
+            if let Some(state) = state {
+                helper_sums.lock().unwrap().push(state.local_res_ab);
+            }
+        };
+        let xarm_guard = if crate::r1_owner_awake::xarm_enabled()
+            && crate::smt_split::zc_r1_pools().is_some()
+        {
+            Some(crate::r1_owner_awake::xarm_open(&help))
+        } else {
+            None
+        };
         rayon::broadcast(|ctx| {
             crate::rstrace::evd("ab:t0", ctx.index() as u32);
             let mut state: Option<WorkerStateAbOnly> = None;
@@ -4698,12 +4721,18 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
             }
         });
         crate::rstrace::ev("ab:bcast", 0);
+        drop(xarm_guard);
         let mut res = [F128::ZERO; ELL];
         for slot in slots {
             if let Some(part) = slot.into_inner().unwrap() {
                 for i in 0..ELL {
                     res[i] += part[i];
                 }
+            }
+        }
+        for part in helper_sums.into_inner().unwrap() {
+            for i in 0..ELL {
+                res[i] += part[i];
             }
         }
         res
@@ -5105,6 +5134,9 @@ pub(crate) fn round1_c_fold4_from_block_major_z_with_canon_side(
                 crate::rstrace::ev("c:in", 0);
                 let full = roots.fold(z_packed, m, &r[k_log..]);
                 crate::rstrace::ev("c:fold", 0);
+                // The rest of the C arm runs on this thread: lend the C
+                // pool's other threads to the AB arm's band counter.
+                crate::r1_owner_awake::xarm_kick();
                 let (full, mut one) = crate::lincheck::finish_block_major_fold(
                     full,
                     Some(inner_tail[6]),

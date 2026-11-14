@@ -1188,6 +1188,10 @@ pub(super) unsafe fn butterfly_fused_4layer_cached(
 #[inline(always)]
 pub(super) unsafe fn seed_window_prepared(src:*const F128,src_quarter:usize,src_r:usize,dst_sparse:*mut F128,dst_dense:*mut F128,source_cols:usize,active:usize,prepared:&[F128;8]){unsafe{x86_64::seed_window_prepared(src,src_quarter,src_r,dst_sparse,dst_dense,source_cols,active,prepared)}}
 
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+#[inline(always)]
+pub(super) unsafe fn xseed_seed_window_pair(src:*const F128,dst:*mut F128,dst_next:*mut F128,source_cols:usize,active:usize,prepared:&[F128;8]){unsafe{x86_64::xseed_seed_window_pair(src,dst,dst_next,source_cols,active,prepared)}}
+
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -1203,3 +1207,5 @@ pub(super) use x86_64::RAW7_PACK_HITS;
     target_feature = "vpclmulqdq"
 ))]
 pub(super) use x86_64::rows_raw7_s8;
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+pub(super) use x86_64::{xseed_four_rows,xseed_three_rows};

@@ -2029,6 +2029,9 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     }
 }
 
+#[cfg(target_feature="avx512bw")]
+include!("xseed_swizzle.rs");
+
 /// Fixed-register prepared four-layer butterfly with lazy x^64 folds.
 /// Rows retain a shared pending high half until they become multiplicands or
 /// are stored. Linearity combines those halves into 20 reductions instead of
@@ -5306,6 +5309,8 @@ mod seed_compact_address_oracle_tests {
     }
 }
 
+
+include!("xseed_seed_pair.rs");
 
 /// Seed a four-aligned window with independent source/destination pitches.
 /// All demanded source fields are initialized; destination ranges are exclusive.

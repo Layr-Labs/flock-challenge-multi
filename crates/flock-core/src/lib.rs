@@ -57,6 +57,8 @@ pub mod zerocheck;
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Diagnostic submission only: selects this trial's factor levels before anything reads a switch.
+    fact_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
@@ -65,6 +67,116 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // built: see `smt_split`.
     smt_split::init();
     built
+}
+
+/// DIAGNOSTIC SUBMISSION ONLY: factorial in-run probe on the ranked runner.
+///
+/// The ranked harness starts one fresh worker per trial and names that trial's
+/// files `run-{r}.ready` / `run-{r}.proof`, so a worker knows its trial number
+/// `r` (1-based, warm-up trials included). Each entry of `FACTORS` is a set of
+/// existing switches of this tree plus a 4-bit mask: the factor is ON in trial
+/// `r` iff `popcount(((r - 1) mod 16) & mask)` is odd. Every mask contains bit
+/// 2 or bit 3, so each factor is ON in exactly half of every 16 consecutive
+/// trials, balanced over `r mod 2` and `r mod 4`, and any two factors are
+/// orthogonal (a two-level full factorial on the bits of `(r - 1) mod 16`).
+/// One run therefore holds one paired A/B per factor, each over all trials.
+///
+/// The switches are set here, on the main thread, as the first statement of the
+/// worker's first library call: no thread, pool or lazily-read switch exists
+/// yet, exactly as if the harness had passed them (it clears the environment,
+/// so it cannot). Every switch only selects between schedules, prefetch
+/// distances or store kinds that compute the same values: proof bytes are the
+/// same in every trial for the same seed.
+///
+/// Method credit: newjordan's run-parity probes; patternrecognition9-del's
+/// interleaved A/B probes. Decoder: the published per-trial times.
+pub(crate) mod fact_probe {
+    /// (mask, switches set when the factor is ON)
+    pub(crate) const FACTORS: &[(u64, &[(&str, &str)])] = &[
+        // Group {4..7} / {8..11} / {12..15}: interactions inside a group alias
+        // onto the r mod 2/4 nuisance columns; mask 12 is left free so the
+        // XARM (5) x AB-workers-6 (9) interaction is its own column.
+        (4, &[("FLOCK_XINT_HOSTFIX", "1")]),
+        (5, &[("FLOCK_XINT_R1_XARM", "1")]),
+        (6, &[("FLOCK_OPEN_NT_17", "1")]),
+        (7, &[("FLOCK_GL1_LC_MIN", "1024")]),
+        (8, &[("FLOCK_RS_SEED6_NT", "0")]),
+        (9, &[("FLOCK_ZC_R1_AB_WORKERS", "6")]),
+        (10, &[("FLOCK_XSEED_ROW_BANKS", "1")]),
+        (11, &[("FLOCK_INV_TABLE_IMAGES4", "1")]),
+        (13, &[("FLOCK_ROOT_FOLD_BATCH", "4")]),
+        (14, &[("FLOCK_COMBINE_MERGE", "1")]),
+        (15, &[("FLOCK_NTT_ST_SLOT_PAD_LINES", "1")]),
+    ];
+
+    /// The trial number, if this process is a ranked worker
+    /// (`flock-benchmark-worker LOG2 .../run-{r}.ready .../run-{r}.proof`).
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 1).then_some(r)
+    }
+
+    pub(crate) fn is_on(r: u64, mask: u64) -> bool {
+        (((r - 1) % 16) & mask).count_ones() & 1 == 1
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        for (mask, env) in FACTORS {
+            if !is_on(r, *mask) {
+                continue;
+            }
+            for (key, value) in *env {
+                // SAFETY: called once from `init_perf_thread_pool` before any other
+                // thread exists, so no concurrent environment access is possible.
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{is_on, FACTORS};
+        #[test]
+        fn factors_are_balanced_and_orthogonal() {
+            let mut seen = std::collections::HashSet::new();
+            for (mask, env) in FACTORS {
+                assert!(*mask < 16 && mask & 0b1100 != 0, "mask {mask}");
+                assert!(seen.insert(*mask), "duplicate mask {mask}");
+                assert!(!env.is_empty());
+                // balanced over r mod 2 and r mod 4 inside every 16-trial period
+                for period in [2u64, 4] {
+                    for class in 0..period {
+                        let on = (1..=16u64).filter(|&r| (r - 1) % period == class && is_on(r, *mask)).count();
+                        assert_eq!(on as u64, 8 / period, "mask {mask} period {period} class {class}");
+                    }
+                }
+            }
+            for (a, _) in FACTORS {
+                for (b, _) in FACTORS {
+                    if a < b {
+                        let agree = (1..=16u64).filter(|&r| is_on(r, *a) == is_on(r, *b)).count();
+                        assert_eq!(agree, 8, "masks {a} {b} not orthogonal");
+                    }
+                }
+            }
+            let keys: Vec<&str> = FACTORS.iter().flat_map(|(_, e)| e.iter().map(|(k, _)| *k)).collect();
+            let unique: std::collections::HashSet<&&str> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "a switch appears in two factors");
+        }
+    }
 }
 
 /// Pin glibc's heap thresholds at process start: `M_MMAP_THRESHOLD` = 32 MiB
@@ -915,6 +1027,87 @@ pub mod r1_owner_awake {
         }
     }
 
+    // ---- xint: round-one cross-arm help (`FLOCK_XINT_R1_XARM=1`) ----
+    //
+    // Round one's arms run on fixed pools (AB on the first hyperthread of
+    // each core, C on the second). Whichever arm ends first leaves its
+    // threads idle while the other finishes. With the switch on, the AB arm's
+    // band claim loop publishes itself here; when the C arm's closure has
+    // returned, the C pool's threads join the same band counter. Bands are
+    // the same; every claimer folds its bands into a private accumulator and
+    // the AB arm XORs all accumulators (field addition), so the grouping of
+    // bands into threads cannot change the result bits. The AB arm closes
+    // the slot before reading the accumulators and waits for every helper
+    // that entered; a helper that arrives after the close returns without
+    // touching the borrowed closure.
+    pub fn xarm_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_XINT_R1_XARM").is_some());
+        *ON
+    }
+    static XARM_OPEN: AtomicBool = AtomicBool::new(false);
+    static XARM_BODY: AtomicU64 = AtomicU64::new(0);
+    static XARM_IN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Open slot for one claim loop; dropping the guard closes it and waits
+    /// for helpers inside. Single opener at a time (round one is serial).
+    pub struct XarmGuard<'a> {
+        _body: Box<&'a (dyn Fn() + Sync)>,
+    }
+
+    pub fn xarm_open<'a>(body: &'a (dyn Fn() + Sync)) -> XarmGuard<'a> {
+        let boxed: Box<&'a (dyn Fn() + Sync)> = Box::new(body);
+        let ptr = &*boxed as *const &(dyn Fn() + Sync) as usize as u64;
+        XARM_BODY.store(ptr, Ordering::SeqCst);
+        XARM_OPEN.store(true, Ordering::SeqCst);
+        XarmGuard { _body: boxed }
+    }
+
+    impl Drop for XarmGuard<'_> {
+        fn drop(&mut self) {
+            XARM_OPEN.store(false, Ordering::SeqCst);
+            while XARM_IN.load(Ordering::SeqCst) != 0 {
+                core::hint::spin_loop();
+            }
+            XARM_BODY.store(0, Ordering::SeqCst);
+        }
+    }
+
+    struct XarmLeave;
+    impl Drop for XarmLeave {
+        fn drop(&mut self) {
+            XARM_IN.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Called on a C-pool thread when the C arm's parallel part has ended:
+    /// queue one helper per C-pool thread (the caller's own copy runs only
+    /// when it next looks for work, i.e. after its serial C tail).
+    pub fn xarm_kick() {
+        if xarm_enabled() && XARM_OPEN.load(Ordering::Acquire) && rayon::current_thread_index().is_some() {
+            rayon::spawn_broadcast(|_| xarm_help());
+        }
+    }
+
+    /// Run the published claim loop if one is open (C-arm threads, after the C arm).
+    pub fn xarm_help() {
+        if !XARM_OPEN.load(Ordering::Acquire) {
+            return;
+        }
+        XARM_IN.fetch_add(1, Ordering::SeqCst);
+        let _leave = XarmLeave;
+        if XARM_OPEN.load(Ordering::SeqCst) {
+            let p = XARM_BODY.load(Ordering::SeqCst);
+            if p != 0 {
+                // SAFETY: the opener keeps the boxed reference and its
+                // referent alive until XARM_IN returns to zero after the close;
+                // we incremented XARM_IN before observing XARM_OPEN.
+                let body = unsafe { &**(p as usize as *const &(dyn Fn() + Sync)) };
+                body();
+            }
+        }
+    }
+
     pub fn run_both<A, B, RA, RB>(
         ab_pool: &rayon::ThreadPool,
         c_pool: &rayon::ThreadPool,
@@ -945,6 +1138,10 @@ pub mod r1_owner_awake {
                 sc.spawn(move |_| {
                     let _d = Done(c_done_ref);
                     *rb_slot = Some(c());
+                    if xarm_enabled() && XARM_OPEN.load(Ordering::Acquire) {
+                        c_pool.spawn_broadcast(|_| xarm_help());
+                        xarm_help();
+                    }
                 });
                 // rayon's own wait until the AB arm has finished.
                 ab_pool.in_place_scope(|sa| {

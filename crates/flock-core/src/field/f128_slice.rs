@@ -359,6 +359,63 @@ mod tests {
         }
     }
 
+    /// `collapse_banks` (deferred-reduction AVX-512 kernel on x86; reduced sum
+    /// elsewhere) equals the per-product reduced sum `Σ w[b]·src[b·n + p]` for
+    /// the 4/16/64-bank collapses and odd bank counts, with vector body and
+    /// scalar tail lengths; one-hot weights pick exactly one bank per output
+    /// and all-one weights give the bank XOR.
+    #[test]
+    fn collapse_banks_matches_scalar_reduced_sum() {
+        use super::*;
+        let mut state = 0xC011_A95E_BA4Bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for banks in [1usize, 2, 3, 4, 16, 63, 64] {
+            for n in [1usize, 3, 4, 5, 8, 128, 131] {
+                let src: Vec<F128> = (0..banks * n)
+                    .map(|_| F128 {
+                        lo: next(),
+                        hi: next(),
+                    })
+                    .collect();
+                let w: Vec<F128> = (0..banks)
+                    .map(|_| F128 {
+                        lo: next(),
+                        hi: next(),
+                    })
+                    .collect();
+                let mut got = vec![F128 { lo: !0, hi: !0 }; n];
+                collapse_banks(&src, &w, &mut got);
+                for p in 0..n {
+                    let mut want = F128::ZERO;
+                    for b in 0..banks {
+                        want += w[b] * src[b * n + p];
+                    }
+                    assert_eq!(got[p], want, "banks={banks} n={n} p={p}");
+                }
+                for b0 in [0, banks - 1] {
+                    let mut one_hot = vec![F128::ZERO; banks];
+                    one_hot[b0] = F128::ONE;
+                    collapse_banks(&src, &one_hot, &mut got);
+                    assert_eq!(
+                        &got[..],
+                        &src[b0 * n..(b0 + 1) * n],
+                        "one-hot banks={banks} n={n} b={b0}"
+                    );
+                }
+                collapse_banks(&src, &vec![F128::ONE; banks], &mut got);
+                for p in 0..n {
+                    let want = (0..banks).fold(F128::ZERO, |a, b| a + src[b * n + p]);
+                    assert_eq!(got[p], want, "all-one banks={banks} n={n} p={p}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn fold64_banked_nested_matches_two_stage_fold() {
         use super::*;
@@ -830,6 +887,49 @@ pub(crate) fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16]) {
             let mut v = F128::ZERO;
             for b in 0..16 {
                 v += w[b] * src[16 * t + b];
+            }
+            *value = v;
+        }
+    }
+}
+
+/// Bank-major weighted collapse: `dst[p] = Σ_{b<banks} w[b] · src[b·n + p]`
+/// with `n = dst.len()` and `banks = w.len()` (bank `b` is the contiguous
+/// block `src[b·n..(b+1)·n]`; each output position is independent).
+///
+/// AVX-512: one unreduced accumulator per four outputs over all banks and one
+/// reduction per output (instead of one per product). Other targets: the
+/// straightforward reduced sum. Same field element either way.
+#[inline]
+pub(crate) fn collapse_banks(src: &[F128], w: &[F128], dst: &mut [F128]) {
+    assert_eq!(
+        src.len(),
+        w.len() * dst.len(),
+        "collapse source must contain one bank of dst.len() elements per weight"
+    );
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the required target features and the
+    // length assertion guarantees every bank holds dst.len() elements.
+    unsafe {
+        x86_64::collapse_banks(src, w, dst);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let n = dst.len();
+        for (p, value) in dst.iter_mut().enumerate() {
+            let mut v = F128::ZERO;
+            for (b, &wb) in w.iter().enumerate() {
+                v += wb * src[b * n + p];
             }
             *value = v;
         }
