@@ -1051,6 +1051,8 @@ fn publish_direct_proof(path: &Path, out: ProveOut) -> std::io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
+    // Diagnostic (warm-up trials only): report the setup probes' numbers.
+    flock_core::scratch::diag_delay();
     flock_core::gaptime::abs("publish enter");
     let bytes = match publish_sized(path, &bundle) {
         Some(Ok(result)) => {
