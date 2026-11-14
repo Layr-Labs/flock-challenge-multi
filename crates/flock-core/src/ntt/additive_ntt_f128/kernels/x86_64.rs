@@ -1,5 +1,7 @@
 use crate::field::F128;
 
+include!("xseed_half.rs");
+
 /// `FLOCK_NO_NTT_MUL_DIET=1` restores the incumbent 6-CLMUL `ghash_mul_x4`
 /// at DIET-controlled call sites, including the fused-two OUTER_LOW path.
 /// The independent fused-three high-one specialization has its own rollback
@@ -4242,6 +4244,11 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
         if super::super::ntt_shaped_enabled() {
             if num_ntts == 64 {
                 match sixteenth {
+                    64 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 64, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
                     128 => {
                         return butterfly_fused_4layer_row_impl::<true, true, H, 128, 64>(
                             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
