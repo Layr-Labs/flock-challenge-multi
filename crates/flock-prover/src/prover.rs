@@ -589,6 +589,17 @@ pub(crate) fn prove_fast_ligerito_from_generated_witness<Ch: Challenger>(
     )
 }
 
+/// `FLOCK_NO_SL2_PRE_CANONICAL=1` makes the C claim's challenge-free
+/// precompute re-collapse its sixty-four-bank statistic instead of taking
+/// zerocheck's canonical `s_hat_v_c`.
+fn sl2_pre_canonical_enabled() -> bool {
+    // Lane xglm (run 15): absent = incumbent re-collapse; `FLOCK_XGLM_CANON=1`
+    // takes zerocheck's canonical `s_hat_v_c` when it matches.
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XGLM_CANON").is_some());
+    *ON
+}
+
 fn sl2_stash_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_STASH").is_none());
@@ -1340,7 +1351,16 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         let c_point = r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest);
         let x_full = quirky_x_outer_full(&c_point);
         if x_full.len() > 1 {
-            pcs::ring_switch::sl2_pre_spawn(fold8, x_full[1..].to_vec());
+            // Zerocheck round 1 already collapsed this exact Fold8 statistic
+            // to the canonical `s_hat_v_c` under the C claim's first six
+            // suffix coordinates; hand it over only when `fold8` is that
+            // Fold8 capture (not a fold4/quad/canonical fallback slot).
+            let canonical = (sl2_pre_canonical_enabled()
+                && s_hat_v_c.fold8.as_deref().is_some_and(|f| {
+                    std::ptr::eq(f.as_ptr(), fold8.as_ptr()) && f.len() == fold8.len()
+                }))
+            .then(|| s_hat_v_c.s_hat_v_c.clone());
+            pcs::ring_switch::sl2_pre_spawn_with_canonical(fold8, x_full[1..].to_vec(), canonical);
         }
     }
 

@@ -5307,6 +5307,8 @@ mod seed_compact_address_oracle_tests {
 }
 
 
+include!("xseed_seed_pair.rs");
+
 /// Seed a four-aligned window with independent source/destination pitches.
 /// All demanded source fields are initialized; destination ranges are exclusive.
 #[cfg(target_feature="avx512bw")]

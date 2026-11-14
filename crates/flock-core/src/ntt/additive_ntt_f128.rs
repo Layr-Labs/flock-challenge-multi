@@ -47,6 +47,9 @@ use crate::field::F128;
 
 mod kernels;
 
+#[cfg(target_os = "linux")]
+mod xseed_hot_queue;
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -488,6 +491,13 @@ fn deep_share_enabled() -> bool {
     *ON
 }
 
+#[cfg(target_os = "linux")]
+fn xseed_hot_queue_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_HOT_QUEUE").is_some());
+    *ON
+}
+
 /// Run the deep pass inside the seed+top pass's sibling-paired broadcast,
 /// behind a spin barrier, instead of opening a second broadcast (whose
 /// workers have gone to sleep by then; waking them cost ~0.4 ms on the
@@ -566,6 +576,7 @@ mod affinity {
 #[cfg(target_os = "linux")]
 struct DeepSplitState {
     queues: Vec<DeepQueue>,
+    hot_queues: Option<Vec<xseed_hot_queue::HotQueue>>,
     next_sub: std::sync::atomic::AtomicUsize,
     prod_done: std::sync::atomic::AtomicUsize,
 }
@@ -575,6 +586,9 @@ impl DeepSplitState {
     fn new(n_pairs: usize) -> Self {
         Self {
             queues: (0..n_pairs).map(|_| DeepQueue::new()).collect(),
+            hot_queues: (deep_share_enabled() && xseed_hot_queue_enabled()).then(|| {
+                (0..n_pairs).map(|_| xseed_hot_queue::HotQueue::new(deep_split_depth())).collect()
+            }),
             next_sub: std::sync::atomic::AtomicUsize::new(0),
             prod_done: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1345,6 +1359,13 @@ fn st_fmp_balanced_enabled() -> bool {
     *ON
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+fn xseed_two_slot_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_XSEED_TWO_SLOT").is_some());
+    *ON
+}
+
 /// Staging blocks the balanced hand-off is defined for: the two free slots
 /// of a group are exactly those of the two tasks published one cycle earlier.
 #[cfg(all(
@@ -1650,7 +1671,7 @@ fn st_fmp_run(
     };
     st_fmp_run_claimed(
         n_tasks, row_len, seed, fold, publish, produce, after, pairs, nbuf,
-        st_fmp_balanced_enabled(), claim,
+        st_fmp_balanced_enabled(), xseed_two_slot_enabled(), claim,
     )
 }
 
@@ -1669,6 +1690,7 @@ fn st_fmp_run_claimed(
     pairs: &[(usize, usize)],
     nbuf: usize,
     balanced: bool,
+    two_slot: bool,
     _claim: StFmpClaim,
 ) -> bool {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1676,7 +1698,9 @@ fn st_fmp_run_claimed(
     assert_eq!(n_pairs * 2, rayon::current_num_threads());
     assert!((2..=ST_FMP_CAP).contains(&nbuf));
     assert!(produce.is_none() || (n_tasks == 2048 && row_len == 64));
-    let balanced = balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
+    let two_slot = two_slot && balanced && produce.is_some() && nbuf == ST_FMP_BALANCED_BUFS;
+    let nbuf = if two_slot { 2 } else { nbuf };
+    let balanced = balanced && produce.is_some() && (nbuf == ST_FMP_BALANCED_BUFS || two_slot);
     crate::rstrace::ev("st:setup", 0);
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
@@ -1712,7 +1736,7 @@ fn st_fmp_run_claimed(
             .ok().and_then(|s| s.parse().ok())
             .filter(|n| *n < 64).unwrap_or(7)
     });
-    let huge_stage = produce.is_some() && nbuf == 3 && row_len == 64 && *HUGE_STAGE;
+    let huge_stage = produce.is_some() && (nbuf == 3 || two_slot) && row_len == 64 && *HUGE_STAGE;
     let states: Vec<StFmpPair> = (0..n_pairs).map(|_| StFmpPair::new()).collect();
     let next = AtomicUsize::new(0);
     let states = &states;
@@ -1894,7 +1918,7 @@ fn st_fmp_run_claimed(
             // SAFETY: both slots hold tasks this sibling seeded and that F
             // never touches (odd tasks); the older one was folded here.
             unsafe {
-                if seeded >= 4 {
+                if seeded >= 4 && !two_slot {
                     let s = (seeded - 3) % nbuf;
                     publish(bufp.add(s * stride), *st.slot_r[s].get());
                     crate::rstrace::evd("mp:pub", (seeded - 3) as u32);
@@ -1902,6 +1926,12 @@ fn st_fmp_run_claimed(
                 let s = (seeded - 1) % nbuf;
                 fold(bufp.add(s * stride), *st.slot_r[s].get());
                 crate::rstrace::evd("mp:fold", (seeded - 1) as u32);
+                if two_slot {
+                    // Both slots retire before the next witness group starts;
+                    // the odd task is not retained through another seed pass.
+                    publish(bufp.add(s * stride), *st.slot_r[s].get());
+                    crate::rstrace::evd("mp:pub", (seeded - 1) as u32);
+                }
             }
             let ok = st.wait_folded(seeded - 1);
             crate::rstrace::evd("mp:fwait", (seeded - 1) as u32);
@@ -1971,11 +2001,14 @@ fn st_fmp_run_claimed(
             if i >= 2 {
                 if !balanced_cycle(i) { return; }
                 let s = (i - 1) % nbuf;
-                // SAFETY: the last task, folded by the cycle above.
-                unsafe {
-                    publish(bufp.add(s * stride), *st.slot_r[s].get());
+                // SAFETY: the last task, folded by the cycle above. The
+                // two-slot cycle already published it before its join.
+                if !two_slot {
+                    unsafe {
+                        publish(bufp.add(s * stride), *st.slot_r[s].get());
+                    }
+                    crate::rstrace::evd("mp:pub", (i - 1) as u32);
                 }
-                crate::rstrace::evd("mp:pub", (i - 1) as u32);
             }
             return;
         }
@@ -4803,6 +4836,21 @@ impl AdditiveNttF128 {
             let hint = deep_pf_hint();
             let share = deep_share_enabled();
             let queues = &stt.queues;
+            let hot_queues = stt.hot_queues.as_ref();
+            let pop = |slot: usize, newest: bool| {
+                if let Some(hot) = hot_queues {
+                    hot[slot].try_pop(newest).map(|lo| DeepBlock { lo })
+                } else {
+                    queues[slot].try_pop()
+                }
+            };
+            let all_empty = || {
+                if let Some(hot) = hot_queues {
+                    hot.iter().all(|q| q.is_empty())
+                } else {
+                    queues.iter().all(|q| q.is_empty())
+                }
+            };
             let next_sub = &stt.next_sub;
             let prod_done = &stt.prod_done;
             let producer = idx < n_pairs;
@@ -4849,8 +4897,8 @@ impl AdditiveNttF128 {
             // Hash one claimed block.
             let run = |b: DeepBlock| {
                 // SAFETY: the producer finished every write to this block
-                // before publishing it, and the release on the ring head /
-                // acquire in the claiming pop order those writes before
+                // before publishing it, and the release on the ring head
+                // (or hot token) / acquire in the claiming pop order those writes before
                 // this read.
                 let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
@@ -4899,13 +4947,13 @@ impl AdditiveNttF128 {
                     }
                     let _ = got;
                 }
-                if let Some(b) = queues[own].try_pop() {
+                if let Some(b) = pop(own, true) {
                     run(b);
                     continue;
                 }
                 let mut got = false;
                 for k in 1..n_pairs {
-                    if let Some(b) = queues[(own + k) % n_pairs].try_pop() {
+                    if let Some(b) = pop((own + k) % n_pairs, false) {
                         run(b);
                         got = true;
                         break;
@@ -4914,7 +4962,7 @@ impl AdditiveNttF128 {
                 if got {
                     continue;
                 }
-                if prod_done.load(Ordering::Acquire) == n_pairs && queues.iter().all(|q| q.is_empty())
+                if prod_done.load(Ordering::Acquire) == n_pairs && all_empty()
                 {
                     return;
                 }
@@ -4926,7 +4974,9 @@ impl AdditiveNttF128 {
                         cb(range, blk);
                         return;
                     };
-                    let queued = if share {
+                    let queued = if let Some(hot) = hot_queues {
+                        hot[slot].try_push(b.lo)
+                    } else if share {
                         q.try_push(b, depth)
                     } else {
                         q.push(b, depth)
@@ -8995,6 +9045,8 @@ mod generated_pair_dispatch_tests {
         assert_eq!(cpus.len(),4);
         let pairs = [(cpus[0],cpus[1]),(cpus[2],cpus[3])];
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for two_slot in [false, true] {
+        for merged in [false, true] {
         let mut normal_runs=0;let mut injected_panics=0;let mut reuse_checks=0;
         let plain = [
             (0,true,2),(1,true,2),(0,true,2),(2,true,2),(0,true,2),
@@ -9086,10 +9138,10 @@ mod generated_pair_dispatch_tests {
             let producer=generating.then_some(&produce as &(dyn Fn(usize,usize,*mut F128,*mut F128)+Sync));
             let claim=StFmpClaim::take().expect("previous call leaked its claim");
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||pool.install(||st_fmp_run_claimed(
-                2048,64,&seed,&fold,&publish,producer,Some(&after),&pairs,nbuf,balanced,claim))));
+                2048,64,&seed,&fold,&publish,producer,merged.then_some(&after),&pairs,nbuf,balanced,two_slot,claim))));
             assert_eq!(live.load(Acquire),0);assert!(!ST_FMP_BUSY.load(Acquire));
             if injection==0 {
-                assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),4);
+                assert!(result.unwrap());assert_eq!(after_count.load(Relaxed),if merged { 4 } else { 0 });
                 assert!(published.iter().all(|v|v.load(Relaxed)==1));
                 assert!(seeded.iter().all(|v|v.load(Relaxed)==2));
                 if generating{assert_eq!(reused.load(Relaxed),2048-previous.lock().unwrap().len());}
@@ -9103,7 +9155,9 @@ mod generated_pair_dispatch_tests {
             }
         }
         assert_eq!(balanced_runs,12);
-        println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} balanced_runs={balanced_runs} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true");
+        println!("OCTA_SEED_DISPATCH normal_runs={normal_runs} injected_panics={injected_panics} reuse_checks={reuse_checks} balanced_runs={balanced_runs} staging_counts=2,3,4 producer_output_roles_joined=true generated_second_seed=false all_callbacks_joined=true actual_production_body=true two_slot={two_slot} merged={merged}");
+        }
+        }
     }
 }
 
@@ -9231,13 +9285,14 @@ mod octa_seed_geometry_tests {
 
 /// Proof-local immutable coefficient preparation for incremental witness seeding.
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
-pub struct WitnessWindowSeed<'a>{target:&'a WitnessSeedTarget,prepared:[F128;8]}
+pub struct WitnessWindowSeed<'a>{target:&'a WitnessSeedTarget,prepared:[F128;8],xseed_pair:bool}
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
 impl WitnessSeedTarget{
  #[inline(always)]
  pub fn prepare_windows(&self)->WitnessWindowSeed<'_>{
   let ts=[self.right,self.dense[0],self.dense[1],self.dense[2]];
-  WitnessWindowSeed{target:self,prepared:core::array::from_fn(|i|if i%2==0{ts[i/2]}else{ts[i/2]*F128{lo:0,hi:1}})}
+  static PAIR:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_XSEED_SEED_PAIR").is_some());
+  WitnessWindowSeed{target:self,prepared:core::array::from_fn(|i|if i%2==0{ts[i/2]}else{ts[i/2]*F128{lo:0,hi:1}}),xseed_pair:*PAIR}
  }
 }
 #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
@@ -9278,6 +9333,11 @@ impl WitnessWindowSeed<'_>{
   if first+count==128&&self.target.odd_tail==0 {for row in 0..8{input.add(row*source_cols+source_cols-4).write_bytes(0,4);}}
   let parity=first/64;let col=first%64;let limit=if parity==1{64-self.target.odd_tail}else{64};let active=count.min(limit.saturating_sub(col));
   assert!(active.is_multiple_of(4));if active==0{return;}
+  if self.xseed_pair {
+   let dst=|kbit|self.target.output[parity].add(seed_top_stage_row(2*kpair+kbit,self.target.stage_perm)*64+col);
+   kernels::xseed_seed_window_pair(input.add(first%source_cols),dst(0),dst(1),source_cols,active,&self.prepared);
+   return;
+  }
   for kbit in 0..2{let kp=seed_top_stage_row(2*kpair+kbit,self.target.stage_perm);let dst=self.target.output[parity].add(kp*64+col);
    kernels::seed_window_prepared(input.add(first%source_cols),2,kbit,dst,dst.add(256*64),source_cols,active,&self.prepared);
   }
