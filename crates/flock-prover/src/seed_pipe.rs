@@ -474,6 +474,101 @@ fn mark_dead() {
 }
 
 // ---------------------------------------------------------------------------
+// DIAGNOSTIC SUBMISSION ONLY: huge-page census, delay-encoded into trial times
+// ---------------------------------------------------------------------------
+
+/// Is a slow trial a trial whose large buffers lost their huge pages?
+///
+/// Once per worker, after the untimed warm-up proves and before readiness, read
+/// `/proc/self/smaps` and add up, over every anonymous mapping with at least
+/// 32 MiB resident (the prover's pooled working buffers; the `[heap]` mapping
+/// excluded), the resident bytes NOT backed by transparent huge pages. Those
+/// buffers are recycled by the timed prove, so this is the state it runs on.
+///
+/// The value is published through the trial's own time: right after the timed
+/// prove and before the proof file is published, the worker sleeps
+/// `10 ms x ceil(non-huge MiB / 8)`, capped at 60 steps. A trial time T then
+/// decodes as `steps = round((T - 120 ms) / 10 ms)` and the prove itself as
+/// `T - 10 ms x steps`, because a prove varies by a few ms and a step is 10 ms.
+/// Reading smaps happens before the ready file, outside the timed window; the
+/// sleep is inside it on purpose. Proof bytes are unchanged.
+mod thp_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const STEP_MIB: u64 = 8;
+    const STEP_MS: u64 = 10;
+    const MAX_STEPS: u64 = 60;
+    /// u64::MAX = not measured (the delay is then skipped).
+    static STEPS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Non-huge resident KiB over anonymous mappings with >= 32 MiB resident.
+    pub(super) fn non_huge_kib(smaps: &str) -> u64 {
+        let (mut total, mut anon, mut huge, mut named_heap) = (0u64, 0u64, 0u64, false);
+        let mut flush = |anon: u64, huge: u64, heap: bool| {
+            if !heap && anon >= 32 * 1024 {
+                total += anon.saturating_sub(huge);
+            }
+        };
+        for line in smaps.lines() {
+            let mut it = line.split_whitespace();
+            let Some(first) = it.next() else { continue };
+            if first.contains('-') && first.chars().next().is_some_and(|c| c.is_ascii_hexdigit()) {
+                flush(anon, huge, named_heap);
+                anon = 0;
+                huge = 0;
+                named_heap = line.ends_with("[heap]");
+            } else if first == "Anonymous:" {
+                anon = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            } else if first == "AnonHugePages:" {
+                huge = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+        flush(anon, huge, named_heap);
+        total
+    }
+
+    pub(super) fn steps_for(kib: u64) -> u64 {
+        kib.div_ceil(STEP_MIB * 1024).min(MAX_STEPS)
+    }
+
+    pub(super) fn measure() {
+        if let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") {
+            STEPS.store(steps_for(non_huge_kib(&smaps)), Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn delay() {
+        let steps = STEPS.load(Ordering::Relaxed);
+        if steps != u64::MAX && steps > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(steps * STEP_MS));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn counts_only_large_anonymous_non_huge() {
+            let smaps = "\
+7f0000000000-7f0040000000 rw-p 00000000 00:00 0
+Anonymous:       1048576 kB
+AnonHugePages:   1040384 kB
+55d000000000-55d010000000 rw-p 00000000 00:00 0                          [heap]
+Anonymous:        262144 kB
+AnonHugePages:         0 kB
+7f1000000000-7f1004000000 rw-p 00000000 00:00 0
+Anonymous:          8192 kB
+AnonHugePages:         0 kB
+";
+            assert_eq!(super::non_huge_kib(smaps), 8192);
+            assert_eq!(super::steps_for(8192), 1);
+            assert_eq!(super::steps_for(8193), 2);
+            assert_eq!(super::steps_for(0), 0);
+            assert_eq!(super::steps_for(u64::MAX / 2), 60);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Raw descriptor plumbing (libc is not a dependency of this crate)
 // ---------------------------------------------------------------------------
 
@@ -1400,6 +1495,8 @@ fn speculative_main(
                 rehearse_publish_tail(path, out);
             }));
         }
+        // Diagnostic: census of the large buffers' huge-page coverage, still untimed.
+        thp_census::measure();
     }
     // Ready-when-hot. The protected main thread writes the ready file as soon as this signal arrives, and the
     // harness sends the seed within one poll of seeing it. In the original order (signal, THEN enter the hot wait)
@@ -1526,6 +1623,8 @@ fn speculative_main(
         flock_core::SL2_TIMED_TAIL.store(false, Ordering::Relaxed);
         match (direct_proof_path.as_deref(), outcome) {
             (Some(path), Ok(out)) => {
+                // Diagnostic: encode the census into this trial's time (see `thp_census`).
+                thp_census::delay();
                 let published = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     publish_direct_proof(path, out)
                 }))
