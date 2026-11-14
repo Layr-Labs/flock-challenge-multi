@@ -3,6 +3,13 @@
 //! points that the PCS layer (when it lands) will verify against `z`'s
 //! commitment.
 //!
+//! Determinism note: every claim and challenge in this composition is a pure
+//! function of the witness and the Fiat-Shamir transcript bound to the
+//! statement — no environment, thread-count, wall-clock, or scheduler
+//! dependence — so the candidate's proof bytes are identical whatever runs
+//! them, and the trusted verifier's lockstep replay derives the identical
+//! challenges.
+//!
 //! Flow:
 //! ```text
 //!     witness z ──► pack ──► a = A·z, b = B·z, c = z (since C=I)

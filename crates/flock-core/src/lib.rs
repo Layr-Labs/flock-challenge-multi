@@ -16,6 +16,13 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//!
+//! Ranked-path notes:
+//!   - `init_perf_thread_pool` sizes rayon's global pool, pins glibc's heap
+//!     thresholds, and builds the zerocheck round-1 half-pools at startup;
+//!     it returns `None` when it changed nothing.
+//!   - `stage_ir.rs` is compiled into the `gf2_kernels` module, so the file
+//!     name and the public module name intentionally differ.
 
 pub mod bits;
 #[path = "stage_ir.rs"]
