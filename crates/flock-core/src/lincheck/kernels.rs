@@ -48,3 +48,19 @@ pub(crate) use x86_64::{gather_transpose_stripe_x86, gather_transpose_stripe4_x8
     target_feature = "gfni"
 ))]
 pub(crate) use x86_64::gfni_fold_word_tiles4;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[path = "kernels/xglm_root_lookup.rs"]
+mod xglm_root_lookup;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+pub(crate) use xglm_root_lookup::{RootLookupTables, build_root_lookup, gfni_fold_word_tiles4_lookup};
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[path = "kernels/xglm_root_narrow.rs"]
+mod xglm_root_narrow;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+pub(crate) use xglm_root_narrow::gfni_fold_word_tiles4_narrow;
