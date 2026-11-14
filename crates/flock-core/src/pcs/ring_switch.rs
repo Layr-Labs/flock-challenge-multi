@@ -3868,6 +3868,52 @@ mod sl2_pre {
 /// tail (see `sl2_pre`). The caller guarantees `fold8` stays alive and
 /// unmodified until [`sl2_pre_settle`] (or the ring switch) has run.
 pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
+    sl2_pre_spawn_with_canonical(fold8, suffix, None);
+}
+
+/// Output positions [`canonical_matches_fold8`] recomputes from the bank tensor.
+const CANONICAL_SPOT: [usize; 5] = [0, 1, 63, 64, 127];
+
+/// Whether a producer's canonical 128-vector agrees with the collapse of `fold8`
+/// under `low_point` (six coordinates) at [`CANONICAL_SPOT`]: each spot is the
+/// full weighted bank sum `Σ_b eq(low_point)[b] · fold8[b·128 + p]`, the same
+/// products [`collapse_s_hat_v_fold8`] forms for that position. A wrong
+/// coordinate order, bank order or statistic changes almost every position, so
+/// a disagreement anywhere sends the caller back to the full collapse.
+fn canonical_matches_fold8(fold8: &[F128], low_point: &[F128], canonical: &[F128]) -> bool {
+    let n_packed = 1usize << LOG_PACKING;
+    if fold8.len() != 64 * n_packed || canonical.len() != n_packed || low_point.len() != 6 {
+        return false;
+    }
+    let low_eq = crate::lincheck::build_eq_table(low_point);
+    CANONICAL_SPOT.iter().all(|&p| {
+        let mut v = F128::ZERO;
+        for (bank, &w) in low_eq.iter().enumerate().take(64) {
+            v += w * fold8[bank * n_packed + p];
+        }
+        v == canonical[p]
+    })
+}
+
+/// The C claim's collapsed statistic for the challenge-free precompute: the
+/// canonical vector zerocheck round 1 already derived from this same `fold8`
+/// when it is supplied and agrees at the spot positions, else the collapse.
+fn sl2_pre_s_hat_v(fold8: &[F128], low_point: &[F128], canonical: Option<Vec<F128>>) -> Vec<F128> {
+    match canonical {
+        Some(c) if canonical_matches_fold8(fold8, low_point, &c) => c,
+        _ => collapse_s_hat_v_fold8(fold8, low_point),
+    }
+}
+
+/// [`sl2_pre_spawn`] taking the claim's canonical 128-vector from its producer
+/// (zerocheck's `s_hat_v_c`, which collapses `fold8` under the same six suffix
+/// coordinates): the queued job then skips re-collapsing the 64 x 128 tensor.
+/// `None`, a shape mismatch or a spot-check mismatch keeps the collapse.
+pub fn sl2_pre_spawn_with_canonical(
+    fold8: &[F128],
+    suffix: Vec<F128>,
+    canonical: Option<Vec<F128>>,
+) {
     use std::sync::atomic::Ordering;
     let n_packed = 1usize << LOG_PACKING;
     if !sl2_pre::on() || fold8.len() != 64 * n_packed || suffix.len() < 6 {
@@ -3884,7 +3930,7 @@ pub fn sl2_pre_spawn(fold8: &[F128], suffix: Vec<F128>) {
         // SAFETY: the caller's contract; the state machine makes the ring
         // switch wait for (never race) this read.
         let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
-        let s_hat_v = collapse_s_hat_v_fold8(fold8, &suffix[..6]);
+        let s_hat_v = sl2_pre_s_hat_v(fold8, &suffix[..6], canonical);
         let mut a_state = crate::alloc_uninit_vec::<F128>(len);
         // Serial: a nested split here could park behind lincheck's long
         // fold tasks on this worker.
@@ -5611,6 +5657,59 @@ mod tests {
             want,
             "corrupted bank went undetected"
         );
+    }
+
+    /// The precompute's reuse of a producer's canonical vector: the exact
+    /// collapse is accepted and returned as is; a canonical vector from the
+    /// wrong coordinate order, a different statistic, one corrupted spot entry
+    /// or the wrong shape is refused, and the precompute then recollapses.
+    #[test]
+    fn sl2_pre_canonical_reuse_takes_only_the_matching_collapse() {
+        let mut rng = Rng::new(0x5_12C_A90_C0FF);
+        let n_packed = 1usize << LOG_PACKING;
+        let low_point: Vec<F128> = (0..6).map(|_| rng.f128()).collect();
+        let fold8: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+        let want = collapse_s_hat_v_fold8(&fold8, &low_point);
+        assert!(canonical_matches_fold8(&fold8, &low_point, &want));
+        assert_eq!(
+            sl2_pre_s_hat_v(&fold8, &low_point, Some(want.clone())),
+            want
+        );
+        assert_eq!(sl2_pre_s_hat_v(&fold8, &low_point, None), want);
+
+        let mut reversed = low_point.clone();
+        reversed.reverse();
+        let wrong_order = collapse_s_hat_v_fold8(&fold8, &reversed);
+        assert!(!canonical_matches_fold8(&fold8, &low_point, &wrong_order));
+        assert_eq!(sl2_pre_s_hat_v(&fold8, &low_point, Some(wrong_order)), want);
+
+        let other: Vec<F128> = (0..64 * n_packed).map(|_| rng.f128()).collect();
+        let other_canonical = collapse_s_hat_v_fold8(&other, &low_point);
+        assert!(!canonical_matches_fold8(
+            &fold8,
+            &low_point,
+            &other_canonical
+        ));
+
+        for &p in CANONICAL_SPOT.iter() {
+            let mut bad = want.clone();
+            bad[p] += F128::ONE;
+            assert!(
+                !canonical_matches_fold8(&fold8, &low_point, &bad),
+                "spot {p}"
+            );
+            assert_eq!(sl2_pre_s_hat_v(&fold8, &low_point, Some(bad)), want);
+        }
+        assert!(!canonical_matches_fold8(
+            &fold8,
+            &low_point,
+            &want[..n_packed - 1]
+        ));
+        assert!(!canonical_matches_fold8(
+            &fold8[..63 * n_packed],
+            &low_point,
+            &want
+        ));
     }
 
     #[test]
