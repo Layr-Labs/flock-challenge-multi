@@ -37,6 +37,9 @@ mod aarch64;
 ))]
 mod x86_64;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+pub(super) use x86_64::{xseed_half_publish, xseed_half_middle};
+
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     debug_assert_eq!(top.len(), bot.len());
