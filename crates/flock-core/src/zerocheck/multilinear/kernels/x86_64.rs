@@ -5020,6 +5020,7 @@ core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
     include_str!("gfni_c4_pass4_register_result.S"),
+    include_str!("gfni_c4_pipe.S"),
 );
 
 #[cfg(all(
@@ -5034,6 +5035,163 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
     fn flock_gfni_c4_pass4_register_result();
+    fn flock_gfni_c4_pipe_g2();
+    fn flock_gfni_c4_pipe_g1();
+    fn flock_gfni_c4_pass4_pipe_g2();
+    fn flock_gfni_c4_pipe_gather2();
+}
+
+/// `FLOCK_NO_C4_PIPE=1` restores the incumbent gather-at-entry c4 calls in
+/// the rounds 3+4+5 pass. Same outputs either way.
+pub(crate) fn c4_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_C4_PIPE").is_none());
+    *ON
+}
+
+/// Double buffer for the software-pipelined c4 calls: each call computes
+/// from the buffer the previous call gathered and gathers the next call's
+/// input into the other one.
+#[repr(C, align(64))]
+struct C4PipeBufs([[u8; 512]; 2]);
+
+// The pipelined kernels live in the Linux-only global asm; elsewhere
+// `c4_pipe_enabled` paths are never taken.
+#[cfg(not(target_os = "linux"))]
+unsafe fn c4_pipe_gather2(_rows: *const u8, _dst: *mut u8) {
+    unreachable!("c4 pipe is Linux-only")
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn gfni_fold64_c4_lm_pipe<const NEXT_PASS4: bool>(
+    _cur: *const u8,
+    _next_rows: *const u8,
+    _nxt: *mut u8,
+    _m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    unreachable!("c4 pipe is Linux-only")
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn gfni_fold32_c4_lm_pipe(
+    _cur: *const u8,
+    _next_rows: *const u8,
+    _nxt: *mut u8,
+    _m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    unreachable!("c4 pipe is Linux-only")
+}
+
+/// Pipeline prologue: gather a two-pass c4 input (`rows`, 512 bytes, line
+/// stride 128) into `dst` (512 bytes, 64-aligned).
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn c4_pipe_gather2(rows: *const u8, dst: *mut u8) {
+    unsafe {
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_pipe_gather2,
+            in("rdi") rows,
+            in("rcx") dst,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+        );
+    }
+}
+
+/// [`gfni_fold64_rows_c4_lm_registers`] over the input the previous call
+/// gathered into `cur`, gathering `next_rows` into `nxt` meanwhile (a
+/// two-pass input when `NEXT_PASS4` is false, else the pass4 kernel's
+/// one-pass input). Bit-identical results.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_c4_lm_pipe<const NEXT_PASS4: bool>(
+    cur: *const u8,
+    next_rows: *const u8,
+    nxt: *mut u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let a: __m512i;
+        let b: __m512i;
+        let c: __m512i;
+        let d: __m512i;
+        if NEXT_PASS4 {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pipe_g1,
+                in("rdi") next_rows,
+                in("rsi") m.1.as_ptr(),
+                in("rdx") cur,
+                in("rcx") nxt,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            );
+        } else {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pipe_g2,
+                in("rdi") next_rows,
+                in("rsi") m.1.as_ptr(),
+                in("rdx") cur,
+                in("rcx") nxt,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+            );
+        }
+        [a, b, c, d]
+    }
+}
+
+/// [`gfni_fold32_rows_c4_lm_registers`] over the one-pass input the previous
+/// call gathered into `cur`, gathering the two-pass `next_rows` into `nxt`.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold32_c4_lm_pipe(
+    cur: *const u8,
+    next_rows: *const u8,
+    nxt: *mut u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let lo: __m512i;
+        let hi: __m512i;
+        core::arch::asm!(
+            "call {kernel}",
+            kernel = sym flock_gfni_c4_pass4_pipe_g2,
+            in("rdi") next_rows,
+            in("rsi") m.1.as_ptr(),
+            in("rdx") cur,
+            in("rcx") nxt,
+            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+            out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+            out("zmm8") lo, out("zmm9") hi,
+        );
+        [lo, hi]
+    }
 }
 
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
@@ -7070,6 +7228,24 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         let i_a012_b3 = ix(&A0_A1_A2_B3);
         let i_a02_b0 = ix(&A0_A2_B0_B0);
         let i_a02_b1 = ix(&A0_A2_B1_B1);
+        // Software-pipelined c4 calls (`c4_pipe_enabled`): call i of a
+        // block computes from bufs[i % 2], which call i-1 gathered, and
+        // gathers call i+1's input into bufs[(i + 1) % 2]. Eight calls per
+        // block keep the parity fixed across blocks.
+        let pipe = cfg!(target_os = "linux") && c4_pipe_enabled();
+        let mut c4_bufs = core::mem::MaybeUninit::<C4PipeBufs>::uninit();
+        let buf0 = c4_bufs.as_mut_ptr().cast::<u8>();
+        let buf1 = buf0.add(512);
+        macro_rules! c4_call {
+            ($i:expr, $rows:expr, $next:expr) => {{
+                if pipe {
+                    let (cur, nxt) = if $i % 2 == 0 { (buf0, buf1) } else { (buf1, buf0) };
+                    gfni_fold64_c4_lm_pipe::<false>(cur, $next, nxt, cfold)
+                } else {
+                    gfni_fold64_rows_c4_lm_registers($rows, cfold)
+                }
+            }};
+        }
 
         // The rho3 level: (rows 0..4 fold) + rho3·(rows 0..4 fold + rows 4..8 fold).
         macro_rules! fold_r3 {
@@ -7080,12 +7256,13 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         }
 
         // A: the incumbent's 16-line half-block, lane-major [4i, 4i+1, 4i+2, 4i+3].
+        // `$i` is the first call's index in the block, `$next` the input of
+        // the call after the second one.
         macro_rules! fold_a_half {
-            ($row0:expr) => {{
+            ($row0:expr, $i:expr, $next:expr) => {{
                 let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                    c4_call!($i, a_pkt.add($row0 * 8), a_pkt.add($row0 * 8 + 512));
+                let [p0, p1, p2, p3] = c4_call!($i + 1, a_pkt.add($row0 * 8 + 512), $next);
                 let oe1 = fold_r3!(q0, q1);
                 let oo1 = fold_r3!(q2, q3);
                 let oe2 = fold_r3!(p0, p1);
@@ -7102,9 +7279,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // B: eight lines from `$row`; returns the folds of its lines
         // (0, 2, 4, 6) and (1, 3, 5, 7).
         macro_rules! fold_b_window {
-            ($row:expr) => {{
-                let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+            ($row:expr, $i:expr, $next:expr) => {{
+                let [q0, q1, q2, q3] = c4_call!($i, b_pkt.add($row * 8), $next);
                 (fold_r3!(q0, q1), fold_r3!(q2, q3))
             }};
         }
@@ -7168,6 +7344,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         let mut acc7 = [WideGhashX4::zero(); 10];
 
         let mut x_lo = 0;
+        if pipe && lo_size >= 16 {
+            c4_pipe_gather2(a_pkt.add(8 * 8 * (out_base + 2 * x_lo)), buf0);
+        }
         while x_lo + 16 <= lo_size {
             // First packed row of this block; B's live lines are 2..30.
             let row0 = 8 * (out_base + 2 * x_lo);
@@ -7181,10 +7360,12 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             // Lines 0..16.
             let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
-            let a_tile = fold_a_half!(row0);
+            let a_tile = fold_a_half!(row0, 0, b_pkt.add((row0 + 16) * 8));
             prefetch_half!(next, 8..16, pf1_first, pf1_last);
-            let (e1, o1) = fold_b_window!(row0 + 16); // lines 2,4,6,8 / 3,5,7,9
-            let (e2, o2) = fold_b_window!(row0 + 80); // lines 10,12,14,16 / 11,13,15,17
+            // lines 2,4,6,8 / 3,5,7,9
+            let (e1, o1) = fold_b_window!(row0 + 16, 2, b_pkt.add((row0 + 80) * 8));
+            // lines 10,12,14,16 / 11,13,15,17
+            let (e2, o2) = fold_b_window!(row0 + 80, 3, a_pkt.add((row0 + 128) * 8));
             let te = _mm512_shuffle_i64x2::<0xDD>(e1, e2); // lines 4, 8, 12, 16
             let to = _mm512_shuffle_i64x2::<0xDD>(o1, o2); // lines 5, 9, 13, 17
             let b_tile = [
@@ -7198,10 +7379,27 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             // Lines 16..32.
             let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
             prefetch_half!(next, 0..8, pf2_first, pf2_last);
-            let c_tile = fold_a_half!(row0 + 128);
+            let c_tile = fold_a_half!(row0 + 128, 4, b_pkt.add((row0 + 144) * 8));
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
-            let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            // lines 18,20,22,24 / 19,21,23,25; with the pipe, call 6 gathers
+            // call 7's one-pass input.
+            let (e3, o3) = if pipe {
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_c4_lm_pipe::<true>(buf0, b_pkt.add((row0 + 208) * 8), buf1, cfold);
+                (fold_r3!(q0, q1), fold_r3!(q2, q3))
+            } else {
+                let [q0, q1, q2, q3] =
+                    gfni_fold64_rows_c4_lm_registers(b_pkt.add((row0 + 144) * 8), cfold);
+                (fold_r3!(q0, q1), fold_r3!(q2, q3))
+            };
+            let [h0, h1] = if pipe {
+                // Call 7 gathers the next block's first input (its own A
+                // rows again on the last block: read, never used).
+                let next_a = if x_lo + 32 <= lo_size { row0 + 256 } else { row0 };
+                gfni_fold32_c4_lm_pipe(buf1, a_pkt.add(next_a * 8), buf0, cfold)
+            } else {
+                gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold)
+            };
             let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
             let d_tile = [
                 // lines 16, 20, 24, 28
