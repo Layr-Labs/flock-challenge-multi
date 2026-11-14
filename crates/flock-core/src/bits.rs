@@ -1,4 +1,12 @@
 //! Small bit-manipulation primitives shared across modules.
+//!
+//! The x86_64 AVX-512/GFNI bodies are compile-time gated on the exact
+//! features they use, so a build without them selects the portable NEON
+//! path instead of compiling instructions the target cannot execute.
+//! Both transposes are pure functions of their inputs: they allocate
+//! nothing, read no environment or global state, and write only the
+//! caller's output slice, so identical inputs give identical output bytes
+//! on every run and on either architecture.
 
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.
 ///

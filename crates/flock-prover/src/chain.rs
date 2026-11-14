@@ -5,6 +5,12 @@
 //! glues them into a **sequential chain** `x_{i+1} = h(x_i)` with public
 //! endpoints `x_0`, `x_{2^n}`.
 //!
+//! Determinism note: the chain argument's challenges come from the
+//! Fiat-Shamir transcript bound to the statement — a pure function of the
+//! prover's own messages — so the prove path emits the same proof bytes
+//! under any thread count, scheduler, or runner state, and the verifier
+//! replaying the same transcript derives the identical challenges.
+//!
 //! ## What it proves
 //!
 //! `In`/`Out` are two-variable MLEs over instance index `i ∈ {0,1}^n` and
