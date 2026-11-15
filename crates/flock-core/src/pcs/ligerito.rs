@@ -1964,10 +1964,78 @@ struct SparseDualL0 {
     w2_pows: Vec<F128>,
     folded_k: usize,
     inverse_local_blocks: Vec<[F128; 32]>,
+    /// Snapshot rows in QUERY order (`new`); empty when `stream` is set.
     rows: Vec<[F128; 16]>,
+    /// Lane gl2 (`from_stream`): the finished stream whose DRAW-ordered rows
+    /// are read in place, with `row_slot[i]` the draw slot of query `i`.
+    /// Stored only after `Gl2DualStream::finish` (see [`SparseDualRows::of`]).
+    stream: Option<std::sync::Arc<Gl2DualStream>>,
+    row_slot: Vec<u32>,
     round0_msg: SumcheckMessage,
     snapshots: bool,
     lane_x4: bool,
+}
+
+/// Read view of the snapshot rows of a [`SparseDualL0`]: the `stride` rows
+/// of query `index` are `rows[slot(index) * stride..][..stride]`, where the
+/// slot is `index` itself for query-ordered storage.
+#[derive(Clone, Copy)]
+struct SparseDualRows<'a> {
+    rows: &'a [[F128; 16]],
+    slot: &'a [u32],
+    stride: usize,
+}
+
+impl<'a> SparseDualRows<'a> {
+    /// Built from the struct's fields (not `&self`) so callers can mutate
+    /// the weight vectors while holding the view.
+    #[inline(always)]
+    fn of(
+        rows: &'a [[F128; 16]],
+        stream: &'a Option<std::sync::Arc<Gl2DualStream>>,
+        row_slot: &'a [u32],
+        stride: usize,
+    ) -> Self {
+        let rows = match stream {
+            // SAFETY: `from_stream` stores the stream only after `finish`
+            // observed `done == count` (acquire), i.e. after every slot's
+            // single writer finished. No row is written afterwards: `one` is
+            // the only writer and runs only for a slot claimed from `next`,
+            // and every slot is already claimed (`work` returns first). The
+            // stream is never restarted, and the held `Arc` keeps the buffer
+            // alive for this borrow.
+            Some(st) => unsafe { (*st.rows.get()).as_slice() },
+            None => rows,
+        };
+        Self { rows, slot: row_slot, stride }
+    }
+
+    /// The `stride` snapshot rows of query `index`.
+    #[inline(always)]
+    fn block(self, index: usize) -> &'a [[F128; 16]] {
+        let slot = if self.slot.is_empty() { index } else { self.slot[index] as usize };
+        &self.rows[slot * self.stride..(slot + 1) * self.stride]
+    }
+
+    /// The four `1 + scale` snapshot lanes of query `index`.
+    #[inline(always)]
+    fn scales(self, index: usize) -> &'a [F128] {
+        &self.block(index)[0][12..16]
+    }
+
+    /// The level-`log_s` local block of query `index` (rows layout of
+    /// `inverse_ntt_final_layers_local_staged`).
+    #[inline(always)]
+    fn local(self, index: usize, log_s: usize) -> &'a [F128] {
+        let blk = self.block(index);
+        match log_s {
+            2 => &blk[0][0..4],
+            3 => &blk[0][4..12],
+            4 => &blk[1],
+            5 => blk[2..4].as_flattened(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 const SPARSE_DUAL_MAX_DEPTH: usize = 4;
@@ -2942,7 +3010,7 @@ impl SparseDualL0 {
     /// one reduction exactly as in `new`.
     #[allow(clippy::too_many_arguments)]
     fn from_stream(
-        stream: &Gl2DualStream,
+        stream: &std::sync::Arc<Gl2DualStream>,
         log_inv_rate: usize,
         queries: Vec<usize>,
         perm: &[u32],
@@ -2960,25 +3028,34 @@ impl SparseDualL0 {
             table
         };
         assert_eq!(alpha_pows.len(), n_queries);
+        // The rows stay in the stream in DRAW order; query `i` reads draw
+        // slot `perm[i]` (see `SparseDualRows`). Require `perm` to be a
+        // bijection of `0..n_queries` so every query maps to one written slot.
+        assert_eq!(stride, sparse_dual_row_stride(depth));
+        assert_eq!(perm.len(), n_queries);
+        {
+            let mut seen = vec![false; n_queries];
+            for &d in perm {
+                let d = d as usize;
+                assert!(d < n_queries && !seen[d], "gl2 draw permutation is not a bijection");
+                seen[d] = true;
+            }
+        }
         stream.finish();
         crate::rstrace::evd("ds:done", 0);
         // SAFETY: `finish` observed `done == count` (acquire): every slot is written.
-        let (src_rows, vals) = unsafe { (&*stream.rows.get(), &*stream.vals.get()) };
-        let mut rows = crate::alloc_uninit_vec::<[F128; 16]>(n_queries * stride);
+        let vals = unsafe { &*stream.vals.get() };
         let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
         const CH: usize = 16;
         let zero = crate::field::F256Unreduced::ZERO;
-        let (enf_acc, u0_acc, u2_acc) = rows
-            .par_chunks_mut(stride * CH)
-            .zip(w2_pows.par_chunks_mut(CH))
+        let (enf_acc, u0_acc, u2_acc) = w2_pows
+            .par_chunks_mut(CH)
             .enumerate()
-            .map(|(c, (rows_c, w2_c))| {
+            .map(|(c, w2_c)| {
                 let (mut e, mut u0, mut u2) = (zero, zero, zero);
                 for (j, w2) in w2_c.iter_mut().enumerate() {
                     let i = c * CH + j;
                     let d = perm[i] as usize;
-                    rows_c[j * stride..(j + 1) * stride]
-                        .copy_from_slice(&src_rows[d * stride..(d + 1) * stride]);
                     let [cq, f0, s, qs0] = vals[d];
                     let a = alpha_pows[i];
                     e ^= a.mul_unreduced(cq);
@@ -3007,7 +3084,9 @@ impl SparseDualL0 {
                 w2_pows,
                 folded_k: 0,
                 inverse_local_blocks: Vec::new(),
-                rows,
+                rows: Vec::new(),
+                stream: Some(stream.clone()),
+                row_slot: perm.to_vec(),
                 round0_msg,
                 snapshots: true,
                 lane_x4: stream.lane_x4,
@@ -3210,6 +3289,8 @@ impl SparseDualL0 {
                 folded_k: 0,
                 inverse_local_blocks,
                 rows,
+                stream: None,
+                row_slot: Vec::new(),
                 round0_msg,
                 snapshots,
                 lane_x4,
@@ -3234,17 +3315,9 @@ impl SparseDualL0 {
         let global_base = query & !(block_len - 1);
         let cache_off = global_base - cache_base;
         let mut residue: [F128; 32];
+        let rows = SparseDualRows::of(&self.rows, &self.stream, &self.row_slot, stride);
         let local: &[F128] = if self.snapshots {
-            let base_row = index * stride;
-            match log_s {
-                2 => &self.rows[base_row][0..4],
-                3 => &self.rows[base_row][4..12],
-                4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
-                _ => unreachable!(),
-            }
+            rows.local(index, log_s)
         } else {
             residue = self.inverse_local_blocks[index];
             forward_ntt_local_until(
@@ -3258,7 +3331,7 @@ impl SparseDualL0 {
         };
 
         let (w0, w2) = if self.snapshots {
-            let scales = &self.rows[index * stride][12..16];
+            let scales = rows.scales(index);
             let mut d0 = F128::ONE + fold_challenges[0] * scales[0];
             for (s, &r_s) in fold_challenges.iter().enumerate().skip(1) {
                 d0 *= F128::ONE + r_s * scales[s];
@@ -3451,20 +3524,12 @@ impl SparseDualL0 {
         let fold_weights = &weights[..weights_len];
         let mut u0 = crate::field::F256Unreduced::ZERO;
         let mut u2 = crate::field::F256Unreduced::ZERO;
+        let rows = SparseDualRows::of(&self.rows, &self.stream, &self.row_slot, stride);
         for index in 0..self.queries.len() {
-            let base_row = index * stride;
-            let local: &[F128] = match log_s {
-                2 => &self.rows[base_row][0..4],
-                3 => &self.rows[base_row][4..12],
-                4 => &self.rows[base_row + 1],
-                5 => unsafe {
-                    core::slice::from_raw_parts(self.rows[base_row + 2].as_ptr(), 32)
-                },
-                _ => unreachable!(),
-            };
+            let local: &[F128] = rows.local(index, log_s);
             let w0 = self.w0_pows[index];
             let top_scale = if log_s <= 4 {
-                self.rows[base_row][12 + log_s - 1]
+                rows.scales(index)[log_s - 1]
             } else {
                 sparse_dual_one_plus_scale(&self.ntt, self.log_d, log_s - 1, self.queries[index])
             };
@@ -3582,6 +3647,7 @@ impl SparseDualL0 {
         let full_ntt = &self.ntt;
         let n_queries = self.queries.len();
         let stride = sparse_dual_row_stride(self.depth);
+        let rows = SparseDualRows::of(&self.rows, &self.stream, &self.row_slot, stride);
         let reduced_log_d = self.log_d - k;
         if self.snapshots && self.folded_k == k && n_queries <= 256 {
             let mut pos_stack = [0usize; 256];
@@ -3627,10 +3693,10 @@ impl SparseDualL0 {
                 let v_ptr = val_stack.as_mut_ptr();
                 let mut idx = 0usize;
                 while idx < lanes {
-                    let s0 = &self.rows.get_unchecked(idx * stride)[12..16];
-                    let s1 = &self.rows.get_unchecked((idx + 1) * stride)[12..16];
-                    let s2 = &self.rows.get_unchecked((idx + 2) * stride)[12..16];
-                    let s3 = &self.rows.get_unchecked((idx + 3) * stride)[12..16];
+                    let s0 = rows.scales(idx);
+                    let s1 = rows.scales(idx + 1);
+                    let s2 = rows.scales(idx + 2);
+                    let s3 = rows.scales(idx + 3);
                     let mut acc = _mm512_loadu_si512(a_ptr.add(idx) as *const __m512i);
                     for s in 0..k {
                         let vs = f128x4_set(s0[s], s1[s], s2[s], s3[s]);
@@ -3642,7 +3708,7 @@ impl SparseDualL0 {
                     idx += 4;
                 }
                 while idx < n_queries {
-                    let scales = &self.rows[idx * stride][12..16];
+                    let scales = rows.scales(idx);
                     let mut v = self.alpha_pows[idx];
                     for (s, &r_s) in fold_challenges.iter().enumerate() {
                         v *= F128::ONE + r_s * scales[s];
@@ -3666,7 +3732,7 @@ impl SparseDualL0 {
         for (index, &query) in self.queries.iter().enumerate() {
             let mut local_value = self.alpha_pows[index];
             if self.snapshots {
-                let scales = &self.rows[index * stride][12..16];
+                let scales = rows.scales(index);
                 for (s, &r_s) in fold_challenges.iter().enumerate() {
                     local_value *= F128::ONE + r_s * scales[s];
                 }
@@ -9677,7 +9743,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             crate::rstrace::evd("L1:dual0", 0);
             // Lane sl1: warm holders for L1's three fold grinds (~0.05 ms ahead).
             crate::challenger::sl1_grind_prewarm(sl1_hold_us(120));
-            let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_deref() {
+            let (dual, enforced_sum) = if let Some(st) = gl2_s0.as_ref() {
                 let r = SparseDualL0::from_stream(st, log_inv_rate_0, queries_0.clone(), &gl2_perm0, &alpha_0);
                 gl2_side_done.extend(st.take_side());
                 r
@@ -10131,7 +10197,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 gl2_jobs.0.push(job.clone());
                 gl2_level_jobs.push((recursive_proofs.len(), job));
                 crate::rstrace::evd("lv:dual0", i as u32);
-                let (dual, enforced_sum) = if let Some(st) = gl2_si.as_deref() {
+                let (dual, enforced_sum) = if let Some(st) = gl2_si.as_ref() {
                     let r = SparseDualL0::from_stream(
                         st,
                         config.log_inv_rates[i + 1],
@@ -13912,6 +13978,8 @@ mod tests {
             folded_k: 0,
             inverse_local_blocks,
             rows: Vec::new(),
+            stream: None,
+            row_slot: Vec::new(),
             round0_msg: SumcheckMessage {
                 u_0: F128::ZERO,
                 u_2: F128::ZERO,
