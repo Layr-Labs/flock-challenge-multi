@@ -391,17 +391,6 @@ pub(super) unsafe fn fold64_banked_nested(
             let mut slot_idx = 0usize;
             while slot_idx < 4 {
                 let base_elem = 64 * (t + slot_idx);
-                if pf_ahead != 0 {
-                    let ahead = base_elem + pf_ahead;
-                    if ahead <= pf_limit {
-                        let p = src.as_ptr().add(ahead).cast::<i8>();
-                        let mut l = 0usize;
-                        while l < 1024 {
-                            _mm_prefetch::<_MM_HINT_T0>(p.add(l));
-                            l += 64;
-                        }
-                    }
-                }
                 let mut acc = WideGhashX4::zero();
                 for g in 0..4 {
                     let base = base_elem + 4 * g;
