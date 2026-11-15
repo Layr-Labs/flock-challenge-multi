@@ -5,6 +5,20 @@
 //! the first-edge interface passes CV word planes directly to parent hashes.
 use super::{BLAKE3_IV, Hash};
 core::arch::global_asm!(include_str!("merkle_contiguous.S"));
+// `FLOCK_MAH_ASM=1` alternates (crate::MAH_ASM): Mahmoud514 a4aa6fa2's leaf kernels as `*_m`.
+core::arch::global_asm!(include_str!("merkle_contiguous_m.S"));
+unsafe extern "C" {
+    fn flock_blake3_contiguous_64_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_contiguous_128_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_contiguous_256_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_contiguous_512_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_contiguous_1024_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_planes_leaf_64_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_planes_leaf_128_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_planes_leaf_256_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_planes_leaf_512_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    fn flock_blake3_planes_leaf_1024_m(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+}
 unsafe extern "C" {
     fn flock_blake3_contiguous_64(
         data: *const u8,
@@ -89,6 +103,18 @@ pub(super) fn hash_many<const N: usize>(
         1024 => flock_blake3_contiguous_1024,
         _ => unreachable!("unsupported contiguous BLAKE3 size"),
     };
+    let kernel: Kernel = if *crate::MAH_ASM {
+        match N {
+            64 => flock_blake3_contiguous_64_m,
+            128 => flock_blake3_contiguous_128_m,
+            256 => flock_blake3_contiguous_256_m,
+            512 => flock_blake3_contiguous_512_m,
+            1024 => flock_blake3_contiguous_1024_m,
+            _ => kernel,
+        }
+    } else {
+        kernel
+    };
     assert!(!out.is_empty() && out.len() % 16 == 0);
     assert_eq!(data.len(), out.len() * N);
     // SAFETY: the compile-time module gate supplies AVX-512F/VL and the Linux
@@ -134,6 +160,18 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
         512 => flock_blake3_planes_leaf_512,
         1024 => flock_blake3_planes_leaf_1024,
         _ => unreachable!("unsupported plane leaf size"),
+    };
+    let leaf: Kernel = if *crate::MAH_ASM {
+        match N {
+            64 => flock_blake3_planes_leaf_64_m,
+            128 => flock_blake3_planes_leaf_128_m,
+            256 => flock_blake3_planes_leaf_256_m,
+            512 => flock_blake3_planes_leaf_512_m,
+            1024 => flock_blake3_planes_leaf_1024_m,
+            _ => leaf,
+        }
+    } else {
+        leaf
     };
     // At most 128 leaves / 64 parents. No typed initialized scratch reference
     // exists before the assembly has written every byte the parent reads.
