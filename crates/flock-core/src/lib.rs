@@ -56,7 +56,124 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
+
+/// DIAGNOSTIC SUBMISSION ONLY: factorial in-run probe on the ranked runner.
+///
+/// The ranked harness starts one fresh worker per trial and names that trial's
+/// files `run-{r}.ready` / `run-{r}.proof`, so a worker knows its trial number
+/// `r` (1-based, warm-up trials included). Each entry of `FACTORS` is a set of
+/// existing switches of this tree plus a 4-bit mask: the factor is ON in trial
+/// `r` iff `popcount(((r - 1) mod 16) & mask)` is odd. Every mask contains bit
+/// 2 or bit 3, so each factor is ON in exactly half of every 16 consecutive
+/// trials, balanced over `r mod 2` and `r mod 4`, and any two factors are
+/// orthogonal (a two-level full factorial on the bits of `(r - 1) mod 16`).
+/// One run therefore holds one paired A/B per factor, each over all trials.
+///
+/// The switches are set here, on the main thread, as the first statement of the
+/// worker's first library call: no thread, pool or lazily-read switch exists
+/// yet, exactly as if the harness had passed them (it clears the environment,
+/// so it cannot). Every switch only selects between schedules, prefetch
+/// distances or store kinds that compute the same values: proof bytes are the
+/// same in every trial for the same seed.
+///
+/// Method credit: newjordan's run-parity probes; patternrecognition9-del's
+/// interleaved A/B probes. Decoder: the published per-trial times.
+pub(crate) mod fact_probe {
+    /// (mask, switches set when the factor is ON)
+    pub(crate) const FACTORS: &[(u64, &[(&str, &str)])] = &[
+        // Each factor ON = the piece's previous code path (kill switch / old default).
+        (4, &[("FLOCK_NO_LD_FOLD_ASSIST", "1")]),
+        (5, &[("FLOCK_NO_X7_PREFETCHW", "1")]),
+        (6, &[("FLOCK_NO_ZC_R2_VEC_SUMS", "1")]),
+        (7, &[("FLOCK_NO_RF_UNINIT", "1")]),
+        (8, &[("FLOCK_NO_ZC_R1_EXIT_WARM", "1")]),
+        (9, &[("FLOCK_NO_ROOT_PIPELINED", "1")]),
+        (10, &[("FLOCK_NO_MERKLE_PLAN_REUSE", "1")]),
+        (11, &[("FLOCK_GL1_LC_MIN", "2048")]),
+        (12, &[("FLOCK_NTT_ST_STAGE_COLOR", "7")]),
+        (13, &[("FLOCK_NTT_ST_SLOT_PAD_LINES", "0")]),
+        (14, &[("FLOCK_ZC_R1_AB_WORKERS", "7")]),
+    ];
+
+    /// The trial number, if this process is a ranked worker
+    /// (`flock-benchmark-worker LOG2 .../run-{r}.ready .../run-{r}.proof`).
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 1).then_some(r)
+    }
+
+    pub(crate) fn is_on(r: u64, mask: u64) -> bool {
+        (((r - 1) % 16) & mask).count_ones() & 1 == 1
+    }
+
+    /// The trial number (cached), if this process is a ranked worker.
+    pub(crate) fn trial_number() -> Option<u64> {
+        static T: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *T.get_or_init(trial)
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        for (mask, env) in FACTORS {
+            if !is_on(r, *mask) {
+                continue;
+            }
+            for (key, value) in *env {
+                // SAFETY: called once from `init_perf_thread_pool` before any other
+                // thread exists, so no concurrent environment access is possible.
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{is_on, FACTORS};
+        #[test]
+        fn factors_are_balanced_and_orthogonal() {
+            let mut seen = std::collections::HashSet::new();
+            for (mask, env) in FACTORS {
+                assert!(*mask < 16 && mask & 0b1100 != 0, "mask {mask}");
+                assert!(seen.insert(*mask), "duplicate mask {mask}");
+                assert!(!env.is_empty());
+                // balanced over r mod 2 and r mod 4 inside every 16-trial period
+                for period in [2u64, 4] {
+                    for class in 0..period {
+                        let on = (1..=16u64).filter(|&r| (r - 1) % period == class && is_on(r, *mask)).count();
+                        assert_eq!(on as u64, 8 / period, "mask {mask} period {period} class {class}");
+                    }
+                }
+            }
+            for (a, _) in FACTORS {
+                for (b, _) in FACTORS {
+                    if a < b {
+                        let agree = (1..=16u64).filter(|&r| is_on(r, *a) == is_on(r, *b)).count();
+                        assert_eq!(agree, 8, "masks {a} {b} not orthogonal");
+                    }
+                }
+            }
+            let keys: Vec<&str> = FACTORS.iter().flat_map(|(_, e)| e.iter().map(|(k, _)| *k)).collect();
+            let unique: std::collections::HashSet<&&str> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "a switch appears in two factors");
+        }
+    }
+}
+
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Diagnostic submission only: selects this trial's factor levels before anything reads a switch.
+    fact_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
@@ -582,7 +699,7 @@ pub(crate) mod smt_split {
                     .and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..16).contains(n)) {
                     Some(workers) => super::arm_cpus_for_workers(&groups, workers),
                     None if rebalance => (s0, s1),
-                    None => super::arm_cpus_for_workers(&groups, 7),
+                    None => super::arm_cpus_for_workers(&groups, 8),
                 }
             } else { (s0, s1) };
             let p0 = half(0, s0, debug);
