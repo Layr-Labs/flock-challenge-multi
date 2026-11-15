@@ -5544,3 +5544,7 @@ unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &Prep
         }
     }
 }
+
+#[cfg(target_feature = "avx512bw")]
+#[path = "x86_64_colored.rs"]
+pub(crate) mod colored;

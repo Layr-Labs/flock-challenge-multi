@@ -3415,6 +3415,7 @@ impl AdditiveNttF128 {
         stage_perm: bool,
         tw4: &[kernels::FourBlock],
         tw2: &[[[F128; 3]; 16]],
+        colored: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -3453,7 +3454,7 @@ impl AdditiveNttF128 {
                     r,
                     lanes2,
                     stage_perm,
-                    &tw2[block],
+                    &tw2[block], colored,
                 );
             }
         }
@@ -3496,6 +3497,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2: &[[[F128; 3]; 16]],
+        colored: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -3519,7 +3521,7 @@ impl AdditiveNttF128 {
                     r,
                     lanes2,
                     stage_perm,
-                    &tw2[block],
+                    &tw2[block], colored,
                 );
             }
         }
@@ -3563,6 +3565,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2_block: &[[F128; 3]; 16],
+        colored: bool,
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
@@ -3576,6 +3579,12 @@ impl AdditiveNttF128 {
                 let dst = |k: usize| {
                     base.add(seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len)
                 };
+                #[cfg(target_feature="avx512bw")]
+                if colored {
+                    let row=seed_top_codeword_row(block,r,k,block_size,sub_stride);
+                    kernels::colored::publish::<ALIGNED_ZMM>(p,step,[dst(k),dst(k+1),dst(k+2),dst(k+3)],lanes2,[t_outer,t_inner_a,t_inner_b],row.count_ones()&1!=0);
+                    continue;
+                }
                 kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
                     p,
                     step,
@@ -3601,6 +3610,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         odd_tail: usize,
         after: Option<&(dyn Fn(usize) + Sync)>,
+        colored: bool,
     ) -> bool {
         crate::rstrace::ev("nt:s8", 0);
         use rayon::prelude::*;
@@ -3937,7 +3947,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
-                            &tw2,
+                            &tw2, colored,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -3951,7 +3961,7 @@ impl AdditiveNttF128 {
                             lanes4_tail,
                             stage_perm,
                             &tw4,
-                            &tw2,
+                            &tw2, colored,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -4047,11 +4057,11 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2, colored,
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2, colored,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
@@ -4437,6 +4447,15 @@ impl AdditiveNttF128 {
             && !ntt_fused3_disabled()
             && deep_block_fuse_enabled();
 
+        #[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+        let colored = fuse_blocks && n_top == 9 && log_d == 20 && num_ntts == 64
+            && seed_msg.is_some() && seed_sub.is_none() && on_sub_done.is_some()
+            && Self::scatter_nt_enabled() && data.as_ptr() as usize % 16 == 0
+            && direct_fused2_publish_shape(log_d,num_ntts,odd_tail)
+            && !ntt_direct_fused2_publish_disabled() && colored_ntt_enabled();
+        #[cfg(not(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq")))]
+        let colored = false;
+        if colored { crate::gaptime::mark("ntt: colored layout selected"); }
         let rs_f33 = force_n_top.is_some() && rs_f33_enabled();
         let deep_sub = |sub_idx: usize,
                         sub_data: &mut [F128],
@@ -4454,6 +4473,13 @@ impl AdditiveNttF128 {
                 unsafe {
                     self.rs_seed_into_sub(msg, k, sub_idx, sub_data, sub_size_positions, log_d, num_ntts);
                 }
+            }
+            #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+            if colored {
+                let noop = |_:core::ops::Range<usize>, _:&[F128]| {};
+                let cb = block_cb.unwrap_or(&noop);
+                unsafe { self.deep_sub_fused_blocks_x86(sub_idx,sub_data,cb,n_top,log_d,num_ntts,odd_tail,raw7_pack,sub_size_positions,hint,true); }
+                return block_cb.is_some();
             }
             if fuse_blocks && let Some(cb) = block_cb {
                 #[cfg(all(
@@ -4473,7 +4499,7 @@ impl AdditiveNttF128 {
                         odd_tail,
                         raw7_pack,
                         sub_size_positions,
-                        hint,
+                        hint, colored,
                     )
                 };
                 #[cfg(not(all(
@@ -4491,7 +4517,7 @@ impl AdditiveNttF128 {
                     odd_tail,
                     raw7_pack,
                     sub_size_positions,
-                    hint,
+                    hint, colored,
                 );
             }
             // The cache-blocked tail normally sweeps each subgroup once per
@@ -4882,7 +4908,7 @@ impl AdditiveNttF128 {
                             unsafe {
                                 self.v2_deep_block_x86(
                                     i, b, sp, cb,
-                                    n_top, log_d, num_ntts, odd_tail, raw7_pack, sub_size_positions, hint,
+                                    n_top, log_d, num_ntts, odd_tail, raw7_pack, sub_size_positions, hint, colored,
                                 );
                             }
                         } else {
@@ -4891,7 +4917,7 @@ impl AdditiveNttF128 {
                             // SAFETY: rows b*per..(b+1)*per of sweep 1, claimed
                             // exactly once; the owner joins on the count below.
                             unsafe {
-                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint, colored);
                             }
                             dsteal_done[ws].fetch_add(1, std::sync::atomic::Ordering::Release);
                         }
@@ -4956,7 +4982,7 @@ impl AdditiveNttF128 {
                             while let Some((si, blk, c)) = dsteal_claim(w) {
                                 debug_assert!(si == i && !blk);
                                 unsafe {
-                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint, colored);
                                 }
                                 mine += 1;
                             }
@@ -4965,7 +4991,7 @@ impl AdditiveNttF128 {
                             }
                         } else {
                             unsafe {
-                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint);
+                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint, colored);
                             }
                         }
                         w.store((i as u64) << 16 | DSTEAL_BLK, Ordering::Release);
@@ -4975,7 +5001,7 @@ impl AdditiveNttF128 {
                             unsafe {
                                 self.v2_deep_block_x86(
                                     si, b, sp, &enqueue, n_top, log_d, num_ntts, odd_tail, raw7_pack,
-                                    sub_size_positions, hint,
+                                    sub_size_positions, hint, colored,
                                 );
                             }
                         }
@@ -5036,7 +5062,7 @@ impl AdditiveNttF128 {
                     };
                 #[cfg(not(target_os = "linux"))]
                 let after: Option<&(dyn Fn(usize) + Sync)> = None;
-                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, after) {
+                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, after, colored) {
                     // The deep pass ran inside the same broadcast.
                     crate::gaptime::mark("ntt: deep pass done");
                     return;
@@ -5628,6 +5654,7 @@ impl AdditiveNttF128 {
         raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
+        colored: bool,
     ) -> bool {
         self.deep_sub_fused_blocks_fallback(
             sub_idx,
@@ -5639,7 +5666,7 @@ impl AdditiveNttF128 {
             odd_tail,
             raw7_pack,
             sub_size_positions,
-            hint,
+            hint, colored,
         )
     }
 
@@ -5666,7 +5693,13 @@ impl AdditiveNttF128 {
         odd_tail: usize,
         sub_size_positions: usize,
         hint: u8,
+        colored: bool,
     ) {
+        #[cfg(target_feature="avx512bw")]
+        if colored {
+            unsafe { self.v2_sweep1_rows_x86(sub_idx,sub_ptr,0,128,n_top,log_d,num_ntts,odd_tail,hint,true); }
+            return;
+        }
         let sub_data = unsafe { core::slice::from_raw_parts_mut(sub_ptr, sub_size_positions * num_ntts) };
         let layer = n_top;
         let block_size = 1usize << (log_d - layer);
@@ -5744,6 +5777,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         odd_tail: usize,
         hint: u8,
+        colored: bool,
     ) {
         let layer = n_top;
         let block_size = 1usize << (log_d - layer);
@@ -5761,6 +5795,17 @@ impl AdditiveNttF128 {
             t[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
         }
         let odd_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        #[cfg(target_feature="avx512bw")]
+        if colored {
+            debug_assert_eq!((sixteenth,num_ntts),(128,64));
+            let prepared=unsafe{kernels::colored::prepare(&t)};
+            for r in r0..r1 { unsafe {
+                let ptr=sub_ptr.add(r*64);
+                let pf=if r+1<sixteenth{sub_ptr.add((r+1)*64)}else{ptr};
+                kernels::colored::four::<128>(ptr,&prepared,if r+1<sixteenth{hint}else{0},pf);
+            }}
+            return;
+        }
         let prepared = unsafe { kernels::prepare_four(&t) }.expect("v2_sweep1_prepared checked");
         let base = sub_ptr;
         for r in r0..r1 {
@@ -5804,6 +5849,7 @@ impl AdditiveNttF128 {
         raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
+        colored: bool,
     ) {
         let layer4 = n_top + 4;
         let block_size4 = 1usize << (log_d - layer4);
@@ -5824,6 +5870,17 @@ impl AdditiveNttF128 {
             tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
         }
         let blk = unsafe { core::slice::from_raw_parts_mut(sub_ptr.add(b * block_bytes4), block_bytes4) };
+        #[cfg(target_feature="avx512bw")]
+        if colored {
+            debug_assert_eq!((sixteenth4,num_ntts),(8,64));
+            let prepared=unsafe{kernels::colored::prepare(&tw)};
+            for r in 0..8{unsafe{
+                let ptr=blk.as_mut_ptr().add(r*64);
+                let pf=if r<7{blk.as_ptr().add((r+1)*64)}else{ptr};
+                kernels::colored::four::<8>(ptr,&prepared,if r<7{hint}else{0},pf);
+            }}
+        }
+        if !colored {
         butterfly_interleaved_fused_4layer_rows_raw7(
             blk,
             &tw,
@@ -5833,6 +5890,7 @@ impl AdditiveNttF128 {
             hint,
             raw7_pack,
         );
+        }
         for j in 0..16usize {
             let g8 = g4 * 16 + j;
             let mut tw3 = [F128 { lo: 0, hi: 0 }; 7];
@@ -5846,7 +5904,11 @@ impl AdditiveNttF128 {
             let eight = &mut blk[j * 8 * num_ntts..(j + 1) * 8 * num_ntts];
             // SAFETY: as in deep_sub_fused_blocks_fallback.
             unsafe {
-                kernels::butterfly_fused_3layer_rows(eight.as_mut_ptr(), num_ntts, dense_lanes, &tw3);
+                #[cfg(target_feature="avx512bw")]
+                if colored {
+                    kernels::colored::three_initialized(eight.as_mut_ptr(),&tw3,g8.count_ones()&1!=0);
+                }
+                if !colored { kernels::butterfly_fused_3layer_rows(eight.as_mut_ptr(), num_ntts, dense_lanes, &tw3); }
             }
         }
         let lo = sub_idx * sub_size_positions + b * block_size4;
@@ -5867,7 +5929,17 @@ impl AdditiveNttF128 {
         raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
+        colored: bool,
     ) -> bool {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+        if colored {
+            unsafe {
+                let ptr=sub_data.as_mut_ptr();
+                self.v2_deep_sweep1_x86(sub_idx,ptr,n_top,log_d,num_ntts,odd_tail,sub_size_positions,hint,true);
+                for b in 0..16{self.v2_deep_block_x86(sub_idx,b,ptr,cb,n_top,log_d,num_ntts,odd_tail,raw7_pack,sub_size_positions,hint,true);}
+            }
+            return true;
+        }
         // Sweep 1: fused-four over the whole sub-group (layers
         // n_top..n_top+4) — verbatim the incumbent's first pass.
         {
@@ -6846,7 +6918,7 @@ mod tests {
                 let lo = sub_idx * 2048 * columns;
                 assert!(ntt.deep_sub_fused_blocks_fallback(
                     sub_idx, &mut data[lo..lo + 2048 * columns], &callback,
-                    2, 13, columns, 0, false, 2048, 0,
+                    2, 13, columns, 0, false, 2048, 0, false,
                 ));
                 let snapshots = snapshots.into_inner().unwrap();
                 assert_eq!(snapshots.len(), 16);
@@ -9486,4 +9558,42 @@ fn raw7_ranked_encoder_and_callback_match_parent() {
         "raw-seven packing changed the complete ranked codeword"
     );
 }
+}
+
+/// One private codeword layout, selected before either stage starts.
+/// Eligible ranked passes use this layout; FLOCK_NO_COLORED_NTT restores
+/// canonical publication and the original deep kernels for diagnostics.
+#[cfg(all(target_os="linux",target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+fn colored_ntt_enabled()->bool{
+    static ON:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_NO_COLORED_NTT").is_none());
+    *ON
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw",target_feature="vpclmulqdq"))]
+mod colored_integration_tests {
+    use super::*;
+    #[test]
+    fn colored_deep_pipeline_restores_callback_bytes_and_raw7_tail() {
+        let ntt=AdditiveNttF128::standard(20);
+        for sub_idx in [0usize,1,31,511] {for odd_tail in [0,4] {
+            let mut state=992881u64;
+            let mut reference:Vec<F128>=(0..2048*64).map(|_|{
+                state^=state<<13;state^=state>>7;state^=state<<17;
+                F128{lo:state,hi:state.rotate_left(21)}
+            }).collect();
+            if odd_tail!=0{for row in (1..2048).step_by(2){reference[row*64+57..(row+1)*64].fill(F128::ZERO);}}
+            let mut candidate=reference.clone();
+            for row in 0usize..2048 {if (sub_idx*2048+row).count_ones()&1!=0{
+                for lane in 0..32{candidate.swap(row*64+lane,row*64+32+lane);}
+            }}
+            let expected_ranges=std::sync::Mutex::new(Vec::new());
+            let actual_ranges=std::sync::Mutex::new(Vec::new());
+            let expected_cb=|range:core::ops::Range<usize>,data:&[F128]|{expected_ranges.lock().unwrap().push((range,data.to_vec()));};
+            let actual_cb=|range:core::ops::Range<usize>,data:&[F128]|{actual_ranges.lock().unwrap().push((range,data.to_vec()));};
+            assert!(ntt.deep_sub_fused_blocks_fallback(sub_idx,&mut reference,&expected_cb,9,20,64,odd_tail,odd_tail==4,2048,0,false));
+            assert!(ntt.deep_sub_fused_blocks_fallback(sub_idx,&mut candidate,&actual_cb,9,20,64,odd_tail,odd_tail==4,2048,0,true));
+            assert_eq!(candidate,reference,"sub={sub_idx} tail={odd_tail}");
+            assert_eq!(*actual_ranges.lock().unwrap(),*expected_ranges.lock().unwrap());
+        }}
+    }
 }
