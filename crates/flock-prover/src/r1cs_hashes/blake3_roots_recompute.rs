@@ -329,7 +329,7 @@ fn roots_only_matches_production_stripes() {
                             z.0.as_mut_ptr(),
                             a.0.as_mut_ptr(),
                             b.0.as_mut_ptr(),
-                            StreamProj { compact_z_tile_words:0, seed_window:None,
+                            StreamProj { compact_z_tile_words:0, seed_window:None, ab_pend: core::ptr::null_mut(),
                                 stage: stage.0.as_mut_ptr(),
                                 out: ab.0.as_mut_ptr(),
                                 out_stride: 29 * 64,
@@ -962,6 +962,171 @@ pub(crate) unsafe fn generate_pair_with_deps(
     }
 }
 
+
+// Input-preparation fusion follows the inline-body technique in public
+// Yukon submission6f19d17f-b575-44ff-9a1b-50f5036b95b3.
+// The existing full root writer is retained; no compact emission is imported.
+#[inline(always)]
+unsafe fn recompute_pair_tile_inline<const SAVE: bool>(
+    prepared: &Prepared16,
+    out: *mut u8,
+    deps: *mut V16,
+    out_lo: *mut V16,
+    out_hi: *mut V16,
+) {
+    unsafe {
+        let il_a = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+        let il_b = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+        let cv_v = &prepared.cv;
+        let m = &prepared.message;
+        let tlo = prepared.counter_lo;
+        let thi = prepared.counter_hi;
+        let blen = prepared.block_len;
+        let flags = prepared.flags;
+
+        let mut state: [V16; 16] = [
+            cv_v[0],
+            cv_v[1],
+            cv_v[2],
+            cv_v[3],
+            cv_v[4],
+            cv_v[5],
+            cv_v[6],
+            cv_v[7],
+            dup16(BLAKE3_IV[0]),
+            dup16(BLAKE3_IV[1]),
+            dup16(BLAKE3_IV[2]),
+            dup16(BLAKE3_IV[3]),
+            tlo,
+            thi,
+            blen,
+            flags,
+        ];
+
+        let mut wa = RootW16::new(out, initial16(shr16::<31>(flags)));
+        wa.write_word::<0>(cv_v[0]);
+        wa.write_word::<1>(cv_v[1]);
+        wa.write_word::<2>(cv_v[2]);
+        wa.write_word::<3>(cv_v[3]);
+        wa.write_word::<4>(cv_v[4]);
+        wa.write_word::<5>(cv_v[5]);
+        wa.write_word::<6>(cv_v[6]);
+        wa.write_word::<7>(cv_v[7]);
+        let one = dup16(1);
+        let chain: [V16; 20] = [
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], tlo, thi, blen, flags,
+        ];
+        wa.write_word::<16>(or16(one, shl16::<1>(chain[0])));
+        wa.write_word::<17>(or16(shr16::<31>(chain[0]), shl16::<1>(chain[1])));
+        wa.write_word::<18>(or16(shr16::<31>(chain[1]), shl16::<1>(chain[2])));
+        wa.write_word::<19>(or16(shr16::<31>(chain[2]), shl16::<1>(chain[3])));
+        wa.write_word::<20>(or16(shr16::<31>(chain[3]), shl16::<1>(chain[4])));
+        wa.write_word::<21>(or16(shr16::<31>(chain[4]), shl16::<1>(chain[5])));
+        wa.write_word::<22>(or16(shr16::<31>(chain[5]), shl16::<1>(chain[6])));
+        wa.write_word::<23>(or16(shr16::<31>(chain[6]), shl16::<1>(chain[7])));
+        wa.write_word::<24>(or16(shr16::<31>(chain[7]), shl16::<1>(chain[8])));
+        wa.write_word::<25>(or16(shr16::<31>(chain[8]), shl16::<1>(chain[9])));
+        wa.write_word::<26>(or16(shr16::<31>(chain[9]), shl16::<1>(chain[10])));
+        wa.write_word::<27>(or16(shr16::<31>(chain[10]), shl16::<1>(chain[11])));
+        wa.write_word::<28>(or16(shr16::<31>(chain[11]), shl16::<1>(chain[12])));
+        wa.write_word::<29>(or16(shr16::<31>(chain[12]), shl16::<1>(chain[13])));
+        wa.write_word::<30>(or16(shr16::<31>(chain[13]), shl16::<1>(chain[14])));
+        wa.write_word::<31>(or16(shr16::<31>(chain[14]), shl16::<1>(chain[15])));
+        wa.write_word::<32>(or16(shr16::<31>(chain[15]), shl16::<1>(chain[16])));
+        wa.write_word::<33>(or16(shr16::<31>(chain[16]), shl16::<1>(chain[17])));
+        wa.write_word::<34>(or16(shr16::<31>(chain[17]), shl16::<1>(chain[18])));
+        wa.write_word::<35>(or16(shr16::<31>(chain[18]), shl16::<1>(chain[19])));
+
+        macro_rules! g {
+            ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+             $mx:literal, $my:literal) => {{
+                let (t0, p0) = add_root16(state[$la], state[$lb]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, p0);
+                let (a1, p1) = add_root16(t0, m[$mx]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, p1);
+                let d1 = xor_rotr16::<16, 16>(state[$ld], a1);
+                let (c1s, p2) = add_root16(state[$lc], d1);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, p2);
+                let b1 = xor_rotr16::<12, 20>(state[$lb], c1s);
+                let (t1, p3) = add_root16(a1, b1);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, p3);
+                let (a2, p4) = add_root16(t1, m[$my]);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, p4);
+                let d2 = xor_rotr16::<8, 24>(d1, a2);
+                let (c2s, p5) = add_root16(c1s, d2);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, p5);
+                let bn = xor_rotr16::<7, 25>(b1, c2s);
+                if SAVE {
+                    *deps.add($g) = _mm512_permutex2var_epi32(bn, il_a, d2);
+                    *deps.add(56 + $g) = _mm512_permutex2var_epi32(bn, il_b, d2);
+                }
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
+                pushf8!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
+                state[$la] = a2;
+                state[$lb] = bn;
+                state[$lc] = c2s;
+                state[$ld] = d2;
+            }};
+        }
+        macro_rules! round {
+            ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+             $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+             $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+             $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                g!($gb, 0, 4, 8, 12, $m0, $m1);
+                g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+        round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+        round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+        round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+        round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+        round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+        round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+        if SAVE {
+            for k in 0..4 {
+                let lo0 = xor16(state[2 * k], state[2 * k + 8]);
+                let lo1 = xor16(state[2 * k + 1], state[2 * k + 9]);
+                let hi0 = xor16(state[2 * k + 8], cv_v[2 * k]);
+                let hi1 = xor16(state[2 * k + 9], cv_v[2 * k + 1]);
+                *out_lo.add(k) = _mm512_permutex2var_epi32(lo0, il_a, lo1);
+                *out_lo.add(4 + k) = _mm512_permutex2var_epi32(lo0, il_b, lo1);
+                *out_hi.add(k) = _mm512_permutex2var_epi32(hi0, il_a, hi1);
+                *out_hi.add(4 + k) = _mm512_permutex2var_epi32(hi0, il_b, hi1);
+            }
+        }
+    }
+}
+pub(crate) unsafe fn generate_tile16_inline(init: u64, tile: usize, out: *mut u8) {
+    #[repr(C,align(64))] struct StackAnchor([u8;64]);
+    let mut aligned=core::mem::MaybeUninit::<StackAnchor>::uninit();
+    core::hint::black_box(aligned.as_mut_ptr());
+    assert!(tile < 4096);
+    unsafe {
+        for pair in 0..4 {
+            let physical = tile * 64 + pair * 16;
+            let base = physical / 256 + ((physical % 256) / 8) * 2048;
+            let input = prepare16(init, base);
+            recompute_pair_tile_inline::<false>(
+                &input,
+                out.add(pair * 128),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 pub(crate) fn selected_generator() -> Option<(
     unsafe fn(u64, usize, *mut u8),
     Option<flock_core::lincheck::RootPairGenerator>,
@@ -973,11 +1138,16 @@ pub(crate) fn selected_generator() -> Option<(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ROOT_RECOMPUTE8").is_some());
     static REUSE: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROOT_PAIR_REUSE").is_none());
+    static INLINE:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||
+        std::env::var_os("FLOCK_NO_ROOT_INLINE_PREP").is_none());
+    static DIAG:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||
+        std::env::var_os("FLOCK_ROOT_INLINE_DIAG").is_some());
+    if *DIAG && !*EIGHT {eprintln!("ROOT_INLINE_SELECTION enabled={}",*INLINE);}
     if *EIGHT {
         Some((generate_tile, None))
     } else {
         Some((
-            generate_tile16,
+            if *INLINE {generate_tile16_inline} else {generate_tile16},
             if *REUSE {
                 Some(generate_pair_with_deps)
             } else {
@@ -1023,3 +1193,32 @@ pub(crate) mod stage_recompute;
 
 #[path="blake3_fused_fold.rs"]
 pub(crate) mod fused_fold;
+
+#[cfg(test)]
+mod root_inline_validation {
+ use super::*;
+ #[repr(C,align(64))]struct Guarded{before:[u8;64],tile:[u8;176*512],after:[u8;64]}
+ #[test]
+ fn inline_all_tiles_match_original_with_guards(){
+  assert!(direct_plan_valid());
+  let mut old=Box::new(Guarded{before:[0x69;64],tile:[0xa5;176*512],after:[0x96;64]});
+  let mut new=Box::new(Guarded{before:[0x69;64],tile:[0x5a;176*512],after:[0x96;64]});
+  for seed in[0,0x1234_5678_9abc_def0,u64::MAX]{for tile in 0..4096{
+   old.tile.fill(0xa5);new.tile.fill(0x5a);
+   unsafe{generate_tile16(seed,tile,old.tile.as_mut_ptr());generate_tile16_inline(seed,tile,new.tile.as_mut_ptr());}
+   assert_eq!(old.tile,new.tile,"seed{seed:x}tile{tile}");
+   assert_eq!(old.before,[0x69;64]);assert_eq!(new.before,[0x69;64]);
+   assert_eq!(old.after,[0x96;64]);assert_eq!(new.after,[0x96;64]);
+  }}
+ }
+ #[test]
+ fn inline_matches_octawriter_and_dependency_reader(){
+  let mut old=Box::new(Tile([0xa5;176*512]));let mut new=Box::new(Tile([0x5a;176*512]));
+  for seed in[0,0x1234_5678_9abc_def0,u64::MAX]{for tile in[0,1,3,4,31,127,1024,4095]{
+   unsafe{generate_tile(seed,tile,old.0.as_mut_ptr());generate_tile16_inline(seed,tile,new.0.as_mut_ptr());}
+   assert_eq!(old.0,new.0,"octa seed{seed:x}tile{tile}");
+   super::super::super::blake3_zregen::imp::check_generated_pair(
+      seed,tile,generate_tile16_inline,generate_pair_with_deps);
+  }}
+ }
+}
