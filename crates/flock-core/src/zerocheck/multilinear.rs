@@ -39,6 +39,7 @@
     target_feature = "vpclmulqdq"
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
+use crate::field::gf2_128::F128WideSum;
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
@@ -2357,32 +2358,29 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
 
             let eq_h = eq_hi[x_hi];
             crate::rstrace::item_end();
-            (
-                eq_h * out[0],
-                eq_h * out[1],
-                [
-                    eq_h * out[2],
-                    eq_h * out[3],
-                    eq_h * out[4],
-                    eq_h * out[5],
-                    eq_h * out[6],
-                    eq_h * out[7],
-                ],
-                if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
-            )
+            // Weighted columns stay unreduced: [sum1, sum_inf, odd agg ×6,
+            // r4 ×18]. The sum over x_hi is F2-linear, so reducing each
+            // column once after the reduce tree equals XOR-ing reduced
+            // products. Without r4_fast the r4 columns stay zero.
+            let mut w = [F128WideSum::zero(); R2_COLS];
+            for (c, &x) in w.iter_mut().zip(out.iter()) {
+                *c = F128WideSum::product(eq_h, x);
+            }
+            if r4_fast {
+                for (c, &x) in w[8..].iter_mut().zip(r4_out.iter()) {
+                    *c = F128WideSum::product(eq_h, x);
+                }
+            }
+            w
     };
-    type R2Sums = (F128, F128, [F128; 6], [F128; 18]);
-    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
-    let op = |(s1, sinf, sa, sr): R2Sums, (c1, cinf, ca, cr): R2Sums| -> R2Sums {
-        let mut a = sa;
-        for (x, y) in a.iter_mut().zip(ca.iter()) {
-            *x += *y;
+    const R2_COLS: usize = 26;
+    type R2Sums = [F128WideSum; R2_COLS];
+    let id = || -> R2Sums { [F128WideSum::zero(); R2_COLS] };
+    let op = |mut s: R2Sums, c: R2Sums| -> R2Sums {
+        for (x, y) in s.iter_mut().zip(c) {
+            *x ^= y;
         }
-        let mut r4 = sr;
-        for (x, y) in r4.iter_mut().zip(cr.iter()) {
-            *x += *y;
-        }
-        (s1 + c1, sinf + cinf, a, r4)
+        s
     };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.
     // Lane gl1 (`FLOCK_NO_GL1_R2_DELTA_IDLE`): the canonical-window deltas
@@ -2392,7 +2390,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R2_DELTA_IDLE").is_none());
     let mut early_d: Option<(F128, F128, [F128; 6])> = None;
     let mut early_d4: Option<Round4Lookahead> = None;
-    let (sum1_even, sum_inf_even, agg, r4_flat) =
+    let wide: R2Sums =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
             if *GL1_DIDLE && canon_elided.is_some() {
                 let rows = canon_elided.unwrap();
@@ -2408,6 +2406,11 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         } else {
             (0..hi_size).into_par_iter().map(leaf).reduce(id, op)
         };
+    // One reduction per column, before any nonlinear consumer.
+    let red: [F128; R2_COLS] = wide.map(F128WideSum::reduce);
+    let (sum1_even, sum_inf_even) = (red[0], red[1]);
+    let agg: [F128; 6] = core::array::from_fn(|i| red[2 + i]);
+    let r4_flat: [F128; 18] = core::array::from_fn(|i| red[8 + i]);
     crate::rstrace::ev("r2:par1", 0);
     crate::rstrace::flush_items("r2:first", "r2:last");
 

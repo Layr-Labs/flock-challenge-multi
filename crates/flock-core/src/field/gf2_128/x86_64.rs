@@ -96,6 +96,73 @@ pub unsafe fn ghash_mul_karatsuba_vec(a: F128, b: F128) -> F128 {
     }
 }
 
+/// Unreduced Karatsuba limbs of a sum of GF(2^128) products, kept in XMM
+/// registers: `low = Σ a.lo·b.lo`, `high = Σ a.hi·b.hi` and
+/// `mid = Σ (a.lo⊕a.hi)·(b.lo⊕b.hi)` (the cross term before the `low ⊕ high`
+/// correction). The recombination and [`reduce_register_product`] are
+/// F2-linear, so XOR-accumulating limbs and reducing once equals the XOR of
+/// the reduced products; one limb set reduces to exactly
+/// [`ghash_mul_karatsuba_vec`].
+#[derive(Clone, Copy)]
+pub struct KaratsubaLimbs {
+    low: __m128i,
+    mid: __m128i,
+    high: __m128i,
+}
+
+impl KaratsubaLimbs {
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    pub unsafe fn zero() -> Self {
+        unsafe {
+            let z = _mm_setzero_si128();
+            Self {
+                low: z,
+                mid: z,
+                high: z,
+            }
+        }
+    }
+
+    /// The three CLMULs of [`ghash_mul_karatsuba_vec`], without its reduction.
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    pub unsafe fn product(a: F128, b: F128) -> Self {
+        unsafe {
+            let x = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+            let y = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+            let xs = _mm_xor_si128(x, _mm_shuffle_epi32::<0x4e>(x));
+            let ys = _mm_xor_si128(y, _mm_shuffle_epi32::<0x4e>(y));
+            Self {
+                low: _mm_clmulepi64_si128::<0x00>(x, y),
+                mid: _mm_clmulepi64_si128::<0x00>(xs, ys),
+                high: _mm_clmulepi64_si128::<0x11>(x, y),
+            }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    pub unsafe fn xor(self, rhs: Self) -> Self {
+        unsafe {
+            Self {
+                low: _mm_xor_si128(self.low, rhs.low),
+                mid: _mm_xor_si128(self.mid, rhs.mid),
+                high: _mm_xor_si128(self.high, rhs.high),
+            }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse4.1")]
+    pub unsafe fn reduce(self) -> F128 {
+        unsafe {
+            let middle = _mm_xor_si128(self.mid, _mm_xor_si128(self.low, self.high));
+            reduce_register_product(self.low, middle, self.high)
+        }
+    }
+}
+
 /// Reduce the three Karatsuba limbs without moving intermediates to GPRs.
 #[inline]
 #[target_feature(enable = "pclmulqdq,sse4.1")]

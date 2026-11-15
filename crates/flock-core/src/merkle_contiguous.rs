@@ -119,6 +119,10 @@ unsafe extern "C" {
     fn flock_blake3_planes_leaf_512(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_planes_leaf_1024(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_planes_parent(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    /// Two parent levels over 64-byte child pairs: `count` top nodes (a
+    /// positive multiple of 16) from `4 * count` canonical children, canonical
+    /// level-j nodes to `out` and canonical level-j+1 nodes to `top`.
+    fn flock_blake3_two_level_64(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8, top: *mut u8);
 }
 
 /// Complete groups only. Every 32 leaves become 16 canonical parent CVs.
@@ -150,6 +154,32 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
                 BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
                 parents.as_mut_ptr().cast());
         }
+    }
+}
+
+/// Two parent levels at once. `children` are canonical CVs of level j-1
+/// (64 bytes per level-j node: left || right). One call of the fused kernel
+/// hashes level j (one PARENT compression per 64-byte message, start = end = 0)
+/// and writes it canonically into `mid` (the tree slots openings read), and
+/// hashes level j+1 from level j's CV word planes (one 512-byte stack spill per
+/// 16 top nodes, the other half fed from registers) into `top`, so level j is
+/// never re-read from the tree and re-transposed. Complete groups only:
+/// `top.len()` a positive multiple of 16, `mid.len() == 2 * top.len()`,
+/// `children.len() == 4 * top.len() * 32`.
+#[inline]
+pub(super) fn hash_parent_two_levels(children: &[u8], mid: &mut [Hash], top: &mut [Hash]) {
+    assert!(!top.is_empty() && top.len() % 16 == 0);
+    assert_eq!(mid.len(), 2 * top.len());
+    assert_eq!(children.len(), mid.len() * 64);
+    // SAFETY: compile-time AVX-512/SysV module gate; `children` holds exactly
+    // `mid.len()` 64-byte messages, `mid` exactly `mid.len() * 32` and `top`
+    // exactly `top.len() * 32` writable bytes; `top.len()` is a positive
+    // multiple of 16, so every group is full; the kernel's plane scratch is
+    // its own stack frame; zero counters throughout.
+    unsafe {
+        flock_blake3_two_level_64(children.as_ptr(), top.len(), 1,
+            BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
+            mid.as_mut_ptr().cast(), top.as_mut_ptr().cast());
     }
 }
 
@@ -195,6 +225,33 @@ mod plane_tests {
                     assert!(plane_bytes[count * 32 + 64..].iter().all(|&x| x == 0xa5));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn two_level_64_matches_two_canonical_levels() {
+        let flags = super::super::BLAKE3_PARENT;
+        for top_n in [16usize, 32, 48, 80] {
+            let mut seed = 0x2545f4914f6cdd1du64 ^ top_n as u64;
+            let children: Vec<u8> = (0..top_n * 4 * 32)
+                .map(|_| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u8 })
+                .collect();
+            let mut want_mid = vec![0u8; top_n * 2 * 32];
+            let mut want_top = vec![0u8; top_n * 32];
+            let mut mid = vec![0x5au8; top_n * 2 * 32 + 128];
+            let mut top = vec![0xa5u8; top_n * 32 + 128];
+            unsafe {
+                flock_blake3_contiguous_64(children.as_ptr(), top_n * 2, 1, BLAKE3_IV.as_ptr(), 0, false,
+                    flags, 0, 0, want_mid.as_mut_ptr());
+                flock_blake3_contiguous_64(want_mid.as_ptr(), top_n, 1, BLAKE3_IV.as_ptr(), 0, false,
+                    flags, 0, 0, want_top.as_mut_ptr());
+                flock_blake3_two_level_64(children.as_ptr(), top_n, 1, BLAKE3_IV.as_ptr(), 0, false,
+                    flags, 0, 0, mid.as_mut_ptr().add(64), top.as_mut_ptr().add(64));
+            }
+            assert_eq!(mid[64..64 + top_n * 64], want_mid[..], "top_n={top_n}");
+            assert_eq!(top[64..64 + top_n * 32], want_top[..], "top_n={top_n}");
+            assert!(mid[..64].iter().chain(&mid[64 + top_n * 64..]).all(|&x| x == 0x5a));
+            assert!(top[..64].iter().chain(&top[64 + top_n * 32..]).all(|&x| x == 0xa5));
         }
     }
 }
