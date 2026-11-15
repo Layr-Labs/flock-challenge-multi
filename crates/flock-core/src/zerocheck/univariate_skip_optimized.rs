@@ -3708,6 +3708,10 @@ pub(crate) struct WorkerStateAbOnly {
     cached_plane_banks: bool,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
     leaf_cache: Option<ab_leaf_accum::Cache>,
+    /// Lane ab1: the invocation's immutable leaf-coefficient preparation,
+    /// lent to every band worker (scratch stays in `leaf_cache`).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    leaf_shared: Option<std::sync::Arc<ab_leaf_accum::Prepared>>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
     /// Lane ab1: band layout the leaf kernels read (0 = incumbent rows).
@@ -3722,6 +3726,8 @@ impl WorkerStateAbOnly {
             cached_plane_banks: false,
             #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
             leaf_cache: None,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            leaf_shared: None,
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
             ab1_layout: 0,
@@ -4210,8 +4216,8 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         let prefetch_mode = if pf_windows == 0 { 0 } else if pf_spread { 1 } else { 2 };
         let used_leaf_accum = {
             #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
-            { ab_leaf_accum::enabled() && ab_leaf_accum::try_run(
-                &mut state.leaf_cache, ab_inner, mats, x_hi,
+            { ab_leaf_accum::enabled() && ab_leaf_accum::try_run_shared(
+                state.leaf_shared.as_deref(), &mut state.leaf_cache, ab_inner, mats, x_hi,
                 prefetch_mode, &mut state.plane_banks, state.ab1_layout) }
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
             { false }
@@ -4564,8 +4570,12 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     // Lane ab1: the hole-free layout is read only by the round-one leaf
     // kernels. Prove from the same gates the band dispatch uses that every
     // band takes that path; otherwise undo the layout in place first.
+    // The leaf coefficients are a pure function of this invocation's `mats`:
+    // prepare them once here and lend them to every band worker (each keeps
+    // its own scratch). The same object answers the layout gate, so it is no
+    // longer built once and discarded. Workers still compare the full key.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
-    let ab1_leaf_ok = direct_ab
+    let ab_leaf_prep = if direct_ab
         && ranked_compact
         && ranked_one_rows_elided
         && n_lo == 12
@@ -4574,9 +4584,18 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
         && b_med_counts_live.as_slice() == [16, 14]
         && zc_r1_ab_batch4_enabled()
         && ab_leaf_accum::enabled()
-        && eq_fold_state.as_ref().is_some_and(|(eq_bot, mats, bank_bits)| {
-            eq_bot.len() == 128 && *bank_bits == 7 && ab_leaf_accum::would_run(mats)
-        });
+    {
+        eq_fold_state
+            .as_ref()
+            .filter(|(eq_bot, mats, bank_bits)| {
+                eq_bot.len() == 128 && *bank_bits == 7 && mats.len() == 32 * 256
+            })
+            .map(|(_, mats, _)| std::sync::Arc::new(ab_leaf_accum::Prepared::new(mats)))
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    let ab1_leaf_ok = ab_leaf_prep.as_ref().is_some_and(|prep| prep.would_run());
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
     let ab1_leaf_ok = false;
     if ab_inner.ab1_hole_layout && !ab1_leaf_ok {
@@ -4597,6 +4616,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
         crate::rstrace::evd("ab:b", x_hi as u32);
         state.ab1_layout = ab1_layout;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+        if state.leaf_shared.is_none() {
+            state.leaf_shared = ab_leaf_prep.clone();
+        }
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",

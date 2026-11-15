@@ -49,16 +49,20 @@ fn grouped_enabled() -> bool {
     *ON
 }
 
-/// Lane ab1: true when [`try_run`] will take the merged leaf path for these
-/// matrices (same key check as the per-worker cache).
-pub(super) fn would_run(mats: &[u64]) -> bool {
-    grouped_enabled() && mats.len() == 32 * 256 && Cache::new(mats).merged.is_some()
-}
-
-pub(super) struct Cache {
+/// Immutable coefficient preparation for one matrix key: the full key, the
+/// validated GF(2^8) coefficient tables and their group packing. It is a
+/// pure function of `mats`, so one invocation can build it once and lend it
+/// to every band worker; each worker keeps its own mutable `Cache::scratch`.
+pub(super) struct Prepared {
     key: Vec<u64>,
     tables: Option<(Vec<u64>, Vec<u64>)>,
     merged: Option<(Vec<u64>, Vec<u64>)>,
+}
+
+/// Per-worker state: private scratch plus a private preparation, used only
+/// when no shared [`Prepared`] for the same full key was lent.
+pub(super) struct Cache {
+    own: Option<Prepared>,
     scratch: Vec<u8>,
 }
 
@@ -71,13 +75,12 @@ fn decode(scale: F128) -> [u8; 16] {
     out
 }
 
-impl Cache {
-    fn new(mats: &[u64]) -> Self {
-        let mut cache = Self {
+impl Prepared {
+    pub(super) fn new(mats: &[u64]) -> Self {
+        let mut prep = Self {
             key: mats.to_vec(),
             tables: None,
             merged: None,
-            scratch: Vec::new(),
         };
         let mut m0 = Vec::with_capacity(32 * 78);
         let mut m2 = Vec::with_capacity(32 * 78);
@@ -97,7 +100,7 @@ impl Cache {
             let mut expected = [0u64; 256];
             super::ab_eq_fold_mats_row_transposed(convert, scale, &mut expected);
             if expected.as_slice() != row {
-                return cache;
+                return prep;
             }
             let coefficients = decode(scale);
             for (forms, dest) in [(&COEFF0, &mut m0), (&COEFF2, &mut m2)] {
@@ -113,17 +116,40 @@ impl Cache {
             }
         }
         if grouped_enabled() {
-            cache.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
+            prep.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
         } else {
-            cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
+            prep.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
         }
-        // Keep both leaf banks and the temporary polynomial cache-line aligned.
-        cache.scratch = vec![0; SCRATCH_DATA_BYTES + 63];
-        cache
+        prep
+    }
+
+    /// Lane ab1: true when [`try_run_shared`] will take the merged leaf path
+    /// for this key (same key check as the per-worker cache).
+    pub(super) fn would_run(&self) -> bool {
+        grouped_enabled() && self.key.len() == 32 * 256 && self.merged.is_some()
     }
 }
 
+/// Private-preparation entry (no shared object), kept for the unit tests.
+#[cfg(test)]
 pub(super) fn try_run(
+    cache: &mut Option<Cache>,
+    source: &[u8],
+    mats: &[u64],
+    x_hi: usize,
+    mode: usize,
+    planes: &mut [u8],
+    layout: usize,
+) -> bool {
+    try_run_shared(None, cache, source, mats, x_hi, mode, planes, layout)
+}
+
+/// `try_run` with an optional invocation-wide [`Prepared`]. The shared
+/// preparation is used only when its full key equals `mats`; otherwise the
+/// worker's private preparation is (re)built exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_run_shared(
+    shared: Option<&Prepared>,
     cache: &mut Option<Cache>,
     source: &[u8],
     mats: &[u64],
@@ -148,18 +174,31 @@ pub(super) fn try_run(
     let Some(rows) = source.get(start..end + end_pad) else {
         return false;
     };
-    if cache.as_ref().is_none_or(|c| c.key.as_slice() != mats) {
-        *cache = Some(Cache::new(mats));
+    let Cache { own, scratch } = cache.get_or_insert_with(|| Cache {
+        own: None,
+        scratch: Vec::new(),
+    });
+    let prep = match shared {
+        Some(p) if p.key.as_slice() == mats => p,
+        _ => {
+            if own.as_ref().is_none_or(|p| p.key.as_slice() != mats) {
+                *own = Some(Prepared::new(mats));
+            }
+            own.as_ref().unwrap()
+        }
+    };
+    if scratch.is_empty() {
+        // Keep both leaf banks and the temporary polynomial cache-line aligned.
+        *scratch = vec![0; SCRATCH_DATA_BYTES + 63];
     }
-    let cache = cache.as_mut().unwrap();
     let merged = grouped_enabled();
-    let tables = if merged { &cache.merged } else { &cache.tables };
+    let tables = if merged { &prep.merged } else { &prep.tables };
     let Some((m0, m2)) = tables else {
         return false;
     };
-    let raw = cache.scratch.as_mut_ptr();
+    let raw = scratch.as_mut_ptr();
     let offset = raw.align_offset(64);
-    debug_assert!(offset + SCRATCH_DATA_BYTES <= cache.scratch.len());
+    debug_assert!(offset + SCRATCH_DATA_BYTES <= scratch.len());
     // SAFETY: byte alignment padding reserves the complete live span.
     let scratch = unsafe { raw.add(offset) };
     // Each original input span, matrix row, initialized scratch bank and
@@ -1339,5 +1378,52 @@ mod tests {
             "AB_LEAF_ACCUM_PRODUCTION_VALIDATED banks=896 comparisons={comparisons} basis_bits=128 rekey=true invalid_map_fallback=true"
         );
         assert_eq!(comparisons, 917504);
+    }
+
+    #[test]
+    fn shared_preparation_matches_private_and_rekeys() {
+        let mut seed = 0x5a7e_d0c1_93b2_4e17u64;
+        let mut source = vec![0u8; 2 * 2048 * 1856];
+        for x in &mut source {
+            *x = rng(&mut seed) as u8;
+        }
+        let scale = |seed: &mut u64| F128 { lo: rng(seed), hi: rng(seed) };
+        let scales_a: Vec<F128> = (0..32).map(|_| scale(&mut seed)).collect();
+        let scales_b: Vec<F128> = (0..32).map(|_| scale(&mut seed)).collect();
+        let build = |s: &[F128]| {
+            super::super::build_ab_eq_fold_mats_gated(s, super::super::convert_table(), false)
+        };
+        let (mats_a, mats_b) = (build(&scales_a), build(&scales_b));
+        let shared = Prepared::new(&mats_a);
+        assert_eq!(shared.would_run(), grouped_enabled());
+        // Two workers borrow one preparation, each with private scratch;
+        // bands are interleaved so a shared scratch would corrupt results.
+        let (mut w0, mut w1, mut private) = (None, None, None);
+        for (hi, mode) in [(0, 0), (1, 1), (0, 2), (1, 0)] {
+            let mut want = vec![0x11u8; 131072];
+            assert!(try_run(&mut private, &source, &mats_a, hi, mode, &mut want, 0));
+            for worker in [&mut w0, &mut w1] {
+                let mut got = vec![0x5cu8; 131072];
+                assert!(try_run_shared(Some(&shared), worker, &source, &mats_a, hi, mode, &mut got, 0));
+                assert_eq!(got, want, "hi={hi} mode={mode}");
+                assert!(worker.as_ref().unwrap().own.is_none(), "shared key must not rebuild");
+            }
+        }
+        // A different proof's matrices never reuse the stale shared tables.
+        let mut want = vec![0; 131072];
+        let mut got = vec![0; 131072];
+        assert!(try_run(&mut None, &source, &mats_b, 1, 1, &mut want, 0));
+        assert!(try_run_shared(Some(&shared), &mut w0, &source, &mats_b, 1, 1, &mut got, 0));
+        assert_eq!(got, want);
+        assert!(w0.as_ref().unwrap().own.is_some());
+        // An invalid map falls back without output writes, shared or not.
+        let mut bad = mats_a.clone();
+        bad[8191] ^= 1;
+        let bad_shared = Prepared::new(&bad);
+        assert!(!bad_shared.would_run());
+        got.fill(0xad);
+        assert!(!try_run_shared(Some(&bad_shared), &mut w1, &source, &bad, 0, 1, &mut got, 0));
+        assert!(!try_run_shared(Some(&shared), &mut w1, &source, &bad, 0, 1, &mut got, 0));
+        assert!(got.iter().all(|&v| v == 0xad));
     }
 }
