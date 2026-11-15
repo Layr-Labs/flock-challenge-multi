@@ -605,7 +605,21 @@ impl RootTileCache {
             .filter_map(|(i, v)| (v != 0).then_some(i))
             .collect();
         let output_blocks = self.blocks + usize::from(self.fixed_roots);
-        let mut out = vec![F128::ZERO; output_blocks * 64];
+        // Every element is written below (live blocks by the reduction, the
+        // omitted group by the boundary move and fill), so the buffer need not
+        // be cleared first. `FLOCK_NO_RF_UNINIT` restores the cleared buffer.
+        static RF_UNINIT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RF_UNINIT").is_none());
+        let n_out = output_blocks * 64;
+        let mut out: Vec<F128> = if *RF_UNINIT {
+            let mut v = Vec::with_capacity(n_out);
+            // SAFETY: F128 is plain data and every element is written before
+            // any read (see above).
+            unsafe { v.set_len(n_out) };
+            v
+        } else {
+            vec![F128::ZERO; n_out]
+        };
         out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
