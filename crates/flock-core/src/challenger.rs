@@ -75,6 +75,15 @@ pub trait Challenger: Send {
         0
     }
 
+    /// Prover-side grinding when any nonce satisfying the stated difficulty
+    /// is acceptable. Unlike grind_pow, implementations may race independent
+    /// chunks and return a non-minimum nonce. The nonce is still absorbed once.
+    /// Zero-bit sites retain the canonical zero nonce. Implementations that do
+    /// not specialize this operation keep the existing deterministic behavior.
+    fn grind_pow_any_valid(&mut self, bits: u32) -> u64 {
+        self.grind_pow(bits)
+    }
+
     /// Verifier-side mirror of [`Self::grind_pow`]: check that `nonce`
     /// satisfies the `bits`-leading-zeros PoW against the current transcript
     /// state, then absorb the nonce so the running state stays in lockstep
@@ -467,6 +476,31 @@ impl Challenger for FsChallenger {
         // Verifier mirrors via verify_pow.
         self.observe_bytes(&nonce.to_le_bytes());
         nonce
+    }
+
+    fn grind_pow_any_valid(&mut self, bits: u32) -> u64 {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw"))]
+        {
+            static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+                std::env::var_os("FLOCK_NO_POW_ANY_VALID").is_none());
+            let k = &*TEAM;
+            if *ON && k.on && self.hash_kind() == HashKind::Blake3
+                && (1..=32).contains(&bits) && bits >= k.par_min {
+                static DIAG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+                    std::env::var_os("FLOCK_POW_ANY_VALID_DIAG").is_some());
+                if *DIAG {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| eprintln!("POW_ANY_VALID_SELECTION enabled=true"));
+                }
+                #[cfg(test)]
+                POW_ANY_VALID_TEST_HITS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                let digest = self.state_digest();
+                let nonce = grind_team_avx512_any_valid(&digest,bits,k);
+                self.observe_bytes(&nonce.to_le_bytes());
+                return nonce;
+            }
+        }
+        self.grind_pow(bits)
     }
 
     fn verify_pow(&mut self, pow_counter: u64, bits: u32) -> bool {
@@ -1741,6 +1775,7 @@ pub fn sl1_grind_prewarm(hold_us: u64) {
             return;
         }
         let sh = std::sync::Arc::new(TeamShared {
+        any_valid: false,
             next: TeamPad(AtomicU64::new(1)),
             best_c: TeamPad(AtomicU64::new(0)),
             best_n: TeamPad(AtomicU64::new(0)),
@@ -1773,6 +1808,7 @@ pub fn sl1_grind_prewarm(hold_us: u64) {
     target_feature = "avx512bw"
 ))]
 struct TeamShared {
+    any_valid: bool,
     next: TeamPad,
     best_c: TeamPad,
     best_n: TeamPad,
@@ -1808,7 +1844,7 @@ struct TeamPad(std::sync::atomic::AtomicU64);
 impl TeamShared {
     /// One team member: claim ascending chunks until past the best match.
     fn work(&self) {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
         if let Some(t) = &self.trace {
             let i = t.n.fetch_add(1, Relaxed);
             if i < TEAM_SLOTS {
@@ -1817,23 +1853,40 @@ impl TeamShared {
         }
         let slot = rayon::current_thread_index().map(|i| &self.slots[i % TEAM_SLOTS].0);
         loop {
+            if self.any_valid && self.best_c.0.load(Acquire) != u64::MAX { break; }
             if let Some(sl) = slot {
                 sl.store(0, SeqCst);
             }
             let c = self.next.0.fetch_add(1, SeqCst);
-            if c > self.best_c.0.load(Acquire) {
+            if self.any_valid {
+                if self.best_c.0.load(Acquire) != u64::MAX { break; }
+            } else if c > self.best_c.0.load(Acquire) {
                 break;
             }
             if let Some(sl) = slot {
                 sl.store(c, SeqCst);
             }
             let start = c << self.clog;
-            let hit = blake3_pow_avx512::scan_prepared(&self.pre, start, 1 << self.clog, self.fold, || {
-                self.best_c.0.load(Relaxed) < c
-            });
+            let hit = if self.any_valid {
+                blake3_pow_avx512::scan_prepared(&self.pre, start, 1 << self.clog, self.fold, || {
+                    self.best_c.0.load(Relaxed) != u64::MAX
+                })
+            } else {
+                blake3_pow_avx512::scan_prepared(&self.pre, start, 1 << self.clog, self.fold, || {
+                    self.best_c.0.load(Relaxed) < c
+                })
+            };
             if let Some(n) = hit {
-                self.best_n.0.fetch_min(n, AcqRel);
-                self.best_c.0.fetch_min(c, SeqCst);
+                if self.any_valid {
+                    // Every racing writer has independently found a VALID
+                    // nonce for this immutable job. Publish value before flag;
+                    // no caller may read the initial sentinel as a result.
+                    self.best_n.0.store(n, Relaxed);
+                    self.best_c.0.store(c, SeqCst);
+                } else {
+                    self.best_n.0.fetch_min(n, AcqRel);
+                    self.best_c.0.fetch_min(c, SeqCst);
+                }
                 if let Some(t) = &self.trace {
                     t.found_at.fetch_min(t.t0.elapsed().as_nanos() as u64, Relaxed);
                 }
@@ -1950,6 +2003,7 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
         threads
     };
     let sh = std::sync::Arc::new(TeamShared {
+        any_valid: false,
         next: TeamPad(AtomicU64::new(0)),
         best_c: TeamPad(AtomicU64::new(u64::MAX)),
         best_n: TeamPad(AtomicU64::new(u64::MAX)),
@@ -2808,5 +2862,144 @@ mod tests {
             c2.observe_f128(F128::ONE);
             assert_ne!(c1.sample_f128(), c2.sample_f128());
         }
+    }
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw"))]
+fn grind_team_avx512_any_valid(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    let pre = blake3_pow_avx512::prepare(state_digest, bits);
+    let fold = k.fold;
+    if bits < k.par_min {
+        let span: u64 = 1 << 12;
+        let mut start: u64 = 0;
+        loop {
+            if let Some(n) = blake3_pow_avx512::scan_prepared(&pre, start, span, fold, || false) {
+                return n;
+            }
+            start = start.saturating_add(span);
+        }
+    }
+    let clog = bits.saturating_sub(k.clog_off).clamp(k.clog_min, k.clog_max);
+    let threads = rayon::current_num_threads().max(1);
+    let team = if bits < k.small_bits {
+        k.small_team.clamp(1, threads)
+    } else {
+        threads
+    };
+    let sh = std::sync::Arc::new(TeamShared {
+        any_valid: true,
+        next: TeamPad(AtomicU64::new(0)),
+        best_c: TeamPad(AtomicU64::new(u64::MAX)),
+        best_n: TeamPad(AtomicU64::new(u64::MAX)),
+        slots: std::array::from_fn(|_| TeamPad(AtomicU64::new(u64::MAX))),
+        pre,
+        clog,
+        fold,
+        trace: GRIND_TRACE.then(|| TeamTrace {
+            t0: std::time::Instant::now(),
+            starts: std::array::from_fn(|_| AtomicU32::new(0)),
+            n: AtomicUsize::new(0),
+            found_at: AtomicU64::new(u64::MAX),
+        }),
+    });
+    let helpers = team - 1;
+    if k.detach {
+        // Publish to warm holders first, then top the team up with fresh
+        // rayon jobs for the rest.
+        let warm = if k.hold_us > 0 {
+            *HUB.job.write().unwrap_or_else(|p| p.into_inner()) = Some(sh.clone());
+            HUB.epoch.0.fetch_add(1, Ordering::AcqRel);
+            HUB.holding.0.load(Ordering::Acquire) as usize
+        } else {
+            0
+        };
+        let hold_us = k.hold_us;
+        GRIND_WARM.store(warm as u64, Ordering::Relaxed);
+        for _ in 0..helpers.saturating_sub(warm) {
+            let h = sh.clone();
+            rayon::spawn(move || team_helper(h, hold_us));
+        }
+        sh.work();
+        // The answer is final once no chunk below the best is in flight.
+        // Wait for every ACTIVE scan to cancel before returning. Workers
+        // that start later see the published flag before scanning any nonce.
+        for sl in &sh.slots {
+            while sl.0.load(Ordering::SeqCst) != u64::MAX {
+                std::hint::spin_loop();
+            }
+        }
+    } else {
+        let shr = &*sh;
+        rayon::in_place_scope(|s| {
+            for _ in 0..helpers {
+                s.spawn(move |_| shr.work());
+            }
+            shr.work();
+        });
+    }
+    if let Some(t) = &sh.trace {
+        GRIND_CLAIMS.store(sh.next.0.load(Ordering::Relaxed), Ordering::Relaxed);
+        let n = t.n.load(Ordering::Relaxed).min(TEAM_SLOTS);
+        let mut st: Vec<u32> = t.starts[..n].iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        st.sort_unstable();
+        let fa = t.found_at.load(Ordering::Relaxed);
+        let q = |f: usize| st.get(f * st.len().saturating_sub(1) / 16).copied().unwrap_or(0) as f64 / 1e3;
+        *GRIND_DETAIL.lock().unwrap() = format!(
+            " nw={} st_min={:.1} st_med={:.1} st_max={:.1} found={:.1} clog={clog} warm={}",
+            st.len(), q(0), q(8), q(16), fa as f64 / 1e3, GRIND_WARM.load(Ordering::Relaxed)
+        );
+    }
+    // The release publication flag, not nonce value, proves initialization.
+    // u64::MAX remains a legitimate nonce if it independently satisfies PoW.
+    assert_ne!(sh.best_c.0.load(Ordering::Acquire),u64::MAX,"any-valid team exited without a match");
+    sh.best_n.0.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static POW_ANY_VALID_TEST_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod pow_any_valid_tests {
+    use super::*;
+    #[test]
+    fn any_valid_predicate_and_transcript_mirror() {
+        let before=POW_ANY_VALID_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for kind in [HashKind::Blake3,HashKind::Sha256] {
+            for seed in 0u64..6 {
+                for bits in [0u32,1,7,11,12,15,16] {
+                    let mut prover=FsChallenger::with_hash(b"pow-any-valid-native",kind);
+                    prover.observe_bytes(&seed.to_le_bytes());
+                    prover.observe_label(b"pow-any-position");
+                    let mut verifier=prover.clone();
+                    let nonce=prover.grind_pow_any_valid(bits);
+                    if bits==0 {assert_eq!(nonce,0);}
+                    assert!(verifier.verify_pow(nonce,bits));
+                    assert_eq!(prover.sample_f128_vec(8),verifier.sample_f128_vec(8));
+                }
+            }
+        }
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512bw"))]
+        if std::env::var_os("FLOCK_NO_POW_ANY_VALID").is_none()
+            && TEAM.on && TEAM.par_min<=16 {
+            assert!(POW_ANY_VALID_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed)>before,
+                "native any-valid path must actually execute");
+        }
+    }
+    #[test]
+    fn any_valid_concurrent_transcripts() {
+        use rayon::prelude::*;
+        let pool=rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        pool.install(||(0u64..32).into_par_iter().for_each(|seed|{
+            let mut prover=FsChallenger::with_hash(b"pow-any-valid-concurrent",HashKind::Blake3);
+            prover.observe_bytes(&seed.to_le_bytes());
+            let mut verifier=prover.clone();
+            for bits in [12u32,15,12] {
+                let nonce=prover.grind_pow_any_valid(bits);
+                assert!(verifier.verify_pow(nonce,bits));
+                assert_eq!(prover.sample_f128(),verifier.sample_f128());
+            }
+        }));
     }
 }

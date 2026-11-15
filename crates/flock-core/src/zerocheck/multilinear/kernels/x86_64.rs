@@ -6348,8 +6348,9 @@ unsafe fn r4_canonical_set(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
-pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
+/// [`round2_lookahead_chunk_baked_elide_r4_x86`] without the per-chunk lane
+/// sums: the chunk's reduced accumulators, for callers that weight them once.
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_red_x86(
     a_pkt: *const u8,
     b_pkt: *const u8,
     row_base: usize,
@@ -6357,12 +6358,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     bk: &R2EqBake,
     lw: &R4LaneWeights,
     ys: bool,
-) -> ([F128; 8], [F128; 18]) {
+) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
     });
-    // The contraction moves each partial set by two F128 lanes. It is
-    // valid exactly when the final lane weights repeat after two lanes.
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
@@ -6391,6 +6390,100 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+/// Adapted from Yukon submission 748eb344-aaf9-4ba6-b32b-c69aedda2a37.
+/// Lane weighting of reduced round-two accumulators: the message terms with
+/// `bk.lane`, the round-four corners with `lw.lv4` / `lw.lv4_odd`.
+pub(crate) unsafe fn r2_r4_finish(
+    red: &[core::arch::x86_64::__m512i; 8],
+    red4: &[core::arch::x86_64::__m512i; 10],
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+) -> ([F128; 8], [F128; 18]) {
+    use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
+    unsafe {
+        let lane_sum = |v: core::arch::x86_64::__m512i, w, w64| -> F128 {
+            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
+            l[0] + l[1] + l[2] + l[3]
+        };
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let lane_w64 = ghash_shift64_x4(lane_w);
+        let out: [F128; 8] = core::array::from_fn(|i| lane_sum(red[i], lane_w, lane_w64));
+        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
+        let lv4_64 = ghash_shift64_x4(lv4);
+        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
+        let lvo_64 = ghash_shift64_x4(lvo);
+        let mut r4 = [F128::ZERO; 18];
+        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
+        r4[0] = lane_sum(red4[0], lv4, lv4_64);
+        for k in 1..9 {
+            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
+        }
+        for k in 0..9 {
+            r4[9 + k] = lane_sum(red4[1 + k], lv4, lv4_64);
+        }
+        (out, r4)
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+    ys: bool,
+) -> ([F128; 8], [F128; 18]) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
+    });
+    // The contraction moves each partial set by two F128 lanes. It is
+    // valid exactly when the final lane weights repeat after two lanes.
+    let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
+    unsafe {
+        macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+        let (red, red4) = match (pair, ys) {
+            (true, true) => go!(true, true, true),
+            (false, true) => go!(false, true, true),
+            (true, false) => go!(true, false, false),
+            (false, false) => go!(false, false, false),
+        };
+        r2_r4_finish(&red, &red4, bk, lw)
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
 #[inline(never)]
 unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA: bool, const YB: bool>(
     a_pkt: *const u8,
@@ -6398,8 +6491,8 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     row_base: usize,
     lo_size: usize,
     bk: &R2EqBake,
-    lw: &R4LaneWeights,
-) -> ([F128; 8], [F128; 18]) {
+    _lw: &R4LaneWeights,
+) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
     debug_assert_eq!(row_base & 255, 0);
@@ -6573,34 +6666,9 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
             x_lo += 128;
         }
 
-        use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
-        let lane_sum = |v: __m512i, w: __m512i, w64: __m512i| -> F128 {
-            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
-            l[0] + l[1] + l[2] + l[3]
-        };
-        let mut out = [F128::ZERO; 8];
-        let lane_w = f128x4_loadu(bk.lane.as_ptr());
-        let lane_w64 = ghash_shift64_x4(lane_w);
-        let mut red = [_mm512_setzero_si512(); 8];
-        for i in 0..8 {
-            red[i] = acc[i].reduce_lanes();
-            out[i] = lane_sum(red[i], lane_w, lane_w64);
-        }
-        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
-        let lv4_64 = ghash_shift64_x4(lv4);
-        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
-        let lvo_64 = ghash_shift64_x4(lvo);
-        let mut r4 = [F128::ZERO; 18];
-        // v1[i+3j] for the odd-u (X3 = 1) corners from the incumbent accumulators.
-        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
-        r4[0] = lane_sum(acc4[0].reduce_lanes(), lv4, lv4_64);
-        for k in 1..9 {
-            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
-        }
-        for k in 0..9 {
-            r4[9 + k] = lane_sum(acc4[1 + k].reduce_lanes(), lv4, lv4_64);
-        }
-        (out, r4)
+        let red: [__m512i; 8] = core::array::from_fn(|i| acc[i].reduce_lanes());
+        let red4: [__m512i; 10] = core::array::from_fn(|i| acc4[i].reduce_lanes());
+        (red, red4)
     }
 }
 
@@ -7340,11 +7408,11 @@ mod r4_canonical_pair_tests {
             let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut s)))).collect();
             let bk=R2EqBake { a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true };
             unsafe {
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
-                let got=round2_lookahead_chunk_baked_elide_r4_impl::<true, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let want=round2_lookahead_chunk_baked_elide_r4_original_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
+                let got=round2_lookahead_chunk_baked_elide_r4_original_impl::<true, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&lw);
                 assert_eq!(got,want,"lo={lo} row_base={row_base}");
                 let other=R4LaneWeights { lv4:[even,odd,even+F128::ONE,odd],lv4_odd:lw.lv4_odd };
-                let want=round2_lookahead_chunk_baked_elide_r4_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
+                let want=round2_lookahead_chunk_baked_elide_r4_original_impl::<false, false, false>(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other);
                 let got=round2_lookahead_chunk_baked_elide_r4_x86(a.as_ptr(),b.as_ptr(),row_base,lo,&bk,&other,lo1_ys_enabled());
                 assert_eq!(got,want,"non-periodic lane weights must retain the original route");
             }
@@ -7352,3 +7420,357 @@ mod r4_canonical_pair_tests {
     }
 }
 
+
+
+// Unchanged published parent arithmetic retained only as a native test oracle.
+#[cfg(test)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+unsafe fn round2_lookahead_chunk_baked_elide_r4_original_impl<const PAIR: bool, const YA: bool, const YB: bool>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+) -> ([F128; 8], [F128; 18]) {
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
+    debug_assert_eq!(row_base & 255, 0);
+
+    unsafe {
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc4 = [WideGhashX4::zero(); 10];
+        let mut fa_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa_work = (*fa_store.as_mut_ptr()).0.as_mut_ptr();
+        let fb_work = (*fb_store.as_mut_ptr()).0.as_mut_ptr();
+        // A distinct first-quarter cache survives until the last quarter.
+        // PAIR=false leaves these unused and removes them at compile time.
+        let mut fa_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let mut fb_first_store = core::mem::MaybeUninit::<FoldCache>::uninit();
+        let fa_first = core::ptr::addr_of_mut!((*fa_first_store.as_mut_ptr()).0).cast::<F128>();
+        let fb_first = core::ptr::addr_of_mut!((*fb_first_store.as_mut_ptr()).0).cast::<F128>();
+        let mut fa = fa_work;
+        let mut fb = fb_work;
+        let a_mats_ptr = bk.a_mats.as_ptr().cast::<u64>();
+        let b_mats_slice = bk.b_mats.as_ptr();
+
+        macro_rules! pf_quarter {
+            ($g0:expr, $q:expr) => {{
+                let next = ($g0 + 64 * ZC_PKT_PF_TILES) * 8;
+                let l0 = 2 * ($q as usize);
+                for l in l0..l0 + 2 {
+                    _mm_prefetch(
+                        a_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    _mm_prefetch(
+                        b_pkt.wrapping_add(next + 64 * l).cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }};
+        }
+
+        macro_rules! ld_group {
+            ($g:expr) => {{
+                let g_off = 4 * ($g as usize);
+                (
+                    _mm512_loadu_si512(fa.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fa.add(48 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(16 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(32 + g_off).cast::<__m512i>()),
+                    _mm512_loadu_si512(fb.add(48 + g_off).cast::<__m512i>()),
+                )
+            }};
+        }
+
+        macro_rules! accum1 {
+            ($g0:expr, $grp:expr) => {{
+                pf_quarter!($g0, $grp);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp);
+                acc[0].mul_acc(a1w, b1);
+                acc[1].mul_acc(_mm512_xor_si512(a0w, a1w), _mm512_xor_si512(b0, b1));
+                acc[2].mul_acc(a3w, b3);
+                acc[3].mul_acc(_mm512_xor_si512(a2w, a3w), _mm512_xor_si512(b2, b3));
+                acc[4].mul_acc(a2w, b2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                acc[5].mul_acc(e_aw, e_b);
+                acc[6].mul_acc(o_aw, o_b);
+                acc[7].mul_acc(_mm512_xor_si512(e_aw, o_aw), _mm512_xor_si512(e_b, o_b));
+            }};
+        }
+
+        macro_rules! accum2 {
+            ($g0:expr, $grp0:expr, $grp1:expr) => {{
+                pf_quarter!($g0, $grp0);
+                let (a0w, a1w, a2w, a3w, b0, b1, b2, b3) = ld_group!($grp0);
+                pf_quarter!($g0, $grp1);
+                let (c0w, c1w, c2w, c3w, d0, d1, d2, d3) = ld_group!($grp1);
+                acc[0].mul_acc2(a1w, b1, c1w, d1);
+                acc[1].mul_acc2(
+                    _mm512_xor_si512(a0w, a1w),
+                    _mm512_xor_si512(b0, b1),
+                    _mm512_xor_si512(c0w, c1w),
+                    _mm512_xor_si512(d0, d1),
+                );
+                acc[2].mul_acc2(a3w, b3, c3w, d3);
+                acc[3].mul_acc2(
+                    _mm512_xor_si512(a2w, a3w),
+                    _mm512_xor_si512(b2, b3),
+                    _mm512_xor_si512(c2w, c3w),
+                    _mm512_xor_si512(d2, d3),
+                );
+                acc[4].mul_acc2(a2w, b2, c2w, d2);
+                let e_aw = _mm512_xor_si512(a0w, a2w);
+                let e_b = _mm512_xor_si512(b0, b2);
+                let o_aw = _mm512_xor_si512(a1w, a3w);
+                let o_b = _mm512_xor_si512(b1, b3);
+                let e_cw = _mm512_xor_si512(c0w, c2w);
+                let e_d = _mm512_xor_si512(d0, d2);
+                let o_cw = _mm512_xor_si512(c1w, c3w);
+                let o_d = _mm512_xor_si512(d1, d3);
+                acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+                acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+                acc[7].mul_acc2(
+                    _mm512_xor_si512(e_aw, o_aw),
+                    _mm512_xor_si512(e_b, o_b),
+                    _mm512_xor_si512(e_cw, o_cw),
+                    _mm512_xor_si512(e_d, o_d),
+                );
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 128 <= lo_size {
+            let batch_base = x_lo >> 5;
+            if PAIR { fa=fa_first; fb=fb_first; }
+            {
+                let g0 = row_base + 2 * x_lo;
+                let bm = &(*b_mats_slice.add(batch_base)).0;
+                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 0);
+                pf_quarter!(g0, 0);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                accum1!(g0, 1);
+                accum2!(g0, 2, 3);
+                if !PAIR { r4_round4_batch(fa, fb, &mut acc4, 0); }
+            }
+            fa=fa_work; fb=fb_work;
+            {
+                let g0 = row_base + 2 * (x_lo + 32);
+                let bm = &(*b_mats_slice.add(batch_base + 1)).0;
+                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
+            }
+            {
+                let g0 = row_base + 2 * (x_lo + 64);
+                let bm = &(*b_mats_slice.add(batch_base + 2)).0;
+                gfni_fold64_rows_masked_tr_bcast4_y::<YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 0);
+                gfni_fold64_rows_masked_tr_bcast_y::<YB>(b_pkt.add(g0 * 8), bm, fb, 0);
+                accum2!(g0, 0, 1);
+                accum2!(g0, 2, 3);
+                r4_round4_batch(fa, fb, &mut acc4, 255);
+            }
+            {
+                let g0 = row_base + 2 * (x_lo + 96);
+                let bm = &(*b_mats_slice.add(batch_base + 3)).0;
+                gfni_fold64_rows_tr_bcast_skip_group_y::<true, YA>(a_pkt.add(g0 * 8), a_mats_ptr, fa, 3);
+                gfni_fold64_rows_tr_bcast_skip_group_y::<false, YB>(b_pkt.add(g0 * 8), bm.as_ptr(), fb, 3);
+                accum2!(g0, 0, 1);
+                accum1!(g0, 2);
+                if PAIR {
+                    // First-quarter group 0 and last-quarter group 3
+                    // were elided by the GFNI producers. Read only the
+                    // initialized groups: the two full sets plus one set
+                    // combining the two surviving partial halves.
+                    // This replaces four sets of ten products with three.
+                    r4_canonical_set(fa_first,fb_first,2,fa_first,fb_first,3,&mut acc4);
+                    r4_canonical_set(fa_first,fb_first,1,fa,fb,2,&mut acc4);
+                    r4_canonical_set(fa,fb,0,fa,fb,1,&mut acc4);
+                } else { r4_round4_batch(fa, fb, &mut acc4, 3); }
+                pf_quarter!(g0, 3);
+                #[cfg(test)]
+                R2_CANON_ELIDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            x_lo += 128;
+        }
+
+        use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
+        let lane_sum = |v: __m512i, w: __m512i, w64: __m512i| -> F128 {
+            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
+            l[0] + l[1] + l[2] + l[3]
+        };
+        let mut out = [F128::ZERO; 8];
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let lane_w64 = ghash_shift64_x4(lane_w);
+        let mut red = [_mm512_setzero_si512(); 8];
+        for i in 0..8 {
+            red[i] = acc[i].reduce_lanes();
+            out[i] = lane_sum(red[i], lane_w, lane_w64);
+        }
+        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
+        let lv4_64 = ghash_shift64_x4(lv4);
+        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
+        let lvo_64 = ghash_shift64_x4(lvo);
+        let mut r4 = [F128::ZERO; 18];
+        // v1[i+3j] for the odd-u (X3 = 1) corners from the incumbent accumulators.
+        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
+        r4[0] = lane_sum(acc4[0].reduce_lanes(), lv4, lv4_64);
+        for k in 1..9 {
+            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
+        }
+        for k in 0..9 {
+            r4[9 + k] = lane_sum(acc4[1 + k].reduce_lanes(), lv4, lv4_64);
+        }
+        (out, r4)
+    }
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",
+    target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod r2_vec_native_tests {
+    use super::*;
+    fn next(s:&mut u64)->u64 {*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+    fn field(s:&mut u64,f:usize)->F128 {
+        match f {1=>F128::ONE,2=>F128::new(1<<63,1<<63),_=>F128::new(next(s),next(s))}
+    }
+    unsafe fn check<const P:bool,const A:bool,const B:bool>(
+        a:*const u8,b:*const u8,row_base:usize,lo:usize,bk:&R2EqBake,
+        periodic:&R4LaneWeights,other:&R4LaneWeights,family:usize,phase:usize,
+    ) {
+        let lw=if P {periodic}else{other};
+        unsafe {
+            let want=round2_lookahead_chunk_baked_elide_r4_original_impl::<P,A,B>(a,b,row_base,lo,bk,lw);
+            let(red,red4)=round2_lookahead_chunk_baked_elide_r4_impl::<P,A,B>(a,b,row_base,lo,bk,lw);
+            let got=r2_r4_finish(&red,&red4,bk,lw);
+            assert_eq!(got,want,"P{P} A{A} B{B} lo{lo} base{row_base} family{family} phase{phase}");
+        }
+    }
+    #[test]
+    fn phase_matches_original_all_modes_and_input_phases() {
+        let mut rng=0x91a5_e746_623b_c8d9u64;
+        let mut fixtures=0usize;let mut comparisons=0usize;
+        for lo in [128usize,256,512,4096] {for row_base in [0usize,256] {
+        for phase in [0usize,1,15,63] {for family in 0usize..8 {
+            let bytes=(row_base+2*lo)*8;
+            let mut a=vec![0xa7u8;bytes+256];let mut b=vec![0x6du8;bytes+256];
+            let ao=a.as_ptr().align_offset(64)+64+phase;
+            let bo=b.as_ptr().align_offset(64)+64+phase;
+            assert_eq!((a.as_ptr() as usize+ao)%64,phase);
+            assert_eq!((b.as_ptr() as usize+bo)%64,phase);
+            assert!(ao>=64 && bo>=64 && a.len()-ao-bytes>=64 && b.len()-bo-bytes>=64);
+            for i in 0..bytes {
+                a[ao+i]=match family {0|3=>0,1=>255,2=>1u8<<(i%8),_=>next(&mut rng)as u8};
+                b[bo+i]=match family {0=>0,1|3=>255,2=>1u8<<((i/8)%8),_=>next(&mut rng)as u8};
+            }
+            let before_a=a.clone();let before_b=b.clone();
+            let lane=std::array::from_fn(|_|field(&mut rng,family));
+            let even=field(&mut rng,family);let odd=field(&mut rng,family);
+            let lv_odd=std::array::from_fn(|_|field(&mut rng,4));
+            let periodic=R4LaneWeights{lv4:[even,odd,even,odd],lv4_odd:lv_odd};
+            let other=R4LaneWeights{lv4:[even,odd,even+F128::ONE,odd+F128::ONE],lv4_odd:lv_odd};
+            let am=std::array::from_fn(|_|R2FoldMats(std::array::from_fn(|_| {
+                if family==1 {0x8040_2010_0804_0201}else{next(&mut rng)}
+            })));
+            let bm=(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_| {
+                if family==1 {0x8040_2010_0804_0201}else{next(&mut rng)}
+            }))).collect();
+            let bk=R2EqBake{a_mats:am,b_mats:bm,b_scale:vec![F128::ONE;lo/32],lane,canonical_elide:true};
+            unsafe {
+                macro_rules! run {($p:literal,$a:literal,$b:literal)=>{{
+                    check::<$p,$a,$b>(a.as_ptr().add(ao),b.as_ptr().add(bo),row_base,lo,&bk,&periodic,&other,family,phase);
+                    comparisons+=1;
+                }};}
+                run!(false,false,false);run!(false,false,true);
+                run!(false,true,false);run!(false,true,true);
+                run!(true,false,false);run!(true,false,true);
+                run!(true,true,false);run!(true,true,true);
+            }
+            assert_eq!(a,before_a,"A input/guards changed");
+            assert_eq!(b,before_b,"B input/guards changed");
+            fixtures+=1;
+        }}}}
+        assert_eq!(fixtures,256);assert_eq!(comparisons,2048);
+        println!("R2_VEC_NATIVE fixtures={fixtures} comparisons={comparisons} full_field_outputs_per_comparison=26 byte_phases=0,1,15,63 source_and_guards_unchanged=true r4_legacy_control={}",std::env::var_os("FLOCK_NO_ZC_R4_STREAM").is_some());
+    }
+}
+#[cfg(all(test,target_arch="x86_64",target_feature="avx512f",
+    target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+mod r2_vec_aggregation_tests {
+    use super::*;
+    use crate::zerocheck::multilinear::{r2vec_zero,r2vec_scale,r2vec_add};
+    fn next(s:&mut u64)->u64 {*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+    fn field(s:&mut u64)->F128 {F128::new(next(s),next(s))}
+    #[test]
+    fn vector_chunk_reduction_matches_original_scalar_results() {
+        let mut seed=0x738c_d4f1_a928_5be6;let mut checks=0usize;let mut chunks_checked=0usize;
+        for lo in [128usize,256] {for ys in [false,true] {for periodic in [false,true] {
+        for family in 0..4 {for chunks in [1usize,2,3,7,16] {
+            let base=256*(checks%2);let phase=[0usize,1,15,63][family];
+            let bytes=(base+2*lo*chunks)*8;
+            let mut a=vec![0xacu8;bytes+256];let mut b=vec![0x53u8;bytes+256];
+            let ao=a.as_ptr().align_offset(64)+64+phase;let bo=b.as_ptr().align_offset(64)+64+phase;
+            assert!(ao>=64&&bo>=64&&a.len()-ao-bytes>=64&&b.len()-bo-bytes>=64);
+            for i in 0..bytes {
+                a[ao+i]=match family {0=>0,1=>255,2=>1u8<<(i%8),_=>next(&mut seed)as u8};
+                b[bo+i]=match family {0=>0,1=>255,2=>1u8<<((i/8)%8),_=>next(&mut seed)as u8};
+            }
+            let before_a=a.clone();let before_b=b.clone();
+            let bk=R2EqBake {
+                a_mats:std::array::from_fn(|_|R2FoldMats(std::array::from_fn(|_|next(&mut seed)))),
+                b_mats:(0..lo/32).map(|_|R2FoldMats(std::array::from_fn(|_|next(&mut seed)))).collect(),
+                b_scale:vec![F128::ONE;lo/32],lane:std::array::from_fn(|_|field(&mut seed)),canonical_elide:true,
+            };
+            let even=field(&mut seed);let odd=field(&mut seed);
+            let lw=R4LaneWeights{lv4:if periodic {[even,odd,even,odd]}else{[even,odd,even+F128::ONE,odd]},
+                lv4_odd:std::array::from_fn(|_|field(&mut seed))};
+            let mut expected=[F128::ZERO;26];let mut sums=r2vec_zero();let mut parts=[r2vec_zero();4];
+            unsafe {for chunk in 0..chunks {
+                let row=base+2*lo*chunk;
+                let old=if ys {round2_lookahead_chunk_baked_elide_r4_original_impl::<false,true,true>(a.as_ptr().add(ao),b.as_ptr().add(bo),row,lo,&bk,&lw)}
+                    else {round2_lookahead_chunk_baked_elide_r4_original_impl::<false,false,false>(a.as_ptr().add(ao),b.as_ptr().add(bo),row,lo,&bk,&lw)};
+                let eh=match family {0=>F128::ZERO,1=>F128::ONE,2=>if chunk%2==0 {F128::new(0,1<<63)}else{F128::new(u64::MAX,u64::MAX)},_=>if chunk%3==0 {F128::ZERO}else{field(&mut seed)}};
+                for i in 0..8 {expected[i]+=eh*old.0[i];}for i in 0..18 {expected[8+i]+=eh*old.1[i];}
+                let(red,red4)=round2_lookahead_chunk_baked_elide_r4_red_x86(a.as_ptr().add(ao),b.as_ptr().add(bo),row,lo,&bk,&lw,ys);
+                let v=r2vec_scale(&red,&red4,eh);sums=r2vec_add(sums,v);parts[chunk%4]=r2vec_add(parts[chunk%4],v);
+                chunks_checked+=1;
+            }
+            let tree=r2vec_add(r2vec_add(parts[0],parts[1]),r2vec_add(parts[2],parts[3]));
+            for total in [sums,tree] {
+                let red=std::array::from_fn(|i|total[i]);let red4=std::array::from_fn(|i|total[8+i]);
+                let got=r2_r4_finish(&red,&red4,&bk,&lw);
+                assert_eq!(got.0.as_slice(),&expected[..8],"lo{lo} ys{ys} periodic{periodic} family{family} chunks{chunks}");
+                assert_eq!(got.1.as_slice(),&expected[8..],"lo{lo} ys{ys} periodic{periodic} family{family} chunks{chunks}");
+            }}
+            assert_eq!(a,before_a);assert_eq!(b,before_b);checks+=1;
+        }}}}}
+        assert_eq!(checks,160);assert_eq!(chunks_checked,928);
+        println!("R2_VEC_AGGREGATION cases={checks} chunks={chunks_checked} sequential_and_partitioned_reductions_match=true source_and_guards_unchanged=true");
+    }
+}
