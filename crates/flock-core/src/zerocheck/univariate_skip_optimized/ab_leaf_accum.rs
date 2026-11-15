@@ -12,6 +12,8 @@ global_asm!(include_str!("ab_leaf_accum.S"), options(raw));
 // Lane ab1: pair-major copies of the merged banks (window stride one row).
 global_asm!(include_str!("ab_leaf_accum_pmaj.S"), options(raw));
 global_asm!(include_str!("ab_leaf_accum_ns.S"), options(raw));
+#[path = "ab_crt57_accum.rs"]
+mod crt57;
 
 const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
 const GROUPS0: [usize; 9] = [9, 9, 9, 9, 6, 9, 9, 9, 9];
@@ -57,6 +59,8 @@ pub(super) fn would_run(mats: &[u64]) -> bool {
 
 pub(super) struct Cache {
     key: Vec<u64>,
+    crt_mode: bool,
+    crt: Option<Vec<u64>>,
     tables: Option<(Vec<u64>, Vec<u64>)>,
     merged: Option<(Vec<u64>, Vec<u64>)>,
     scratch: Vec<u8>,
@@ -73,14 +77,21 @@ fn decode(scale: F128) -> [u8; 16] {
 
 impl Cache {
     fn new(mats: &[u64]) -> Self {
+        Self::new_kind(mats, false)
+    }
+
+    fn new_kind(mats: &[u64], use_crt: bool) -> Self {
         let mut cache = Self {
             key: mats.to_vec(),
+            crt_mode: use_crt,
+            crt: None,
             tables: None,
             merged: None,
             scratch: Vec::new(),
         };
-        let mut m0 = Vec::with_capacity(32 * 78);
-        let mut m2 = Vec::with_capacity(32 * 78);
+        let mut m0 = Vec::with_capacity(if use_crt { 0 } else { 32 * 78 });
+        let mut m2 = Vec::with_capacity(if use_crt { 0 } else { 32 * 78 });
+        let mut crt = Vec::with_capacity(if use_crt { 32 * 57 } else { 0 });
         let convert = super::convert_table();
         for row in mats.chunks_exact(256) {
             // At absolute row0, phi8(1)=1, so the first bit column is scale.
@@ -100,6 +111,10 @@ impl Cache {
                 return cache;
             }
             let coefficients = decode(scale);
+            if use_crt {
+                crt57::push_row(&coefficients, &mut crt);
+                continue;
+            }
             for (forms, dest) in [(&COEFF0, &mut m0), (&COEFF2, &mut m2)] {
                 for &form in forms {
                     let mut mask = form;
@@ -112,7 +127,9 @@ impl Cache {
                 }
             }
         }
-        if grouped_enabled() {
+        if use_crt {
+            cache.crt = Some(crt57::pack(crt));
+        } else if grouped_enabled() {
             cache.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
         } else {
             cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
@@ -148,10 +165,25 @@ pub(super) fn try_run(
     let Some(rows) = source.get(start..end + end_pad) else {
         return false;
     };
-    if cache.as_ref().is_none_or(|c| c.key.as_slice() != mats) {
-        *cache = Some(Cache::new(mats));
+    let use_crt = layout == 33 && grouped_enabled() && crt57::enabled();
+    if cache.as_ref().is_none_or(|c| c.key.as_slice() != mats || c.crt_mode != use_crt) {
+        *cache = Some(Cache::new_kind(mats, use_crt));
     }
     let cache = cache.as_mut().unwrap();
+    if use_crt {
+        let Some(matrices) = &cache.crt else { return false; };
+        let raw = cache.scratch.as_mut_ptr();
+        let offset = raw.align_offset(64);
+        debug_assert!(offset + SCRATCH_DATA_BYTES <= cache.scratch.len());
+        // SAFETY: all complete spans and the multiplication family were checked
+        // above; the two allocations and output are disjoint. The NS32p kernel
+        // demand loads and bounded next-window hints stay in the live14 rows.
+        unsafe {
+            crt57::run(rows.as_ptr(), matrices.as_ptr(), raw.add(offset),
+                planes.as_mut_ptr(), mode);
+        }
+        return true;
+    }
     let merged = grouped_enabled();
     let tables = if merged { &cache.merged } else { &cache.tables };
     let Some((m0, m2)) = tables else {
@@ -1340,4 +1372,68 @@ mod tests {
         );
         assert_eq!(comparisons, 917504);
     }
+    #[test]
+    fn crt57_layout33_matches_original_rekeys_and_falls_back() {
+        if !grouped_enabled() { return; }
+        const BAND: usize = 2048 * 1856;
+        let mut seed = 0x57acb903e61fu64;
+        let mut original = vec![0u8; 2 * BAND];
+        for x in &mut original { *x = rng(&mut seed) as u8; }
+        let mut source = vec![0x39u8; 2 * BAND];
+        for hi in 0..2 {
+            for window in 0..32 {
+                for pair in 0..64 {
+                    let from = hi * BAND + (window * 64 + pair) * 1856;
+                    let to = hi * BAND + window * 118784 + pair * 1792;
+                    source[to..to + 1792].copy_from_slice(&original[from..from + 1792]);
+                }
+            }
+        }
+        let saved = source.clone();
+        let mut scales: Vec<F128> = (0..32).map(|_| F128 {
+            lo: rng(&mut seed), hi: rng(&mut seed),
+        }).collect();
+        scales[0] = F128::ZERO;
+        scales[1] = F128::ONE;
+        let mut mats = super::super::build_ab_eq_fold_mats_gated(
+            &scales, super::super::convert_table(), false);
+        let mut cache = None;
+        let mut comparisons = 0;
+        for hi in 0..2 {
+            for mode in 0..3 {
+                let mut old = vec![0xceu8; 131072];
+                let mut new = vec![0x73u8; 131072];
+                unsafe {
+                    super::super::process_ranked_ab_w4_band(
+                        &original, &mats, hi, true, mode, &mut old);
+                }
+                assert!(try_run(&mut cache, &source, &mats, hi, mode, &mut new, 33));
+                assert_eq!(new, old, "CRT57 hi={hi} mode={mode}");
+                assert_eq!(cache.as_ref().unwrap().crt_mode, crt57::enabled());
+                comparisons += new.len();
+            }
+        }
+        scales[0] = F128 { lo: rng(&mut seed), hi: rng(&mut seed) };
+        scales[17] = F128 { lo: rng(&mut seed), hi: rng(&mut seed) };
+        let changed = super::super::build_ab_eq_fold_mats_gated(
+            &scales, super::super::convert_table(), false);
+        mats.copy_from_slice(&changed);
+        let mut old = vec![0u8; 131072];
+        let mut new = vec![0u8; 131072];
+        unsafe {
+            super::super::process_ranked_ab_w4_band(
+                &original, &mats, 0, true, 1, &mut old);
+        }
+        assert!(try_run(&mut cache, &source, &mats, 0, 1, &mut new, 33));
+        assert_eq!(new, old);
+        comparisons += new.len();
+        mats[8191] ^= 1;
+        new.fill(0xad);
+        assert!(!try_run(&mut cache, &source, &mats, 0, 1, &mut new, 33));
+        assert!(new.iter().all(|x| *x == 0xad));
+        assert_eq!(source, saved);
+        assert_eq!(comparisons, 917504);
+        println!("AB_CRT57_PRODUCTION_VALIDATED comparisons={comparisons} rekey=true invalid_map_fallback=true layout33=true selected={}", crt57::enabled());
+    }
+
 }

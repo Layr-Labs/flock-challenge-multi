@@ -9375,7 +9375,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let _tg = std::time::Instant::now();
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
-            fold_grinding_nonces.push(challenger.grind_pow(bits));
+            fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
         }
         let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
         crate::rstrace::ev("r:grind", j as u32);
@@ -9603,7 +9603,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut gl2_l1_job: Option<std::sync::Arc<Gl2Deferred>> = None;
     let mut gl2_level_jobs: Vec<(usize, std::sync::Arc<Gl2Deferred>)> = Vec::new();
     let mut gl2_side_done: Vec<crate::hot_pool::side::Task> = Vec::new();
-    let pow_nonce_0 = challenger.grind_pow(config.grinding_bits[0] as u32);
+    let pow_nonce_0 = challenger.grind_pow_any_valid(config.grinding_bits[0] as u32);
     crate::rstrace::ev("L1:qgrind", 0);
     let mut grinding_nonces: Vec<u64> = vec![pow_nonce_0];
 
@@ -9819,7 +9819,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         for j in 0..k_i {
             let bits = fold_bits(i + 1).saturating_sub(j as u32);
             if bits > 0 {
-                fold_grinding_nonces.push(challenger.grind_pow(bits));
+                fold_grinding_nonces.push(challenger.grind_pow_any_valid(bits));
             }
             crate::rstrace::ev("lv:fgrind", (i * 16 + j) as u32);
             let ri = challenger.sample_f128();
@@ -9886,7 +9886,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 challenger.observe_f128(*v);
             }
             crate::rstrace::ev("fin:yr", 0);
-            let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
+            let nonce_last = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
             crate::rstrace::ev("fin:qgrind", 0);
             grinding_nonces.push(nonce_last);
             let num_queries_last = config.queries[i + 1];
@@ -10061,7 +10061,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         crate::rstrace::ev("lv:ood", i as u32);
-        let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
+        let nonce_i = challenger.grind_pow_any_valid(config.grinding_bits[i + 1] as u32);
         crate::rstrace::ev("lv:qgrind", i as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
