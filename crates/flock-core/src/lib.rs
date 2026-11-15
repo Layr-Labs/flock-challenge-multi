@@ -56,7 +56,69 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
+/// DIAGNOSTIC SUBMISSION ONLY: factorial in-run probe on the ranked runner.
+///
+/// The harness names each trial's files `run-{r}.ready` / `run-{r}.proof`
+/// (r = 1..=120, the first 20 are warm-ups). Warm-up trials run the base
+/// settings. In measured trial r, factor `(mask, switches)` is ON iff
+/// `popcount(((r - 21) mod 16) & mask)` is odd: a two-level full factorial on
+/// the bits of `(r - 21) mod 16`. Every switch selects between schedules or
+/// kernels that compute the same values, so proof bytes do not depend on the
+/// settings. Design after patternrecognition9-del's `2f8b5ba1` and
+/// leech1996's `afca20fd`.
+pub(crate) mod fact_probe {
+    // Masks fall in three groups {4..7}, {8..11}, {12..15}; inside a group a
+    // two-factor interaction aliases onto masks 1..3 (fitted as nuisance), so
+    // factors that may interact share a group. Masks 7 and 15 are unused.
+    pub(crate) const FACTORS: &[(u64, &[(&str, &str)])] = &[
+        (4, &[("FLOCK_GL1_LC_MIN", "512")]),
+        (5, &[("FLOCK_SL1_WARM_TILES", "512")]),
+        (6, &[("FLOCK_SL1_WARM_KB", "160")]),
+        (8, &[("FLOCK_ZC_C3_AT", "1")]),
+        (9, &[("FLOCK_ZC_TAIL_CHUNK_LOG", "10")]),
+        (10, &[("FLOCK_HOT_POOL_SPINS", "8192")]),
+        (11, &[("FLOCK_RL_PREWAKE_AT", "2")]),
+        (12, &[("FLOCK_NTT_SEED_PF_LINES", "4")]),
+        (13, &[("FLOCK_XINT_HOSTFIX", "1")]),
+        (14, &[("FLOCK_NO_RS_BANK_MAJOR", "1")]),
+    ];
+
+    fn trial() -> Option<u64> {
+        let mut args = std::env::args_os();
+        let exe = args.next()?;
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if rest.len() != 3
+            || !std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+        {
+            return None;
+        }
+        let name = std::path::Path::new(&rest[2]).file_name()?.to_str()?;
+        let r: u64 = name.strip_prefix("run-")?.strip_suffix(".proof")?.parse().ok()?;
+        (r >= 21).then_some(r)
+    }
+
+    pub(crate) fn is_on(r: u64, mask: u64) -> bool {
+        (((r - 21) % 16) & mask).count_ones() & 1 == 1
+    }
+
+    pub(crate) fn arm() {
+        let Some(r) = trial() else { return };
+        for (mask, env) in FACTORS {
+            if is_on(r, *mask) {
+                for (key, value) in *env {
+                    // SAFETY: called once at process start, before any other thread exists.
+                    unsafe { std::env::set_var(key, value) };
+                }
+            }
+        }
+    }
+}
+
 pub fn init_perf_thread_pool() -> Option<usize> {
+    fact_probe::arm();
     // Before any worker thread (and its malloc arena) exists.
     pin_glibc_heap_thresholds();
     let built = init_global_pool();
