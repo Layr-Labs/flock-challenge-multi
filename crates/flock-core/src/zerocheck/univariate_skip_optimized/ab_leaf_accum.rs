@@ -13,7 +13,7 @@ global_asm!(include_str!("ab_leaf_accum.S"), options(raw));
 global_asm!(include_str!("ab_leaf_accum_pmaj.S"), options(raw));
 global_asm!(include_str!("ab_leaf_accum_ns.S"), options(raw));
 
-const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
+pub(super) const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
 const GROUPS0: [usize; 9] = [9, 9, 9, 9, 6, 9, 9, 9, 9];
 const GROUPS2: [usize; 9] = [6, 9, 9, 9, 9, 9, 9, 9, 9];
 
@@ -49,36 +49,18 @@ fn grouped_enabled() -> bool {
     *ON
 }
 
-/// Lane ab1: true when [`try_run`] will take the merged leaf path for these
-/// matrices (same key check as the per-worker cache).
-pub(super) fn would_run(mats: &[u64]) -> bool {
-    grouped_enabled() && mats.len() == 32 * 256 && Cache::new(mats).merged.is_some()
+#[derive(Clone)]
+pub(super) struct Prepared {
+    pub(super) m0: Vec<u64>,
+    pub(super) m2: Vec<u64>,
+    pub(super) merged: bool,
 }
 
-pub(super) struct Cache {
-    key: Vec<u64>,
-    tables: Option<(Vec<u64>, Vec<u64>)>,
-    merged: Option<(Vec<u64>, Vec<u64>)>,
-    scratch: Vec<u8>,
-}
-
-fn decode(scale: F128) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for (bit, &(lo, hi)) in DECODE_DUAL.iter().enumerate() {
-        let parity = ((scale.lo & lo).count_ones() ^ (scale.hi & hi).count_ones()) & 1;
-        out[bit >> 3] |= (parity as u8) << (bit & 7);
-    }
-    out
-}
-
-impl Cache {
-    fn new(mats: &[u64]) -> Self {
-        let mut cache = Self {
-            key: mats.to_vec(),
-            tables: None,
-            merged: None,
-            scratch: Vec::new(),
-        };
+impl Prepared {
+    pub(super) fn new(mats: &[u64]) -> Option<Self> {
+        if mats.len() != 32 * 256 {
+            return None;
+        }
         let mut m0 = Vec::with_capacity(32 * 78);
         let mut m2 = Vec::with_capacity(32 * 78);
         let convert = super::convert_table();
@@ -97,7 +79,7 @@ impl Cache {
             let mut expected = [0u64; 256];
             super::ab_eq_fold_mats_row_transposed(convert, scale, &mut expected);
             if expected.as_slice() != row {
-                return cache;
+                return None;
             }
             let coefficients = decode(scale);
             for (forms, dest) in [(&COEFF0, &mut m0), (&COEFF2, &mut m2)] {
@@ -112,28 +94,62 @@ impl Cache {
                 }
             }
         }
-        if grouped_enabled() {
-            cache.merged = Some((pack_groups(m0, &[27,24,27]), pack_groups(m2, &[24,27,27])));
+        let merged = grouped_enabled();
+        let (m0_packed, m2_packed) = if merged {
+            (pack_groups(m0, &[27, 24, 27]), pack_groups(m2, &[24, 27, 27]))
         } else {
-            cache.tables = Some((pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2)));
-        }
-        // Keep both leaf banks and the temporary polynomial cache-line aligned.
-        cache.scratch = vec![0; SCRATCH_DATA_BYTES + 63];
-        cache
+            (pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2))
+        };
+        Some(Self {
+            m0: m0_packed,
+            m2: m2_packed,
+            merged,
+        })
     }
 }
 
-pub(super) fn try_run(
-    cache: &mut Option<Cache>,
+/// Lane ab1: true when [`try_run`] will take the merged leaf path for these
+/// matrices (same key check as the per-worker cache).
+pub(super) fn would_run(mats: &[u64]) -> bool {
+    grouped_enabled() && mats.len() == 32 * 256 && Prepared::new(mats).is_some()
+}
+
+pub(super) struct Cache {
+    key: Vec<u64>,
+    prepared: Option<Prepared>,
+    scratch: Vec<u8>,
+}
+
+fn decode(scale: F128) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (bit, &(lo, hi)) in DECODE_DUAL.iter().enumerate() {
+        let parity = ((scale.lo & lo).count_ones() ^ (scale.hi & hi).count_ones()) & 1;
+        out[bit >> 3] |= (parity as u8) << (bit & 7);
+    }
+    out
+}
+
+impl Cache {
+    fn new(mats: &[u64]) -> Self {
+        Self {
+            key: mats.to_vec(),
+            prepared: Prepared::new(mats),
+            scratch: vec![0; SCRATCH_DATA_BYTES + 63],
+        }
+    }
+}
+
+pub(super) fn try_run_prepared(
+    prepared: &Prepared,
+    scratch: &mut [u8],
     source: &[u8],
-    mats: &[u64],
     x_hi: usize,
     mode: usize,
     planes: &mut [u8],
     layout: usize,
 ) -> bool {
     const BAND_BYTES: usize = 2048 * 29 * 64;
-    if mats.len() != 32 * 256 || planes.len() != 128 * 1024 || mode > 2 {
+    if planes.len() != 128 * 1024 || mode > 2 {
         return false;
     }
     // Probe only: the padded split-half layout spans more than one band.
@@ -148,36 +164,56 @@ pub(super) fn try_run(
     let Some(rows) = source.get(start..end + end_pad) else {
         return false;
     };
+    let raw = scratch.as_mut_ptr();
+    let offset = raw.align_offset(64);
+    if offset + SCRATCH_DATA_BYTES > scratch.len() {
+        return false;
+    }
+    let aligned_scratch = unsafe { raw.add(offset) };
+    unsafe {
+        flock_ab_poly_band(
+            rows.as_ptr(),
+            prepared.m0.as_ptr(),
+            prepared.m2.as_ptr(),
+            BASIS_MATRICES.as_ptr(),
+            aligned_scratch,
+            planes.as_mut_ptr(),
+            mode,
+            prepared.merged,
+            if prepared.merged { layout } else { 0 },
+        );
+    }
+    true
+}
+
+pub(super) fn try_run(
+    cache: &mut Option<Cache>,
+    source: &[u8],
+    mats: &[u64],
+    x_hi: usize,
+    mode: usize,
+    planes: &mut [u8],
+    layout: usize,
+) -> bool {
+    if mats.len() != 32 * 256 || planes.len() != 128 * 1024 || mode > 2 {
+        return false;
+    }
     if cache.as_ref().is_none_or(|c| c.key.as_slice() != mats) {
         *cache = Some(Cache::new(mats));
     }
     let cache = cache.as_mut().unwrap();
-    let merged = grouped_enabled();
-    let tables = if merged { &cache.merged } else { &cache.tables };
-    let Some((m0, m2)) = tables else {
+    let Some(ref prepared) = cache.prepared else {
         return false;
     };
-    let raw = cache.scratch.as_mut_ptr();
-    let offset = raw.align_offset(64);
-    debug_assert!(offset + SCRATCH_DATA_BYTES <= cache.scratch.len());
-    // SAFETY: byte alignment padding reserves the complete live span.
-    let scratch = unsafe { raw.add(offset) };
-    // Each original input span, matrix row, initialized scratch bank and
-    // output bank is disjoint and complete. All final output planes are written.
-    unsafe {
-        flock_ab_poly_band(
-            rows.as_ptr(),
-            m0.as_ptr(),
-            m2.as_ptr(),
-            BASIS_MATRICES.as_ptr(),
-            scratch,
-            planes.as_mut_ptr(),
-            mode,
-            merged,
-            if merged { layout } else { 0 },
-        );
-    }
-    true
+    try_run_prepared(
+        prepared,
+        &mut cache.scratch,
+        source,
+        x_hi,
+        mode,
+        planes,
+        layout,
+    )
 }
 
 // System V x86-64 ABI. Each bank function sums six/nine-leaf groups in

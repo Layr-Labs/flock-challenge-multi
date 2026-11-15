@@ -3051,8 +3051,7 @@ vmovdqu64 zmm28, ZMMWORD PTR [rdi + 64]
 vmovdqu64 zmm25, ZMMWORD PTR [rdi + 384]
 vpxorq zmm24, zmm30, zmm25
 vmovdqu64 zmm23, ZMMWORD PTR [rdi + 0]
-vmovdqa64 zmm22, zmm23
-vmovdqu64 ZMMWORD PTR [rsi + 0], zmm22
+vmovdqu64 ZMMWORD PTR [rsi + 0], zmm23
 vpxorq zmm23, zmm23, zmm28
 vpxorq zmm24, zmm24, zmm23
 vmovdqu64 ZMMWORD PTR [rsi + 128], zmm24
@@ -3378,7 +3377,6 @@ vpxorq zmm29, zmm29, zmm18
 vmovdqu64 ZMMWORD PTR [rsi + 960], zmm29
 mov rsp, rbp
 pop rbp
-vzeroupper
 ret
 .size flock_ab_leaf_interpolate0, .-flock_ab_leaf_interpolate0
 .p2align 5
@@ -3730,7 +3728,6 @@ vpxorq zmm17, zmm17, zmm16
 vmovdqu64 ZMMWORD PTR [rsi + 1792], zmm17
 mov rsp, rbp
 pop rbp
-vzeroupper
 ret
 .size flock_ab_leaf_interpolate2, .-flock_ab_leaf_interpolate2
 .p2align 5
