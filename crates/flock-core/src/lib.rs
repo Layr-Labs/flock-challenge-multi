@@ -241,6 +241,9 @@ pub(crate) mod topology_pool {
                 .build_global()
             {
                 Ok(()) => {
+                    if POOL_MODE == "pin16" {
+                        super::RANKED_CORES.store(cores, std::sync::atomic::Ordering::Release);
+                    }
                     super::RANKED_POOL_BUILT.store(true, std::sync::atomic::Ordering::Release);
                     Some(n)
                 }
@@ -257,6 +260,15 @@ pub(crate) mod topology_pool {
 pub const RANKED_WORKER_STACK: usize = 32 << 20;
 
 static RANKED_POOL_BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Physical cores of the ranked `pin16` pool (worker `i` and `i + cores` are
+/// the two siblings of core `i`), or 0 when that pool is not the global one.
+static RANKED_CORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[allow(dead_code)] // read by the x86 AVX-512 team grind only
+pub(crate) fn ranked_pin16_cores() -> usize {
+    RANKED_CORES.load(std::sync::atomic::Ordering::Acquire)
+}
 
 std::thread_local! {
     static POOL_OWNER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };

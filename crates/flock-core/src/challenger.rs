@@ -1749,6 +1749,9 @@ pub fn sl1_grind_prewarm(hold_us: u64) {
             clog: 0,
             fold: k.fold,
             trace: None::<TeamTrace>,
+            cores: 0,
+            caller: 0,
+            started: AtomicUsize::new(0),
         });
         let _ = (AtomicU32::new(0), AtomicUsize::new(0));
         for _ in 0..want {
@@ -1783,6 +1786,12 @@ struct TeamShared {
     clog: u32,
     fold: bool,
     trace: Option<TeamTrace>,
+    /// One scanner per physical core (`FLOCK_NO_GRIND_ONE_PER_CORE`): the
+    /// ranked pin16 core count, or 0 when every thread scans. `caller` is the
+    /// grinding worker's index; `started` counts scanners that entered `work`.
+    cores: usize,
+    caller: usize,
+    started: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(all(
@@ -1809,6 +1818,9 @@ impl TeamShared {
     /// One team member: claim ascending chunks until past the best match.
     fn work(&self) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
+        if self.cores != 0 {
+            self.started.fetch_add(1, AcqRel);
+        }
         if let Some(t) = &self.trace {
             let i = t.n.fetch_add(1, Relaxed);
             if i < TEAM_SLOTS {
@@ -1843,6 +1855,23 @@ impl TeamShared {
         if let Some(sl) = slot {
             sl.store(u64::MAX, SeqCst);
         }
+    }
+
+    /// A helper's entry: with one scanner per core, worker `i` (pin16: core
+    /// `i % cores`) scans iff it is the first sibling of a core other than the
+    /// caller's. A thread outside the team still scans when it arrived as a
+    /// fresh helper while fewer than `cores` scanners have started, so a core
+    /// whose first sibling got no job is not left idle.
+    fn join(&self, fresh: bool) {
+        if self.cores != 0
+            && let Some(i) = rayon::current_thread_index()
+            && i != self.caller
+            && (i >= self.cores || i == self.caller % self.cores)
+            && !(fresh && self.started.load(std::sync::atomic::Ordering::Acquire) < self.cores)
+        {
+            return;
+        }
+        self.work();
     }
 }
 
@@ -1885,7 +1914,7 @@ fn team_helper(sh: std::sync::Arc<TeamShared>, hold_us: u64) {
         static IN_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     let mut seen = HUB.epoch.0.load(Acquire);
-    sh.work();
+    sh.join(true);
     drop(sh);
     // A helper job run nested under this thread's own hold loop (through
     // `yield_now`) must not hold again: one holder per thread keeps the
@@ -1903,7 +1932,7 @@ fn team_helper(sh: std::sync::Arc<TeamShared>, hold_us: u64) {
             seen = e;
             let job = HUB.job.read().unwrap_or_else(|p| p.into_inner()).clone();
             if let Some(job) = job {
-                job.work();
+                job.join(false);
             }
             t_end = std::time::Instant::now() + hold;
             continue;
@@ -1949,6 +1978,14 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
     } else {
         threads
     };
+    static ONE_PER_CORE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_ONE_PER_CORE").is_none());
+    let pc = crate::ranked_pin16_cores();
+    let caller = rayon::current_thread_index();
+    let cores = match caller {
+        Some(_) if *ONE_PER_CORE && k.detach && team == threads && pc != 0 && threads == 2 * pc => pc,
+        _ => 0,
+    };
     let sh = std::sync::Arc::new(TeamShared {
         next: TeamPad(AtomicU64::new(0)),
         best_c: TeamPad(AtomicU64::new(u64::MAX)),
@@ -1963,6 +2000,9 @@ fn grind_team_avx512(state_digest: &[u8; 32], bits: u32, k: &TeamKnobs) -> u64 {
             n: AtomicUsize::new(0),
             found_at: AtomicU64::new(u64::MAX),
         }),
+        cores,
+        caller: caller.unwrap_or(0),
+        started: AtomicUsize::new(0),
     });
     let helpers = team - 1;
     if k.detach {

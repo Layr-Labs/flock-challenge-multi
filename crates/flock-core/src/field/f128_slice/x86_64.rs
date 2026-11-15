@@ -339,6 +339,62 @@ pub(super) unsafe fn fold16_banked(src: &[F128], dst: &mut [F128], w: &[F128; 16
     }
 }
 
+/// Bank-major weighted collapse with deferred reduction, four adjacent output
+/// positions per vector: `dst[p] = Σ_{b<banks} w[b] · src[b·n + p]`,
+/// `n = dst.len()`, `banks = w.len()`.
+///
+/// Bank `b`'s four positions `p..p+4` are contiguous (`src[b·n + p..]`), so
+/// each load is already one output position per 128-bit lane; it is
+/// multiplied by the broadcast weight into ONE four-lane unreduced
+/// accumulator (`WideGhashX4::mul_acc2`, two banks per call), and each lane is
+/// reduced once after all banks (`reduce_lanes`) and stored once. The lanes
+/// are never XORed together: lane `l` stays output `p + l`. The product count
+/// is unchanged; the per-product reductions and the per-bank output
+/// load/store of the `scale_slice` + `add_scaled` chain are gone.
+/// Field-identical: GF(2^128) addition is XOR and the reduction is F₂-linear.
+///
+/// # Safety
+/// Caller guarantees `avx512f` + `vpclmulqdq` and `src.len() == w.len() * dst.len()`.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn collapse_banks(src: &[F128], w: &[F128], dst: &mut [F128]) {
+    use crate::field::gf2_128::x86_64::WideGhashX4;
+    use core::arch::x86_64::*;
+    let n = dst.len();
+    let banks = w.len();
+    debug_assert_eq!(src.len(), banks * n);
+    // SAFETY: caller guarantees the target features and source bounds.
+    unsafe {
+        let wb = |b: usize| _mm512_broadcast_i32x4(_mm_set_epi64x(w[b].hi as i64, w[b].lo as i64));
+        let quads = n & !3;
+        let mut p = 0usize;
+        while p < quads {
+            let mut acc = WideGhashX4::zero();
+            let mut b = 0usize;
+            while b + 2 <= banks {
+                let x0 = _mm512_loadu_si512(src.as_ptr().add(b * n + p) as *const __m512i);
+                let x1 = _mm512_loadu_si512(src.as_ptr().add((b + 1) * n + p) as *const __m512i);
+                acc.mul_acc2(x0, wb(b), x1, wb(b + 1));
+                b += 2;
+            }
+            if b < banks {
+                let x0 = _mm512_loadu_si512(src.as_ptr().add(b * n + p) as *const __m512i);
+                acc.mul_acc(x0, wb(b));
+            }
+            _mm512_storeu_si512(dst.as_mut_ptr().add(p) as *mut __m512i, acc.reduce_lanes());
+            p += 4;
+        }
+        while p < n {
+            let mut v = F128::ZERO;
+            for b in 0..banks {
+                v += w[b] * src[b * n + p];
+            }
+            dst[p] = v;
+            p += 1;
+        }
+    }
+}
+
 /// Sixty-four-bank weighted + nested fold: fuses [`fold16_banked`] and
 /// [`fold4_nested`] in registers without materializing the 4x intermediate
 /// buffer (`mid4`).
@@ -764,6 +820,104 @@ pub(super) unsafe fn bind_both_and_msg_split(
             cq1[i] = hi;
             zq0[i] = zlo;
             zq1[i] = zhi;
+            e1_acc ^= hi.mul_unreduced(zhi);
+            einf_acc ^= (hi + lo).mul_unreduced(zhi + zlo);
+            i += 1;
+        }
+        e1_acc ^= e1_wide.fold();
+        einf_acc ^= einf_wide.fold();
+        (e1_acc.reduce(), einf_acc.reduce())
+    }
+}
+
+/// [`bind_both_and_msg_split`] with the `z` bound values written to separate
+/// output runs `zo0/zo1` instead of over `zq0/zq1` (same per-slot values and
+/// message). Per slot `i`:
+/// `lo = c0[i] + r·(c2[i]+c0[i])`, `hi = c1[i] + r·(c3[i]+c1[i])`, likewise
+/// for `z`; `c0[i]/c1[i]/zo0[i]/zo1[i]` take the bound values, and the message
+/// accumulates `hi·zhi` and `(hi+lo)·(zhi+zlo)`.
+///
+/// Quarters are separate contiguous runs, so no lane permute is needed; the
+/// four binds share one broadcast `r`.
+///
+/// # Safety
+/// Requires `avx512f` and `vpclmulqdq`; all ten slices at least `n` long.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bind_both_and_msg_split_zout(
+    cq0: &mut [F128],
+    cq1: &mut [F128],
+    cq2: &[F128],
+    cq3: &[F128],
+    zq0: &[F128],
+    zq1: &[F128],
+    zq2: &[F128],
+    zq3: &[F128],
+    zo0: &mut [F128],
+    zo1: &mut [F128],
+    r: F128,
+    n: usize,
+) -> (F128, F128) {
+    use crate::field::gf2_128::F256Unreduced;
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+
+    // SAFETY: caller guarantees features and that every slice covers `n`.
+    unsafe {
+        let r_bcast = _mm512_broadcast_i32x4(_mm_set_epi64x(r.hi as i64, r.lo as i64));
+        let r_x64 = ghash_shift64_x4(r_bcast);
+        let mut e1_wide = WideGhashX4::zero();
+        let mut einf_wide = WideGhashX4::zero();
+        let lanes = n & !3;
+        let mut i = 0usize;
+        while i < lanes {
+            let c0 = _mm512_loadu_si512(cq0.as_ptr().add(i) as *const __m512i);
+            let c1 = _mm512_loadu_si512(cq1.as_ptr().add(i) as *const __m512i);
+            let c2 = _mm512_loadu_si512(cq2.as_ptr().add(i) as *const __m512i);
+            let c3 = _mm512_loadu_si512(cq3.as_ptr().add(i) as *const __m512i);
+            let z0 = _mm512_loadu_si512(zq0.as_ptr().add(i) as *const __m512i);
+            let z1 = _mm512_loadu_si512(zq1.as_ptr().add(i) as *const __m512i);
+            let z2 = _mm512_loadu_si512(zq2.as_ptr().add(i) as *const __m512i);
+            let z3 = _mm512_loadu_si512(zq3.as_ptr().add(i) as *const __m512i);
+
+            let lo = _mm512_xor_si512(
+                c0,
+                ghash_mul_x4_split(_mm512_xor_si512(c2, c0), r_bcast, r_x64),
+            );
+            let hi = _mm512_xor_si512(
+                c1,
+                ghash_mul_x4_split(_mm512_xor_si512(c3, c1), r_bcast, r_x64),
+            );
+            let zlo = _mm512_xor_si512(
+                z0,
+                ghash_mul_x4_split(_mm512_xor_si512(z2, z0), r_bcast, r_x64),
+            );
+            let zhi = _mm512_xor_si512(
+                z1,
+                ghash_mul_x4_split(_mm512_xor_si512(z3, z1), r_bcast, r_x64),
+            );
+
+            _mm512_storeu_si512(cq0.as_mut_ptr().add(i) as *mut __m512i, lo);
+            _mm512_storeu_si512(cq1.as_mut_ptr().add(i) as *mut __m512i, hi);
+            _mm512_storeu_si512(zo0.as_mut_ptr().add(i) as *mut __m512i, zlo);
+            _mm512_storeu_si512(zo1.as_mut_ptr().add(i) as *mut __m512i, zhi);
+
+            e1_wide.mul_acc(hi, zhi);
+            einf_wide.mul_acc(_mm512_xor_si512(hi, lo), _mm512_xor_si512(zhi, zlo));
+            i += 4;
+        }
+        let mut e1_acc = F256Unreduced::ZERO;
+        let mut einf_acc = F256Unreduced::ZERO;
+        while i < n {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zo0[i] = zlo;
+            zo1[i] = zhi;
             e1_acc ^= hi.mul_unreduced(zhi);
             einf_acc ^= (hi + lo).mul_unreduced(zhi + zlo);
             i += 1;

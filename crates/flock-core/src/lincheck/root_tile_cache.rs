@@ -456,15 +456,47 @@ impl RootTileCache {
         let plane_offset = plane_storage.as_ptr().align_offset(64);
         #[cfg(test)]
         let mut planes = &mut plane_storage[plane_offset..plane_offset + workers * stride];
-        let mut active = vec![0u8; workers];
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::{Acquire, Release, SeqCst}};
+        let active: Vec<AtomicU8> = (0..workers).map(|_| AtomicU8::new(0)).collect();
+        let next = AtomicUsize::new(0);
         let dynamic = dynamic_tiles_enabled();
+        // Every element of `out` is written before it is read (see below).
+        // `FLOCK_NO_RF_UNINIT` restores the cleared buffer.
+        static RF_UNINIT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RF_UNINIT").is_none());
+        let output_blocks = self.blocks + usize::from(self.fixed_roots);
+        let n_out = output_blocks * 64;
+        let mut out: Vec<F128> = if *RF_UNINIT {
+            let mut v = Vec::with_capacity(n_out);
+            // SAFETY: F128 is plain data and every element is written before
+            // any read (see below).
+            unsafe { v.set_len(n_out) };
+            v
+        } else {
+            vec![F128::ZERO; n_out]
+        };
+        // `FLOCK_NO_RF_PLANE_FUSE` restores the separate reduction region. The
+        // fused form needs the dynamic claim counter: with static ranges every
+        // worker item must run, and a spin barrier could not be deadlock-free.
+        static RF_PLANE_FUSE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RF_PLANE_FUSE").is_none());
+        let fuse = *RF_PLANE_FUSE && dynamic;
+        let started = AtomicUsize::new(0);
+        let finished = AtomicUsize::new(0);
+        let red_next = AtomicUsize::new(0);
+        // Raw bases (as usize so the closure stays Send/Sync): plane `w` is
+        // written only through `planes_base + w*stride` by the item that
+        // claimed tiles; `out` blocks are written only by their claimer.
+        let planes_base = planes.as_mut_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
         crate::rstrace::ev("rf:par0", workers as u32);
-        planes
-            .par_chunks_mut(stride)
-            .zip(active.par_iter_mut())
-            .enumerate()
-            .for_each(|(worker, (dst, active))| {
+        (0..workers)
+            .into_par_iter()
+            .for_each(|worker| {
+                // Counted before any claim: a tile-claiming item is always
+                // in `started` until it has finished folding.
+                started.fetch_add(1, SeqCst);
+                let dst_ptr = (planes_base as *mut core::mem::MaybeUninit<u8>).wrapping_add(worker * stride);
                 crate::rstrace::evd("rf:w0", worker as u32);
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
@@ -545,7 +577,7 @@ impl RootTileCache {
                                 kernels::gfni_fold_word_tiles4(
                                     source.add(block * 512),
                                     matrices.as_ptr().cast::<u64>(),
-                                    dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                    dst_ptr.cast::<u8>().add(block * 1024),
                                     self.blocks * 512, count, first,
                                     WORD_TO_COLUMNS.as_ptr(),
                                     prefetch_blocks && block + 1 < self.blocks);
@@ -588,35 +620,86 @@ impl RootTileCache {
                             kernels::gfni_fold_rows(
                                 &rows,
                                 &mats,
-                                dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                dst_ptr.cast::<u8>().add(block * 1024),
                                 first,
                             );
                         }
                     }
                     first = false;
                 }
-                *active = u8::from(!first);
+                active[worker].store(u8::from(!first), Release);
                 crate::rstrace::evd("rf:w1", worker as u32);
+                if !fuse {
+                    return;
+                }
+                // Fused plane reduction. Barrier: wait until every item that
+                // has started has finished folding. This item's own claim loop
+                // ended with `next >= tiles`, so an item that starts later
+                // claims nothing, leaves its flag 0 and its plane unread.
+                // Only started items are waited for and they never wait on
+                // anything but this count, so there is no deadlock even if
+                // the items do not all run concurrently.
+                finished.fetch_add(1, SeqCst);
+                loop {
+                    let s = started.load(SeqCst);
+                    if finished.load(SeqCst) == s {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                let active_workers: Vec<usize> = active
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| (v.load(Acquire) != 0).then_some(i))
+                    .collect();
+                // SAFETY: all claiming items finished writing their planes
+                // before their `finished` increment (SeqCst, observed above);
+                // inactive planes are neither read nor written.
+                let planes_ro = unsafe {
+                    core::slice::from_raw_parts(
+                        planes_base as *const core::mem::MaybeUninit<u8>, workers * stride)
+                };
+                const RUN: usize = 4;
+                loop {
+                    let b0 = red_next.fetch_add(RUN, SeqCst);
+                    if b0 >= output_blocks {
+                        break;
+                    }
+                    for block in b0..(b0 + RUN).min(output_blocks) {
+                        // Leave the omitted group for the boundary move below.
+                        if self.fixed_roots && block == 14 { continue; }
+                        let source = block - usize::from(self.fixed_roots && block > 14);
+                        // SAFETY: the claim counter hands each `block` to
+                        // exactly one thread, so this 64-element window of
+                        // `out` is exclusively ours; `out` is not otherwise
+                        // touched until the region joins.
+                        unsafe {
+                            let dst = core::slice::from_raw_parts_mut(
+                                (out_base as *mut F128).add(block * 64), 64);
+                            reduce_worker_plane_block(planes_ro, stride, &active_workers, source, dst);
+                        }
+                    }
+                }
             });
         crate::rstrace::ev("rf:red0", 0);
-        let active_workers: Vec<usize> = active
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, v)| (v != 0).then_some(i))
-            .collect();
-        let output_blocks = self.blocks + usize::from(self.fixed_roots);
-        let mut out = vec![F128::ZERO; output_blocks * 64];
-        out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
-            // Leave the omitted group clear. The boundary group's surviving
-            // bits are moved into it after the parallel reduction joins.
-            if self.fixed_roots && block == 14 { return; }
-            let source = block - usize::from(self.fixed_roots && block > 14);
-            // SAFETY: every active worker initialized this live block and
-            // the Rayon producer join completed before reduction starts.
-            unsafe {
-                reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
-            }
-        });
+        if !fuse {
+            let active_workers: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| (v.load(Acquire) != 0).then_some(i))
+                .collect();
+            out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
+                // Leave the omitted group clear. The boundary group's surviving
+                // bits are moved into it after the parallel reduction joins.
+                if self.fixed_roots && block == 14 { return; }
+                let source = block - usize::from(self.fixed_roots && block > 14);
+                // SAFETY: every active worker initialized this live block and
+                // the Rayon producer join completed before reduction starts.
+                unsafe {
+                    reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
+                }
+            });
+        }
         crate::rstrace::ev("lcf:reduced", 0);
         if self.fixed_roots {
             out.copy_within(833..896, 897);
