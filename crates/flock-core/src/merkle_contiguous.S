@@ -2,6 +2,15 @@
 // Changed: contiguous fixed strides, no input pointer array, zero counter, full 16-input groups only.
 .text
 // R10 is call-clobbered and unused throughout the incumbent leaf body.
+// R10 = 0: canonical output; 1: CV planes; 2 (64-byte only): both, planes to
+// the 11th argument [rbp+0x58] (advanced by 512 per group), canonical to out.
+.p2align 6
+.global flock_blake3_dual_64
+.hidden flock_blake3_dual_64
+.type flock_blake3_dual_64, @function
+flock_blake3_dual_64:
+        mov     r10d, 2
+        jmp     .Lflock_leaf_shared_64
 .p2align 6
 .global flock_blake3_planes_leaf_64
 .hidden flock_blake3_planes_leaf_64
@@ -951,7 +960,8 @@ flock_blake3_contiguous_64:
         jne     9b
         mov     rbx, qword ptr [rbp+0x50]
         test    r10d, r10d
-        jnz     .Lflock_leaf_store_64
+        jnz     .Lflock_leaf_planes_64
+.Lflock_leaf_canon_64:
         vpunpckldq zmm16, zmm0, zmm1
         vpunpckhdq zmm17, zmm0, zmm1
         vpunpckldq zmm18, zmm2, zmm3
@@ -1009,8 +1019,24 @@ flock_blake3_contiguous_64:
         pop     r14
         pop     r15
         ret
+.Lflock_leaf_planes_64:
+        cmp     r10d, 1
+        je      .Lflock_leaf_store_64
+        mov     r11, qword ptr [rbp+0x58]
+        vmovdqu32 zmmword ptr [r11], zmm0
+        vmovdqu32 zmmword ptr [r11+0x1*0x40], zmm1
+        vmovdqu32 zmmword ptr [r11+0x2*0x40], zmm2
+        vmovdqu32 zmmword ptr [r11+0x3*0x40], zmm3
+        vmovdqu32 zmmword ptr [r11+0x4*0x40], zmm4
+        vmovdqu32 zmmword ptr [r11+0x5*0x40], zmm5
+        vmovdqu32 zmmword ptr [r11+0x6*0x40], zmm6
+        vmovdqu32 zmmword ptr [r11+0x7*0x40], zmm7
+        add     r11, 512
+        mov     qword ptr [rbp+0x58], r11
+        jmp     .Lflock_leaf_canon_64
 .size flock_blake3_contiguous_64, .-flock_blake3_contiguous_64
 .size flock_blake3_planes_leaf_64, .-flock_blake3_planes_leaf_64
+.size flock_blake3_dual_64, .-flock_blake3_dual_64
 // R10 is call-clobbered and unused throughout the incumbent leaf body.
 .p2align 6
 .global flock_blake3_planes_leaf_128

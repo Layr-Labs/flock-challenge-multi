@@ -519,11 +519,45 @@ fn finalize_cpu_commit(
             // nodes [start >> j, (start + len) >> j) of it.
             let mut lvl_read_off = parent_range.start; // level 0 = leaves
             let mut lvl_read_len = len;
-            for j in 1..=depth {
+            let mut j = 1;
+            while j <= depth {
                 let nodes_j = stored_leaves >> j;
                 let base_j = 2 * stored_leaves - 2 * nodes_j;
                 let write_off = base_j + (parent_range.start >> j);
                 let write_len = len >> j;
+                // Levels j and j + 1 together when j + 1 is also folded here:
+                // level j+1 is hashed from level j's CV planes (same CVs as
+                // two single-level calls; complete 16-groups only, otherwise
+                // the helper falls back to two single-level calls).
+                if j < depth {
+                    let nodes_k = stored_leaves >> (j + 1);
+                    let base_k = 2 * stored_leaves - 2 * nodes_k;
+                    let top_off = base_k + (parent_range.start >> (j + 1));
+                    let top_len = len >> (j + 1);
+                    // SAFETY: as below; the three ranges are this worker's own
+                    // slices of levels j - 1, j and j + 1 and never alias.
+                    let (read, mid, top) = unsafe {
+                        (
+                            core::slice::from_raw_parts(
+                                (tree_addr as *const Hash).add(lvl_read_off),
+                                lvl_read_len,
+                            ),
+                            core::slice::from_raw_parts_mut(
+                                (tree_addr as *mut Hash).add(write_off),
+                                write_len,
+                            ),
+                            core::slice::from_raw_parts_mut(
+                                (tree_addr as *mut Hash).add(top_off),
+                                top_len,
+                            ),
+                        )
+                    };
+                    merkle::hash_pairs_two_levels_serial(read, mid, top, kind);
+                    lvl_read_off = top_off;
+                    lvl_read_len = top_len;
+                    j += 2;
+                    continue;
+                }
                 // SAFETY: the read range is this worker's own just-written
                 // nodes of level j−1 (leaves for j = 1); the write range is
                 // this worker's own disjoint slice of level j. Both are inside
@@ -543,6 +577,7 @@ fn finalize_cpu_commit(
                 merkle::hash_pairs_level_serial(read, write, kind);
                 lvl_read_off = write_off;
                 lvl_read_len = write_len;
+                j += 1;
             }
             if !super_done.is_empty() {
                 if len != RANKED_PARENT_SUBGROUP_LEAVES >> merkle_cut_depth

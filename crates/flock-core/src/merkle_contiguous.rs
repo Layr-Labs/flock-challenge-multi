@@ -119,6 +119,10 @@ unsafe extern "C" {
     fn flock_blake3_planes_leaf_512(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_planes_leaf_1024(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
     fn flock_blake3_planes_parent(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8);
+    /// 64-byte messages, both outputs: canonical CVs to `out` (as
+    /// `flock_blake3_contiguous_64`) and CV planes to `planes` (as
+    /// `flock_blake3_planes_leaf_64`), each advanced by 512 bytes per group.
+    fn flock_blake3_dual_64(data: *const u8, count: usize, blocks: usize, key: *const u32, counter: u64, increment: bool, flags: u8, start: u8, end: u8, out: *mut u8, planes: *mut u8);
 }
 
 /// Complete groups only. Every 32 leaves become 16 canonical parent CVs.
@@ -149,6 +153,48 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
             flock_blake3_planes_parent(planes, parents.len(), 1,
                 BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
                 parents.as_mut_ptr().cast());
+        }
+    }
+}
+
+/// Two parent levels at once. `children` are canonical CVs of level j-1
+/// (64 bytes per level-j node: left || right). Level j is hashed once by the
+/// dual-output 64-byte kernel with PARENT flags and start = end = 0 (exactly
+/// one PARENT compression per 64-byte message): its vector canonical
+/// transpose/store writes level j into `mid` (the tree slots openings read),
+/// and its CV planes go to a stack scratch from which `flock_blake3_planes_parent`
+/// hashes level j+1 into `top`, so level j is never re-read and re-transposed.
+/// Complete groups only: `top.len()` a positive multiple of 16,
+/// `mid.len() == 2 * top.len()`, `children.len() == 4 * top.len() * 32`.
+#[inline]
+pub(super) fn hash_parent_two_levels(children: &[u8], mid: &mut [Hash], top: &mut [Hash]) {
+    assert!(!top.is_empty() && top.len() % 16 == 0);
+    assert_eq!(mid.len(), 2 * top.len());
+    assert_eq!(children.len(), mid.len() * 64);
+    // At most 64 level-j nodes (planes) / 32 level-j+1 nodes per step, as in
+    // `hash_leaf_pairs`. No typed scratch reference exists before the
+    // assembly has written every byte that is read; the scratch outlives
+    // both calls of every step.
+    let mut scratch = core::mem::MaybeUninit::<[u8; 64 * 32]>::uninit();
+    for ((tops, mids), kids) in top
+        .chunks_mut(32)
+        .zip(mid.chunks_mut(64))
+        .zip(children.chunks(64 * 64))
+    {
+        let planes = scratch.as_mut_ptr().cast::<u8>();
+        // SAFETY: compile-time AVX-512/SysV module gate; `kids` holds exactly
+        // `mids.len()` 64-byte messages; `mids` is exactly `mids.len() * 32`
+        // canonical bytes; `mids.len()` is a multiple of 32, so both kernels
+        // see full 16-lane groups; the plane buffer holds
+        // `mids.len() * 32 <= 2048` bytes and does not overlap `mids`/`kids`;
+        // zero counters throughout.
+        unsafe {
+            flock_blake3_dual_64(kids.as_ptr(), mids.len(), 1,
+                BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
+                mids.as_mut_ptr().cast(), planes);
+            flock_blake3_planes_parent(planes, tops.len(), 1,
+                BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
+                tops.as_mut_ptr().cast());
         }
     }
 }
@@ -194,6 +240,34 @@ mod plane_tests {
                     assert!(plane_bytes[..64].iter().all(|&x| x == 0xa5));
                     assert!(plane_bytes[count * 32 + 64..].iter().all(|&x| x == 0xa5));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn dual_64_matches_canonical_and_plane_kernels() {
+        for flags in [super::super::BLAKE3_PARENT, 0] {
+            for count in [16usize, 32, 48, 64] {
+                let mut seed = 0x2545f4914f6cdd1du64 ^ count as u64;
+                let data: Vec<u8> = (0..count * 64)
+                    .map(|_| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u8 })
+                    .collect();
+                let mut want_canon = vec![0u8; count * 32];
+                let mut want_planes = vec![0u8; count * 32];
+                let mut canon = vec![0x5au8; count * 32 + 128];
+                let mut planes = vec![0xa5u8; count * 32 + 128];
+                unsafe {
+                    flock_blake3_contiguous_64(data.as_ptr(), count, 1, BLAKE3_IV.as_ptr(), 0, false,
+                        flags, 0, 0, want_canon.as_mut_ptr());
+                    flock_blake3_planes_leaf_64(data.as_ptr(), count, 1, BLAKE3_IV.as_ptr(), 0, false,
+                        flags, 0, 0, want_planes.as_mut_ptr());
+                    flock_blake3_dual_64(data.as_ptr(), count, 1, BLAKE3_IV.as_ptr(), 0, false,
+                        flags, 0, 0, canon.as_mut_ptr().add(64), planes.as_mut_ptr().add(64));
+                }
+                assert_eq!(canon[64..64 + count * 32], want_canon[..], "flags={flags} count={count}");
+                assert_eq!(planes[64..64 + count * 32], want_planes[..], "flags={flags} count={count}");
+                assert!(canon[..64].iter().chain(&canon[64 + count * 32..]).all(|&x| x == 0x5a));
+                assert!(planes[..64].iter().chain(&planes[64 + count * 32..]).all(|&x| x == 0xa5));
             }
         }
     }
