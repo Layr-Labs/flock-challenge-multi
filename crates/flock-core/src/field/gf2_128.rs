@@ -222,6 +222,74 @@ impl BitXorAssign for F256Unreduced {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+type WideSumRepr = x86_64::KaratsubaLimbs;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+type WideSumRepr = F256Unreduced;
+
+/// Σ aᵢ·bᵢ with one reduction: XOR-accumulate [`F128WideSum::product`] terms
+/// and call [`F128WideSum::reduce`] once. On x86 the limbs stay in XMM
+/// registers (no GPR round trip as in [`F256Unreduced`]); a single product
+/// reduces to exactly `a * b`.
+#[derive(Clone, Copy)]
+pub struct F128WideSum(WideSumRepr);
+
+impl F128WideSum {
+    #[inline]
+    pub fn zero() -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq/sse4.1 are enabled at compile time.
+            Self(unsafe { x86_64::KaratsubaLimbs::zero() })
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            Self(F256Unreduced::ZERO)
+        }
+    }
+
+    #[inline]
+    pub fn product(a: F128, b: F128) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq/sse4.1 are enabled at compile time.
+            Self(unsafe { x86_64::KaratsubaLimbs::product(a, b) })
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            Self(ghash_mul_unreduced(a, b))
+        }
+    }
+
+    #[inline]
+    pub fn reduce(self) -> F128 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq/sse4.1 are enabled at compile time.
+            unsafe { self.0.reduce() }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            self.0.reduce()
+        }
+    }
+}
+
+impl BitXorAssign for F128WideSum {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq/sse4.1 are enabled at compile time.
+            self.0 = unsafe { self.0.xor(rhs.0) };
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            self.0 ^= rhs.0;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reduction mod p = x^128 + x^7 + x^2 + x + 1. Works on any target.
 // ---------------------------------------------------------------------------
@@ -340,6 +408,35 @@ mod tests {
             let x = rng.next_f128(); let y = rng.next_f128();
             assert_eq!(x * y, software::ghash_mul(x, y));
             assert_eq!(x.square(), software::ghash_mul(x, x));
+        }
+    }
+
+    #[test]
+    fn wide_sum_reduces_once_to_the_reduced_sum() {
+        let basis = |i: usize| if i < 64 { F128::new(1u64 << i, 0) }
+            else { F128::new(0, 1u64 << (i - 64)) };
+        assert_eq!(F128WideSum::zero().reduce(), F128::ZERO);
+        let top = F128::new(u64::MAX, u64::MAX);
+        for i in 0..128 {
+            for y in [basis(127), top, basis(i)] {
+                assert_eq!(F128WideSum::product(basis(i), y).reduce(), software::ghash_mul(basis(i), y));
+            }
+        }
+        let mut rng = Rng::new(0x52_7765_6967);
+        for len in [1usize, 2, 3, 26, 257] {
+            let pairs: Vec<(F128, F128)> = (0..len).map(|_| (rng.next_f128(), rng.next_f128())).collect();
+            let mut wide = F128WideSum::zero();
+            let mut reduced = F128::ZERO;
+            for &(a, b) in &pairs {
+                wide ^= F128WideSum::product(a, b);
+                reduced += a * b;
+            }
+            assert_eq!(wide.reduce(), reduced, "len {len}");
+            // Cancellation: every product twice reduces to zero.
+            for &(a, b) in &pairs {
+                wide ^= F128WideSum::product(a, b);
+            }
+            assert_eq!(wide.reduce(), F128::ZERO, "len {len} doubled sum");
         }
     }
 
