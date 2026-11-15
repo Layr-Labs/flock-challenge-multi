@@ -582,7 +582,7 @@ pub(crate) mod smt_split {
                     .and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..16).contains(n)) {
                     Some(workers) => super::arm_cpus_for_workers(&groups, workers),
                     None if rebalance => (s0, s1),
-                    None => super::arm_cpus_for_workers(&groups, 7),
+                    None => super::arm_cpus_for_workers(&groups, 8),
                 }
             } else { (s0, s1) };
             let p0 = half(0, s0, debug);

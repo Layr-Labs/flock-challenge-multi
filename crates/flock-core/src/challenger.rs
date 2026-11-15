@@ -172,6 +172,57 @@ const OP_BYTES: u8 = 0x05;
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
+/// Transcript record of one observed scalar: the op/kind tag followed by the
+/// little-endian low and high limbs, i.e. exactly the bytes the three separate
+/// absorbs (tag, `lo`, `hi`) used to feed the hasher, in the same order.
+#[inline]
+fn scalar_record(op: u8, value: F128) -> [u8; 18] {
+    let mut rec = [0u8; 18];
+    rec[0] = op;
+    rec[1] = KIND_SCALAR;
+    rec[2..10].copy_from_slice(&value.lo.to_le_bytes());
+    rec[10..].copy_from_slice(&value.hi.to_le_bytes());
+    rec
+}
+
+/// Header of a slice operation: the op/kind tag followed by the little-endian
+/// element count, i.e. exactly the bytes of the two separate absorbs (tag,
+/// length) it replaces, in the same order.
+#[inline]
+fn slice_header(op: u8, len: usize) -> [u8; 10] {
+    let mut hdr = [0u8; 10];
+    hdr[0] = op;
+    hdr[1] = KIND_SLICE;
+    hdr[2..].copy_from_slice(&(len as u64).to_le_bytes());
+    hdr
+}
+
+// `F128` is `#[repr(C, align(16))]` with two `u64` fields (`lo`, then `hi`),
+// so it is exactly 16 bytes with no padding.
+const _: () = assert!(core::mem::size_of::<F128>() == 16);
+
+/// The bytes of an `F128` slice. On little-endian targets each element's
+/// in-memory bytes are `lo.to_le_bytes() ‖ hi.to_le_bytes()`, the transcript
+/// encoding of one element, so the whole slice is its encoding in one piece.
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes(values: &[F128]) -> &[u8] {
+    // SAFETY: F128 is two adjacent u64 fields under repr(C) with no padding
+    // (size checked above), so every byte of the slice is initialized.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values)) }
+}
+
+/// Mutable byte view of an `F128` slice (little-endian targets): writing a
+/// 16-byte transcript chunk into element `i` sets `lo` and `hi` to its two
+/// little-endian halves. Every bit pattern is a valid `F128`.
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes_mut(values: &mut [F128]) -> &mut [u8] {
+    let len = core::mem::size_of_val(values);
+    // SAFETY: as `f128s_as_bytes`; both fields accept any bit pattern.
+    unsafe { core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len) }
+}
+
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
 /// tracked via [`FsChallenger::absorbed_bytes`].
@@ -266,6 +317,8 @@ impl FsChallenger {
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
+    /// Per-element absorb, used by the big-endian slice fallback only.
+    #[cfg(not(target_endian = "little"))]
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
@@ -328,13 +381,19 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        // One update for the 18-byte record instead of three (tag, lo, hi).
+        self.absorb(&scalar_record(OP_OBSERVE, value));
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        // One update for the 10-byte header instead of two (tag, length).
+        self.absorb(&slice_header(OP_OBSERVE, values.len()));
+
+        // One update for the whole payload instead of two per element.
+        #[cfg(target_endian = "little")]
+        self.absorb(f128s_as_bytes(values));
+
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }
@@ -362,19 +421,34 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
-        self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+        // One update for the 10-byte header instead of two (tag, length).
+        self.absorb(&slice_header(OP_SQUEEZE, n));
+
+        // Squeeze straight into the returned elements: the same stream bytes,
+        // re-absorbed as one piece, with no intermediate byte buffer.
+        #[cfg(target_endian = "little")]
+        {
+            let mut values = vec![F128::ZERO; n];
+            let bytes = f128s_as_bytes_mut(&mut values);
+            self.squeeze_into(bytes);
+            self.absorb(bytes);
+            values
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = vec![0u8; n * 16];
+            self.squeeze_into(&mut buf);
+            self.absorb(&buf);
+            buf.as_chunks::<16>()
+                .0
+                .iter()
+                .map(|c| F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -2707,6 +2781,65 @@ mod tests {
     }
 
     // ---- FsChallenger ------------------------------------------------------
+
+    /// The coalesced absorbs feed the hasher exactly the byte stream of the
+    /// legacy piecewise absorbs: same challenges, same state digest, same
+    /// absorbed-byte count, for every hash, before and after squeezes.
+    #[test]
+    fn fs_challenger_coalesced_absorbs_match_piecewise_stream() {
+        fn legacy_scalar(c: &mut FsChallenger, v: F128) {
+            c.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+            c.absorb(&v.lo.to_le_bytes());
+            c.absorb(&v.hi.to_le_bytes());
+        }
+        fn legacy_slice(c: &mut FsChallenger, vs: &[F128]) {
+            c.absorb(&[OP_OBSERVE, KIND_SLICE]);
+            c.absorb(&(vs.len() as u64).to_le_bytes());
+            for v in vs {
+                c.absorb(&v.lo.to_le_bytes());
+                c.absorb(&v.hi.to_le_bytes());
+            }
+        }
+        fn legacy_sample_vec(c: &mut FsChallenger, n: usize) -> Vec<F128> {
+            c.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+            c.absorb(&(n as u64).to_le_bytes());
+            let mut buf = vec![0u8; n * 16];
+            c.squeeze_into(&mut buf);
+            c.absorb(&buf);
+            buf.chunks_exact(16)
+                .map(|ch| F128 {
+                    lo: u64::from_le_bytes(ch[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(ch[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
+        let vals: Vec<F128> = (0..67u64)
+            .map(|i| F128 {
+                lo: 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1),
+                hi: 0xC2B2_AE3D_27D4_EB4Fu64.rotate_left(i as u32) ^ i,
+            })
+            .collect();
+        for kind in KINDS {
+            let mut new = FsChallenger::with_hash(b"coalesced-absorbs", kind);
+            let mut old = FsChallenger::with_hash(b"coalesced-absorbs", kind);
+            for round in 0..4usize {
+                let v = vals[round];
+                new.observe_f128(v);
+                legacy_scalar(&mut old, v);
+                let s = &vals[..1 + 22 * round];
+                new.observe_f128_slice(s);
+                legacy_slice(&mut old, s);
+                new.observe_f128_slice(&[]);
+                legacy_slice(&mut old, &[]);
+                assert_eq!(new.state_digest(), old.state_digest());
+                assert_eq!(new.sample_f128(), old.sample_f128());
+                let n = [0usize, 1, 5, 64][round];
+                assert_eq!(new.sample_f128_vec(n), legacy_sample_vec(&mut old, n));
+                assert_eq!(new.n_absorbed, old.n_absorbed);
+            }
+            assert_eq!(new.state_digest(), old.state_digest());
+        }
+    }
 
     #[test]
     fn fs_challenger_identical_scripts_produce_identical_output() {

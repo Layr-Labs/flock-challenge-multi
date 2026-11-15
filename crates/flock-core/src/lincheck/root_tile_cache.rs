@@ -424,6 +424,12 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Schedule-only leaf (patternrecognition9-del 0cde1b93, runner in-run reads
+        // -0.15% and -0.35%): four GFNI pairs before their XORs. FLOCK_NO_ROOT_PIPELINED=1 restores.
+        static PIPELINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_PIPELINED").is_none()
+        });
+        let pipelined = BATCH_WORD_TILES && *PIPELINED;
         // Resolve the tile group once, outside the parallel reader. Two-tile
         // groups reduced measured lincheck latency on the ranked CPU shape.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -532,6 +538,16 @@ impl RootTileCache {
                             }
                         }
                         for block in 0..self.blocks {
+                            if pipelined {
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_pipelined(
+                                        source.add(block * 512), matrices.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                                continue;
+                            }
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
                             // and actual tile stride is blocks*512. Arrays of
@@ -605,7 +621,21 @@ impl RootTileCache {
             .filter_map(|(i, v)| (v != 0).then_some(i))
             .collect();
         let output_blocks = self.blocks + usize::from(self.fixed_roots);
-        let mut out = vec![F128::ZERO; output_blocks * 64];
+        // Every element is written below (live blocks by the reduction, the
+        // omitted group by the boundary move and fill), so the buffer need not
+        // be cleared first. `FLOCK_NO_RF_UNINIT` restores the cleared buffer.
+        static RF_UNINIT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RF_UNINIT").is_none());
+        let n_out = output_blocks * 64;
+        let mut out: Vec<F128> = if *RF_UNINIT {
+            let mut v = Vec::with_capacity(n_out);
+            // SAFETY: F128 is plain data and every element is written before
+            // any read (see above).
+            unsafe { v.set_len(n_out) };
+            v
+        } else {
+            vec![F128::ZERO; n_out]
+        };
         out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
