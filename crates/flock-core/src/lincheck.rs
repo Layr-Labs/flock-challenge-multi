@@ -4804,7 +4804,7 @@ fn gl1_lc_team_min() -> usize {
         if std::env::var_os("FLOCK_NO_GL1_LC_TEAM").is_some() {
             return 0;
         }
-        std::env::var("FLOCK_GL1_LC_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+        std::env::var("FLOCK_GL1_LC_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1024)
     });
     if *MIN != 0 && crate::flat_par::team_enabled() && crate::flat_par::team_ready() {
         *MIN
