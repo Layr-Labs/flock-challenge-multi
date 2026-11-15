@@ -5303,6 +5303,7 @@ pub fn prove_padded<Ch: Challenger>(
         circuit,
         x_ab,
         ZCaptureMode::None,
+        None,
         challenger,
     );
     (proof, claim)
@@ -5347,6 +5348,7 @@ pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
         circuit,
         x_ab,
         capture,
+        None,
         challenger,
     );
     (
@@ -5354,6 +5356,100 @@ pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
         claim,
         captured.expect("a capture mode must produce z_vec"),
         actual,
+    )
+}
+
+/// [`prove_padded_capture_z_vec_mode`] that, when the ranked Fold8 capture
+/// happens, also returns its PCS A state
+/// ([`crate::pcs::ring_switch::fold8_a_state`]) built beside lincheck's
+/// remaining rounds. Same proof, claim, capture and transcript.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode_early_a<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (
+    LincheckProof,
+    LincheckClaim,
+    Vec<F128>,
+    ZCaptureMode,
+    Option<Vec<F128>>,
+) {
+    assert!(
+        capture != ZCaptureMode::None,
+        "capture mode must not be None"
+    );
+    let mut early_a = None;
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        Some(&mut early_a),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+        early_a,
+    )
+}
+
+/// Block-major counterpart of [`prove_padded_capture_z_vec_mode_early_a`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode_with_roots_early_a<Ch: Challenger>(
+    z_packed: &[F128],
+    roots: Option<&RootFoldSource>,
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (
+    LincheckProof,
+    LincheckClaim,
+    Vec<F128>,
+    ZCaptureMode,
+    Option<Vec<F128>>,
+) {
+    assert!(
+        capture != ZCaptureMode::None,
+        "capture mode must not be None"
+    );
+    let mut early_a = None;
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed, roots),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        Some(&mut early_a),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+        early_a,
     )
 }
 
@@ -5410,6 +5506,7 @@ pub fn prove_padded_capture_z_vec_block_major_mode_with_roots<Ch: Challenger>(
         circuit,
         x_ab,
         capture,
+        None,
         challenger,
     );
     (
@@ -5448,6 +5545,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         circuit,
         x_ab,
         ZCaptureMode::PreSumcheck,
+        None,
         challenger,
     );
     (proof, claim, captured.expect("capture must produce z_vec"))
@@ -5476,6 +5574,7 @@ pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
         circuit,
         x_ab,
         ZCaptureMode::PreSumcheck,
+        None,
         challenger,
     );
     (proof, claim, captured.expect("capture must produce z_vec"))
@@ -5491,6 +5590,7 @@ fn prove_padded_inner<Ch: Challenger>(
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     capture: ZCaptureMode,
+    early_a_out: Option<&mut Option<Vec<F128>>>,
     challenger: &mut Ch,
 ) -> (
     LincheckProof,
@@ -5724,6 +5824,9 @@ fn prove_padded_inner<Ch: Challenger>(
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
     let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    let early_a_on = fold8_ready && early_a_out.is_some();
+    let fold8_cell: std::sync::OnceLock<Vec<F128>> = std::sync::OnceLock::new();
+    let early_a_cell: std::sync::OnceLock<Vec<F128>> = std::sync::OnceLock::new();
     if inner_rest_len > 0 {
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
@@ -5739,32 +5842,54 @@ fn prove_padded_inner<Ch: Challenger>(
             sumcheck_round_eval_par(&comb_vec, &z_vec)
         };
         crate::rstrace::ev("lc:sc:r0", 0);
-        for t in 0..inner_rest_len {
-            challenger.observe_f128(e1);
-            challenger.observe_f128(einf);
-            let r = challenger.sample_f128();
-            rounds.push((e1, einf));
-            r_rounds.push(r);
-            if t + 1 < inner_rest_len {
-                // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
-                    gl1_bind_both_and_eval_next_team(&mut comb_vec, &mut z_vec, r)
+        // With an early-A request, the Fold8 capture goes into `fold8_cell` and
+        // a task in this scope builds its PCS A state from that borrow while
+        // the remaining rounds run; the scope joins it (the waiting thread
+        // runs it itself if no other worker has) before the capture is used.
+        rayon::in_place_scope(|scope| {
+            for t in 0..inner_rest_len {
+                challenger.observe_f128(e1);
+                challenger.observe_f128(einf);
+                let r = challenger.sample_f128();
+                rounds.push((e1, einf));
+                r_rounds.push(r);
+                if t + 1 < inner_rest_len {
+                    // Fused: bind both tables at r AND compute round (t+1)'s message.
+                    let (ne1, neinf) = if gl1_ok(comb_vec.len()) && comb_vec.len() == z_vec.len() {
+                        gl1_bind_both_and_eval_next_team(&mut comb_vec, &mut z_vec, r)
+                    } else {
+                        sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
+                    };
+                    e1 = ne1;
+                    einf = neinf;
                 } else {
-                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r)
-                };
-                e1 = ne1;
-                einf = neinf;
-            } else {
-                // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
-                sumcheck_bind_top_in_place_par(&mut z_vec, r);
+                    // Final round: just fold; z_vec collapses to z_partial.
+                    sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+                    sumcheck_bind_top_in_place_par(&mut z_vec, r);
+                }
+                if fold8_ready && t == 0 {
+                    debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
+                    if early_a_on {
+                        let _ = fold8_cell.set(z_vec.clone());
+                        if let Some(capture) = fold8_cell.get() {
+                            let out = &early_a_cell;
+                            scope.spawn(move |_| {
+                                let _ = out.set(crate::pcs::ring_switch::fold8_a_state(capture));
+                            });
+                        }
+                    } else {
+                        captured_z_vec = Some(z_vec.clone());
+                    }
+                }
+                crate::rstrace::ev("lc:sc:rnd", t as u32);
             }
-            if fold8_ready && t == 0 {
-                debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
-                captured_z_vec = Some(z_vec.clone());
-            }
-            crate::rstrace::ev("lc:sc:rnd", t as u32);
-        }
+        });
+    }
+    if let Some(capture) = fold8_cell.into_inner() {
+        captured_z_vec = Some(capture);
+    }
+    if let Some(out) = early_a_out {
+        *out = early_a_cell.into_inner();
     }
     if let Some(t) = t_sumcheck_start {
         eprintln!(

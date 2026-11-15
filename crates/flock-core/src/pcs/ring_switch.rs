@@ -3092,7 +3092,10 @@ fn build_direct_fold8_factors_from_slice(
         Some(p) => (Some(p.a), Some(p.eq)),
         None => (None, None),
     };
-    let a_state = if let Some(a) = pre_a.filter(|a| a.len() == state_len) {
+    let a_state = if let Some(a) = pre_a
+        .filter(|a| a.len() == state_len)
+        .or_else(|| early_ab_a_take(fold8))
+    {
         crate::rstrace::ev("rs:W0", 0);
         unsafe { direct_fold8_w_state_gfni_from_generators(&low_eq, generators, &mut w_state) };
         crate::rstrace::ev("rs:W1", 0);
@@ -4123,11 +4126,19 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                 // SAFETY: the owner waits for state 2 before its borrow of
                 // the tensor ends (claim tail or the final settle below).
                 let fold8 = unsafe { core::slice::from_raw_parts(addr as *const F128, len) };
-                let mut a = crate::alloc_uninit_vec::<F128>(len);
-                let (_, eq) = rayon::join(
-                    || direct_fold8_a_state_lines(fold8, &mut a),
-                    || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
-                );
+                // The A state lincheck already built from this very buffer, if
+                // any; only the tail eq split is left then.
+                let (a, eq) = match early_ab_a_take(fold8) {
+                    Some(a) => (a, build_eq_split(&tail, deferred_split_n_lo(tail.len()))),
+                    None => {
+                        let mut a = crate::alloc_uninit_vec::<F128>(len);
+                        let (_, eq) = rayon::join(
+                            || direct_fold8_a_state_lines(fold8, &mut a),
+                            || build_eq_split(&tail, deferred_split_n_lo(tail.len())),
+                        );
+                        (a, eq)
+                    }
+                };
                 *job.val.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreParts { a, eq });
                 job.state.store(2, Ordering::Release);
             });
@@ -4643,6 +4654,61 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         drop(e.take());
     }
     (results, gammas_rs)
+}
+
+/// AB's Fold8 A state (64 bank transposes into the bit-major table) for one
+/// bank tensor: the same values [`direct_fold8_a_state_lines`] writes.
+pub(crate) fn fold8_a_state(fold8: &[F128]) -> Vec<F128> {
+    let mut a = crate::alloc_uninit_vec::<F128>(fold8.len());
+    direct_fold8_a_state_lines(fold8, &mut a);
+    a
+}
+
+/// AB's A state that lincheck built beside its last rounds, handed to this
+/// proof's open. The entry holds only the address and length of the AB Fold8
+/// buffer it was built from (never dereferenced) and the owned A state.
+///
+/// Invariant kept by the prover: an entry is published by the core path at the
+/// end of the proof's core, while that buffer is alive, and is cleared by the
+/// same proof (after its open, and by a guard declared after the buffer, so
+/// also on unwind) before the buffer is freed. Every entry therefore names a
+/// live allocation of the proof that published it, and two live allocations
+/// never share an address: a consumer whose own live buffer has that address
+/// and length holds that very allocation. Any other buffer (C's tensor,
+/// another proof's) misses and builds the A state as before.
+struct EarlyAbA {
+    addr: usize,
+    len: usize,
+    a: Vec<F128>,
+}
+
+static EARLY_AB_A: std::sync::Mutex<Option<EarlyAbA>> = std::sync::Mutex::new(None);
+
+/// Publish (or, with `None`, clear) the early A state for the live AB Fold8
+/// buffer `fold8`. Always replaces the previous entry.
+pub fn early_ab_a_publish(fold8: &[F128], a: Option<Vec<F128>>) {
+    let entry = a
+        .filter(|a| !fold8.is_empty() && a.len() == fold8.len())
+        .map(|a| EarlyAbA {
+            addr: fold8.as_ptr() as usize,
+            len: fold8.len(),
+            a,
+        });
+    *EARLY_AB_A.lock().unwrap_or_else(|e| e.into_inner()) = entry;
+}
+
+/// Drop any published early A state.
+pub fn early_ab_a_clear() {
+    *EARLY_AB_A.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Take the published early A state iff it was built from this very buffer.
+fn early_ab_a_take(fold8: &[F128]) -> Option<Vec<F128>> {
+    let mut slot = EARLY_AB_A.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = slot
+        .as_ref()
+        .is_some_and(|e| e.addr == fold8.as_ptr() as usize && e.len == fold8.len());
+    if hit { slot.take().map(|e| e.a) } else { None }
 }
 
 /// Lane sl2: an A state built beside the observe chain (claim-once).

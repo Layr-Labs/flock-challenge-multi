@@ -589,6 +589,16 @@ pub(crate) fn prove_fast_ligerito_from_generated_witness<Ch: Challenger>(
     )
 }
 
+/// Clears the early AB A state published for this proof's AB Fold8 buffer when
+/// dropped. Declared after that buffer's owner, so it drops first.
+struct EarlyAbAGuard;
+
+impl Drop for EarlyAbAGuard {
+    fn drop(&mut self) {
+        pcs::ring_switch::early_ab_a_clear();
+    }
+}
+
 fn sl2_stash_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SL2_STASH").is_none());
@@ -726,8 +736,12 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
         lincheck_circuit,
         prefaulted_codeword,
         precommitted,
+        true,
         challenger,
     );
+    // Declared after the core's buffers, so it drops (clearing the early AB A
+    // state published for `s_hat_v_ab`) before they are freed, also on unwind.
+    let _early_ab_a = EarlyAbAGuard;
     flock_core::gaptime::mark("core: returned");
 
     let padding = r1cs.padding_spec();
@@ -817,6 +831,7 @@ fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
     // stale one defensively so a recycled buffer can never match it.
     flock_core::pcs::elided_z::forget(z_key.0, z_key.1);
     pcs::ring_switch::sl2_pre_settle();
+    pcs::ring_switch::early_ab_a_clear();
     let [ab, c] = claims_arr;
     if let Some(done) = stash {
         // Finished long ago (µs vs the ~20 ms open); waiting keeps the stash
@@ -1027,6 +1042,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         lincheck_circuit,
         prefaulted_codeword,
         None,
+        false,
         challenger,
     )
 }
@@ -1155,6 +1171,7 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
     precommitted: Option<(Commitment, pcs::ProverData)>,
+    early_ab_a: bool,
     challenger: &mut Ch,
 ) -> ProveCore {
     if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
@@ -1352,13 +1369,17 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // placement at −0.6% (its z-scan is L1-load-latency-bound and the
     // E-core stragglers dominate the barrier), overriding the earlier
     // ff7f68b-era 14T datapoint from the pre-NT-kernel lineage.
-    let (lc_proof, lc_claim, z_vec_pre, z_mode) = flock_core::in_pool(|| {
+    // Only the owning main path asks lincheck to build AB's A state beside its
+    // last rounds; every other caller keeps the plain capture.
+    let lc_mode = ab_capture_mode(r1cs, &s_hat_v_c);
+    let early_a = early_ab_a && lc_mode == lincheck::ZCaptureMode::RankedFold8Tail;
+    let (lc_proof, lc_claim, z_vec_pre, z_mode, early_a_state) = flock_core::in_pool(|| {
         flock_core::rstrace::ev("lc:inpool", 0);
         let _hot = flock_core::hot_pool::HotPool::start();
         flock_core::rstrace::ev("lc:hot", 0);
         let lc_out = match lincheck_input {
-            FastLincheckInput::Stripe(z_packed_lincheck) => {
-                let result = lincheck::prove_padded_capture_z_vec_mode(
+            FastLincheckInput::Stripe(z_packed_lincheck) if early_a => {
+                let result = lincheck::prove_padded_capture_z_vec_mode_early_a(
                     &z_packed_lincheck,
                     r1cs.m,
                     r1cs.k_log,
@@ -1366,16 +1387,14 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     r1cs.useful_bits,
                     lincheck_circuit,
                     &x_ab,
-                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    lc_mode,
                     challenger,
                 );
-                // The stripe copy is dead after lincheck. Stripe-based callers
-                // retain their existing allocation lifecycle.
                 drop(z_packed_lincheck);
                 result
             }
-            FastLincheckInput::BlockMajor => {
-                lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
+            FastLincheckInput::BlockMajor if early_a => {
+                lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots_early_a(
                     &z_packed,
                     roots.as_deref(),
                     r1cs.m,
@@ -1384,9 +1403,42 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
                     r1cs.useful_bits,
                     lincheck_circuit,
                     &x_ab,
-                    ab_capture_mode(r1cs, &s_hat_v_c),
+                    lc_mode,
                     challenger,
                 )
+            }
+            FastLincheckInput::Stripe(z_packed_lincheck) => {
+                let (p, c, z, m) = lincheck::prove_padded_capture_z_vec_mode(
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    lc_mode,
+                    challenger,
+                );
+                let result = (p, c, z, m, None);
+                // The stripe copy is dead after lincheck. Stripe-based callers
+                // retain their existing allocation lifecycle.
+                drop(z_packed_lincheck);
+                result
+            }
+            FastLincheckInput::BlockMajor => {
+                let (p, c, z, m) = lincheck::prove_padded_capture_z_vec_block_major_mode_with_roots(
+                    &z_packed,
+                    roots.as_deref(),
+                    r1cs.m,
+                    r1cs.k_log,
+                    r1cs.k_skip,
+                    r1cs.useful_bits,
+                    lincheck_circuit,
+                    &x_ab,
+                    lc_mode,
+                    challenger,
+                );
+                (p, c, z, m, None)
             }
         };
         lc_out
@@ -1415,6 +1467,19 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
         &lc_claim.r_inner_rest[1..],
     );
     flock_core::gaptime::mark("s_hat_v_ab built (core exit)");
+    // Publish the early A state for this live AB Fold8 buffer (the capture
+    // itself: `finish_ab_s_hat_v` returns it unchanged on the ranked route),
+    // or clear any entry. Last statement before the return, so the caller's
+    // guard is in place before anything can unwind.
+    if early_ab_a {
+        let ranked = z_mode == lincheck::ZCaptureMode::RankedFold8Tail;
+        match (s_hat_v_ab.as_deref(), early_a_state) {
+            (Some(fold8), Some(a)) if ranked => {
+                pcs::ring_switch::early_ab_a_publish(fold8, Some(a))
+            }
+            _ => pcs::ring_switch::early_ab_a_clear(),
+        }
+    }
 
     ProveCore {
         zc_proof,
