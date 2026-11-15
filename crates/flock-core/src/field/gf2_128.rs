@@ -65,6 +65,16 @@ impl F128 {
 
     #[inline]
     fn square_n(mut self, count: usize) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vbmi",
+            target_feature = "gfni"
+        ))]
+        if let Some(value) = frobenius::apply(self, count) {
+            return value;
+        }
         for _ in 0..count { self = self.square(); }
         self
     }
@@ -653,3 +663,12 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+mod frobenius;
