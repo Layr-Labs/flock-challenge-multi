@@ -673,6 +673,53 @@ pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: H
     }
 }
 
+/// `FLOCK_NO_MERKLE_TWO_LEVEL=1` makes [`hash_pairs_two_levels_serial`] take
+/// the two single-level calls.
+#[cfg(all(target_arch = "x86_64", target_os = "linux",
+          target_feature = "avx512f", target_feature = "avx512vl"))]
+fn two_level_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_TWO_LEVEL").is_some());
+    *OFF
+}
+
+/// Two consecutive internal levels: `mid[i] = hash_pair(read[2i], read[2i+1])`
+/// and `top[i] = hash_pair(mid[2i], mid[2i+1])`, the same CVs as two
+/// [`hash_pairs_level_serial`] calls. On the AVX-512 BLAKE3 build, complete
+/// groups (`top.len()` a multiple of 16) hash the upper level straight from
+/// the lower level's CV planes instead of re-reading and re-transposing its
+/// canonical bytes; everything else takes the two single-level calls.
+pub(crate) fn hash_pairs_two_levels_serial(
+    read: &[Hash],
+    mid: &mut [Hash],
+    top: &mut [Hash],
+    kind: HashKind,
+) {
+    assert_eq!(read.len(), 2 * mid.len());
+    assert_eq!(mid.len(), 2 * top.len());
+    #[cfg(all(target_arch = "x86_64", target_os = "linux",
+              target_feature = "avx512f", target_feature = "avx512vl"))]
+    if kind == HashKind::Blake3
+        && !top.is_empty()
+        && top.len().is_multiple_of(16)
+        && !two_level_disabled()
+    {
+        #[cfg(feature = "hash-count")]
+        hash_count::PAIR_CALLS.fetch_add(
+            (mid.len() + top.len()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // SAFETY: `Hash` is `[u8; 32]`, so `n` hashes are `32n` initialized
+        // bytes with no padding.
+        let read_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+        contiguous::hash_parent_two_levels(read_bytes, mid, top);
+        return;
+    }
+    hash_pairs_level_serial(read, mid, kind);
+    hash_pairs_level_serial(mid, top, kind);
+}
+
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
 /// Children are contiguous 64-byte spans of the level below, so both hashes
@@ -1706,6 +1753,28 @@ mod tests {
                 "{kind}: pooled L1 tree != merkle_tree() node-for-node"
             );
             crate::pcs::commit::give_tree(pooled);
+        }
+    }
+
+    /// Two parent levels at once equal two single-level folds, for complete
+    /// 16-groups (one and several 64-node steps, partial last step) and the
+    /// fallback shapes, for every hash kind.
+    #[test]
+    fn hash_pairs_two_levels_serial_matches_single_levels() {
+        for &top_n in &[16usize, 32, 48, 80, 8, 1] {
+            let data = random_data(4 * top_n, 32, 0x2_1E7E1);
+            let read: Vec<Hash> = data.chunks(32).map(|c| c.try_into().unwrap()).collect();
+            for kind in KINDS {
+                let mut mid_ref = vec![[0u8; 32]; 2 * top_n];
+                let mut top_ref = vec![[0u8; 32]; top_n];
+                hash_pairs_level_serial(&read, &mut mid_ref, kind);
+                hash_pairs_level_serial(&mid_ref, &mut top_ref, kind);
+                let mut mid = vec![[0xa5u8; 32]; 2 * top_n];
+                let mut top = vec![[0xa5u8; 32]; top_n];
+                hash_pairs_two_levels_serial(&read, &mut mid, &mut top, kind);
+                assert_eq!(mid, mid_ref, "{kind} top={top_n} middle level");
+                assert_eq!(top, top_ref, "{kind} top={top_n} upper level");
+            }
         }
     }
 

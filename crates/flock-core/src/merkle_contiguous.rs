@@ -153,6 +153,54 @@ pub(super) fn hash_leaf_pairs<const N: usize>(data: &[u8], out: &mut [Hash]) {
     }
 }
 
+/// Two parent levels at once. `children` are canonical CVs of level j-1
+/// (64 bytes per level-j node: left || right). Level j is hashed with the
+/// plane-output kernel (`flock_blake3_planes_leaf_64` with PARENT flags and
+/// start = end = 0 is exactly one PARENT compression per 64-byte message),
+/// written to `mid` as canonical CVs, and level j+1 is hashed straight from
+/// those planes (`flock_blake3_planes_parent`) into `top`, so level j is
+/// never re-read and re-transposed. Complete groups only: `top.len()` a
+/// positive multiple of 16, `mid.len() == 2 * top.len()`,
+/// `children.len() == 4 * top.len() * 32`.
+#[inline]
+pub(super) fn hash_parent_two_levels(children: &[u8], mid: &mut [Hash], top: &mut [Hash]) {
+    assert!(!top.is_empty() && top.len() % 16 == 0);
+    assert_eq!(mid.len(), 2 * top.len());
+    assert_eq!(children.len(), mid.len() * 64);
+    // At most 64 level-j nodes (planes) / 32 level-j+1 nodes per step, as in
+    // `hash_leaf_pairs`. No typed scratch reference exists before the
+    // assembly has written every byte that is read.
+    let mut scratch = core::mem::MaybeUninit::<[u8; 64 * 32]>::uninit();
+    for ((tops, mids), kids) in top
+        .chunks_mut(32)
+        .zip(mid.chunks_mut(64))
+        .zip(children.chunks(64 * 64))
+    {
+        let planes = scratch.as_mut_ptr().cast::<u8>();
+        // SAFETY: compile-time AVX-512/SysV module gate; `kids` holds exactly
+        // `mids.len()` 64-byte messages; `mids.len()` is a multiple of 32, so
+        // both kernels see full 16-lane groups; the plane buffer holds
+        // `mids.len() * 32 <= 2048` bytes; zero counters throughout.
+        unsafe {
+            flock_blake3_planes_leaf_64(kids.as_ptr(), mids.len(), 1,
+                BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0, planes);
+            // Canonical level-j CVs from the planes: plane layout
+            // [group_of_16][cv_word][lane], little-endian u32 words.
+            let plane_bytes = core::slice::from_raw_parts(planes, mids.len() * 32);
+            for (i, cv) in mids.iter_mut().enumerate() {
+                let base = (i / 16) * 512 + (i % 16) * 4;
+                for word in 0..8 {
+                    let p = base + word * 64;
+                    cv[word * 4..word * 4 + 4].copy_from_slice(&plane_bytes[p..p + 4]);
+                }
+            }
+            flock_blake3_planes_parent(planes, tops.len(), 1,
+                BLAKE3_IV.as_ptr(), 0, false, super::BLAKE3_PARENT, 0, 0,
+                tops.as_mut_ptr().cast());
+        }
+    }
+}
+
 #[cfg(test)]
 mod plane_tests {
     use super::*;
