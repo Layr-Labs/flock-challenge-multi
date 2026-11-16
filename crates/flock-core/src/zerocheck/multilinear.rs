@@ -2221,11 +2221,14 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let lo1_ys = kernels::x86_64::lo1_ys_enabled();
+    let r2_vec = r2_vec_sums_enabled() && r4_fast;
     crate::rstrace::ev("r2:par0", hi_size as u32);
     let leaf = |x_hi: usize| {
             crate::rstrace::item_start();
             #[allow(unused_mut)]
             let mut r4_out = [F128::ZERO; 18];
+            #[allow(unused_mut)]
+            let mut vec_out: Option<R2Vec> = None;
             let x_in = x_hi;
             let row_base = x_in * chunk_size;
             let pair_idx_base = x_in * lo_size;
@@ -2249,6 +2252,20 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && let Some(bk) = bake_arg
                 {
                     if let Some(lw) = r4_lv.as_ref() {
+                        if r2_vec {
+                            r2vec_route_diagnostic();
+                            let (red, red4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_red_x86(
+                                a_packed.as_ptr(),
+                                b_packed.as_ptr(),
+                                row_base,
+                                lo_size,
+                                bk,
+                                lw,
+                                lo1_ys,
+                            );
+                            vec_out = Some(r2vec_scale(&red, &red4, eq_hi[x_hi]));
+                            [F128::ZERO; 8]
+                        } else {
                         let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
                             a_packed.as_ptr(),
                             b_packed.as_ptr(),
@@ -2260,6 +2277,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         );
                         r4_out = r4;
                         o
+                        }
                     } else {
                         kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
                             a_packed.as_ptr(),
@@ -2355,8 +2373,11 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 useful_pairs_inclusive,
             );
 
-            let eq_h = eq_hi[x_hi];
             crate::rstrace::item_end();
+            if let Some(v) = vec_out {
+                return (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], v);
+            }
+            let eq_h = eq_hi[x_hi];
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -2369,11 +2390,12 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     eq_h * out[7],
                 ],
                 if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
+                r2vec_zero(),
             )
     };
-    type R2Sums = (F128, F128, [F128; 6], [F128; 18]);
-    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
-    let op = |(s1, sinf, sa, sr): R2Sums, (c1, cinf, ca, cr): R2Sums| -> R2Sums {
+    type R2Sums = (F128, F128, [F128; 6], [F128; 18], R2Vec);
+    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], r2vec_zero()) };
+    let op = |(s1, sinf, sa, sr, sv): R2Sums, (c1, cinf, ca, cr, cv): R2Sums| -> R2Sums {
         let mut a = sa;
         for (x, y) in a.iter_mut().zip(ca.iter()) {
             *x += *y;
@@ -2382,7 +2404,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         for (x, y) in r4.iter_mut().zip(cr.iter()) {
             *x += *y;
         }
-        (s1 + c1, sinf + cinf, a, r4)
+        (s1 + c1, sinf + cinf, a, r4, r2vec_add(sv, cv))
     };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.
     // Lane gl1 (`FLOCK_NO_GL1_R2_DELTA_IDLE`): the canonical-window deltas
@@ -2392,7 +2414,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R2_DELTA_IDLE").is_none());
     let mut early_d: Option<(F128, F128, [F128; 6])> = None;
     let mut early_d4: Option<Round4Lookahead> = None;
-    let (sum1_even, sum_inf_even, agg, r4_flat) =
+    let (mut sum1_even, mut sum_inf_even, mut agg, mut r4_flat, vsum) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
             if *GL1_DIDLE && canon_elided.is_some() {
                 let rows = canon_elided.unwrap();
@@ -2410,6 +2432,18 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         };
     crate::rstrace::ev("r2:par1", 0);
     crate::rstrace::flush_items("r2:first", "r2:last");
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    if r2_vec && let (Some(bk), Some(lw)) = (bake_arg, r4_lv.as_ref()) {
+        let red: [core::arch::x86_64::__m512i; 8] = core::array::from_fn(|i| vsum[i]);
+        let red4: [core::arch::x86_64::__m512i; 10] = core::array::from_fn(|i| vsum[8 + i]);
+        // SAFETY: the cfg gate supplies every intrinsic feature.
+        let (o, r4) = unsafe { kernels::x86_64::r2_r4_finish(&red, &red4, bk, lw) };
+        sum1_even += o[0];
+        sum_inf_even += o[1];
+        for j in 0..6 { agg[j] += o[2 + j]; }
+        for k in 0..18 { r4_flat[k] += r4[k]; }
+    }
+    let _ = &vsum;
 
     crate::rstrace::ev("r2:red", 0);
     let sum1 = kappa * sum1_even + agg[0];
@@ -8040,5 +8074,57 @@ mod tests {
                 "unpredicated kernel vs scalar table fold, row {r}"
             );
         }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+// Claimer-level aggregation adapted from Yukon submission 748eb344-aaf9-4ba6-b32b-c69aedda2a37.
+type R2Vec = [core::arch::x86_64::__m512i; 18];
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+type R2Vec = ();
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+fn r2vec_zero() -> R2Vec { unsafe { [core::arch::x86_64::_mm512_setzero_si512(); 18] } }
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[inline(always)]
+fn r2vec_zero() -> R2Vec {}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+fn r2vec_add(a: R2Vec, b: R2Vec) -> R2Vec {
+    unsafe { core::array::from_fn(|i| core::arch::x86_64::_mm512_xor_si512(a[i], b[i])) }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[inline(always)]
+fn r2vec_add(_a: R2Vec, _b: R2Vec) -> R2Vec {}
+/// Round two's claimer-level vector sums (`FLOCK_NO_ZC_R2_VEC_SUMS` restores
+/// the per-chunk lane sums and scalar `eq_hi` products).
+fn r2_vec_sums_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| {
+            let enabled=std::env::var_os("FLOCK_NO_ZC_R2_VEC_SUMS").is_none();
+            if std::env::var_os("FLOCK_R2_VEC_DIAG").is_some() {eprintln!("R2_VEC_OPTION enabled={enabled}");}
+            enabled
+        });
+    *ON
+}
+
+#[cfg(all(target_arch="x86_64",target_feature="avx512f",target_feature="avx512vbmi",target_feature="gfni",target_feature="vpclmulqdq"))]
+#[inline(always)]
+unsafe fn r2vec_scale(red:&[core::arch::x86_64::__m512i;8],red4:&[core::arch::x86_64::__m512i;10],eh:F128)->R2Vec {
+    use crate::field::gf2_128::x86_64::{f128x4_loadu,ghash_mul_x4_split,ghash_shift64_x4};
+    unsafe {
+        let w=f128x4_loadu([eh,eh,eh,eh].as_ptr());let w64=ghash_shift64_x4(w);
+        let mut v=r2vec_zero();
+        for i in 0..8 {v[i]=ghash_mul_x4_split(red[i],w,w64);}
+        for i in 0..10 {v[8+i]=ghash_mul_x4_split(red4[i],w,w64);}
+        v
+    }
+}
+
+fn r2vec_route_diagnostic() {
+    static DIAG:std::sync::LazyLock<bool>=std::sync::LazyLock::new(||std::env::var_os("FLOCK_R2_VEC_DIAG").is_some());
+    if *DIAG {
+        static LOG:std::sync::Once=std::sync::Once::new();
+        LOG.call_once(||eprintln!("R2_VEC_ROUTE_SELECTED"));
     }
 }
