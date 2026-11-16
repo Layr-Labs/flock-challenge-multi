@@ -185,6 +185,7 @@ impl<'a> FoldW16<'a> {
     }
 }
 unsafe fn recompute_folded16(prepared: &Prepared16, weights: &FoldWeights, out: *mut V16) {
+    flock_core::realign_frame64!();
     unsafe {
         let mut partial = core::mem::MaybeUninit::<[V16; 12]>::uninit();
         let cv_v = &prepared.cv;

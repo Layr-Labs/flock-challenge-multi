@@ -225,6 +225,71 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
     }
 }
 
+/// Resolve low-twiddle and mul-diet flags once outside publish loops.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) fn publish_nt_flags() -> (bool, bool) {
+    (!low_twiddle_disabled(), !x86_64::mul_diet_disabled())
+}
+
+/// Same contract as [`butterfly_fused_2layer_publish_nt`], with env-var flags hoisted to consts.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_cfg<
+    const ALIGNED_ZMM: bool,
+    const ALLOW_LOW: bool,
+    const DIET: bool,
+>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    let outer_low = ALLOW_LOW && t_outer.hi == 0;
+    let inner_low = ALLOW_LOW && t_inner_a.hi == 0 && t_inner_b.hi == 0;
+    // SAFETY: forwarded caller contract; flags match the zero-high-limb preconditions.
+    unsafe {
+        match (outer_low, inner_low) {
+            (false, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_direct::<false, false, DIET, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (false, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_direct::<false, true, DIET, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_direct::<true, false, DIET, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_direct::<true, true, DIET, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+        }
+    }
+}
+
 /// Lane rs: half of the rate seed (see the x86 kernel). x86 AVX-512 only.
 ///
 /// # Safety

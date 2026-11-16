@@ -1753,6 +1753,7 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
     lo_size: usize,
     wt: &[F128],
 ) -> [F128; 8] {
+    crate::realign_frame64!();
     use core::arch::x86_64::*;
     debug_assert!(lo_size.is_multiple_of(16));
 
@@ -2917,11 +2918,95 @@ pub(crate) fn fold2_packed_c4_lm_wtab_route_ok(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    wt: &[F128],
+) -> [F128; 8] {
+    if *crate::MAH_ASM_C4 {
+        unsafe {
+            fold2_from_packed_lookahead_c4_lm_wtab_x86_impl::<NT_OUT, OUT_LM, true>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, wt,
+            )
+        }
+    } else {
+        unsafe {
+            fold2_from_packed_lookahead_c4_lm_wtab_x86_cold::<NT_OUT, OUT_LM>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, wt,
+            )
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86_cold<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    wt: &[F128],
+) -> [F128; 8] {
+    unsafe {
+        fold2_from_packed_lookahead_c4_lm_wtab_x86_impl::<NT_OUT, OUT_LM, false>(
+            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, wt,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86_impl<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+    const MAH_C4: bool,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -2949,9 +3034,9 @@ pub(crate) unsafe fn fold2_from_packed_lookahead_c4_lm_wtab_x86<
                 let ol = 2 * x;
                 let xg = out_base + ol;
                 let [a0, a1, a2, a3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add(4 * xg * 8), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>(a_pkt.add(4 * xg * 8), cfold);
                 let [b0, b1, b2, b3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add(4 * xg * 8), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>(b_pkt.add(4 * xg * 8), cfold);
                 let next = (4 * xg + 64 * ZC_PKT_PF_TILES) * 8;
                 for l in 0..2 {
                     _mm_prefetch(
@@ -5054,14 +5139,14 @@ unsafe extern "C" {
     target_feature = "gfni"
 ))]
 #[inline(always)]
-unsafe fn gfni_fold32_rows_c4_lm_registers(
+unsafe fn gfni_fold32_rows_c4_lm_registers<const MAH_C4: bool>(
     rows: *const u8,
     m: &CFoldMats,
 ) -> [core::arch::x86_64::__m512i; 2] {
     use core::arch::x86_64::*;
     #[cfg(target_os = "linux")]
     unsafe {
-        if *crate::MAH_ASM_C4 {
+        if MAH_C4 {
             let lo: __m512i;
             let hi: __m512i;
             core::arch::asm!(
@@ -5100,7 +5185,7 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
         for t in 0..4 {
             core::ptr::copy_nonoverlapping(rows.add(64 * t), wide.as_mut_ptr().add(128 * t), 64);
         }
-        let [lo, hi, _, _] = gfni_fold64_rows_c4_lm_registers(wide.as_ptr(), m);
+        let [lo, hi, _, _] = gfni_fold64_rows_c4_lm_registers::<MAH_C4>(wide.as_ptr(), m);
         [lo, hi]
     }
 }
@@ -5114,14 +5199,14 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
     target_feature = "gfni"
 ))]
 #[inline(always)]
-unsafe fn gfni_fold64_rows_c4_lm_registers(
+unsafe fn gfni_fold64_rows_c4_lm_registers<const MAH_C4: bool>(
     rows: *const u8,
     m: &CFoldMats,
 ) -> [core::arch::x86_64::__m512i; 4] {
     use core::arch::x86_64::*;
     #[cfg(target_os = "linux")]
     unsafe {
-        if *crate::MAH_ASM_C4 {
+        if MAH_C4 {
             let a: __m512i;
             let b: __m512i;
             let c: __m512i;
@@ -6747,11 +6832,97 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
     const NT_OUT: bool,
     const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+) -> [F128; 8] {
+    if *crate::MAH_ASM_C4 {
+        unsafe {
+            fold3_from_packed_lookahead_c4_lm_wtab_x86_impl::<NT_OUT, OUT_LM, true>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt,
+            )
+        }
+    } else {
+        unsafe {
+            fold3_from_packed_lookahead_c4_lm_wtab_x86_cold::<NT_OUT, OUT_LM>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt,
+            )
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86_cold<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+) -> [F128; 8] {
+    unsafe {
+        fold3_from_packed_lookahead_c4_lm_wtab_x86_impl::<NT_OUT, OUT_LM, false>(
+            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86_impl<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+    const MAH_C4: bool,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -6778,9 +6949,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_x86<
 
         macro_rules! fold_side {
             ($pkt:expr, $row0:expr) => {{
-                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8), cfold);
+                let [q0, q1, q2, q3] = gfni_fold64_rows_c4_lm_registers::<MAH_C4>($pkt.add($row0 * 8), cfold);
                 let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers($pkt.add($row0 * 8 + 512), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>($pkt.add($row0 * 8 + 512), cfold);
                 let oe1 = _mm512_xor_si512(q0, ghash_mul_x4_split(_mm512_xor_si512(q0, q1), r3, r3_64));
                 let oo1 = _mm512_xor_si512(q2, ghash_mul_x4_split(_mm512_xor_si512(q2, q3), r3, r3_64));
                 let oe2 = _mm512_xor_si512(p0, ghash_mul_x4_split(_mm512_xor_si512(p0, p1), r3, r3_64));
@@ -7135,7 +7306,7 @@ pub(crate) fn zc_c3_enabled() -> bool {
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const NT_OUT: bool,
@@ -7155,6 +7326,108 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     la7: &mut [F128; 18],
     kappa6: F128,
 ) -> [F128; 8] {
+    if *crate::MAH_ASM_C4 {
+        unsafe {
+            fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86_impl::<
+                NT_OUT,
+                OUT_LM,
+                CASC,
+                true,
+            >(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, la7,
+                kappa6,
+            )
+        }
+    } else {
+        unsafe {
+            fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86_cold::<NT_OUT, OUT_LM, CASC>(
+                a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, la7,
+                kappa6,
+            )
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86_cold<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+    const CASC: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+    b_canon: &[F128; 4],
+    la7: &mut [F128; 18],
+    kappa6: F128,
+) -> [F128; 8] {
+    unsafe {
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86_impl::<NT_OUT, OUT_LM, CASC, false>(
+            a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, la7, kappa6,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86_impl<
+    const NT_OUT: bool,
+    const OUT_LM: bool,
+    const CASC: bool,
+    const MAH_C4: bool,
+>(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    out_base: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    lo_size: usize,
+    cfold: &CFoldMats,
+    rho3: F128,
+    wt: &[F128],
+    b_canon: &[F128; 4],
+    la7: &mut [F128; 18],
+    kappa6: F128,
+) -> [F128; 8] {
+    crate::realign_frame64!();
     use super::super::lane_select;
     use crate::field::gf2_128::x86_64::{ghash_broadcast_split, ghash_mul_x4_split};
     use core::arch::x86_64::*;
@@ -7207,9 +7480,9 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         macro_rules! fold_a_half {
             ($row0:expr) => {{
                 let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>(a_pkt.add($row0 * 8), cfold);
                 let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>(a_pkt.add($row0 * 8 + 512), cfold);
                 let oe1 = fold_r3!(q0, q1);
                 let oo1 = fold_r3!(q2, q3);
                 let oe2 = fold_r3!(p0, p1);
@@ -7228,7 +7501,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         macro_rules! fold_b_window {
             ($row:expr) => {{
                 let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                    gfni_fold64_rows_c4_lm_registers::<MAH_C4>(b_pkt.add($row * 8), cfold);
                 (fold_r3!(q0, q1), fold_r3!(q2, q3))
             }};
         }
@@ -7325,7 +7598,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             let c_tile = fold_a_half!(row0 + 128);
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
             let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let [h0, h1] = gfni_fold32_rows_c4_lm_registers::<MAH_C4>(b_pkt.add((row0 + 208) * 8), cfold);
             let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
             let d_tile = [
                 // lines 16, 20, 24, 28
