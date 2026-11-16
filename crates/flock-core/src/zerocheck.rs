@@ -102,9 +102,11 @@ pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
 /// default 2). `FLOCK_NO_ZC_C3=1` turns the deeper cascade off.
 fn zc_c3_at() -> usize {
     static AT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        // Default 1 here (four official in-run readings ahead of level 2:
+        // +0.13, +0.18, +0.22, +0.25 ms); `FLOCK_ZC_C3_AT=2` restores level 2.
         match std::env::var("FLOCK_ZC_C3_AT").ok().as_deref() {
-            Some("1") => 1,
-            _ => 2,
+            Some("2") => 2,
+            _ => 1,
         }
     });
     *AT
@@ -624,6 +626,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         }
     };
     let peq_idle_arg: Option<&(dyn Fn() + Sync)> = if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
+    // Keep-warm guard taken right after the round-one join instead of after z
+    // is sampled (`FLOCK_NO_ZC_R1_EXIT_WARM` restores the later start).
+    static R1_EXIT_WARM: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_EXIT_WARM").is_none());
+    let mut early_hot: Option<crate::hot_pool::HotPool> = None;
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -747,6 +754,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     None => rayon::join(ab_closure, c_closure),
                 };
             crate::rstrace::ev("r1:joined", 0);
+            if *R1_EXIT_WARM { early_hot = crate::hot_pool::HotPool::start(); }
             let (canon, w30d) = canon;
             if w30_elided {
                 let rows = canon
@@ -870,7 +878,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
     crate::rstrace::ev("r1:sampled", 0);
-    let _hot_pool = crate::hot_pool::HotPool::start();
+    let _hot_pool = early_hot.take().or_else(crate::hot_pool::HotPool::start);
     crate::rstrace::ev("r1:hot", 0);
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
