@@ -3708,6 +3708,9 @@ pub(crate) struct WorkerStateAbOnly {
     cached_plane_banks: bool,
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
     leaf_cache: Option<ab_leaf_accum::Cache>,
+    /// Scratch for [`ab_leaf_accum::try_run_prepared`], sized on first use.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    leaf_scratch: Vec<u8>,
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     pub(crate) local_res_ab: [F128; ELL],
     /// Lane ab1: band layout the leaf kernels read (0 = incumbent rows).
@@ -3722,6 +3725,8 @@ impl WorkerStateAbOnly {
             cached_plane_banks: false,
             #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
             leaf_cache: None,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+            leaf_scratch: Vec::new(),
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
             ab1_layout: 0,
@@ -3760,6 +3765,8 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
     plane_cache: bool,
     ranked_one_rows_elided: bool,
     ranked_compact: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    ab_prepared: Option<&ab_leaf_accum::Prepared>,
     state: &mut WorkerStateAbOnly,
 ) {
     #[cfg(all(
@@ -3788,6 +3795,8 @@ fn process_one_x_hi_ab_only<const DIRECT: bool>(
                 plane_cache,
                 ranked_one_rows_elided,
                 ranked_compact,
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+                ab_prepared,
                 state,
             );
         }
@@ -4157,6 +4166,8 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     plane_cache: bool,
     ranked_one_rows_elided: bool,
     ranked_compact: bool,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    ab_prepared: Option<&ab_leaf_accum::Prepared>,
     state: &mut WorkerStateAbOnly,
 ) {
     debug_assert!(!plane_first_write || b_med_counts.iter().all(|&count| count != 0));
@@ -4210,9 +4221,28 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
         let prefetch_mode = if pf_windows == 0 { 0 } else if pf_spread { 1 } else { 2 };
         let used_leaf_accum = {
             #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
-            { ab_leaf_accum::enabled() && ab_leaf_accum::try_run(
-                &mut state.leaf_cache, ab_inner, mats, x_hi,
-                prefetch_mode, &mut state.plane_banks, state.ab1_layout) }
+            {
+                if let Some(prep) = ab_prepared {
+                    // Round-level tables (FLOCK_NO_AB_PREPARED unset). The cached
+                    // path below keeps its own scratch inside `Cache`.
+                    if state.leaf_scratch.is_empty() {
+                        state.leaf_scratch = vec![0u8; ab_leaf_accum::SCRATCH_DATA_BYTES + 63];
+                    }
+                    ab_leaf_accum::try_run_prepared(
+                        prep,
+                        &mut state.leaf_scratch,
+                        ab_inner,
+                        x_hi,
+                        prefetch_mode,
+                        &mut state.plane_banks,
+                        state.ab1_layout,
+                    )
+                } else {
+                    ab_leaf_accum::enabled() && ab_leaf_accum::try_run(
+                        &mut state.leaf_cache, ab_inner, mats, x_hi,
+                        prefetch_mode, &mut state.plane_banks, state.ab1_layout)
+                }
+            }
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
             { false }
         };
@@ -4565,7 +4595,7 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     // kernels. Prove from the same gates the band dispatch uses that every
     // band takes that path; otherwise undo the layout in place first.
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
-    let ab1_leaf_ok = direct_ab
+    let ab1_gates = direct_ab
         && ranked_compact
         && ranked_one_rows_elided
         && n_lo == 12
@@ -4573,10 +4603,33 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
         && within_outer_mask == 1
         && b_med_counts_live.as_slice() == [16, 14]
         && zc_r1_ab_batch4_enabled()
-        && ab_leaf_accum::enabled()
-        && eq_fold_state.as_ref().is_some_and(|(eq_bot, mats, bank_bits)| {
-            eq_bot.len() == 128 && *bank_bits == 7 && ab_leaf_accum::would_run(mats)
-        });
+        && ab_leaf_accum::enabled();
+    // Mahmoud514 5b2ced50: validate and pack the leaf tables once per round
+    // and share them with every band. FLOCK_NO_AB_PREPARED=1 keeps the
+    // per-worker cache and the `would_run` gate below unchanged.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    let ab_prepared = if ab_leaf_accum::prepared_enabled() && ab1_gates {
+        eq_fold_state.as_ref().and_then(|(eq_bot, mats, bank_bits)| {
+            if eq_bot.len() == 128 && *bank_bits == 7 && mats.len() == 32 * 256 {
+                ab_leaf_accum::Prepared::new(mats)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+    let ab1_leaf_ok = if ab_leaf_accum::prepared_enabled() {
+        // Same answer as `would_run`: only the merged banks read the hole-free
+        // layout, so unmerged tables (FLOCK_NO_AB_MERGED=1) must undo it.
+        ab_prepared.as_ref().is_some_and(|prep| prep.merged)
+    } else {
+        ab1_gates
+            && eq_fold_state.as_ref().is_some_and(|(eq_bot, mats, bank_bits)| {
+                eq_bot.len() == 128 && *bank_bits == 7 && ab_leaf_accum::would_run(mats)
+            })
+    };
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
     let ab1_leaf_ok = false;
     if ab_inner.ab1_hole_layout && !ab1_leaf_ok {
@@ -4629,6 +4682,8 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
                 plane_cache,
                 ranked_one_rows_elided,
                 ranked_compact,
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+                ab_prepared.as_ref(),
                 state,
             );
         } else {
@@ -4647,6 +4702,8 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
                 plane_cache,
                 ranked_one_rows_elided,
                 ranked_compact,
+                #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+                ab_prepared.as_ref(),
                 state,
             );
         }
@@ -7099,7 +7156,10 @@ mod ab_batch4_worker_tests {
             unsafe {
                 process_one_x_hi_ab_only_direct_x86(
                     x_hi, 4096, 12 + N_INNER, 1, &[16, 14], &source,
-                    eq_hi, &eq_bot, &mats, 7, true, true, true, true, &mut state,
+                    eq_hi, &eq_bot, &mats, 7, true, true, true, true,
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+                    None,
+                    &mut state,
                 );
             }
             add(&mut accumulated, &expected[x_hi]);
@@ -7119,6 +7179,8 @@ mod ab_batch4_worker_tests {
                 process_one_x_hi_ab_only_direct_x86(
                     1, 4096, 12 + N_INNER, 1, &[16, 14], &source,
                     eq_hi, &eq_bot, &mats, 7, first_write, first_write, true, true,
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni"))]
+                    None,
                     &mut recycled,
                 );
             }
