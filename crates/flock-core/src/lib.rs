@@ -149,11 +149,42 @@ pub(crate) mod topology_pool {
     pub(crate) const POOL_MODE: &str = "pin16";
 
     #[cfg(target_os = "linux")]
-    fn sibling_groups() -> Option<Vec<Vec<usize>>> {
-        let n = std::thread::available_parallelism().ok()?.get();
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn allowed_cpus() -> Option<Vec<usize>> {
+        let mut mask = [0u64; 16]; // 1024 CPUs
+        // SAFETY: `mask` matches the 1024-bit buffer passed to the kernel.
+        let rc = unsafe { sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let mut cpus = Vec::new();
+        for (word_idx, &word) in mask.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                cpus.push(word_idx * 64 + bit);
+                w &= w - 1;
+            }
+        }
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn sibling_groups() -> Option<Vec<Vec<usize>>> {
+        let allowed = allowed_cpus()?;
+        let max_cpu = *allowed.last()?;
+        let mut is_allowed = vec![false; max_cpu + 1];
+        for &c in &allowed {
+            is_allowed[c] = true;
+        }
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut seen = vec![false; n];
-        for cpu in 0..n {
+        let mut seen = vec![false; max_cpu + 1];
+        for &cpu in &allowed {
             if seen[cpu] {
                 continue;
             }
@@ -168,20 +199,19 @@ pub(crate) mod topology_pool {
                     g.push(part.parse().ok()?);
                 }
             }
-            g.retain(|&c| c < n);
+            g.retain(|&c| c <= max_cpu && is_allowed[c]);
             g.sort_unstable();
             g.dedup();
+            if g.is_empty() || g.iter().any(|&c| seen[c]) {
+                return None;
+            }
             for &c in &g {
                 seen[c] = true;
             }
             groups.push(g);
         }
-        Some(groups)
-    }
-
-    #[cfg(target_os = "linux")]
-    unsafe extern "C" {
-        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+        let total: usize = groups.iter().map(Vec::len).sum();
+        (total == allowed.len()).then_some(groups)
     }
 
     #[cfg(target_os = "linux")]
@@ -430,19 +460,9 @@ pub(crate) mod smt_split {
 
         unsafe extern "C" {
             fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
-            fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
         }
 
         type Mask = [u64; 16]; // 1024 CPUs
-
-        fn affinity() -> Mask {
-            let mut m: Mask = [0; 16];
-            // SAFETY: `m` is exactly the 1024-bit buffer the kernel is told about.
-            unsafe {
-                sched_getaffinity(0, core::mem::size_of::<Mask>(), m.as_mut_ptr());
-            }
-            m
-        }
 
         fn pin_to(cpu: usize) {
             if cpu >= 1024 {
@@ -455,63 +475,6 @@ pub(crate) mod smt_split {
             unsafe {
                 let _ = sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr());
             }
-        }
-
-        /// Logical CPU count from `/sys/devices/system/cpu/present`.
-        /// Deliberately NOT `available_parallelism()` — see the module doc.
-        fn present_cpus() -> usize {
-            let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/present") else {
-                return 0;
-            };
-            let mut hi = 0usize;
-            for part in s.trim().split(',') {
-                let last = part.split('-').next_back().unwrap_or("");
-                if let Ok(v) = last.parse::<usize>() {
-                    hi = hi.max(v);
-                }
-            }
-            hi + 1
-        }
-
-        /// One ascending group per physical core, from `thread_siblings_list`.
-        fn sibling_groups() -> Vec<Vec<usize>> {
-            let n = present_cpus();
-            if n == 0 {
-                return Vec::new();
-            }
-            let mut groups: Vec<Vec<usize>> = Vec::new();
-            let mut seen = vec![false; n];
-            for cpu in 0..n {
-                if seen[cpu] {
-                    continue;
-                }
-                let path =
-                    format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-                let Ok(list) = std::fs::read_to_string(path) else {
-                    return Vec::new();
-                };
-                let mut g = Vec::new();
-                for part in list.trim().split(',') {
-                    if let Some((a, b)) = part.split_once('-') {
-                        let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) else {
-                            return Vec::new();
-                        };
-                        g.extend(a..=b);
-                    } else if let Ok(v) = part.parse::<usize>() {
-                        g.push(v);
-                    } else {
-                        return Vec::new();
-                    }
-                }
-                g.retain(|&c| c < n);
-                g.sort_unstable();
-                g.dedup();
-                for &c in &g {
-                    seen[c] = true;
-                }
-                groups.push(g);
-            }
-            groups
         }
 
         fn half(sibling: usize, cpus: Vec<usize>, debug: bool) -> ThreadPool {
@@ -539,39 +502,27 @@ pub(crate) mod smt_split {
                 }
                 return None;
             }
-            let groups = sibling_groups();
+            let Some(groups) = super::super::topology_pool::sibling_groups() else {
+                if debug {
+                    eprintln!("[smt_split] declined: no sibling groups in affinity set");
+                }
+                return None;
+            };
             let cores = groups.len();
-            // Ranked shape only: every core has exactly two SMT siblings, the
-            // machine is fully described, and the global pool already owns one
-            // worker per logical CPU (so the split reassigns workers rather
-            // than adding oversubscription during the window itself).
+            // Ranked shape only: every allowed core has exactly two SMT siblings,
+            // both siblings are allowed in this process's affinity set, and the
+            // global pool owns one worker per allowed logical CPU.
             if cores < 2
                 || groups.iter().any(|g| g.len() != 2)
-                || present_cpus() != 2 * cores
                 || rayon::current_num_threads() != 2 * cores
             {
                 if debug {
                     eprintln!(
-                        "[smt_split] declined: cores={cores} present={} rayon={}",
-                        present_cpus(),
+                        "[smt_split] declined: cores={cores} rayon={}",
                         rayon::current_num_threads()
                     );
                 }
                 return None;
-            }
-            // Every CPU we would pin to must be inside this process's own
-            // affinity set, or the pin silently lands the thread somewhere the
-            // cpuset forbids.
-            let m = affinity();
-            for g in &groups {
-                for &c in g {
-                    if c >= 1024 || m[c / 64] & (1u64 << (c % 64)) == 0 {
-                        if debug {
-                            eprintln!("[smt_split] declined: cpu {c} outside affinity mask");
-                        }
-                        return None;
-                    }
-                }
             }
             let rebalance = (super::ZC_R1_AB_REBALANCE
                 || std::env::var_os("FLOCK_ZC_R1_AB_REBALANCE").is_some())
