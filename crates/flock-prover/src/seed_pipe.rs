@@ -1533,6 +1533,14 @@ fn speculative_main(
                 if published {
                     // Publish precedes EOF. The harness can capture the complete
                     // file whether it observes the rename or main's exit first.
+                    // After a successful publish the seed thread waits up to
+                    // 50 ms before closing the writer. `FLOCK_NO_PUB_HOLD=1`
+                    // restores the immediate close.
+                    static PUB_HOLD: std::sync::LazyLock<bool> =
+                        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PUB_HOLD").is_none());
+                    if *PUB_HOLD {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
                     close_fd(writer);
                     return;
                 }

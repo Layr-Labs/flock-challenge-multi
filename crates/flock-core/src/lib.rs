@@ -1682,6 +1682,25 @@ pub fn sl2_env_live() -> bool {
     *LIVE
 }
 
+/// A/B switch: `FLOCK_MAH_ASM=1` calls the `*_m` copies of Mahmoud514's
+/// a4aa6fa2 kernels (c4 fold, contiguous Merkle leaves); unset keeps the originals.
+#[allow(dead_code)]
+pub(crate) static MAH_ASM: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_MAH_ASM").is_some_and(|v| v == "1"));
+/// Mahmoud514's c4 fold kernels (`*_m` in the zerocheck kernels) are on by
+/// default: an official in-run factorial on the ranked runner read them
+/// +0.28 ms [+0.11, +0.44] faster (kaankolcu 4f922c80). `FLOCK_NO_MAH_C4=1`
+/// restores the original c4 kernels. The Merkle leaf copies stay opt-in
+/// (`FLOCK_MAH_ASM=1`); they read +0.05 ms, inside noise.
+/// Merkle leaf copies of Mahmoud514's assembly: opt-in (`FLOCK_MAH_MK=1` or
+/// `FLOCK_MAH_ASM=1`).
+pub(crate) static MAH_ASM_MK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    *MAH_ASM || std::env::var_os("FLOCK_MAH_MK").is_some_and(|v| v == "1")
+});
+pub(crate) static MAH_ASM_C4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    *MAH_ASM || std::env::var_os("FLOCK_NO_MAH_C4").is_none()
+});
+
 /// Lane sl2: set by the ranked worker for the timed speculative prove, whose
 /// process exits right after publishing (its tail may leak instead of free).
 pub static SL2_TIMED_TAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

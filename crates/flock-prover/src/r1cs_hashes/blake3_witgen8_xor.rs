@@ -6,7 +6,7 @@
 use super::*;
 use flock_core::zerocheck::univariate_skip_optimized::round1_ranked_bcomplement_mode as mode;
 #[repr(align(64))]
-pub(super) struct Tables([u64; 8 * 128]);
+pub(super) struct Tables([u64; 128 + 8 * 152]);
 impl Tables {
     /// Lane v2: [`Self::new`] is a pure function of the inverse-NTT table,
     /// which the ranked path shares process-wide; derive it once (in the
@@ -57,7 +57,17 @@ impl Tables {
                 }
             }
         }
-        Self(m)
+        // B retains the raw coefficients for sparse modes. Dense B shares
+        // the nineteen unweighted rank21 forms of A bank zero.
+        let mut out = [0u64; 128 + 8 * 152];
+        out[..128].copy_from_slice(&m[..128]);
+        for bank in 0..8 {
+            let prepared = unsafe { rank21::prepare_network(m.as_ptr().add(bank*128)) };
+            for i in 0..19 {
+                out[128+bank*152+i*8..128+bank*152+(i+1)*8].copy_from_slice(&prepared[i]);
+            }
+        }
+        Self(out)
     }
 }
 
@@ -359,6 +369,19 @@ unsafe fn affine_conv<const MODE:u8>(p: *const u64, m: *const u64) -> [__m512i; 
 // Kill switch for the pruned complement convolution (FLOCK_NO_RPPRUNE).
 static RPPRUNE_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RPPRUNE").is_none());
+
+// Mahmoud514 a4aa6fa2: each window's FIRST row product writes all eight Horner
+// accumulators before any read, so their zero fill is dead and is skipped.
+// FLOCK_NO_WITGEN_UNINIT=1 restores the zero-initialised accumulator.
+static WITGEN_UNINIT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_UNINIT").is_none());
+
+// FLOCK_NO_PROJ_PIPE=1 restores the incumbent pretranspose slots on the deferred
+// (production) projection. Default: A and B rows go to 64-byte-aligned slots
+// (`Slots64`) so the kernels' 8-byte reloads forward from the fresh stores.
+// Same instructions and values; only stack addresses change.
+static PROJ_PIPE_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PROJ_PIPE").is_none());
 
 /// Superset-sum coordinate `s` of the translated input `y_j = x_{j^tau}` is
 /// structurally zero when every contributing `x_t` is a known (zeroed) byte.
@@ -679,7 +702,7 @@ const BYTE_TR: [u8; 64] = [
 // superset byte XORs with a second GFNI. The final byte permutation produces
 // the private prepared qwords consumed by the unchanged row projection.
 #[inline(always)]
-unsafe fn ring_prepared_pack(v:__m512i)->__m512i{
+unsafe fn ring_prepared_pack<const RANK21: bool>(v:__m512i)->__m512i{
  const ROW:[u8;64]=[0, 1, 2, 3, 32, 33, 34, 35, 4, 5, 6, 7, 36, 37, 38, 39, 8, 9, 10, 11, 40, 41, 42, 43, 12, 13, 14, 15, 44, 45, 46, 47, 16, 17, 18, 19, 48, 49, 50, 51, 20, 21, 22, 23, 52, 53, 54, 55, 24, 25, 26, 27, 56, 57, 58, 59, 28, 29, 30, 31, 60, 61, 62, 63];
  const COLUMN:[u8;64]=[0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
  let row=_mm512_permutexvar_epi8(_mm512_loadu_si512(ROW.as_ptr().cast()),v);
@@ -687,13 +710,47 @@ unsafe fn ring_prepared_pack(v:__m512i)->__m512i{
  // eight-byte bit matrix. The second affine selects the superset byte XORs.
  let basis=_mm512_set1_epi64(0x0102040810204080u64 as i64);
  let transpose=_mm512_gf2p8affine_epi64_epi8::<0>(basis,row);
- let subsets=_mm512_set1_epi64(0x0103050f113355ffu64 as i64);
+ let subsets=_mm512_set1_epi64((if RANK21 {0xe02ea069dd99ccffu64} else {0x0103050f113355ffu64}) as i64);
  let prepared=_mm512_gf2p8affine_epi64_epi8::<0>(subsets,transpose);
  _mm512_permutexvar_epi8(_mm512_loadu_si512(COLUMN.as_ptr().cast()),prepared)
 }
 
+// The near-dense modes use the same prepared basis and full linear map.
+#[inline(always)]
+const fn dense_b_mode(mode: u8) -> bool { matches!(mode, 0 | 1 | 8) }
+
 #[inline(always)]
 unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
+    unsafe {
+        let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
+        pretranspose_ring_into::<BLK, PREPARE_A>(ring, rw, out.as_mut_ptr().cast::<u64>());
+        out.assume_init()
+    }
+}
+
+/// The same eight pretransposed rows, each on its own aligned 64-byte line.
+/// The row kernels reload every row as 8-byte pieces right after these stores.
+/// A plain `[u64; 64]` local is 8-aligned in a frame that is only 16-aligned
+/// (incumbent build: slots at rsp+16 mod 64), so in three of four runtime stack
+/// alignments each 64-byte store splits two lines and cannot forward: the
+/// reload waits until the store commits, which needs everything older to retire
+/// first. A whole aligned store forwards to every naturally aligned 8-byte piece
+/// inside it. The 64-byte local also makes the frame realign, so the
+/// projection's zmm spill slots become whole lines too.
+#[repr(C, align(64))]
+struct Slots64([u64; 64]);
+
+#[inline(always)]
+unsafe fn pretranspose_ring_aligned<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> Slots64 {
+    unsafe {
+        let mut out = core::mem::MaybeUninit::<Slots64>::uninit();
+        pretranspose_ring_into::<BLK, PREPARE_A>(ring, rw, out.as_mut_ptr().cast::<u64>());
+        out.assume_init()
+    }
+}
+
+#[inline(always)]
+unsafe fn pretranspose_ring_into<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize, p: *mut u64) {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -704,65 +761,62 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
             57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
         ];
         let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
-        let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-        let p = out.as_mut_ptr().cast::<u64>();
         let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
-        let v = if PREPARE_A || mode(BLK, 0) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 0)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(0).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
-        let v = if PREPARE_A || mode(BLK, 1) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 1)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(8).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
-        let v = if PREPARE_A || mode(BLK, 2) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 2)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(16).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
-        let v = if PREPARE_A || mode(BLK, 3) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 3)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(24).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
-        let v = if PREPARE_A || mode(BLK, 4) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 4)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(32).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
-        let v = if PREPARE_A || mode(BLK, 5) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 5)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(40).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
-        let v = if PREPARE_A || mode(BLK, 6) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 6)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(48).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
-        let v = if PREPARE_A || mode(BLK, 7) == 0 {
-            ring_prepared_pack(v)
+        let v = if PREPARE_A || dense_b_mode(mode(BLK, 7)) {
+            ring_prepared_pack::<true>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(56).cast(), v);
-        out.assume_init()
     }
 }
 
@@ -774,6 +828,71 @@ unsafe fn row_product<const MODE: u8, const FIRST: bool, const PRUNE: bool>(
     acc: &mut [__m512i; 8],
 ) {
     unsafe {
+        #[cfg(target_os = "linux")]
+        if const { dense_b_mode(MODE) } {
+            *acc = dense_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 7 } {
+            *acc = partial7_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 14 } {
+            *acc = partial14_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 2 } {
+            *acc = partial2_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 4 } {
+            *acc = partial4_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 5 } {
+            *acc = partial5_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 6 } {
+            *acc = partial6_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 9 } {
+            *acc = partial9_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 11 } {
+            *acc = partial11_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 12 } {
+            *acc = partial12_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 13 } {
+            *acc = partial13_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 3 } {
+            *acc = partial3_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if const { PRUNE && MODE == 10 } {
+            *acc = partial10_registers::run::<FIRST>(ap, bp, ma, mb, *acc);
+            return;
+        }
         let acc0 = if FIRST { _mm512_setzero_si512() } else { acc[0] };
         acc[0] = row_product_vector_abi::<MODE, FIRST, PRUNE>(ap, bp, ma, mb, acc, acc0);
     }
@@ -788,9 +907,12 @@ unsafe extern "C" fn row_product_vector_abi<const MODE: u8, const FIRST: bool, c
     acc: &mut [__m512i; 8], acc0: __m512i,
 ) -> __m512i {
     unsafe {
-        let av = affine_prepared(ap, ma);
-        let bv = if MODE == 0 {
-            affine_prepared(bp, mb)
+        let av = rank21::affine21_network(ap, ma.add(128));
+        let bv = if dense_b_mode(MODE) {
+            // Dense and near-dense B use the unweighted bank-zero rank21 map.
+            // Their pretranspose selects the matching basis; other partial
+            // rows retain raw-byte inputs and the existing pruned maps.
+            rank21::affine21_network(bp, mb.add(128))
         } else if const { PRUNE && prune_wins(MODE) } {
             affine_conv_pruned::<MODE>(bp, mb)
         } else {
@@ -813,7 +935,7 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
-unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool>(
+unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows<COMPACT_COLS>,
     a: [__m512i; 8],
@@ -824,250 +946,260 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
     m: *const u64,
 ) {
     unsafe {
-        let bp = pretranspose_ring::<BLK, false>(br, rw);
-        // First-writer accumulators: every block's first live residual row runs
-        // the FIRST row_product variant, which writes all 8 lanes without reading
-        // them, so the array needs no zero fill (8 dead stack stores per window
-        // that the outlined call's &mut otherwise forces).
+        let bp_aligned;
+        let bp_plain;
+        let bp: &[u64; 64] = if ALIGN {
+            bp_aligned = pretranspose_ring_aligned::<BLK, false>(br, rw);
+            &bp_aligned.0
+        } else {
+            bp_plain = pretranspose_ring::<BLK, false>(br, rw);
+            &bp_plain
+        };
+        // a4aa6fa2: start uninitialised unless FLOCK_NO_WITGEN_UNINIT=1 asks for
+        // the zero fill; the first live row is a FIRST product either way.
         let mut acc_slot = core::mem::MaybeUninit::<[__m512i; 8]>::uninit();
-        let acc: &mut [__m512i; 8] = &mut *acc_slot.as_mut_ptr();
+        if !*WITGEN_UNINIT {
+            acc_slot.write([_mm512_setzero_si512(); 8]);
+        }
+        let acc = &mut *acc_slot.as_mut_ptr();
         let pend_live = DEFER && (*proj.ab_pend).live;
         rows.publish_dense_values(0, a[0], b[0]);
         if pend_live { ab_pend_one(proj.ab_pend, 0); }
         if residual_row_live(BLK, 7) {
         match mode(BLK, 7) {
-0 => row_product::<0, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-1 => row_product::<1, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-2 => row_product::<2, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-3 => row_product::<3, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-4 => row_product::<4, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-5 => row_product::<5, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-6 => row_product::<6, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-7 => row_product::<7, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-8 => row_product::<8, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-9 => row_product::<9, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-10 => row_product::<10, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-11 => row_product::<11, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-12 => row_product::<12, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-13 => row_product::<13, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-14 => row_product::<14, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
-15 => row_product::<15, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 128), m, acc),
+0 => row_product::<0, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+1 => row_product::<1, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+2 => row_product::<2, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+3 => row_product::<3, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+4 => row_product::<4, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+5 => row_product::<5, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+6 => row_product::<6, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+7 => row_product::<7, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+8 => row_product::<8, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+9 => row_product::<9, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+10 => row_product::<10, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+11 => row_product::<11, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+12 => row_product::<12, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+13 => row_product::<13, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+14 => row_product::<14, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
+15 => row_product::<15, true, PRUNE>(ap.as_ptr().add(7 * 8), bp.as_ptr().add(7 * 8), m.add(7 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
-        // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        // forcing accumulator vectors through asm register operands. This boundary
+        // can observe published stores but writes no memory.
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(1, a[1], b[1]);
         if pend_live { ab_pend_one(proj.ab_pend, 1); }
         if residual_row_live(BLK, 6) {
         match mode(BLK, 6) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(6 * 8), bp.as_ptr().add(6 * 8), m.add(6 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(2, a[2], b[2]);
         if pend_live { ab_pend_one(proj.ab_pend, 2); }
         if residual_row_live(BLK, 5) {
         match mode(BLK, 5) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(5 * 8), bp.as_ptr().add(5 * 8), m.add(5 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(3, a[3], b[3]);
         if pend_live { ab_pend_one(proj.ab_pend, 3); }
         if residual_row_live(BLK, 4) {
         match mode(BLK, 4) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(4 * 8), bp.as_ptr().add(4 * 8), m.add(4 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(4, a[4], b[4]);
         if pend_live { ab_pend_one(proj.ab_pend, 4); }
         if BLK == 29 {
         match mode(BLK, 3) {
-0 => row_product::<0, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-1 => row_product::<1, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-2 => row_product::<2, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-3 => row_product::<3, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-4 => row_product::<4, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-5 => row_product::<5, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-6 => row_product::<6, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-7 => row_product::<7, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-8 => row_product::<8, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-9 => row_product::<9, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-10 => row_product::<10, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-11 => row_product::<11, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-12 => row_product::<12, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-13 => row_product::<13, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-14 => row_product::<14, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-15 => row_product::<15, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
+0 => row_product::<0, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+1 => row_product::<1, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+2 => row_product::<2, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+3 => row_product::<3, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+4 => row_product::<4, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+5 => row_product::<5, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+6 => row_product::<6, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+7 => row_product::<7, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+8 => row_product::<8, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+9 => row_product::<9, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+10 => row_product::<10, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+11 => row_product::<11, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+12 => row_product::<12, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+13 => row_product::<13, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+14 => row_product::<14, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+15 => row_product::<15, true, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
 _ => unreachable!(),
 }
         } else {
         match mode(BLK, 3) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(3 * 8), bp.as_ptr().add(3 * 8), m.add(3 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(5, a[5], b[5]);
         if pend_live { ab_pend_one(proj.ab_pend, 5); }
         if residual_row_live(BLK, 2) {
         match mode(BLK, 2) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(2 * 8), bp.as_ptr().add(2 * 8), m.add(2 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(6, a[6], b[6]);
         if pend_live { ab_pend_one(proj.ab_pend, 6); }
         if residual_row_live(BLK, 1) {
         match mode(BLK, 1) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(1 * 8), bp.as_ptr().add(1 * 8), m.add(1 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         rows.publish_dense_values(7, a[7], b[7]);
         if pend_live { ab_pend_one(proj.ab_pend, 7); }
         if pend_live { (*proj.ab_pend).live = false; }
         if residual_row_live(BLK, 0) {
         match mode(BLK, 0) {
-0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
-15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 128), m, acc),
+0 => row_product::<0, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+1 => row_product::<1, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+2 => row_product::<2, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+3 => row_product::<3, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+4 => row_product::<4, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+5 => row_product::<5, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+6 => row_product::<6, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+7 => row_product::<7, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+8 => row_product::<8, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+9 => row_product::<9, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+10 => row_product::<10, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+11 => row_product::<11, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+12 => row_product::<12, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+13 => row_product::<13, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+14 => row_product::<14, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
+15 => row_product::<15, false, PRUNE>(ap.as_ptr().add(0 * 8), bp.as_ptr().add(0 * 8), m.add(0 * 152), m, acc),
 _ => unreachable!(),
 }
         }
         // Keep this row's NT stores before the next row's publication without
         // forcing accumulator vectors through asm register operands.
-        core::arch::asm!("/* Horner NT publication boundary */", options(nostack, preserves_flags));
+        core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
         let out = trq([
@@ -1158,20 +1290,28 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
         // FLOCK_NO_SB1_DEFER path compiles to the unchanged code. A non-null buffer on another
         // policy only delays the previous window's lines to the octa-end flush.
         if !proj.ab_pend.is_null() && rows.cross_quarter && *RPPRUNE_ON {
-            if rows.cached_z {
-                return project_policy::<true, true, COMPACT_COLS, true, true>(proj, blk, rows, ar, br, rw, t);
+            // Aligned pretranspose slots: production deferred policies only,
+            // so every other policy keeps its single unchanged instantiation.
+            if *PROJ_PIPE_ON {
+                if rows.cached_z {
+                    return project_policy::<true, true, COMPACT_COLS, true, true, true>(proj, blk, rows, ar, br, rw, t);
+                }
+                return project_policy::<false, true, COMPACT_COLS, true, true, true>(proj, blk, rows, ar, br, rw, t);
             }
-            return project_policy::<false, true, COMPACT_COLS, true, true>(proj, blk, rows, ar, br, rw, t);
+            if rows.cached_z {
+                return project_policy::<true, true, COMPACT_COLS, true, true, false>(proj, blk, rows, ar, br, rw, t);
+            }
+            return project_policy::<false, true, COMPACT_COLS, true, true, false>(proj, blk, rows, ar, br, rw, t);
         }
         match (rows.cached_z, rows.cross_quarter, *RPPRUNE_ON) {
-            (true, true, true) => project_policy::<true, true, COMPACT_COLS, true, false>(proj, blk, rows, ar, br, rw, t),
-            (true, false, true) => project_policy::<true, false, COMPACT_COLS, true, false>(proj, blk, rows, ar, br, rw, t),
-            (false, true, true) => project_policy::<false, true, COMPACT_COLS, true, false>(proj, blk, rows, ar, br, rw, t),
-            (false, false, true) => project_policy::<false, false, COMPACT_COLS, true, false>(proj, blk, rows, ar, br, rw, t),
-            (true, true, false) => project_policy::<true, true, COMPACT_COLS, false, false>(proj, blk, rows, ar, br, rw, t),
-            (true, false, false) => project_policy::<true, false, COMPACT_COLS, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, true, false) => project_policy::<false, true, COMPACT_COLS, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, false, false) => project_policy::<false, false, COMPACT_COLS, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, true, true) => project_policy::<true, true, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, false, true) => project_policy::<true, false, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, true, true) => project_policy::<false, true, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, false, true) => project_policy::<false, false, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, true, false) => project_policy::<true, true, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, false, false) => project_policy::<true, false, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, true, false) => project_policy::<false, true, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, false, false) => project_policy::<false, false, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
         }
     }
 }
@@ -1180,7 +1320,7 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
 // This prevents opaque publication boundaries from causing repeated reloads
 // of the incoming row descriptor's runtime flag. Values and stores are unchanged.
 #[inline(never)]
-unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool>(
+unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
     rows: RankedRows<COMPACT_COLS>,
@@ -1191,38 +1331,46 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
 ) {
     let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
     unsafe {
-        let ap = pretranspose_ring::<0, true>(ar, rw);
+        let ap_aligned;
+        let ap_plain;
+        let ap: &[u64; 64] = if ALIGN {
+            ap_aligned = pretranspose_ring_aligned::<0, true>(ar, rw);
+            &ap_aligned.0
+        } else {
+            ap_plain = pretranspose_ring::<0, true>(ar, rw);
+            &ap_plain
+        };
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
-            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER>(proj, rows, a, b, &ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }
@@ -1271,9 +1419,38 @@ mod tests {
             let mut actual = [0u8; 64];
             unsafe {
                 let value = _mm512_loadu_si512(input.as_ptr().cast());
-                _mm512_storeu_si512(actual.as_mut_ptr().cast(), ring_prepared_pack(value));
+                _mm512_storeu_si512(actual.as_mut_ptr().cast(), ring_prepared_pack::<false>(value));
             }
             assert_eq!(actual, expected, "prepared input case {case}");
+        }
+    }
+
+    /// FLOCK_NO_PROJ_PIPE: aligned slots hold the incumbent slots' bytes, on whole lines.
+    #[test]
+    fn aligned_pretranspose_matches_plain_slots() {
+        unsafe {
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut ring = Ring([[0; 8]; 32]);
+            for x in ring.0.iter_mut().flatten() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *x = seed as u32;
+            }
+            let p = ring.0.as_ptr().cast::<V8>();
+            for rw in [0, 16] {
+                macro_rules! check_b {
+                    ($($blk:literal)*) => {$(
+                        let s = pretranspose_ring_aligned::<$blk, false>(p, rw);
+                        assert_eq!(s.0.as_ptr() as usize % 64, 0);
+                        assert_eq!(s.0, pretranspose_ring::<$blk, false>(p, rw), "B blk={} rw={rw}", $blk);
+                    )*};
+                }
+                check_b!(2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29);
+                let s = pretranspose_ring_aligned::<0, true>(p, rw);
+                assert_eq!(s.0.as_ptr() as usize % 64, 0);
+                assert_eq!(s.0, pretranspose_ring::<0, true>(p, rw), "A rw={rw}");
+            }
         }
     }
 
@@ -1439,3 +1616,62 @@ mod global_cse;
 #[cfg(test)]
 #[path="blake3_witgen8_xor_cse_tests.rs"]
 mod cse_tests;
+
+#[path="blake3_witgen8_xor_rank21.rs"]
+mod rank21;
+
+#[cfg(test)]
+#[path = "blake3_witgen8_xor_defer_tests.rs"]
+mod defer_tests;
+
+#[cfg(target_os = "linux")]
+#[path = "blake3_witgen8_xor_registers.rs"]
+mod dense_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial7.rs"]
+mod partial7_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial14.rs"]
+mod partial14_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial2.rs"]
+mod partial2_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial4.rs"]
+mod partial4_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial5.rs"]
+mod partial5_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial6.rs"]
+mod partial6_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial9.rs"]
+mod partial9_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial11.rs"]
+mod partial11_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial12.rs"]
+mod partial12_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial13.rs"]
+mod partial13_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial3.rs"]
+mod partial3_registers;
+
+#[cfg(target_os = "linux")]
+#[path="blake3_witgen8_xor_partial10.rs"]
+mod partial10_registers;

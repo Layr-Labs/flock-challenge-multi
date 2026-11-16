@@ -12,8 +12,10 @@ global_asm!(include_str!("ab_leaf_accum.S"), options(raw));
 // Lane ab1: pair-major copies of the merged banks (window stride one row).
 global_asm!(include_str!("ab_leaf_accum_pmaj.S"), options(raw));
 global_asm!(include_str!("ab_leaf_accum_ns.S"), options(raw));
+// FLOCK_AB_NOVZU=1 alternates: interpolate kernels without the trailing vzeroupper.
+global_asm!(include_str!("ab_leaf_accum_nv.S"), options(raw));
 
-const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
+pub(super) const SCRATCH_DATA_BYTES: usize = (78 + 31) * 64;
 const GROUPS0: [usize; 9] = [9, 9, 9, 9, 6, 9, 9, 9, 9];
 const GROUPS2: [usize; 9] = [6, 9, 9, 9, 9, 9, 9, 9, 9];
 
@@ -47,6 +49,86 @@ fn grouped_enabled() -> bool {
         std::env::var_os("FLOCK_NO_AB_MERGED").is_none()
     });
     *ON
+}
+
+/// Mahmoud514 5b2ced50's single-pass leaf preparation: validate and pack the
+/// coefficient tables once per round ([`Prepared`]) and run every band from
+/// them ([`try_run_prepared`]) instead of a per-worker [`Cache`] that compares
+/// the 64 KiB matrix key on every band. Same tables, same kernel arguments.
+/// `FLOCK_NO_AB_PREPARED=1` restores the per-worker cache path unchanged.
+/// Mahmoud514 5b2ced50's interpolate kernels without the trailing vzeroupper
+/// (`*_nv` in ab_leaf_accum_nv.S): opt-in with `FLOCK_AB_NOVZU=1`; unset keeps
+/// the incumbent kernels. Same instructions otherwise, so the same planes.
+fn novzu_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_AB_NOVZU").is_some_and(|v| v == "1")
+    });
+    *ON
+}
+
+pub(super) fn prepared_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_AB_PREPARED").is_none());
+    *ON
+}
+
+#[derive(Clone)]
+pub(super) struct Prepared {
+    pub(super) m0: Vec<u64>,
+    pub(super) m2: Vec<u64>,
+    pub(super) merged: bool,
+}
+
+impl Prepared {
+    pub(super) fn new(mats: &[u64]) -> Option<Self> {
+        if mats.len() != 32 * 256 {
+            return None;
+        }
+        let mut m0 = Vec::with_capacity(32 * 78);
+        let mut m2 = Vec::with_capacity(32 * 78);
+        let convert = super::convert_table();
+        for row in mats.chunks_exact(256) {
+            // At absolute row0, phi8(1)=1, so the first bit column is scale.
+            let mut bytes = [0u8; 16];
+            for byte in 0..16 {
+                for bit in 0..8 {
+                    bytes[byte] |= (((row[byte] >> (8 * (7 - bit))) & 1) as u8) << bit;
+                }
+            }
+            let scale = F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            };
+            let mut expected = [0u64; 256];
+            super::ab_eq_fold_mats_row_transposed(convert, scale, &mut expected);
+            if expected.as_slice() != row {
+                return None;
+            }
+            let coefficients = decode(scale);
+            for (forms, dest) in [(&COEFF0, &mut m0), (&COEFF2, &mut m2)] {
+                for &form in forms {
+                    let mut mask = form;
+                    let mut coefficient = 0u8;
+                    while mask != 0 {
+                        coefficient ^= coefficients[mask.trailing_zeros() as usize];
+                        mask &= mask - 1;
+                    }
+                    dest.push(GF8_MATRICES[coefficient as usize]);
+                }
+            }
+        }
+        let merged = grouped_enabled();
+        let (m0_packed, m2_packed) = if merged {
+            (pack_groups(m0, &[27, 24, 27]), pack_groups(m2, &[24, 27, 27]))
+        } else {
+            (pack_groups(m0, &GROUPS0), pack_groups(m2, &GROUPS2))
+        };
+        Some(Self {
+            m0: m0_packed,
+            m2: m2_packed,
+            merged,
+        })
+    }
 }
 
 /// Lane ab1: true when [`try_run`] will take the merged leaf path for these
@@ -123,6 +205,56 @@ impl Cache {
     }
 }
 
+/// One band from round-level [`Prepared`] tables and a caller-owned scratch
+/// span (Mahmoud514 5b2ced50). The caller built `prepared` from this round's
+/// matrices, so no per-band key comparison is needed.
+pub(super) fn try_run_prepared(
+    prepared: &Prepared,
+    scratch: &mut [u8],
+    source: &[u8],
+    x_hi: usize,
+    mode: usize,
+    planes: &mut [u8],
+    layout: usize,
+) -> bool {
+    const BAND_BYTES: usize = 2048 * 29 * 64;
+    if planes.len() != 128 * 1024 || mode > 2 {
+        return false;
+    }
+    // Probe only: the padded split-half layout spans more than one band.
+    let x_hi = if layout == 65 { x_hi % 120 } else { x_hi };
+    let end_pad = if layout == 65 { 32 * 15 * 4096 * 2 + 4096 - BAND_BYTES } else { 0 };
+    let Some(start) = x_hi.checked_mul(BAND_BYTES) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(BAND_BYTES) else {
+        return false;
+    };
+    let Some(rows) = source.get(start..end + end_pad) else {
+        return false;
+    };
+    let raw = scratch.as_mut_ptr();
+    let offset = raw.align_offset(64);
+    if offset + SCRATCH_DATA_BYTES > scratch.len() {
+        return false;
+    }
+    let aligned_scratch = unsafe { raw.add(offset) };
+    unsafe {
+        flock_ab_poly_band(
+            rows.as_ptr(),
+            prepared.m0.as_ptr(),
+            prepared.m2.as_ptr(),
+            BASIS_MATRICES.as_ptr(),
+            aligned_scratch,
+            planes.as_mut_ptr(),
+            mode,
+            prepared.merged,
+            if prepared.merged { layout } else { 0 },
+        );
+    }
+    true
+}
+
 pub(super) fn try_run(
     cache: &mut Option<Cache>,
     source: &[u8],
@@ -195,6 +327,8 @@ unsafe extern "C" {
     fn flock_ab_register_bank2_m2(source: *const u8, matrices: *const u64, leaves: *mut u8);
     fn flock_ab_leaf_interpolate0(leaves: *const u8, polynomial: *mut u8);
     fn flock_ab_leaf_interpolate2(leaves: *const u8, polynomial: *mut u8);
+    fn flock_ab_leaf_interpolate0_nv(leaves: *const u8, polynomial: *mut u8);
+    fn flock_ab_leaf_interpolate2_nv(leaves: *const u8, polynomial: *mut u8);
     fn flock_ab_poly_finalize(polynomial: *const u8, basis: *const u64, planes: *mut u8);
     fn flock_ab_merged_bank0_m0(source: *const u8, matrices: *const u64, leaves: *mut u8);
     fn flock_ab_merged_bank0_m1(source: *const u8, matrices: *const u64, leaves: *mut u8);
@@ -319,6 +453,19 @@ unsafe extern "C" fn flock_ab_poly_band(
         };
         let leaves = scratch;
         let polynomial = scratch.add(78 * 64);
+        if novzu_enabled() {
+            // Same loop with the vzeroupper-free interpolate copies.
+            for pair in 0..64 {
+                let source = rows.add(pair * pair_bytes);
+                bank2(source, mats2, leaves);
+                flock_ab_leaf_interpolate2_nv(leaves, polynomial);
+                flock_ab_poly_finalize(polynomial.add(128), basis.add(32), out.add(2 * pair * 1024));
+                bank0(source.add(half), mats0, leaves);
+                flock_ab_leaf_interpolate0_nv(leaves, polynomial);
+                flock_ab_poly_finalize(polynomial, basis, out.add((2 * pair + 1) * 1024));
+            }
+            return;
+        }
         for pair in 0..64 {
             let source = rows.add(pair * pair_bytes);
             bank2(source, mats2, leaves);
