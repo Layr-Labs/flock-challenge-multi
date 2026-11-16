@@ -99,15 +99,100 @@ pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
 /// it. Cascade level 2 requires the lookahead itself to be on.
 #[inline]
 /// Cascade level of the deeper tail cascade (`FLOCK_ZC_C3_AT`, 1 or 2;
-/// default 2). `FLOCK_NO_ZC_C3=1` turns the deeper cascade off.
+/// default 1: five official in-run factorial readings on the ranked runner
+/// put level 1 ahead of level 2 by +0.13, +0.18, +0.22, +0.25 and +0.28 ms:
+/// kaankolcu 66df0836, 1736ca81, 942b2880, leech1996 9772fbd5, e-man07
+/// f46c31d9). `FLOCK_ZC_C3_AT=2` restores the previous level.
+/// `FLOCK_NO_ZC_C3=1` turns the deeper cascade off.
 fn zc_c3_at() -> usize {
     static AT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         match std::env::var("FLOCK_ZC_C3_AT").ok().as_deref() {
-            Some("1") => 1,
-            _ => 2,
+            Some("2") => 2,
+            _ => 1,
         }
     });
     *AT
+}
+
+/// Test-only override of [`zc_c3_chain`] (0 = read the environment). Both
+/// routes emit the same transcript, so flipping it under a concurrently
+/// running test cannot make that test wrong.
+#[cfg(test)]
+pub(crate) static ZC_C3_CHAIN_FORCED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Chained deeper tail cascade (`FLOCK_ZC_C3_CHAIN=<k>`, opt-in; unset, `0`
+/// or unparsable keeps the incumbent route). With the rounds 3+4+5 cascade on
+/// (`c3_r345`, the `FLOCK_ZC_C3_AT=1` default), the three-variable level 1
+/// also emits the round two ahead of its message as a biquadratic, so level 2
+/// folds three variables too, and so on for up to `k` levels after level 1
+/// (see [`c3_chain_shifts`]). At the ranked shape `k = 1` turns level 2 from
+/// n20 → n18 into n20 → n17 (every later level reads half the data); `k ≥ 6`
+/// makes every plain level a three-variable one (8 composed levels instead
+/// of 11). Value-identical (same messages, same transcript, same proof
+/// bytes); any `FLOCK_NO_ZC_CASCADE*` / `FLOCK_NO_ZC_DEEP_CASCADE` switch also
+/// keeps the incumbent route.
+fn zc_c3_chain() -> usize {
+    #[cfg(test)]
+    {
+        let forced = ZC_C3_CHAIN_FORCED.load(std::sync::atomic::Ordering::Relaxed);
+        if forced != 0 {
+            return forced;
+        }
+    }
+    static K: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_ZC_C3_CHAIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    *K
+}
+
+/// Level shifts of the chained deeper cascade ([`zc_c3_chain`]): level `L`
+/// folds `shifts[L]` variables (3 = a composed three-variable level). Starts
+/// from the rounds 3+4+5 pass and its three-variable level 1 (`c3_r345`),
+/// then appends levels while one more lookahead level is possible (input of
+/// at least 2⁴ elements, non-zero lookahead weight), making each new level a
+/// three-variable one while fewer than `chain` were appended, the previous
+/// level is itself three-variable and can emit the biquadratic
+/// (`casc_ok(input log₂)`), the new level's input has at least 2⁵ elements,
+/// and the two extra weights the biquadratic and the new level's lookahead
+/// divide by are non-zero. Once a two-variable level is appended the chain
+/// stops. `w[j]` is the eq weight of `X_{j+1}` (`r[k_skip..]`); level `L`
+/// reads `2^(n_mlv − Σ shifts[..L])` elements, its variable offset is
+/// `Σ shifts[..L] − 2L`, and the tail loop starts at `Σ shifts`.
+pub(crate) fn c3_chain_shifts(
+    n_mlv: usize,
+    w: &[F128],
+    chain: usize,
+    casc_ok: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    assert_eq!(w.len(), n_mlv);
+    let mut shifts = vec![3usize, 3];
+    let mut extra = 0usize;
+    let mut chaining = true;
+    loop {
+        let used: usize = shifts.iter().sum();
+        let last = *shifts.last().expect("at least two levels");
+        // The last level emits X_{used+1}'s message; one more level needs the
+        // lookahead weight of X_{used+2} and an input of at least 2⁴.
+        if n_mlv < used + 4 || w[used + 1] == F128::ZERO {
+            break;
+        }
+        let log_next = n_mlv - used;
+        let c3_next = chaining
+            && extra < chain
+            && last == 3
+            && log_next >= 5
+            && casc_ok(log_next + last)
+            && w[used + 2] != F128::ZERO
+            && w[used + 4] != F128::ZERO;
+        chaining = c3_next;
+        extra += c3_next as usize;
+        shifts.push(if c3_next { 3 } else { 2 });
+    }
+    shifts
 }
 
 fn cascade2_off() -> bool {
@@ -624,6 +709,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         }
     };
     let peq_idle_arg: Option<&(dyn Fn() + Sync)> = if *V1_PEQ_EARLY { Some(&peq_idle) } else { None };
+    // Keep-warm guard taken right after the round-one join instead of after z
+    // is sampled (`FLOCK_NO_ZC_R1_EXIT_WARM` restores the later start).
+    static R1_EXIT_WARM: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R1_EXIT_WARM").is_none());
+    let mut early_hot: Option<crate::hot_pool::HotPool> = None;
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
@@ -747,6 +837,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     None => rayon::join(ab_closure, c_closure),
                 };
             crate::rstrace::ev("r1:joined", 0);
+            if *R1_EXIT_WARM { early_hot = crate::hot_pool::HotPool::start(); }
             let (canon, w30d) = canon;
             if w30_elided {
                 let rows = canon
@@ -870,7 +961,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let z = challenger.sample_f128();
     crate::gaptime::mark("zc: round1 observed + z sampled");
     crate::rstrace::ev("r1:sampled", 0);
-    let _hot_pool = crate::hot_pool::HotPool::start();
+    let _hot_pool = early_hot.take().or_else(crate::hot_pool::HotPool::start);
     crate::rstrace::ev("r1:hot", 0);
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
@@ -1169,6 +1260,29 @@ fn prove_packed_padded_inner<C: Challenger>(
         (true, true, true, true, true, true, true, true, true, true, true, false) => 11,
         (true, true, true, true, true, true, true, true, true, true, true, true) => 12,
     };
+    // Chained deeper cascade (`FLOCK_ZC_C3_CHAIN`, opt-in, see `zc_c3_chain`):
+    // only on top of the rounds 3+4+5 cascade with every cascade level on, and
+    // only when it adds at least one three-variable level; otherwise `None`
+    // and every line below runs the incumbent route.
+    let chain_k = zc_c3_chain();
+    let chain_plan: Option<Vec<usize>> = (chain_k > 0
+        && c3_r345
+        && n_levels > 2
+        && !cascade2_off()
+        && !cascade3_off()
+        && !cascade4_off()
+        && !cascade5_off()
+        && !deep_cascade_off())
+    .then(|| {
+        c3_chain_shifts(n_mlv, &r[k_skip..], chain_k, |log_n| {
+            multilinear::fold3_oct_casc_route_ok(1usize << log_n)
+        })
+    })
+    .filter(|p| p.len() > 2 && p[2] == 3);
+    let n_levels = chain_plan.as_ref().map_or(n_levels, |p| p.len());
+    if zc_timing && let Some(p) = chain_plan.as_ref() {
+        eprintln!("[zc-timing] c3 chain k={chain_k}: level shifts {p:?}");
+    }
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
 
@@ -1186,7 +1300,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     for level in 0..n_levels {
         let la_cur = la.take().expect("cascade level without a deferred message");
         // Level offset: with ZC-3VAR, levels ≥ 1 sit one variable later.
-        let lo_off = if level == 0 {
+        // Chained: every earlier three-variable level adds one.
+        let lo_off = if let Some(p) = chain_plan.as_ref() {
+            p[..level].iter().sum::<usize>() - 2 * level
+        } else if level == 0 {
             0
         } else if level <= c3_at {
             off
@@ -1194,9 +1311,15 @@ fn prove_packed_padded_inner<C: Challenger>(
             off2
         };
         // Cascade level `c3_at` folds three variables; the level before it
-        // emits the biquadratic (`casc`).
-        let c3_level = c3 && level == c3_at;
+        // emits the biquadratic (`casc`). Chained: every level the plan gives
+        // three variables, and each of them that precedes another emits it.
+        let c3_level = match chain_plan.as_ref() {
+            Some(p) => level >= 1 && p[level] == 3,
+            None => c3 && level == c3_at,
+        };
         let casc_level = c3_tail && level + 1 == c3_at;
+        let chain_casc =
+            chain_plan.as_ref().is_some_and(|p| c3_level && level + 1 < p.len() && p[level + 1] == 3);
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
         multilinear_msgs.push((m_odd_1, m_odd_inf));
@@ -1339,6 +1462,36 @@ fn prove_packed_padded_inner<C: Challenger>(
                 la = Some(la_next);
             }
             (m1, mi, lm_out)
+        } else if c3_level && chain_plan.is_some() {
+            // Chained three-variable level: octet tables plus the next
+            // biquadratic when another three-variable level follows; small
+            // levels on the spinning team like the two-variable levels.
+            let lm_out =
+                lm_reader_ok && !chain_casc && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
+            let (m1, mi, la_next, la7_next) =
+                multilinear::fold3_oct_plain_and_round_pair_lookahead_into_chain(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    [
+                        mlv_rhos[2 * level + lo_off],
+                        mlv_rhos[2 * level + 1 + lo_off],
+                        mlv_rhos[2 * level + 2 + lo_off],
+                    ],
+                    &r_next,
+                    lm_out,
+                    chain_casc,
+                    gl1_team,
+                );
+            assert_eq!(la7_next.is_some(), chain_casc, "chained cascade route did not run");
+            if level + 1 < n_levels {
+                la = Some(la_next);
+            }
+            if chain_casc {
+                la7 = la7_next;
+            }
+            (m1, mi, lm_out)
         } else if c3_level {
             let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
             let (m1, mi, la_next) = multilinear::fold3_oct_plain_and_round_pair_lookahead_into(
@@ -1409,9 +1562,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         mlv_rhos.push(challenger.sample_f128());
         crate::rstrace::ev("lv:smp", level as u32);
     }
-    let loop_start = 2 * n_levels
-        + if n_levels > 0 { off } else { 0 }
-        + if n_levels > c3_at { c3 as usize } else { 0 };
+    let loop_start = match chain_plan.as_ref() {
+        Some(p) => p.iter().sum(),
+        None => {
+            2 * n_levels
+                + if n_levels > 0 { off } else { 0 }
+                + if n_levels > c3_at { c3 as usize } else { 0 }
+        }
+    };
 
     for i in loop_start..(n_mlv - 1) {
         crate::rstrace::ev("tr:in", i as u32);
@@ -1733,6 +1891,74 @@ mod tests {
     fn pack_abc(a: &[bool], b: &[bool], c: &[bool]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use univariate_skip::pack_bits;
         (pack_bits(a), pack_bits(b), pack_bits(c))
+    }
+
+    /// Chained deeper cascade plan (`FLOCK_ZC_C3_CHAIN`): at the ranked shape
+    /// (n_mlv = 26) the full chain is eight three-variable levels and `k = 1`
+    /// adds exactly one; the real route predicate admits the full chain; and
+    /// for every shape, depth and zero slot each level stays above its kernel
+    /// floor, three-variable levels form one run after level 1 that never
+    /// exceeds `k`, every weight the levels divide by is non-zero, the last
+    /// message variable is in range, and the plan stops only when no further
+    /// lookahead level is possible.
+    #[test]
+    fn c3_chain_shifts_ranked_and_invariants() {
+        let all = |_: usize| true;
+        let ones = vec![F128::ONE; 26];
+        assert_eq!(c3_chain_shifts(26, &ones, 99, all), vec![3; 8]);
+        assert_eq!(c3_chain_shifts(26, &ones, 6, all), vec![3; 8]);
+        assert_eq!(c3_chain_shifts(26, &ones, 1, all), vec![3, 3, 3, 2, 2, 2, 2, 2, 2, 2]);
+        let route = |log_n: usize| {
+            let lo = multilinear::plain_cascade_lo_size(1usize << (log_n - 1));
+            lo >= 16 && lo.is_multiple_of(16)
+        };
+        assert_eq!(c3_chain_shifts(26, &ones, 99, route), vec![3; 8]);
+        // Σ shifts is where the tail loop starts; at the ranked shape the
+        // full chain leaves one single-round iteration (X₂₆), k = 1 two.
+        assert_eq!(c3_chain_shifts(26, &ones, 99, all).iter().sum::<usize>(), 24);
+        assert_eq!(c3_chain_shifts(26, &ones, 1, all).iter().sum::<usize>(), 23);
+
+        for n_mlv in 10usize..=30 {
+            for chain in [1usize, 2, 3, 99] {
+                for zero in [None, Some(7usize), Some(8), Some(9), Some(10), Some(13), Some(n_mlv - 1)] {
+                    for no_route_at in [None, Some(17usize)] {
+                        let mut w = vec![F128::ONE; n_mlv];
+                        if let Some(z) = zero {
+                            if z >= n_mlv {
+                                continue;
+                            }
+                            w[z] = F128::ZERO;
+                        }
+                        let ok = |log_n: usize| Some(log_n) != no_route_at;
+                        let p = c3_chain_shifts(n_mlv, &w, chain, ok);
+                        let case = format!("n_mlv={n_mlv} chain={chain} zero={zero:?} route={no_route_at:?} plan={p:?}");
+                        assert_eq!(&p[..2], &[3, 3], "{case}");
+                        let mut used = p[0] + p[1];
+                        let mut extra = 0;
+                        for l in 2..p.len() {
+                            let log_n = n_mlv - used;
+                            // The previous level's lookahead weight (X_{used+2}).
+                            assert_ne!(w[used + 1], F128::ZERO, "{case} l={l}");
+                            if p[l] == 3 {
+                                extra += 1;
+                                assert!(p[2..l].iter().all(|&s| s == 3), "{case} l={l}");
+                                assert!(log_n >= 5, "{case} l={l}");
+                                assert!(ok(log_n + 3), "{case} l={l}");
+                                assert_ne!(w[used + 2], F128::ZERO, "{case} l={l}");
+                                assert_ne!(w[used + 4], F128::ZERO, "{case} l={l}");
+                            } else {
+                                assert_eq!(p[l], 2, "{case} l={l}");
+                                assert!(log_n >= 4, "{case} l={l}");
+                            }
+                            used += p[l];
+                        }
+                        assert!(extra <= chain, "{case}");
+                        assert!(used < n_mlv, "{case}");
+                        assert!(n_mlv < used + 4 || w[used + 1] == F128::ZERO, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     /// `prove` runs end-to-end at the smallest valid m (= k_skip + N_INNER = 13)

@@ -1879,6 +1879,162 @@ pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_x86<
     }
 }
 
+/// Chained deeper cascade (`FLOCK_ZC_C3_CHAIN`): [`fold3_oct_and_message_lookahead_wtab_x86`]
+/// that also emits the deferred biquadratic of the round two ahead of its
+/// message, exactly as [`fold2_and_message_lookahead_defer_wtab_casc_x86`]
+/// does for a two-variable level. Same three-variable octet fold and the same
+/// lane-major message tiles; the tiles are not stored per tile but per
+/// 32-output block in octet layout by `casc_block` (the next three-variable
+/// level reads that layout), and `casc_finish` returns the eight message sums
+/// as `odd + kappa·even` plus the per-chunk biquadratic in `la7`. `wt` must be
+/// the `build_w_pair_table_casc` table. A separate function so the incumbent
+/// level's code is untouched.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ),
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )),
+    target_feature(enable = "avx512f,vpclmulqdq")
+)]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold3_oct_and_message_lookahead_wtab_casc_x86<const NT_OUT: bool>(
+    a_in: *const F128,
+    b_in: *const F128,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    rho: [F128; 3],
+    lo_size: usize,
+    wt: &[F128],
+    la7: &mut [F128; 18],
+    kappa: F128,
+) -> [F128; 8] {
+    use core::arch::x86_64::*;
+    debug_assert!(lo_size.is_multiple_of(16));
+
+    unsafe {
+        let bc = |t: F128| _mm512_broadcast_i32x4(_mm_set_epi64x(t.hi as i64, t.lo as i64));
+        let [ra, rb, rc] = rho;
+        let r = [
+            bc(ra),
+            bc(rb),
+            bc(ra * rb),
+            bc(rc),
+            bc(ra * rc),
+            bc(rb * rc),
+            bc(ra * rb * rc),
+        ];
+        let mut acc = [WideGhashX4::zero(); 8];
+        let mut acc7 = [WideGhashX4::zero(); 10];
+        let wt_ptr = wt.as_ptr();
+        const PF_OFF: usize = 2 * ZC_TAIL_PF_TILES * 64 * core::mem::size_of::<F128>();
+
+        // One 16-output tile: fold, transpose to lane-major, weight. No store;
+        // `casc_block` writes the whole 32-output block in octet layout.
+        macro_rules! step8_fast {
+            ($x_lo:expr) => {{
+                let x = $x_lo;
+                let output = 2 * x;
+                let input = 8 * output;
+                let a_src = a_in.add(input);
+                let b_src = b_in.add(input);
+                let pa = a_src.cast::<i8>().wrapping_add(PF_OFF);
+                let pb = b_src.cast::<i8>().wrapping_add(PF_OFF);
+                for l in 0..16 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+                let oa0 = fold32_oct_to_4(a_src, &r);
+                let oa1 = fold32_oct_to_4(a_src.add(32), &r);
+                let oa2 = fold32_oct_to_4(a_src.add(64), &r);
+                let oa3 = fold32_oct_to_4(a_src.add(96), &r);
+                for l in 16..32 {
+                    _mm_prefetch(pa.wrapping_add(64 * l), _MM_HINT_T0);
+                    _mm_prefetch(pb.wrapping_add(64 * l), _MM_HINT_T0);
+                }
+                let ob0 = fold32_oct_to_4(b_src, &r);
+                let ob1 = fold32_oct_to_4(b_src.add(32), &r);
+                let ob2 = fold32_oct_to_4(b_src.add(64), &r);
+                let ob3 = fold32_oct_to_4(b_src.add(96), &r);
+                let [a0, a1, a2, a3] = transpose4_lanes(oa0, oa1, oa2, oa3);
+                let [b0, b1, b2, b3] = transpose4_lanes(ob0, ob1, ob2, ob3);
+                let wp = wt_ptr.add(x) as *const __m512i;
+                let w = _mm512_loadu_si512(wp);
+                let w64 = _mm512_loadu_si512(wp.add(1));
+                let a0w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a0, w, w64);
+                let a1w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a1, w, w64);
+                let a2w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a2, w, w64);
+                let a3w = crate::field::gf2_128::x86_64::ghash_mul_x4_split(a3, w, w64);
+                (a0w, a1w, a2w, a3w, b0, b1, b2, b3, [a0, a1, a2, a3])
+            }};
+        }
+
+        let mut x_lo = 0;
+        while x_lo + 16 <= lo_size {
+            let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, a_t) = step8_fast!(x_lo);
+            let (c0w, c1w, c2w, c3w, d0, d1, d2, d3, c_t) = step8_fast!(x_lo + 8);
+            casc_block::<NT_OUT>(
+                a_t, c_t, [a0w, a1w, a2w, a3w], [c0w, c1w, c2w, c3w],
+                [b0, b1, b2, b3], [d0, d1, d2, d3],
+                a_out.add(2 * x_lo), b_out.add(2 * x_lo), &mut acc7,
+            );
+            acc[0].mul_acc2(a1w, b1, c1w, d1);
+            acc[1].mul_acc2(
+                _mm512_xor_si512(a0w, a1w),
+                _mm512_xor_si512(b0, b1),
+                _mm512_xor_si512(c0w, c1w),
+                _mm512_xor_si512(d0, d1),
+            );
+            acc[2].mul_acc2(a3w, b3, c3w, d3);
+            acc[3].mul_acc2(
+                _mm512_xor_si512(a2w, a3w),
+                _mm512_xor_si512(b2, b3),
+                _mm512_xor_si512(c2w, c3w),
+                _mm512_xor_si512(d2, d3),
+            );
+            acc[4].mul_acc2(a2w, b2, c2w, d2);
+            let e_aw = _mm512_xor_si512(a0w, a2w);
+            let e_b = _mm512_xor_si512(b0, b2);
+            let o_aw = _mm512_xor_si512(a1w, a3w);
+            let o_b = _mm512_xor_si512(b1, b3);
+            let e_cw = _mm512_xor_si512(c0w, c2w);
+            let e_d = _mm512_xor_si512(d0, d2);
+            let o_cw = _mm512_xor_si512(c1w, c3w);
+            let o_d = _mm512_xor_si512(d1, d3);
+            acc[5].mul_acc2(e_aw, e_b, e_cw, e_d);
+            acc[6].mul_acc2(o_aw, o_b, o_cw, o_d);
+            acc[7].mul_acc2(
+                _mm512_xor_si512(e_aw, o_aw),
+                _mm512_xor_si512(e_b, o_b),
+                _mm512_xor_si512(e_cw, o_cw),
+                _mm512_xor_si512(e_d, o_d),
+            );
+            x_lo += 16;
+        }
+
+        if NT_OUT {
+            _mm_sfence();
+        }
+        let (sums, l7) = casc_finish(&acc, &acc7, kappa);
+        *la7 = l7;
+        sums
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -5020,6 +5176,10 @@ core::arch::global_asm!(
     include_str!("gfni_c4_lm.S"),
     include_str!("gfni_c4_register_result.S"),
     include_str!("gfni_c4_pass4_register_result.S"),
+    // `FLOCK_MAH_ASM=1` alternates (crate::MAH_ASM), appended after the originals.
+    include_str!("gfni_c4_lm_m.S"),
+    include_str!("gfni_c4_register_result_m.S"),
+    include_str!("gfni_c4_pass4_register_result_m.S"),
 );
 
 #[cfg(all(
@@ -5034,6 +5194,9 @@ unsafe extern "C" {
     fn flock_gfni_c4_lm_preserving();
     fn flock_gfni_c4_lm_register_result();
     fn flock_gfni_c4_pass4_register_result();
+    fn flock_gfni_c4_lm_preserving_m();
+    fn flock_gfni_c4_lm_register_result_m();
+    fn flock_gfni_c4_pass4_register_result_m();
 }
 
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
@@ -5054,6 +5217,22 @@ unsafe fn gfni_fold32_rows_c4_lm_registers(
     use core::arch::x86_64::*;
     #[cfg(target_os = "linux")]
     unsafe {
+        if *crate::MAH_ASM_C4 {
+            let lo: __m512i;
+            let hi: __m512i;
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+            return [lo, hi];
+        }
         let lo: __m512i;
         let hi: __m512i;
         core::arch::asm!(
@@ -5098,6 +5277,24 @@ unsafe fn gfni_fold64_rows_c4_lm_registers(
     use core::arch::x86_64::*;
     #[cfg(target_os = "linux")]
     unsafe {
+        if *crate::MAH_ASM_C4 {
+            let a: __m512i;
+            let b: __m512i;
+            let c: __m512i;
+            let d: __m512i;
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+            return [a, b, c, d];
+        }
         let a: __m512i;
         let b: __m512i;
         let c: __m512i;
@@ -5148,6 +5345,22 @@ pub(crate) unsafe fn gfni_fold64_rows_masked_c4_bcast_lm(
 ) {
     #[cfg(target_os = "linux")]
     if dead_lines == 0 {
+        if *crate::MAH_ASM_C4 {
+            unsafe {
+                core::arch::asm!(
+                    "call {kernel}",
+                    kernel = sym flock_gfni_c4_lm_preserving_m,
+                    in("rdi") rows,
+                    in("rsi") m.1.as_ptr(),
+                    in("rdx") out,
+                    lateout("rax") _,
+                    out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                    out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                    out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _,
+                );
+            }
+            return;
+        }
         unsafe {
             core::arch::asm!(
                 "call {kernel}",
@@ -6348,8 +6561,9 @@ unsafe fn r4_canonical_set(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
-#[inline(never)]
-pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
+/// [`round2_lookahead_chunk_baked_elide_r4_x86`] without the per-chunk lane
+/// sums: the chunk's reduced accumulators, for callers that weight them once.
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_red_x86(
     a_pkt: *const u8,
     b_pkt: *const u8,
     row_base: usize,
@@ -6357,12 +6571,10 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     bk: &R2EqBake,
     lw: &R4LaneWeights,
     ys: bool,
-) -> ([F128; 8], [F128; 18]) {
+) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
     });
-    // The contraction moves each partial set by two F128 lanes. It is
-    // valid exactly when the final lane weights repeat after two lanes.
     let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
     unsafe {
         macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
@@ -6391,6 +6603,99 @@ pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
     not(target_feature = "avx512bw"),
     target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
 )]
+/// Lane weighting of reduced round-two accumulators: the message terms with
+/// `bk.lane`, the round-four corners with `lw.lv4` / `lw.lv4_odd`.
+pub(crate) unsafe fn r2_r4_finish(
+    red: &[core::arch::x86_64::__m512i; 8],
+    red4: &[core::arch::x86_64::__m512i; 10],
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+) -> ([F128; 8], [F128; 18]) {
+    use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
+    unsafe {
+        let lane_sum = |v: core::arch::x86_64::__m512i, w, w64| -> F128 {
+            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
+            l[0] + l[1] + l[2] + l[3]
+        };
+        let lane_w = f128x4_loadu(bk.lane.as_ptr());
+        let lane_w64 = ghash_shift64_x4(lane_w);
+        let out: [F128; 8] = core::array::from_fn(|i| lane_sum(red[i], lane_w, lane_w64));
+        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
+        let lv4_64 = ghash_shift64_x4(lv4);
+        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
+        let lvo_64 = ghash_shift64_x4(lvo);
+        let mut r4 = [F128::ZERO; 18];
+        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
+        r4[0] = lane_sum(red4[0], lv4, lv4_64);
+        for k in 1..9 {
+            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
+        }
+        for k in 0..9 {
+            r4[9 + k] = lane_sum(red4[1 + k], lv4, lv4_64);
+        }
+        (out, r4)
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[inline(never)]
+pub(crate) unsafe fn round2_lookahead_chunk_baked_elide_r4_x86(
+    a_pkt: *const u8,
+    b_pkt: *const u8,
+    row_base: usize,
+    lo_size: usize,
+    bk: &R2EqBake,
+    lw: &R4LaneWeights,
+    ys: bool,
+) -> ([F128; 8], [F128; 18]) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R4_CANON_PAIR").is_some()
+    });
+    // The contraction moves each partial set by two F128 lanes. It is
+    // valid exactly when the final lane weights repeat after two lanes.
+    let pair = !*OFF && lw.lv4[0] == lw.lv4[2] && lw.lv4[1] == lw.lv4[3];
+    unsafe {
+        macro_rules! go { ($p:literal,$a:literal,$b:literal) => {
+            round2_lookahead_chunk_baked_elide_r4_impl::<$p, $a, $b>(a_pkt,b_pkt,row_base,lo_size,bk,lw) } }
+        let (red, red4) = match (pair, ys) {
+            (true, true) => go!(true, true, true),
+            (false, true) => go!(false, true, true),
+            (true, false) => go!(true, false, false),
+            (false, false) => go!(false, false, false),
+        };
+        r2_r4_finish(&red, &red4, bk, lw)
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni",
+    target_feature = "vpclmulqdq"
+))]
+#[cfg_attr(
+    target_feature = "avx512bw",
+    target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")
+)]
+#[cfg_attr(
+    not(target_feature = "avx512bw"),
+    target_feature(enable = "avx512f,avx512vbmi,gfni,vpclmulqdq")
+)]
 #[inline(never)]
 unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA: bool, const YB: bool>(
     a_pkt: *const u8,
@@ -6398,8 +6703,8 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     row_base: usize,
     lo_size: usize,
     bk: &R2EqBake,
-    lw: &R4LaneWeights,
-) -> ([F128; 8], [F128; 18]) {
+    _lw: &R4LaneWeights,
+) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
     debug_assert_eq!(row_base & 255, 0);
@@ -6573,34 +6878,9 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
             x_lo += 128;
         }
 
-        use crate::field::gf2_128::x86_64::{f128x4_extract, ghash_mul_x4_split, ghash_shift64_x4};
-        let lane_sum = |v: __m512i, w: __m512i, w64: __m512i| -> F128 {
-            let l = f128x4_extract(ghash_mul_x4_split(v, w, w64));
-            l[0] + l[1] + l[2] + l[3]
-        };
-        let mut out = [F128::ZERO; 8];
-        let lane_w = f128x4_loadu(bk.lane.as_ptr());
-        let lane_w64 = ghash_shift64_x4(lane_w);
-        let mut red = [_mm512_setzero_si512(); 8];
-        for i in 0..8 {
-            red[i] = acc[i].reduce_lanes();
-            out[i] = lane_sum(red[i], lane_w, lane_w64);
-        }
-        let lv4 = f128x4_loadu(lw.lv4.as_ptr());
-        let lv4_64 = ghash_shift64_x4(lv4);
-        let lvo = f128x4_loadu(lw.lv4_odd.as_ptr());
-        let lvo_64 = ghash_shift64_x4(lvo);
-        let mut r4 = [F128::ZERO; 18];
-        // v1[i+3j] for the odd-u (X3 = 1) corners from the incumbent accumulators.
-        const MAP: [usize; 9] = [usize::MAX, 0, 1, 4, 2, 3, 5, 6, 7];
-        r4[0] = lane_sum(acc4[0].reduce_lanes(), lv4, lv4_64);
-        for k in 1..9 {
-            r4[k] = lane_sum(red[MAP[k]], lvo, lvo_64);
-        }
-        for k in 0..9 {
-            r4[9 + k] = lane_sum(acc4[1 + k].reduce_lanes(), lv4, lv4_64);
-        }
-        (out, r4)
+        let red: [__m512i; 8] = core::array::from_fn(|i| acc[i].reduce_lanes());
+        let red4: [__m512i; 10] = core::array::from_fn(|i| acc4[i].reduce_lanes());
+        (red, red4)
     }
 }
 

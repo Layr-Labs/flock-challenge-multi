@@ -2029,26 +2029,71 @@ pub(super) unsafe fn butterfly_fused_4layer_row_shaped<
     }
 }
 
+/// Port-0 x^64 fold for [`butterfly_four_fixed_registers`]. The incumbent fold
+/// of a pending high half `H = h0 + h1·x^64` is `vpslldq H,8` plus
+/// `vpclmulqdq H,0x87,1`: two port-5 uops. `x^64·H mod p` also equals
+/// `S = rot64(H) = (h1, h0)` with the bytes `b_k` of `h1` mapped to
+/// `f(b_k) ^ c(b_{k-1})`, plus `c(b_7)` in byte 0 of the high qword, where
+/// `f`/`c` are the low/high bytes of `b·0x87`. One `vpshufd` (port 5) makes S;
+/// `vpshldq` (port 0) puts `b_{k-1}` under byte k and `b_7` under byte 8;
+/// two `vgf2p8affineqb` (port 0) apply `f` (identity on the high qword) and
+/// the byte-masked `c`. Same canonical field value, so stored rows are
+/// bit-identical. Per converted fold: port 5 -1, port 0 +3, two loads.
+/// Rows: `[F, I] x4` (64 bytes), then `C x8` (64 bytes).
+#[cfg(target_feature = "avx512bw")]
+#[repr(C, align(64))]
+struct P0RedTable([u64; 16]);
+#[cfg(target_feature = "avx512bw")]
+static P0RED_TABLE: P0RedTable = {
+    const F: u64 = 0x0103_070E_1C38_70E1; // b -> (b·0x87) mod x^8
+    const I: u64 = 0x0102_0408_1020_4080; // identity
+    const C: u64 = 0xC284_0810_2040_8000; // b -> (b·0x87) div x^8
+    P0RedTable([F, I, F, I, F, I, F, I, C, C, C, C, C, C, C, C])
+};
+
+/// Folds of [`butterfly_four_fixed_registers`] that take the port-0 form,
+/// bit i = i-th fold in program order (layer 1: 0..3, layer 2: 4..7,
+/// layer 3: 8..11, layer 4: 12..19). Three per layer: per lane step port 5
+/// goes 168 -> 156 uops and port-0-only 0 -> 36, so the 116 XOR/ternlog uops
+/// still fit on port 0 (152 <= 156). Zero without GFNI/VBMI2 at compile time.
+#[cfg(target_feature = "avx512bw")]
+const P0RED_MASK: u32 = if cfg!(all(target_feature = "gfni", target_feature = "avx512vbmi2")) {
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6)
+        | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 13) | (1 << 16) | (1 << 19)
+} else {
+    0
+};
+
 /// Fixed-register prepared four-layer butterfly with lazy x^64 folds.
 /// Rows retain a shared pending high half until they become multiplicands or
 /// are stored. Linearity combines those halves into 20 reductions instead of
 /// 32. The top three prepared pairs remain in zmm16..21 across the loop;
 /// terminal pairs shorten temporary lifetimes so all work fits without spills.
 /// Every original row load, store and prefetch hint remains present.
+/// `RED` selects folds that use the port-0 form (see [`P0RED_TABLE`]);
+/// `RED = 0` is the incumbent instruction stream.
 ///
 /// # Safety
-/// Requires AVX-512F, AVX-512BW and VPCLMULQDQ. The caller provides valid,
+/// Requires AVX-512F, AVX-512BW and VPCLMULQDQ, plus GFNI and AVX512-VBMI2
+/// when `RED != 0`. The caller provides valid,
 /// disjoint row storage and initialized prepared pairs for the shaped geometry.
 #[cfg(target_feature = "avx512bw")]
 #[inline(always)]
-unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, const H: u8, const ORD: u8>(
+unsafe fn butterfly_four_fixed_registers<
+    const S16: usize,
+    const NN: usize,
+    const H: u8,
+    const ORD: u8,
+    const RED: u32,
+>(
     ptr: *mut F128,
     prepared: *const PreparedFour,
     vector_bytes: usize,
     prefetch: *const F128,
 ) {
     // SAFETY: the caller establishes all storage and ISA preconditions.
-    // All clobbered vector registers, flags and rax are declared. Memory is
+    // All clobbered vector registers, k1, flags and rax are declared; r8 is a
+    // read-only pointer to the static fold table. Memory is
     // both read and written; nostack only asserts that this block uses no
     // stack space. No options claim purity or read-only memory.
     unsafe {
@@ -2064,6 +2109,10 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vbroadcasti32x4 zmm19, [rsi+48]",
             "vbroadcasti32x4 zmm20, [rsi+64]",
             "vbroadcasti32x4 zmm21, [rsi+80]",
+            ".if {red}",
+            "mov rax, 0x01FE01FE01FE01FE",
+            "kmovq k1, rax",
+            ".endif",
             "xor eax, eax",
             ".p2align 5",
             "2:",
@@ -2154,20 +2203,48 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpxorq zmm23, zmm24, zmm25",
             "vpxorq zmm24, zmm26, zmm27",
             "vpxorq zmm25, zmm28, zmm29",
+            ".if (({red} >> 0) & 1)",
+            "vpshufd zmm26, zmm22, 0x4e",
+            "vpshldq zmm22, zmm26, zmm22, 8",
+            "vgf2p8affineqb zmm26, zmm26, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm26, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpternlogd zmm4, zmm22, zmm26, 0x96",
             "vpxorq zmm12, zmm12, zmm4",
+            ".if (({red} >> 1) & 1)",
+            "vpshufd zmm22, zmm23, 0x4e",
+            "vpshldq zmm23, zmm22, zmm23, 8",
+            "vgf2p8affineqb zmm22, zmm22, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm23 {{k1}} {{z}}, zmm23, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm22, zmm23, 8",
             "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            ".endif",
             "vpternlogd zmm5, zmm23, zmm22, 0x96",
             "vpxorq zmm13, zmm13, zmm5",
+            ".if (({red} >> 2) & 1)",
+            "vpshufd zmm22, zmm24, 0x4e",
+            "vpshldq zmm23, zmm22, zmm24, 8",
+            "vgf2p8affineqb zmm22, zmm22, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm23 {{k1}} {{z}}, zmm23, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm22, zmm24, 8",
             "vpclmulqdq zmm23, zmm24, zmm30, 1",
+            ".endif",
             "vpternlogd zmm6, zmm23, zmm22, 0x96",
             "vpxorq zmm14, zmm14, zmm6",
+            ".if (({red} >> 3) & 1)",
+            "vpshufd zmm22, zmm25, 0x4e",
+            "vpshldq zmm23, zmm22, zmm25, 8",
+            "vgf2p8affineqb zmm22, zmm22, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm23 {{k1}} {{z}}, zmm23, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm22, zmm25, 8",
             "vpclmulqdq zmm23, zmm25, zmm30, 1",
+            ".endif",
             "vpternlogd zmm7, zmm23, zmm22, 0x96",
             "vpxorq zmm15, zmm15, zmm7",
             "vpclmulqdq zmm22, zmm8, zmm16, 0",
@@ -2230,12 +2307,26 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm29, zmm15, zmm21, 17",
             "vpternlogd zmm26, zmm27, zmm24, 0x96",
             "vpternlogd zmm28, zmm29, zmm25, 0x96",
+            ".if (({red} >> 4) & 1)",
+            "vpshufd zmm27, zmm26, 0x4e",
+            "vpshldq zmm26, zmm27, zmm26, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm26 {{k1}} {{z}}, zmm26, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            ".endif",
             "vpternlogd zmm10, zmm26, zmm27, 0x96",
             "vpxorq zmm14, zmm14, zmm10",
+            ".if (({red} >> 5) & 1)",
+            "vpshufd zmm26, zmm28, 0x4e",
+            "vpshldq zmm27, zmm26, zmm28, 8",
+            "vgf2p8affineqb zmm26, zmm26, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm27 {{k1}} {{z}}, zmm27, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm26, zmm28, 8",
             "vpclmulqdq zmm27, zmm28, zmm30, 1",
+            ".endif",
             "vpternlogd zmm11, zmm27, zmm26, 0x96",
             "vpxorq zmm15, zmm15, zmm11",
             "vpclmulqdq zmm26, zmm6, zmm18, 0",
@@ -2250,12 +2341,26 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm29, zmm7, zmm19, 17",
             "vpternlogd zmm24, zmm26, zmm27, 0x96",
             "vpternlogd zmm25, zmm28, zmm29, 0x96",
+            ".if (({red} >> 6) & 1)",
+            "vpshufd zmm26, zmm24, 0x4e",
+            "vpshldq zmm24, zmm26, zmm24, 8",
+            "vgf2p8affineqb zmm26, zmm26, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm24 {{k1}} {{z}}, zmm24, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm26, zmm24, 8",
             "vpclmulqdq zmm24, zmm24, zmm30, 1",
+            ".endif",
             "vpternlogd zmm2, zmm24, zmm26, 0x96",
             "vpxorq zmm6, zmm6, zmm2",
+            ".if (({red} >> 7) & 1)",
+            "vpshufd zmm24, zmm25, 0x4e",
+            "vpshldq zmm25, zmm24, zmm25, 8",
+            "vgf2p8affineqb zmm24, zmm24, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm25 {{k1}} {{z}}, zmm25, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm24, zmm25, 8",
             "vpclmulqdq zmm25, zmm25, zmm30, 1",
+            ".endif",
             "vpternlogd zmm3, zmm25, zmm24, 0x96",
             "vpxorq zmm7, zmm7, zmm3",
             "vpclmulqdq zmm24, zmm12, zmm20, 0",
@@ -2320,8 +2425,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm27, zmm6, zmm27, 17",
             "vpternlogd zmm28, zmm29, zmm23, 0x96",
             "vpternlogd zmm25, zmm27, zmm22, 0x96",
+            ".if (({red} >> 8) & 1)",
+            "vpshufd zmm27, zmm28, 0x4e",
+            "vpshldq zmm28, zmm27, zmm28, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm28 {{k1}} {{z}}, zmm28, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm28, 8",
             "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            ".endif",
             "vpternlogd zmm5, zmm28, zmm27, 0x96",
             "vpxorq zmm7, zmm7, zmm5",
             "vpxorq zmm6, zmm6, zmm4",
@@ -2339,8 +2451,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm28, zmm2, zmm28, 17",
             "vpternlogd zmm23, zmm29, zmm31, 0x96",
             "vpternlogd zmm22, zmm27, zmm28, 0x96",
+            ".if (({red} >> 9) & 1)",
+            "vpshufd zmm27, zmm23, 0x4e",
+            "vpshldq zmm23, zmm27, zmm23, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm23 {{k1}} {{z}}, zmm23, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm23, 8",
             "vpclmulqdq zmm23, zmm23, zmm30, 1",
+            ".endif",
             "vpternlogd zmm1, zmm23, zmm27, 0x96",
             "vpxorq zmm3, zmm3, zmm1",
             "vpxorq zmm2, zmm2, zmm0",
@@ -2358,8 +2477,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm27, zmm14, zmm27, 17",
             "vpternlogd zmm28, zmm29, zmm26, 0x96",
             "vpternlogd zmm23, zmm27, zmm24, 0x96",
+            ".if (({red} >> 10) & 1)",
+            "vpshufd zmm27, zmm28, 0x4e",
+            "vpshldq zmm28, zmm27, zmm28, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm28 {{k1}} {{z}}, zmm28, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm28, 8",
             "vpclmulqdq zmm28, zmm28, zmm30, 1",
+            ".endif",
             "vpternlogd zmm13, zmm28, zmm27, 0x96",
             "vpxorq zmm15, zmm15, zmm13",
             "vpxorq zmm14, zmm14, zmm12",
@@ -2377,8 +2503,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm28, zmm10, zmm28, 17",
             "vpternlogd zmm26, zmm29, zmm31, 0x96",
             "vpternlogd zmm24, zmm27, zmm28, 0x96",
+            ".if (({red} >> 11) & 1)",
+            "vpshufd zmm27, zmm26, 0x4e",
+            "vpshldq zmm26, zmm27, zmm26, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm26 {{k1}} {{z}}, zmm26, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            ".endif",
             "vpternlogd zmm9, zmm26, zmm27, 0x96",
             "vpxorq zmm11, zmm11, zmm9",
             "vpxorq zmm10, zmm10, zmm8",
@@ -2412,8 +2545,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm26, zmm27, zmm22, 0x96",
             "vbroadcasti32x4 zmm27, [rsi+224]",
             "vbroadcasti32x4 zmm28, [rsi+240]",
+            ".if (({red} >> 12) & 1)",
+            "vpshufd zmm29, zmm26, 0x4e",
+            "vpshldq zmm26, zmm29, zmm26, 8",
+            "vgf2p8affineqb zmm29, zmm29, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm26 {{k1}} {{z}}, zmm26, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm29, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            ".endif",
             "vpclmulqdq zmm31, zmm1, zmm27, 0",
             "vpternlogd zmm2, zmm26, zmm29, 0x96",
             "vpxorq zmm3, zmm3, zmm2",
@@ -2424,8 +2564,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm26, zmm1, zmm27, 16",
             "vpclmulqdq zmm27, zmm1, zmm28, 17",
             "vpternlogd zmm26, zmm27, zmm22, 0x96",
+            ".if (({red} >> 13) & 1)",
+            "vpshufd zmm22, zmm26, 0x4e",
+            "vpshldq zmm26, zmm22, zmm26, 8",
+            "vgf2p8affineqb zmm22, zmm22, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm26 {{k1}} {{z}}, zmm26, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm22, zmm26, 8",
             "vpclmulqdq zmm26, zmm26, zmm30, 1",
+            ".endif",
             "vpternlogd zmm0, zmm26, zmm22, 0x96",
             "vpxorq zmm1, zmm1, zmm0",
             "vmovdqu64 [rdi+rax+{stride}*0], zmm0",
@@ -2440,8 +2587,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm22, zmm26, zmm25, 0x96",
             "vbroadcasti32x4 zmm26, [rsi+288]",
             "vbroadcasti32x4 zmm27, [rsi+304]",
+            ".if (({red} >> 14) & 1)",
+            "vpshufd zmm28, zmm22, 0x4e",
+            "vpshldq zmm22, zmm28, zmm22, 8",
+            "vgf2p8affineqb zmm28, zmm28, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm28, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpclmulqdq zmm29, zmm5, zmm26, 0",
             "vpternlogd zmm6, zmm22, zmm28, 0x96",
             "vpxorq zmm7, zmm7, zmm6",
@@ -2452,8 +2606,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm22, zmm5, zmm26, 16",
             "vpclmulqdq zmm26, zmm5, zmm27, 17",
             "vpternlogd zmm22, zmm26, zmm25, 0x96",
+            ".if (({red} >> 15) & 1)",
+            "vpshufd zmm25, zmm22, 0x4e",
+            "vpshldq zmm22, zmm25, zmm22, 8",
+            "vgf2p8affineqb zmm25, zmm25, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm25, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpternlogd zmm4, zmm22, zmm25, 0x96",
             "vpxorq zmm5, zmm5, zmm4",
             "vmovdqu64 [rdi+rax+{stride}*4], zmm4",
@@ -2468,8 +2629,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm22, zmm25, zmm24, 0x96",
             "vbroadcasti32x4 zmm25, [rsi+352]",
             "vbroadcasti32x4 zmm26, [rsi+368]",
+            ".if (({red} >> 16) & 1)",
+            "vpshufd zmm27, zmm22, 0x4e",
+            "vpshldq zmm22, zmm27, zmm22, 8",
+            "vgf2p8affineqb zmm27, zmm27, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm27, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpclmulqdq zmm28, zmm9, zmm25, 0",
             "vpternlogd zmm10, zmm22, zmm27, 0x96",
             "vpxorq zmm11, zmm11, zmm10",
@@ -2480,8 +2648,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm22, zmm9, zmm25, 16",
             "vpclmulqdq zmm25, zmm9, zmm26, 17",
             "vpternlogd zmm22, zmm25, zmm24, 0x96",
+            ".if (({red} >> 17) & 1)",
+            "vpshufd zmm24, zmm22, 0x4e",
+            "vpshldq zmm22, zmm24, zmm22, 8",
+            "vgf2p8affineqb zmm24, zmm24, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm24, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpternlogd zmm8, zmm22, zmm24, 0x96",
             "vpxorq zmm9, zmm9, zmm8",
             "vmovdqu64 [rdi+rax+{stride}*8], zmm8",
@@ -2496,8 +2671,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpternlogd zmm22, zmm24, zmm23, 0x96",
             "vbroadcasti32x4 zmm24, [rsi+416]",
             "vbroadcasti32x4 zmm25, [rsi+432]",
+            ".if (({red} >> 18) & 1)",
+            "vpshufd zmm26, zmm22, 0x4e",
+            "vpshldq zmm22, zmm26, zmm22, 8",
+            "vgf2p8affineqb zmm26, zmm26, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm26, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpclmulqdq zmm27, zmm13, zmm24, 0",
             "vpternlogd zmm14, zmm22, zmm26, 0x96",
             "vpxorq zmm15, zmm15, zmm14",
@@ -2508,8 +2690,15 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             "vpclmulqdq zmm22, zmm13, zmm24, 16",
             "vpclmulqdq zmm24, zmm13, zmm25, 17",
             "vpternlogd zmm22, zmm24, zmm23, 0x96",
+            ".if (({red} >> 19) & 1)",
+            "vpshufd zmm23, zmm22, 0x4e",
+            "vpshldq zmm22, zmm23, zmm22, 8",
+            "vgf2p8affineqb zmm23, zmm23, zmmword ptr [r8], 0",
+            "vgf2p8affineqb zmm22 {{k1}} {{z}}, zmm22, zmmword ptr [r8+64], 0",
+            ".else",
             "vpslldq zmm23, zmm22, 8",
             "vpclmulqdq zmm22, zmm22, zmm30, 1",
+            ".endif",
             "vpternlogd zmm12, zmm22, zmm23, 0x96",
             "vpxorq zmm13, zmm13, zmm12",
             "vmovdqu64 [rdi+rax+{stride}*12], zmm12",
@@ -2521,11 +2710,14 @@ unsafe fn butterfly_four_fixed_registers<const S16: usize, const NN: usize, cons
             stride = const S16 * NN * core::mem::size_of::<F128>(),
             hint = const H,
             ord = const ORD,
+            red = const RED,
             in("rdi") ptr,
             in("rsi") prepared,
             in("rdx") vector_bytes,
             in("rcx") prefetch,
+            in("r8") P0RED_TABLE.0.as_ptr(),
             out("rax") _,
+            out("k1") _,
             out("zmm0") _,
             out("zmm1") _,
             out("zmm2") _,
@@ -2611,20 +2803,20 @@ unsafe fn butterfly_fused_4layer_row_impl<
             // `S16 * NN * 16` bytes is a multiple of 4 KiB (the deep sweeps: 128 KiB and 8 KiB). The
             // contiguous-row shapes keep the original order. `FLOCK_NO_NTT_ALIAS_LOAD_ORDER=1` restores
             // the original order everywhere (exact same-binary A/B).
-            if (S16 * NN) % 256 == 0 && super::super::ntt_alias_load_order_enabled() {
-                butterfly_four_fixed_registers::<S16, NN, H, 1>(
-                    ptr.add(r * num_ntts),
-                    prepared,
-                    lanes * core::mem::size_of::<F128>(),
-                    ptr.add(pf_index),
-                );
-            } else {
-                butterfly_four_fixed_registers::<S16, NN, H, 0>(
-                    ptr.add(r * num_ntts),
-                    prepared,
-                    lanes * core::mem::size_of::<F128>(),
-                    ptr.add(pf_index),
-                );
+            // `p0red` was latched per block in `prepare_four`
+            // (`FLOCK_NO_NTT_P0RED=1` selects the incumbent folds).
+            let ordered = (S16 * NN) % 256 == 0 && super::super::ntt_alias_load_order_enabled();
+            let (row0, bytes, pf) =
+                (ptr.add(r * num_ntts), lanes * core::mem::size_of::<F128>(), ptr.add(pf_index));
+            match (ordered, (*prepared).p0red) {
+                (true, true) => {
+                    butterfly_four_fixed_registers::<S16, NN, H, 1, P0RED_MASK>(row0, prepared, bytes, pf)
+                }
+                (true, false) => butterfly_four_fixed_registers::<S16, NN, H, 1, 0>(row0, prepared, bytes, pf),
+                (false, true) => {
+                    butterfly_four_fixed_registers::<S16, NN, H, 0, P0RED_MASK>(row0, prepared, bytes, pf)
+                }
+                (false, false) => butterfly_four_fixed_registers::<S16, NN, H, 0, 0>(row0, prepared, bytes, pf),
             }
             if lanes < active_lanes {
                 if lanes + 4 <= num_ntts && !masked_tail_disabled() {
@@ -4164,6 +4356,20 @@ mod diet_tests {
     }
 }
 
+/// `FLOCK_NO_NTT_P0RED=1` keeps every x^64 fold of the fixed-register
+/// fused-four kernel on the incumbent port-5 form (same-binary A/B). Read once
+/// per process; `prepare_four` copies it into each block's `PreparedFour`.
+fn ntt_p0red_enabled() -> bool {
+    #[cfg(target_feature = "avx512bw")]
+    {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_P0RED").is_none());
+        P0RED_MASK != 0 && *ON
+    }
+    #[cfg(not(target_feature = "avx512bw"))]
+    false
+}
+
 /// Immutable split twiddles shared across all rows of a fused-four block.
 /// Plain F128 storage permits sharing between Rayon workers without SIMD ABI.
 #[repr(C, align(16))]
@@ -4172,6 +4378,9 @@ pub(crate) struct PreparedFour {
     // Kept after pairs: fixed-register assembly uses the unchanged offsets.
     zero_chain: bool,
     prefetch_lines: usize,
+    /// Port-0 x^64 folds in `butterfly_four_fixed_registers` (`P0RED_MASK`).
+    /// Latched per block from `FLOCK_NO_NTT_P0RED` (set = incumbent folds).
+    p0red: bool,
 }
 
 #[target_feature(enable = "avx512f,vpclmulqdq")]
@@ -4194,6 +4403,7 @@ pub(crate) unsafe fn prepare_four(t: &[F128; 15]) -> Option<PreparedFour> {
         pairs: [[F128::ZERO; 2]; 15],
         zero_chain: *ZERO_CHAIN && zero_chain_twiddles(t),
         prefetch_lines: *PREFETCH_LINES,
+        p0red: ntt_p0red_enabled(),
     };
     for i in (0..12).step_by(4) {
         unsafe {
@@ -5453,6 +5663,69 @@ mod zero_chain_tests {
     }}
 }
 
+#[cfg(all(
+    test,
+    target_feature = "avx512bw",
+    target_feature = "gfni",
+    target_feature = "avx512vbmi2",
+    target_feature = "vpclmulqdq"
+))]
+mod p0red_tests {
+    use super::*;
+
+    /// Port-0 x^64 folds (`P0RED_MASK`, and all twenty) store exactly the rows
+    /// of the incumbent folds and of the portable four-layer butterfly.
+    #[test]
+    fn p0red_folds_match_incumbent_and_portable() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        assert_ne!(P0RED_MASK, 0);
+        for case in 0..24 {
+            let mut tw: [F128; 15] = core::array::from_fn(|_| F128::new(next(), next()));
+            if case % 3 == 1 {
+                tw[3] = F128::ZERO;
+                tw[7] = F128::ONE;
+            }
+            // SAFETY: the module cfg carries the kernel's ISA requirements.
+            let prepared = unsafe { prepare_four(&tw) }.unwrap();
+            // S16 = 8, NN = 64: sixteen rows 512 fields apart, 64 lanes each.
+            let original: Vec<F128> = (0..16 * 8 * 64)
+                .map(|_| {
+                    if case % 3 == 2 {
+                        F128::new(!(next() & 0xff), u64::MAX)
+                    } else {
+                        F128::new(next(), next())
+                    }
+                })
+                .collect();
+            let mut expected = original.clone();
+            for lane in 0..64 {
+                let mut values = core::array::from_fn(|row| expected[row * 512 + lane]);
+                super::super::portable::butterfly_fused_4layer(&mut values, &tw);
+                for row in 0..16 {
+                    expected[row * 512 + lane] = values[row];
+                }
+            }
+            let (mut old, mut new, mut all) = (original.clone(), original.clone(), original);
+            // SAFETY: each buffer covers the sixteen rows of the geometry.
+            unsafe {
+                butterfly_four_fixed_registers::<8, 64, 0, 0, 0>(old.as_mut_ptr(), &prepared, 1024, old.as_ptr());
+                butterfly_four_fixed_registers::<8, 64, 0, 0, P0RED_MASK>(new.as_mut_ptr(), &prepared, 1024, new.as_ptr());
+                butterfly_four_fixed_registers::<8, 64, 1, 1, 0xF_FFFF>(all.as_mut_ptr(), &prepared, 1024, all.as_ptr());
+            }
+            assert!(old == expected, "incumbent case={case}");
+            assert!(new == expected, "P0RED_MASK case={case}");
+            assert!(all == expected, "all twenty folds case={case}");
+        }
+        println!("P0RED_ORACLE_OK 24 cases x 3 fold masks, 16 rows x 64 lanes");
+    }
+}
+
 /// Fold the four real trailing fields of the S8 odd groups together.
 /// The caller guarantees 128 rows of 64 initialized fields and seven zero
 /// trailing fields on every odd row. No callback may read the block until
@@ -5471,13 +5744,10 @@ pub(crate) unsafe fn rows_raw7_s8(ptr: *mut F128, t: &[F128; 15], hint: u8) -> b
     };
     let ordered = super::super::ntt_alias_load_order_enabled();
     unsafe {
-        match (hint, ordered) {
-            (0, false) => rows_raw7_s8_impl::<0, 0>(ptr, &p),
-            (0, true) => rows_raw7_s8_impl::<0, 1>(ptr, &p),
-            (1, false) => rows_raw7_s8_impl::<1, 0>(ptr, &p),
-            (1, true) => rows_raw7_s8_impl::<1, 1>(ptr, &p),
-            (_, false) => rows_raw7_s8_impl::<2, 0>(ptr, &p),
-            (_, true) => rows_raw7_s8_impl::<2, 1>(ptr, &p),
+        if p.p0red {
+            rows_raw7_s8_pick::<P0RED_MASK>(ptr, &p, hint, ordered)
+        } else {
+            rows_raw7_s8_pick::<0>(ptr, &p, hint, ordered)
         }
     }
     #[cfg(test)]
@@ -5498,8 +5768,27 @@ pub(crate) static RAW7_PACK_HITS: std::sync::atomic::AtomicUsize =
     target_feature = "avx512bw",
     target_feature = "vpclmulqdq"
 ))]
+#[inline(always)]
+unsafe fn rows_raw7_s8_pick<const RED: u32>(ptr: *mut F128, p: &PreparedFour, hint: u8, ordered: bool) {
+    unsafe {
+        match (hint, ordered) {
+            (0, false) => rows_raw7_s8_impl::<0, 0, RED>(ptr, p),
+            (0, true) => rows_raw7_s8_impl::<0, 1, RED>(ptr, p),
+            (1, false) => rows_raw7_s8_impl::<1, 0, RED>(ptr, p),
+            (1, true) => rows_raw7_s8_impl::<1, 1, RED>(ptr, p),
+            (_, false) => rows_raw7_s8_impl::<2, 0, RED>(ptr, p),
+            (_, true) => rows_raw7_s8_impl::<2, 1, RED>(ptr, p),
+        }
+    }
+}
+
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
 #[inline]
-unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &PreparedFour) {
+unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8, const RED: u32>(ptr: *mut F128, p: &PreparedFour) {
     #[repr(C, align(64))]
     struct Tail([F128; 64]);
     let mut storage = core::mem::MaybeUninit::<Tail>::uninit();
@@ -5510,14 +5799,14 @@ unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &Prep
             let odd = r & 1 == 1;
             let lanes = if odd { 56 } else { 64 };
             if r == 7 || H == 0 {
-                butterfly_four_fixed_registers::<8, 64, 0, ORD>(
+                butterfly_four_fixed_registers::<8, 64, 0, ORD, RED>(
                     ptr.add(r * 64),
                     p,
                     lanes * 16,
                     ptr,
                 );
             } else {
-                butterfly_four_fixed_registers::<8, 64, H, ORD>(
+                butterfly_four_fixed_registers::<8, 64, H, ORD, RED>(
                     ptr.add(r * 64),
                     p,
                     lanes * 16,
@@ -5535,7 +5824,7 @@ unsafe fn rows_raw7_s8_impl<const H: u8, const ORD: u8>(ptr: *mut F128, p: &Prep
         }
         // All compact fields are initialized. Columns have the identical
         // twiddles of their original r groups; the butterfly is lane-local.
-        butterfly_four_fixed_registers::<1, 4, 0, 0>(tail, p, 64, tail);
+        butterfly_four_fixed_registers::<1, 4, 0, 0, RED>(tail, p, 64, tail);
         for i in 0..16 {
             for j in 0..4 {
                 ptr.add((i * 8 + 2 * j + 1) * 64 + 56)

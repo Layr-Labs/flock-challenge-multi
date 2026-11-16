@@ -2221,11 +2221,14 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         target_feature = "vpclmulqdq"
     ))]
     let lo1_ys = kernels::x86_64::lo1_ys_enabled();
+    let r2_vec = r2_vec_sums_enabled() && r4_fast;
     crate::rstrace::ev("r2:par0", hi_size as u32);
     let leaf = |x_hi: usize| {
             crate::rstrace::item_start();
             #[allow(unused_mut)]
             let mut r4_out = [F128::ZERO; 18];
+            #[allow(unused_mut)]
+            let mut vec_out: Option<R2Vec> = None;
             let x_in = x_hi;
             let row_base = x_in * chunk_size;
             let pair_idx_base = x_in * lo_size;
@@ -2249,6 +2252,26 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     && let Some(bk) = bake_arg
                 {
                     if let Some(lw) = r4_lv.as_ref() {
+                        if r2_vec {
+                            let (red, red4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_red_x86(
+                                a_packed.as_ptr(),
+                                b_packed.as_ptr(),
+                                row_base,
+                                lo_size,
+                                bk,
+                                lw,
+                                lo1_ys,
+                            );
+                            use crate::field::gf2_128::x86_64::{f128x4_loadu, ghash_mul_x4_split, ghash_shift64_x4};
+                            let eh = eq_hi[x_hi];
+                            let w = f128x4_loadu([eh, eh, eh, eh].as_ptr());
+                            let w64 = ghash_shift64_x4(w);
+                            let mut v = r2vec_zero();
+                            for i in 0..8 { v[i] = ghash_mul_x4_split(red[i], w, w64); }
+                            for i in 0..10 { v[8 + i] = ghash_mul_x4_split(red4[i], w, w64); }
+                            vec_out = Some(v);
+                            [F128::ZERO; 8]
+                        } else {
                         let (o, r4) = kernels::x86_64::round2_lookahead_chunk_baked_elide_r4_x86(
                             a_packed.as_ptr(),
                             b_packed.as_ptr(),
@@ -2260,6 +2283,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                         );
                         r4_out = r4;
                         o
+                        }
                     } else {
                         kernels::x86_64::round2_lookahead_chunk_baked_elide_x86(
                             a_packed.as_ptr(),
@@ -2355,8 +2379,11 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                 useful_pairs_inclusive,
             );
 
-            let eq_h = eq_hi[x_hi];
             crate::rstrace::item_end();
+            if let Some(v) = vec_out {
+                return (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], v);
+            }
+            let eq_h = eq_hi[x_hi];
             (
                 eq_h * out[0],
                 eq_h * out[1],
@@ -2369,11 +2396,12 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
                     eq_h * out[7],
                 ],
                 if r4_fast { r4_out.map(|x| eq_h * x) } else { r4_out },
+                r2vec_zero(),
             )
     };
-    type R2Sums = (F128, F128, [F128; 6], [F128; 18]);
-    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
-    let op = |(s1, sinf, sa, sr): R2Sums, (c1, cinf, ca, cr): R2Sums| -> R2Sums {
+    type R2Sums = (F128, F128, [F128; 6], [F128; 18], R2Vec);
+    let id = || -> R2Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18], r2vec_zero()) };
+    let op = |(s1, sinf, sa, sr, sv): R2Sums, (c1, cinf, ca, cr, cv): R2Sums| -> R2Sums {
         let mut a = sa;
         for (x, y) in a.iter_mut().zip(ca.iter()) {
             *x += *y;
@@ -2382,7 +2410,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         for (x, y) in r4.iter_mut().zip(cr.iter()) {
             *x += *y;
         }
-        (s1 + c1, sinf + cinf, a, r4)
+        (s1 + c1, sinf + cinf, a, r4, r2vec_add(sv, cv))
     };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `flat_tail`.
     // Lane gl1 (`FLOCK_NO_GL1_R2_DELTA_IDLE`): the canonical-window deltas
@@ -2392,7 +2420,7 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GL1_R2_DELTA_IDLE").is_none());
     let mut early_d: Option<(F128, F128, [F128; 6])> = None;
     let mut early_d4: Option<Round4Lookahead> = None;
-    let (sum1_even, sum_inf_even, agg, r4_flat) =
+    let (mut sum1_even, mut sum_inf_even, mut agg, mut r4_flat, vsum) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
             if *GL1_DIDLE && canon_elided.is_some() {
                 let rows = canon_elided.unwrap();
@@ -2410,6 +2438,18 @@ pub(crate) fn uni_skip_round_pair_lookahead_nomat_packed_padded_with_eq(
         };
     crate::rstrace::ev("r2:par1", 0);
     crate::rstrace::flush_items("r2:first", "r2:last");
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+    if r2_vec && let (Some(bk), Some(lw)) = (bake_arg, r4_lv.as_ref()) {
+        let red: [core::arch::x86_64::__m512i; 8] = core::array::from_fn(|i| vsum[i]);
+        let red4: [core::arch::x86_64::__m512i; 10] = core::array::from_fn(|i| vsum[8 + i]);
+        // SAFETY: the cfg gate supplies every intrinsic feature.
+        let (o, r4) = unsafe { kernels::x86_64::r2_r4_finish(&red, &red4, bk, lw) };
+        sum1_even += o[0];
+        sum_inf_even += o[1];
+        for j in 0..6 { agg[j] += o[2 + j]; }
+        for k in 0..18 { r4_flat[k] += r4[k]; }
+    }
+    let _ = &vsum;
 
     crate::rstrace::ev("r2:red", 0);
     let sum1 = kappa * sum1_even + agg[0];
@@ -4074,6 +4114,215 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next[0] * sum1, sum_inf, la)
+}
+
+/// Whether a three-variable octet level with an input of `n` elements can
+/// also emit the deeper cascade (chained `casc`, `FLOCK_ZC_C3_CHAIN`): the
+/// AVX-512 leaf with sixteen-group chunks. The level's `eq_lo` is the plain
+/// split over `log₂(n) − 4` coordinates, i.e. `plain_cascade_lo_size(n / 2)`.
+pub(crate) fn fold3_oct_casc_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        n.is_power_of_two() && n >= 32 && {
+            let lo_size = plain_cascade_lo_size(n / 2);
+            lo_size >= 16 && lo_size.is_multiple_of(16) && kernels::x86_64::zc_c3_enabled()
+        }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+/// Chained deeper cascade (`FLOCK_ZC_C3_CHAIN`): the three-variable octet
+/// level of [`fold3_oct_plain_and_round_pair_lookahead_into`] (same tables,
+/// message and lookahead) that can also
+///
+/// * with `casc`, store its eighth-size tables in octet layout and return the
+///   round two ahead of its message as a biquadratic in `(ρ_c, ρ_d)`, so the
+///   next level folds three variables too — the same composition the rounds
+///   3+4+5 pass and [`fold2_plain_and_round_pair_lookahead_into_lm_casc`] apply
+///   (`out_lm` ignored; needs [`fold3_oct_casc_route_ok`] and
+///   `r_next[1], r_next[2] ≠ 0`);
+/// * with `team`, run on the hot pool's spinning team when the level misses
+///   the flat claim route, like the two-variable levels it replaces.
+///
+/// A separate driver so the incumbent level keeps its code. Value identity:
+/// the per-chunk sums are the incumbent's (`odd + κ·even` restores the even
+/// lanes' weight, `κ = (1 + r_next[2])/r_next[2]`), the biquadratic is the
+/// same deferred quadratic-in-two-challenges as every other `casc` level, and
+/// F128 is exact, so every message and the transcript are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into_chain(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho: [F128; 3],
+    r_next: &[F128],
+    out_lm: bool,
+    casc: bool,
+    team: bool,
+) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
+    use rayon::prelude::*;
+    assert!(!casc || fold3_oct_casc_route_ok(a.len()), "chained casc route unavailable");
+    let out_lm = out_lm && !casc;
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 32);
+    let eighth = n / 8;
+    assert_eq!(a_out.len(), eighth);
+    assert_eq!(b_out.len(), eighth);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 3);
+    let r = r_next[1];
+    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+    if casc {
+        assert_ne!(r_next[2], F128::ZERO, "deeper cascade needs a non-zero second weight");
+    }
+    // Both lanes of an eight-group ride the odd lane's weight; κ restores the
+    // even lanes' own weight in the message sums.
+    let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2);
+    assert_eq!(lo_size * hi_size * 2, eighth);
+    assert!(
+        !out_lm || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major tiles need eight-group chunks"
+    );
+    let (kappa, r_inv) = lookahead_inv_factors(r);
+    let chunk_in = 16 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let fast = (lo_size >= 16 && lo_size.is_multiple_of(16)).then(|| {
+        let nt = kernels::x86_64::zc_tail_nt_enabled()
+            && eighth >= (1usize << kernels::x86_64::ZC_TAIL_NT_LOG)
+            && (a_out.as_ptr() as usize) % 16 == 0
+            && (b_out.as_ptr() as usize) % 16 == 0;
+        let wt = if casc { build_w_pair_table_casc(eq_lo) } else { build_w_pair_table(eq_lo) };
+        (wt, nt)
+    });
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    assert!(!casc || fast.is_some(), "chained casc needs the AVX-512 leaf");
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    let _ = kappa_c;
+
+    let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
+            crate::rstrace::evd("zt:c0", x_hi as u32);
+            #[allow(unused_mut)]
+            let mut la7 = [F128::ZERO; 18];
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            let out = if let Some((wt, nt)) = fast.as_ref() {
+                let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
+                let (aop, bop) = (a_out.as_mut_ptr(), b_out.as_mut_ptr());
+                // SAFETY: the chunk holds eight inputs per output and two
+                // outputs per eq_lo entry; lo_size is a multiple of 16.
+                unsafe {
+                    match (casc, *nt, out_lm) {
+                        (true, true, _) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_casc_x86::<true>(ap, bp, aop, bop, rho, lo_size, wt, &mut la7, kappa_c),
+                        (true, false, _) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_casc_x86::<false>(ap, bp, aop, bop, rho, lo_size, wt, &mut la7, kappa_c),
+                        (false, true, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, true>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (false, true, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, false>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (false, false, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, true>(ap, bp, aop, bop, rho, lo_size, wt),
+                        (false, false, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, false>(ap, bp, aop, bop, rho, lo_size, wt),
+                    }
+                }
+            } else {
+                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm)
+            };
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            let out =
+                fold3_oct_and_message_lookahead_scalar(a_in, b_in, a_out, b_out, rho, eq_lo, out_lm);
+            let eq_h = eq_hi[x_hi];
+            crate::rstrace::evd("zt:c1", x_hi as u32);
+            (
+                eq_h * out[0],
+                eq_h * out[1],
+                [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ],
+                if casc { la7.map(|v| eq_h * v) } else { la7 },
+            )
+    };
+    type Sums = (F128, F128, [F128; 6], [F128; 18]);
+    let id = || -> Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6], [F128::ZERO; 18]) };
+    let op = |(s1, sinf, sa, sl): Sums, (c1, cinf, ca, cl): Sums| -> Sums {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        let mut l = sl;
+        for (x, y) in l.iter_mut().zip(cl.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a, l)
+    };
+    let (sum1_even, sum_inf_even, agg, la7_acc) =
+        if flat_tail(n) {
+            // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`): same leaves,
+            // per-chunk results summed (XOR) on the caller.
+            flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+        } else if team && crate::flat_par::team_ready() {
+            // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
+            team_chunks_aff(a, chunk_in, a_out, b_out, chunk_out, leaf, id, op)
+        } else {
+            a_out
+                .par_chunks_mut(chunk_out)
+                .zip(b_out.par_chunks_mut(chunk_out))
+                .enumerate()
+                .map(leaf)
+                .reduce(id, op)
+        };
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
+    let la7 = casc.then(|| {
+        Round4Lookahead::from_flat(&la7_acc).scaled((r_next[1] * r_next[2]).inv())
+    });
+    (r_next[0] * sum1, sum_inf, la, la7)
 }
 
 /// Portable leaf of [`fold3_oct_plain_and_round_pair_lookahead_into`]: octet
@@ -6066,6 +6315,84 @@ mod tests {
         }
     }
 
+    /// Chained deeper cascade (`FLOCK_ZC_C3_CHAIN`), three-variable side:
+    /// without `casc` the chained level is the incumbent octet level (tables,
+    /// message, lookahead, both store layouts); with `casc` it keeps the same
+    /// message and lookahead, stores the row-major tables in octet layout, and
+    /// its biquadratic equals the definition over those tables. Portable: off
+    /// the AVX-512 route only the non-`casc` half runs (scalar leaves).
+    #[test]
+    fn fold3_oct_chain_casc_matches_definition() {
+        for &log_n in &[5usize, 7, 8, 10, 13, 16, 17, 18] {
+            let mut rng = Rng::new(0xC3C4 + log_n as u64);
+            let n = 1usize << log_n;
+            // Octet-layout inputs: any values are a valid octet table.
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let rho = [rng.f128(), rng.f128(), rng.f128()];
+            let mut r_next = rng.f128_vec(log_n - 3);
+            r_next[0] = F128::ONE;
+            for out_lm in [false, true] {
+                if out_lm
+                    && !(zc_lane_major_handoff_on()
+                        && plain_cascade_lo_size(n / 2).is_multiple_of(8)
+                        && plain_cascade_lo_size(n / 2) >= 16)
+                {
+                    continue;
+                }
+                let mut a_ref = vec![F128::ZERO; n / 8];
+                let mut b_ref = vec![F128::ZERO; n / 8];
+                let want = fold3_oct_plain_and_round_pair_lookahead_into(
+                    &a, &b, &mut a_ref, &mut b_ref, rho, &r_next, out_lm,
+                );
+                let mut a_got = vec![F128::ZERO; n / 8];
+                let mut b_got = vec![F128::ZERO; n / 8];
+                let got = fold3_oct_plain_and_round_pair_lookahead_into_chain(
+                    &a, &b, &mut a_got, &mut b_got, rho, &r_next, out_lm, false, false,
+                );
+                assert!(got.3.is_none());
+                assert_eq!((got.0, got.1, got.2), want, "message log_n={log_n} lm={out_lm}");
+                assert!(a_got == a_ref, "a log_n={log_n} lm={out_lm}");
+                assert!(b_got == b_ref, "b log_n={log_n} lm={out_lm}");
+            }
+            if !fold3_oct_casc_route_ok(n) {
+                continue;
+            }
+            let mut a_rm = vec![F128::ZERO; n / 8];
+            let mut b_rm = vec![F128::ZERO; n / 8];
+            let inc = fold3_oct_plain_and_round_pair_lookahead_into(
+                &a, &b, &mut a_rm, &mut b_rm, rho, &r_next, false,
+            );
+            let mut a_oct = vec![F128::ZERO; n / 8];
+            let mut b_oct = vec![F128::ZERO; n / 8];
+            let got = fold3_oct_plain_and_round_pair_lookahead_into_chain(
+                &a, &b, &mut a_oct, &mut b_oct, rho, &r_next, false, true, false,
+            );
+            assert_eq!((got.0, got.1, got.2), inc, "casc message log_n={log_n}");
+            for e in 0..n / 8 {
+                let pos = 32 * (e / 32) + 4 * (e % 8) + (e % 32) / 8;
+                assert_eq!(a_oct[pos], a_rm[e], "a oct log_n={log_n} e={e}");
+                assert_eq!(b_oct[pos], b_rm[e], "b oct log_n={log_n} e={e}");
+            }
+            let w = build_eq(&r_next[3..]);
+            assert_eq!(w.len() * 8, n / 8);
+            let mut want = Round4Lookahead::ZERO;
+            for (q, &om) in w.iter().enumerate() {
+                let x = &a_rm[8 * q..8 * q + 8];
+                let y = &b_rm[8 * q..8 * q + 8];
+                let (pa, pb) = (three_var::corners9(&x[4..8]), three_var::corners9(&y[4..8]));
+                let c: [F128; 4] = std::array::from_fn(|k| x[k] + x[k + 4]);
+                let d: [F128; 4] = std::array::from_fn(|k| y[k] + y[k + 4]);
+                let (pc, pd) = (three_var::corners9(&c), three_var::corners9(&d));
+                for k in 0..9 {
+                    want.v1[k] += om * (pa[k] * pb[k]);
+                    want.vinf[k] += om * (pc[k] * pd[k]);
+                }
+            }
+            assert_eq!(got.3.unwrap(), want, "biquadratic log_n={log_n}");
+        }
+    }
+
     /// `lane_select` against the `vpermi2q` definition: qword `i` of the
     /// result is `idx[i] & 7` of the source `idx[i] >> 3` picks.
     #[test]
@@ -8041,4 +8368,30 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+type R2Vec = [core::arch::x86_64::__m512i; 18];
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+type R2Vec = ();
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+fn r2vec_zero() -> R2Vec { unsafe { [core::arch::x86_64::_mm512_setzero_si512(); 18] } }
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[inline(always)]
+fn r2vec_zero() -> R2Vec {}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq"))]
+#[inline(always)]
+fn r2vec_add(a: R2Vec, b: R2Vec) -> R2Vec {
+    unsafe { core::array::from_fn(|i| core::arch::x86_64::_mm512_xor_si512(a[i], b[i])) }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vbmi", target_feature = "gfni", target_feature = "vpclmulqdq")))]
+#[inline(always)]
+fn r2vec_add(_a: R2Vec, _b: R2Vec) -> R2Vec {}
+/// Round two's claimer-level vector sums (`FLOCK_NO_ZC_R2_VEC_SUMS` restores
+/// the per-chunk lane sums and scalar `eq_hi` products).
+fn r2_vec_sums_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_VEC_SUMS").is_none());
+    *ON
 }
