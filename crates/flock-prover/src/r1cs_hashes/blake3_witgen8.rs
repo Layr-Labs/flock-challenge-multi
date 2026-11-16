@@ -4521,7 +4521,7 @@ mod cached_z_seed_pair_dispatch_tests {
                 &dummy_ab.0,
                 true,
             );
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, win_plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::new(&inv_table, win_plan, (false, 0));
         let crate::seed_pipe::BlockSource::Closed { init, .. } =
             crate::seed_pipe::BlockSource::closed(18, 0xD1CE_C105_EDA5_1E5Du64)
         else {
@@ -4790,7 +4790,7 @@ mod cross_quarter_witness_tests {
         let dummy = Box::new(Ab([0; 8 * 32 * 64]));
         let plan = flock_core::zerocheck::univariate_skip_optimized::prepare_round1_ab_window_plan(&inv_table, &dummy.0, true);
         assert!(plan.offsets_eligible(2));
-        let preps = super::super::SharedRankedClosedWindowPreps(prepare_ranked_closed_window_preps(&inv_table, plan));
+        let preps = super::super::SharedRankedClosedWindowPreps::new(&inv_table, plan, (false, 0));
         let stride = 29 * 64;
         let z = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
         let a = Arena::new((1 << 18) * U32_PER_BLOCK * 4);
