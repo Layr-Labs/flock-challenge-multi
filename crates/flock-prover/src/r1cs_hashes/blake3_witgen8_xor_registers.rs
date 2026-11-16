@@ -40,6 +40,7 @@ out("zmm16")_,
 out("zmm17")_,
 out("zmm18")_,
 out("zmm19")_,
+out("zmm20")_,
 options(pure,readonly));
 }else{
 core::arch::asm!("call {kernel}",kernel=sym flock_family19_mixedp20_next,
@@ -72,6 +73,7 @@ out("zmm16")_,
 out("zmm17")_,
 out("zmm18")_,
 out("zmm19")_,
+out("zmm20")_,
 options(pure,readonly));
 }
 [a0,a1,a2,a3,a4,a5,a6,a7]

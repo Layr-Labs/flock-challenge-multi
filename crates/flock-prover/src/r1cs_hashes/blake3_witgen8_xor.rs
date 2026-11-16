@@ -63,7 +63,7 @@ impl Tables {
         out[..128].copy_from_slice(&m[..128]);
         for bank in 0..8 {
             let prepared = unsafe { rank21::prepare_network(m.as_ptr().add(bank*128)) };
-            for i in 0..19 {
+            for i in 0..rank21::SLOTS {
                 out[128+bank*152+i*8..128+bank*152+(i+1)*8].copy_from_slice(&prepared[i]);
             }
         }
@@ -710,7 +710,7 @@ unsafe fn ring_prepared_pack<const RANK21: bool>(v:__m512i)->__m512i{
  // eight-byte bit matrix. The second affine selects the superset byte XORs.
  let basis=_mm512_set1_epi64(0x0102040810204080u64 as i64);
  let transpose=_mm512_gf2p8affine_epi64_epi8::<0>(basis,row);
- let subsets=_mm512_set1_epi64((if RANK21 {0xe02ea069dd99ccffu64} else {0x0103050f113355ffu64}) as i64);
+ let subsets=_mm512_set1_epi64((if RANK21 {0x1f8b41829622aaccu64} else {0x0103050f113355ffu64}) as i64);
  let prepared=_mm512_gf2p8affine_epi64_epi8::<0>(subsets,transpose);
  _mm512_permutexvar_epi8(_mm512_loadu_si512(COLUMN.as_ptr().cast()),prepared)
 }
