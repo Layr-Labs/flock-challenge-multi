@@ -57,6 +57,22 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+/// Lane cr1 kill switches: `FLOCK_NO_CR_<NAME>=1` restores the record path of
+/// one piece. Each flag is read once per phase/task entry, never in a hot loop.
+pub mod cr_flags {
+    macro_rules! cr_flag {
+        ($fn:ident, $var:literal) => {
+            #[inline]
+            pub fn $fn() -> bool {
+                static S: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| std::env::var_os($var).is_some_and(|v| v == "1"));
+                *S
+            }
+        };
+    }
+    cr_flag!(no_pub2, "FLOCK_NO_CR_PUB2");
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///
