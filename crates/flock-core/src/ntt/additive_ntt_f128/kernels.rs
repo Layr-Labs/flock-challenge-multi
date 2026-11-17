@@ -1156,6 +1156,17 @@ impl FourBlock {
         }
     }
 }
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl FourBlock {
+    /// The prepared twiddle pairs, when the prepared path is on.
+    pub(super) fn prepared(&self) -> Option<&x86_64::PreparedFour> {
+        self.cache.as_ref()
+    }
+}
 impl core::ops::Deref for FourBlock {
     type Target = [F128; 15];
     fn deref(&self) -> &Self::Target {
@@ -1202,4 +1213,4 @@ pub(super) use x86_64::RAW7_PACK_HITS;
     target_feature = "avx512bw",
     target_feature = "vpclmulqdq"
 ))]
-pub(super) use x86_64::rows_raw7_s8;
+pub(super) use x86_64::{raw7_pack4_field56, rows_raw7_s8};

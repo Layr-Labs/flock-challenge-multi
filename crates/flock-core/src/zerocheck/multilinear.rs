@@ -1219,8 +1219,24 @@ pub(crate) fn flat_chunks<T>(
     op: impl Fn(T, T) -> T + Sync,
 ) -> T {
     assert_eq!(a_out.len(), b_out.len());
+    flat_chunks2(a_out, chunk, b_out, chunk, leaf, id, op)
+}
+
+/// [`flat_chunks`] with B chunks of their own size (`chunk_b`), e.g. the B7
+/// table layout of the rounds 3+4+5 pass: item `i` gets A chunk `i` and B
+/// chunk `i`.
+pub(crate) fn flat_chunks2<T>(
+    a_out: &mut [F128],
+    chunk: usize,
+    b_out: &mut [F128],
+    chunk_b: usize,
+    leaf: impl Fn((usize, (&mut [F128], &mut [F128]))) -> T + Sync,
+    id: impl Fn() -> T + Sync,
+    op: impl Fn(T, T) -> T + Sync,
+) -> T {
     assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
     let n = a_out.len() / chunk;
+    assert!(chunk_b > 0 && b_out.len() == n * chunk_b);
     let (ao, bo) = (a_out.as_mut_ptr() as usize, b_out.as_mut_ptr() as usize);
     let rec = crate::flat_par::sl1_aff_enabled() && n <= crate::flat_par::SL1_OWN_CAP;
     if rec {
@@ -1238,7 +1254,7 @@ pub(crate) fn flat_chunks<T>(
             let (ac, bc) = unsafe {
                 (
                     core::slice::from_raw_parts_mut((ao as *mut F128).add(i * chunk), chunk),
-                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk), chunk),
+                    core::slice::from_raw_parts_mut((bo as *mut F128).add(i * chunk_b), chunk_b),
                 )
             };
             leaf((i, (ac, bc)))
@@ -1246,6 +1262,29 @@ pub(crate) fn flat_chunks<T>(
         id,
         op,
     )
+}
+
+/// Lane sl1 writer map for `n` items whose item `i` starts at input element
+/// `i * chunk_in` of the table at `base` (`len` elements), when that table is
+/// the last flat-claimed level's output.
+fn sl1_owner_map(base: usize, len: usize, chunk_in: usize, n: usize) -> Option<Vec<u8>> {
+    if !crate::flat_par::sl1_aff_enabled() {
+        return None;
+    }
+    let (ga, _gb, gbytes, gn) = *crate::flat_par::SL1_OWN_GEOM.lock().unwrap();
+    if gn > 0 && base == ga && len * 16 == gbytes * gn {
+        Some(
+            (0..n)
+                .map(|i| {
+                    let off = i * chunk_in * 16;
+                    crate::flat_par::SL1_OWN[(off / gbytes).min(gn - 1)]
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                })
+                .collect(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Lane sl1: [`team_chunks`] that hands item `i` (input chunk `i` of `a`,
@@ -1263,20 +1302,7 @@ pub(crate) fn team_chunks_aff<T>(
     op: impl Fn(T, T) -> T + Sync,
 ) -> T {
     let n = a_out.len() / chunk;
-    let owner: Option<Vec<u8>> = if crate::flat_par::sl1_aff_enabled() {
-        let (ga, _gb, gbytes, gn) = *crate::flat_par::SL1_OWN_GEOM.lock().unwrap();
-        let base = a_in.as_ptr() as usize;
-        if gn > 0 && base == ga && a_in.len() * 16 == gbytes * gn {
-            Some((0..n).map(|i| {
-                let off = i * chunk_in * 16;
-                crate::flat_par::SL1_OWN[(off / gbytes).min(gn - 1)].load(core::sync::atomic::Ordering::Relaxed)
-            }).collect())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let owner = sl1_owner_map(a_in.as_ptr() as usize, a_in.len(), chunk_in, n);
     let Some(owner) = owner else { return team_chunks(a_out, b_out, chunk, leaf, id, op) };
     assert_eq!(a_out.len(), b_out.len());
     assert!(chunk > 0 && a_out.len().is_multiple_of(chunk));
@@ -3668,7 +3694,7 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm(
     out_lm: bool,
 ) -> (F128, F128, Round3Lookahead) {
     let (m1, mi, la, _) = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-        a, b, a_out, b_out, rho_a, rho_b, r_next, in_lm, out_lm, false, false,
+        a, b, a_out, b_out, rho_a, rho_b, r_next, in_lm, out_lm, false, false, None,
     );
     (m1, mi, la)
 }
@@ -3722,8 +3748,10 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     out_lm: bool,
     casc: bool,
     team: bool,
+    pieces: Option<TlPieces>,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
+    assert!(pieces.is_none() || !casc, "in-place handoff feeds a plain level");
     assert!(!casc || fold2_plain_casc_route_ok(a.len()), "casc route unavailable");
     let out_lm = out_lm && !casc;
     if casc {
@@ -3732,8 +3760,15 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
     // Deeper cascade: both lanes of an eight-group ride the odd lane's weight;
     // κ restores the even lanes' own weight in the message sums.
     let kappa_c = if casc { (F128::ONE + r_next[2]) * r_next[2].inv() } else { F128::ZERO };
-    let n = a.len();
-    assert_eq!(b.len(), n);
+    // In-place handoff input (`TlPieces`): `a`/`b` are level 1's input
+    // buffers, read piece by piece; `n` is the logical length.
+    let n = pieces.map_or(a.len(), |p| p.n);
+    if let Some(p) = pieces {
+        assert_eq!(a.len(), (n / p.piece) * p.stride_a);
+        assert!(b.len() >= (n / p.piece) * p.stride_b);
+    } else {
+        assert_eq!(b.len(), n);
+    }
     assert!(n.is_power_of_two() && n >= 16);
     let quarter = n / 4;
     assert_eq!(a_out.len(), quarter);
@@ -3819,10 +3854,84 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
         lo_size,
         wtab_arg.is_some(),
     );
+    // In-place handoff: each chunk reads `per` whole level-1 pieces, as `per`
+    // kernel runs of `sub_lo` groups each (`tl_route_ok`).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let tl_geom = pieces.map(|p| {
+        assert!(fast_plain && wtab_arg.is_some(), "in-place handoff needs the wtab kernel");
+        assert!(chunk_in.is_multiple_of(p.piece));
+        let per = chunk_in / p.piece;
+        let sub_lo = lo_size / per;
+        assert!(sub_lo.is_multiple_of(16) && sub_lo * 8 == p.piece);
+        (p, per, sub_lo)
+    });
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    assert!(pieces.is_none(), "in-place handoff needs the AVX-512 kernels");
 
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
             crate::rstrace::evd("zt:c0", x_hi as u32);
             let mut la7 = [F128::ZERO; 18];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            if let Some((p, per, sub_lo)) = tl_geom {
+                let wt = wtab_arg.unwrap();
+                let mut out = [F128::ZERO; 8];
+                for j in 0..per {
+                    let pi = x_hi * per + j;
+                    let a_in = &a[pi * p.stride_a..pi * p.stride_a + p.piece];
+                    let b_in = &b[pi * p.stride_b..pi * p.stride_b + p.piece];
+                    let a_o = &mut a_out[j * 2 * sub_lo..(j + 1) * 2 * sub_lo];
+                    let b_o = &mut b_out[j * 2 * sub_lo..(j + 1) * 2 * sub_lo];
+                    let w = &wt[j * sub_lo..(j + 1) * sub_lo];
+                    let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
+                    let (aop, bop) = (a_o.as_mut_ptr(), b_o.as_mut_ptr());
+                    // SAFETY: a piece holds four inputs per output for `sub_lo`
+                    // groups (two outputs each); `sub_lo` is a multiple of 16.
+                    let o = unsafe {
+                        match (nt_out, in_lm, out_lm) {
+                            (false, true, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, true, true>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (false, false, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, false, true>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (false, true, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, true, false>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (false, false, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, false, false>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (true, true, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<true, true, true>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (true, false, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<true, false, true>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (true, true, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<true, true, false>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                            (true, false, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<true, false, false>(ap, bp, aop, bop, rho_a, rho_b, sub_lo, w),
+                        }
+                    };
+                    // The kernel's sums are reduced F2-linear images of XOR
+                    // accumulators over its groups: sub-runs add up exactly.
+                    for (x, y) in out.iter_mut().zip(o.iter()) {
+                        *x += *y;
+                    }
+                }
+                let eq_h = eq_hi[x_hi];
+                crate::rstrace::evd("zt:c1", x_hi as u32);
+                return (
+                    eq_h * out[0],
+                    eq_h * out[1],
+                    [
+                        eq_h * out[2],
+                        eq_h * out[3],
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ],
+                    la7,
+                );
+            }
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -3962,7 +4071,10 @@ pub(crate) fn fold2_plain_and_round_pair_lookahead_into_lm_casc(
             flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
         } else if team && crate::flat_par::team_ready() {
             // Lane gl1 (`FLOCK_NO_GL1_TEAM`): the hot pool's spinning team.
-            team_chunks_aff(a, chunk_in, a_out, b_out, chunk_out, leaf, id, op)
+            // With the in-place handoff, level-2 item `i` starts at level-1
+            // input chunk `i * per` (the stride of `per` pieces).
+            let aff_in = pieces.map_or(chunk_in, |p| (chunk_in / p.piece) * p.stride_a);
+            team_chunks_aff(a, aff_in, a_out, b_out, chunk_out, leaf, id, op)
         } else {
             a_out
                 .par_chunks_mut(chunk_out)
@@ -3999,6 +4111,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     rho: [F128; 3],
     r_next: &[F128],
     out_lm: bool,
+    b7: Option<&[F128; 4]>,
 ) -> (F128, F128, Round3Lookahead) {
     use rayon::prelude::*;
     let n = a.len();
@@ -4024,9 +4137,16 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     );
     let (kappa, r_inv) = lookahead_inv_factors(r);
     let chunk_in = 16 * lo_size;
+    // B7 input (see `kernels::x86_64::b7_pack`): seven lines per 32 inputs.
+    let chunk_in_b = if b7.is_some() { 14 * lo_size } else { chunk_in };
     let chunk_out = 2 * lo_size;
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
+    assert!(
+        b7.is_none() || fold3_oct_b7_route_ok(n),
+        "B7 tables need the AVX-512 octet route"
+    );
+    let b_canon = b7.copied().unwrap_or([F128::ZERO; 4]);
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -4044,7 +4164,7 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     let leaf = |(x_hi, (a_out, b_out)): (usize, (&mut [F128], &mut [F128]))| {
             crate::rstrace::evd("zt:c0", x_hi as u32);
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in_b..(x_hi + 1) * chunk_in_b];
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -4053,14 +4173,25 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
             let out = if let Some((wt, nt)) = fast.as_ref() {
                 let (ap, bp) = (a_in.as_ptr(), b_in.as_ptr());
                 let (aop, bop) = (a_out.as_mut_ptr(), b_out.as_mut_ptr());
-                // SAFETY: the chunk holds eight inputs per output and two
-                // outputs per eq_lo entry; lo_size is a multiple of 16.
+                let bc = &b_canon;
+                // SAFETY: the chunk holds eight inputs per output (seven per
+                // eight for B7 B) and two outputs per eq_lo entry; lo_size is
+                // a multiple of 16.
                 unsafe {
-                    match (*nt, out_lm) {
-                        (true, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, true>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (true, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<true, false>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (false, true) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, true>(ap, bp, aop, bop, rho, lo_size, wt),
-                        (false, false) => kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, false>(ap, bp, aop, bop, rho, lo_size, wt),
+                    macro_rules! go {
+                        ($nt:literal, $lm:literal, $b7:literal) => {
+                            kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<$nt, $lm, $b7>(ap, bp, aop, bop, rho, lo_size, wt, bc)
+                        };
+                    }
+                    match (*nt, out_lm, b7.is_some()) {
+                        (true, true, false) => go!(true, true, false),
+                        (true, false, false) => go!(true, false, false),
+                        (false, true, false) => go!(false, true, false),
+                        (false, false, false) => go!(false, false, false),
+                        (true, true, true) => go!(true, true, true),
+                        (true, false, true) => go!(true, false, true),
+                        (false, true, true) => go!(false, true, true),
+                        (false, false, true) => go!(false, false, true),
                     }
                 }
             } else {
@@ -4114,6 +4245,421 @@ pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_into(
     let sum_inf = kappa * sum_inf_even + agg[1];
     let la = lookahead_from_odd_weighted(&agg, r_inv);
     (r_next[0] * sum1, sum_inf, la)
+}
+
+/// Tail level 1 -> level 2 handoff in place (`FLOCK_NO_TL`): where level-1
+/// output chunk `i` sits inside its own input chunk. Logical output element
+/// `i * piece + k` (`k < piece`) of A is at `i * stride_a + k`, of B at
+/// `i * stride_b + k`; `n` is the logical table length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TlPieces {
+    pub(crate) piece: usize,
+    pub(crate) stride_a: usize,
+    pub(crate) stride_b: usize,
+    pub(crate) n: usize,
+}
+
+/// `FLOCK_NO_TL=1` keeps tail level 1's separate non-temporal output tables.
+pub(crate) fn tl_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TL").is_none());
+    *ON
+}
+
+/// Whether the in-place handoff can run for a level-1 input of `n` elements
+/// followed by a plain (non-cascade) level 2: the AVX-512 octet kernel at
+/// level 1 and the deferred `wtab` kernel at level 2, with every level-2
+/// chunk covering whole level-1 pieces in sub-runs of a multiple of 16 groups.
+pub(crate) fn tl_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if !tl_enabled() || !fold3_oct_b7_route_ok(n) {
+            return false;
+        }
+        let n_vars1 = n.trailing_zeros() as usize - 4;
+        let lo1 = 1usize << (n_vars1 - tail_split_n_hi(n_vars1).min(n_vars1));
+        let n2 = n / 8;
+        let lo2 = plain_cascade_lo_size(n2);
+        let piece = 2 * lo1;
+        let chunk_in2 = 8 * lo2;
+        kernels::x86_64::zc_wtab_enabled()
+            && kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+                kernels::x86_64::zc_defer_split_enabled(),
+                lo2,
+                true,
+            )
+            && chunk_in2.is_multiple_of(piece)
+            && (lo2 / (chunk_in2 / piece)).is_multiple_of(16)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+/// Plain level 2 of the in-place handoff (`FLOCK_NO_TL`): the deferred
+/// `wtab` level of [`fold2_plain_and_round_pair_lookahead_into_lm_casc`]
+/// (`casc = false`, no non-temporal stores) on level 1's pieces, writing each
+/// piece's outputs over the start of that piece, so level 3 reads the
+/// returned (quarter-size) pieces at the same strides. Per piece the kernel
+/// stores outputs `[2x, 2x+16)` after loading inputs `[0, 8x+64)`, which
+/// cover them, and later loads start at `8(x+8)`. Same kernel runs, values
+/// and messages as the piece reader in that function.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_plain_tl_inplace(
+    a: &mut [F128],
+    b: &mut [F128],
+    pieces: TlPieces,
+    rho_a: F128,
+    rho_b: F128,
+    r_next: &[F128],
+    in_lm: bool,
+    out_lm: bool,
+    team: bool,
+) -> (F128, F128, Round3Lookahead, TlPieces) {
+    use rayon::prelude::*;
+    let p = pieces;
+    let n = p.n;
+    assert!(n.is_power_of_two() && n >= 16);
+    assert_eq!(a.len(), (n / p.piece) * p.stride_a);
+    assert!(b.len() >= (n / p.piece) * p.stride_b);
+    let quarter = n / 4;
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 2);
+    let r = r_next[1];
+    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, quarter);
+    assert!(
+        !(in_lm || out_lm) || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major tiles need eight-group AVX-512 chunks"
+    );
+    let (kappa, r_inv) = lookahead_inv_factors(r);
+    let chunk_in = 8 * lo_size;
+    assert!(
+        kernels::x86_64::zc_wtab_enabled()
+            && kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+                kernels::x86_64::zc_defer_split_enabled(),
+                lo_size,
+                true,
+            )
+            && chunk_in.is_multiple_of(p.piece),
+        "in-place level 2 needs the wtab kernel"
+    );
+    let per = chunk_in / p.piece;
+    let sub_lo = lo_size / per;
+    assert!(sub_lo.is_multiple_of(16) && sub_lo * 8 == p.piece);
+    let wt = build_w_pair_table(&eq.lo);
+    let eq_hi = &eq.hi;
+    let (ab, bb) = (a.as_mut_ptr() as usize, b.as_mut_ptr() as usize);
+    let (sa, sb) = (p.stride_a, p.stride_b);
+
+    type Sums = (F128, F128, [F128; 6]);
+    let item = |x_hi: usize| -> Sums {
+        crate::rstrace::evd("zt:c0", x_hi as u32);
+        let mut out = [F128::ZERO; 8];
+        for j in 0..per {
+            let pi = x_hi * per + j;
+            let w = &wt[j * sub_lo..(j + 1) * sub_lo];
+            // SAFETY: item `x_hi` alone reads and writes pieces
+            // `x_hi*per .. x_hi*per + per` (disjoint across items), each
+            // holding `p.piece` = 8·sub_lo elements; outputs overwrite only
+            // inputs already loaded (see above). Both borrows outlive the
+            // parallel region.
+            let o = unsafe {
+                let ap = (ab as *mut F128).add(pi * sa);
+                let bp = (bb as *mut F128).add(pi * sb);
+                let (ai, bi) = (ap as *const F128, bp as *const F128);
+                match (in_lm, out_lm) {
+                    (true, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, true, true>(ai, bi, ap, bp, rho_a, rho_b, sub_lo, w),
+                    (false, true) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, false, true>(ai, bi, ap, bp, rho_a, rho_b, sub_lo, w),
+                    (true, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, true, false>(ai, bi, ap, bp, rho_a, rho_b, sub_lo, w),
+                    (false, false) => kernels::x86_64::fold2_and_message_lookahead_defer_wtab_x86::<false, false, false>(ai, bi, ap, bp, rho_a, rho_b, sub_lo, w),
+                }
+            };
+            for (x, y) in out.iter_mut().zip(o.iter()) {
+                *x += *y;
+            }
+        }
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::evd("zt:c1", x_hi as u32);
+        (
+            eq_h * out[0],
+            eq_h * out[1],
+            [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ],
+        )
+    };
+    let id = || -> Sums { (F128::ZERO, F128::ZERO, [F128::ZERO; 6]) };
+    let op = |(s1, sinf, sa): Sums, (c1, cinf, ca): Sums| -> Sums {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a)
+    };
+    let (sum1_even, sum_inf_even, agg) = if team && crate::flat_par::team_ready() {
+        // Same team route and writer-affinity hint as the piece reader.
+        match sl1_owner_map(ab, a.len(), per * sa, hi_size) {
+            Some(owner) => crate::flat_par::team_map_reduce_aff(hi_size, &owner, item, id, op),
+            None => crate::flat_par::team_map_reduce(hi_size, item, id, op),
+        }
+    } else {
+        (0..hi_size).into_par_iter().map(item).reduce(id, op)
+    };
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
+    let next = TlPieces { piece: 2 * sub_lo, stride_a: sa, stride_b: sb, n: quarter };
+    (r_next[0] * sum1, sum_inf, la, next)
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_plain_tl_inplace(
+    _a: &mut [F128],
+    _b: &mut [F128],
+    _pieces: TlPieces,
+    _rho_a: F128,
+    _rho_b: F128,
+    _r_next: &[F128],
+    _in_lm: bool,
+    _out_lm: bool,
+    _team: bool,
+) -> (F128, F128, Round3Lookahead, TlPieces) {
+    unreachable!("in-place level 2 needs the AVX-512 kernels (tl2_route_ok)")
+}
+
+/// `FLOCK_NO_TL2=1` keeps level 2's separate output tables under the
+/// in-place handoff (level 3 then reads them as usual).
+pub(crate) fn tl2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TL2").is_none());
+    *ON
+}
+
+/// Whether level 2 of the in-place handoff (level-1 input of `n` elements)
+/// can also write in place: level 3 is the same plain `wtab` kernel and each
+/// of its chunks covers whole level-2 pieces in sub-runs of a multiple of 16.
+pub(crate) fn tl2_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if !tl2_enabled() || !tl_route_ok(n) {
+            return false;
+        }
+        let lo2 = plain_cascade_lo_size(n / 8);
+        let n_vars1 = n.trailing_zeros() as usize - 4;
+        let lo1 = 1usize << (n_vars1 - tail_split_n_hi(n_vars1).min(n_vars1));
+        let per2 = 8 * lo2 / (2 * lo1);
+        let piece3 = 2 * (lo2 / per2);
+        let lo3 = plain_cascade_lo_size(n / 32);
+        let chunk_in3 = 8 * lo3;
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+            kernels::x86_64::zc_defer_split_enabled(),
+            lo3,
+            true,
+        ) && chunk_in3.is_multiple_of(piece3)
+            && (lo3 / (chunk_in3 / piece3)).is_multiple_of(16)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+/// [`fold3_oct_plain_and_round_pair_lookahead_into`] with the in-place
+/// handoff (see [`TlPieces`]): output chunk `i` (both tables) is written over
+/// the start of input chunk `i`, whose lines the octet kernel has just read
+/// and still holds in cache, instead of streaming to separate tables. Within
+/// a chunk the kernel's store to outputs `[2x, 2x+16)` comes after its loads
+/// of inputs `[0, 16x+128)` (A) and `[0, 14x+112)` (B7 B), which cover them,
+/// so every input is read before it is overwritten. Same kernel, same values
+/// and messages; only the output addresses move. Needs [`tl_route_ok`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold3_oct_plain_and_round_pair_lookahead_inplace(
+    a: &mut [F128],
+    b: &mut [F128],
+    rho: [F128; 3],
+    r_next: &[F128],
+    out_lm: bool,
+    b7: Option<&[F128; 4]>,
+) -> (F128, F128, Round3Lookahead, TlPieces) {
+    use rayon::prelude::*;
+    let n = a.len();
+    assert!(tl_route_ok(n), "in-place handoff route unavailable");
+    // The B7 table fills the first seven eighths of its buffer.
+    let n_b = if b7.is_some() { 7 * n / 8 } else { n };
+    assert!(b.len() >= n_b);
+    let b = &mut b[..n_b];
+    let eighth = n / 8;
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 3);
+    let r = r_next[1];
+    assert_ne!(r, F128::ZERO, "cascade lookahead requires a non-zero parity weight");
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tail_split_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 16 && lo_size.is_multiple_of(16));
+    assert_eq!(lo_size * hi_size * 2, eighth);
+    assert!(
+        !out_lm || (lo_size.is_multiple_of(8) && zc_lane_major_handoff_on()),
+        "lane-major tiles need eight-group chunks"
+    );
+    let (kappa, r_inv) = lookahead_inv_factors(r);
+    let chunk_in = 16 * lo_size;
+    let chunk_in_b = if b7.is_some() { 14 * lo_size } else { chunk_in };
+    let chunk_out = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let b_canon = b7.copied().unwrap_or([F128::ZERO; 4]);
+    let pieces = TlPieces { piece: chunk_out, stride_a: chunk_in, stride_b: chunk_in_b, n: eighth };
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    let wt = build_w_pair_table(&eq.lo);
+
+    let leaf = |(x_hi, (a_ch, b_ch)): (usize, (&mut [F128], &mut [F128]))| {
+        crate::rstrace::evd("zt:c0", x_hi as u32);
+        debug_assert_eq!(a_ch.len(), chunk_in);
+        debug_assert_eq!(b_ch.len(), chunk_in_b);
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let out = {
+            let (ap, bp) = (a_ch.as_mut_ptr(), b_ch.as_mut_ptr());
+            let bc = &b_canon;
+            let wt = &wt[..];
+            // SAFETY: the chunk holds eight inputs per output (seven per eight
+            // for B7 B) and two outputs per eq_lo entry; lo_size is a multiple
+            // of 16. Reads and writes go through the one pointer per table,
+            // and each output tile is stored only after the inputs it
+            // overwrites were loaded (see above).
+            unsafe {
+                macro_rules! go {
+                    ($lm:literal, $b7:literal) => {
+                        kernels::x86_64::fold3_oct_and_message_lookahead_wtab_x86::<false, $lm, $b7>(
+                            ap as *const F128, bp as *const F128, ap, bp, rho, lo_size, wt, bc,
+                        )
+                    };
+                }
+                match (out_lm, b7.is_some()) {
+                    (true, false) => go!(true, false),
+                    (false, false) => go!(false, false),
+                    (true, true) => go!(true, true),
+                    (false, true) => go!(false, true),
+                }
+            }
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let out: [F128; 8] = {
+            let _ = (a_ch, b_ch, &b_canon);
+            unreachable!("in-place handoff needs the AVX-512 octet kernel")
+        };
+        let eq_h = eq_hi[x_hi];
+        crate::rstrace::evd("zt:c1", x_hi as u32);
+        (
+            eq_h * out[0],
+            eq_h * out[1],
+            [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ],
+        )
+    };
+    type Sums3 = (F128, F128, [F128; 6]);
+    let id = || -> Sums3 { (F128::ZERO, F128::ZERO, [F128::ZERO; 6]) };
+    let op = |(s1, sinf, sa): Sums3, (c1, cinf, ca): Sums3| -> Sums3 {
+        let mut a = sa;
+        for (x, y) in a.iter_mut().zip(ca.iter()) {
+            *x += *y;
+        }
+        (s1 + c1, sinf + cinf, a)
+    };
+    let (sum1_even, sum_inf_even, agg) = if flat_tail(n) {
+        flat_chunks2(a, chunk_in, b, chunk_in_b, leaf, id, op)
+    } else {
+        a.par_chunks_mut(chunk_in)
+            .zip(b.par_chunks_mut(chunk_in_b))
+            .enumerate()
+            .map(leaf)
+            .reduce(id, op)
+    };
+    let sum1 = kappa * sum1_even + agg[0];
+    let sum_inf = kappa * sum_inf_even + agg[1];
+    let la = lookahead_from_odd_weighted(&agg, r_inv);
+    (r_next[0] * sum1, sum_inf, la, pieces)
+}
+
+/// Whether [`fold3_oct_plain_and_round_pair_lookahead_into`] on `n` inputs
+/// takes the AVX-512 octet kernel (the only reader of B7 tables).
+pub(crate) fn fold3_oct_b7_route_ok(n: usize) -> bool {
+    if !n.is_power_of_two() || n < 32 {
+        return false;
+    }
+    let n_vars = n.trailing_zeros() as usize - 4;
+    let n_lo = n_vars - tail_split_n_hi(n_vars).min(n_vars);
+    let lo_size = 1usize << n_lo;
+    cfg!(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))
+        && lo_size >= 16
+        && lo_size.is_multiple_of(16)
+}
+
+/// `FLOCK_NO_ZC_B7=1` keeps the rounds 3+4+5 pass's B table in the full
+/// eight-ZMM octet layout (its four static lanes per block stored and read).
+pub(crate) fn b7_tables_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_B7").is_none());
+    *ON
 }
 
 /// Portable leaf of [`fold3_oct_plain_and_round_pair_lookahead_into`]: octet
@@ -5962,12 +6508,48 @@ mod tests {
                 let mut b_out = vec![F128::ZERO; n_out];
                 let msg = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
                     &a, &b, m, K_SKIP, &table, &padding, &mut a_out, &mut b_out, rho, &r_next5,
-                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, casc, None, false,
                 );
                 (msg, a_out, b_out)
             };
             let (inc, a_rm, b_rm) = run(false);
             let (got, a_oct, b_oct) = run(true);
+            {
+                // B7: same messages and A table; the B table is the octet table
+                // with its four static lanes per block dropped (`b7_pack`).
+                let mut a7 = vec![F128::ZERO; n_out];
+                let mut b7 = vec![F128::ZERO; n_out];
+                let msg7 = three_var::fold3_from_packed_and_round_pair_lookahead_casc(
+                    &a, &b, m, K_SKIP, &table, &padding, &mut a7, &mut b7, rho, &r_next5,
+                    Some((&eq.lo[..], &eq.hi[..])), false, true, true, None, true,
+                );
+                assert_eq!(msg7, got, "b7 messages {case}");
+                assert!(a7 == a_oct, "b7 a table {case}");
+                let kc = three_var::fold3_b_canonical_lines(&table, rho);
+                for blk in 0..n_out / 32 {
+                    let p = &b7[28 * blk..28 * blk + 28];
+                    let z = |j: usize, g: usize| -> F128 {
+                        match (j, g) {
+                            (0, 0) => kc[0],
+                            (1, 0) => kc[1],
+                            (6, 3) => kc[2],
+                            (7, 3) => kc[3],
+                            (0, g) => p[16 + g - 1],
+                            (1, g) => p[20 + g - 1],
+                            (6, 0) => p[19],
+                            (7, 0) => p[23],
+                            (6, g) => p[24 + g - 1],
+                            (7, g) => p[26 + g - 1],
+                            (j, g) => p[4 * (j - 2) + g],
+                        }
+                    };
+                    for j in 0..8 {
+                        for g in 0..4 {
+                            assert_eq!(z(j, g), b_oct[32 * blk + 4 * j + g], "b7 b {case} blk={blk} j={j} g={g}");
+                        }
+                    }
+                }
+            }
             assert!(inc.3.is_none());
             assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message {case}");
             for e in 0..n_out {
@@ -6018,12 +6600,12 @@ mod tests {
             let mut a_rm = vec![F128::ZERO; n / 4];
             let mut b_rm = vec![F128::ZERO; n / 4];
             let inc = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-                &a, &b, &mut a_rm, &mut b_rm, ra, rb, &r_next, false, false, false, false,
+                &a, &b, &mut a_rm, &mut b_rm, ra, rb, &r_next, false, false, false, false, None,
             );
             let mut a_oct = vec![F128::ZERO; n / 4];
             let mut b_oct = vec![F128::ZERO; n / 4];
             let got = fold2_plain_and_round_pair_lookahead_into_lm_casc(
-                &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true, false,
+                &a, &b, &mut a_oct, &mut b_oct, ra, rb, &r_next, false, false, true, false, None,
             );
             assert!(inc.3.is_none());
             assert_eq!((inc.0, inc.1, inc.2), (got.0, got.1, got.2), "message log_n={log_n}");
@@ -6092,7 +6674,7 @@ mod tests {
                 let mut a_got = vec![F128::ZERO; n / 8];
                 let mut b_got = vec![F128::ZERO; n / 8];
                 let got = fold3_oct_plain_and_round_pair_lookahead_into(
-                    &ao, &bo, &mut a_got, &mut b_got, rho, &r_next, out_lm,
+                    &ao, &bo, &mut a_got, &mut b_got, rho, &r_next, out_lm, None,
                 );
                 assert_eq!(got, want, "message log_n={log_n} lm={out_lm}");
                 if out_lm {
@@ -6101,6 +6683,84 @@ mod tests {
                 } else {
                     assert!(a_got == a_ref, "a log_n={log_n}");
                     assert!(b_got == b_ref, "b log_n={log_n}");
+                }
+            }
+        }
+    }
+
+    /// In-place level 1 -> level 2 handoff (`FLOCK_NO_TL`): level 1 written
+    /// over its input chunks and level 2 reading the pieces gives the same
+    /// messages and the same level-2 tables as the separate-table route, for
+    /// both B layouts (full octet and B7) and both level-1 output layouts.
+    #[test]
+    fn tl_inplace_handoff_matches_separate_tables() {
+        for &log_n in &[17usize, 18, 20] {
+            let n = 1usize << log_n;
+            if !tl_route_ok(n) {
+                continue;
+            }
+            let mut rng = Rng::new(0x71A0 + log_n as u64);
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let rho = [rng.f128(), rng.f128(), rng.f128()];
+            let mut r1 = rng.f128_vec(log_n - 3);
+            r1[0] = F128::ONE;
+            let (ra, rb) = (rng.f128(), rng.f128());
+            let mut r2 = rng.f128_vec(log_n - 5);
+            r2[0] = F128::ONE;
+            let kc = [rng.f128(), rng.f128(), rng.f128(), rng.f128()];
+            for b7 in [None, Some(&kc)] {
+                for lm in [false, true] {
+                    if lm && !(zc_lane_major_handoff_on() && plain_cascade_lo_size(n / 8) % 8 == 0) {
+                        continue;
+                    }
+                    let mut a1 = vec![F128::ZERO; n / 8];
+                    let mut b1 = vec![F128::ZERO; n / 8];
+                    let m1 = fold3_oct_plain_and_round_pair_lookahead_into(
+                        &a, &b, &mut a1, &mut b1, rho, &r1, lm, b7,
+                    );
+                    let mut a2 = vec![F128::ZERO; n / 32];
+                    let mut b2 = vec![F128::ZERO; n / 32];
+                    let m2 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                        &a1, &b1, &mut a2, &mut b2, ra, rb, &r2, lm, false, false, false, None,
+                    );
+                    let (mut ai, mut bi) = (a.clone(), b.clone());
+                    let (g0, g1, g2, pieces) = fold3_oct_plain_and_round_pair_lookahead_inplace(
+                        &mut ai, &mut bi, rho, &r1, lm, b7,
+                    );
+                    assert_eq!((g0, g1, g2), m1, "level 1 log_n={log_n} b7={} lm={lm}", b7.is_some());
+                    for e in 0..n / 8 {
+                        let (i, k) = (e / pieces.piece, e % pieces.piece);
+                        assert_eq!(ai[i * pieces.stride_a + k], a1[e], "a1 e={e}");
+                        assert_eq!(bi[i * pieces.stride_b + k], b1[e], "b1 e={e}");
+                    }
+                    let mut a2i = vec![F128::ZERO; n / 32];
+                    let mut b2i = vec![F128::ZERO; n / 32];
+                    let got = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                        &ai, &bi, &mut a2i, &mut b2i, ra, rb, &r2, lm, false, false, false,
+                        Some(pieces),
+                    );
+                    assert_eq!((got.0, got.1, got.2), (m2.0, m2.1, m2.2), "level 2 log_n={log_n}");
+                    assert!(a2i == a2 && b2i == b2, "level 2 tables log_n={log_n}");
+                    // Level 2 in place too (`FLOCK_NO_TL2`).
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    if tl2_route_ok(n) {
+                        let (mut aj, mut bj) = (ai.clone(), bi.clone());
+                        let (h0, h1, h2, next) = fold2_plain_tl_inplace(
+                            &mut aj, &mut bj, pieces, ra, rb, &r2, lm, false, false,
+                        );
+                        assert_eq!((h0, h1, h2), (m2.0, m2.1, m2.2), "level 2 in place log_n={log_n}");
+                        assert_eq!(next.n, n / 32);
+                        for e in 0..n / 32 {
+                            let (i, k) = (e / next.piece, e % next.piece);
+                            assert_eq!(aj[i * next.stride_a + k], a2[e], "a2 e={e}");
+                            assert_eq!(bj[i * next.stride_b + k], b2[e], "b2 e={e}");
+                        }
+                    }
                 }
             }
         }

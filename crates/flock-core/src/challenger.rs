@@ -1083,6 +1083,7 @@ mod blake3_pow_avx512 {
         end: u64,
         stop: F,
     ) -> Option<u64> {
+    crate::realign_frame64!();
         let zero = _mm512_setzero_si512();
         let bswap = _mm512_set4_epi32(0x0C0D_0E0F, 0x0809_0A0B, 0x0405_0607, 0x0001_0203);
         let lane_idx: [u32; 16] = std::array::from_fn(|i| i as u32);

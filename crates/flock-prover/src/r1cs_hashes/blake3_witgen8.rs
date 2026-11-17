@@ -1320,6 +1320,31 @@ pub(crate) struct StreamProj<'t> {
 #[path = "blake3_witgen8_xor.rs"]
 mod xor_projection;
 
+/// tc: whether the ranked deferred projection writes the transpose-contract
+/// ab_inner layout (see `xor_projection`). The pipelined producer brands
+/// ab_inner with it only when this holds and every window 2..=29 of every
+/// octa is projected there ([`window_seed_projection_eligible`]).
+pub(crate) fn tc_layout_active() -> bool {
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    {
+        xor_projection::tc_layout_active() && *SB1_DEFER_ON
+    }
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )))]
+    {
+        false
+    }
+}
+
 pub(crate) struct RankedClosedWindowPreps {
     windows: [(Round1AbWindowPlan, Round1AbTableImages); 31],
     #[cfg(all(

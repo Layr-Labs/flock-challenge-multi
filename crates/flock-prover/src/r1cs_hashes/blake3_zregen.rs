@@ -848,58 +848,122 @@ pub(crate) mod imp {
         assert!(view.cross_quarter && view.tiles == 4096);
         let seed = view.generator.expect("fold generator seed").0;
         let dst = SendPtr(out.as_mut_ptr());
+        (0..view.tiles / 8).into_par_iter().for_each(|u| {
+            let dst = dst;
+            // SAFETY: `out` holds every compression slot; task `u` writes
+            // only the slots of its eight tiles.
+            unsafe { fold64_generated_task(seed, u, dst.0, weights, generate) };
+        });
+    }
+
+    /// One `fold64_generated` task: tiles `8u..8u+8`.
+    ///
+    /// # Safety
+    /// AVX-512 / VPCLMULQDQ (cfg preconditions); `dst` covers all
+    /// `2 * 4096 * 64` outputs of the cross-quarter 4096-tile view.
+    unsafe fn fold64_generated_task(
+        seed: u64,
+        u: usize,
+        dst: *mut F128,
+        weights: &Weights,
+        generate: unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8),
+    ) {
         #[repr(C, align(64))]
         struct FoldOut([__m512i; 8]);
         thread_local! {static OUTPUT:core::cell::RefCell<Option<Box<FoldOut>>>=const {core::cell::RefCell::new(None)};}
-        (0..view.tiles / 8).into_par_iter().for_each(|u| {
-            let dst = dst;
-            flock_core::rstrace::evd("z:task", u as u32);
-            OUTPUT.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let output = guard
-                    .get_or_insert_with(|| unsafe { Box::<FoldOut>::new_zeroed().assume_init() });
-                for tile in u * 8..(u + 1) * 8 {
-                    for pair in 0..4 {
-                        unsafe {
-                            generate(
-                                seed,
-                                tile,
-                                pair,
-                                output.0.as_mut_ptr().cast(),
-                                core::ptr::null_mut(),
-                                (weights as *const Weights).cast(),
-                            );
-                            let base = 64 * tile + 16 * pair;
-                            for octa in 0..2 {
-                                for parity in 0..2 {
-                                    let lo = output.0[2 * octa + parity];
-                                    let hi = output.0[4 + 2 * octa + parity];
-                                    macro_rules! store {
-                                        ($l:literal) => {{
-                                            let c = compression(
-                                                true,
-                                                base + 8 * octa + 2 * $l + parity,
-                                            );
-                                            let value = _mm256_inserti128_si256::<1>(
-                                                _mm256_castsi128_si256(
-                                                    _mm512_extracti32x4_epi32::<$l>(lo),
-                                                ),
-                                                _mm512_extracti32x4_epi32::<$l>(hi),
-                                            );
-                                            _mm256_storeu_si256(dst.0.add(2 * c).cast(), value);
-                                        }};
-                                    }
-                                    store!(0);
-                                    store!(1);
-                                    store!(2);
-                                    store!(3);
+        flock_core::rstrace::evd("z:task", u as u32);
+        OUTPUT.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let output = guard
+                .get_or_insert_with(|| unsafe { Box::<FoldOut>::new_zeroed().assume_init() });
+            for tile in u * 8..(u + 1) * 8 {
+                for pair in 0..4 {
+                    unsafe {
+                        generate(
+                            seed,
+                            tile,
+                            pair,
+                            output.0.as_mut_ptr().cast(),
+                            core::ptr::null_mut(),
+                            (weights as *const Weights).cast(),
+                        );
+                        let base = 64 * tile + 16 * pair;
+                        for octa in 0..2 {
+                            for parity in 0..2 {
+                                let lo = output.0[2 * octa + parity];
+                                let hi = output.0[4 + 2 * octa + parity];
+                                macro_rules! store {
+                                    ($l:literal) => {{
+                                        let c = compression(
+                                            true,
+                                            base + 8 * octa + 2 * $l + parity,
+                                        );
+                                        let value = _mm256_inserti128_si256::<1>(
+                                            _mm256_castsi128_si256(
+                                                _mm512_extracti32x4_epi32::<$l>(lo),
+                                            ),
+                                            _mm512_extracti32x4_epi32::<$l>(hi),
+                                        );
+                                        _mm256_storeu_si256(dst.add(2 * c).cast(), value);
+                                    }};
                                 }
+                                store!(0);
+                                store!(1);
+                                store!(2);
+                                store!(3);
                             }
                         }
                     }
                 }
-            });
+            }
         });
+    }
+
+    /// Lane h3: `fold64_generated` as [`flock_core::pcs::elided_z::Fold64Tasks`].
+    ///
+    /// Task `u` covers tiles `8u..8u+8`. In the cross-quarter layout slot
+    /// `s = 64·tile + o` is compression `c = (lane/2)·2^16 + (2·kpair +
+    /// lane%2)·2^10 + tile/4` (`kpair = (s%256)/8`, `lane = s%8`), stored at
+    /// outputs `2c, 2c+1`; output row `p = c/4` (8 outputs) therefore has
+    /// low ten bits `((2·kpair + lane%2) % 4)·256 + tile/16`, and all four
+    /// compressions of the row come from the 16 tiles with that `tile/16`
+    /// (two consecutive tasks). Group `g` = tasks `16g..16g+16` (tiles
+    /// `128g..128g+128`) writes exactly the rows with `((p % 1024) / 8) % 32
+    /// == g`.
+    pub(crate) struct GeneratedFoldTasks {
+        seed: u64,
+        weights: Box<Weights>,
+        generate: unsafe fn(u64, usize, usize, *mut u8, *mut u8, *const u8),
+    }
+
+    // SAFETY: plain data plus a function pointer; tasks share `weights`
+    // read-only.
+    unsafe impl Sync for GeneratedFoldTasks {}
+
+    impl flock_core::pcs::elided_z::Fold64Tasks for GeneratedFoldTasks {
+        fn len(&self) -> usize {
+            512
+        }
+        fn groups(&self) -> usize {
+            32
+        }
+        fn row_group(&self, p: usize) -> usize {
+            ((p % 1024) / 8) % 32
+        }
+        unsafe fn run(&self, u: usize, out: *mut F128) {
+            assert!(u < 512);
+            // SAFETY: forwarded caller contract.
+            unsafe { fold64_generated_task(self.seed, u, out, &self.weights, self.generate) }
+        }
+    }
+
+    pub(crate) fn fold64_tasks(view: &WitnessTileView, w: &[F128; 64]) -> Option<GeneratedFoldTasks> {
+        if !super::fused_fold_enabled() || !view.cross_quarter || view.tiles != 4096 {
+            return None;
+        }
+        let generate = view.stage_generator?;
+        let seed = view.generator?.0;
+        Some(GeneratedFoldTasks { seed, weights: Weights::new(w), generate })
     }
 
     pub(crate) fn fold64(view: &WitnessTileView, out: &mut [F128], w: &[F128; 64]) {
@@ -1044,6 +1108,15 @@ pub(crate) mod imp {
         fn fold64(&self, out: &mut [F128], w: &[F128; 64]) {
             fold64(&self.view(), out, w);
             super::REGEN_FOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn fold64_tasks<'a>(
+            &'a self,
+            w: &[F128; 64],
+        ) -> Option<Box<dyn flock_core::pcs::elided_z::Fold64Tasks + 'a>> {
+            let tasks = fold64_tasks(&self.view(), w)?;
+            super::REGEN_FOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Box::new(tasks))
         }
 
         fn materialize(&self, z: &mut [F128]) {

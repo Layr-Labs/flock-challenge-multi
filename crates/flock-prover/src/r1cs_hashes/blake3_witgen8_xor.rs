@@ -63,7 +63,7 @@ impl Tables {
         out[..128].copy_from_slice(&m[..128]);
         for bank in 0..8 {
             let prepared = unsafe { rank21::prepare_network(m.as_ptr().add(bank*128)) };
-            for i in 0..19 {
+            for i in 0..rank21::SLOTS {
                 out[128+bank*152+i*8..128+bank*152+(i+1)*8].copy_from_slice(&prepared[i]);
             }
         }
@@ -698,11 +698,63 @@ const BYTE_TR: [u8; 64] = [
     14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63,
 ];
 
+// tc: transpose contract between this projection and round one's AB arm.
+// The pretransposes place compression lane c at byte tc_byte(c) of each input
+// qword instead of byte c; every row kernel is bytewise (broadcast qwords,
+// GFNI, GF(2^8) products, XOR), so the accumulators carry the same values
+// with the same byte permutation. Lanes 2k+h (k = 0..3) then share one dword,
+// and the output keeps each line inside one round-one group (same h): line
+// 2q+h holds all four quarters k of Horner bytes 16q..16q+15. Round one's AB
+// arm is lane-uniform until its band-end eq_hi fold, which maps lane 4d+k of
+// band x back to byte 16q+d with eq_hi[(x & 31) + 32k]
+// (flock_core::zerocheck::univariate_skip_optimized, `tc` fold).
+// `FLOCK_NO_TC=1` keeps the incumbent layout and fold.
+static TC_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TC").is_none());
+const fn tc_byte(c: usize) -> usize { 4 * (c & 1) + (c >> 1) }
+const fn tc_permute_bytes(src: [u8; 64]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        out[(i & !7) + tc_byte(i & 7)] = src[i];
+        i += 1;
+    }
+    out
+}
+const TC_DWORDS: [[u32; 16]; 2] = {
+    let mut t = [[0u32; 16]; 2];
+    let mut h = 0;
+    while h < 2 {
+        let mut d = 0;
+        while d < 16 {
+            t[h][d] = (if d < 8 { 2 * d + h } else { 16 + 2 * (d - 8) + h }) as u32;
+            d += 1;
+        }
+        h += 1;
+    }
+    t
+};
+const PP_COLUMN: [u8; 64] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+const TC_COLUMN: [u8; 64] = tc_permute_bytes(PP_COLUMN);
+const PR_INDEX: [u8; 64] = [
+    0, 4, 8, 12, 16, 20, 24, 28, 1, 5, 9, 13, 17, 21, 25, 29, 2, 6, 10, 14, 18, 22, 26, 30,
+    3, 7, 11, 15, 19, 23, 27, 31, 32, 36, 40, 44, 48, 52, 56, 60, 33, 37, 41, 45, 49, 53,
+    57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
+];
+const TC_INDEX: [u8; 64] = tc_permute_bytes(PR_INDEX);
+
+/// True when every ranked deferred projection writes the tc layout. The
+/// producer brands ab_inner with it only when all windows 2..=29 of every
+/// octa take that projection (cross-quarter, deferred, pruned, aligned).
+pub(super) fn tc_layout_active() -> bool {
+    *TC_ON && *RPPRUNE_ON && *PROJ_PIPE_ON
+}
+
 // Pack each row's bytes into a qword, transpose its bit matrix, and select
 // superset byte XORs with a second GFNI. The final byte permutation produces
 // the private prepared qwords consumed by the unchanged row projection.
 #[inline(always)]
-unsafe fn ring_prepared_pack<const RANK21: bool>(v:__m512i)->__m512i{
+unsafe fn ring_prepared_pack<const RANK21: bool, const TC: bool>(v:__m512i)->__m512i{
  const ROW:[u8;64]=[0, 1, 2, 3, 32, 33, 34, 35, 4, 5, 6, 7, 36, 37, 38, 39, 8, 9, 10, 11, 40, 41, 42, 43, 12, 13, 14, 15, 44, 45, 46, 47, 16, 17, 18, 19, 48, 49, 50, 51, 20, 21, 22, 23, 52, 53, 54, 55, 24, 25, 26, 27, 56, 57, 58, 59, 28, 29, 30, 31, 60, 61, 62, 63];
  const COLUMN:[u8;64]=[0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57, 2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59, 4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61, 6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
  let row=_mm512_permutexvar_epi8(_mm512_loadu_si512(ROW.as_ptr().cast()),v);
@@ -710,9 +762,12 @@ unsafe fn ring_prepared_pack<const RANK21: bool>(v:__m512i)->__m512i{
  // eight-byte bit matrix. The second affine selects the superset byte XORs.
  let basis=_mm512_set1_epi64(0x0102040810204080u64 as i64);
  let transpose=_mm512_gf2p8affine_epi64_epi8::<0>(basis,row);
- let subsets=_mm512_set1_epi64((if RANK21 {0xe02ea069dd99ccffu64} else {0x0103050f113355ffu64}) as i64);
+ // Prepared basis of the rank-22 network (e-man07, Yukon submission c84cbde1).
+ let subsets=_mm512_set1_epi64((if RANK21 {0x1f8b41829622aaccu64} else {0x0103050f113355ffu64}) as i64);
  let prepared=_mm512_gf2p8affine_epi64_epi8::<0>(subsets,transpose);
- _mm512_permutexvar_epi8(_mm512_loadu_si512(COLUMN.as_ptr().cast()),prepared)
+ // tc: same transpose, compression y lands at byte tc_byte(y) of its qword.
+ let column=if TC {TC_COLUMN.as_ptr()} else {COLUMN.as_ptr()};
+ _mm512_permutexvar_epi8(_mm512_loadu_si512(column.cast()),prepared)
 }
 
 // The near-dense modes use the same prepared basis and full linear map.
@@ -720,10 +775,10 @@ unsafe fn ring_prepared_pack<const RANK21: bool>(v:__m512i)->__m512i{
 const fn dense_b_mode(mode: u8) -> bool { matches!(mode, 0 | 1 | 8) }
 
 #[inline(always)]
-unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
+unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool, const TC: bool>(ring: *const V8, rw: usize) -> [u64; 64] {
     unsafe {
         let mut out = core::mem::MaybeUninit::<[u64; 64]>::uninit();
-        pretranspose_ring_into::<BLK, PREPARE_A>(ring, rw, out.as_mut_ptr().cast::<u64>());
+        pretranspose_ring_into::<BLK, PREPARE_A, TC>(ring, rw, out.as_mut_ptr().cast::<u64>());
         out.assume_init()
     }
 }
@@ -741,16 +796,16 @@ unsafe fn pretranspose_ring<const BLK: usize, const PREPARE_A: bool>(ring: *cons
 struct Slots64([u64; 64]);
 
 #[inline(always)]
-unsafe fn pretranspose_ring_aligned<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize) -> Slots64 {
+unsafe fn pretranspose_ring_aligned<const BLK: usize, const PREPARE_A: bool, const TC: bool>(ring: *const V8, rw: usize) -> Slots64 {
     unsafe {
         let mut out = core::mem::MaybeUninit::<Slots64>::uninit();
-        pretranspose_ring_into::<BLK, PREPARE_A>(ring, rw, out.as_mut_ptr().cast::<u64>());
+        pretranspose_ring_into::<BLK, PREPARE_A, TC>(ring, rw, out.as_mut_ptr().cast::<u64>());
         out.assume_init()
     }
 }
 
 #[inline(always)]
-unsafe fn pretranspose_ring_into<const BLK: usize, const PREPARE_A: bool>(ring: *const V8, rw: usize, p: *mut u64) {
+unsafe fn pretranspose_ring_into<const BLK: usize, const PREPARE_A: bool, const TC: bool>(ring: *const V8, rw: usize, p: *mut u64) {
     unsafe {
         // Two adjacent ring vectors hold the two 32-bit words for all eight rows.
         // One fixed byte permutation packs each of their eight byte positions across
@@ -760,59 +815,59 @@ unsafe fn pretranspose_ring_into<const BLK: usize, const PREPARE_A: bool>(ring: 
             3, 7, 11, 15, 19, 23, 27, 31, 32, 36, 40, 44, 48, 52, 56, 60, 33, 37, 41, 45, 49, 53,
             57, 61, 34, 38, 42, 46, 50, 54, 58, 62, 35, 39, 43, 47, 51, 55, 59, 63,
         ];
-        let ix = _mm512_loadu_si512(INDEX.as_ptr().cast());
+        let ix = _mm512_loadu_si512(if TC { TC_INDEX.as_ptr() } else { INDEX.as_ptr() }.cast());
         let v = _mm512_loadu_si512(ring.add(rw + 0).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 0)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(0).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 2).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 1)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(8).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 4).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 2)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(16).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 6).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 3)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(24).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 8).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 4)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(32).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 10).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 5)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(40).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 12).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 6)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
         _mm512_storeu_si512(p.add(48).cast(), v);
         let v = _mm512_loadu_si512(ring.add(rw + 14).cast());
         let v = if PREPARE_A || dense_b_mode(mode(BLK, 7)) {
-            ring_prepared_pack::<true>(v)
+            ring_prepared_pack::<true, TC>(v)
         } else {
             _mm512_permutexvar_epi8(ix, v)
         };
@@ -935,7 +990,7 @@ const fn residual_row_live(blk: usize, k: usize) -> bool {
     (blk != 2 || k >= 2) && (blk != 29 || k <= 3)
 }
 #[inline(always)]
-unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool>(
+unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool, const TC: bool>(
     proj: &StreamProj<'_>,
     rows: RankedRows<COMPACT_COLS>,
     a: [__m512i; 8],
@@ -949,10 +1004,10 @@ unsafe fn project_const<const BLK: usize, const CROSS_QUARTER: bool,const COMPAC
         let bp_aligned;
         let bp_plain;
         let bp: &[u64; 64] = if ALIGN {
-            bp_aligned = pretranspose_ring_aligned::<BLK, false>(br, rw);
+            bp_aligned = pretranspose_ring_aligned::<BLK, false, TC>(br, rw);
             &bp_aligned.0
         } else {
-            bp_plain = pretranspose_ring::<BLK, false>(br, rw);
+            bp_plain = pretranspose_ring::<BLK, false, TC>(br, rw);
             &bp_plain
         };
         // a4aa6fa2: start uninitialised unless FLOCK_NO_WITGEN_UNINIT=1 asks for
@@ -1201,8 +1256,27 @@ _ => unreachable!(),
         // forcing accumulator vectors through asm register operands.
         core::arch::asm!("/* Horner NT publication boundary */", options(readonly, nostack, preserves_flags));
 
+        let out = if TC {
+            // tc layout: byte tc_byte(c) of every accumulator qword holds lane
+            // c, so dword 2y+h of acc[j] is lanes 2k+h (k = 0..3) at Horner
+            // byte 8j+y. Slot 2q+h takes those dwords of acc[2q] and acc[2q+1]:
+            // its byte 4d+k is lane 2k+h's incumbent byte 16q+d. One vpermt2d
+            // per line replaces the 8 vpermb + 24 qword shuffles below.
+            let i0 = _mm512_loadu_si512(TC_DWORDS[0].as_ptr().cast());
+            let i1 = _mm512_loadu_si512(TC_DWORDS[1].as_ptr().cast());
+            [
+                _mm512_permutex2var_epi32(acc[0], i0, acc[1]),
+                _mm512_permutex2var_epi32(acc[0], i1, acc[1]),
+                _mm512_permutex2var_epi32(acc[2], i0, acc[3]),
+                _mm512_permutex2var_epi32(acc[2], i1, acc[3]),
+                _mm512_permutex2var_epi32(acc[4], i0, acc[5]),
+                _mm512_permutex2var_epi32(acc[4], i1, acc[5]),
+                _mm512_permutex2var_epi32(acc[6], i0, acc[7]),
+                _mm512_permutex2var_epi32(acc[6], i1, acc[7]),
+            ]
+        } else {
         let ix = _mm512_loadu_si512(BYTE_TR.as_ptr().cast());
-        let out = trq([
+        trq([
             _mm512_permutexvar_epi8(ix, acc[0]),
             _mm512_permutexvar_epi8(ix, acc[1]),
             _mm512_permutexvar_epi8(ix, acc[2]),
@@ -1211,7 +1285,8 @@ _ => unreachable!(),
             _mm512_permutexvar_epi8(ix, acc[5]),
             _mm512_permutexvar_epi8(ix, acc[6]),
             _mm512_permutexvar_epi8(ix, acc[7]),
-        ]);
+        ])
+        };
         if DEFER && BLK < 29 {
             let p = proj.ab_pend;
             for c in 0..8 { _mm512_store_si512((*p).v.as_mut_ptr().add(c).cast(), out[c]); }
@@ -1293,25 +1368,32 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
             // Aligned pretranspose slots: production deferred policies only,
             // so every other policy keeps its single unchanged instantiation.
             if *PROJ_PIPE_ON {
-                if rows.cached_z {
-                    return project_policy::<true, true, COMPACT_COLS, true, true, true>(proj, blk, rows, ar, br, rw, t);
+                // tc: the transpose-contract layout (see `tc_layout_active`).
+                if *TC_ON {
+                    if rows.cached_z {
+                        return project_policy::<true, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
+                    }
+                    return project_policy::<false, true, COMPACT_COLS, true, true, true, true>(proj, blk, rows, ar, br, rw, t);
                 }
-                return project_policy::<false, true, COMPACT_COLS, true, true, true>(proj, blk, rows, ar, br, rw, t);
+                if rows.cached_z {
+                    return project_policy::<true, true, COMPACT_COLS, true, true, true, false>(proj, blk, rows, ar, br, rw, t);
+                }
+                return project_policy::<false, true, COMPACT_COLS, true, true, true, false>(proj, blk, rows, ar, br, rw, t);
             }
             if rows.cached_z {
-                return project_policy::<true, true, COMPACT_COLS, true, true, false>(proj, blk, rows, ar, br, rw, t);
+                return project_policy::<true, true, COMPACT_COLS, true, true, false, false>(proj, blk, rows, ar, br, rw, t);
             }
-            return project_policy::<false, true, COMPACT_COLS, true, true, false>(proj, blk, rows, ar, br, rw, t);
+            return project_policy::<false, true, COMPACT_COLS, true, true, false, false>(proj, blk, rows, ar, br, rw, t);
         }
         match (rows.cached_z, rows.cross_quarter, *RPPRUNE_ON) {
-            (true, true, true) => project_policy::<true, true, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
-            (true, false, true) => project_policy::<true, false, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, true, true) => project_policy::<false, true, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, false, true) => project_policy::<false, false, COMPACT_COLS, true, false, false>(proj, blk, rows, ar, br, rw, t),
-            (true, true, false) => project_policy::<true, true, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
-            (true, false, false) => project_policy::<true, false, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, true, false) => project_policy::<false, true, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
-            (false, false, false) => project_policy::<false, false, COMPACT_COLS, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, true, true) => project_policy::<true, true, COMPACT_COLS, true, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, false, true) => project_policy::<true, false, COMPACT_COLS, true, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, true, true) => project_policy::<false, true, COMPACT_COLS, true, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, false, true) => project_policy::<false, false, COMPACT_COLS, true, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, true, false) => project_policy::<true, true, COMPACT_COLS, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (true, false, false) => project_policy::<true, false, COMPACT_COLS, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, true, false) => project_policy::<false, true, COMPACT_COLS, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
+            (false, false, false) => project_policy::<false, false, COMPACT_COLS, false, false, false, false>(proj, blk, rows, ar, br, rw, t),
         }
     }
 }
@@ -1320,7 +1402,7 @@ pub(super) unsafe fn project<const COMPACT_COLS:usize>(
 // This prevents opaque publication boundaries from causing repeated reloads
 // of the incoming row descriptor's runtime flag. Values and stores are unchanged.
 #[inline(never)]
-unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool>(
+unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const COMPACT_COLS:usize, const PRUNE: bool, const DEFER: bool, const ALIGN: bool, const TC: bool>(
     proj: &StreamProj<'_>,
     blk: usize,
     rows: RankedRows<COMPACT_COLS>,
@@ -1334,43 +1416,43 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
         let ap_aligned;
         let ap_plain;
         let ap: &[u64; 64] = if ALIGN {
-            ap_aligned = pretranspose_ring_aligned::<0, true>(ar, rw);
+            ap_aligned = pretranspose_ring_aligned::<0, true, TC>(ar, rw);
             &ap_aligned.0
         } else {
-            ap_plain = pretranspose_ring::<0, true>(ar, rw);
+            ap_plain = pretranspose_ring::<0, true, TC>(ar, rw);
             &ap_plain
         };
         let a = tr8x16_zmm(ar, rw);
         let b = tr8x16_zmm(br, rw);
         match blk {
-            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
-            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            2 => project_const::<2, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            3 => project_const::<3, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            4 => project_const::<4, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            5 => project_const::<5, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            6 => project_const::<6, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            7 => project_const::<7, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            8 => project_const::<8, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            9 => project_const::<9, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            10 => project_const::<10, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            11 => project_const::<11, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            12 => project_const::<12, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            13 => project_const::<13, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            14 => project_const::<14, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            15 => project_const::<15, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            16 => project_const::<16, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            17 => project_const::<17, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            18 => project_const::<18, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            19 => project_const::<19, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            20 => project_const::<20, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            21 => project_const::<21, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            22 => project_const::<22, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            23 => project_const::<23, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            24 => project_const::<24, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            25 => project_const::<25, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            26 => project_const::<26, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            27 => project_const::<27, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            28 => project_const::<28, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
+            29 => project_const::<29, CROSS_QUARTER, COMPACT_COLS, PRUNE, DEFER, ALIGN, TC>(proj, rows, a, b, ap, br, rw, t.0.as_ptr()),
             _ => unreachable!("only ranked mixed windows 2 through 29 reach XOR projection"),
         }
     }

@@ -1131,6 +1131,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         && multilinear::fold2_plain_casc_route_ok(1usize << (n_mlv - 3));
     let c3 = c3_r345 || c3_tail;
     let off2 = off + c3 as usize;
+    // B7 tables (`FLOCK_NO_ZC_B7`): with the cascade at level 1 the rounds
+    // 3+4+5 pass's B table is read only by level 1's octet kernel, so its four
+    // static lanes per block (the ranked brand's `b_canon` constants) are
+    // neither stored nor read back: 1/8 of that table's write and read traffic.
+    let b7 = c3_r345
+        && multilinear::b7_tables_enabled()
+        && multilinear::fold3_oct_b7_route_ok((1usize << n_mlv) / 8);
+    let mut b7_canon: Option<[F128; 4]> = None;
     // Levels 3 and 4 (rounds 9+10 and 11+12) extend the same chain; with
     // ZC-3VAR every level sits one variable later (`off`).
     let use_cascade4 = use_cascade3
@@ -1182,6 +1190,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     #[cfg(test)]
     ZC_LEVELS_LAST.store(n_levels, std::sync::atomic::Ordering::Relaxed);
 
+    // In-place level 1 -> level 2 handoff (`FLOCK_NO_TL`): level 1 (the
+    // three-variable cascade level after the rounds 3+4+5 pass) writes its
+    // outputs over the start of each input chunk it has just read, and the
+    // plain level 2 reads them piece by piece (`multilinear::TlPieces`).
+    let tl = c3_r345 && n_levels > 3 && multilinear::tl_route_ok((1usize << n_mlv) / 8);
+    // Level 2 also writes in place and level 3 reads its pieces.
+    let tl2 = tl && n_levels > 4 && multilinear::tl2_route_ok((1usize << n_mlv) / 8);
+    let mut tl_pieces: Option<multilinear::TlPieces> = None;
+
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2·levels needs no other change.
@@ -1207,6 +1224,14 @@ fn prove_packed_padded_inner<C: Challenger>(
         // emits the biquadratic (`casc`).
         let c3_level = c3 && level == c3_at;
         let casc_level = c3_tail && level + 1 == c3_at;
+        assert!(
+            tl_pieces.is_none()
+                || ((level == 2 || (tl2 && level == 3))
+                    && level + 1 < n_levels
+                    && !c3_level
+                    && !casc_level),
+            "the in-place handoff feeds plain levels 2 and 3 only"
+        );
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
         multilinear_msgs.push((m_odd_1, m_odd_inf));
@@ -1242,7 +1267,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // turns 512 + 256 MiB reads / 256 + 128 MiB writes into 512 / 128.
         crate::rstrace::ev("lv:in", level as u32);
         let t_round = std::time::Instant::now();
-        let n_cur = if level == 0 { n_in } else { a_mlv.len() };
+        let n_cur = if level == 0 { n_in } else { tl_pieces.map_or(a_mlv.len(), |p| p.n) };
         crate::rstrace::ev("zt:lv0", n_cur.trailing_zeros());
         let log_n_cur = n_cur.trailing_zeros() as usize;
         let quarter = if (level == 0 && use_3var) || c3_level { n_cur / 8 } else { n_cur / 4 };
@@ -1305,8 +1330,16 @@ fn prove_packed_padded_inner<C: Challenger>(
                     b_canonical,
                     c3_r345,
                     pre_wtab,
+                    b7,
                 );
             assert_eq!(la7_next.is_some(), c3_r345, "deeper cascade route did not run");
+            if b7 {
+                // The same constants the pass substituted for those lanes.
+                b7_canon = Some(multilinear::three_var::fold3_b_canonical_lines(
+                    &fold_table,
+                    [mlv_rhos[0], mlv_rhos[1], mlv_rhos[2]],
+                ));
+            }
             la7 = la7_next;
             a_mlv = a8;
             b_mlv = b8;
@@ -1349,6 +1382,23 @@ fn prove_packed_padded_inner<C: Challenger>(
                 la = Some(la_next);
             }
             (m1, mi, lm_out)
+        } else if c3_level && tl && level == 1 {
+            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
+            let (m1, mi, la_next, pieces) =
+                multilinear::fold3_oct_plain_and_round_pair_lookahead_inplace(
+                    &mut a_mlv,
+                    &mut b_mlv,
+                    [mlv_rhos[2 * level + lo_off], mlv_rhos[2 * level + 1 + lo_off], mlv_rhos[2 * level + 2 + lo_off]],
+                    &r_next,
+                    lm_out,
+                    b7_canon.as_ref(),
+                );
+            debug_assert_eq!(pieces.n, quarter);
+            tl_pieces = Some(pieces);
+            if level + 1 < n_levels {
+                la = Some(la_next);
+            }
+            (m1, mi, lm_out)
         } else if c3_level {
             let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur / 2) % 8 == 0;
             let (m1, mi, la_next) = multilinear::fold3_oct_plain_and_round_pair_lookahead_into(
@@ -1359,10 +1409,28 @@ fn prove_packed_padded_inner<C: Challenger>(
                 [mlv_rhos[2 * level + lo_off], mlv_rhos[2 * level + 1 + lo_off], mlv_rhos[2 * level + 2 + lo_off]],
                 &r_next,
                 lm_out,
+                if level == 1 { b7_canon.as_ref() } else { None },
             );
             if level + 1 < n_levels {
                 la = Some(la_next);
             }
+            (m1, mi, lm_out)
+        } else if tl2 && level == 2 {
+            let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
+            let (m1, mi, la_next, next) = multilinear::fold2_plain_tl_inplace(
+                &mut a_mlv,
+                &mut b_mlv,
+                tl_pieces.take().expect("in-place level 2 without level-1 pieces"),
+                mlv_rhos[2 * level + lo_off],
+                mlv_rhos[2 * level + 1 + lo_off],
+                &r_next,
+                lm_in,
+                lm_out,
+                gl1_team,
+            );
+            debug_assert_eq!(next.n, quarter);
+            tl_pieces = Some(next);
+            la = Some(la_next);
             (m1, mi, lm_out)
         } else if level + 1 < n_levels {
             let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
@@ -1379,6 +1447,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     lm_out,
                     casc_level,
                     gl1_team,
+                    tl_pieces.take(),
                 );
             la = Some(la_next);
             if casc_level {
@@ -1401,7 +1470,8 @@ fn prove_packed_padded_inner<C: Challenger>(
         crate::rstrace::ev("lv:out", level as u32);
         lm_in = lm_out;
         crate::rstrace::ev("zt:lv1", level as u32);
-        if !(level == 0 && (use_nomat || use_3var)) {
+        // The in-place level keeps its outputs inside its input buffers.
+        if !(level == 0 && (use_nomat || use_3var)) && tl_pieces.is_none() {
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(quarter);

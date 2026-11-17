@@ -20,6 +20,31 @@ pub trait ZRegen: Send + Sync {
     fn fold64(&self, out: &mut [F128], w: &[F128; 64]);
     /// Overwrite every element of `z` with the canonical witness.
     fn materialize(&self, z: &mut [F128]);
+    /// Lane h3: [`Self::fold64`] as independent tasks, so a consumer of
+    /// finished output rows can run beside the rest of the fold. `None`:
+    /// this regenerator only folds in one piece.
+    fn fold64_tasks<'a>(&'a self, _w: &[F128; 64]) -> Option<Box<dyn Fold64Tasks + 'a>> {
+        None
+    }
+}
+
+/// Lane h3: a [`ZRegen::fold64`] split into tasks grouped by the output
+/// rows they write. A row is eight consecutive outputs (`out[8p..8p+8]`).
+pub trait Fold64Tasks: Sync {
+    /// Number of tasks; each is run exactly once and together they write
+    /// every output once (the same values [`ZRegen::fold64`] writes).
+    fn len(&self) -> usize;
+    /// Number of task groups; group `g` is tasks
+    /// `g·len/groups .. (g+1)·len/groups`.
+    fn groups(&self) -> usize;
+    /// The group whose tasks write every element of row `p`.
+    fn row_group(&self, p: usize) -> usize;
+    /// Run task `u`.
+    ///
+    /// # Safety
+    /// `out` is valid for the registered witness's `fold64` output; each
+    /// task index is run once; tasks write disjoint elements.
+    unsafe fn run(&self, u: usize, out: *mut F128);
 }
 
 struct Entry {

@@ -3,6 +3,7 @@
 //! and ZMM20..23 are preserved. FIRST initializes all eight outputs. The kernel
 //! reads only input memory, with no explicit stack use or output stores;
 //! CALL/RET uses the private return-address stack permitted by readonly.
+// zmm20 clobber for the rank-22 kernels: e-man07 Yukon submission c84cbde1-0a50-442a-88e7-bb36f8508363.
 use super::*;
 core::arch::global_asm!(include_str!("blake3_witgen8_xor_registers.S"),options(raw));
 unsafe extern "C" {fn flock_family19_mixedp20_first();fn flock_family19_mixedp20_next();}
@@ -40,6 +41,7 @@ out("zmm16")_,
 out("zmm17")_,
 out("zmm18")_,
 out("zmm19")_,
+out("zmm20")_,
 options(pure,readonly));
 }else{
 core::arch::asm!("call {kernel}",kernel=sym flock_family19_mixedp20_next,
@@ -72,6 +74,7 @@ out("zmm16")_,
 out("zmm17")_,
 out("zmm18")_,
 out("zmm19")_,
+out("zmm20")_,
 options(pure,readonly));
 }
 [a0,a1,a2,a3,a4,a5,a6,a7]

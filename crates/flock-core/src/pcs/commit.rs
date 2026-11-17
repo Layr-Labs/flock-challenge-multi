@@ -162,6 +162,8 @@ pub struct ProverData {
 // wrap-cache keys MTLBuffer wraps by base pointer — see [`TREE_POOL`]).
 impl Drop for ProverData {
     fn drop(&mut self) {
+        // The buffer leaves this commitment: forget its row layout.
+        crate::ntt::additive_ntt_f128::note_l0_layout(self.codeword.as_ptr(), self.codeword.len(), false);
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
         give_tree(std::mem::take(&mut self.merkle_tree));
     }
@@ -263,7 +265,7 @@ pub unsafe fn commit_generated_into(
         // SAFETY: this function forwards its exclusive message borrow and
         // the documented producer contract; the encoder joins every role.
         unsafe {
-            ntt.rs_encode_generated_on_range_done(z_packed, codeword, produce, on_range_done);
+            ntt.rs_encode_generated_on_range_done(z_packed, codeword, produce, on_range_done)
         }
     })
 }
@@ -339,6 +341,7 @@ fn finalize_commit(
 
     finalize_cpu_commit(codeword, params, |codeword, on_range_done| {
         ntt.rs_encode_interleaved_on_range_done(z_packed, codeword, params.num_ntts(), on_range_done);
+        false
     })
 }
 
@@ -348,7 +351,7 @@ fn finalize_commit(
 fn finalize_cpu_commit(
     mut codeword: Vec<F128>,
     params: &PcsParams,
-    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)) -> bool,
 ) -> (Commitment, ProverData) {
     crate::rstrace::ev("fc:in", 0);
     let timing = crate::sl2_env_set!("FLOCK_COMMIT_TIMING");
@@ -414,7 +417,9 @@ fn finalize_cpu_commit(
     let super_ok = std::sync::atomic::AtomicBool::new(sl2_super);
     crate::rstrace::ev("fc:enc", 0);
     let t_ntt = std::time::Instant::now();
-    encode(
+    // `encode` reports whether the codeword rows were stored page-blocked;
+    // the hashing callback below sees logical leaf ranges either way.
+    let blocked = encode(
         &mut codeword,
         &|range, sub_data| {
             debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
@@ -587,6 +592,7 @@ fn finalize_cpu_commit(
         );
     }
     crate::rstrace::ev("cm:encoded", 0);
+    crate::ntt::additive_ntt_f128::note_l0_layout(codeword.as_ptr(), codeword.len(), blocked);
     let t_merkle = std::time::Instant::now();
     let folded = match local_levels.load(Ordering::Acquire) {
         usize::MAX | 0 => 0,
@@ -1043,13 +1049,70 @@ pub(crate) fn fused_encode_leaves_subtree(
     leaf_size: usize,
     kind: HashKind,
 ) -> usize {
+    fused_leaves_subtree_with(codeword, num_ntts, tree, n_leaves, leaf_size, kind, |cw, cb| {
+        ntt.rs_encode_interleaved_on_range_done(msg, cw, num_ntts, cb)
+    })
+}
+
+/// Lane h3: [`fused_encode_leaves_subtree`] for a codeword whose seed6
+/// layers are already applied (see `AdditiveNttF128::seed6_plan`): only the
+/// seed6 route's deep pass runs, with the same leaf / subtree callback.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fused_leaves_subtree_after_seed6(
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    codeword: &mut [F128],
+    num_ntts: usize,
+    tree: &mut [Hash],
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+) -> usize {
+    fused_leaves_subtree_with(codeword, num_ntts, tree, n_leaves, leaf_size, kind, |cw, cb| {
+        ntt.rs_encode_deep_after_seed6(cw, num_ntts, log_inv_rate, cb)
+    })
+}
+
+/// Lane op: fused commit sub-groups finished so far in this process (each
+/// sub-group's leaf/subtree callback bumps it once at its end). Scheduling
+/// hint only (see `pcs::ligerito`'s background sparse-dual gate). Own line.
+#[repr(align(128))]
+struct SubsDone(AtomicUsize);
+static SUBS_DONE: SubsDone = SubsDone(AtomicUsize::new(0));
+
+pub(crate) fn subs_done() -> usize {
+    SUBS_DONE.0.load(Ordering::Relaxed)
+}
+
+fn fused_leaves_subtree_with(
+    codeword: &mut [F128],
+    num_ntts: usize,
+    tree: &mut [Hash],
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    encode: impl FnOnce(&mut [F128], &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync)),
+) -> usize {
     debug_assert_eq!(codeword.len(), n_leaves * num_ntts);
     debug_assert_eq!(leaf_size, num_ntts * core::mem::size_of::<F128>());
     debug_assert_eq!(tree.len(), 2 * n_leaves - 1);
     let tree_addr = tree.as_mut_ptr() as usize;
     let subtree_parents = subtree_parents_enabled();
     let local_levels = AtomicUsize::new(usize::MAX);
-    ntt.rs_encode_interleaved_on_range_done(msg, codeword, num_ntts, &|range, sub_data| {
+    encode(codeword, &|range, sub_data| {
+        // Lane op: count this sub-group once its callback returns.
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                SUBS_DONE.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let _done = Done;
         debug_assert_eq!(sub_data.len(), range.len() * num_ntts);
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(

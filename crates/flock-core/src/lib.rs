@@ -17,6 +17,26 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+
+/// Realign the calling function's stack frame to 64 bytes.
+///
+/// An escaping 64-byte-aligned local forces LLVM to realign the frame
+/// (`and rsp, -64`), so every 64-byte zmm spill slot of the function is one
+/// whole cache line instead of straddling two lines under three of the four
+/// possible 16-byte stack alignments at entry. That removes split spill
+/// loads/stores and failed store forwarding. Layout only: no value changes.
+/// Idea: akki-rock05, submission adc9f9dd-6e02-42a5-a609-76b072904d9a ("frame
+/// realignment", E2); this is our own re-implementation of it.
+#[macro_export]
+macro_rules! realign_frame64 {
+    () => {
+        #[repr(C, align(64))]
+        struct __RealignFrame64([u8; 64]);
+        let __realign_frame64 = ::core::mem::MaybeUninit::<__RealignFrame64>::uninit();
+        ::core::hint::black_box(&__realign_frame64);
+    };
+}
+
 pub mod bits;
 #[path = "stage_ir.rs"]
 pub mod gf2_kernels;

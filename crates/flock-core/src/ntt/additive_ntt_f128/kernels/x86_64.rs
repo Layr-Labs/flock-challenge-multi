@@ -3155,6 +3155,7 @@ unsafe fn butterfly_fused_3layer_rows_impl<
     dense_lanes: usize,
     twiddles: &[F128; 7],
 ) {
+    crate::realign_frame64!();
     use core::arch::x86_64::*;
 
     // Shape substitution (identity: the wrapper only pins the runtime value).
@@ -4244,6 +4245,13 @@ pub(crate) unsafe fn row_prepared<const H: u8>(
                 match sixteenth {
                     128 => {
                         return butterfly_fused_4layer_row_impl::<true, true, H, 128, 64>(
+                            ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
+                        );
+                    }
+                    // Deep sweep 1 on the page-blocked ranked codeword: the
+                    // sixteen rows of a group are one 2 MiB page apart.
+                    2048 => {
+                        return butterfly_fused_4layer_row_impl::<true, true, H, 2048, 64>(
                             ptr, sixteenth, num_ntts, lanes, r, t, pf_r, p,
                         );
                     }
@@ -5484,6 +5492,43 @@ pub(crate) unsafe fn rows_raw7_s8(ptr: *mut F128, t: &[F128; 15], hint: u8) -> b
     RAW7_PACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
+/// The [`rows_raw7_s8`] pack for a 64-column fused-four sweep whose sixteen
+/// group rows are `stride` rows apart (deep sweep 1): field 56 of the four
+/// odd row groups `rs` goes through ONE fused-four group of four-field rows.
+/// The caller has already folded fields 0..56 of those groups and leaves
+/// fields 57..64 (zero on every odd row, and zero again after the fold)
+/// untouched. The groups share one twiddle set `p`; the butterfly is
+/// field-local, so this is the same arithmetic on the same values.
+///
+/// # Safety
+/// Rows `rs[j] + i·stride` (`i < 16`) are valid 64-field rows of one sweep
+/// owned by the caller; no other thread reads them until this returns.
+#[cfg(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) unsafe fn raw7_pack4_field56(ptr: *mut F128, rs: [usize; 4], stride: usize, p: &PreparedFour) {
+    #[repr(C, align(64))]
+    struct Tail([F128; 64]);
+    let mut storage = core::mem::MaybeUninit::<Tail>::uninit();
+    let tail = storage.as_mut_ptr().cast::<F128>();
+    // SAFETY: forwarded; all 64 compact fields are written before the fold.
+    unsafe {
+        for (j, &r) in rs.iter().enumerate() {
+            for i in 0..16 {
+                tail.add(i * 4 + j).write(ptr.add((r + i * stride) * 64 + 56).read());
+            }
+        }
+        butterfly_four_fixed_registers::<1, 4, 0, 0>(tail, p, 64, tail);
+        for (j, &r) in rs.iter().enumerate() {
+            for i in 0..16 {
+                ptr.add((r + i * stride) * 64 + 56).write(tail.add(i * 4 + j).read());
+            }
+        }
+    }
+}
+
 #[cfg(all(
     test,
     target_feature = "avx512f",
