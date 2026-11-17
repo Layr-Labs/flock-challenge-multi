@@ -424,6 +424,12 @@ impl RootTileCache {
             std::env::var_os("FLOCK_NO_ROOT_CACHE_PREFETCH").is_none()
         });
         let prefetch_blocks = BATCH_WORD_TILES && *PREFETCH;
+        // Schedule-only leaf (patternrecognition9-del 0cde1b93, runner in-run reads
+        // -0.15% and -0.35%): four GFNI pairs before their XORs. FLOCK_NO_ROOT_PIPELINED=1 restores.
+        static PIPELINED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ROOT_PIPELINED").is_none()
+        });
+        let pipelined = BATCH_WORD_TILES && *PIPELINED;
         // Resolve the tile group once, outside the parallel reader. Two-tile
         // groups reduced measured lincheck latency on the ranked CPU shape.
         static WORD_BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -442,8 +448,20 @@ impl RootTileCache {
         let tiles_per_worker = self.tiles.div_ceil(rayon::current_num_threads().max(1));
         let workers = self.tiles.div_ceil(tiles_per_worker);
         let stride = self.blocks * 1024;
+        // Lane cr1 CH: while round one's C arm folds, the AB arm's idle
+        // core-warm holders may join as extra dynamic-claim workers, each with
+        // its own plane slot behind the pool's (`FLOCK_NO_CR_CH=1` disables).
+        // Planes are XOR accumulations, so any tile-to-slot split gives the
+        // same reduced sum.
+        let dynamic = dynamic_tiles_enabled();
+        let helpers = if dynamic && crate::r1_owner_awake::help_armed() {
+            crate::r1_owner_awake::HELP_SLOTS
+        } else {
+            0
+        };
+        let slots = workers + helpers;
         #[cfg(not(test))]
-        let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride);
+        let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(slots * stride);
         // The ranked prover's global recycler aligns allocations >=32 KiB to
         // 64 bytes. Core-only test binaries use System instead, so emulate that
         // alignment for the complete-reader premise rather than timing extra
@@ -451,20 +469,20 @@ impl RootTileCache {
         // separately exercises unaligned raw buffers.
         #[cfg(test)]
         let mut plane_storage =
-            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(workers * stride + 63);
+            crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(slots * stride + 63);
         #[cfg(test)]
         let plane_offset = plane_storage.as_ptr().align_offset(64);
         #[cfg(test)]
-        let mut planes = &mut plane_storage[plane_offset..plane_offset + workers * stride];
-        let mut active = vec![0u8; workers];
+        let mut planes = &mut plane_storage[plane_offset..plane_offset + slots * stride];
+        let mut active = vec![0u8; slots];
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let dynamic = dynamic_tiles_enabled();
+        // Lane cr1 LZ: resolve the leaf's prefetch-hint switch once per fold.
+        #[cfg(target_arch = "x86_64")]
+        let cr_hoist = !crate::cr_flags::no_lz();
+        #[cfg(target_arch = "x86_64")]
+        let cr_pf_shift = kernels::x7_prefetch_shift();
         crate::rstrace::ev("rf:par0", workers as u32);
-        planes
-            .par_chunks_mut(stride)
-            .zip(active.par_iter_mut())
-            .enumerate()
-            .for_each(|(worker, (dst, active))| {
+        let body = |worker: usize, dst: &mut [core::mem::MaybeUninit<u8>], active: &mut u8| {
                 crate::rstrace::evd("rf:w0", worker as u32);
                 // MaybeUninit bytes require no initialization; each live tile
                 // is fully overwritten by the checked generator before read.
@@ -532,6 +550,16 @@ impl RootTileCache {
                             }
                         }
                         for block in 0..self.blocks {
+                            if pipelined {
+                                unsafe {
+                                    kernels::gfni_fold_word_tiles4_pipelined(
+                                        source.add(block * 512), matrices.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first, WORD_TO_COLUMNS.as_ptr(),
+                                        prefetch_blocks && block + 1 < self.blocks);
+                                }
+                                continue;
+                            }
                             // SAFETY: tile + count <= hi <= self.tiles, each
                             // source block has eight initialized 64-byte rows,
                             // and actual tile stride is blocks*512. Arrays of
@@ -542,6 +570,15 @@ impl RootTileCache {
                             // batch the leaf initializes all sixteen planes
                             // without reading dst; later calls load them once.
                             unsafe {
+                                if cr_hoist {
+                                    kernels::gfni_fold_word_tiles4_mode(
+                                        source.add(block * 512),
+                                        matrices.as_ptr().cast::<u64>(),
+                                        dst.as_mut_ptr().cast::<u8>().add(block * 1024),
+                                        self.blocks * 512, count, first,
+                                        WORD_TO_COLUMNS.as_ptr(),
+                                        usize::from(prefetch_blocks && block + 1 < self.blocks) << cr_pf_shift);
+                                } else {
                                 kernels::gfni_fold_word_tiles4(
                                     source.add(block * 512),
                                     matrices.as_ptr().cast::<u64>(),
@@ -549,6 +586,7 @@ impl RootTileCache {
                                     self.blocks * 512, count, first,
                                     WORD_TO_COLUMNS.as_ptr(),
                                     prefetch_blocks && block + 1 < self.blocks);
+                                }
                             }
                         }
                         first = false;
@@ -597,7 +635,39 @@ impl RootTileCache {
                 }
                 *active = u8::from(!first);
                 crate::rstrace::evd("rf:w1", worker as u32);
-            });
+            };
+        let help_next = std::sync::atomic::AtomicUsize::new(0);
+        let planes_base = planes.as_mut_ptr() as usize;
+        let active_base = active.as_mut_ptr() as usize;
+        let help = || {
+            let h = help_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if h >= helpers || next.load(std::sync::atomic::Ordering::Relaxed) >= self.tiles {
+                return;
+            }
+            let slot = workers + h;
+            // SAFETY: each helper slot index is claimed once (fetch_add), so
+            // its plane and active byte are exclusively this helper's; the
+            // poster keeps both buffers alive until every helper has left
+            // (`help_close`), and the pool's workers own only slots < workers.
+            unsafe {
+                let dst = core::slice::from_raw_parts_mut(
+                    (planes_base as *mut core::mem::MaybeUninit<u8>).add(slot * stride),
+                    stride,
+                );
+                let act = &mut *(active_base as *mut u8).add(slot);
+                body(slot, dst, act);
+            }
+        };
+        let help_dyn: &(dyn Fn() + Sync) = &help;
+        let posted = helpers != 0 && crate::r1_owner_awake::help_post(&help_dyn);
+        planes[..workers * stride]
+            .par_chunks_mut(stride)
+            .zip(active[..workers].par_iter_mut())
+            .enumerate()
+            .for_each(|(worker, (dst, active))| body(worker, dst, active));
+        if posted {
+            crate::r1_owner_awake::help_close();
+        }
         crate::rstrace::ev("rf:red0", 0);
         let active_workers: Vec<usize> = active
             .into_iter()
@@ -620,7 +690,8 @@ impl RootTileCache {
         } else {
             vec![F128::ZERO; n_out]
         };
-        out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| {
+        let reduce_one = |block: usize, dst: &mut [F128]| {
+            crate::rstrace::evd("rf:rb", block as u32);
             // Leave the omitted group clear. The boundary group's surviving
             // bits are moved into it after the parallel reduction joins.
             if self.fixed_roots && block == 14 { return; }
@@ -630,7 +701,28 @@ impl RootTileCache {
             unsafe {
                 reduce_worker_plane_block(&planes, stride, &active_workers, source, dst);
             }
-        });
+        };
+        // Lane sc1 (`FLOCK_NO_SC_RTEAM`): in lincheck (the caller owns a live
+        // hot pool) the plane reduce runs on the spinning team instead of a
+        // second rayon region right after the fold's join. Each block is
+        // written by exactly one claimer with the same kernel, so `out` is
+        // identical.
+        if super::sc_rteam_active() && crate::flat_par::team_ready() {
+            let op = out.as_mut_ptr() as usize;
+            crate::flat_par::team_map_reduce(
+                output_blocks,
+                |block| {
+                    // SAFETY: block `block` owns out[64*block..64*block+64];
+                    // blocks are disjoint and `out` outlives the region.
+                    let dst = unsafe { core::slice::from_raw_parts_mut((op as *mut F128).add(64 * block), 64) };
+                    reduce_one(block, dst);
+                },
+                || (),
+                |_, _| (),
+            );
+        } else {
+            out.par_chunks_mut(64).enumerate().for_each(|(block, dst)| reduce_one(block, dst));
+        }
         crate::rstrace::ev("lcf:reduced", 0);
         if self.fixed_roots {
             out.copy_within(833..896, 897);

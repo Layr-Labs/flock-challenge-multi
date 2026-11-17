@@ -4503,6 +4503,59 @@ pub(crate) fn tl2_route_ok(n: usize) -> bool {
     }
 }
 
+/// Lane sc1 `FLOCK_NO_SC_TL3=1` keeps level 3's separate output tables under
+/// the in-place handoff (level 4 then reads them as usual).
+pub(crate) fn tl3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SC_TL3").is_none());
+    *ON
+}
+
+/// Whether level 3 of the in-place handoff (level-1 input of `n` elements)
+/// can also write in place: it runs [`fold2_plain_tl_inplace`] on level 2's
+/// pieces, and level 4 is the same plain `wtab` kernel whose chunks cover
+/// whole level-3 pieces in sub-runs of a multiple of 16 groups. Level 3 writes
+/// its outputs over the start of each piece it has just read instead of into
+/// the cold scratch table, exactly as level 2 does.
+pub(crate) fn tl3_route_ok(n: usize) -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        if !tl3_enabled() || !tl2_route_ok(n) || n < (1usize << 10) {
+            return false;
+        }
+        let n_vars1 = n.trailing_zeros() as usize - 4;
+        let lo1 = 1usize << (n_vars1 - tail_split_n_hi(n_vars1).min(n_vars1));
+        let lo2 = plain_cascade_lo_size(n / 8);
+        let per2 = 8 * lo2 / (2 * lo1);
+        let piece3 = 2 * (lo2 / per2);
+        let lo3 = plain_cascade_lo_size(n / 32);
+        let per3 = 8 * lo3 / piece3;
+        let piece4 = 2 * (lo3 / per3);
+        let lo4 = plain_cascade_lo_size(n / 128);
+        let chunk_in4 = 8 * lo4;
+        kernels::x86_64::fold2_plain_defer_wtab_route_ok(
+            kernels::x86_64::zc_defer_split_enabled(),
+            lo4,
+            true,
+        ) && kernels::x86_64::zc_wtab_enabled()
+            && chunk_in4.is_multiple_of(piece4)
+            && (lo4 / (chunk_in4 / piece4)).is_multiple_of(16)
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        let _ = n;
+        false
+    }
+}
+
 /// [`fold3_oct_plain_and_round_pair_lookahead_into`] with the in-place
 /// handoff (see [`TlPieces`]): output chunk `i` (both tables) is written over
 /// the start of input chunk `i`, whose lines the octet kernel has just read
@@ -6760,9 +6813,64 @@ mod tests {
                             assert_eq!(aj[i * next.stride_a + k], a2[e], "a2 e={e}");
                             assert_eq!(bj[i * next.stride_b + k], b2[e], "b2 e={e}");
                         }
+                        // Level 3 in place too (lane sc1, `FLOCK_NO_SC_TL3`):
+                        // same messages and tables as level 3 on the level-2
+                        // pieces with separate outputs, and level 4 on the
+                        // level-3 pieces equals level 4 on that table.
+                        if tl3_route_ok(n) {
+                            let mut r3 = rng.f128_vec(log_n - 7);
+                            r3[0] = F128::ONE;
+                            let mut r4 = rng.f128_vec(log_n - 9);
+                            r4[0] = F128::ONE;
+                            let (rc, rd, re, rf) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
+                            let mut a3 = vec![F128::ZERO; n / 128];
+                            let mut b3 = vec![F128::ZERO; n / 128];
+                            let m3 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &aj, &bj, &mut a3, &mut b3, rc, rd, &r3, false, false, false, false,
+                                Some(next),
+                            );
+                            let mut a4 = vec![F128::ZERO; n / 512];
+                            let mut b4 = vec![F128::ZERO; n / 512];
+                            let m4 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &a3, &b3, &mut a4, &mut b4, re, rf, &r4, false, false, false, false,
+                                None,
+                            );
+                            let (mut ak, mut bk) = (aj.clone(), bj.clone());
+                            let (q0, q1, q2, next3) = fold2_plain_tl_inplace(
+                                &mut ak, &mut bk, next, rc, rd, &r3, false, false, false,
+                            );
+                            assert_eq!((q0, q1, q2), (m3.0, m3.1, m3.2), "level 3 in place log_n={log_n}");
+                            assert_eq!(next3.n, n / 128);
+                            for e in 0..n / 128 {
+                                let (i, k) = (e / next3.piece, e % next3.piece);
+                                assert_eq!(ak[i * next3.stride_a + k], a3[e], "a3 e={e}");
+                                assert_eq!(bk[i * next3.stride_b + k], b3[e], "b3 e={e}");
+                            }
+                            let mut a4i = vec![F128::ZERO; n / 512];
+                            let mut b4i = vec![F128::ZERO; n / 512];
+                            let got4 = fold2_plain_and_round_pair_lookahead_into_lm_casc(
+                                &ak, &bk, &mut a4i, &mut b4i, re, rf, &r4, false, false, false, false,
+                                Some(next3),
+                            );
+                            assert_eq!((got4.0, got4.1, got4.2), (m4.0, m4.1, m4.2), "level 4 log_n={log_n}");
+                            assert!(a4i == a4 && b4i == b4, "level 4 tables log_n={log_n}");
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Lane sc1: the ranked tail (level-1 input 2^23) takes the level-3
+    /// in-place route, and its geometry needs level 2 in place.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+    #[test]
+    fn tl3_route_holds_at_ranked_shape() {
+        if tl_enabled() && tl2_enabled() && tl3_enabled() && tl2_route_ok(1 << 23) {
+            assert!(tl3_route_ok(1 << 23));
+        }
+        for log_n in 10..24 {
+            assert!(!tl3_route_ok(1 << log_n) || tl2_route_ok(1 << log_n));
         }
     }
 

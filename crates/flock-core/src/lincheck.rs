@@ -362,6 +362,23 @@ struct Sl1Warm {
     table: Option<Vec<F128>>,
 }
 
+/// Lane sc1 (`FLOCK_NO_SC_RTEAM=1` restores the rayon reduce): set on the
+/// thread running lincheck's root fold, so only that fold (whose caller owns
+/// the lincheck hot pool) takes the team plane reduce.
+pub(crate) fn sc_rteam_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SC_RTEAM").is_none());
+    *ON
+}
+
+thread_local! {
+    static SC_RTEAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn sc_rteam_active() -> bool {
+    SC_RTEAM.with(|c| c.get())
+}
+
 thread_local! {
     static SL1_RC_HOOK: std::cell::RefCell<Option<Sl1Warm>> = const { std::cell::RefCell::new(None) };
     static SL1_RC_TABLE: std::cell::Cell<Option<Vec<F128>>> = const { std::cell::Cell::new(None) };
@@ -5575,7 +5592,11 @@ fn prove_padded_inner<Ch: Challenger>(
                     }
                     PackedZ::BlockMajor(z, roots) => {
                         if let Some(roots) = roots {
-                            roots.fold(z, m, &x_ab.x_outer)
+                            let team = sc_rteam_enabled() && crate::flat_par::team_enabled();
+                            SC_RTEAM.with(|c| c.set(team));
+                            let r = roots.fold(z, m, &x_ab.x_outer);
+                            SC_RTEAM.with(|c| c.set(false));
+                            r
                         } else if let Some(plan) = circuit.root_fold_plan() {
                             RootFoldSource::new(z, k_log, plan).fold(z, m, &x_ab.x_outer)
                         } else {

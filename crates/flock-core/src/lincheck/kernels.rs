@@ -47,4 +47,14 @@ pub(crate) use x86_64::{gather_transpose_stripe_x86, gather_transpose_stripe4_x8
     target_feature = "avx512vbmi",
     target_feature = "gfni"
 ))]
-pub(crate) use x86_64::gfni_fold_word_tiles4;
+pub(crate) use x86_64::{gfni_fold_word_tiles4, gfni_fold_word_tiles4_mode, x7_prefetch_shift};
+
+// Schedule-only root fold (patternrecognition9-del 9bd6d5cb / 0cde1b93 xglm-7):
+// four independent GFNI pairs issued before their XORs; same algebra and spans.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+#[path = "kernels/xglm_root_pipelined.rs"]
+mod xglm_root_pipelined;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f",
+    target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "gfni"))]
+pub(crate) use xglm_root_pipelined::gfni_fold_word_tiles4_pipelined;

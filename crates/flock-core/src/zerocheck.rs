@@ -692,6 +692,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             let gl1_w30 = gl1_side && w30_elided && capture_canon;
             let c_closure = || {
                 crate::rstrace::ev("r1:c0", 0);
+                // Lane cr1 CH: only the `run_both` route has AB holders.
+                crate::r1_owner_awake::help_arm(
+                    crate::r1_owner_awake::enabled() && crate::smt_split::zc_r1_pools().is_some(),
+                );
                 let t = std::time::Instant::now();
                 let (c, s_hat_v_c, quad, fold4, fold8, one_ab, canon, w30d) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_block_major_z_with_canon_side(
@@ -708,6 +712,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         gl1_side,
                         gl1_w30,
                     );
+                crate::r1_owner_awake::help_arm(false);
                 crate::gaptime::mark("r1: C closure end");
                 crate::rstrace::ev("r1:c1", 0);
                 (
@@ -1197,6 +1202,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     let tl = c3_r345 && n_levels > 3 && multilinear::tl_route_ok((1usize << n_mlv) / 8);
     // Level 2 also writes in place and level 3 reads its pieces.
     let tl2 = tl && n_levels > 4 && multilinear::tl2_route_ok((1usize << n_mlv) / 8);
+    // Lane sc1 (`FLOCK_NO_SC_TL3`): level 3 also writes in place and level 4
+    // reads its pieces (level 4 is not the last level, which reads tables).
+    let tl3 = tl2 && n_levels > 5 && multilinear::tl3_route_ok((1usize << n_mlv) / 8);
     let mut tl_pieces: Option<multilinear::TlPieces> = None;
 
     // `loop_start` is the first tail iteration this route has not already
@@ -1226,11 +1234,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         let casc_level = c3_tail && level + 1 == c3_at;
         assert!(
             tl_pieces.is_none()
-                || ((level == 2 || (tl2 && level == 3))
+                || ((level == 2 || (tl2 && level == 3) || (tl3 && level == 4))
                     && level + 1 < n_levels
                     && !c3_level
                     && !casc_level),
-            "the in-place handoff feeds plain levels 2 and 3 only"
+            "the in-place handoff feeds plain levels 2 to 4 only"
         );
         // Round 2L+3: evaluate the deferred quadratic at ρ_{2L+1}. No pass.
         let (m_odd_1, m_odd_inf) = eval_round3_lookahead(&la_cur, mlv_rhos[2 * level + lo_off]);
@@ -1415,7 +1423,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 la = Some(la_next);
             }
             (m1, mi, lm_out)
-        } else if tl2 && level == 2 {
+        } else if tl2 && (level == 2 || (tl3 && level == 3)) {
             let lm_out = lm_reader_ok && plain_cascade_lo_size(n_cur) % 8 == 0 && !casc_level;
             let (m1, mi, la_next, next) = multilinear::fold2_plain_tl_inplace(
                 &mut a_mlv,

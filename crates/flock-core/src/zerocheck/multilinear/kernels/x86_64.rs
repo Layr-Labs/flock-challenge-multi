@@ -2521,7 +2521,12 @@ pub(crate) fn zc_pkt_pf_enabled() -> bool {
     *ON
 }
 
-const ZC_PKT_PF_TILES: usize = 3;
+/// Lane r5: shared packed-row prefetch lead 3 -> 2 tiles (r2 and the other
+/// packed sweeps); build-time env `NO_ZC_PKT_PF2=1` restores 3. Prefetch only.
+const ZC_PKT_PF_TILES: usize = match option_env!("NO_ZC_PKT_PF2") {
+    Some(_) => 3,
+    None => 2,
+};
 
 pub(crate) fn zc_pkt_pf_far_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -5080,6 +5085,130 @@ unsafe extern "C" {
     fn flock_gfni_c4_pass4_register_result_m();
 }
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold64_rows_c4_lm_registers_k<const MAH: bool>(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 4] {
+    use core::arch::x86_64::*;
+    let a: __m512i;
+    let b: __m512i;
+    let c: __m512i;
+    let d: __m512i;
+    unsafe {
+        if MAH {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+        } else {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_lm_register_result,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") a, out("zmm9") b, out("zmm10") c, out("zmm11") d,
+                options(pure,readonly),
+            );
+        }
+    }
+    [a, b, c, d]
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn gfni_fold32_rows_c4_lm_registers_k<const MAH: bool>(
+    rows: *const u8,
+    m: &CFoldMats,
+) -> [core::arch::x86_64::__m512i; 2] {
+    use core::arch::x86_64::*;
+    let lo: __m512i;
+    let hi: __m512i;
+    unsafe {
+        if MAH {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result_m,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+        } else {
+            core::arch::asm!(
+                "call {kernel}",
+                kernel = sym flock_gfni_c4_pass4_register_result,
+                in("rdi") rows,
+                in("rsi") m.1.as_ptr(),
+                lateout("rax") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") lo, out("zmm9") hi,
+                options(pure,readonly),
+            );
+        }
+    }
+    [lo, hi]
+}
+
+/// Lane r5 (`FLOCK_NO_R5_PF1`): the r345 casc kernel prefetches its packed
+/// rows ONE half-block ahead instead of `ZC_PKT_PF_TILES` (3). On SPR one
+/// half-block (~1300 cycles per thread) already covers DRAM latency, and the
+/// shorter lead keeps less of L1 (shared by both hyperthreads) in flight:
+/// r345 -0.09..-0.11 ms; leads 4/6 and L2 hints were slower, no prefetch +3.3 ms.
+/// `FLOCK_NO_R5_PF1=1` restores lead 3; `FLOCK_R5_PFD=1|2|3` picks a lead (A/B sweeps).
+pub(crate) fn zc_r5_pfd() -> u8 {
+    static PFD: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_R5_PF1").is_some() {
+            return 3;
+        }
+        match std::env::var("FLOCK_R5_PFD").as_deref() {
+            Ok("2") => 2,
+            Ok("3") => 3,
+            _ => 1,
+        }
+    });
+    *PFD
+}
+
+/// Lane r5 (`FLOCK_NO_R5_MAHK`): the rounds 3+4+5 casc kernel picks its GFNI
+/// asm variant at compile time (const generic) instead of a `LazyLock` check
+/// per call; halves the hot loop's code.
+pub(crate) fn zc_r5_mahk_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        cfg!(target_os = "linux") && std::env::var_os("FLOCK_NO_R5_MAHK").is_none()
+    });
+    *ON
+}
+
 /// One pass of [`gfni_fold64_rows_c4_lm_registers`] over four contiguous
 /// lines (32 packed rows): `[rows 0..4 folds, rows 4..8 folds]` of each line,
 /// lane `t` = line `t`. Half the two-pass kernel's GFNI work.
@@ -6677,6 +6806,8 @@ unsafe fn round2_lookahead_chunk_baked_elide_r4_impl<const PAIR: bool, const YA:
     bk: &R2EqBake,
     _lw: &R4LaneWeights,
 ) -> ([core::arch::x86_64::__m512i; 8], [core::arch::x86_64::__m512i; 10]) {
+    crate::realign_frame64!(); // e2x
+
     use core::arch::x86_64::*;
     debug_assert!(lo_size >= 128 && lo_size.is_multiple_of(128));
     debug_assert_eq!(row_base & 255, 0);
@@ -7138,7 +7269,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86<
 ) -> [F128; 8] {
     let mut unused = [F128::ZERO; 18];
     unsafe {
-        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false>(
+        fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<NT_OUT, OUT_LM, false, false, 0, ZC_PKT_PF_TILES>(
             a_pkt, b_pkt, out_base, a_out, b_out, lo_size, cfold, rho3, wt, b_canon, &mut unused,
             F128::ZERO,
         )
@@ -7455,6 +7586,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const OUT_LM: bool,
     const CASC: bool,
     const B7: bool,
+    const MAHK: u8,
+    const PFD: usize,
 >(
     a_pkt: *const u8,
     b_pkt: *const u8,
@@ -7491,7 +7624,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
     const A0_A2_B1_B1: [u64; 8] = lane_select([(0, 0), (0, 2), (1, 1), (1, 1)]);
     // Prefetch targets sit `ZC_PKT_PF_TILES` half-blocks ahead, so an odd
     // lead makes a block's first half prefetch a second half and vice versa.
-    const PF_FLIPS_HALF: bool = ZC_PKT_PF_TILES % 2 == 1;
+    // Lane r5: `PFD` (FLOCK_R5_PFD) is the lead in half-blocks, 0 = none.
+    let pf_flips_half: bool = PFD % 2 == 1;
 
     unsafe {
         let mut acc = [WideGhashX4::zero(); 8];
@@ -7511,6 +7645,34 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         let i_a02_b0 = ix(&A0_A2_B0_B0);
         let i_a02_b1 = ix(&A0_A2_B1_B1);
 
+        // Lane r5: MAHK 1 = Mahmoud asm, 2 = original asm, 0 = runtime check per call.
+        macro_rules! g64 {
+            ($p:expr) => {{
+                #[cfg(target_os = "linux")]
+                let r = match MAHK {
+                    1 => gfni_fold64_rows_c4_lm_registers_k::<true>($p, cfold),
+                    2 => gfni_fold64_rows_c4_lm_registers_k::<false>($p, cfold),
+                    _ => gfni_fold64_rows_c4_lm_registers($p, cfold),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let r = gfni_fold64_rows_c4_lm_registers($p, cfold);
+                r
+            }};
+        }
+        macro_rules! g32 {
+            ($p:expr) => {{
+                #[cfg(target_os = "linux")]
+                let r = match MAHK {
+                    1 => gfni_fold32_rows_c4_lm_registers_k::<true>($p, cfold),
+                    2 => gfni_fold32_rows_c4_lm_registers_k::<false>($p, cfold),
+                    _ => gfni_fold32_rows_c4_lm_registers($p, cfold),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let r = gfni_fold32_rows_c4_lm_registers($p, cfold);
+                r
+            }};
+        }
+
         // The rho3 level: (rows 0..4 fold) + rho3·(rows 0..4 fold + rows 4..8 fold).
         macro_rules! fold_r3 {
             ($e:expr, $o:expr) => {{
@@ -7522,10 +7684,8 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // A: the incumbent's 16-line half-block, lane-major [4i, 4i+1, 4i+2, 4i+3].
         macro_rules! fold_a_half {
             ($row0:expr) => {{
-                let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8), cfold);
-                let [p0, p1, p2, p3] =
-                    gfni_fold64_rows_c4_lm_registers(a_pkt.add($row0 * 8 + 512), cfold);
+                let [q0, q1, q2, q3] = g64!(a_pkt.add($row0 * 8));
+                let [p0, p1, p2, p3] = g64!(a_pkt.add($row0 * 8 + 512));
                 let oe1 = fold_r3!(q0, q1);
                 let oo1 = fold_r3!(q2, q3);
                 let oe2 = fold_r3!(p0, p1);
@@ -7543,8 +7703,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // (0, 2, 4, 6) and (1, 3, 5, 7).
         macro_rules! fold_b_window {
             ($row:expr) => {{
-                let [q0, q1, q2, q3] =
-                    gfni_fold64_rows_c4_lm_registers(b_pkt.add($row * 8), cfold);
+                let [q0, q1, q2, q3] = g64!(b_pkt.add($row * 8));
                 (fold_r3!(q0, q1), fold_r3!(q2, q3))
             }};
         }
@@ -7552,7 +7711,7 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
         // `$b_first..$b_last` are the half-block lines of B worth prefetching.
         macro_rules! prefetch_half {
             ($next:expr, $lines:expr, $b_first:expr, $b_last:expr) => {{
-                for l in $lines {
+                for l in if PFD == 0 { 0..0 } else { $lines } {
                     _mm_prefetch(a_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
                     if l >= $b_first && l < $b_last {
                         _mm_prefetch(b_pkt.wrapping_add($next + 64 * l).cast::<i8>(), _MM_HINT_T0);
@@ -7612,14 +7771,14 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             // First packed row of this block; B's live lines are 2..30.
             let row0 = 8 * (out_base + 2 * x_lo);
             debug_assert!(row0.is_multiple_of(256));
-            let (pf1_first, pf1_last, pf2_first, pf2_last) = if PF_FLIPS_HALF {
+            let (pf1_first, pf1_last, pf2_first, pf2_last) = if pf_flips_half {
                 (0, 14, 2, 16)
             } else {
                 (2, 16, 0, 14)
             };
 
             // Lines 0..16.
-            let next = (row0 + 128 * ZC_PKT_PF_TILES) * 8;
+            let next = (row0 + 128 * PFD) * 8;
             prefetch_half!(next, 0..8, pf1_first, pf1_last);
             let a_tile = fold_a_half!(row0);
             prefetch_half!(next, 8..16, pf1_first, pf1_last);
@@ -7636,12 +7795,12 @@ pub(crate) unsafe fn fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86<
             let (a0w, a1w, a2w, a3w, b0, b1, b2, b3, wa, wa64) = emit_tile!(x_lo, a_tile, b_tile);
 
             // Lines 16..32.
-            let next = (row0 + 128 + 128 * ZC_PKT_PF_TILES) * 8;
+            let next = (row0 + 128 + 128 * PFD) * 8;
             prefetch_half!(next, 0..8, pf2_first, pf2_last);
             let c_tile = fold_a_half!(row0 + 128);
             prefetch_half!(next, 8..16, pf2_first, pf2_last);
             let (e3, o3) = fold_b_window!(row0 + 144); // lines 18,20,22,24 / 19,21,23,25
-            let [h0, h1] = gfni_fold32_rows_c4_lm_registers(b_pkt.add((row0 + 208) * 8), cfold);
+            let [h0, h1] = g32!(b_pkt.add((row0 + 208) * 8));
             let f4 = fold_r3!(h0, h1); // lines 26, 27, 28, 29
             let d_tile = [
                 // lines 16, 20, 24, 28
