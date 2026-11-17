@@ -1241,6 +1241,11 @@ unsafe fn project_blocks_ranked_hot_offsets_direct_inline_bcomplement_const<
 }
 
 const RING_WORDS: usize = 32;
+/// st1: pair two ring words into one 64-byte zmm store (on; build-time env
+/// `NO_ST1_ZP=1` restores one 32-byte store per word). Same ring bytes.
+const ST1_ZP: bool = match option_env!("NO_ST1_ZP") { Some(x) => x.as_bytes()[0] != b'1', None => true };
+#[repr(C, align(64))]
+struct Ring64([V8; RING_WORDS]);
 /// Words the pre-round prologue fills, starting at word 16.
 const PROLOGUE_WORDS: usize = 20;
 /// Ranked static windows whose B side is supplied without reading the ring.
@@ -1775,6 +1780,7 @@ fn packer_high_to_low<const BACK: i32>(pending: V8) -> V8 {
 /// incumbent low-aligned `pending` representation.
 struct W8<'t, const FLUSH: bool, const RANKED_CLOSED: bool = false, const WINDOW_COLS:usize=0> {
     pending: V8,
+    held: V8,
     stage: *mut V8,
     drain: *mut Drain8<'t>,
     ranked_static: bool,
@@ -1785,6 +1791,7 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
     fn at(stage: *mut V8, pending: V8, drain: *mut Drain8<'t>, ranked_static: bool) -> Self {
         Self {
             pending,
+            held: pending,
             stage,
             drain,
             ranked_static,
@@ -1805,7 +1812,13 @@ impl<'t, const FLUSH: bool, const RANKED_CLOSED: bool, const WINDOW_COLS:usize> 
             let static_b = FLUSH
                 && (WORD < RANKED_STATIC_B_PREFIX_END || WORD >= RANKED_STATIC_B_TAIL_START)
                 && is_ranked_static;
-            if !static_b {
+            if !static_b && RANKED_CLOSED && ST1_ZP && WORD % 2 == 0 {
+                // Even word: hold it; the odd partner stores the full 64-byte line.
+                self.held = v;
+            } else if !static_b && RANKED_CLOSED && ST1_ZP {
+                let line = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(self.held), v);
+                _mm512_store_si512(self.stage.add((WORD - 1) & (RING_WORDS - 1)).cast(), line);
+            } else if !static_b {
                 store_v8(self.stage.add(WORD & (RING_WORDS - 1)) as *mut u32, v);
             }
             if FLUSH && WORD % RING_WORDS == RING_WORDS - 1 {
@@ -3205,8 +3218,8 @@ unsafe fn build_octa_witness_ab_stream_prepared_elide<const RANKED_CLOSED: bool,
         ];
 
         let zero = dup_u32(0);
-        let mut ast = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
-        let mut bs = core::mem::MaybeUninit::<[V8; RING_WORDS]>::uninit();
+        let mut ast = core::mem::MaybeUninit::<Ring64>::uninit();
+        let mut bs = core::mem::MaybeUninit::<Ring64>::uninit();
         let ast = ast.as_mut_ptr().cast::<V8>();
         let bs = bs.as_mut_ptr().cast::<V8>();
 

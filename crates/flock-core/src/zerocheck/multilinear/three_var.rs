@@ -566,19 +566,39 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 unsafe {
                     if casc && let Some(bc) = b_canon.as_ref() {
                         macro_rules! casc {
-                            ($nt:literal, $b7:literal) => {
-                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7>(
+                            ($nt:literal, $b7:literal, $mk:literal) => {
+                                // Lane r5 (FLOCK_NO_R5_PF1 / FLOCK_R5_PFD): prefetch lead in half-blocks.
+                                match kernels::x86_64::zc_r5_pfd() {
+                                    1 => casc!(@ $nt, $b7, $mk, 1),
+                                    2 => casc!(@ $nt, $b7, $mk, 2),
+                                    _ => casc!(@ $nt, $b7, $mk, 3),
+                                }
+                            };
+                            (@ $nt:literal, $b7:literal, $mk:literal, $pf:literal) => {
+                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7, $mk, $pf>(
                                     ap, bp, out_base, a_out, b_out, lo_size, c, rho[2],
                                     wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6,
                                 )
                             };
                         }
                         let _ = wt;
-                        match (*nt, b7) {
-                            (true, true) => casc!(true, true),
-                            (false, true) => casc!(false, true),
-                            (true, false) => casc!(true, false),
-                            (false, false) => casc!(false, false),
+                        // Lane r5 (FLOCK_NO_R5_MAHK): asm variant fixed at compile time.
+                        let mk = if !kernels::x86_64::zc_r5_mahk_enabled() {
+                            0
+                        } else if *crate::MAH_ASM_C4 {
+                            1
+                        } else {
+                            2
+                        };
+                        match (*nt, b7, mk) {
+                            (true, true, 1) => casc!(true, true, 1),
+                            (true, true, 2) => casc!(true, true, 2),
+                            (true, true, _) => casc!(true, true, 0),
+                            (false, true, 1) => casc!(false, true, 1),
+                            (false, true, 2) => casc!(false, true, 2),
+                            (false, true, _) => casc!(false, true, 0),
+                            (true, false, _) => casc!(true, false, 0),
+                            (false, false, _) => casc!(false, false, 0),
                         }
                     } else if let Some(bc) = b_canon.as_ref() {
                         match (*nt, out_lm) {
