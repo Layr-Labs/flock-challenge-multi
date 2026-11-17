@@ -1411,6 +1411,8 @@ unsafe fn project_policy<const CACHED_Z: bool, const CROSS_QUARTER: bool,const C
     rw: usize,
     t: &Tables,
 ) {
+    flock_core::realign_frame64!(); // e2x
+
     let rows = rows.with_cached_z(CACHED_Z).with_cross_quarter(CROSS_QUARTER);
     unsafe {
         let ap_aligned;

@@ -587,6 +587,8 @@ pub(crate) unsafe fn gfni_fold_word_tiles4(
     permutation: *const u8,
     prefetch_next_block: bool,
 ) {
+    crate::realign_frame64!(); // e2x
+
     debug_assert!((1..=4).contains(&count));
     debug_assert!(tile_stride >= 512);
     // SAFETY: the caller upholds the exact byte ranges above. Every modified
