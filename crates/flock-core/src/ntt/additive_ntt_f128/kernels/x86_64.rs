@@ -5,7 +5,7 @@ use crate::field::F128;
 /// The independent fused-three high-one specialization has its own rollback
 /// switches. Read once, outside every lane loop.
 #[inline]
-fn mul_diet_disabled() -> bool {
+pub(super) fn mul_diet_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_MUL_DIET").is_some())
 }
@@ -592,6 +592,35 @@ pub(super) unsafe fn butterfly_fused_2layer_publish_nt_gen<
                 src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
             )
         }
+    }
+}
+
+/// Compile-time-specialized fused 2-layer publish leaf with runtime env flags hoisted out of the caller's loop.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt_direct<
+    const OUTER_LOW: bool,
+    const INNER_LOW: bool,
+    const DIET: bool,
+    const ALIGNED_ZMM: bool,
+>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        butterfly_fused_2layer_publish_nt_impl::<OUTER_LOW, INNER_LOW, DIET, ALIGNED_ZMM>(
+            src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+        )
     }
 }
 
@@ -2587,6 +2616,8 @@ unsafe fn butterfly_fused_4layer_row_impl<
     pf_r: usize,
     prepared: *const PreparedFour,
 ) {
+    crate::realign_frame64!(); // e2x
+
     use core::arch::x86_64::*;
 
     // Shape substitution: a compile-time constant when the wrapper pins one
@@ -4703,6 +4734,8 @@ unsafe fn seed_sparse_dense_compact<const OUTER_LOW: bool, const PREPARED:bool>(
     prepared: *const F128,
     source_cols:usize,
 ) {
+    crate::realign_frame64!(); // e2x
+
     const DIET: bool = true;
     use core::arch::x86_64::*;
     let [t_outer, t_inner_a, t_inner_b] = *dense_tw;
