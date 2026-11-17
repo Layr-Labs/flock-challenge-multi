@@ -601,11 +601,14 @@ impl DeepBlock {
         blk: &[F128],
         base_addr: usize,
         columns: usize,
+        blocked: bool,
     ) -> Option<Self> {
         if range.end - range.start == Self::ROWS
+            && range.start.is_multiple_of(Self::ROWS)
             && blk.len() == Self::ROWS * columns
             && blk.as_ptr() as usize
-                == base_addr + range.start * columns * core::mem::size_of::<F128>()
+                == base_addr
+                    + codeword_row(range.start, blocked) * columns * core::mem::size_of::<F128>()
         {
             Some(Self { lo: range.start })
         } else {
@@ -961,6 +964,20 @@ fn ranked_zero_odd_tail_snapshot(log_d: usize, num_ntts: usize) -> (usize, usize
     };
     (lanes, raw)
 }
+/// The page-blocked codeword layout is off: the ranked codeword stays in
+/// natural row order. The blocked order only pays when the codeword is backed
+/// by 2 MiB pages; with 4 KiB pages it scatters each publish task's stores and
+/// is slower than natural order, so natural order is kept unconditionally.
+fn page_blocked_disabled() -> bool {
+    true
+}
+/// `FLOCK_NO_NTT_RAW7_SWEEP=1` keeps the raw-seven pack to the deep
+/// per-block pass (no pack in deep sweep 1 or the seed+top fold).
+fn raw7_sweep_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RAW7_SWEEP").is_some());
+    *OFF
+}
 fn ntt_raw7_pack_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RAW7_PACK").is_none());
@@ -1069,6 +1086,84 @@ const fn seed_top_codeword_row(
     sub_stride: usize,
 ) -> usize {
     block * block_size + r + k * sub_stride
+}
+
+/// Physical row of logical position `p` in the page-blocked ranked codeword
+/// (2^20 rows of 64 lanes, 1 KiB each, 2^11 rows per 2 MiB page).
+///
+/// Write `p = j·2^11 + r` (deep sub-group `j`, row `r` inside it). The
+/// blocked layout swaps the four bits `j mod 16` with the four bits `r / 128`,
+/// so page `16·(j / 16) + r / 128` holds the 128-row blocks `r / 128` of the
+/// sixteen sub-groups `16·(j / 16) .. 16·(j / 16) + 16`. A seed+top task (one
+/// `r`, all 512 `j`) then stores into 32 pages instead of 512, every
+/// 128-row deep block stays contiguous, and a deep sub-group is sixteen such
+/// blocks one page apart. The map is an involution.
+#[inline]
+pub(crate) const fn ranked_blocked_row(p: usize) -> usize {
+    const MASK: usize = 0xf;
+    let j_lo = (p >> 11) & MASK;
+    let r_hi = (p >> 7) & MASK;
+    (p & !((MASK << 11) | (MASK << 7))) | (r_hi << 11) | (j_lo << 7)
+}
+
+/// Codeword row of logical position `p` under `blocked`.
+#[inline]
+const fn codeword_row(p: usize, blocked: bool) -> usize {
+    if blocked { ranked_blocked_row(p) } else { p }
+}
+
+/// Base address (L0 codeword of the most recent ranked commit) whose rows are
+/// stored in [`ranked_blocked_row`] order, or 0. Set by the committer when its
+/// encode used the blocked layout, cleared when that buffer is committed in
+/// the ordinary layout or released. Readers of a codeword check its base
+/// address against this value, so no other buffer can pick it up.
+static BLOCKED_L0_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record the row layout of the committed codeword at `base` (`len` lanes).
+pub(crate) fn note_l0_layout(base: *const F128, len: usize, blocked: bool) {
+    use std::sync::atomic::Ordering;
+    let addr = base as usize;
+    if blocked {
+        assert_eq!(len, 1 << 26, "blocked layout is ranked-shape only");
+        BLOCKED_L0_BASE.store(addr, Ordering::Release);
+    } else {
+        let _ = BLOCKED_L0_BASE.compare_exchange(addr, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Row layout of a committed L0 codeword: maps logical positions to rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct L0Rows {
+    blocked: bool,
+}
+
+impl L0Rows {
+    /// The layout `codeword` was committed in.
+    #[inline]
+    pub(crate) fn of(codeword: &[F128]) -> Self {
+        let base = BLOCKED_L0_BASE.load(std::sync::atomic::Ordering::Acquire);
+        Self { blocked: base != 0 && base == codeword.as_ptr() as usize && codeword.len() == 1 << 26 }
+    }
+
+    #[inline]
+    pub(crate) fn is_blocked(self) -> bool {
+        self.blocked
+    }
+
+    /// Physical row of logical position `p`.
+    #[inline]
+    pub(crate) fn row(self, p: usize) -> usize {
+        codeword_row(p, self.blocked)
+    }
+
+    /// Physical first row of the `len` logical rows starting at `p`, which
+    /// are contiguous in either layout when `len ≤ 128` and `p` is a multiple
+    /// of `len` (both powers of two).
+    #[inline]
+    pub(crate) fn aligned_run(self, p: usize, len: usize) -> usize {
+        assert!(len.is_power_of_two() && len <= 128 && p.is_multiple_of(len));
+        self.row(p)
+    }
 }
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
@@ -1405,6 +1500,9 @@ struct StFmpPair {
     announced: std::sync::atomic::AtomicUsize,
     witness_done: std::sync::atomic::AtomicUsize,
     assist_done: std::sync::atomic::AtomicUsize,
+    /// F-announced groups: `j + 1` once M+P has published its task `j`.
+    /// Written by MP only; F acquires it before reusing that task's slot.
+    mp_pub: std::sync::atomic::AtomicUsize,
     mp_gone: std::sync::atomic::AtomicBool,
     slot_r: [std::cell::UnsafeCell<usize>; ST_FMP_CAP],
 }
@@ -1441,6 +1539,7 @@ impl StFmpPair {
             announced: AtomicUsize::new(0),
             witness_done: AtomicUsize::new(0),
             assist_done: AtomicUsize::new(0),
+            mp_pub: AtomicUsize::new(0),
             mp_gone: AtomicBool::new(false),
             slot_r: [const { std::cell::UnsafeCell::new(0) }; ST_FMP_CAP],
         }
@@ -1687,6 +1786,24 @@ fn st_fmp_run_claimed(
         std::env::var_os("FLOCK_NO_LD_FOLD_ASSIST").is_none()
     });
     let assist = assist.filter(|_| balanced && *ASSIST);
+    // F-announced groups (balanced hand-off only, default on): the F
+    // sibling claims and announces the next group the moment its own task is
+    // published, instead of idling until M+P has finished the longer fold of
+    // the odd task. M+P joins that group's production when its fold is done;
+    // the per-group octa claims share the witness work between whoever is
+    // producing, so the sibling with the shorter fold/publish chain simply
+    // produces more octas. M+P also runs F's four-lane assist before, not
+    // after, its own publication, so F is not held at the assist join by a
+    // publish it does not depend on. Only which logical CPU runs which call,
+    // and when, changes: every task is still seeded, folded, assisted and
+    // published exactly once by the same closures on the same staging slot.
+    // `FLOCK_NO_NTT_ST_FMP_FANN=1` restores the M+P-announced schedule in
+    // the same binary.
+    static FANN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_ST_FMP_FANN").is_none()
+    });
+    let fann = balanced && *FANN;
+    let assist_first = fann;
     crate::rstrace::ev("st:setup", 0);
     // Engagement is PRINTED, never inferred. Diagnostics only: the ranked
     // worker runs under `env_clear()`, so this is compiled in and dead there.
@@ -1695,7 +1812,7 @@ fn st_fmp_run_claimed(
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ST_FMP_DEBUG").is_some());
         if *DBG {
             eprintln!(
-                "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len} balanced={balanced}"
+                "[st-fmp] engaged pairs={n_pairs} bufs={nbuf} tasks={n_tasks} row_len={row_len} balanced={balanced} fann={fann} assist_first={assist_first}"
             );
         }
     }
@@ -1773,18 +1890,68 @@ fn st_fmp_run_claimed(
             let _fg = FGuard { st };
             let mut i = 0usize;
             let mut epoch = 0usize;
+            // F-announced groups: the staging base, published by M+P before
+            // its first wait.
+            let mut f_bufp = 0usize;
+            if fann {
+                loop {
+                    f_bufp = st.bufp.load(Ordering::Acquire);
+                    if f_bufp != 0 {
+                        break;
+                    }
+                    if st.mp_gone.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
             loop {
                 if let Some(produce) = produce
                     && i.is_multiple_of(2)
                 {
-                    while st.announced.load(Ordering::Acquire) <= epoch {
-                        if st.total.load(Ordering::Acquire) <= i {
+                    let group = if fann {
+                        // Claim the next group here, the moment this
+                        // sibling's own task is published, instead of
+                        // idling until M+P finishes its longer fold.
+                        let first_r = next.fetch_add(2, Ordering::Relaxed);
+                        if first_r >= n_tasks {
+                            // FGuard's `f_gone` release tells M+P that no
+                            // further group follows.
                             return;
                         }
-                        std::hint::spin_loop();
-                    }
-                    epoch += 1;
-                    let group = st.group.load(Ordering::Relaxed);
+                        // The group's two slots held tasks `i - 3` (M+P's,
+                        // published at its `mp_pub` release) and `i - 2`
+                        // (ours, published above).
+                        if i >= 4 {
+                            while st.mp_pub.load(Ordering::Acquire) < i - 2 {
+                                if st.mp_gone.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                std::hint::spin_loop();
+                            }
+                        }
+                        let b = f_bufp as *mut F128;
+                        // SAFETY: both slots lie inside M+P's staging, which
+                        // lives until DrainGuard has observed `f_gone`.
+                        let (o0, o1) = unsafe {
+                            (b.add((i % nbuf) * stride), b.add(((i + 1) % nbuf) * stride))
+                        };
+                        st.producer_output[0].store(o0 as usize, Ordering::Relaxed);
+                        st.producer_output[1].store(o1 as usize, Ordering::Relaxed);
+                        st.group.store(first_r / 2, Ordering::Relaxed);
+                        epoch += 1;
+                        st.announced.store(epoch, Ordering::Release);
+                        first_r / 2
+                    } else {
+                        while st.announced.load(Ordering::Acquire) <= epoch {
+                            if st.total.load(Ordering::Acquire) <= i {
+                                return;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        epoch += 1;
+                        st.group.load(Ordering::Relaxed)
+                    };
                     crate::rstrace::evd("f:ann", group as u32);
                     produce(group, 1,
                         st.producer_output[0].load(Ordering::Relaxed) as *mut F128,
@@ -1913,15 +2080,25 @@ fn st_fmp_run_claimed(
         // `seeded - 3` first. On return every task below `seeded - 1` is
         // published, so the slots of tasks `seeded - 3` and `seeded - 2` are
         // free: on the three-slot ring those are the next group's two slots.
+        let publish_old = |seeded: usize| {
+            if seeded >= 4 {
+                let s = (seeded - 3) % nbuf;
+                // SAFETY: task `seeded - 3` is this sibling's, folded here
+                // one cycle earlier; F never touches odd tasks.
+                unsafe {
+                    publish(bufp.add(s * stride), *st.slot_r[s].get());
+                }
+                st.mp_pub.store(seeded - 2, Ordering::Release);
+                crate::rstrace::evd("mp:pub", (seeded - 3) as u32);
+            }
+        };
         let balanced_cycle = |seeded: usize| {
+            if !assist_first {
+                publish_old(seeded);
+            }
             // SAFETY: both slots hold tasks this sibling seeded and that F
             // never touches (odd tasks); the older one was folded here.
             unsafe {
-                if seeded >= 4 {
-                    let s = (seeded - 3) % nbuf;
-                    publish(bufp.add(s * stride), *st.slot_r[s].get());
-                    crate::rstrace::evd("mp:pub", (seeded - 3) as u32);
-                }
                 // Complete F's short suffix before our own long fold: doing
                 // it afterwards would delay F's independent publication.
                 if let Some(part) = assist {
@@ -1929,14 +2106,77 @@ fn st_fmp_run_claimed(
                     part(bufp.add(even * stride), *st.slot_r[even].get(), true);
                     st.assist_done.store(seeded - 1, Ordering::Release);
                 }
+            }
+            if assist_first {
+                publish_old(seeded);
+            }
+            unsafe {
                 let s = (seeded - 1) % nbuf;
                 fold(bufp.add(s * stride), *st.slot_r[s].get());
                 crate::rstrace::evd("mp:fold", (seeded - 1) as u32);
+            }
+            if fann {
+                // F announces the next group only after its own task is
+                // published; nothing here waits for it.
+                return true;
             }
             let ok = st.wait_folded(seeded - 1);
             crate::rstrace::evd("mp:fwait", (seeded - 1) as u32);
             ok
         };
+        if fann && let Some(produce) = produce {
+            loop {
+                // Join the group F announced, or finish once F has left
+                // without announcing another one.
+                loop {
+                    if st.announced.load(Ordering::Acquire) > epoch {
+                        break;
+                    }
+                    if st.f_gone.load(Ordering::Acquire) {
+                        // F's last `announced` store precedes its `f_gone`
+                        // release, so this re-read is final.
+                        if st.announced.load(Ordering::Acquire) > epoch {
+                            break;
+                        }
+                        if i >= 2 {
+                            let s = (i - 1) % nbuf;
+                            // SAFETY: the last task, folded by the cycle below.
+                            unsafe {
+                                publish(bufp.add(s * stride), *st.slot_r[s].get());
+                            }
+                            crate::rstrace::evd("mp:pub", (i - 1) as u32);
+                        }
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+                epoch += 1;
+                let group = st.group.load(Ordering::Relaxed);
+                let output0 = st.producer_output[0].load(Ordering::Relaxed) as *mut F128;
+                let output1 = st.producer_output[1].load(Ordering::Relaxed) as *mut F128;
+                crate::rstrace::evd("mp:claim", (2 * group) as u32);
+                produce(group, 0, output0, output1);
+                unsafe { core::arch::x86_64::_mm_sfence() };
+                crate::rstrace::evd("mp:prod", group as u32);
+                while st.witness_done.load(Ordering::Acquire) < epoch {
+                    if st.f_gone.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+                crate::rstrace::evd("mp:pjoin", group as u32);
+                for r in 2 * group..2 * group + 2 {
+                    // SAFETY: F announced this slot free; the producers of
+                    // both roles have seeded it and joined above.
+                    unsafe {
+                        *st.slot_r[i % nbuf].get() = r;
+                    }
+                    st.seeded.store(i + 1, Ordering::Release);
+                    i += 1;
+                }
+                balanced_cycle(i);
+            }
+        }
         loop {
             let first_r = next.fetch_add(group_width, Ordering::Relaxed);
             if first_r >= n_tasks {
@@ -2147,8 +2387,9 @@ unsafe fn st_fmp_fold4(
     lanes4_tail: usize,
     stage_perm: bool,
     tw4: &[kernels::FourBlock],
+    raw7: bool,
 ) {
-    unsafe { st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, tw4, 0, row_len); }
+    unsafe { st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, tw4, 0, row_len, raw7); }
 }
 
 #[cfg(all(
@@ -2170,17 +2411,38 @@ unsafe fn st_fmp_fold4_range(
     tw4: &[kernels::FourBlock],
     lane_start: usize,
     lane_count: usize,
+    raw7: bool,
 ) {
     let (g4_stride, g4_base): (usize, usize) = if stage_perm { (1, 16) } else { (4, 1) };
+    // Raw-seven pack (as the deep per-block pass's `rows_raw7_s8`): on an odd
+    // task every staging row has seven zero trailing fields, and the four
+    // fused-four groups of a block share one twiddle set, so each group folds
+    // fields 0..56 and field 56 of all four goes through one packed group.
+    // Fields 57..60 hold the seed's zeros either way; 60..64 stay unread.
+    let pack = raw7
+        && !raw7_sweep_disabled()
+        && cfg!(target_feature = "avx512bw")
+        && r & 1 == 1
+        && lanes4_tail == 4
+        && row_len == 64
+        && lane_start == 0
+        && lane_count >= 57
+        && (0..4).all(|j| row_lanes(r + j * sub_stride, row_len, lanes4_tail) == 60);
     // SAFETY: forwarded contract; each block's fused-four group is confined to
     // that block's own 64 staging rows.
     unsafe {
         for block in 0..8 {
             let region = bufp.add(block * 64 * row_len);
             let tw = &tw4[block];
+            let packed = if pack { tw.prepared() } else { None };
             for j in 0..4 {
-                let lanes4 = row_lanes(r + j * sub_stride, row_len, lanes4_tail)
-                    .saturating_sub(lane_start).min(lane_count);
+                let lanes4 = if packed.is_some() {
+                    56
+                } else {
+                    row_lanes(r + j * sub_stride, row_len, lanes4_tail)
+                        .saturating_sub(lane_start)
+                        .min(lane_count)
+                };
                 kernels::butterfly_fused_4layer_cached(
                     region.add(j * g4_base * row_len + lane_start),
                     g4_stride,
@@ -2188,6 +2450,15 @@ unsafe fn st_fmp_fold4_range(
                     lanes4,
                     0,
                     tw,
+                );
+            }
+            #[cfg(target_feature = "avx512bw")]
+            if let Some(p) = packed {
+                kernels::raw7_pack4_field56(
+                    region,
+                    [0, g4_base, 2 * g4_base, 3 * g4_base],
+                    g4_stride,
+                    p,
                 );
             }
         }
@@ -2469,7 +2740,7 @@ impl AdditiveNttF128 {
         codeword: &mut [F128],
         produce: &(dyn Fn(*mut F128, usize, usize, Option<&WitnessSeedTarget>) + Sync),
         on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
-    ) {
+    ) -> bool {
         assert_eq!(msg.len(), 1 << 25);
         assert_eq!(codeword.len(), 1 << 26);
         assert_eq!(self.log_domain_size(), 20);
@@ -2478,10 +2749,14 @@ impl AdditiveNttF128 {
         if rate_half_seed_disabled() || ntt_seed_top_fusion_disabled() {
             let ready = input.into_ready();
             self.rs_encode_interleaved_on_range_done(ready, codeword, 64, on_range_done);
+            false
         } else {
-            self.forward_transform_interleaved_parallel_from_layer_impl(
-                codeword, 64, 3, None, Some(on_range_done), Some(input),
-            );
+            // Returns whether the codeword rows were stored page-blocked
+            // (see `ranked_blocked_row`); the caller records it for the open.
+            self.forward_transform_interleaved_parallel_from_layer_impl_n(
+                codeword, 64, 3, None, Some(on_range_done), Some(input), None, None,
+                !page_blocked_disabled(),
+            )
         }
     }
 
@@ -2576,6 +2851,7 @@ impl AdditiveNttF128 {
                         None,
                         Some(log_inv_rate + 6),
                         None,
+                        false,
                     );
                     return;
                 }
@@ -2613,6 +2889,7 @@ impl AdditiveNttF128 {
                         None,
                         force,
                         Some((msg, log_inv_rate)),
+                        false,
                     );
                     return;
                 }
@@ -3067,9 +3344,46 @@ impl AdditiveNttF128 {
         k: usize,
     ) {
         use rayon::prelude::*;
-        let blocks = codeword.len() / msg.len();
+        let plan = self.seed6_plan(msg.len(), codeword.len(), num_ntts, k);
+        let src = msg.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        struct NtFence<const NT: bool>;
+        impl<const NT: bool> Drop for NtFence<NT> {
+            fn drop(&mut self) {
+                if NT {
+                    unsafe { core::arch::x86_64::_mm_sfence() };
+                }
+            }
+        }
+        let plan = &plan;
+        (0..plan.tasks()).into_par_iter().for_each_init(
+            || (plan.staging(), NtFence::<NT>),
+            |(buf, _), r| {
+                // SAFETY: `msg` / `codeword` cover the plan's geometry; task
+                // `r` writes only its own rows (see `Seed6Plan::run`).
+                unsafe { plan.run::<NT>(src as *const F128, dst as *mut F128, r, buf) };
+                crate::rstrace::evd("s6:done", r as u32);
+            },
+        );
+    }
+
+    /// Lane h3: the [`Self::seed_first4_from_msg`] geometry and twiddles, so
+    /// its tasks can also be scheduled one at a time (see `Seed6Plan::run`).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub(crate) fn seed6_plan(
+        &self,
+        msg_len: usize,
+        codeword_len: usize,
+        num_ntts: usize,
+        k: usize,
+    ) -> Seed6Plan {
+        let blocks = codeword_len / msg_len;
         debug_assert_eq!(blocks, 1usize << k);
-        let msg_positions = msg.len() / num_ntts;
+        let msg_positions = msg_len / num_ntts;
         let q = msg_positions >> 2;
         let s16 = q >> 4;
         debug_assert!(s16 >= 1);
@@ -3094,102 +3408,92 @@ impl AdditiveNttF128 {
                 kernels::FourBlock::new(tw)
             })
             .collect();
-        let src = msg.as_ptr() as usize;
-        let dst = codeword.as_mut_ptr() as usize;
         // Chunk R consecutive positions into one "super-row" of R·num_ntts
         // lanes: positions r..r+R share every twiddle of these six layers
         // (same blocks), so the kernels treat the chunk as wider rows. Same
         // butterflies per lane → same bytes. R ≤ 8 keeps ≥ 64 tasks.
         let rr = (s16 / 64).clamp(1, 8);
-        let nn = num_ntts * rr;
-        let s16s = s16 / rr;
-        let (seed_tw, tw4) = (&seed_tw, &tw4);
-        let task = |buf: &mut Vec<F128>, rc: usize| unsafe {
-            let dst = dst as *mut F128;
-            let (st, sg) = buf.split_at_mut(64 * nn);
-            let st = st.as_mut_ptr();
-            let r = rc * rr;
-            crate::rstrace::evd("s6:task", rc as u32);
-            // Source rows r + i·s16 + j·Q sit at power-of-two strides that
-            // alias in L1/L2; gather them once into a contiguous block
-            // (row 16·j + i) so the per-block seed re-reads stay cache hits.
-            let g = sg.as_mut_ptr();
-            for j in 0..4 {
-                for i in 0..16 {
-                    core::ptr::copy_nonoverlapping(
-                        (src as *const F128).add((j * q + i * s16 + r) * num_ntts),
-                        g.add((16 * j + i) * nn),
-                        nn,
-                    );
-                }
-            }
-            let src = g as *const F128;
-            crate::rstrace::evd("s6:gathered", rc as u32);
-            // Publish one staged 16-row run (block b, j) to the codeword.
-            let publish = |stg: *const F128, b: usize, j: usize| {
-                for i in 0..16 {
-                    let from = stg.add((16 * j + i) * nn);
-                    let to = dst.add((b * 4 * q + j * q + i * s16 + r) * num_ntts);
-                    if NT {
-                        use core::arch::x86_64::*;
-                        let mut c = 0;
-                        while c < nn {
-                            _mm512_stream_si512(
-                                to.add(c) as *mut __m512i,
-                                _mm512_loadu_si512(from.add(c) as *const __m512i),
-                            );
-                            c += 4;
-                        }
-                    } else {
-                        core::ptr::copy_nonoverlapping(from, to, nn);
-                    }
-                }
-            };
-            for b in 0..blocks {
-                let cur = st;
-                for i in 0..16 {
-                    if b == 0 {
-                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
-                            src, 16, i, cur, 16, i, nn, seed_tw[0][2],
-                        );
-                    } else {
-                        kernels::butterfly_fused_2layer_row_from_geo(
-                            src, 16, i, cur, 16, i, nn, &seed_tw[b],
-                        );
-                    }
-                }
-                crate::rstrace::evd("s6:seeded", b as u32);
-                for j in 0..4 {
-                    kernels::butterfly_fused_4layer_cached(
-                        cur.add(16 * j * nn),
-                        1,
-                        nn,
-                        nn,
-                        0,
-                        &tw4[4 * b + j],
-                    );
-                }
-                crate::rstrace::evd("s6:computed", b as u32);
-                for j in 0..4 {
-                    publish(cur, b, j);
-                }
-                crate::rstrace::evd("s6:written", b as u32);
-            }
-        };
-        struct NtFence<const NT: bool>;
-        impl<const NT: bool> Drop for NtFence<NT> {
-            fn drop(&mut self) {
-                if NT {
-                    unsafe { core::arch::x86_64::_mm_sfence() };
-                }
-            }
+        Seed6Plan { seed_tw, tw4, blocks, q, s16, rr, nn: num_ntts * rr, num_ntts }
+    }
+
+    /// Lane h3: whether [`Self::rs_encode_interleaved_on_range_done`] takes
+    /// the seed6 route for this shape, and then whether its seed stores are
+    /// non-temporal. Same predicate, evaluated without encoding.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub(crate) fn seed6_route(
+        &self,
+        msg_len: usize,
+        codeword: &[F128],
+        num_ntts: usize,
+    ) -> Option<(usize, bool)> {
+        if !(num_ntts.is_power_of_two() && msg_len > 0 && msg_len % num_ntts == 0) {
+            return None;
         }
-        (0..s16s).into_par_iter().for_each_init(
-            || (staging_block(128, nn), NtFence::<NT>),
-            |(buf, _), r| {
-                task(buf, r);
-                crate::rstrace::evd("s6:done", r as u32);
-            },
+        if codeword.len() % msg_len != 0 {
+            return None;
+        }
+        let inv_rate = codeword.len() / msg_len;
+        if !(inv_rate.is_power_of_two() && inv_rate > 1) {
+            return None;
+        }
+        let log_inv_rate = log2_pow2(inv_rate);
+        let n_positions = codeword.len() / num_ntts;
+        if !n_positions.is_power_of_two() {
+            return None;
+        }
+        let log_d = log2_pow2(n_positions);
+        if log_inv_rate > log_d || log_d > self.log_domain_size() {
+            return None;
+        }
+        if msg_len / num_ntts != 1usize << (log_d - log_inv_rate) {
+            return None;
+        }
+        // The rate-1/2 route is taken first in the encoder.
+        if log_inv_rate == 1 {
+            return None;
+        }
+        let deep_log = log_d.saturating_sub(log_inv_rate + 6);
+        let (on6, nt6) = rs_seed6_mode();
+        let ok = log_inv_rate >= 2
+            && log_inv_rate + 2 <= log_d
+            && msg_len / num_ntts >= 4
+            && !rate_seed_disabled()
+            && on6
+            && deep_log >= 10
+            && num_ntts == 8
+            && msg_len / num_ntts >= 64
+            && (codeword.as_ptr() as usize).is_multiple_of(64);
+        ok.then_some((log_inv_rate, nt6))
+    }
+
+    /// Lane h3: the seed6 route's deep pass, for a codeword whose seed6
+    /// layers were already applied by [`Seed6Plan::run`] over every task.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    pub(crate) fn rs_encode_deep_after_seed6(
+        &self,
+        codeword: &mut [F128],
+        num_ntts: usize,
+        log_inv_rate: usize,
+        on_range_done: &(dyn Fn(core::ops::Range<usize>, &[F128]) + Sync),
+    ) {
+        self.forward_transform_interleaved_parallel_from_layer_impl_n(
+            codeword,
+            num_ntts,
+            log_inv_rate + 6,
+            None,
+            Some(on_range_done),
+            None,
+            Some(log_inv_rate + 6),
+            None,
+            false,
         );
     }
 
@@ -3469,6 +3773,7 @@ impl AdditiveNttF128 {
         stage_perm: bool,
         tw4: &[kernels::FourBlock],
         tw2: &[[[F128; 3]; 16]],
+        blocked: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -3508,6 +3813,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    blocked,
                 );
             }
         }
@@ -3550,6 +3856,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2: &[[[F128; 3]; 16]],
+        blocked: bool,
     ) {
         debug_assert_eq!(row_len, 64);
         debug_assert_eq!(block_size, 1 << 17);
@@ -3574,6 +3881,7 @@ impl AdditiveNttF128 {
                     lanes2,
                     stage_perm,
                     &tw2[block],
+                    blocked,
                 );
             }
         }
@@ -3617,6 +3925,7 @@ impl AdditiveNttF128 {
         lanes2: usize,
         stage_perm: bool,
         tw2_block: &[[F128; 3]; 16],
+        blocked: bool,
     ) {
         let g2_stride: usize = if stage_perm { 16 } else { 1 };
         // SAFETY: forwarded exact-ranked-shape contract. Each m quad is the
@@ -3628,7 +3937,10 @@ impl AdditiveNttF128 {
                 let p = region.add(seed_top_stage_row(k, stage_perm) * row_len);
                 let step = g2_stride * row_len;
                 let dst = |k: usize| {
-                    base.add(seed_top_codeword_row(block, r, k, block_size, sub_stride) * row_len)
+                    base.add(
+                        codeword_row(seed_top_codeword_row(block, r, k, block_size, sub_stride), blocked)
+                            * row_len,
+                    )
                 };
                 kernels::butterfly_fused_2layer_publish_nt::<ALIGNED_ZMM>(
                     p,
@@ -3655,6 +3967,8 @@ impl AdditiveNttF128 {
         log_d: usize,
         odd_tail: usize,
         after: Option<&(dyn Fn(usize) + Sync)>,
+        blocked: bool,
+        raw7: bool,
     ) -> bool {
         crate::rstrace::ev("nt:s8", 0);
         use rayon::prelude::*;
@@ -3666,7 +3980,6 @@ impl AdditiveNttF128 {
         let block_size = 1usize << (log_d - LAYER); // B, also the seed quarter
         let msg_positions = msg.len() / num_ntts;
         debug_assert_eq!(msg_positions >> 2, block_size);
-        let block_bytes = block_size * num_ntts;
         let sub_stride = block_size >> 6; // S
         debug_assert!(sub_stride >= 1);
         let sixteenth = block_size >> 4;
@@ -3992,6 +4305,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            blocked,
                         );
                     } else {
                         self.seed_top_direct_fused2_publish::<false>(
@@ -4006,6 +4320,7 @@ impl AdditiveNttF128 {
                             stage_perm,
                             &tw4,
                             &tw2,
+                            blocked,
                         );
                     }
                     // All 512 rows are published. Drain once for this r task;
@@ -4045,7 +4360,10 @@ impl AdditiveNttF128 {
                         for k in 0..64 {
                             Self::publish_row_nt(
                                 bufp.add((block * 64 + perm(k)) * row_len),
-                                base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                                base.add(
+                                    codeword_row(block * block_size + r + k * sub_stride, blocked)
+                                        * row_len,
+                                ),
                                 row_len,
                             );
                         }
@@ -4059,7 +4377,10 @@ impl AdditiveNttF128 {
                     for k in 0..64 {
                         core::ptr::copy_nonoverlapping(
                             bufp.add((block * 64 + perm(k)) * row_len),
-                            base.add(block * block_bytes + (r + k * sub_stride) * row_len),
+                            base.add(
+                                codeword_row(block * block_size + r + k * sub_stride, blocked)
+                                    * row_len,
+                            ),
                             row_len,
                         );
                     }
@@ -4082,7 +4403,7 @@ impl AdditiveNttF128 {
             // SAFETY: `bufp` addresses the 512 seeded staging rows of task
             // `r`; this half writes nothing outside them.
             unsafe {
-                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4);
+                st_fmp_fold4(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4, raw7);
             }
         };
         #[cfg(all(
@@ -4101,11 +4422,11 @@ impl AdditiveNttF128 {
                 let base = base_addr as *mut F128;
                 if direct_publish_zmm {
                     self.seed_top_direct_publish2::<true>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2, blocked,
                     );
                 } else {
                     self.seed_top_direct_publish2::<false>(
-                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2,
+                        bufp, base, row_len, block_size, sub_stride, r, lanes2, stage_perm, &tw2, blocked,
                     );
                 }
                 // All 512 rows of this task are published. Drain the WC
@@ -4156,7 +4477,7 @@ impl AdditiveNttF128 {
                 sub_stride, row_len, &seed, &fold4, &publish2,
                 Some(&|bufp, r, helper| unsafe {
                     let (start, count) = if helper { (60, 4) } else { (0, 60) };
-                    st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4, start, count);
+                    st_fmp_fold4_range(bufp, row_len, sub_stride, r, lanes4_tail, stage_perm, &tw4, start, count, raw7);
                 }),
                 produce.as_ref().map(|f| f as &(dyn Fn(usize, usize, *mut F128, *mut F128) + Sync)), after,
             )
@@ -4349,7 +4670,7 @@ impl AdditiveNttF128 {
         seed_msg: Option<SeedInput<'_>>,
     ) {
         self.forward_transform_interleaved_parallel_from_layer_impl_n(
-            data, num_ntts, start_layer, stream, on_sub_done, seed_msg, None, None,
+            data, num_ntts, start_layer, stream, on_sub_done, seed_msg, None, None, false,
         );
     }
 
@@ -4380,7 +4701,8 @@ impl AdditiveNttF128 {
         seed_msg: Option<SeedInput<'_>>,
         force_n_top: Option<usize>,
         seed_sub: Option<(&[F128], usize)>,
-    ) {
+        blocked_ok: bool,
+    ) -> bool {
         use rayon::prelude::*;
         crate::rstrace::ev("nt:in", 0);
         let n_total = data.len();
@@ -4448,7 +4770,7 @@ impl AdditiveNttF128 {
             if let Some((_, on_chunk)) = stream {
                 on_chunk(0, 0..n_positions);
             }
-            return;
+            return false;
         }
 
         // Top layers: full-buffer sweep. Parallelize **rows within each
@@ -4784,6 +5106,36 @@ impl AdditiveNttF128 {
             .map(|(pairs, _)| DeepSplitState::new(pairs.len()));
         #[cfg(target_os = "linux")]
         let deep_base_addr = data.as_mut_ptr() as usize;
+        // Page-blocked ranked codeword (see `ranked_blocked_row`): only when
+        // the seed+top task publishes every top row and the sibling-paired
+        // deep pass (`deep_role`, which addresses rows through the same map)
+        // runs every deep layer. Every other schedule keeps natural order.
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        let blocked = blocked_ok
+            && split_claim.is_some()
+            && fuse_blocks
+            && seed_msg.is_some()
+            && seed_fits
+            && seed_sub.is_none()
+            && log_d == 20
+            && num_ntts == 64
+            && n_top == 9
+            && sub_size_positions == 2048;
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )))]
+        let blocked = {
+            let _ = blocked_ok;
+            false
+        };
         // Lane v2 tail stealing: one claim word per producer slot,
         // `sub << 8 | next_block`, or NONE while no sub-group is open.
         #[cfg(all(
@@ -4859,6 +5211,12 @@ impl AdditiveNttF128 {
             let n_subs = n_total / sub_bytes;
             let depth = deep_split_depth();
             let hint = deep_pf_hint();
+            // First row of sub-group `i`, and the row strides of its sweep-1
+            // groups and 128-row blocks, in the codeword's row layout.
+            let sub_row = |i: usize| codeword_row(i * sub_size_positions, blocked);
+            let group_stride = if blocked { 2048 } else { sub_size_positions >> 4 };
+            let block_stride = if blocked { 2048 } else { sub_size_positions >> 4 };
+            let _ = (group_stride, block_stride);
             let share = deep_share_enabled();
             let queues = &stt.queues;
             let next_sub = &stt.next_sub;
@@ -4910,7 +5268,8 @@ impl AdditiveNttF128 {
                 // before publishing it, and the release on the ring head /
                 // acquire in the claiming pop order those writes before
                 // this read.
-                let ptr = (deep_base_addr as *const F128).wrapping_add(b.lo * num_ntts);
+                let ptr = (deep_base_addr as *const F128)
+                    .wrapping_add(codeword_row(b.lo, blocked) * num_ntts);
                 let blk = unsafe { std::slice::from_raw_parts(ptr, DeepBlock::ROWS * num_ntts) };
                 crate::rstrace::evd("hb:s", (b.lo / DeepBlock::ROWS) as u32);
                 cb(b.lo..b.lo + DeepBlock::ROWS, blk);
@@ -4931,7 +5290,7 @@ impl AdditiveNttF128 {
                     }
                     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
                     if let Some((ws, (i, blk, b))) = got {
-                        let sp = unsafe { (deep_base_addr as *mut F128).add(i * sub_bytes) };
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(sub_row(i) * num_ntts) };
                         if blk {
                             crate::rstrace::evd("ds:steal", (i * 16 + b) as u32);
                             // SAFETY: block `b` of sub-group `i` was claimed by
@@ -4941,6 +5300,7 @@ impl AdditiveNttF128 {
                                 self.v2_deep_block_x86(
                                     i, b, sp, cb,
                                     n_top, log_d, num_ntts, odd_tail, raw7_pack, sub_size_positions, hint,
+                                    block_stride,
                                 );
                             }
                         } else {
@@ -4949,7 +5309,7 @@ impl AdditiveNttF128 {
                             // SAFETY: rows b*per..(b+1)*per of sweep 1, claimed
                             // exactly once; the owner joins on the count below.
                             unsafe {
-                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                self.v2_sweep1_rows_x86(i, sp, b * per, (b + 1) * per, n_top, log_d, num_ntts, odd_tail, hint, group_stride, raw7_pack);
                             }
                             dsteal_done[ws].fetch_add(1, std::sync::atomic::Ordering::Release);
                         }
@@ -4980,7 +5340,7 @@ impl AdditiveNttF128 {
             };
             if producer {
                 let enqueue = |range: core::ops::Range<usize>, blk: &[F128]| {
-                    let Some(b) = DeepBlock::from_finished(&range, blk, deep_base_addr, num_ntts) else {
+                    let Some(b) = DeepBlock::from_finished(&range, blk, deep_base_addr, num_ntts, blocked) else {
                         cb(range, blk);
                         return;
                     };
@@ -5003,7 +5363,7 @@ impl AdditiveNttF128 {
                     if dsteal != 0 && i + 2 * n_pairs >= n_subs {
                         use std::sync::atomic::Ordering;
                         let w = &dsteal_words[slot];
-                        let sp = unsafe { (deep_base_addr as *mut F128).add(i * sub_bytes) };
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(sub_row(i) * num_ntts) };
                         // SAFETY: sub-group `i` is this worker's alone until
                         // the claim word below opens its rows / blocks.
                         if unsafe { self.v2_sweep1_prepared(i, n_top) } {
@@ -5014,7 +5374,7 @@ impl AdditiveNttF128 {
                             while let Some((si, blk, c)) = dsteal_claim(w) {
                                 debug_assert!(si == i && !blk);
                                 unsafe {
-                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint);
+                                    self.v2_sweep1_rows_x86(i, sp, c * per, (c + 1) * per, n_top, log_d, num_ntts, odd_tail, hint, group_stride, raw7_pack);
                                 }
                                 mine += 1;
                             }
@@ -5023,7 +5383,7 @@ impl AdditiveNttF128 {
                             }
                         } else {
                             unsafe {
-                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint);
+                                self.v2_deep_sweep1_x86(i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint, group_stride, raw7_pack);
                             }
                         }
                         w.store((i as u64) << 16 | DSTEAL_BLK, Ordering::Release);
@@ -5033,11 +5393,34 @@ impl AdditiveNttF128 {
                             unsafe {
                                 self.v2_deep_block_x86(
                                     si, b, sp, &enqueue, n_top, log_d, num_ntts, odd_tail, raw7_pack,
-                                    sub_size_positions, hint,
+                                    sub_size_positions, hint, block_stride,
                                 );
                             }
                         }
                         w.store(DSTEAL_NONE, Ordering::Release);
+                        crate::rstrace::evd("dp:subend", i as u32);
+                        continue;
+                    }
+                    // Page-blocked: the sub-group is sixteen 128-row blocks a
+                    // page apart; run the same sweep 1 and per-block passes
+                    // the fused schedule runs, through raw row addresses.
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+                    if blocked {
+                        let sp = unsafe { (deep_base_addr as *mut F128).add(sub_row(i) * num_ntts) };
+                        // SAFETY: sub-group `i` (its sixteen blocks) is this
+                        // worker's alone; sweep 1 completes before any block.
+                        unsafe {
+                            self.v2_deep_sweep1_x86(
+                                i, sp, n_top, log_d, num_ntts, odd_tail, sub_size_positions, hint, group_stride,
+                                raw7_pack,
+                            );
+                            for b in 0..16 {
+                                self.v2_deep_block_x86(
+                                    i, b, sp, &enqueue, n_top, log_d, num_ntts, odd_tail, raw7_pack,
+                                    sub_size_positions, hint, block_stride,
+                                );
+                            }
+                        }
                         crate::rstrace::evd("dp:subend", i as u32);
                         continue;
                     }
@@ -5094,10 +5477,10 @@ impl AdditiveNttF128 {
                     };
                 #[cfg(not(target_os = "linux"))]
                 let after: Option<&(dyn Fn(usize) + Sync)> = None;
-                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, after) {
+                if self.seed_top_fused8_pass(msg, data, num_ntts, log_d, odd_tail, after, blocked, raw7_pack) {
                     // The deep pass ran inside the same broadcast.
                     crate::gaptime::mark("ntt: deep pass done");
-                    return;
+                    return blocked;
                 }
                 crate::gaptime::mark("ntt: seed+top fused pass done");
                 layer += 6;
@@ -5254,8 +5637,9 @@ impl AdditiveNttF128 {
                 if split_claim.is_some() {
                     rayon::broadcast(|ctx| deep_role(ctx.index()));
                     crate::gaptime::mark("ntt: deep pass done");
-                    return;
+                    return blocked;
                 }
+                debug_assert!(!blocked);
                 data.par_chunks_mut(sub_bytes)
                     .enumerate()
                     .for_each(|(sub_idx, sub_data)| {
@@ -5298,7 +5682,7 @@ impl AdditiveNttF128 {
                         );
                         sub_cursor = end_sub;
                     }
-                    return;
+                    return false;
                 }
 
                 // Streaming path, completion-tracked: ONE fully-parallel
@@ -5399,6 +5783,7 @@ impl AdditiveNttF128 {
                 drain(true);
             }
         }
+        false
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -5724,11 +6109,30 @@ impl AdditiveNttF128 {
         odd_tail: usize,
         sub_size_positions: usize,
         hint: u8,
+        group_stride: usize,
+        raw7_pack: bool,
     ) {
-        let sub_data = unsafe { core::slice::from_raw_parts_mut(sub_ptr, sub_size_positions * num_ntts) };
         let layer = n_top;
         let block_size = 1usize << (log_d - layer);
         let sixteenth = block_size >> 4;
+        if group_stride != sixteenth {
+            // Page-blocked sub-group: its sixteen 128-row blocks are
+            // `group_stride` rows apart, so no contiguous slice of it exists.
+            // Same row groups, twiddles and per-row order as below.
+            // SAFETY: forwarded; the prepared path is the production one.
+            unsafe {
+                if self.v2_sweep1_prepared(sub_idx, n_top) {
+                    self.v2_sweep1_rows_x86(
+                        sub_idx, sub_ptr, 0, sixteenth, n_top, log_d, num_ntts, odd_tail, hint, group_stride,
+                        raw7_pack,
+                    );
+                } else {
+                    self.blocked_sweep1_generic_x86(sub_idx, sub_ptr, n_top, log_d, num_ntts, odd_tail, group_stride);
+                }
+            }
+            return;
+        }
+        let sub_data = unsafe { core::slice::from_raw_parts_mut(sub_ptr, sub_size_positions * num_ntts) };
         let global_block = sub_idx;
         let mut tw = [F128 { lo: 0, hi: 0 }; 15];
         tw[0] = self.twiddle(layer, global_block);
@@ -5802,6 +6206,8 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         odd_tail: usize,
         hint: u8,
+        group_stride: usize,
+        raw7_pack: bool,
     ) {
         let layer = n_top;
         let block_size = 1usize << (log_d - layer);
@@ -5821,17 +6227,99 @@ impl AdditiveNttF128 {
         let odd_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
         let prepared = unsafe { kernels::prepare_four(&t) }.expect("v2_sweep1_prepared checked");
         let base = sub_ptr;
+        // Raw-seven pack (as the per-block pass's `rows_raw7_s8`): odd rows
+        // carry seven zero trailing fields, so odd groups fold fields 0..56
+        // in the row kernel and field 56 of every four odd groups (one shared
+        // twiddle set) through one packed group; fields 57..64 stay zero.
+        #[cfg(target_feature = "avx512bw")]
+        let raw7 = raw7_pack
+            && !raw7_sweep_disabled()
+            && odd_tail == 4
+            && num_ntts == 64
+            && r0.is_multiple_of(8)
+            && (r1 - r0).is_multiple_of(8);
+        #[cfg(not(target_feature = "avx512bw"))]
+        let raw7 = {
+            let _ = raw7_pack;
+            false
+        };
+        let mut pending = [0usize; 4];
+        let mut n_pending = 0usize;
         for r in r0..r1 {
-            let lanes = row_lanes(r, num_ntts, odd_tail);
+            let packed = raw7 && r & 1 == 1;
+            let lanes = if packed { 56 } else { row_lanes(r, num_ntts, odd_tail) };
             unsafe {
+                // `group_stride` is the kernel's row-group stride: `sixteenth`
+                // in natural order, one page in the page-blocked layout.
                 if hint == 0 || r + 1 >= sixteenth {
-                    kernels::row_prepared::<0>(base, sixteenth, num_ntts, lanes, r, &t, 0, &prepared);
+                    kernels::row_prepared::<0>(base, group_stride, num_ntts, lanes, r, &t, 0, &prepared);
                 } else if hint == 1 {
-                    kernels::row_prepared::<1>(base, sixteenth, num_ntts, lanes, r, &t, r + 1, &prepared);
+                    kernels::row_prepared::<1>(base, group_stride, num_ntts, lanes, r, &t, r + 1, &prepared);
                 } else {
-                    kernels::row_prepared::<2>(base, sixteenth, num_ntts, lanes, r, &t, r + 1, &prepared);
+                    kernels::row_prepared::<2>(base, group_stride, num_ntts, lanes, r, &t, r + 1, &prepared);
                 }
             }
+            if packed {
+                pending[n_pending] = r;
+                n_pending += 1;
+                if n_pending == 4 {
+                    n_pending = 0;
+                    #[cfg(target_feature = "avx512bw")]
+                    // SAFETY: four odd groups of this call's own rows, folded
+                    // through field 56 above; same twiddles.
+                    unsafe {
+                        kernels::raw7_pack4_field56(base, pending, group_stride, &prepared);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(n_pending, 0);
+    }
+
+    /// Sweep 1 of a page-blocked sub-group when the prepared twiddle path is
+    /// switched off (`FLOCK_NO_NTT_TWIDDLE_PREP` / `FLOCK_NO_NTT_MUL_DIET`):
+    /// the un-hinted generic row kernel with the blocked row-group stride.
+    ///
+    /// # Safety
+    /// As [`Self::v2_sweep1_rows_x86`] for all `sixteenth` row groups.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    #[target_feature(enable = "avx512f,vpclmulqdq")]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn blocked_sweep1_generic_x86(
+        &self,
+        sub_idx: usize,
+        sub_ptr: *mut F128,
+        n_top: usize,
+        log_d: usize,
+        num_ntts: usize,
+        odd_tail: usize,
+        group_stride: usize,
+    ) {
+        let layer = n_top;
+        let block_size = 1usize << (log_d - layer);
+        let sixteenth = block_size >> 4;
+        let global_block = sub_idx;
+        let mut t = [F128 { lo: 0, hi: 0 }; 15];
+        t[0] = self.twiddle(layer, global_block);
+        for s in 0..2 {
+            t[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+        }
+        for s in 0..4 {
+            t[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+        }
+        for s in 0..8 {
+            t[7 + s] = self.twiddle(layer + 3, 8 * global_block + s);
+        }
+        let odd_tail = if sixteenth.is_multiple_of(2) { odd_tail } else { 0 };
+        for r in 0..sixteenth {
+            let lanes = row_lanes(r, num_ntts, odd_tail);
+            // SAFETY: row group `{r + i·group_stride}` of this sub-group.
+            unsafe { kernels::butterfly_fused_4layer_row(sub_ptr, group_stride, num_ntts, lanes, r, &t) };
         }
     }
 
@@ -5862,6 +6350,7 @@ impl AdditiveNttF128 {
         raw7_pack: bool,
         sub_size_positions: usize,
         hint: u8,
+        block_stride: usize,
     ) {
         let layer4 = n_top + 4;
         let block_size4 = 1usize << (log_d - layer4);
@@ -5881,7 +6370,12 @@ impl AdditiveNttF128 {
         for s in 0..8 {
             tw[7 + s] = self.twiddle(layer4 + 3, 8 * g4 + s);
         }
-        let blk = unsafe { core::slice::from_raw_parts_mut(sub_ptr.add(b * block_bytes4), block_bytes4) };
+        // `block_stride` rows between the sub-group's 128-row blocks: the
+        // block size itself in natural order, one page when page-blocked.
+        debug_assert!(block_stride == block_size4 || block_stride == 2048);
+        let blk = unsafe {
+            core::slice::from_raw_parts_mut(sub_ptr.add(b * block_stride * num_ntts), block_bytes4)
+        };
         butterfly_interleaved_fused_4layer_rows_raw7(
             blk,
             &tw,
@@ -6395,6 +6889,187 @@ fn rate_half_seed_disabled() -> bool {
 /// `FLOCK_NO_NTT_RATE_SEED=1` restores `replicate_message_fill` + a transform
 /// from layer `log_inv_rate` for rate ≤ 1/4 encodes. Read once per process;
 /// default ON (the ranked worker clears its env).
+/// Lane h3: [`AdditiveNttF128::seed_first4_from_msg`] as a task list.
+///
+/// Geometry (`Q = |msg| / (4·num_ntts)` positions): layers `k, k+1` are the
+/// [`AdditiveNttF128::seed_layers_pair_from_msg`] seed — output row
+/// `b·4Q + j·Q + r` (block `b < 2^k`, `j < 4`) comes from message rows
+/// `r + i·Q`, `i < 4`. Layers `k+2..k+6` are the first fused-four of
+/// sub-group `g = 4b + j` (`Q` positions, sixteenth `Q/16`): row group
+/// `{r + i·Q/16 : i < 16}`. Task `t` owns positions `r ∈ [t·R, (t+1)·R)` of
+/// the sixteenth: it reads the 64 message row runs `r + i·Q/16 + j·Q`
+/// (`i < 16`, `j < 4`), and for every block `b` seeds them into a private
+/// staging block, applies the fused-four on each 16-row run and writes the
+/// rows to their codeword positions.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+pub(crate) struct Seed6Plan {
+    seed_tw: Vec<[F128; 3]>,
+    tw4: Vec<kernels::FourBlock>,
+    blocks: usize,
+    q: usize,
+    s16: usize,
+    rr: usize,
+    nn: usize,
+    num_ntts: usize,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+impl Seed6Plan {
+    /// Number of tasks; together they write every codeword row once.
+    pub(crate) fn tasks(&self) -> usize {
+        self.s16 / self.rr
+    }
+
+    /// Message positions read by task `t`: `j·Q + i·Q/16 + t·R + d` for
+    /// `j < 4`, `i < 16`, `d < R` (each position is `num_ntts` F128).
+    pub(crate) fn task_positions(&self, t: usize) -> impl Iterator<Item = usize> + '_ {
+        let r = t * self.rr;
+        (0..4).flat_map(move |j| {
+            (0..16).flat_map(move |i| (0..self.rr).map(move |d| j * self.q + i * self.s16 + r + d))
+        })
+    }
+
+    /// A worker's staging buffer for [`Self::run`].
+    pub(crate) fn staging(&self) -> Vec<F128> {
+        staging_block(128, self.nn)
+    }
+
+    /// Run task `rc`: the incumbent per-task body of the seed6 pass.
+    ///
+    /// # Safety
+    /// `src` holds the plan's message and `dst` its codeword (64-byte
+    /// aligned when `NT`); the message rows of [`Self::task_positions`] are
+    /// final; no other thread touches this task's codeword rows. With `NT`
+    /// the caller fences (`sfence`) before another thread reads them.
+    pub(crate) unsafe fn run<const NT: bool>(
+        &self,
+        src: *const F128,
+        dst: *mut F128,
+        rc: usize,
+        buf: &mut Vec<F128>,
+    ) {
+        let (num_ntts, q, s16, rr, nn) = (self.num_ntts, self.q, self.s16, self.rr, self.nn);
+        let (seed_tw, tw4) = (&self.seed_tw, &self.tw4);
+        unsafe {
+            let (st, sg) = buf.split_at_mut(64 * nn);
+            let st = st.as_mut_ptr();
+            let r = rc * rr;
+            crate::rstrace::evd("s6:task", rc as u32);
+            // Source rows r + i·s16 + j·Q sit at power-of-two strides that
+            // alias in L1/L2; gather them once into a contiguous block
+            // (row 16·j + i) so the per-block seed re-reads stay cache hits.
+            let g = sg.as_mut_ptr();
+            for j in 0..4 {
+                for i in 0..16 {
+                    core::ptr::copy_nonoverlapping(
+                        src.add((j * q + i * s16 + r) * num_ntts),
+                        g.add((16 * j + i) * nn),
+                        nn,
+                    );
+                }
+            }
+            let src = g as *const F128;
+            crate::rstrace::evd("s6:gathered", rc as u32);
+            // Publish one staged 16-row run (block b, j) to the codeword.
+            let publish = |stg: *const F128, b: usize, j: usize| {
+                for i in 0..16 {
+                    let from = stg.add((16 * j + i) * nn);
+                    let to = dst.add((b * 4 * q + j * q + i * s16 + r) * num_ntts);
+                    if NT {
+                        use core::arch::x86_64::*;
+                        let mut c = 0;
+                        while c < nn {
+                            _mm512_stream_si512(
+                                to.add(c) as *mut __m512i,
+                                _mm512_loadu_si512(from.add(c) as *const __m512i),
+                            );
+                            c += 4;
+                        }
+                    } else {
+                        core::ptr::copy_nonoverlapping(from, to, nn);
+                    }
+                }
+            };
+            for b in 0..self.blocks {
+                let cur = st;
+                for i in 0..16 {
+                    if b == 0 {
+                        kernels::butterfly_fused_2layer_row_from_sparse_geo(
+                            src, 16, i, cur, 16, i, nn, seed_tw[0][2],
+                        );
+                    } else {
+                        kernels::butterfly_fused_2layer_row_from_geo(
+                            src, 16, i, cur, 16, i, nn, &seed_tw[b],
+                        );
+                    }
+                }
+                crate::rstrace::evd("s6:seeded", b as u32);
+                // Stream the last two layers straight from registers (as the
+                // ranked seed+top publish does): the sixteen-row fused-four
+                // of group `j` is exactly a fused-two over the quads
+                // `{m, m+4, m+8, m+12}` (layers +0, +1: twiddles 0 | 1, 2)
+                // then a fused-two over the quads `{4p .. 4p+3}` (layers +2,
+                // +3: twiddles 3+p | 7+2p, 8+2p), whose NT stores then
+                // overlap the butterflies instead of a separate staging
+                // reload pass. Same butterflies, twiddles and per-element
+                // order. The zero-chain group keeps its dedicated kernel.
+                let direct = NT && nn == 64 && dst as usize % 64 == 0 && !s6_publish_fuse_disabled();
+                for j in 0..4 {
+                    let tw = &tw4[4 * b + j];
+                    let zero_chain = tw[0] == F128::ZERO
+                        && tw[1] == F128::ZERO
+                        && tw[3] == F128::ZERO
+                        && tw[7] == F128::ZERO;
+                    if !direct || zero_chain {
+                        kernels::butterfly_fused_4layer_cached(cur.add(16 * j * nn), 1, nn, nn, 0, tw);
+                        publish(cur, b, j);
+                        continue;
+                    }
+                    let grp = cur.add(16 * j * nn);
+                    let row = |i: usize| core::slice::from_raw_parts_mut(grp.add(i * nn), nn);
+                    for m in 0..4 {
+                        kernels::butterfly_fused_2layer(
+                            row(m), row(m + 4), row(m + 8), row(m + 12), tw[0], tw[1], tw[2],
+                        );
+                    }
+                    let to = |i: usize| dst.add((b * 4 * q + j * q + i * s16 + r) * num_ntts);
+                    for p in 0..4 {
+                        kernels::butterfly_fused_2layer_publish_nt::<true>(
+                            grp.add(4 * p * nn),
+                            nn,
+                            to(4 * p),
+                            to(4 * p + 1),
+                            to(4 * p + 2),
+                            to(4 * p + 3),
+                            nn,
+                            tw[3 + p],
+                            tw[7 + 2 * p],
+                            tw[8 + 2 * p],
+                        );
+                    }
+                }
+                crate::rstrace::evd("s6:written", b as u32);
+            }
+        }
+    }
+}
+
+/// `FLOCK_NO_S6_PUB_FUSE=1` restores the seed6 task's separate staged
+/// fused-four and NT publish passes (exact same-binary A/B).
+fn s6_publish_fuse_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_S6_PUB_FUSE").is_some());
+    *OFF
+}
+
 fn rate_seed_disabled() -> bool {
     static OFF: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_RATE_SEED").is_some());
@@ -6868,12 +7543,12 @@ mod tests {
         let columns = 8;
         let data = vec![F128::ZERO; 256 * columns];
         let base = data.as_ptr() as usize;
-        assert_eq!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns).unwrap().lo, 0);
-        assert_eq!(DeepBlock::from_finished(&(128..256), &data[128 * columns..], base, columns).unwrap().lo, 128);
-        assert!(DeepBlock::from_finished(&(0..256), &data, base, columns).is_none());
-        assert!(DeepBlock::from_finished(&(0..128), &data[128 * columns..], base, columns).is_none());
-        assert!(DeepBlock::from_finished(&(0..128), &data[..64 * columns], base, columns).is_none());
-        assert!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns + 1).is_none());
+        assert_eq!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns, false).unwrap().lo, 0);
+        assert_eq!(DeepBlock::from_finished(&(128..256), &data[128 * columns..], base, columns, false).unwrap().lo, 128);
+        assert!(DeepBlock::from_finished(&(0..256), &data, base, columns, false).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[128 * columns..], base, columns, false).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..64 * columns], base, columns, false).is_none());
+        assert!(DeepBlock::from_finished(&(0..128), &data[..128 * columns], base, columns + 1, false).is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -6891,7 +7566,7 @@ mod tests {
                 let snapshots = Mutex::new(Vec::new());
                 let q = DeepQueue::new();
                 let callback = |range: core::ops::Range<usize>, block: &[F128]| {
-                    let token = DeepBlock::from_finished(&range, block, base, columns).expect("fixed callback");
+                    let token = DeepBlock::from_finished(&range, block, base, columns, false).expect("fixed callback");
                     assert!(q.try_push(token, 8));
                     let got = q.try_pop().unwrap();
                     let ptr = (base as *const F128).wrapping_add(got.lo * columns);
@@ -9167,6 +9842,43 @@ mod generated_pair_dispatch_tests {
     }
 }
 
+#[cfg(test)]
+mod page_blocked_layout_tests {
+    use super::ranked_blocked_row as s;
+
+    #[test]
+    fn blocked_rows_are_an_involution_with_the_geometry_the_passes_use() {
+        const N: usize = 1 << 20;
+        let mut seen = vec![false; N];
+        for p in 0..N {
+            assert_eq!(s(s(p)), p);
+            assert!(!core::mem::replace(&mut seen[s(p)], true));
+        }
+        // 128-row aligned runs (deep blocks, sparse-dual runs) stay contiguous.
+        for b in (0..N).step_by(128) {
+            for i in 0..128 {
+                assert_eq!(s(b + i), s(b) + i);
+            }
+        }
+        // A seed+top task stores into 32 pages; a sub-group's sweep-1 group
+        // and its blocks are one page (2048 rows) apart.
+        for r in [0usize, 1, 127, 128, 1000, 2047] {
+            let mut pages: Vec<usize> = (0..8)
+                .flat_map(|b| (0..64).map(move |k| s(b * (1 << 17) + k * 2048 + r) >> 11))
+                .collect();
+            pages.sort_unstable();
+            pages.dedup();
+            assert_eq!(pages.len(), 32);
+        }
+        for j in [0usize, 1, 15, 16, 300, 511] {
+            for k in 0..16 {
+                for r0 in [0usize, 7, 127] {
+                    assert_eq!(s(j * 2048 + k * 128 + r0), s(j * 2048) + k * 2048 + r0);
+                }
+            }
+        }
+    }
+}
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "vpclmulqdq"))]
 mod compact_seed_geometry_tests {

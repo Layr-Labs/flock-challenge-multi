@@ -344,7 +344,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_into_with_eq(
 ) -> (F128, F128, Round3Lookahead) {
     let (m1, mi, la, _) = fold3_from_packed_and_round_pair_lookahead_casc(
         a_packed, b_packed, m, k_skip, table, padding, a_out, b_out, rho, r_next5, eq_override,
-        out_lm, b_canonical, false, None,
+        out_lm, b_canonical, false, None, false,
     );
     (m1, mi, la)
 }
@@ -403,6 +403,7 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     b_canonical: bool,
     casc: bool,
     pre_wtab: Option<&[F128]>,
+    b7: bool,
 ) -> (F128, F128, Round3Lookahead, Option<Round4Lookahead>) {
     use rayon::prelude::*;
     assert_eq!(k_skip, 6);
@@ -520,6 +521,10 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
     if casc {
         assert_ne!(r_next5[2], F128::ZERO, "round-seven lookahead needs r6 != 0");
     }
+    // B7 (`b7_tables_enabled`): the B table is written in the packed seven-ZMM
+    // block layout, which only the cascade's b-canonical kernel produces.
+    assert!(!b7 || casc, "the B7 table layout needs the deeper-cascade route");
+    let chunk_b = if b7 { 7 * (2 * lo_size) / 8 } else { 2 * lo_size };
     // Deeper cascade: both lanes of an eight-group ride the odd lane's
     // weight; κ₆ restores the even lanes' own weight in the message sums.
     crate::rstrace::ev("r345:s3", 0);
@@ -561,15 +566,20 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 unsafe {
                     if casc && let Some(bc) = b_canon.as_ref() {
                         macro_rules! casc {
-                            ($nt:literal) => {
-                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true>(
+                            ($nt:literal, $b7:literal) => {
+                                kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_casc_x86::<$nt, true, true, $b7>(
                                     ap, bp, out_base, a_out, b_out, lo_size, c, rho[2],
                                     wtab_casc.as_deref().unwrap(), bc, &mut la7, kappa6,
                                 )
                             };
                         }
                         let _ = wt;
-                        if *nt { casc!(true) } else { casc!(false) }
+                        match (*nt, b7) {
+                            (true, true) => casc!(true, true),
+                            (false, true) => casc!(false, true),
+                            (true, false) => casc!(true, false),
+                            (false, false) => casc!(false, false),
+                        }
                     } else if let Some(bc) = b_canon.as_ref() {
                         match (*nt, out_lm) {
                             (true, true) => kernels::x86_64::fold3_from_packed_lookahead_c4_lm_wtab_b_canon_x86::<true, true>(
@@ -668,13 +678,15 @@ pub(crate) fn fold3_from_packed_and_round_pair_lookahead_casc(
                 (s1 + c1, sinf + cinf, a, l)
             };
     // Lane ru flat claim route (`FLOCK_NO_RU_FLAT_PAR`), see `super::flat_tail`.
+    let b_len = b_out.len() / chunk_out * chunk_b;
+    let b_out = &mut b_out[..b_len];
     let (sum1_even, sum_inf_even, agg, la7_acc) =
         if crate::flat_par::enabled() && rayon::current_thread_index().is_some() {
-            super::flat_chunks(a_out, b_out, chunk_out, leaf, id, op)
+            super::flat_chunks2(a_out, chunk_out, b_out, chunk_b, leaf, id, op)
         } else {
             a_out
                 .par_chunks_mut(chunk_out)
-                .zip(b_out.par_chunks_mut(chunk_out))
+                .zip(b_out.par_chunks_mut(chunk_b))
                 .enumerate()
                 .map(leaf)
                 .reduce(id, op)

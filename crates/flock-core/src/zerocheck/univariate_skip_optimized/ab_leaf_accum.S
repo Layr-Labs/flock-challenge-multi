@@ -3711,8 +3711,7 @@ vpternlogq zmm2, zmm11, zmm20, 0x96
 vpxorq zmm2, zmm2, zmm10
 vmovdqu64 ZMMWORD PTR [rsi + 1216], zmm2
 vmovdqu64 zmm2, ZMMWORD PTR [rsp + 768]
-vpxorq zmm2, zmm2, zmm1
-vpxorq zmm2, zmm2, zmm17
+vpternlogq zmm2,zmm1,zmm17,0x96
 vmovdqu64 ZMMWORD PTR [rsi + 1536], zmm2
 vmovdqu64 zmm2, ZMMWORD PTR [rsp + 960]
 vpxorq zmm2, zmm2, zmm16
@@ -3725,8 +3724,7 @@ vpternlogq zmm17, zmm1, zmm2, 0x96
 vpxorq zmm17, zmm17, zmm3
 vmovdqu64 ZMMWORD PTR [rsi + 1728], zmm17
 vmovdqu64 zmm17, ZMMWORD PTR [rsp + 2176]
-vpxorq zmm17, zmm17, zmm19
-vpxorq zmm17, zmm17, zmm16
+vpternlogq zmm17,zmm19,zmm16,0x96
 vmovdqu64 ZMMWORD PTR [rsi + 1792], zmm17
 mov rsp, rbp
 pop rbp
@@ -4542,8 +4540,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+256]
@@ -4571,8 +4568,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -4604,8 +4600,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -4693,8 +4688,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+768]
@@ -4740,8 +4734,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -4833,8 +4826,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+256]
@@ -4864,8 +4856,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -4903,8 +4894,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -5013,8 +5003,7 @@ vpxorq zmm7,zmm7,zmm31
 prefetcht1 [r8 + 640]
 prefetcht1 [r8 + 704]
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 prefetcht1 [r8 + 768]
@@ -5044,8 +5033,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -5077,8 +5065,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -5166,8 +5153,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+768]
@@ -5213,8 +5199,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -5306,8 +5291,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+256]
@@ -5337,8 +5321,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -5376,8 +5359,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -5488,8 +5470,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+256]
@@ -5517,8 +5498,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -5550,8 +5530,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -5639,8 +5618,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+768]
@@ -5686,8 +5664,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -5779,8 +5756,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+256]
@@ -5810,8 +5786,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+0]
@@ -5849,8 +5824,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -5960,8 +5934,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+104]{1to8},0
 vpxorq zmm13,zmm13,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+112]{1to8},0
 vpxorq zmm14,zmm14,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -5991,8 +5964,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -6080,8 +6052,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+640]
@@ -6109,8 +6080,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+384]
@@ -6142,8 +6112,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -6236,8 +6205,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6269,8 +6237,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6308,8 +6275,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -6433,8 +6399,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+104]{1to8},0
 vpxorq zmm13,zmm13,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+112]{1to8},0
 vpxorq zmm14,zmm14,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6464,8 +6429,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -6553,8 +6517,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+640]
@@ -6582,8 +6545,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+384]
@@ -6615,8 +6577,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -6709,8 +6670,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6742,8 +6702,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6781,8 +6740,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -6906,8 +6864,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+104]{1to8},0
 vpxorq zmm13,zmm13,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+112]{1to8},0
 vpxorq zmm14,zmm14,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -6937,8 +6894,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+176]{1to8},0
 vpxorq zmm22,zmm22,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+184]{1to8},0
 vpxorq zmm23,zmm23,zmm31
 add r8,118784
@@ -7026,8 +6982,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+640]
@@ -7055,8 +7010,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+384]
@@ -7088,8 +7042,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784
@@ -7182,8 +7135,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+56]{1to8},0
 vpxorq zmm7,zmm7,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+64]{1to8},0
 vpxorq zmm8,zmm8,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -7215,8 +7167,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+128]{1to8},0
 vpxorq zmm16,zmm16,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+136]{1to8},0
 vpxorq zmm17,zmm17,zmm31
 vmovdqu64 zmm27, [r8+128]
@@ -7254,8 +7205,7 @@ vpxorq zmm31,zmm28,zmm30
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+200]{1to8},0
 vpxorq zmm25,zmm25,zmm31
 vpxorq zmm31,zmm27,zmm28
-vpxorq zmm31,zmm31,zmm29
-vpxorq zmm31,zmm31,zmm30
+vpternlogq zmm31,zmm29,zmm30,0x96
 vgf2p8affineqb zmm31,zmm31,QWORD PTR [r9+208]{1to8},0
 vpxorq zmm26,zmm26,zmm31
 add r8,118784

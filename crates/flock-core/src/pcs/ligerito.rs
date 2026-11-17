@@ -2858,7 +2858,9 @@ impl Gl2DualStream {
         let cw = unsafe { self.codeword.get() };
         let base = query & !(cache_len - 1);
         let qoff = query - base;
-        let block = &cw[base * ni..(base + cache_len) * ni];
+        // Physical rows of the aligned run (page-blocked ranked codeword).
+        let pb = crate::ntt::additive_ntt_f128::L0Rows::of(cw).aligned_run(base, cache_len);
+        let block = &cw[pb * ni..(pb + cache_len) * ni];
         let mut cached = [F128::ZERO; 32];
         sparse_dual_lane_fold_block(block, &self.lane_weights, &mut cached[..cache_len], self.lane_x4);
         let c = cached[qoff];
@@ -3125,6 +3127,8 @@ impl SparseDualL0 {
             table
         };
         assert_eq!(alpha_pows.len(), queries.len());
+        // Physical rows of each aligned query run (page-blocked ranked codeword).
+        let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(l0_codeword);
 
         let cache_len = 1usize << (depth + 1);
         let ntt = AdditiveNttF128::standard(log_d);
@@ -3164,8 +3168,8 @@ impl SparseDualL0 {
                     .map(|(((&query, &alpha), w2_slot), out_rows)| {
                         let base = query & !(cache_len - 1);
                         let qoff = query - base;
-                        let block =
-                            &l0_codeword[base * num_interleaved..(base + cache_len) * num_interleaved];
+                        let pb = l0_layout.aligned_run(base, cache_len);
+                        let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
                         let mut cached = [F128::ZERO; 32];
                         sparse_dual_lane_fold_block(
                             block,
@@ -3214,8 +3218,8 @@ impl SparseDualL0 {
                 {
                     let base = query & !(cache_len - 1);
                     let qoff = query - base;
-                    let block =
-                        &l0_codeword[base * num_interleaved..(base + cache_len) * num_interleaved];
+                    let pb = l0_layout.aligned_run(base, cache_len);
+                    let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
                     let mut cached = [F128::ZERO; 32];
                     sparse_dual_lane_fold_block(
                         block,
@@ -3259,8 +3263,8 @@ impl SparseDualL0 {
                 .zip(inverse_local_blocks.par_iter_mut())
                 .map(|((&query, &alpha), cached)| {
                     let base = query & !(cache_len - 1);
-                    let block =
-                        &l0_codeword[base * num_interleaved..(base + cache_len) * num_interleaved];
+                    let pb = l0_layout.aligned_run(base, cache_len);
+                    let block = &l0_codeword[pb * num_interleaved..(pb + cache_len) * num_interleaved];
                     sparse_dual_lane_fold_block(
                         block,
                         &lane_weights,
@@ -5116,17 +5120,33 @@ fn round_msg_and_eval_lsb_factorized_eq(
         .expect("factorized OOD tail overflow");
     assert_eq!(f.len(), 2 * tail_len);
 
-    let (a, s) = f
-        .par_chunks(2 * eq_lo.len())
-        .zip(eq_hi.par_iter())
-        .map(|(chunk, &hi)| {
-            let (a, s) = factorized_eq_round0(chunk, eq_lo);
-            (a * hi, s * hi)
-        })
-        .reduce(
+    let chunk_len = 2 * eq_lo.len();
+    let (a, s) = if op_ood_team(eq_hi.len()) {
+        // Lane op: the deep levels' OOD pass (<= 64 chunks) as a hot-pool
+        // team region: the owner claims chunks itself and waits by spinning,
+        // so it never stalls in an unrelated stolen job (the background
+        // sparse-dual materialization). Same per-chunk values, XOR-summed.
+        crate::flat_par::team_map_reduce(
+            eq_hi.len(),
+            |c| {
+                let (a, s) = factorized_eq_round0(&f[c * chunk_len..(c + 1) * chunk_len], eq_lo);
+                (a * eq_hi[c], s * eq_hi[c])
+            },
             || (F128::ZERO, F128::ZERO),
             |(a0, s0), (a1, s1)| (a0 + a1, s0 + s1),
-        );
+        )
+    } else {
+        f.par_chunks(chunk_len)
+            .zip(eq_hi.par_iter())
+            .map(|(chunk, &hi)| {
+                let (a, s) = factorized_eq_round0(chunk, eq_lo);
+                (a * hi, s * hi)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, s0), (a1, s1)| (a0 + a1, s0 + s1),
+            )
+    };
     (
         SumcheckMessage {
             u_0: (F128::ONE + z_0) * a,
@@ -7094,6 +7114,30 @@ const ENV_NO_OPEN_INDUCE_DUAL2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL2";
 const ENV_OPEN_INDUCE_DUAL_DEPTH: &str = "FLOCK_OPEN_INDUCE_DUAL_DEPTH";
 const ENV_NO_OPEN_INDUCE_DUAL_DEPTH2: &str = "FLOCK_NO_OPEN_INDUCE_DUAL_DEPTH2";
 const RANKED_SPARSE_DUAL_DEFAULT_DEPTH: usize = 2;
+/// Lane op: with the background materialization on, the ranked L0 dual has
+/// depth 3 = the first recursive level's fold count, so its basis is
+/// complete after that level's last fold and only has to be in the combined
+/// basis by the next level's first fold (see [`op_bg_dual_enabled`]). The
+/// depth only changes when the same basis is materialized (every depth is
+/// exact).
+const OP_BG_SPARSE_DUAL_DEPTH: usize = 3;
+
+/// Lane op (`FLOCK_NO_OP_BGDUAL=1`: incumbent depth 2, materialized inside
+/// the fold join): when the L0 sparse dual reaches its depth at the last
+/// fold of a non-final level, its merge into the combined basis is first read
+/// by the next level's first fold (the next commit, OOD, queries and duals
+/// read only `f`, their own bases and the transcript; the round's message
+/// takes only the dual's round delta, computed in the join as before). The
+/// transposed sparse NTT that materializes the basis then runs as a detached
+/// job on idle hot-pool spinners while the next commit drains, and the next
+/// level's first fold adds it to the combined basis while folding (alpha 1:
+/// `fold(b + basis)`, the same field values as merging first). Same round
+/// messages, same transcript, same bytes. Read once.
+fn op_bg_dual_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OP_BGDUAL").is_none());
+    *ON
+}
 const ENV_NO_DEEP_INDUCE_DUAL: &str = "FLOCK_NO_DEEP_INDUCE_DUAL";
 #[cfg(test)]
 thread_local! {
@@ -7220,6 +7264,8 @@ fn ranked_sparse_dual_l0_depth_setting(
         })
         .unwrap_or(if depth2_disabled {
             SPARSE_DUAL_MAX_DEPTH
+        } else if op_bg_dual_enabled() {
+            OP_BG_SPARSE_DUAL_DEPTH
         } else {
             RANKED_SPARSE_DUAL_DEFAULT_DEPTH
         });
@@ -7555,12 +7601,254 @@ pub fn bench_direct_fold8_f_dense(
         });
 }
 
+/// Lane h3 (`FLOCK_NO_H3_F8_PIPE=1` restores fold64, then the commit).
+fn h3_f8_pipe_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_H3_F8_PIPE").is_none());
+    *ON
+}
+
+/// Lane h3: what [`h3_fold64_seed_pipeline`] did besides folding.
+enum H3Seeded {
+    /// `folded_f` is complete; the commit runs as before.
+    Folded,
+    /// `folded_f` is complete and `mat` holds the commit's seed6 layers.
+    Seeded { mat: Vec<F128>, ntt: AdditiveNttF128 },
+}
+
+/// Lane h3: run the elided witness's fold64 and the L1 commit's seed6 pass
+/// in one parallel region.
+///
+/// fold64 (regenerating z from root tiles) is compute-bound and leaves DRAM
+/// idle; the seed6 pass is bound by its 32 MiB of non-temporal stores. Every
+/// seed task reads only the message rows of its own positions (see
+/// `Seed6Plan::task_positions`), and every row is written by one known
+/// fold64 task group (`Fold64Tasks::row_group`). Workers claim from one
+/// ordered list — all fold64 tasks in order, each seed task placed
+/// `H3_PIPE_LAG` groups after the last group it reads — and a seed task
+/// waits (acquire) until its groups' tasks have all finished (release).
+/// Claims are ordered and every claimed task is running, so the wait always
+/// ends. Each fold64 task and each seed task is the incumbent task body on
+/// the same inputs, so `folded_f` and the seeded codeword are bit-identical;
+/// the deep pass then runs exactly as in `rs_encode_interleaved_on_range_done`.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
-    target_feature = "avx512vbmi",
-    target_feature = "vpclmulqdq",
-    target_feature = "gfni"
+    target_feature = "vpclmulqdq"
+))]
+fn h3_fold64_seed_pipeline(
+    packed_witness: &[F128],
+    folded_f: &mut [F128],
+    fold16_weight: &[F128; 16],
+    r4: F128,
+    r5: F128,
+    precommit: &DirectFold8L1Precommit,
+) -> Option<H3Seeded> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    const H3_PIPE_LAG: usize = 2;
+    if !h3_f8_pipe_enabled()
+        || !crate::pcs::commit::lig_fused_commit_enabled()
+        || crate::gpu::merkle::available()
+        || !super::elided_z::is_elided(packed_witness)
+    {
+        return None;
+    }
+    let num_ntts = 1usize << precommit.log_num_interleaved;
+    let msg_len = folded_f.len();
+    if msg_len != num_ntts << precommit.log_msg_cols {
+        return None;
+    }
+    let codeword_len = msg_len << precommit.log_inv_rate;
+    let ntt = AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
+    let mut mat = crate::scratch::take_f128(codeword_len);
+    let nt = match ntt.seed6_route(msg_len, &mat, num_ntts) {
+        Some((log_inv_rate, nt)) if log_inv_rate == precommit.log_inv_rate => nt,
+        _ => {
+            crate::scratch::give_f128(mat);
+            return None;
+        }
+    };
+    let regen = super::elided_z::take(packed_witness).expect("elided witness has a regenerator");
+    let e4 = [F128::ONE + r4, r4];
+    let e5 = [F128::ONE + r5, r5];
+    let w: [F128; 64] = std::array::from_fn(|i| {
+        let s = i >> 4;
+        fold16_weight[i & 15] * e4[s & 1] * e5[s >> 1]
+    });
+    assert_eq!(folded_f.len() * 64, packed_witness.len());
+    let Some(tasks) = regen.fold64_tasks(&w) else {
+        crate::scratch::give_f128(mat);
+        regen.fold64(folded_f, &w);
+        return Some(H3Seeded::Folded);
+    };
+    let plan = ntt.seed6_plan(msg_len, codeword_len, num_ntts, precommit.log_inv_rate);
+    let (n_prod, groups, n_cons) = (tasks.len(), tasks.groups(), plan.tasks());
+    assert!(groups >= 1 && groups <= 64 && n_prod % groups == 0);
+    // A fold64 output row (8 F128) is one seed position (`num_ntts` F128).
+    assert_eq!(num_ntts, 8);
+    let per_group = n_prod / groups;
+    // Group mask each seed task reads: pure geometry, built once.
+    static DEPS: std::sync::OnceLock<(usize, usize, usize, Vec<u64>)> = std::sync::OnceLock::new();
+    let deps = DEPS.get_or_init(|| {
+        let masks = (0..n_cons)
+            .map(|t| plan.task_positions(t).fold(0u64, |m, p| m | 1u64 << tasks.row_group(p)))
+            .collect();
+        (n_prod, groups, n_cons, masks)
+    });
+    if deps.0 != n_prod || deps.1 != groups || deps.2 != n_cons {
+        crate::scratch::give_f128(mat);
+        // SAFETY: `folded_f` is the full output; every task runs once.
+        let out = folded_f.as_mut_ptr() as usize;
+        (0..n_prod).into_par_iter().for_each(|u| unsafe { tasks.run(u, out as *mut F128) });
+        return Some(H3Seeded::Folded);
+    }
+    let masks = &deps.3;
+    // Claim order: fold64 tasks in order; a seed task right after the
+    // fold64 tasks of group (its last group + LAG).
+    let mut seq: Vec<u32> = Vec::with_capacity(n_prod + n_cons);
+    let mut by_group: Vec<Vec<u32>> = vec![Vec::new(); groups];
+    for (t, &m) in masks.iter().enumerate() {
+        let last = 63 - m.leading_zeros() as usize;
+        by_group[(last + H3_PIPE_LAG).min(groups - 1)].push(t as u32);
+    }
+    const CONS: u32 = 1 << 31;
+    for (g, cons) in by_group.iter().enumerate() {
+        seq.extend((g * per_group..(g + 1) * per_group).map(|u| u as u32));
+        seq.extend(cons.iter().map(|&t| t | CONS));
+    }
+    let done: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let out = folded_f.as_mut_ptr() as usize;
+    let cw = mat.as_mut_ptr() as usize;
+    let (tasks, plan, seq, done, next) = (&*tasks, &plan, &seq, &done, &next);
+    (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
+        let mut buf: Option<Vec<F128>> = None;
+        loop {
+            let s = next.fetch_add(1, Ordering::Relaxed);
+            if s >= seq.len() {
+                break;
+            }
+            let item = seq[s];
+            if item & CONS == 0 {
+                let u = item as usize;
+                // SAFETY: `out` is the full fold64 output; `u` is claimed once.
+                unsafe { tasks.run(u, out as *mut F128) };
+                done[u / per_group].fetch_add(1, Ordering::Release);
+            } else {
+                let t = (item & !CONS) as usize;
+                let mut m = masks[t];
+                while m != 0 {
+                    let g = m.trailing_zeros() as usize;
+                    while done[g].load(Ordering::Acquire) < per_group as u32 {
+                        core::hint::spin_loop();
+                    }
+                    m &= m - 1;
+                }
+                let b = buf.get_or_insert_with(|| plan.staging());
+                // SAFETY: every message row task `t` reads is final (its
+                // groups are done); `t` is claimed once and writes only its
+                // own codeword rows; NT stores are fenced right after.
+                unsafe {
+                    if nt {
+                        plan.run::<true>(out as *const F128, cw as *mut F128, t, b);
+                        core::arch::x86_64::_mm_sfence();
+                    } else {
+                        plan.run::<false>(out as *const F128, cw as *mut F128, t, b);
+                    }
+                }
+            }
+        }
+    });
+    for d in done.iter() {
+        assert_eq!(d.load(Ordering::Acquire), per_group as u32, "fold64 task group incomplete");
+    }
+    Some(H3Seeded::Seeded { mat, ntt })
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+fn h3_fold64_seed_pipeline(
+    _packed_witness: &[F128],
+    _folded_f: &mut [F128],
+    _fold16_weight: &[F128; 16],
+    _r4: F128,
+    _r5: F128,
+    _precommit: &DirectFold8L1Precommit,
+) -> Option<H3Seeded> {
+    None
+}
+
+/// Lane h3: [`ligero_commit`]'s fused route for a codeword whose seed6
+/// layers [`h3_fold64_seed_pipeline`] already applied.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+fn ligero_commit_after_seed6(
+    poly: &[F128],
+    mut mat: Vec<F128>,
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+) -> LigeroWitness {
+    let msg_cols = 1usize << log_msg_cols;
+    let num_interleaved = 1usize << log_num_interleaved;
+    let block_len = msg_cols << log_inv_rate;
+    let log_block_len = log_msg_cols + log_inv_rate;
+    assert_eq!(poly.len(), num_interleaved * msg_cols);
+    assert_eq!(mat.len(), block_len * num_interleaved);
+    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
+    crate::rstrace::ev("lc:start", log_block_len as u32);
+    let mut tree = crate::pcs::commit::take_tree(2 * block_len - 1);
+    let folded = crate::pcs::commit::fused_leaves_subtree_after_seed6(
+        ntt,
+        log_inv_rate,
+        &mut mat,
+        num_interleaved,
+        &mut tree,
+        block_len,
+        leaf_size_bytes,
+        kind,
+    );
+    crate::rstrace::ev("lc:fused", log_block_len as u32);
+    crate::pcs::commit::build_upper_levels(&mut tree, block_len, block_len >> folded, kind);
+    crate::rstrace::ev("lc:end", log_block_len as u32);
+    LigeroWitness {
+        mat,
+        tree,
+        block_len,
+        num_interleaved,
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+fn ligero_commit_after_seed6(
+    _poly: &[F128],
+    _mat: Vec<F128>,
+    _log_msg_cols: usize,
+    _log_num_interleaved: usize,
+    _log_inv_rate: usize,
+    _ntt: &AdditiveNttF128,
+    _kind: HashKind,
+) -> LigeroWitness {
+    unreachable!("the h3 seed pipeline is x86 AVX-512 only")
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
 ))]
 fn materialize_direct_fold8_f_for_precommit(
     packed_witness: &[F128],
@@ -7945,14 +8233,26 @@ fn materialize_direct_fold8(
             crate::rstrace::ev("f8s:start", 0);
             let mut folded_f = crate::scratch::take_f128(out_len);
             let t_f8a = t_f8.elapsed();
-            materialize_direct_fold8_f_for_precommit(
+            // Lane h3: fold64 and the L1 commit's seed pass in one region
+            // (see `h3_fold64_seed_pipeline`); `None` folded nothing.
+            let h3_seeded = h3_fold64_seed_pipeline(
                 &packed_witness,
                 &mut folded_f,
-                block_len,
                 &fold16_weight,
                 r4,
                 r5,
+                &precommit,
             );
+            if h3_seeded.is_none() {
+                materialize_direct_fold8_f_for_precommit(
+                    &packed_witness,
+                    &mut folded_f,
+                    block_len,
+                    &fold16_weight,
+                    r4,
+                    r5,
+                );
+            }
             if open_timing() {
                 eprintln!("[f8] take {:.3} ms, f-fold {:.3} ms over {} MiB in",
                     t_f8a.as_secs_f64()*1e3, (t_f8.elapsed()-t_f8a).as_secs_f64()*1e3, packed_witness.len()*16>>20);
@@ -7964,17 +8264,29 @@ fn materialize_direct_fold8(
             crate::scratch::give_f128(ordinary_basis);
 
             let (precommitted, (folded_b, msg)) = rayon::join(
-                || {
-                    let ntt =
-                        AdditiveNttF128::standard(precommit.log_msg_cols + precommit.log_inv_rate);
-                    ligero_commit(
+                || match h3_seeded {
+                    Some(H3Seeded::Seeded { mat, ntt }) => ligero_commit_after_seed6(
                         &folded_f,
+                        mat,
                         precommit.log_msg_cols,
                         precommit.log_num_interleaved,
                         precommit.log_inv_rate,
                         &ntt,
                         precommit.kind,
-                    )
+                    ),
+                    Some(H3Seeded::Folded) | None => {
+                        let ntt = AdditiveNttF128::standard(
+                            precommit.log_msg_cols + precommit.log_inv_rate,
+                        );
+                        ligero_commit(
+                            &folded_f,
+                            precommit.log_msg_cols,
+                            precommit.log_num_interleaved,
+                            precommit.log_inv_rate,
+                            &ntt,
+                            precommit.kind,
+                        )
+                    }
                 },
                 || {
                     let r = materialize_direct_fold8_b_gfni_for_precommit(
@@ -8467,6 +8779,18 @@ impl SumcheckProver {
         self.pending_fold_basis = Some((basis, alpha));
     }
 
+    /// Lane op: add a materialized sparse-dual basis (alpha 1) to the
+    /// combined basis inside the next fold, after this level's OOD and dual
+    /// introductions (which read only `f` and their own bases). The fold
+    /// computes `fold(b + basis)`, the same field values as merging first.
+    fn attach_folded_sparse_dual(&mut self, basis: Vec<F128>) {
+        assert!(self.pending_glue.is_none());
+        assert!(!matches!(self.pending_ood_eq, Some(PendingOodEq::Introduced { .. })));
+        assert!(self.pending_fold_basis.is_none());
+        assert_eq!(basis.len(), self.combined_basis.len());
+        self.pending_fold_basis = Some((basis, F128::ONE));
+    }
+
     fn merge_folded_sparse_dual(&mut self, basis: Vec<F128>) {
         use rayon::prelude::*;
         assert!(self.pending_glue.is_none());
@@ -8625,6 +8949,16 @@ impl SumcheckProver {
 }
 
 
+/// Lane op (`FLOCK_NO_OP_OODTEAM=1`: rayon route): run a factorized OOD pass
+/// of `chunks` chunks on the hot-pool team when the caller owns a live team.
+fn op_ood_team(chunks: usize) -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OP_OODTEAM").is_none());
+    *ON && (2..=64).contains(&chunks)
+        && crate::flat_par::team_enabled()
+        && crate::flat_par::team_ready()
+}
+
 /// Lane opus-pcs: `FLOCK_NO_OPUS_DUAL_JOIN=1` runs the sparse duals' fold
 /// step after `sc_prover.fold` (incumbent order) instead of beside it.
 /// Read once.
@@ -8640,6 +8974,9 @@ fn opus_dual_join_enabled() -> bool {
 struct SparseDualFoldWork {
     l0_delta: Option<SumcheckMessage>,
     l0_basis: Option<Vec<F128>>,
+    /// Lane op: the L0 dual reached its depth but its materialization was
+    /// left to the caller (`defer_l0`).
+    l0_left: bool,
     /// Sum of the deep duals' round deltas (F128 addition is XOR, so the
     /// sum equals adding them one by one; no per-round Vec).
     deep_delta: Option<SumcheckMessage>,
@@ -8665,10 +9002,12 @@ fn sparse_duals_fold_step(
     l0: &mut Option<(SparseDualL0, Vec<F128>)>,
     deep: &mut [(SparseDualL0, Vec<F128>)],
     ri: F128,
+    defer_l0: bool,
 ) -> SparseDualFoldWork {
     let mut work = SparseDualFoldWork {
         l0_delta: None,
         l0_basis: None,
+        l0_left: false,
         deep_delta: None,
         deep_basis: None,
     };
@@ -8678,10 +9017,14 @@ fn sparse_duals_fold_step(
             work.l0_delta = Some(dual.round_msg_step(fold_challenges));
         }
         if fold_challenges.len() == dual.depth {
-            work.l0_basis = Some(dual.materialize_after_folds(fold_challenges));
+            if defer_l0 {
+                work.l0_left = true;
+            } else {
+                work.l0_basis = Some(dual.materialize_after_folds(fold_challenges));
+            }
         }
     }
-    let l0_materialized_here = work.l0_basis.is_some();
+    let l0_materialized_here = work.l0_basis.is_some() || work.l0_left;
     for (dual, fold_challenges) in deep.iter_mut() {
         fold_challenges.push(ri);
         if fold_challenges.len() <= dual.depth {
@@ -8797,25 +9140,45 @@ struct Gl2Pad(std::sync::atomic::AtomicUsize);
 #[derive(Clone, Copy)]
 struct Gl2Line([usize; 8]);
 
-/// A detached open-arm gather. Claimed exactly once (by the rayon job or by
+/// A detached open-arm job (an opened-rows gather, or lane op's background
+/// sparse-dual materialization). Claimed exactly once (by the rayon job or by
 /// the waiter, whichever comes first), so a waiter never blocks on a job that
 /// no worker has started.
 #[repr(align(128))]
-struct Gl2Deferred {
+struct Gl2Deferred<T = Gl2Opened> {
     state: std::sync::atomic::AtomicU8,
-    job: std::cell::UnsafeCell<Option<Box<dyn FnOnce() -> Gl2Opened + Send>>>,
-    out: std::cell::UnsafeCell<Option<Gl2Opened>>,
+    job: std::cell::UnsafeCell<Option<Box<dyn FnOnce() -> T + Send>>>,
+    out: std::cell::UnsafeCell<Option<T>>,
     side: std::sync::Mutex<Option<crate::hot_pool::side::Task>>,
 }
 
 // SAFETY: `job` is taken only by the thread that wins the 0 -> 1 claim, `out`
 // is written by that thread before the release store of 2 and read only after
 // an acquire load of 2.
-unsafe impl Sync for Gl2Deferred {}
-unsafe impl Send for Gl2Deferred {}
+unsafe impl<T: Send> Sync for Gl2Deferred<T> {}
+unsafe impl<T: Send> Send for Gl2Deferred<T> {}
 
-impl Gl2Deferred {
-    fn spawn(job: Box<dyn FnOnce() -> Gl2Opened + Send>) -> std::sync::Arc<Self> {
+impl<T: Send + 'static> Gl2Deferred<T> {
+    fn spawn(job: Box<dyn FnOnce() -> T + Send>) -> std::sync::Arc<Self> {
+        Self::spawn_inner(job, false, None)
+    }
+
+    /// [`Self::spawn`] for compute-heavy jobs: the open owner's SMT sibling
+    /// never claims it (the owner's serial steps, e.g. the query draws, are
+    /// latency-bound BLAKE3 chains on that core), and with a `gate` no
+    /// spinner claims it before the gate opens (the waiter always may).
+    fn spawn_off_sibling(
+        job: Box<dyn FnOnce() -> T + Send>,
+        gate: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) -> std::sync::Arc<Self> {
+        Self::spawn_inner(job, true, gate)
+    }
+
+    fn spawn_inner(
+        job: Box<dyn FnOnce() -> T + Send>,
+        skip_sib: bool,
+        gate: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) -> std::sync::Arc<Self> {
         let d = std::sync::Arc::new(Self {
             state: std::sync::atomic::AtomicU8::new(0),
             job: std::cell::UnsafeCell::new(Some(job)),
@@ -8826,8 +9189,11 @@ impl Gl2Deferred {
             // Run by an idle hot-pool spinner; never popped by the owner's
             // own join waits (a `rayon::spawn` lands on the owner's deque).
             let d2 = d.clone();
-            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |_sib: bool| {
-                if d2.state.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            let t: crate::hot_pool::side::Task = std::sync::Arc::new(move |sib: bool| {
+                if !(skip_sib && sib)
+                    && d2.state.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && gate.as_ref().is_none_or(|g| g())
+                {
                     d2.run();
                 }
             });
@@ -8856,7 +9222,7 @@ impl Gl2Deferred {
         self.side.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
-    fn wait(&self) -> Option<Gl2Opened> {
+    fn wait(&self) -> Option<T> {
         use std::sync::atomic::Ordering;
         self.run();
         while self.state.load(Ordering::Acquire) != 2 {
@@ -9045,6 +9411,8 @@ fn merkle_multi_proof_for_l0(
     use rayon::prelude::*;
     let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
     let leaf_size = num_interleaved * core::mem::size_of::<F128>();
+    // Leaf `i` is codeword row `l0_layout.row(i)` (page-blocked ranked codeword).
+    let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(codeword);
     let bytes = unsafe {
         core::slice::from_raw_parts(
             codeword.as_ptr().cast::<u8>(),
@@ -9066,6 +9434,13 @@ fn merkle_multi_proof_for_l0(
         let (leaf_out, stored_out) = proof.split_at_mut(leaf_siblings);
         let leaf_indices = &indices[..leaf_siblings];
         let stored_indices = &indices[leaf_siblings..];
+        let leaf_rows: Vec<usize>;
+        let leaf_indices = if l0_layout.is_blocked() {
+            leaf_rows = leaf_indices.iter().map(|&i| l0_layout.row(i)).collect();
+            &leaf_rows[..]
+        } else {
+            leaf_indices
+        };
         rayon::join(
             || merkle::hash_indexed_blake3_1k(bytes, leaf_indices, leaf_out),
             || {
@@ -9089,7 +9464,7 @@ fn merkle_multi_proof_for_l0(
 
     let gather = |&i: &usize| {
         if i < block_len {
-            let start = i * leaf_size;
+            let start = l0_layout.row(i) * leaf_size;
             merkle::hash_leaf(&bytes[start..start + leaf_size], kind)
         } else {
             tree[i - block_len]
@@ -9532,8 +9907,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_root: Hash = l0_tree[l0_tree.len() - 1];
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
+    // Opened row `q` is codeword row `l0_layout.row(q)` (page-blocked
+    // ranked codeword; the identity otherwise).
+    let l0_layout = crate::ntt::additive_ntt_f128::L0Rows::of(l0_codeword);
     let l0_row = |q: usize| -> &[F128] {
-        let start = q * l0_num_interleaved;
+        let start = l0_layout.row(q) * l0_num_interleaved;
         &l0_codeword[start..start + l0_num_interleaved]
     };
     challenger.observe_bytes(&initial_root);
@@ -9942,7 +10320,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 // SAFETY: the L0 tree / codeword are borrowed for the whole
                 // open; `gl2_jobs` waits for this job before it returns.
                 let (tree, cw) = unsafe { (tree_p.get(), cw_p.get()) };
-                let rows = gather_opened_rows(&qs, |q| &cw[q * ni..(q + 1) * ni], serial_par_enabled());
+                let lay = crate::ntt::additive_ntt_f128::L0Rows::of(cw);
+                let rows = gather_opened_rows(&qs, |q| { let q = lay.row(q); &cw[q * ni..(q + 1) * ni] }, serial_par_enabled());
                 let mp = merkle_multi_proof_for_l0(tree, cw, bl, ni, &qs, kind);
                 crate::rstrace::evd("L1:deferred", 0);
                 (rows, mp)
@@ -10071,6 +10450,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut active_deep_duals: Vec<(SparseDualL0, Vec<F128>)> = Vec::with_capacity(2);
 
     let mut gl2_tail: Option<crate::hot_pool::side::Task> = None;
+    // Lane op: a sparse dual's basis materializing off the critical path
+    // (`op_bg_dual_enabled`), consumed by the next level's first fold.
+    let mut op_bg_job: Option<std::sync::Arc<Gl2Deferred<Vec<F128>>>> = None;
     for i in 0..r {
         if i + 2 == r || r == 1 {
             // Lane gl2: the publisher's tail hook, run by an idle spinner
@@ -10112,19 +10494,34 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // query-sized round steps is cheaper inline than a join.
             let join_pays = sc_prover.f().len() >= (1 << 13)
                 || sparse_duals_materialize_next(&active_sparse_dual_0, &active_deep_duals);
+            // Lane op: the L0 dual reaching its depth at this level's last fold
+            // materializes in the background (the next level's first fold adds
+            // it to the combined basis).
+            let defer_l0 = op_bg_dual_enabled() && j + 1 == k_i && i + 1 < r;
+            // Lane op: a background basis joins this level's first fold.
+            if j == 0 {
+                if let Some(job) = op_bg_job.take() {
+                    gl2_side_done.extend(job.take_side());
+                    let basis = job.wait().expect("background sparse-dual materialization panicked");
+                    sc_prover.attach_folded_sparse_dual(basis);
+                }
+            }
             let (mut msg, dual_work) = if has_dual_work && join_pays && opus_dual_join_enabled() {
                 let (l0, deep, scp) =
                     (&mut active_sparse_dual_0, &mut active_deep_duals, &mut sc_prover);
                 let (work, msg) =
-                    rayon::join(|| sparse_duals_fold_step(l0, deep, ri), || scp.fold(ri));
+                    rayon::join(|| sparse_duals_fold_step(l0, deep, ri, defer_l0), || scp.fold(ri));
                 (msg, work)
             } else {
                 let msg = sc_prover.fold(ri);
-                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri))
+                (msg, sparse_duals_fold_step(&mut active_sparse_dual_0, &mut active_deep_duals, ri, defer_l0))
             };
             if let Some(delta) = dual_work.l0_delta {
                 msg = sc_prover.add_to_last_message(delta);
             }
+            // Lane op: the L0 dual whose materialization was left to us (its
+            // round delta was applied above, as before).
+            let left = if dual_work.l0_left { active_sparse_dual_0.take() } else { None };
             if let Some(basis) = dual_work.l0_basis {
                 if j + 1 < k_i {
                     sc_prover.defer_folded_sparse_dual(basis, F128::ONE);
@@ -10146,6 +10543,20 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 }
                 active_deep_duals
                     .retain(|(dual, fold_challenges)| fold_challenges.len() < dual.depth);
+            }
+            if let Some((dual, fold_challenges)) = left {
+                assert!(op_bg_job.is_none(), "one background basis per level");
+                // Claimable by spinners once a sub-group of the next level's
+                // commit has finished (no fused commit runs before it), so
+                // every sub-group already has a worker; the next level's
+                // first fold waits for it (and runs it if still unclaimed).
+                let base = crate::pcs::commit::subs_done();
+                let gate: Box<dyn Fn() -> bool + Send + Sync> =
+                    Box::new(move || crate::pcs::commit::subs_done() != base);
+                op_bg_job = Some(Gl2Deferred::spawn_off_sibling(
+                    Box::new(move || dual.materialize_after_folds(&fold_challenges)),
+                    Some(gate),
+                ));
             }
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
@@ -13885,7 +14296,8 @@ mod tests {
 
     #[test]
     fn sparse_dual_ranked_depth2_default_rollback_and_explicit_priority() {
-        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), 2);
+        let default = if op_bg_dual_enabled() { OP_BG_SPARSE_DUAL_DEPTH } else { 2 };
+        assert_eq!(ranked_sparse_dual_l0_depth_setting(None, false), default);
         assert_eq!(ranked_sparse_dual_l0_depth_setting(None, true), 4);
         for depth in 1..=4 {
             let value = depth.to_string();

@@ -582,6 +582,9 @@ pub struct Round1AbInner {
     /// Lane ab1: the ranked compact producer wrote the hole-free layout (see
     /// [`ab1_hole_layout_enabled`]); only the round-one leaf kernels read it.
     ab1_hole_layout: bool,
+    /// tc: the ranked projection wrote the transpose-contract line layout
+    /// (see [`Self::set_tc_layout`]); only round one's tc band fold reads it.
+    tc_layout: bool,
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -683,6 +686,7 @@ impl Round1AbInner {
             ranked_compact: false,
             ranked_w30_elided: false,
             ab1_hole_layout: false,
+            tc_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -712,6 +716,7 @@ impl Round1AbInner {
             ranked_compact: true,
             ranked_w30_elided: false,
             ab1_hole_layout: false,
+            tc_layout: false,
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -766,10 +771,79 @@ impl Round1AbInner {
         self.ab1_hole_layout = true;
     }
 
+    /// tc: brand the storage as written in the transpose-contract layout.
+    /// Octa `b` (bit 10 and bits 16.. of `b` clear) owns compact rows
+    /// `row(s) = b + (s >> 1) * 65536 + (s & 1) * 1024` for lanes `s = 0..8`.
+    /// For every live window line, lane `s = 2q + h` stores at byte `4d + k`
+    /// the incumbent byte `16q + d` of lane `2k + h`'s line. Lanes `h` and
+    /// `2k + h` sit in the same round-one group and pair, so every round-one
+    /// band reads lines of one group's matrices; the band-end eq_hi fold
+    /// undoes the byte map (`fold_ab_plane_banks_tc_x86_avx512`).
+    pub fn set_tc_layout(&mut self) {
+        assert!(self.ranked_compact && self.ranked_one_rows_elided && self.ranked_w30_elided);
+        assert_eq!(self.invalid_prefix_bytes, 0);
+        self.tc_layout = true;
+    }
+
+    /// Whether the storage holds the tc layout.
+    #[inline]
+    pub fn tc_layout(&self) -> bool {
+        self.tc_layout
+    }
+
+    /// Undo the tc layout in place (exact inverse byte permutation inside
+    /// each octa's eight lines per window), for any consumer other than the
+    /// tc band fold. Cold: only kill switches and gate mismatches reach it.
+    pub(crate) fn restore_tc_layout(&mut self) {
+        use rayon::prelude::*;
+        if !self.tc_layout {
+            return;
+        }
+        self.tc_layout = false;
+        assert!(self.ranked_compact);
+        let ab1 = self.ab1_hole_layout;
+        let bytes = self.as_bytes_mut();
+        assert_eq!(bytes.len(), (1usize << 18) * RANKED_AB_COMPACT_BLOCK_BYTES);
+        let base = bytes.as_mut_ptr() as usize;
+        let row_at = move |row: usize| {
+            if ab1 { ab1_row_offset(row) } else { row * RANKED_AB_COMPACT_BLOCK_BYTES }
+        };
+        (0..1usize << 15).into_par_iter().for_each(|o| {
+            let b = (o & 1023) | ((o >> 10) << 11);
+            let rows: [usize; 8] = core::array::from_fn(|s| row_at(b + (s >> 1) * 65536 + (s & 1) * 1024));
+            for w in 0..AB1_ROW_LIVE / ELL {
+                let mut lines = [[0u8; ELL]; 8];
+                // SAFETY: the octa's eight rows are disjoint from every other
+                // octa's; each line lies inside the checked storage.
+                unsafe {
+                    for s in 0..8 {
+                        core::ptr::copy_nonoverlapping((base + rows[s] + w * ELL) as *const u8, lines[s].as_mut_ptr(), ELL);
+                    }
+                }
+                let mut orig = [[0u8; ELL]; 8];
+                for qq in 0..4 {
+                    for h in 0..2 {
+                        for d in 0..16 {
+                            for k in 0..4 {
+                                orig[2 * k + h][16 * qq + d] = lines[2 * qq + h][4 * d + k];
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    for c in 0..8 {
+                        core::ptr::copy_nonoverlapping(orig[c].as_ptr(), (base + rows[c] + w * ELL) as *mut u8, ELL);
+                    }
+                }
+            }
+        });
+    }
+
     /// Undo the hole-free layout in place (exact inverse permutation of
     /// every 64-row block), for any consumer other than the leaf kernels.
     pub(crate) fn restore_ab1_hole_layout(&mut self) {
         use rayon::prelude::*;
+        self.restore_tc_layout();
         if !self.ab1_hole_layout {
             return;
         }
@@ -804,6 +878,7 @@ impl Round1AbInner {
         b_packed: &[u8],
         inv_table: &InvNttTableByteSingleGf8,
     ) {
+        self.restore_tc_layout();
         self.restore_ab1_hole_layout();
         if !self.ranked_one_rows_elided {
             return;
@@ -1040,6 +1115,7 @@ fn precompute_round1_ab_inner_packed_padded_impl(
         ranked_compact: false,
         ranked_w30_elided: false,
         ab1_hole_layout: false,
+        tc_layout: false,
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
@@ -3715,6 +3791,9 @@ pub(crate) struct WorkerStateAbOnly {
     pub(crate) local_res_ab: [F128; ELL],
     /// Lane ab1: band layout the leaf kernels read (0 = incumbent rows).
     ab1_layout: usize,
+    /// tc: this band's quarter and the eq_hi of the four bands its lanes
+    /// carry (`None`: incumbent layout and fold).
+    tc_band: Option<(usize, [F128; 4])>,
 }
 
 impl WorkerStateAbOnly {
@@ -3730,6 +3809,7 @@ impl WorkerStateAbOnly {
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             local_res_ab: [F128::ZERO; ELL],
             ab1_layout: 0,
+            tc_band: None,
         }
     }
 }
@@ -4323,15 +4403,26 @@ unsafe fn process_one_x_hi_ab_only_direct_x86(
     let wide = r1_eqfold_x4_enabled();
     if wide {
         unsafe {
-            kernels::x86_64::fold_ab_plane_banks_x86_avx512(
-                &mut state.plane_banks,
-                eq_bot,
-                eq_hi_val,
-                &mut state.local_res_ab,
-            );
+            if let Some((q, eq4)) = state.tc_band {
+                kernels::x86_64::fold_ab_plane_banks_tc_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    q,
+                    &eq4,
+                    &mut state.local_res_ab,
+                );
+            } else {
+                kernels::x86_64::fold_ab_plane_banks_x86_avx512(
+                    &mut state.plane_banks,
+                    eq_bot,
+                    eq_hi_val,
+                    &mut state.local_res_ab,
+                );
+            }
         }
         return;
     }
+    assert!(state.tc_band.is_none(), "tc layout requires the wide plane fold");
     fold_ab_plane_banks_fallback_cold(state, eq_bot, eq_hi_val, wide);
 }
 
@@ -4632,6 +4723,11 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     };
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vbmi", target_feature = "vpclmulqdq", target_feature = "gfni")))]
     let ab1_leaf_ok = false;
+    // tc: every band then ends in the wide plane fold, which has the tc twin.
+    let tc_bands = ab_inner.tc_layout && ab1_leaf_ok && hi_size == 128 && r1_eqfold_x4_enabled();
+    if ab_inner.tc_layout && !tc_bands {
+        ab_inner.restore_tc_layout();
+    }
     if ab_inner.ab1_hole_layout && !ab1_leaf_ok {
         ab_inner.restore_ab1_hole_layout();
     }
@@ -4650,6 +4746,10 @@ pub fn round1_shift_reduce_ab_packed_padded_with_precomputed_idle(
     let band = |state: &mut WorkerStateAbOnly, x_hi: usize| {
         crate::rstrace::evd("ab:b", x_hi as u32);
         state.ab1_layout = ab1_layout;
+        state.tc_band = tc_bands.then(|| {
+            let x0 = x_hi & 31;
+            (x_hi >> 5, [eq_hi[x0], eq_hi[x0 + 32], eq_hi[x0 + 64], eq_hi[x0 + 96]])
+        });
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx512f",

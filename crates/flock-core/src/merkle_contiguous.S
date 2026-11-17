@@ -1,3 +1,4 @@
+// Assembly hoists (resident FOUR, direct CV broadcasts, folded flags load, shuffle transposes) from e-man07 Yukon submission c84cbde1-0a50-442a-88e7-bb36f8508363 (carried unchanged; credit e-man07).
 // Derived from BLAKE3 1.8.6 c/blake3_avx512_x86-64_unix.S, under CC0-1.0.
 // Changed: contiguous fixed strides, no input pointer array, zero counter, full 16-input groups only.
 .text
@@ -47,61 +48,55 @@ flock_blake3_contiguous_64:
         cmove   eax, ebx
         mov     dword ptr [rsp+0x88], eax
         vmovdqu32 ymm16, ymmword ptr [rdi+rdx+-64]
-        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+448], 0x01
+        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+192], 0x01
         vmovdqu32 ymm17, ymmword ptr [rdi+rdx+0]
-        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+512], 0x01
+        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+256], 0x01
         vpunpcklqdq zmm8, zmm16, zmm17
         vpunpckhqdq zmm9, zmm16, zmm17
         vmovdqu32 ymm18, ymmword ptr [rdi+rdx+64]
-        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+576], 0x01
+        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+320], 0x01
         vmovdqu32 ymm19, ymmword ptr [rdi+rdx+128]
-        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+640], 0x01
+        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+384], 0x01
         vpunpcklqdq zmm10, zmm18, zmm19
         vpunpckhqdq zmm11, zmm18, zmm19
-        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+192]
+        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+448]
         vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+704], 0x01
-        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+256]
+        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+512]
         vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+768], 0x01
         vpunpcklqdq zmm12, zmm16, zmm17
         vpunpckhqdq zmm13, zmm16, zmm17
-        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+320]
+        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+576]
         vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+832], 0x01
-        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+384]
+        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+640]
         vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+896], 0x01
         vpunpcklqdq zmm14, zmm18, zmm19
         vpunpckhqdq zmm15, zmm18, zmm19
-        vmovdqa32 zmm27, zmmword ptr [.Lflock_contiguous_INDEX0+rip]
-        vmovdqa32 zmm31, zmmword ptr [.Lflock_contiguous_INDEX1+rip]
         vshufps zmm16, zmm8, zmm10, 136
         vshufps zmm17, zmm12, zmm14, 136
-        vmovdqa32 zmm20, zmm16
-        vpermt2d zmm16, zmm27, zmm17
-        vpermt2d zmm20, zmm31, zmm17
+        vshufi32x4 zmm20, zmm16, zmm17, 0xdd
+        vshufi32x4 zmm16, zmm16, zmm17, 0x88
         vshufps zmm17, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm21, zmm17
-        vpermt2d zmm17, zmm27, zmm30
-        vpermt2d zmm21, zmm31, zmm30
+        vshufi32x4 zmm21, zmm17, zmm30, 0xdd
+        vshufi32x4 zmm17, zmm17, zmm30, 0x88
         vshufps zmm18, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm22, zmm18
-        vpermt2d zmm18, zmm27, zmm8
-        vpermt2d zmm22, zmm31, zmm8
+        vshufi32x4 zmm22, zmm18, zmm8, 0xdd
+        vshufi32x4 zmm18, zmm18, zmm8, 0x88
         vshufps zmm19, zmm9, zmm11, 221
         vshufps zmm8, zmm13, zmm15, 221
-        vmovdqa32 zmm23, zmm19
-        vpermt2d zmm19, zmm27, zmm8
-        vpermt2d zmm23, zmm31, zmm8
+        vshufi32x4 zmm23, zmm19, zmm8, 0xdd
+        vshufi32x4 zmm19, zmm19, zmm8, 0x88
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+-32]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+480], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+224], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+32]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+544], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+288], 0x01
         vpunpcklqdq zmm8, zmm24, zmm25
         vpunpckhqdq zmm9, zmm24, zmm25
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+96]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+608], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+352], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+160]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+672], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+416], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
         prefetcht0 [rdi+rdx+128]
@@ -112,15 +107,15 @@ flock_blake3_contiguous_64:
         prefetcht0 [rdi+rdx+768]
         prefetcht0 [rdi+rdx+320]
         prefetcht0 [rdi+rdx+832]
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+224]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+480]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+736], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+288]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+544]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+800], 0x01
         vpunpcklqdq zmm12, zmm24, zmm25
         vpunpckhqdq zmm13, zmm24, zmm25
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+352]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+608]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+864], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+416]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+672]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+928], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
@@ -134,23 +129,20 @@ flock_blake3_contiguous_64:
         prefetcht0 [rdi+rdx+1088]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
-        vmovdqa32 zmm28, zmm24
-        vpermt2d zmm24, zmm27, zmm30
-        vpermt2d zmm28, zmm31, zmm30
+        vshufi32x4 zmm28, zmm24, zmm30, 0xdd
+        vshufi32x4 zmm24, zmm24, zmm30, 0x88
         vshufps zmm25, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm29, zmm25
-        vpermt2d zmm25, zmm27, zmm30
-        vpermt2d zmm29, zmm31, zmm30
+        vshufi32x4 zmm29, zmm25, zmm30, 0xdd
+        vshufi32x4 zmm25, zmm25, zmm30, 0x88
         vshufps zmm26, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm30, zmm26
-        vpermt2d zmm26, zmm27, zmm8
-        vpermt2d zmm30, zmm31, zmm8
+        vshufi32x4 zmm30, zmm26, zmm8, 0xdd
+        vshufi32x4 zmm26, zmm26, zmm8, 0x88
         vshufps zmm8, zmm9, zmm11, 221
         vshufps zmm10, zmm13, zmm15, 221
-        vpermi2d zmm27, zmm8, zmm10
-        vpermi2d zmm31, zmm8, zmm10
+        vshufi32x4 zmm27, zmm8, zmm10, 0x88
+        vshufi32x4 zmm31, zmm8, zmm10, 0xdd
         vpbroadcastd zmm8, dword ptr [.Lflock_contiguous_BLAKE3_IV_0+rip]
         vpbroadcastd zmm9, dword ptr [.Lflock_contiguous_BLAKE3_IV_1+rip]
         vpbroadcastd zmm10, dword ptr [.Lflock_contiguous_BLAKE3_IV_2+rip]
@@ -1057,61 +1049,55 @@ flock_blake3_contiguous_128:
         cmove   eax, ebx
         mov     dword ptr [rsp+0x88], eax
         vmovdqu32 ymm16, ymmword ptr [rdi+rdx+-64]
-        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+960], 0x01
+        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+448], 0x01
         vmovdqu32 ymm17, ymmword ptr [rdi+rdx+64]
-        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+1088], 0x01
+        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+576], 0x01
         vpunpcklqdq zmm8, zmm16, zmm17
         vpunpckhqdq zmm9, zmm16, zmm17
         vmovdqu32 ymm18, ymmword ptr [rdi+rdx+192]
-        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+1216], 0x01
+        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+704], 0x01
         vmovdqu32 ymm19, ymmword ptr [rdi+rdx+320]
-        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+1344], 0x01
+        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+832], 0x01
         vpunpcklqdq zmm10, zmm18, zmm19
         vpunpckhqdq zmm11, zmm18, zmm19
-        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+448]
+        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+960]
         vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+1472], 0x01
-        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+576]
+        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+1088]
         vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+1600], 0x01
         vpunpcklqdq zmm12, zmm16, zmm17
         vpunpckhqdq zmm13, zmm16, zmm17
-        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+704]
+        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+1216]
         vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+1728], 0x01
-        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+832]
+        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+1344]
         vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+1856], 0x01
         vpunpcklqdq zmm14, zmm18, zmm19
         vpunpckhqdq zmm15, zmm18, zmm19
-        vmovdqa32 zmm27, zmmword ptr [.Lflock_contiguous_INDEX0+rip]
-        vmovdqa32 zmm31, zmmword ptr [.Lflock_contiguous_INDEX1+rip]
         vshufps zmm16, zmm8, zmm10, 136
         vshufps zmm17, zmm12, zmm14, 136
-        vmovdqa32 zmm20, zmm16
-        vpermt2d zmm16, zmm27, zmm17
-        vpermt2d zmm20, zmm31, zmm17
+        vshufi32x4 zmm20, zmm16, zmm17, 0xdd
+        vshufi32x4 zmm16, zmm16, zmm17, 0x88
         vshufps zmm17, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm21, zmm17
-        vpermt2d zmm17, zmm27, zmm30
-        vpermt2d zmm21, zmm31, zmm30
+        vshufi32x4 zmm21, zmm17, zmm30, 0xdd
+        vshufi32x4 zmm17, zmm17, zmm30, 0x88
         vshufps zmm18, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm22, zmm18
-        vpermt2d zmm18, zmm27, zmm8
-        vpermt2d zmm22, zmm31, zmm8
+        vshufi32x4 zmm22, zmm18, zmm8, 0xdd
+        vshufi32x4 zmm18, zmm18, zmm8, 0x88
         vshufps zmm19, zmm9, zmm11, 221
         vshufps zmm8, zmm13, zmm15, 221
-        vmovdqa32 zmm23, zmm19
-        vpermt2d zmm19, zmm27, zmm8
-        vpermt2d zmm23, zmm31, zmm8
+        vshufi32x4 zmm23, zmm19, zmm8, 0xdd
+        vshufi32x4 zmm19, zmm19, zmm8, 0x88
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+-32]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+992], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+480], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+96]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1120], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+608], 0x01
         vpunpcklqdq zmm8, zmm24, zmm25
         vpunpckhqdq zmm9, zmm24, zmm25
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+224]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+1248], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+736], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+352]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1376], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+864], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
         prefetcht0 [rdi+rdx+128]
@@ -1122,15 +1108,15 @@ flock_blake3_contiguous_128:
         prefetcht0 [rdi+rdx+1408]
         prefetcht0 [rdi+rdx+512]
         prefetcht0 [rdi+rdx+1536]
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+480]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+992]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+1504], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+608]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+1120]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1632], 0x01
         vpunpcklqdq zmm12, zmm24, zmm25
         vpunpckhqdq zmm13, zmm24, zmm25
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+736]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+1248]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+1760], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+864]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+1376]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1888], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
@@ -1144,23 +1130,20 @@ flock_blake3_contiguous_128:
         prefetcht0 [rdi+rdx+2048]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
-        vmovdqa32 zmm28, zmm24
-        vpermt2d zmm24, zmm27, zmm30
-        vpermt2d zmm28, zmm31, zmm30
+        vshufi32x4 zmm28, zmm24, zmm30, 0xdd
+        vshufi32x4 zmm24, zmm24, zmm30, 0x88
         vshufps zmm25, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm29, zmm25
-        vpermt2d zmm25, zmm27, zmm30
-        vpermt2d zmm29, zmm31, zmm30
+        vshufi32x4 zmm29, zmm25, zmm30, 0xdd
+        vshufi32x4 zmm25, zmm25, zmm30, 0x88
         vshufps zmm26, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm30, zmm26
-        vpermt2d zmm26, zmm27, zmm8
-        vpermt2d zmm30, zmm31, zmm8
+        vshufi32x4 zmm30, zmm26, zmm8, 0xdd
+        vshufi32x4 zmm26, zmm26, zmm8, 0x88
         vshufps zmm8, zmm9, zmm11, 221
         vshufps zmm10, zmm13, zmm15, 221
-        vpermi2d zmm27, zmm8, zmm10
-        vpermi2d zmm31, zmm8, zmm10
+        vshufi32x4 zmm27, zmm8, zmm10, 0x88
+        vshufi32x4 zmm31, zmm8, zmm10, 0xdd
         vpbroadcastd zmm8, dword ptr [.Lflock_contiguous_BLAKE3_IV_0+rip]
         vpbroadcastd zmm9, dword ptr [.Lflock_contiguous_BLAKE3_IV_1+rip]
         vpbroadcastd zmm10, dword ptr [.Lflock_contiguous_BLAKE3_IV_2+rip]
@@ -2067,61 +2050,55 @@ flock_blake3_contiguous_256:
         cmove   eax, ebx
         mov     dword ptr [rsp+0x88], eax
         vmovdqu32 ymm16, ymmword ptr [rdi+rdx+-64]
-        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+1984], 0x01
+        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+960], 0x01
         vmovdqu32 ymm17, ymmword ptr [rdi+rdx+192]
-        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+2240], 0x01
+        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+1216], 0x01
         vpunpcklqdq zmm8, zmm16, zmm17
         vpunpckhqdq zmm9, zmm16, zmm17
         vmovdqu32 ymm18, ymmword ptr [rdi+rdx+448]
-        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+2496], 0x01
+        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+1472], 0x01
         vmovdqu32 ymm19, ymmword ptr [rdi+rdx+704]
-        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+2752], 0x01
+        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+1728], 0x01
         vpunpcklqdq zmm10, zmm18, zmm19
         vpunpckhqdq zmm11, zmm18, zmm19
-        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+960]
+        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+1984]
         vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+3008], 0x01
-        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+1216]
+        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+2240]
         vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+3264], 0x01
         vpunpcklqdq zmm12, zmm16, zmm17
         vpunpckhqdq zmm13, zmm16, zmm17
-        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+1472]
+        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+2496]
         vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+3520], 0x01
-        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+1728]
+        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+2752]
         vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+3776], 0x01
         vpunpcklqdq zmm14, zmm18, zmm19
         vpunpckhqdq zmm15, zmm18, zmm19
-        vmovdqa32 zmm27, zmmword ptr [.Lflock_contiguous_INDEX0+rip]
-        vmovdqa32 zmm31, zmmword ptr [.Lflock_contiguous_INDEX1+rip]
         vshufps zmm16, zmm8, zmm10, 136
         vshufps zmm17, zmm12, zmm14, 136
-        vmovdqa32 zmm20, zmm16
-        vpermt2d zmm16, zmm27, zmm17
-        vpermt2d zmm20, zmm31, zmm17
+        vshufi32x4 zmm20, zmm16, zmm17, 0xdd
+        vshufi32x4 zmm16, zmm16, zmm17, 0x88
         vshufps zmm17, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm21, zmm17
-        vpermt2d zmm17, zmm27, zmm30
-        vpermt2d zmm21, zmm31, zmm30
+        vshufi32x4 zmm21, zmm17, zmm30, 0xdd
+        vshufi32x4 zmm17, zmm17, zmm30, 0x88
         vshufps zmm18, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm22, zmm18
-        vpermt2d zmm18, zmm27, zmm8
-        vpermt2d zmm22, zmm31, zmm8
+        vshufi32x4 zmm22, zmm18, zmm8, 0xdd
+        vshufi32x4 zmm18, zmm18, zmm8, 0x88
         vshufps zmm19, zmm9, zmm11, 221
         vshufps zmm8, zmm13, zmm15, 221
-        vmovdqa32 zmm23, zmm19
-        vpermt2d zmm19, zmm27, zmm8
-        vpermt2d zmm23, zmm31, zmm8
+        vshufi32x4 zmm23, zmm19, zmm8, 0xdd
+        vshufi32x4 zmm19, zmm19, zmm8, 0x88
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+-32]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+2016], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+992], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+224]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+2272], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1248], 0x01
         vpunpcklqdq zmm8, zmm24, zmm25
         vpunpckhqdq zmm9, zmm24, zmm25
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+480]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+2528], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+1504], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+736]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+2784], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+1760], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
         prefetcht0 [rdi+rdx+128]
@@ -2132,15 +2109,15 @@ flock_blake3_contiguous_256:
         prefetcht0 [rdi+rdx+2688]
         prefetcht0 [rdi+rdx+896]
         prefetcht0 [rdi+rdx+2944]
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+992]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+2016]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+3040], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+1248]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+2272]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+3296], 0x01
         vpunpcklqdq zmm12, zmm24, zmm25
         vpunpckhqdq zmm13, zmm24, zmm25
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+1504]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+2528]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+3552], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+1760]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+2784]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+3808], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
@@ -2154,23 +2131,20 @@ flock_blake3_contiguous_256:
         prefetcht0 [rdi+rdx+3968]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
-        vmovdqa32 zmm28, zmm24
-        vpermt2d zmm24, zmm27, zmm30
-        vpermt2d zmm28, zmm31, zmm30
+        vshufi32x4 zmm28, zmm24, zmm30, 0xdd
+        vshufi32x4 zmm24, zmm24, zmm30, 0x88
         vshufps zmm25, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm29, zmm25
-        vpermt2d zmm25, zmm27, zmm30
-        vpermt2d zmm29, zmm31, zmm30
+        vshufi32x4 zmm29, zmm25, zmm30, 0xdd
+        vshufi32x4 zmm25, zmm25, zmm30, 0x88
         vshufps zmm26, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm30, zmm26
-        vpermt2d zmm26, zmm27, zmm8
-        vpermt2d zmm30, zmm31, zmm8
+        vshufi32x4 zmm30, zmm26, zmm8, 0xdd
+        vshufi32x4 zmm26, zmm26, zmm8, 0x88
         vshufps zmm8, zmm9, zmm11, 221
         vshufps zmm10, zmm13, zmm15, 221
-        vpermi2d zmm27, zmm8, zmm10
-        vpermi2d zmm31, zmm8, zmm10
+        vshufi32x4 zmm27, zmm8, zmm10, 0x88
+        vshufi32x4 zmm31, zmm8, zmm10, 0xdd
         vpbroadcastd zmm8, dword ptr [.Lflock_contiguous_BLAKE3_IV_0+rip]
         vpbroadcastd zmm9, dword ptr [.Lflock_contiguous_BLAKE3_IV_1+rip]
         vpbroadcastd zmm10, dword ptr [.Lflock_contiguous_BLAKE3_IV_2+rip]
@@ -3077,61 +3051,55 @@ flock_blake3_contiguous_512:
         cmove   eax, ebx
         mov     dword ptr [rsp+0x88], eax
         vmovdqu32 ymm16, ymmword ptr [rdi+rdx+-64]
-        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+4032], 0x01
+        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+1984], 0x01
         vmovdqu32 ymm17, ymmword ptr [rdi+rdx+448]
-        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+4544], 0x01
+        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+2496], 0x01
         vpunpcklqdq zmm8, zmm16, zmm17
         vpunpckhqdq zmm9, zmm16, zmm17
         vmovdqu32 ymm18, ymmword ptr [rdi+rdx+960]
-        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+5056], 0x01
+        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+3008], 0x01
         vmovdqu32 ymm19, ymmword ptr [rdi+rdx+1472]
-        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+5568], 0x01
+        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+3520], 0x01
         vpunpcklqdq zmm10, zmm18, zmm19
         vpunpckhqdq zmm11, zmm18, zmm19
-        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+1984]
+        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+4032]
         vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+6080], 0x01
-        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+2496]
+        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+4544]
         vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+6592], 0x01
         vpunpcklqdq zmm12, zmm16, zmm17
         vpunpckhqdq zmm13, zmm16, zmm17
-        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+3008]
+        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+5056]
         vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+7104], 0x01
-        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+3520]
+        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+5568]
         vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+7616], 0x01
         vpunpcklqdq zmm14, zmm18, zmm19
         vpunpckhqdq zmm15, zmm18, zmm19
-        vmovdqa32 zmm27, zmmword ptr [.Lflock_contiguous_INDEX0+rip]
-        vmovdqa32 zmm31, zmmword ptr [.Lflock_contiguous_INDEX1+rip]
         vshufps zmm16, zmm8, zmm10, 136
         vshufps zmm17, zmm12, zmm14, 136
-        vmovdqa32 zmm20, zmm16
-        vpermt2d zmm16, zmm27, zmm17
-        vpermt2d zmm20, zmm31, zmm17
+        vshufi32x4 zmm20, zmm16, zmm17, 0xdd
+        vshufi32x4 zmm16, zmm16, zmm17, 0x88
         vshufps zmm17, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm21, zmm17
-        vpermt2d zmm17, zmm27, zmm30
-        vpermt2d zmm21, zmm31, zmm30
+        vshufi32x4 zmm21, zmm17, zmm30, 0xdd
+        vshufi32x4 zmm17, zmm17, zmm30, 0x88
         vshufps zmm18, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm22, zmm18
-        vpermt2d zmm18, zmm27, zmm8
-        vpermt2d zmm22, zmm31, zmm8
+        vshufi32x4 zmm22, zmm18, zmm8, 0xdd
+        vshufi32x4 zmm18, zmm18, zmm8, 0x88
         vshufps zmm19, zmm9, zmm11, 221
         vshufps zmm8, zmm13, zmm15, 221
-        vmovdqa32 zmm23, zmm19
-        vpermt2d zmm19, zmm27, zmm8
-        vpermt2d zmm23, zmm31, zmm8
+        vshufi32x4 zmm23, zmm19, zmm8, 0xdd
+        vshufi32x4 zmm19, zmm19, zmm8, 0x88
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+-32]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+4064], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+2016], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+480]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+4576], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+2528], 0x01
         vpunpcklqdq zmm8, zmm24, zmm25
         vpunpckhqdq zmm9, zmm24, zmm25
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+992]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+5088], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+3040], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+1504]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+5600], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+3552], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
         prefetcht0 [rdi+rdx+128]
@@ -3142,15 +3110,15 @@ flock_blake3_contiguous_512:
         prefetcht0 [rdi+rdx+5248]
         prefetcht0 [rdi+rdx+1664]
         prefetcht0 [rdi+rdx+5760]
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+2016]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+4064]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+6112], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+2528]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+4576]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+6624], 0x01
         vpunpcklqdq zmm12, zmm24, zmm25
         vpunpckhqdq zmm13, zmm24, zmm25
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+3040]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+5088]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+7136], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+3552]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+5600]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+7648], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
@@ -3164,23 +3132,20 @@ flock_blake3_contiguous_512:
         prefetcht0 [rdi+rdx+7808]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
-        vmovdqa32 zmm28, zmm24
-        vpermt2d zmm24, zmm27, zmm30
-        vpermt2d zmm28, zmm31, zmm30
+        vshufi32x4 zmm28, zmm24, zmm30, 0xdd
+        vshufi32x4 zmm24, zmm24, zmm30, 0x88
         vshufps zmm25, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm29, zmm25
-        vpermt2d zmm25, zmm27, zmm30
-        vpermt2d zmm29, zmm31, zmm30
+        vshufi32x4 zmm29, zmm25, zmm30, 0xdd
+        vshufi32x4 zmm25, zmm25, zmm30, 0x88
         vshufps zmm26, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm30, zmm26
-        vpermt2d zmm26, zmm27, zmm8
-        vpermt2d zmm30, zmm31, zmm8
+        vshufi32x4 zmm30, zmm26, zmm8, 0xdd
+        vshufi32x4 zmm26, zmm26, zmm8, 0x88
         vshufps zmm8, zmm9, zmm11, 221
         vshufps zmm10, zmm13, zmm15, 221
-        vpermi2d zmm27, zmm8, zmm10
-        vpermi2d zmm31, zmm8, zmm10
+        vshufi32x4 zmm27, zmm8, zmm10, 0x88
+        vshufi32x4 zmm31, zmm8, zmm10, 0xdd
         vpbroadcastd zmm8, dword ptr [.Lflock_contiguous_BLAKE3_IV_0+rip]
         vpbroadcastd zmm9, dword ptr [.Lflock_contiguous_BLAKE3_IV_1+rip]
         vpbroadcastd zmm10, dword ptr [.Lflock_contiguous_BLAKE3_IV_2+rip]
@@ -4087,61 +4052,55 @@ flock_blake3_contiguous_1024:
         cmove   eax, ebx
         mov     dword ptr [rsp+0x88], eax
         vmovdqu32 ymm16, ymmword ptr [rdi+rdx+-64]
-        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+8128], 0x01
+        vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+4032], 0x01
         vmovdqu32 ymm17, ymmword ptr [rdi+rdx+960]
-        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+9152], 0x01
+        vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+5056], 0x01
         vpunpcklqdq zmm8, zmm16, zmm17
         vpunpckhqdq zmm9, zmm16, zmm17
         vmovdqu32 ymm18, ymmword ptr [rdi+rdx+1984]
-        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+10176], 0x01
+        vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+6080], 0x01
         vmovdqu32 ymm19, ymmword ptr [rdi+rdx+3008]
-        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+11200], 0x01
+        vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+7104], 0x01
         vpunpcklqdq zmm10, zmm18, zmm19
         vpunpckhqdq zmm11, zmm18, zmm19
-        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+4032]
+        vmovdqu32 ymm16, ymmword ptr [rdi+rdx+8128]
         vinserti64x4 zmm16, zmm16, ymmword ptr [rdi+rdx+12224], 0x01
-        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+5056]
+        vmovdqu32 ymm17, ymmword ptr [rdi+rdx+9152]
         vinserti64x4 zmm17, zmm17, ymmword ptr [rdi+rdx+13248], 0x01
         vpunpcklqdq zmm12, zmm16, zmm17
         vpunpckhqdq zmm13, zmm16, zmm17
-        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+6080]
+        vmovdqu32 ymm18, ymmword ptr [rdi+rdx+10176]
         vinserti64x4 zmm18, zmm18, ymmword ptr [rdi+rdx+14272], 0x01
-        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+7104]
+        vmovdqu32 ymm19, ymmword ptr [rdi+rdx+11200]
         vinserti64x4 zmm19, zmm19, ymmword ptr [rdi+rdx+15296], 0x01
         vpunpcklqdq zmm14, zmm18, zmm19
         vpunpckhqdq zmm15, zmm18, zmm19
-        vmovdqa32 zmm27, zmmword ptr [.Lflock_contiguous_INDEX0+rip]
-        vmovdqa32 zmm31, zmmword ptr [.Lflock_contiguous_INDEX1+rip]
         vshufps zmm16, zmm8, zmm10, 136
         vshufps zmm17, zmm12, zmm14, 136
-        vmovdqa32 zmm20, zmm16
-        vpermt2d zmm16, zmm27, zmm17
-        vpermt2d zmm20, zmm31, zmm17
+        vshufi32x4 zmm20, zmm16, zmm17, 0xdd
+        vshufi32x4 zmm16, zmm16, zmm17, 0x88
         vshufps zmm17, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm21, zmm17
-        vpermt2d zmm17, zmm27, zmm30
-        vpermt2d zmm21, zmm31, zmm30
+        vshufi32x4 zmm21, zmm17, zmm30, 0xdd
+        vshufi32x4 zmm17, zmm17, zmm30, 0x88
         vshufps zmm18, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm22, zmm18
-        vpermt2d zmm18, zmm27, zmm8
-        vpermt2d zmm22, zmm31, zmm8
+        vshufi32x4 zmm22, zmm18, zmm8, 0xdd
+        vshufi32x4 zmm18, zmm18, zmm8, 0x88
         vshufps zmm19, zmm9, zmm11, 221
         vshufps zmm8, zmm13, zmm15, 221
-        vmovdqa32 zmm23, zmm19
-        vpermt2d zmm19, zmm27, zmm8
-        vpermt2d zmm23, zmm31, zmm8
+        vshufi32x4 zmm23, zmm19, zmm8, 0xdd
+        vshufi32x4 zmm19, zmm19, zmm8, 0x88
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+-32]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+8160], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+4064], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+992]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+9184], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+5088], 0x01
         vpunpcklqdq zmm8, zmm24, zmm25
         vpunpckhqdq zmm9, zmm24, zmm25
         vmovdqu32 ymm24, ymmword ptr [rdi+rdx+2016]
-        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+10208], 0x01
+        vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+6112], 0x01
         vmovdqu32 ymm25, ymmword ptr [rdi+rdx+3040]
-        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+11232], 0x01
+        vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+7136], 0x01
         vpunpcklqdq zmm10, zmm24, zmm25
         vpunpckhqdq zmm11, zmm24, zmm25
         // RDX already advanced by 64: hint the next compression block.
@@ -4153,15 +4112,15 @@ flock_blake3_contiguous_1024:
         prefetcht0 [rdi+rdx+10240]
         prefetcht0 [rdi+rdx+3072]
         prefetcht0 [rdi+rdx+11264]
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+4064]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+8160]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+12256], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+5088]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+9184]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+13280], 0x01
         vpunpcklqdq zmm12, zmm24, zmm25
         vpunpckhqdq zmm13, zmm24, zmm25
-        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+6112]
+        vmovdqu32 ymm24, ymmword ptr [rdi+rdx+10208]
         vinserti64x4 zmm24, zmm24, ymmword ptr [rdi+rdx+14304], 0x01
-        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+7136]
+        vmovdqu32 ymm25, ymmword ptr [rdi+rdx+11232]
         vinserti64x4 zmm25, zmm25, ymmword ptr [rdi+rdx+15328], 0x01
         vpunpcklqdq zmm14, zmm24, zmm25
         vpunpckhqdq zmm15, zmm24, zmm25
@@ -4175,23 +4134,20 @@ flock_blake3_contiguous_1024:
         prefetcht0 [rdi+rdx+15360]
         vshufps zmm24, zmm8, zmm10, 136
         vshufps zmm30, zmm12, zmm14, 136
-        vmovdqa32 zmm28, zmm24
-        vpermt2d zmm24, zmm27, zmm30
-        vpermt2d zmm28, zmm31, zmm30
+        vshufi32x4 zmm28, zmm24, zmm30, 0xdd
+        vshufi32x4 zmm24, zmm24, zmm30, 0x88
         vshufps zmm25, zmm8, zmm10, 221
         vshufps zmm30, zmm12, zmm14, 221
-        vmovdqa32 zmm29, zmm25
-        vpermt2d zmm25, zmm27, zmm30
-        vpermt2d zmm29, zmm31, zmm30
+        vshufi32x4 zmm29, zmm25, zmm30, 0xdd
+        vshufi32x4 zmm25, zmm25, zmm30, 0x88
         vshufps zmm26, zmm9, zmm11, 136
         vshufps zmm8, zmm13, zmm15, 136
-        vmovdqa32 zmm30, zmm26
-        vpermt2d zmm26, zmm27, zmm8
-        vpermt2d zmm30, zmm31, zmm8
+        vshufi32x4 zmm30, zmm26, zmm8, 0xdd
+        vshufi32x4 zmm26, zmm26, zmm8, 0x88
         vshufps zmm8, zmm9, zmm11, 221
         vshufps zmm10, zmm13, zmm15, 221
-        vpermi2d zmm27, zmm8, zmm10
-        vpermi2d zmm31, zmm8, zmm10
+        vshufi32x4 zmm27, zmm8, zmm10, 0x88
+        vshufi32x4 zmm31, zmm8, zmm10, 0xdd
         vpbroadcastd zmm8, dword ptr [.Lflock_contiguous_BLAKE3_IV_0+rip]
         vpbroadcastd zmm9, dword ptr [.Lflock_contiguous_BLAKE3_IV_1+rip]
         vpbroadcastd zmm10, dword ptr [.Lflock_contiguous_BLAKE3_IV_2+rip]

@@ -2471,6 +2471,141 @@ unsafe fn transpose_plane_banks_in_place_x86_avx512(plane_banks: &mut [u8], n_ba
     }
 }
 
+/// tc: [`fold_ab_plane_banks_x86_avx512`] for a band of the transpose-
+/// contract ab_inner layout. The leaf, interpolate, finalize, plane transpose
+/// and eq_bot accumulation are lane-uniform, so reduced lane `4d + k` of band
+/// `x` (quarter `q = x >> 5`) is band `(x & 31) + 32k`'s incumbent reduced
+/// lane `16q + d`. Each lane takes its own band's eq_hi (`eq4[k]`) and the
+/// four quarters of `d` are summed into `local_res_ab[16q + d]`: the same
+/// field products as the incumbent per-band fold, XOR-combined in another
+/// order.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vbmi",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")]
+pub(crate) unsafe fn fold_ab_plane_banks_tc_x86_avx512(
+    plane_banks: &mut [u8],
+    eq_bot: &[F128],
+    q: usize,
+    eq4: &[F128; 4],
+    local_res_ab: &mut [F128; ELL],
+) {
+    debug_assert!(q < 4);
+    unsafe {
+        transpose_plane_banks_in_place_x86_avx512(plane_banks, eq_bot.len());
+        accumulate_transposed_banks_half_tc_x86_avx512(plane_banks, eq_bot, q, eq4, 0, local_res_ab);
+        accumulate_transposed_banks_half_tc_x86_avx512(plane_banks, eq_bot, q, eq4, 8, local_res_ab);
+    }
+}
+
+/// tc twin of [`accumulate_transposed_banks_half_x86_avx512`]: same eq_bot
+/// accumulation; only the band-end eq_hi fold differs (see
+/// [`fold_ab_plane_banks_tc_x86_avx512`]).
+#[inline(never)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn accumulate_transposed_banks_half_tc_x86_avx512(
+    plane_banks: &[u8],
+    eq_bot: &[F128],
+    q: usize,
+    eq4: &[F128; 4],
+    half_offset: usize,
+    local_res_ab: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64::{WideGhashX4, ghash_mul_x4_split, ghash_shift64_x4};
+    use core::arch::x86_64::*;
+    debug_assert_eq!(plane_banks.len(), eq_bot.len() * 16 * ELL);
+    debug_assert!(half_offset == 0 || half_offset == 8);
+    unsafe {
+        let base_ptr = (plane_banks.as_ptr() as *const __m512i).add(half_offset);
+        let mut acc0 = WideGhashX4::zero();
+        let mut acc1 = WideGhashX4::zero();
+        let mut acc2 = WideGhashX4::zero();
+        let mut acc3 = WideGhashX4::zero();
+        let mut acc4 = WideGhashX4::zero();
+        let mut acc5 = WideGhashX4::zero();
+        let mut acc6 = WideGhashX4::zero();
+        let mut acc7 = WideGhashX4::zero();
+
+        let mut u = 0usize;
+        let n = eq_bot.len();
+        while u + 2 <= n {
+            let e0 = *eq_bot.get_unchecked(u);
+            let e1 = *eq_bot.get_unchecked(u + 1);
+            let wb0 = _mm512_broadcast_i32x4(_mm_set_epi64x(e0.hi as i64, e0.lo as i64));
+            let wb1 = _mm512_broadcast_i32x4(_mm_set_epi64x(e1.hi as i64, e1.lo as i64));
+            let p0 = base_ptr.add(u * 16);
+            let p1 = base_ptr.add((u + 1) * 16);
+            acc0.mul_acc2(_mm512_loadu_si512(p0.add(0)), wb0, _mm512_loadu_si512(p1.add(0)), wb1);
+            acc1.mul_acc2(_mm512_loadu_si512(p0.add(1)), wb0, _mm512_loadu_si512(p1.add(1)), wb1);
+            acc2.mul_acc2(_mm512_loadu_si512(p0.add(2)), wb0, _mm512_loadu_si512(p1.add(2)), wb1);
+            acc3.mul_acc2(_mm512_loadu_si512(p0.add(3)), wb0, _mm512_loadu_si512(p1.add(3)), wb1);
+            acc4.mul_acc2(_mm512_loadu_si512(p0.add(4)), wb0, _mm512_loadu_si512(p1.add(4)), wb1);
+            acc5.mul_acc2(_mm512_loadu_si512(p0.add(5)), wb0, _mm512_loadu_si512(p1.add(5)), wb1);
+            acc6.mul_acc2(_mm512_loadu_si512(p0.add(6)), wb0, _mm512_loadu_si512(p1.add(6)), wb1);
+            acc7.mul_acc2(_mm512_loadu_si512(p0.add(7)), wb0, _mm512_loadu_si512(p1.add(7)), wb1);
+            u += 2;
+        }
+        while u < n {
+            let e0 = *eq_bot.get_unchecked(u);
+            let wb0 = _mm512_broadcast_i32x4(_mm_set_epi64x(e0.hi as i64, e0.lo as i64));
+            let p0 = base_ptr.add(u * 16);
+            acc0.mul_acc(_mm512_loadu_si512(p0.add(0)), wb0);
+            acc1.mul_acc(_mm512_loadu_si512(p0.add(1)), wb0);
+            acc2.mul_acc(_mm512_loadu_si512(p0.add(2)), wb0);
+            acc3.mul_acc(_mm512_loadu_si512(p0.add(3)), wb0);
+            acc4.mul_acc(_mm512_loadu_si512(p0.add(4)), wb0);
+            acc5.mul_acc(_mm512_loadu_si512(p0.add(5)), wb0);
+            acc6.mul_acc(_mm512_loadu_si512(p0.add(6)), wb0);
+            acc7.mul_acc(_mm512_loadu_si512(p0.add(7)), wb0);
+            u += 1;
+        }
+
+        // 128-bit lane k carries eq_hi of band (x & 31) + 32k.
+        let tv = _mm512_set_epi64(
+            eq4[3].hi as i64, eq4[3].lo as i64, eq4[2].hi as i64, eq4[2].lo as i64,
+            eq4[1].hi as i64, eq4[1].lo as i64, eq4[0].hi as i64, eq4[0].lo as i64,
+        );
+        let tv_x64 = ghash_shift64_x4(tv);
+        let accs = [acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7];
+        let scaled: [__m512i; 8] =
+            core::array::from_fn(|m| ghash_mul_x4_split(accs[m].reduce_lanes(), tv, tv_x64));
+        // Lane i of hfold4(v0..v3) is the XOR of the four lanes of v_i.
+        let s1_lo = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+        let s1_hi = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+        let s2_lo = _mm512_set_epi64(11, 10, 9, 8, 3, 2, 1, 0);
+        let s2_hi = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+        let hfold4 = |v0: __m512i, v1: __m512i, v2: __m512i, v3: __m512i| -> __m512i {
+            let t0 = _mm512_xor_si512(
+                _mm512_permutex2var_epi64(v0, s1_lo, v1),
+                _mm512_permutex2var_epi64(v0, s1_hi, v1),
+            );
+            let t1 = _mm512_xor_si512(
+                _mm512_permutex2var_epi64(v2, s1_lo, v3),
+                _mm512_permutex2var_epi64(v2, s1_hi, v3),
+            );
+            _mm512_xor_si512(
+                _mm512_permutex2var_epi64(t0, s2_lo, t1),
+                _mm512_permutex2var_epi64(t0, s2_hi, t1),
+            )
+        };
+        let dst = (local_res_ab.as_mut_ptr() as *mut __m512i).add(4 * q + half_offset / 4);
+        for r in 0..2usize {
+            let folded = hfold4(scaled[4 * r], scaled[4 * r + 1], scaled[4 * r + 2], scaled[4 * r + 3]);
+            let cur = _mm512_loadu_si512(dst.add(r) as *const __m512i);
+            _mm512_storeu_si512(dst.add(r), _mm512_xor_si512(cur, folded));
+        }
+    }
+}
+
 #[inline(never)]
 #[cfg(all(
     target_arch = "x86_64",

@@ -3335,6 +3335,13 @@ fn generate_round1_inner_octa_with_ranked_closed_dispatch_and_commit(
         }
         if pipelined && ab1_hole && ab_block_bytes == 29 * 64 {
             ab_inner.set_ab1_hole_layout();
+            // tc: every octa above is cross-quarter with a deferred buffer, and
+            // with all windows 2..=29 eligible each one reaches the projection.
+            if blake3_witgen8::tc_layout_active()
+                && blake3_witgen8::window_seed_projection_eligible(preps.get())
+            {
+                ab_inner.set_tc_layout();
+            }
         }
         return;
     }

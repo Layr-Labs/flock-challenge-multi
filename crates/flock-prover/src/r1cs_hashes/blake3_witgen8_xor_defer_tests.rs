@@ -154,23 +154,23 @@ unsafe fn run_sequence<const COLS: usize>(cq: bool, cached: bool, rw: usize) {
                     // Actual production dispatch: non-null pending, cross-quarter
                     // (aligned slots unless FLOCK_NO_PROJ_PIPE is set).
                     (true, _, true) => project(&proj, blk, rows, arp, brp, rw, &tables),
-                    (true, true, false) => project_policy::<true, true, COLS, true, true, false>(
+                    (true, true, false) => project_policy::<true, true, COLS, true, true, false, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
-                    (true, false, false) => project_policy::<false, true, COLS, true, true, false>(
+                    (true, false, false) => project_policy::<false, true, COLS, true, true, false, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
                     // Small-layout check of the same constant deferred kernel.
-                    (false, true, true) => project_policy::<true, false, COLS, true, true, true>(
+                    (false, true, true) => project_policy::<true, false, COLS, true, true, true, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
-                    (false, true, false) => project_policy::<true, false, COLS, true, true, false>(
+                    (false, true, false) => project_policy::<true, false, COLS, true, true, false, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
-                    (false, false, true) => project_policy::<false, false, COLS, true, true, true>(
+                    (false, false, true) => project_policy::<false, false, COLS, true, true, true, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
-                    (false, false, false) => project_policy::<false, false, COLS, true, true, false>(
+                    (false, false, false) => project_policy::<false, false, COLS, true, true, false, false>(
                         &proj, blk, rows, arp, brp, rw, &tables,
                     ),
                 }
